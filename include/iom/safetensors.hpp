@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -37,7 +38,21 @@ private:
     size_t nbytes_ = 0;
 };
 
-class SafeTensorsFile {
+class SafeTensorsStore {
+public:
+    virtual ~SafeTensorsStore() = default;
+
+    [[nodiscard]]
+    virtual SafeTensorView operator[](const std::string& name) const = 0;
+
+    [[nodiscard]]
+    virtual size_t size() const = 0;
+
+    [[nodiscard]]
+    virtual const std::vector<std::string>& keys() const = 0;
+};
+
+class SafeTensorsFile : public SafeTensorsStore {
 public:
     explicit SafeTensorsFile(const std::string& filename);
 
@@ -45,16 +60,38 @@ public:
     SafeTensorsFile& operator=(const SafeTensorsFile&) = delete;
 
     [[nodiscard]]
-    SafeTensorView operator[](const std::string& name) const;
+    SafeTensorView operator[](const std::string& name) const override;
 
     [[nodiscard]]
-    size_t size() const;
+    size_t size() const override;
 
     [[nodiscard]]
-    const std::vector<std::string>& keys() const;
+    const std::vector<std::string>& keys() const override;
 
 private:
     MappedFile file_;
+    std::unordered_map<std::string, SafeTensorView> tensors_;
+    std::vector<std::string> keys_;
+};
+
+class SafeTensorsDir : public SafeTensorsStore {
+public:
+    explicit SafeTensorsDir(const std::string& dirname);
+
+    SafeTensorsDir(const SafeTensorsDir&) = delete;
+    SafeTensorsDir& operator=(const SafeTensorsDir&) = delete;
+
+    [[nodiscard]]
+    SafeTensorView operator[](const std::string& name) const override;
+
+    [[nodiscard]]
+    size_t size() const override;
+
+    [[nodiscard]]
+    const std::vector<std::string>& keys() const override;
+
+private:
+    std::vector<std::unique_ptr<SafeTensorsFile>> files_;
     std::unordered_map<std::string, SafeTensorView> tensors_;
     std::vector<std::string> keys_;
 };

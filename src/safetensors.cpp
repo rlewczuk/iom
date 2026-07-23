@@ -1,6 +1,8 @@
 #include "iom/safetensors.hpp"
 
+
 #include <algorithm>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -143,6 +145,41 @@ size_t SafeTensorsFile::size() const {
 }
 
 const std::vector<std::string>& SafeTensorsFile::keys() const {
+    return keys_;
+}
+
+SafeTensorsDir::SafeTensorsDir(const std::string& dirname) {
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(dirname)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
+            paths.push_back(entry.path());
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+
+    for (const auto& path : paths) {
+        auto file = std::make_unique<SafeTensorsFile>(path.string());
+        for (const auto& key : file->keys()) {
+            tensors_.emplace(key, (*file)[key]);
+            keys_.push_back(key);
+        }
+        files_.push_back(std::move(file));
+    }
+}
+
+SafeTensorView SafeTensorsDir::operator[](const std::string& name) const {
+    const auto it = tensors_.find(name);
+    if (it == tensors_.end()) {
+        throw std::out_of_range("safetensors tensor not found: " + name);
+    }
+    return it->second;
+}
+
+size_t SafeTensorsDir::size() const {
+    return tensors_.size();
+}
+
+const std::vector<std::string>& SafeTensorsDir::keys() const {
     return keys_;
 }
 
