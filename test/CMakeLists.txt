@@ -1,5 +1,7 @@
 add_executable(iom_tests
         test_iom.cpp
+        test_mmap.cpp
+        test_safetensors.cpp
 )
 
 set_source_files_properties(test_iom.cpp PROPERTIES

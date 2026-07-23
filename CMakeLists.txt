@@ -19,11 +19,15 @@ set(ROCM_PATH "/opt/rocm" CACHE PATH "Path to the ROCm SDK")
 set(IOM_SOURCES
         src/iom.cpp
         src/llama.cpp
+        src/mmap.cpp
+        src/safetensors.cpp
 )
 
 set(IOM_HEADERS
         include/iom/iom.hpp
         include/iom/llama.hpp
+        include/iom/mmap.hpp
+        include/iom/safetensors.hpp
 )
 
 if(ROCM_ENABLED)
