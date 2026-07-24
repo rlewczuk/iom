@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.21)
 
 project(iom
     VERSION 0.0.1
@@ -13,7 +13,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(nlohmann_json REQUIRED)
 
-set(ROCM_ENABLED OFF CACHE STRING "Build with ROCm/HIP support")
+option(CUDA_ENABLED "Build with CUDA support" OFF)
+set(CUDA_PATH "/usr/local/cuda" CACHE PATH "Path to the CUDA Toolkit")
+option(ROCM_ENABLED "Build with ROCm support" OFF)
 set(ROCM_PATH "/opt/rocm" CACHE PATH "Path to the ROCm SDK")
 
 set(IOM_SOURCES
@@ -30,12 +32,34 @@ set(IOM_HEADERS
         include/iom/safetensors.hpp
 )
 
-if(ROCM_ENABLED)
-    set(IOM_ROCM_ENABLED TRUE)
-    list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}")
-    find_package(hip REQUIRED CONFIG)
-    list(APPEND IOM_SOURCES src/rocm.cpp)
-    list(APPEND IOM_HEADERS include/iom/rocm.hpp)
+set(IOM_KERNEL_SOURCES
+)
+
+if(CUDA_ENABLED AND ROCM_ENABLED)
+    message(FATAL_ERROR "CUDA_ENABLED and ROCM_ENABLED cannot both be enabled")
+elseif(CUDA_ENABLED)
+    set(CMAKE_CUDA_COMPILER "${CUDA_PATH}/bin/nvcc")
+    enable_language(CUDA)
+    set(IOM_KERNEL_LANGUAGE CUDA)
+elseif(ROCM_ENABLED)
+    file(STRINGS "${ROCM_PATH}/.info/version" IOM_ROCM_VERSION LIMIT_COUNT 1)
+    if(IOM_ROCM_VERSION VERSION_LESS 7.2)
+        message(FATAL_ERROR
+            "ROCm 7.2 or newer is required for WMMA; detected ${IOM_ROCM_VERSION}"
+        )
+    endif()
+
+    set(CMAKE_HIP_COMPILER_ROCM_ROOT "${ROCM_PATH}")
+    set(CMAKE_HIP_COMPILER "${ROCM_PATH}/llvm/bin/clang++")
+    enable_language(HIP)
+    set(IOM_KERNEL_LANGUAGE HIP)
+endif()
+
+if(IOM_KERNEL_LANGUAGE AND IOM_KERNEL_SOURCES)
+    set_source_files_properties(${IOM_KERNEL_SOURCES} PROPERTIES
+        LANGUAGE "${IOM_KERNEL_LANGUAGE}"
+    )
+    list(APPEND IOM_SOURCES ${IOM_KERNEL_SOURCES})
 endif()
 
 add_library(libiom STATIC
@@ -47,22 +71,22 @@ set_target_properties(libiom PROPERTIES
     OUTPUT_NAME iom
 )
 
+if(IOM_KERNEL_LANGUAGE)
+    set_target_properties(libiom PROPERTIES
+        "${IOM_KERNEL_LANGUAGE}_STANDARD" 20
+        "${IOM_KERNEL_LANGUAGE}_STANDARD_REQUIRED" ON
+    )
+endif()
+
 target_include_directories(libiom
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
 )
 
-target_compile_features(libiom PUBLIC cxx_std_20)
-
-target_link_libraries(libiom
-    PRIVATE
-        nlohmann_json::nlohmann_json
-)
-
-if(ROCM_ENABLED)
+if(CUDA_ENABLED)
+    target_compile_definitions(libiom PUBLIC IOM_CUDA_ENABLED=1)
+elseif(ROCM_ENABLED)
     target_compile_definitions(libiom PUBLIC IOM_ROCM_ENABLED=1)
-    target_include_directories(libiom PUBLIC "${ROCM_PATH}/include")
-    target_link_libraries(libec PUBLIC hip::host)
 endif()
 
 add_executable(iom
