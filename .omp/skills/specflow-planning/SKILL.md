@@ -21,7 +21,11 @@ Read:
 - relevant source, tests, build files, and interfaces;
 - `.specs/<change-id>/progress.md`.
 
-Planning may inspect but must not edit production code.
+Planning may inspect but must not edit production code. Load `specflow-exploration` and use one or more routed `scout` instances when repository breadth makes direct inspection inefficient. Internet research remains optional and disabled by default.
+
+## Exploration during planning
+
+When exploration is enabled, use a single batch of distinct routed `scout` tasks rather than repeatedly searching the same paths. Record decisive file references and wiki freshness in the plan context. Native `librarian` is allowed only after developer-approved internet research and `/explorer-web on`; external information must be cited and cannot override repository reality.
 
 ## Outputs
 
@@ -72,7 +76,12 @@ Every `tasks/NNN-<slug>.md` must include:
 - review focus;
 - dependencies;
 - write scope;
-- risk and model class.
+- risk and model class;
+- `prewalk_policy: auto|on|off`;
+- `prewalk_situation: mechanical|repository-heavy-small-edit|normal|cross-cutting|high-risk|debugging`;
+- `exploration_policy: auto|on|off`;
+- `internet_research: false|true`;
+- `docs_update: auto|on|off`.
 
 Prohibited placeholders:
 
@@ -93,6 +102,8 @@ Prohibited placeholders:
 - dependency-aware execution waves;
 - Markdown links to every detailed task;
 - risk and model class;
+- prewalk policy and situation;
+- exploration, internet-research, and docs-update policy;
 - task status;
 - validation checklist;
 - review history.
@@ -112,14 +123,33 @@ Put tasks in the same execution wave only when all are true:
 
 When uncertain, schedule sequentially.
 
-### Model class
+### Model class and prewalk policy
 
-Classify each task:
+Load `specflow-cost-routing` and classify each task before plan review.
+
+Model adequacy floor:
 
 - `smol`: mechanical or narrow, low-risk work.
 - `task`: normal implementation requiring repository reasoning.
-- `slow`: architecture-heavy, security-sensitive, migration-critical, or
-  difficult debugging work.
+- `slow`: architecture-heavy, security-sensitive, migration-critical,
+  numerically delicate GPU work, or difficult debugging work.
+
+Prewalk metadata:
+
+- `prewalk_policy: on` only when the developer wants repository exploration on
+  a stronger model before a localized, stable edit proceeds on the configured
+  target model;
+- `prewalk_policy: off` for read-only work, debugging, broad architectural
+  changes, high-risk/security work, migrations, or tasks whose first edit is
+  likely to invalidate the plan;
+- `prewalk_policy: auto` delegates to `.omp/gpu-lab/cost-policy.json`;
+- `prewalk_situation` must describe the actual task, not merely the desired
+  cost: `mechanical`, `repository-heavy-small-edit`, `normal`, `cross-cutting`,
+  `high-risk`, or `debugging`.
+
+Expose these choices in `tasks.md`. They are approval-scope decisions: the
+developer may change them before approving the plan. Never assume prewalk is a
+quality improvement; it is a cost-routing mechanism for an editing subagent.
 
 ## Self-review before developer review
 
@@ -130,7 +160,9 @@ Classify each task:
 5. Search for placeholders and vague instructions.
 6. Check cross-task names, types, and interfaces for consistency.
 7. Confirm every task has executable verification.
-8. Confirm the plan fits the approved scope and contains no speculative extras.
+8. Confirm every task has an adequate model floor and a justified prewalk policy/situation.
+9. Confirm prewalk is not assigned to read-only, debugging, cross-cutting, or high-risk work by default.
+10. Confirm the plan fits the approved scope and contains no speculative extras.
 
 Fix every issue inline.
 
@@ -153,8 +185,8 @@ plan_status: review
 Present the plan and ask:
 
 > Please review `.specs/<change-id>/tasks.md` and its linked task files. What
-> should change, or do you explicitly approve this plan and want me to proceed
-> with implementation?
+> should change—including any model class or prewalk choice—or do you explicitly
+> approve this plan and want me to proceed with implementation?
 
 Do not implement while waiting.
 
@@ -181,3 +213,7 @@ Only when the developer explicitly approves and asks to proceed:
    - `stage: implementation`
    - `plan_status: approved`;
 5. immediately load and follow `specflow-execution`.
+
+## GPU-aware planning
+
+For GPU-relevant tasks, populate `gpu_targets`, `gpu_profile`, `benchmark_required`, and `debug_policy`. Include exact local checks and `.omp/gpu-lab/bin/gpu-labctl` validation phases. Keep source writing in one implementer; plan CUDA/ROCm validators and portability review as a parallel read-only wave after ordinary review. Require a full matrix rerun after repairs.

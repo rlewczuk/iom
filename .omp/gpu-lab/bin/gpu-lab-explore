@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Inspect and modify persistent defaults for SpecFlow exploration and the project agent wiki."""
+from __future__ import annotations
+import argparse, json, os, sys
+from pathlib import Path
+from typing import Any, NoReturn
+
+
+def die(message: str) -> NoReturn:
+    print(f"gpu-lab-explore: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def find_root(start: Path) -> Path:
+    override = os.environ.get("GPU_LAB_PROJECT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    for origin in (start.resolve(), Path(__file__).resolve()):
+        for candidate in (origin, *origin.parents):
+            if (candidate / ".omp/gpu-lab/exploration-policy.json").is_file():
+                return candidate
+    die("cannot locate .omp/gpu-lab/exploration-policy.json; initialize the GPU lab first")
+
+
+def path_for(root: Path) -> Path:
+    return root / ".omp/gpu-lab/exploration-policy.json"
+
+
+def load(root: Path) -> dict[str, Any]:
+    path = path_for(root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot read {path}: {exc}")
+    validate(data)
+    return data
+
+
+def validate(data: Any) -> None:
+    if not isinstance(data, dict) or data.get("version") != 1:
+        die("exploration-policy.json must be a version-1 object")
+    defaults = data.get("defaults")
+    if not isinstance(defaults, dict):
+        die("missing defaults object")
+    for key in ("explorers_enabled", "internet_enabled"):
+        if not isinstance(defaults.get(key), bool):
+            die(f"defaults.{key} must be boolean")
+    maximum = defaults.get("max_parallel_explorers")
+    if not isinstance(maximum, int) or maximum < 1 or maximum > 16:
+        die("defaults.max_parallel_explorers must be between 1 and 16")
+    docs_root = defaults.get("docs_root")
+    parts = Path(docs_root).parts if isinstance(docs_root, str) else ()
+    if (
+        not isinstance(docs_root, str)
+        or not docs_root.strip()
+        or Path(docs_root).is_absolute()
+        or ".." in parts
+        or not parts
+        or parts[0] != "docs"
+    ):
+        die("defaults.docs_root must be a safe path under project docs/")
+    if defaults.get("docs_update") not in {"auto", "on", "off"}:
+        die("defaults.docs_update must be auto, on, or off")
+
+
+def write(root: Path, data: dict[str, Any]) -> None:
+    validate(data)
+    p = path_for(root)
+    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote: {p}")
+
+
+def init_docs(root: Path, data: dict[str, Any]) -> None:
+    docs = root / data["defaults"]["docs_root"]
+    (docs / "raw").mkdir(parents=True, exist_ok=True)
+    (docs / "wiki").mkdir(parents=True, exist_ok=True)
+    index = docs / "index.md"
+    log = docs / "log.md"
+    if not index.exists():
+        index.write_text("# Project Agent Wiki\n\nDurable project knowledge maintained by `specflow-doc-librarian`.\n\n## Topics\n\n_No compiled pages yet._\n", encoding="utf-8")
+        print(f"created: {index}")
+    else:
+        print(f"preserved: {index}")
+    if not log.exists():
+        log.write_text("# Agent Wiki Operation Log\n\nAppend-only record of knowledge-base updates.\n", encoding="utf-8")
+        print(f"created: {log}")
+    else:
+        print(f"preserved: {log}")
+    for d in (docs / "raw", docs / "wiki"):
+        keep=d/'.gitkeep'
+        if not any(d.iterdir()):
+            keep.write_text("", encoding="utf-8")
+            print(f"created: {keep}")
+
+
+
+def ensure_mapping(lines: list[str], task_start: int, task_end: int, section_name: str, values: dict[str, str]) -> tuple[list[str], int]:
+    section_start = next((i for i in range(task_start + 1, task_end) if lines[i].strip() == f"{section_name}:" and lines[i].startswith("  ")), None)
+    if section_start is None:
+        block = ["", f"  {section_name}:", *[f"    {key}: {value}" for key, value in values.items()]]
+        lines[task_end:task_end] = block
+        return lines, task_end + len(block)
+    section_end = next((i for i in range(section_start + 1, task_end) if lines[i] and len(lines[i]) - len(lines[i].lstrip()) <= 2), task_end)
+    for key, value in values.items():
+        prefix = f"    {key}:"
+        match = next((i for i in range(section_start + 1, section_end) if lines[i].startswith(prefix)), None)
+        if match is None:
+            lines.insert(section_end, f"    {key}: {value}")
+            section_end += 1
+            task_end += 1
+    return lines, task_end
+
+
+def apply_overlay(root: Path) -> None:
+    overlay = root / ".omp/gpu-lab/omp-config.yml"
+    if not overlay.exists():
+        die(f"missing OMP overlay: {overlay}")
+    original = overlay.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    task_start = next((i for i, line in enumerate(lines) if line == "task:"), None)
+    if task_start is None:
+        die(f"{overlay} has no top-level task section")
+    task_end = next((i for i in range(task_start + 1, len(lines)) if lines[i] and not lines[i].startswith((" ", "#"))), len(lines))
+    depth = next((i for i in range(task_start + 1, task_end) if lines[i].strip().startswith("maxRecursionDepth:")), None)
+    if depth is None:
+        lines.insert(task_start + 1, "  maxRecursionDepth: 2")
+        task_end += 1
+    else:
+        try:
+            value = int(lines[depth].split(":", 1)[1].strip())
+        except ValueError:
+            value = 0
+        if value < 2:
+            lines[depth] = "  maxRecursionDepth: 2"
+    lines, task_end = ensure_mapping(lines, task_start, task_end, "agentModelOverrides", {
+        "scout": '"@smol"',
+        "librarian": '"@smol"',
+        "specflow-doc-librarian": '"@task"',
+    })
+    lines, task_end = ensure_mapping(lines, task_start, task_end, "agentPrewalk", {
+        "scout": '"off"',
+        "librarian": '"off"',
+        "specflow-doc-librarian": '"off"',
+    })
+    rendered = "\n".join(lines) + "\n"
+    if rendered != original:
+        overlay.write_text(rendered, encoding="utf-8")
+        print(f"updated exploration task settings: {overlay}")
+    else:
+        print(f"unchanged: {overlay}")
+
+def main() -> int:
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--project',type=Path,default=Path.cwd())
+    sub=ap.add_subparsers(dest='command',required=True)
+    sub.add_parser('show'); sub.add_parser('validate'); sub.add_parser('init-docs'); sub.add_parser('apply')
+    default=sub.add_parser('default'); default.add_argument('feature',choices=['explorers','internet','docs-update']); default.add_argument('value')
+    mx=sub.add_parser('max-parallel'); mx.add_argument('count',type=int)
+    dr=sub.add_parser('docs-root'); dr.add_argument('path')
+    args=ap.parse_args(); root=find_root(args.project); data=load(root)
+    if args.command=='show':
+        d=data['defaults']; print(json.dumps({'policy':str(path_for(root)),'defaults':d,'contexts':data.get('contexts',{})},indent=2))
+    elif args.command=='validate': print(f"valid: {path_for(root)}")
+    elif args.command=='init-docs': init_docs(root,data)
+    elif args.command=='apply': apply_overlay(root)
+    elif args.command=='default':
+        if args.feature in {'explorers','internet'}:
+            if args.value not in {'on','off'}: die('value must be on or off')
+            data['defaults'][args.feature+'_enabled']=args.value=='on'
+        else:
+            if args.value not in {'auto','on','off'}: die('docs-update value must be auto, on, or off')
+            data['defaults']['docs_update']=args.value
+        write(root,data)
+    elif args.command=='max-parallel':
+        data['defaults']['max_parallel_explorers']=args.count; write(root,data)
+    elif args.command=='docs-root':
+        data['defaults']['docs_root']=args.path; write(root,data); init_docs(root,data)
+    return 0
+
+if __name__=='__main__': raise SystemExit(main())

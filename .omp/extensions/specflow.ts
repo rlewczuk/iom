@@ -115,6 +115,22 @@ _To be consolidated and updated after every material developer answer._
 
 ### Observability
 
+### Cost and model policy
+
+_Record the preferred economy/balanced/quality profile, minimum model tiers for risky requirements, and whether edit-triggered prewalk is allowed. Developers retain per-task control through model_class, prewalk_policy, and prewalk_situation._
+
+### Exploration and project knowledge policy
+
+_Record whether parallel codebase exploration is permitted, whether external internet research is permitted, and which durable changes must update docs/agent-wiki/. Internet research defaults to disabled._
+
+### GPU target matrix
+
+_Record required CUDA/ROCm hosts, architectures, debug/release profiles, benchmark requirements, and acceptable environment exceptions. Use 'none' when GPU validation is not applicable._
+
+### Remote debugging policy
+
+_Record which failures require debugger escalation and any source-path constraints._
+
 ## Acceptance criteria
 
 ## Non-goals
@@ -182,6 +198,7 @@ async function ensureChange(cwd: string, changeId: string, initial: string): Pro
   await fs.mkdir(path.join(dir, "tasks"), { recursive: true });
   await fs.mkdir(path.join(dir, "reviews"), { recursive: true });
   await fs.mkdir(path.join(dir, "reports"), { recursive: true });
+  await fs.mkdir(path.join(dir, "gpu-lab"), { recursive: true });
 
   const spec = path.join(dir, "specification.md");
   const progress = path.join(dir, "progress.md");

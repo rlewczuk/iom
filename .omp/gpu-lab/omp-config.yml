@@ -1,0 +1,72 @@
+# Recommended project overlay. Launch with:
+#   ./.omp/gpu-lab/bin/omp-gpu
+# or:
+#   omp --config .omp/gpu-lab/omp-config.yml
+#
+# Map these role aliases to provider/model IDs available in your OMP account.
+# Keep the aliases stable: cost-policy.json routes subagents through them.
+# Example only:
+# modelRoles:
+#   default: provider/general-coding-model:medium
+#   smol: provider/cheap-fast-model:low
+#   task: provider/coding-model:medium
+#   slow: provider/strong-reasoning-model:high
+#   plan: provider/strong-reasoning-model:high
+#   tiny: provider/very-cheap-model:minimal
+
+async:
+  enabled: true
+  maxJobs: 16
+
+task:
+  batch: true
+  eager: preferred
+  maxConcurrency: 6
+  enableLsp: true
+  maxRecursionDepth: 2
+  maxRuntimeMs: 7200000
+  isolation:
+    mode: none
+
+  # Fallback routing. The cost-routing skill passes an explicit model per spawn,
+  # which has higher precedence. These values keep manual spawns economical.
+  agentModelOverrides:
+    specflow-implementer: "@task"
+    specflow-implementer-prewalk: "@slow"
+    specflow-reviewer: "@task"
+    specflow-tester: "@smol"
+    specflow-final-reviewer: "@slow"
+    specflow-gpu-cuda-validator: "@smol"
+    specflow-gpu-rocm-validator: "@smol"
+    specflow-gpu-portability-reviewer: "@task"
+    specflow-gpu-performance-reviewer: "@task"
+    specflow-gpu-debugger: "@slow"
+    scout: "@smol"
+    librarian: "@smol"
+    specflow-doc-librarian: "@task"
+
+  # Agent-scoped prewalk is used only by the editing prewalk variant. Keeping
+  # every read-only agent off prevents a hand-off that can never be triggered.
+  agentPrewalk:
+    specflow-implementer: "off"
+    specflow-implementer-prewalk: "@smol"
+    specflow-reviewer: "off"
+    specflow-tester: "off"
+    specflow-final-reviewer: "off"
+    specflow-gpu-cuda-validator: "off"
+    specflow-gpu-rocm-validator: "off"
+    specflow-gpu-portability-reviewer: "off"
+    specflow-gpu-performance-reviewer: "off"
+    specflow-gpu-debugger: "off"
+    scout: "off"
+    librarian: "off"
+    specflow-doc-librarian: "off"
+
+debug:
+  enabled: true
+
+mcp:
+  enableProjectConfig: true
+
+tools:
+  maxTimeout: 0

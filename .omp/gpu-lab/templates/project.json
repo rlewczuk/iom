@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "source_root": ".",
+  "sync": {
+    "checksum": false,
+    "delete": true,
+    "excludes": [
+      "/.git/",
+      "/.omp/gpu-lab/results/",
+      "/.omp/gpu-lab/generated/",
+      "/.specs/*/gpu-lab/",
+      "/build/",
+      "/build-*/",
+      "/.cache/",
+      "/compile_commands.json"
+    ]
+  },
+  "profiles": {
+    "cuda-debug": {
+      "backend": "cuda",
+      "configure": "cmake --preset cuda-debug -S \"$GPU_LAB_SOURCE_DIR\"",
+      "build": "cmake --build --preset cuda-debug --parallel \"$GPU_LAB_JOBS\"",
+      "test": "ctest --preset cuda-debug --output-on-failure",
+      "benchmark": "",
+      "notes": "Configure a CUDA debug preset with device debug information, normally -g -G -O0."
+    },
+    "cuda-release": {
+      "backend": "cuda",
+      "configure": "cmake --preset cuda-release -S \"$GPU_LAB_SOURCE_DIR\"",
+      "build": "cmake --build --preset cuda-release --parallel \"$GPU_LAB_JOBS\"",
+      "test": "ctest --preset cuda-release --output-on-failure",
+      "benchmark": "ctest --preset cuda-release -L benchmark --output-on-failure",
+      "notes": "Use an optimized build. Never evaluate performance from a CUDA -G build."
+    },
+    "rocm-debug": {
+      "backend": "rocm",
+      "configure": "cmake --preset rocm-debug -S \"$GPU_LAB_SOURCE_DIR\"",
+      "build": "cmake --build --preset rocm-debug --parallel \"$GPU_LAB_JOBS\"",
+      "test": "ctest --preset rocm-debug --output-on-failure",
+      "benchmark": "",
+      "notes": "Configure a HIP/ROCm debug preset with -ggdb -O0 or equivalent."
+    },
+    "rocm-release": {
+      "backend": "rocm",
+      "configure": "cmake --preset rocm-release -S \"$GPU_LAB_SOURCE_DIR\"",
+      "build": "cmake --build --preset rocm-release --parallel \"$GPU_LAB_JOBS\"",
+      "test": "ctest --preset rocm-release --output-on-failure",
+      "benchmark": "ctest --preset rocm-release -L benchmark --output-on-failure",
+      "notes": "Use an optimized build with debug symbols when practical."
+    }
+  },
+  "policy": {
+    "reproduce_before_debug": 2,
+    "max_repair_iterations": 3,
+    "debug_one_host_at_a_time": true,
+    "require_all_enabled_hosts": true
+  }
+}

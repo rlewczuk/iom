@@ -57,7 +57,8 @@ Check for:
 - concurrency, retries, and idempotency;
 - observability and operations;
 - conflicts with existing architecture;
-- scope that should be explicitly excluded.
+- scope that should be explicitly excluded;
+- model-quality constraints and whether any editing task may use prewalk.
 
 ### 4. Ask one question at a time
 
@@ -125,3 +126,15 @@ Do not write code.
 
 The approved file must be sufficient for a planner in a fresh session. It must
 not require access to earlier conversation.
+
+## Cost-policy clarification
+
+When `.omp/gpu-lab/cost-policy.json` exists, capture any developer requirement that overrides the project defaults: release-critical work requiring a `slow` floor, cost-sensitive mechanical batches, or situations where prewalk must be forced on/off. Do not choose exact provider models in the specification unless the developer requires them; prefer role aliases and task-level policy.
+
+## CUDA/ROCm clarification
+
+When `.omp/gpu-lab/hosts.json` exists or the request concerns GPU C++, refine an explicit GPU target matrix before approval: required CUDA/ROCm hosts or architectures, correctness tests, debug and optimized profiles, performance criteria, acceptable environmental blockers, and remote-debug policy. Do not infer that success on one backend covers the other.
+
+## Exploration support
+
+Use `specflow-exploration` for bounded parallel repository discovery when needed. Internet research is disabled by default and must not silently expand approved scope. Durable findings belong in `docs/agent-wiki/` through `specflow-doc-librarian`, not direct explorer edits.

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "defaults": {
+    "explorers_enabled": true,
+    "internet_enabled": false,
+    "max_parallel_explorers": 4,
+    "docs_root": "docs/agent-wiki",
+    "docs_update": "auto"
+  },
+  "contexts": {
+    "planning": {
+      "enabled": "on-demand",
+      "max_instances": 4
+    },
+    "implementation": {
+      "enabled": "on-demand",
+      "max_instances": 2
+    },
+    "review": {
+      "enabled": "on-demand",
+      "max_instances": 3
+    },
+    "verification": {
+      "enabled": "on-demand",
+      "max_instances": 2
+    }
+  },
+  "developer_overrides": {}
+}

@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Inspect and modify SpecFlow GPU model-routing and prewalk policy."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, NoReturn
+
+VALID_MODES = {"on", "off", "auto"}
+VALID_THINKING = {"off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"}
+ROLE_TO_AGENT = {
+    "implementer": "specflow-implementer",
+    "implementer_prewalk": "specflow-implementer-prewalk",
+    "reviewer": "specflow-reviewer",
+    "tester": "specflow-tester",
+    "final_reviewer": "specflow-final-reviewer",
+    "cuda_validator": "specflow-gpu-cuda-validator",
+    "rocm_validator": "specflow-gpu-rocm-validator",
+    "portability_reviewer": "specflow-gpu-portability-reviewer",
+    "performance_reviewer": "specflow-gpu-performance-reviewer",
+    "debugger": "specflow-gpu-debugger",
+    "explorer": "scout",
+    "external_librarian": "librarian",
+    "doc_librarian": "specflow-doc-librarian",
+}
+
+
+def die(message: str) -> NoReturn:
+    print(f"gpu-lab-cost: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def find_root(start: Path) -> Path:
+    override = os.environ.get("GPU_LAB_PROJECT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    roots = [start.resolve(), Path(__file__).resolve()]
+    seen: set[Path] = set()
+    for origin in roots:
+        for candidate in (origin, *origin.parents):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if (candidate / ".omp/gpu-lab/cost-policy.json").is_file():
+                return candidate
+    die("cannot locate .omp/gpu-lab/cost-policy.json; initialize the GPU lab first")
+
+
+def policy_path(root: Path) -> Path:
+    return root / ".omp/gpu-lab/cost-policy.json"
+
+
+def load_policy(root: Path) -> dict[str, Any]:
+    path = policy_path(root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot read {path}: {exc}")
+    validate_policy(data)
+    return data
+
+
+def write_policy(root: Path, data: dict[str, Any]) -> None:
+    validate_policy(data)
+    path = policy_path(root)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote: {path}")
+
+
+def normalize_model(value: Any) -> str | list[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value):
+        return [item.strip() for item in value]
+    die(f"invalid model selector/fallback chain: {value!r}")
+
+
+def validate_role_config(role: str, value: Any) -> None:
+    if not isinstance(value, dict):
+        die(f"role {role!r} must be an object")
+    normalize_model(value.get("model"))
+    thinking = value.get("thinking_level")
+    if thinking not in VALID_THINKING:
+        die(f"role {role!r} has invalid thinking_level {thinking!r}")
+    target = value.get("prewalk_target")
+    if target is not None and (not isinstance(target, str) or not target.strip()):
+        die(f"role {role!r} has invalid prewalk_target {target!r}; expected one model pattern")
+
+
+def validate_policy(data: Any) -> None:
+    if not isinstance(data, dict) or data.get("version") != 1:
+        die("cost-policy.json must be a version-1 object")
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        die("cost-policy.json must contain profiles")
+    active = data.get("active_profile")
+    if active not in profiles:
+        die(f"active_profile {active!r} does not exist")
+    for profile_name, profile in profiles.items():
+        if not isinstance(profile, dict):
+            die(f"profile {profile_name!r} must be an object")
+        roles = profile.get("roles")
+        if not isinstance(roles, dict):
+            die(f"profile {profile_name!r} has no roles object")
+        missing = sorted(set(ROLE_TO_AGENT) - set(roles))
+        if missing:
+            die(f"profile {profile_name!r} is missing roles: {', '.join(missing)}")
+        for role, value in roles.items():
+            validate_role_config(role, value)
+        prewalk = profile.get("prewalk")
+        if not isinstance(prewalk, dict) or prewalk.get("default") not in VALID_MODES:
+            die(f"profile {profile_name!r} has invalid prewalk.default")
+        situations = prewalk.get("situations")
+        if not isinstance(situations, dict):
+            die(f"profile {profile_name!r} has no prewalk.situations")
+        for situation, mode in situations.items():
+            if mode not in VALID_MODES:
+                die(f"profile {profile_name!r} situation {situation!r} has invalid mode {mode!r}")
+    overrides = data.get("developer_overrides", {})
+    if not isinstance(overrides, dict):
+        die("developer_overrides must be an object")
+    role_overrides = overrides.get("roles", {})
+    if not isinstance(role_overrides, dict):
+        die("developer_overrides.roles must be an object")
+    for role, value in role_overrides.items():
+        if role not in ROLE_TO_AGENT:
+            die(f"unknown role override: {role}")
+        validate_role_config(role, value)
+    prewalk_overrides = overrides.get("prewalk_situations", {})
+    if not isinstance(prewalk_overrides, dict):
+        die("developer_overrides.prewalk_situations must be an object")
+    for situation, mode in prewalk_overrides.items():
+        if mode not in VALID_MODES:
+            die(f"prewalk override {situation!r} has invalid mode {mode!r}")
+
+
+def active_profile(data: dict[str, Any]) -> dict[str, Any]:
+    return data["profiles"][data["active_profile"]]
+
+
+def effective_role(data: dict[str, Any], role: str) -> dict[str, Any]:
+    if role not in ROLE_TO_AGENT:
+        die(f"unknown role {role!r}; available: {', '.join(sorted(ROLE_TO_AGENT))}")
+    base = dict(active_profile(data)["roles"][role])
+    override = data.get("developer_overrides", {}).get("roles", {}).get(role)
+    if isinstance(override, dict):
+        base.update(override)
+    validate_role_config(role, base)
+    return base
+
+
+def effective_prewalk(data: dict[str, Any], situation: str, explicit: str = "auto") -> str:
+    if explicit not in VALID_MODES:
+        die(f"invalid explicit prewalk mode {explicit!r}")
+    if explicit != "auto":
+        return explicit
+    overrides = data.get("developer_overrides", {}).get("prewalk_situations", {})
+    if situation in overrides:
+        return overrides[situation]
+    profile = active_profile(data)
+    return profile["prewalk"]["situations"].get(situation, profile["prewalk"]["default"])
+
+
+def selector_with_thinking(selector: str, thinking: str) -> str:
+    if thinking == "auto":
+        return selector
+    suffixes = VALID_THINKING - {"auto"}
+    head, sep, tail = selector.rpartition(":")
+    if sep and tail in suffixes:
+        selector = head
+    return f"{selector}:{thinking}"
+
+
+def task_model(value: str | list[str], thinking: str) -> str | list[str]:
+    if isinstance(value, str):
+        return selector_with_thinking(value, thinking)
+    return [selector_with_thinking(item, thinking) for item in value]
+
+
+def sync_prewalk_overlay(root: Path, data: dict[str, Any]) -> None:
+    overlay = root / ".omp/gpu-lab/omp-config.yml"
+    if not overlay.exists():
+        print(f"warning: {overlay} is missing; prewalk target not synchronized", file=sys.stderr)
+        return
+    target = effective_role(data, "implementer_prewalk").get("prewalk_target", "@smol")
+    if not isinstance(target, str):
+        die("implementer_prewalk.prewalk_target must be one model pattern")
+    lines = overlay.read_text(encoding="utf-8").splitlines()
+    task_start = next((i for i, line in enumerate(lines) if line == "task:"), None)
+    if task_start is None:
+        die(f"{overlay} has no top-level task section")
+    task_end = next((i for i in range(task_start + 1, len(lines)) if lines[i] and not lines[i].startswith((" ", "#"))), len(lines))
+    prewalk_start = next((i for i in range(task_start + 1, task_end) if lines[i].strip() == "agentPrewalk:" and lines[i].startswith("  ")), None)
+    rendered_target = json.dumps(target)
+    if prewalk_start is None:
+        block = [
+            "",
+            "  # Managed by gpu-lab-cost: only the editing variant is armed.",
+            "  agentPrewalk:",
+            '    specflow-implementer: "off"',
+            f"    specflow-implementer-prewalk: {rendered_target}",
+            '    specflow-reviewer: "off"',
+            '    specflow-tester: "off"',
+            '    specflow-final-reviewer: "off"',
+            '    specflow-gpu-cuda-validator: "off"',
+            '    specflow-gpu-rocm-validator: "off"',
+            '    specflow-gpu-portability-reviewer: "off"',
+            '    specflow-gpu-performance-reviewer: "off"',
+            '    specflow-gpu-debugger: "off"',
+            '    scout: "off"',
+            '    librarian: "off"',
+            '    specflow-doc-librarian: "off"',
+        ]
+        lines[task_end:task_end] = block
+    else:
+        section_end = next((i for i in range(prewalk_start + 1, task_end) if lines[i] and len(lines[i]) - len(lines[i].lstrip()) <= 2), task_end)
+        managed = {
+            "specflow-implementer": '"off"',
+            "specflow-implementer-prewalk": rendered_target,
+            "specflow-reviewer": '"off"',
+            "specflow-tester": '"off"',
+            "specflow-final-reviewer": '"off"',
+            "specflow-gpu-cuda-validator": '"off"',
+            "specflow-gpu-rocm-validator": '"off"',
+            "specflow-gpu-portability-reviewer": '"off"',
+            "specflow-gpu-performance-reviewer": '"off"',
+            "specflow-gpu-debugger": '"off"',
+            "scout": '"off"',
+            "librarian": '"off"',
+            "specflow-doc-librarian": '"off"',
+        }
+        for agent, rendered in managed.items():
+            key = f"    {agent}:"
+            match = next((i for i in range(prewalk_start + 1, section_end) if lines[i].startswith(key)), None)
+            line = f"    {agent}: {rendered}"
+            if match is None:
+                lines.insert(section_end, line)
+                section_end += 1
+                task_end += 1
+            else:
+                lines[match] = line
+    rendered = "\n".join(lines) + "\n"
+    if overlay.read_text(encoding="utf-8") != rendered:
+        overlay.write_text(rendered, encoding="utf-8")
+        print(f"synchronized prewalk target in: {overlay}")
+
+
+
+def upgrade_policy(root: Path) -> None:
+    current_path = policy_path(root)
+    template_path = root / ".omp/gpu-lab/templates/cost-policy.json"
+    try:
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        template = json.loads(template_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot upgrade cost policy: {exc}")
+    if not isinstance(current, dict) or current.get("version") != 1:
+        die("only version-1 cost policies can be upgraded automatically")
+    if not isinstance(template, dict) or template.get("version") != 1:
+        die(f"invalid package template: {template_path}")
+    changed = False
+    current.setdefault("profiles", {})
+    for profile_name, template_profile in template["profiles"].items():
+        if profile_name not in current["profiles"]:
+            current["profiles"][profile_name] = template_profile
+            changed = True
+            continue
+        profile = current["profiles"][profile_name]
+        profile.setdefault("roles", {})
+        for role, value in template_profile["roles"].items():
+            if role not in profile["roles"]:
+                profile["roles"][role] = value
+                changed = True
+        if "prewalk" not in profile:
+            profile["prewalk"] = template_profile["prewalk"]
+            changed = True
+        else:
+            profile["prewalk"].setdefault("situations", {})
+            for situation, mode in template_profile["prewalk"]["situations"].items():
+                if situation not in profile["prewalk"]["situations"]:
+                    profile["prewalk"]["situations"][situation] = mode
+                    changed = True
+            if "default" not in profile["prewalk"]:
+                profile["prewalk"]["default"] = template_profile["prewalk"]["default"]
+                changed = True
+    current.setdefault("developer_overrides", {})
+    current["developer_overrides"].setdefault("roles", {})
+    current["developer_overrides"].setdefault("prewalk_situations", {})
+    validate_policy(current)
+    rendered = json.dumps(current, indent=2) + "\n"
+    if changed or current_path.read_text(encoding="utf-8") != rendered:
+        current_path.write_text(rendered, encoding="utf-8")
+        print(f"upgraded: {current_path}")
+    else:
+        print(f"unchanged: {current_path}")
+
+def render_model(value: str | list[str]) -> str:
+    return value if isinstance(value, str) else " -> ".join(value)
+
+
+def cmd_show(data: dict[str, Any]) -> None:
+    profile = active_profile(data)
+    print(f"active_profile: {data['active_profile']}")
+    print(f"description: {profile.get('description', '')}")
+    print("roles:")
+    for role in ROLE_TO_AGENT:
+        value = effective_role(data, role)
+        suffix = f" prewalk_target={value['prewalk_target']}" if value.get("prewalk_target") else ""
+        effective = task_model(value["model"], value["thinking_level"])
+        print(
+            f"  {role:22} agent={ROLE_TO_AGENT[role]:36} "
+            f"model={render_model(effective)}{suffix}"
+        )
+    print("prewalk situations:")
+    situations = set(profile["prewalk"]["situations"])
+    situations.update(data.get("developer_overrides", {}).get("prewalk_situations", {}))
+    for situation in sorted(situations):
+        print(f"  {situation:28} {effective_prewalk(data, situation)}")
+
+
+def resolve_auto_prewalk(mode: str, situation: str, risk: str, model_class: str) -> tuple[str, str]:
+    if mode in {"on", "off"}:
+        return mode, "explicit task or project policy"
+    if risk in {"high", "critical"} or model_class == "slow":
+        return "off", "high-risk/slow-model work should retain one capable model through edits"
+    if situation in {"cross-cutting", "high-risk", "debugging", "read-only"}:
+        return "off", f"prewalk is unsafe or ineffective for {situation} work"
+    if situation in {"mechanical", "repository-heavy-small-edit"}:
+        return "on", "repository discovery is substantial while the approved edit is localized"
+    return "off", "normal work defaults off unless the developer explicitly opts in"
+
+
+def cmd_recommend(data: dict[str, Any], args: argparse.Namespace) -> None:
+    role = args.role
+    rationale = "read-only/non-editing roles never use prewalk"
+    if role == "implementer":
+        configured = effective_prewalk(data, args.situation, args.prewalk)
+        mode, rationale = resolve_auto_prewalk(configured, args.situation, args.risk, args.model_class)
+        selected_role = "implementer_prewalk" if mode == "on" else "implementer"
+    else:
+        mode = "off"
+        selected_role = role
+    value = effective_role(data, selected_role)
+
+    # The approved model class is an adequacy floor. Preserve configured fallback
+    # chains, but prepend the required role alias when the profile starts lower.
+    model = value["model"]
+    floor = {"smol": "@smol", "task": "@task", "slow": "@slow"}[args.model_class]
+    chain = [model] if isinstance(model, str) else list(model)
+    rank = {"@smol": 0, "@task": 1, "@default": 1, "@slow": 2}
+    first_rank = rank.get(chain[0], 1)
+    floor_rank = rank[floor]
+    if floor_rank > first_rank:
+        chain = [floor, *[item for item in chain if item != floor]]
+        rationale += f"; escalated to approved model floor {args.model_class}"
+    model = chain[0] if len(chain) == 1 else chain
+
+    routed_model = task_model(model, value["thinking_level"])
+    result = {
+        "profile": data["active_profile"],
+        "requested_role": role,
+        "selected_role": selected_role,
+        "agent": ROLE_TO_AGENT[selected_role],
+        "model": routed_model,
+        "base_model": model,
+        "thinking_level": value["thinking_level"],
+        "prewalk": mode,
+        "prewalk_target": value.get("prewalk_target") if mode == "on" else None,
+        "situation": args.situation,
+        "risk": args.risk,
+        "model_class": args.model_class,
+        "rationale": rationale,
+    }
+    print(json.dumps(result, indent=2))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", type=Path, default=Path.cwd())
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("show")
+    sub.add_parser("validate")
+    sub.add_parser("apply")
+    sub.add_parser("upgrade")
+
+    profile = sub.add_parser("profile")
+    profile.add_argument("name")
+
+    prewalk = sub.add_parser("prewalk")
+    prewalk.add_argument("situation")
+    prewalk.add_argument("mode", choices=sorted(VALID_MODES))
+
+    role = sub.add_parser("role")
+    role.add_argument("name", choices=sorted(ROLE_TO_AGENT))
+    role.add_argument("model", nargs="+")
+    role.add_argument("--thinking", choices=sorted(VALID_THINKING))
+    role.add_argument("--prewalk-target")
+
+    reset = sub.add_parser("reset")
+    reset.add_argument("kind", choices=["roles", "prewalk", "all"])
+
+    recommend = sub.add_parser("recommend")
+    recommend.add_argument("--role", choices=sorted(ROLE_TO_AGENT), default="implementer")
+    recommend.add_argument("--situation", default="normal")
+    recommend.add_argument("--risk", choices=["low", "normal", "high", "critical"], default="normal")
+    recommend.add_argument("--model-class", choices=["smol", "task", "slow"], default="task")
+    recommend.add_argument("--prewalk", choices=sorted(VALID_MODES), default="auto")
+
+    args = parser.parse_args()
+    root = find_root(args.project)
+    if args.command == "upgrade":
+        upgrade_policy(root)
+        data = load_policy(root)
+        sync_prewalk_overlay(root, data)
+        return 0
+    data = load_policy(root)
+
+    if args.command == "show":
+        cmd_show(data)
+    elif args.command == "validate":
+        print(f"valid: {policy_path(root)}")
+    elif args.command == "apply":
+        sync_prewalk_overlay(root, data)
+        print(f"applied: {policy_path(root)}")
+    elif args.command == "profile":
+        if args.name not in data["profiles"]:
+            die(f"unknown profile {args.name!r}; available: {', '.join(sorted(data['profiles']))}")
+        data["active_profile"] = args.name
+        write_policy(root, data)
+        sync_prewalk_overlay(root, data)
+        cmd_show(data)
+    elif args.command == "prewalk":
+        data.setdefault("developer_overrides", {}).setdefault("prewalk_situations", {})[args.situation] = args.mode
+        write_policy(root, data)
+        print(f"effective {args.situation}: {effective_prewalk(data, args.situation)}")
+    elif args.command == "role":
+        model: str | list[str] = args.model[0] if len(args.model) == 1 else args.model
+        current = effective_role(data, args.name)
+        override: dict[str, Any] = {"model": model, "thinking_level": args.thinking or current["thinking_level"]}
+        if args.prewalk_target:
+            override["prewalk_target"] = args.prewalk_target
+        elif current.get("prewalk_target"):
+            override["prewalk_target"] = current["prewalk_target"]
+        data.setdefault("developer_overrides", {}).setdefault("roles", {})[args.name] = override
+        write_policy(root, data)
+        sync_prewalk_overlay(root, data)
+        print(json.dumps(effective_role(data, args.name), indent=2))
+    elif args.command == "reset":
+        overrides = data.setdefault("developer_overrides", {})
+        if args.kind in {"roles", "all"}:
+            overrides["roles"] = {}
+        if args.kind in {"prewalk", "all"}:
+            overrides["prewalk_situations"] = {}
+        write_policy(root, data)
+        sync_prewalk_overlay(root, data)
+        cmd_show(data)
+    elif args.command == "recommend":
+        cmd_recommend(data, args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

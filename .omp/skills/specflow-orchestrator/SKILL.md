@@ -31,6 +31,7 @@ Conversation history is not authoritative. Files are.
 5. Do not skip review or testing because a task looks simple.
 6. Do not mark a task complete until independent review and testing pass.
 7. Do not generate a final summary report. Leave durable evidence in state files.
+8. Resolve every subagent through `specflow-cost-routing`; record the selected model and prewalk decision.
 
 Examples of acceptable approval:
 
@@ -130,3 +131,15 @@ Give each subagent:
 - exact commands and expected evidence.
 
 Do not pass the whole parent conversation.
+
+## Cost routing
+
+When `.omp/gpu-lab/cost-policy.json` exists, load `specflow-cost-routing` before planning or execution. Task `model_class`, `prewalk_policy`, and `prewalk_situation` are approval-controlled durable state. The coordinator passes explicit models to subagents and never enables prewalk for read-only or debugger roles.
+
+## GPU-lab routing
+
+When `.omp/gpu-lab/hosts.json` exists and approved scope requires CUDA/ROCm validation, route execution through `specflow-gpu-orchestrator`. Preserve the two human approval gates. GPU hosts add evidence gates; they do not create additional source writers or bypass specification/plan status.
+
+## Exploration support
+
+Use `specflow-exploration` for bounded parallel repository discovery when needed. Internet research is disabled by default and must not silently expand approved scope. Durable findings belong in `docs/agent-wiki/` through `specflow-doc-librarian`, not direct explorer edits.

@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Generate OMP DAP and optional SSH-MCP configuration from GPU-lab inventory."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+PREFIX = "gpu-lab-"
+MCP_NAME = "gpu-lab-ssh"
+
+
+def die(message: str) -> "NoReturn":
+    print(f"gpu-lab-configure: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def find_root(start: Path) -> Path:
+    override = os.environ.get("GPU_LAB_PROJECT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    for candidate in (start.resolve(), *start.resolve().parents):
+        if (candidate / ".omp/gpu-lab/hosts.json").is_file():
+            return candidate
+    die("cannot locate .omp/gpu-lab/hosts.json; run from a configured project")
+
+
+def load_json(path: Path, default: Any | None = None) -> Any:
+    if not path.exists():
+        if default is not None:
+            return default
+        die(f"missing file: {path}")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"cannot read {path}: {exc}")
+
+
+def backup(path: Path) -> None:
+    if not path.exists():
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = path.with_name(f"{path.name}.gpu-lab-backup-{stamp}")
+    shutil.copy2(path, target)
+    print(f"backup: {target}")
+
+
+def write_json(path: Path, value: Any, dry_run: bool) -> bool:
+    rendered = json.dumps(value, indent=2, sort_keys=False) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") == rendered:
+        print(f"unchanged: {path}")
+        return False
+    if dry_run:
+        print(f"would write: {path}")
+        print(rendered)
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup(path)
+    path.write_text(rendered, encoding="utf-8")
+    print(f"wrote: {path}")
+    return True
+
+
+def adapter_for(host_id: str, host: dict[str, Any], item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    alias = host.get("ssh_alias")
+    if not alias:
+        die(f"host {host_id!r} has no ssh_alias")
+    command = item.get("command")
+    if not command:
+        die(f"debug adapter {host_id}/{item.get('name', '<unnamed>')} has no command")
+    name = item.get("name")
+    if not name:
+        die(f"host {host_id!r} contains an unnamed debug adapter")
+
+    backend = host.get("backend")
+    gpu_index = str(host.get("gpu_index", "0"))
+    remote_root = host.get("remote_root", "/home/omp-gpu/gpu-lab")
+    env: dict[str, str] = {}
+    if backend == "cuda":
+        env["CUDA_VISIBLE_DEVICES"] = gpu_index
+    elif backend == "rocm":
+        env["HIP_VISIBLE_DEVICES"] = gpu_index
+        env["ROCR_VISIBLE_DEVICES"] = gpu_index
+
+    args = [
+        "-T",
+        "-o", "BatchMode=yes",
+        "-o", "LogLevel=ERROR",
+        alias,
+        f"exec {command} -q -i=dap",
+    ]
+    result: dict[str, Any] = {
+        "command": "ssh",
+        "args": args,
+        "languages": item.get("languages", ["c", "cpp"]),
+        "fileTypes": item.get("file_types", [".c", ".cc", ".cpp", ".cxx"]),
+        "rootMarkers": item.get("root_markers", ["CMakeLists.txt", "CMakePresets.json", ".git"]),
+        "launchDefaults": {
+            "request": "launch",
+            "cwd": f"{remote_root}/current/src",
+            "stopOnEntry": False,
+            "env": env,
+        },
+        "connectMode": "stdio",
+    }
+    if item.get("attach_defaults"):
+        result["attachDefaults"] = item["attach_defaults"]
+    return f"{PREFIX}{host_id}-{name}", result
+
+
+def build_dap(root: Path, inventory: dict[str, Any]) -> dict[str, Any]:
+    path = root / ".omp/dap.json"
+    current = load_json(path, {"adapters": {}})
+    if not isinstance(current, dict):
+        die(f"{path} must contain a JSON object")
+    adapters = current.setdefault("adapters", {})
+    if not isinstance(adapters, dict):
+        die(f"{path}: adapters must be a JSON object")
+
+    preserved = {key: value for key, value in adapters.items() if not key.startswith(PREFIX)}
+    generated: dict[str, Any] = {}
+    for host_id, host in inventory.get("hosts", {}).items():
+        if not host.get("enabled", False):
+            continue
+        for item in host.get("debug_adapters", []):
+            if item.get("enabled", False):
+                key, value = adapter_for(host_id, host, item)
+                generated[key] = value
+    current["adapters"] = {**preserved, **generated}
+    return current
+
+
+def update_mcp(root: Path, enable: bool | None) -> dict[str, Any] | None:
+    if enable is None:
+        return None
+    path = root / ".omp/mcp.json"
+    if not enable and not path.exists():
+        return None
+    current = load_json(path, {"$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json", "mcpServers": {}})
+    current.setdefault("$schema", "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json")
+    if not isinstance(current, dict):
+        die(f"{path} must contain a JSON object")
+    servers = current.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        die(f"{path}: mcpServers must be a JSON object")
+    if enable:
+        servers[MCP_NAME] = {
+            "type": "stdio",
+            "command": "uvx",
+            "args": ["--from", "slepp-ssh-mcp==0.1.0", "ssh-mcp"],
+            "timeout": 0,
+        }
+    else:
+        servers.pop(MCP_NAME, None)
+    return current
+
+
+def register_native_ssh(root: Path, inventory: dict[str, Any], dry_run: bool) -> None:
+    if shutil.which("omp") is None:
+        die("omp is not on PATH; cannot register native SSH hosts")
+    for host_id, host in inventory.get("hosts", {}).items():
+        if not host.get("enabled", False):
+            continue
+        native = host.get("native_omp_ssh") or {}
+        hostname = native.get("host")
+        user = native.get("user")
+        key = native.get("key")
+        if not all((hostname, user, key)):
+            print(f"skip native SSH registration for {host_id}: host/user/key are incomplete")
+            continue
+        command = [
+            "omp", "ssh", "add", host_id,
+            "--host", str(hostname),
+            "--user", str(user),
+            "--key", os.path.expanduser(str(key)),
+            "--scope", "project",
+        ]
+        port = native.get("port")
+        if port:
+            command.extend(["--port", str(port)])
+        description = host.get("description")
+        if description:
+            command.extend(["--desc", str(description)])
+        if dry_run:
+            print("would run:", " ".join(command))
+            continue
+        subprocess.run(command, cwd=root, check=True)
+
+
+def check(root: Path, inventory: dict[str, Any]) -> int:
+    failures = 0
+    print(f"project: {root}")
+    policy_path = root / ".omp/gpu-lab/cost-policy.json"
+    try:
+        policy = load_json(policy_path)
+        valid_policy = policy.get("version") == 1 and policy.get("active_profile") in policy.get("profiles", {})
+    except SystemExit:
+        valid_policy = False
+    print(f"{'OK' if valid_policy else 'MISSING':8} {'cost policy':16} {policy_path}")
+    if not valid_policy:
+        failures += 1
+    exploration_path = root / ".omp/gpu-lab/exploration-policy.json"
+    try:
+        exploration = load_json(exploration_path)
+        defaults = exploration.get("defaults", {})
+        valid_exploration = (
+            exploration.get("version") == 1
+            and isinstance(defaults.get("explorers_enabled"), bool)
+            and isinstance(defaults.get("internet_enabled"), bool)
+            and isinstance(defaults.get("docs_root"), str)
+        )
+    except SystemExit:
+        valid_exploration = False
+    print(f"{'OK' if valid_exploration else 'MISSING':8} {'exploration':16} {exploration_path}")
+    if not valid_exploration:
+        failures += 1
+    enabled = [key for key, value in inventory.get("hosts", {}).items() if value.get("enabled")]
+    print("enabled hosts:", ", ".join(enabled) if enabled else "none")
+    for executable in ("ssh", "rsync", "jq", "flock", "cmake", "ninja", "clang", "clangd", "gdb"):
+        found = shutil.which(executable)
+        print(f"{'OK' if found else 'MISSING':8} {executable:16} {found or ''}")
+        if not found:
+            failures += 1
+    if enabled and not (root / ".omp/dap.json").exists():
+        print("MISSING  .omp/dap.json; run gpu-lab-configure")
+        failures += 1
+    return 1 if failures else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", type=Path, default=Path.cwd())
+    parser.add_argument("--enable-ssh-mcp", action="store_true")
+    parser.add_argument("--disable-ssh-mcp", action="store_true")
+    parser.add_argument("--register-native-ssh", action="store_true")
+    parser.add_argument("--remove-generated", action="store_true", help="remove generated gpu-lab DAP adapters")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+
+    if args.enable_ssh_mcp and args.disable_ssh_mcp:
+        parser.error("choose only one of --enable-ssh-mcp and --disable-ssh-mcp")
+
+    root = find_root(args.project)
+    if args.remove_generated:
+        # Uninstall cleanup only needs existing DAP/MCP files and must remain
+        # possible even when a mutable host inventory is incomplete or damaged.
+        inventory: dict[str, Any] = {"version": 1, "hosts": {}}
+    else:
+        inventory = load_json(root / ".omp/gpu-lab/hosts.json")
+        if inventory.get("version") != 1 or not isinstance(inventory.get("hosts"), dict):
+            die("invalid hosts.json: expected version 1 and a hosts object")
+        policy = load_json(root / ".omp/gpu-lab/cost-policy.json")
+        if policy.get("version") != 1 or policy.get("active_profile") not in policy.get("profiles", {}):
+            die("invalid cost-policy.json: expected version 1 and an existing active profile")
+        exploration = load_json(root / ".omp/gpu-lab/exploration-policy.json")
+        defaults = exploration.get("defaults", {})
+        if (
+            exploration.get("version") != 1
+            or not isinstance(defaults.get("explorers_enabled"), bool)
+            or not isinstance(defaults.get("internet_enabled"), bool)
+            or not isinstance(defaults.get("docs_root"), str)
+        ):
+            die("invalid exploration-policy.json: expected version 1 and valid defaults")
+
+    if args.check:
+        return check(root, inventory)
+
+    dap = build_dap(root, inventory)
+    if args.remove_generated:
+        dap["adapters"] = {key: value for key, value in dap.get("adapters", {}).items() if not key.startswith(PREFIX)}
+    write_json(root / ".omp/dap.json", dap, args.dry_run)
+
+    mcp_enable: bool | None = None
+    if args.enable_ssh_mcp:
+        mcp_enable = True
+    elif args.disable_ssh_mcp:
+        mcp_enable = False
+    mcp = update_mcp(root, mcp_enable)
+    if mcp is not None:
+        write_json(root / ".omp/mcp.json", mcp, args.dry_run)
+
+    if args.register_native_ssh:
+        register_native_ssh(root, inventory, args.dry_run)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
