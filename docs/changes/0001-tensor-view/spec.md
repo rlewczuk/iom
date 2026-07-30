@@ -1,1436 +1,478 @@
+# Minimal materialized tiled-tensor API
 
-# Minimal tiled-tensor API for an LLM inference engine
+## 1. Purpose
 
-## 1. Design rules
+Define the tensor metadata, storage layout, ownership, and data-access contract used by IOM kernels and the existing `iom::DeviceOps` interface.
 
-The API is based on the following invariants:
+This change replaces the empty `iom::Tensor` definition in `include/iom/iom.hpp`. It reuses `iom::DataType` from that header and `iom::Allocator` from `include/iom/alloc.hpp`.
 
-1. **Every engine tensor is tiled.**
+The design has four goals:
 
-    * A vector is represented as a two-dimensional tensor such as `[1, N]`.
-    * The last two dimensions are tiled.
-    * Leading dimensions are ordinary batch dimensions.
+1. every engine tensor is a materialized tiled tensor;
+2. tensor metadata is small, fixed-size, and host-resident;
+3. CPU, CUDA, and ROCm share one persistent layout that CUDA and ROCm kernels can consume with 16x16 matrix instructions;
+4. operations continue to use caller-created input, output, and scratch tensors.
 
-2. **Operations never allocate output tensors.**
+## 2. Scope
 
-    * Public operations always receive output tensors by mutable reference.
-    * Example: `linear(ctx, x, weight, bias, y)`.
-    * No operation returns a newly allocated engine tensor.
+This specification defines:
 
-3. **Tensor transfers are always explicit.**
+- `iom::TileSize`, `iom::BackendKind`, and `iom::TensorSpec`;
+- the common `iom::Tensor` interface used by callers and kernels;
+- the standard CPU, CUDA, and ROCm tiled layout;
+- allocator ownership for manual-storage tensors;
+- synchronous host access and whole-tensor copies;
+- lifetime rules required by asynchronous `iom::DeviceOps` calls;
+- observable validation and test requirements.
 
-    * No operation automatically moves tensors between host and device.
-    * No operation automatically moves tensors between devices.
-    * No operation automatically changes backend.
+This specification does not define:
 
-4. **CPU, CUDA, and ROCm tensors use fixed storage allocated during initialization.**
+- `Backend`, execution-context, status, result, or workspace classes;
+- new compute operations or changes to the signatures of existing `DeviceOps` compute methods;
+- kernel-specific scratch-memory management; scratch storage is an ordinary, explicitly created `Tensor` when an operation needs it;
+- tensor views, slices, strides, reshapes, or non-materialized tensors;
+- graphs, autograd, implicit transfers, distributed tensors, or memory planning;
+- quantization scales, zero points, or other format-specific metadata;
+- the concrete factory that creates a backend-specific `Tensor`;
+- TTNN native-storage internals.
 
-    * Tensor metadata remains on the host.
-    * An injected allocator supplies buffer regions.
-    * Operations perform no allocator calls.
+## 3. Verified current constraints
 
-5. **TTNN tensors use native `ttnn::Tensor` storage.**
+The repository currently provides:
 
-    * The public tensor object remains stable.
-    * The TTNN backend may replace the native `ttnn::Tensor` held by an output tensor.
-    * Replacing the native value releases the previous value through normal RAII.
+- `iom::DataType` in `include/iom/iom.hpp`;
+- an empty polymorphic `iom::Tensor` base class;
+- asynchronous `iom::DeviceOps` methods that return an `iom::oid` and whose completion can be observed through `DeviceOps::wait(oid)`;
+- in-place `DeviceOps` call sites such as `silu(g, g)` and `rmsnorm(t, t, ...)`;
+- `iom::Allocator::alloc(size_t)`, `free(void*)`, and `reset()` in `include/iom/alloc.hpp`;
+- allocator implementations whose alignment is selected when the allocator is constructed.
 
-6. **The engine is imperative.**
+Consequences:
 
-    * There is no graph construction, graph compilation, autograd, or backward pass.
+- the tensor API uses exceptions for immediate failures, matching the existing allocator API; it does not introduce `Status` or `Result`;
+- this specification imposes no blanket input/output aliasing rule on `DeviceOps`;
+- allocation alignment is a property of the injected allocator, not an argument to each tensor allocation;
+- no separate public and kernel tensor descriptors are required.
 
-7. **Higher-level systems manage streaming and parallelism.**
+## 4. Tensor metadata
 
-    * Expert streaming uses explicit `copy` calls.
-    * Expert parallelism is implemented by maintaining tensors on individual devices and invoking communication explicitly.
-    * Paged KV cache logic owns page tables and invokes explicit cache operations.
+All tensor-related definitions are in namespace `iom`.
 
-# 2. Tiled tensor model
+```cpp
+namespace iom {
 
-## 2.1 Logical shape
-
-The public tensor shape always has at least two dimensions.
-
-Examples:
-
-```text
-Single-token hidden state: [1, hidden_size]
-Token batch:               [batch, hidden_size]
-Attention tensor:          [batch, heads, sequence, head_dim]
-Expert weights:            [experts, input_dim, output_dim]
-```
-
-Rank-one device tensors are not supported. A logical vector of length `N` is represented as `[1, N]`.
-
-```c++
-namespace llm {
-
-constexpr std::size_t kMaxRank = 6;
-
-struct Shape {
-    std::uint8_t rank = 0;
-    std::array<std::uint32_t, kMaxRank> dimensions{};
-
-    [[nodiscard]] std::uint32_t operator[](std::size_t index) const noexcept {
-        return dimensions[index];
-    }
+enum class TileSize : std::uint8_t {
+    TILE_16 = 16,
+    TILE_32 = 32,
 };
 
-struct TileShape {
-    std::uint16_t rows = 0;
-    std::uint16_t columns = 0;
-
-    friend bool operator==(const TileShape&, const TileShape&) = default;
-};
-
-enum class DType : std::uint16_t {
-    Float32,
-    Float16,
-    BFloat16,
-    Int32,
-    Int8,
-    UInt8,
-
-    // Add stable packed or quantized formats as required.
-    QInt8,
-    QInt4
+enum class BackendKind : std::uint8_t {
+    CPU,
+    CUDA,
+    ROCM,
+    TTNN,
 };
 
 struct TensorSpec {
-    Shape shape;
-    DType dtype;
-    TileShape tile;
+    static constexpr std::size_t MAX_RANK = 4;
+
+    std::uint8_t rank = 0;
+    std::array<std::size_t, MAX_RANK> dimensions{};
+    DataType dtype = DataType::F32;
+    TileSize tile_size = TileSize::TILE_16;
+
+    [[nodiscard]] std::size_t dimension(std::size_t index) const;
+    [[nodiscard]] std::size_t element_count() const;
+    [[nodiscard]] std::size_t logical_nbytes() const;
+    [[nodiscard]] std::array<std::size_t, MAX_RANK>
+    padded_dimensions() const;
+    [[nodiscard]] std::size_t tiled_storage_nbytes() const;
+
+    void validate() const;
 
     friend bool operator==(const TensorSpec&, const TensorSpec&) = default;
 };
 
-} // namespace llm
+}  // namespace iom
 ```
 
-## 2.2 Standard physical layout
+There is no separate `Shape`, `TileShape`, or `PaddedShape` type.
 
-CPU, CUDA, and ROCm use one engine-defined physical representation:
+`backend_kind()` and `backend_device()` identify the tensor's execution target. CPU tensors use device `0`; CUDA, ROCm, 
+and TTNN tensors use the nonnegative runtime device ordinal supplied during construction. Both values remain fixed for 
+the Tensor lifetime.
 
-* leading dimensions are stored in row-major order;
-* the final two dimensions are divided into tiles;
-* tiles are stored in row-major tile order;
-* elements inside each tile are stored in row-major order;
-* final dimensions are padded to complete tiles.
+### 4.1 Shape rules
 
-For a tensor:
+- `rank` is 2, 3, or 4.
+- `dimensions[0]` through `dimensions[rank - 1]` are nonzero logical dimensions.
+- Unused entries from `dimensions[rank]` through `dimensions[3]` are zero. This gives one canonical representation for equality and tests.
+- Leading dimensions are row-major tensor planes.
+- Only the final two dimensions are tiled.
+- A logical vector of length `N` is represented as shape `[1, N]`; rank-one tensors are invalid.
+- `dimension(index)` throws `std::out_of_range` when `index >= rank`.
+- Metadata calculations detect multiplication, addition, and round-up overflow and throw `std::overflow_error` rather than wrapping.
+
+`padded_dimensions()` returns the same fixed-size array as `dimensions`, with only the final two logical dimensions rounded up to the selected tile size. It does not allocate.
+
+Examples:
 
 ```text
-[D0, D1, ..., M, N]
+rank=2, dimensions=[1, 17, 0, 0], TILE_16
+    padded_dimensions=[16, 32, 0, 0]
+
+rank=4, dimensions=[2, 8, 31, 33], TILE_32
+    padded_dimensions=[2, 8, 32, 64]
 ```
 
-with tile shape:
+### 4.2 Data widths
+
+`TensorSpec` reuses every existing `iom::DataType` enumerator. Metadata byte calculations use these storage widths:
+
+| `DataType` | bits per element |
+|---|---:|
+| `BOOL`, `U8`, `I8`, `F8_E5M2`, `F8_E4M3`, `F8_E8M0` | 8 |
+| `U16`, `I16`, `F16`, `BF16` | 16 |
+| `U32`, `I32`, `F32` | 32 |
+| `U64`, `I64`, `F64` | 64 |
+| `F6_E2M3`, `F6_E3M2` | 6 |
+| `F4` | 4 |
+
+`logical_nbytes()` is the byte count of the unpadded logical elements, rounded up to a whole byte. `tiled_storage_nbytes()` 
+is the byte count of all padded element slots in the standard tiled layout. Because one 16x16 microtile contains 256 elements, 
+every currently defined element width produces a whole number of bytes per microtile.
+
+The numerical scalar encoding represented by each `DataType` is a `DataType` contract. This layout additionally defines 
+packed ordering: for `F4` or either `F6` type, element `i` begins at bit offset `i * bits_per_element`; bit offset zero 
+is the least-significant bit of byte zero, and each element is stored least-significant bit first into increasing bit offsets. 
+Unused tail bits in a logical host buffer are ignored on input and written as zero on output.
+
+## 5. Standard tiled layout
+
+CPU, CUDA, and ROCm tensors use the same engine-defined layout. TTNN may retain its native materialized layout but must 
+present the same logical shape and copy behavior.
+
+The physical unit is a 16x16 microtile:
+
+- microtiles are contiguous;
+- elements within a microtile are row-major;
+- element slots for sub-byte types are consecutive bits;
+- padding occupies ordinary element slots but is not part of the logical tensor.
+
+A `TILE_16` logical tile contains one microtile. A `TILE_32` logical tile contains four 16x16 microtiles in this order:
 
 ```text
-[TR, TC]
+0: rows  0..15, columns  0..15
+1: rows  0..15, columns 16..31
+2: rows 16..31, columns  0..15
+3: rows 16..31, columns 16..31
 ```
 
-the logical element `[..., m, n]` is located using:
+Complete tensor storage order is:
+
+1. flattened leading-dimension plane, in row-major order;
+2. logical tile row;
+3. logical tile column;
+4. 16x16 microtile row within the logical tile;
+5. 16x16 microtile column within the logical tile;
+6. row within the microtile;
+7. column within the microtile.
+
+For rank 2, `plane` is zero. For rank 3, it is the index in dimension 0. For rank 4 coordinates `[d0, d1, row, column]`, it is `d0 * dimensions[1] + d1`.
+
+For logical coordinates `[..., row, column]`, let:
 
 ```text
-tile_row = m / TR
-tile_col = n / TC
-in_tile_row = m % TR
-in_tile_col = n % TC
+T = 16 or 32
+S = T / 16
+
+tile_row = row / T
+tile_column = column / T
+microtile_row = (row % T) / 16
+microtile_column = (column % T) / 16
+in_microtile_row = row % 16
+in_microtile_column = column % 16
 ```
 
-Conceptually, the physical dimensions are:
+The element-slot index is:
 
 ```text
-[D0, D1, ..., ceil(M / TR), ceil(N / TC), TR, TC]
+plane_tile_count = ceil(rows / T) * ceil(columns / T)
+logical_tile_index = plane * plane_tile_count
+                   + tile_row * ceil(columns / T)
+                   + tile_column
+microtile_index = logical_tile_index * (S * S)
+                + microtile_row * S
+                + microtile_column
+element_slot = microtile_index * 256
+             + in_microtile_row * 16
+             + in_microtile_column
 ```
 
-Padding is not part of the logical tensor. Its values are unspecified and must not be observable through the public API.
+A checked pure helper used by `TensorSpec` and tests may implement this calculation. It is not an additional public tensor 
+representation.
 
-The Tenstorrent backend may use TTNN’s native tiled representation rather than this byte-level format. 
-It must nevertheless expose equivalent logical semantics.
+### 5.1 Matrix-instruction compatibility
 
-## 2.3 Shape utilities
+Manual-storage tensor base addresses must be at least 32-byte aligned. The existing `Allocator` interface receives no 
+alignment argument, so a backend must inject an allocator configured to satisfy this requirement.
 
-Layout calculations should be pure functions so they can be unit-tested independently.
+Every 16x16 microtile payload starts at a 32-byte boundary for every current `DataType`: 256 elements multiplied by 
+4, 6, 8, 16, 32, or 64 bits is a multiple of 32 bytes. A 16x16 half-precision microtile therefore has a 32-byte-aligned 
+base and a row stride of 16 elements. A `TILE_32` kernel consumes four such microtiles rather than first converting 
+a row-major 32x32 block.
 
-```c++
-struct PaddedShape {
-    Shape shape;
-};
+This directly satisfies the pointer-alignment and leading-dimension constraints of 16x16 CUDA WMMA loads and matches the 
+16x16 wave-matrix shape exposed for modern ROCm RDNA devices. It does not claim native matrix-unit support for every 
+`DataType`; unsupported types require an operation-specific kernel or are rejected by that operation.
 
-[[nodiscard]] Result<PaddedShape>
-compute_padded_shape(const TensorSpec& spec);
+Padding values are unspecified. Kernels must not allow padding to affect logical outputs, and host reads never expose padding.
 
-[[nodiscard]] Result<std::size_t>
-logical_element_count(const TensorSpec& spec);
+## 6. Tensor interface
 
-[[nodiscard]] Result<std::size_t>
-standard_tiled_storage_bytes(const TensorSpec& spec);
-```
+`Tensor` is the single common surface for metadata, backend-native kernel access, host transfer, and tensor transfer. 
+No other class, or separate kernel descriptor is introduced.
 
-The backend remains responsible for the final storage requirement because quantized formats or native alignment requirements may alter the required size.
-
-# 3. Tensor object
-
-A tensor is a stable logical object consisting of:
-
-* immutable logical metadata;
-* its owning backend;
-* backend-specific storage.
-
-The tensor should be move-only. Accidental copying would otherwise make ownership and output replacement ambiguous.
-
-```c++
-namespace llm {
-
-class Backend;
-
-namespace detail {
-class TensorStorage;
-class TensorAccess;
-}
+```cpp
+namespace iom {
 
 class Tensor {
 public:
-    Tensor() noexcept = default;
-
-    Tensor(Tensor&&) noexcept;
-    Tensor& operator=(Tensor&&) noexcept;
+    virtual ~Tensor() = default;
 
     Tensor(const Tensor&) = delete;
     Tensor& operator=(const Tensor&) = delete;
-
-    ~Tensor();
-
-    [[nodiscard]] bool valid() const noexcept;
-    [[nodiscard]] bool has_storage() const noexcept;
+    Tensor(Tensor&&) = delete;
+    Tensor& operator=(Tensor&&) = delete;
 
     [[nodiscard]] const TensorSpec& spec() const noexcept;
-    [[nodiscard]] Backend& backend() const noexcept;
+    [[nodiscard]] BackendKind backend_kind() const noexcept;
+    [[nodiscard]] std::uint32_t backend_device() const noexcept;
 
-    // Releases the underlying manual allocation or native tensor.
-    void reset() noexcept;
+    // Backend-native kernel handle. See section 6.1.
+    [[nodiscard]] virtual void* native_handle() noexcept = 0;
+    [[nodiscard]] virtual const void* native_handle() const noexcept = 0;
 
-private:
-    friend class detail::TensorAccess;
+    // Synchronous, complete-tensor transfers. See section 6.2.
+    virtual void copy_from_host(std::span<const std::byte> source) = 0;
+    virtual void copy_to_host(std::span<std::byte> destination) const = 0;
+    virtual void copy_from(const Tensor& source) = 0;
 
-    Backend* backend_ = nullptr;
-    TensorSpec spec_{};
-    std::unique_ptr<detail::TensorStorage> storage_;
-};
-
-} // namespace llm
-```
-
-The `TensorSpec` does not change after construction.
-
-For CPU, CUDA, and ROCm, the storage address also remains fixed until `reset()`.
-
-For TTNN, only the backend-private storage object may be replaced. The public `Tensor` object and its `TensorSpec` remain unchanged.
-
-## 3.1 Lifetime rule
-
-A backend must outlive:
-
-* all tensors created by that backend;
-* all execution contexts created by that backend.
-
-An allocator must outlive the backend and all tensors using that allocator.
-
-This avoids shared ownership between every tensor, backend, and allocator.
-
-# 4. Allocator contract
-
-Only CPU, CUDA, and ROCm use this allocator interface.
-
-The allocator is injected when the backend is created. It is only used during tensor and execution-context initialization.
-
-```c++
-namespace llm {
-
-struct Allocation {
-    void* address = nullptr;
-    std::size_t bytes = 0;
-    std::size_t alignment = 0;
-
-    // Returned unchanged to deallocate(). It may identify a pool block,
-    // offset, CUDA allocation, HIP allocation, or test allocation.
-    std::uintptr_t token = 0;
-};
-
-class Allocator {
-public:
-    virtual ~Allocator() = default;
-
-    [[nodiscard]] virtual Result<Allocation>
-    allocate(std::size_t bytes, std::size_t alignment) = 0;
-
-    virtual void deallocate(Allocation allocation) noexcept = 0;
-};
-
-struct StorageRequirements {
-    std::size_t bytes = 0;
-    std::size_t alignment = 0;
-};
-
-} // namespace llm
-```
-
-An allocator instance is associated with one memory domain. For example:
-
-* CPU allocator: host memory;
-* CUDA allocator: memory on one CUDA device;
-* ROCm allocator: memory on one ROCm device.
-
-The backend therefore does not pass a device argument to every allocator call.
-
-## 4.1 Fixed-pool allocator
-
-A normal CPU, CUDA, or ROCm configuration would use an allocator backed by one externally created pool:
-
-```c++
-class FixedPoolAllocator final : public Allocator {
-public:
-    FixedPoolAllocator(void* base, std::size_t bytes);
-
-    Result<Allocation>
-    allocate(std::size_t bytes, std::size_t alignment) override;
-
-    void deallocate(Allocation allocation) noexcept override;
-
-    void reset();
-};
-```
-
-Two implementations are reasonable:
-
-* a monotonic allocator whose `deallocate` is a no-op and whose entire pool is reset together;
-* a free-list allocator that can reclaim tensor ranges individually.
-
-The allocator policy is not visible to tensors or operations.
-
-## 4.2 Storage requirement queries
-
-Manual-memory backends expose exact requirements before creating a tensor:
-
-```c++
-class Backend {
-public:
-    virtual Result<StorageRequirements>
-    storage_requirements(const TensorSpec& spec) const = 0;
-};
-```
-
-For TTNN, this function may return `StatusCode::Unsupported`, because the native runtime owns allocation and placement.
-
-This query makes static planning straightforward:
-
-```cpp
-auto requirements = cuda_backend.storage_requirements(spec);
-auto tensor = cuda_backend.create_tensor(spec);
-```
-
-The same function can be used by tests to verify padding, tile sizes, alignment, and quantized storage calculations.
-
-# 5. Backend and execution context
-
-A backend instance represents one execution target.
-
-Examples:
-
-* one CPU backend;
-* CUDA device 0;
-* CUDA device 1;
-* ROCm device 0;
-* one TTNN device or mesh configuration.
-
-```c++
-namespace llm {
-
-enum class BackendKind {
-    Cpu,
-    Cuda,
-    Rocm,
-    Ttnn
-};
-
-struct ContextOptions {
-    // Preallocated scratch memory for CPU/CUDA/ROCm kernels.
-    // Zero is valid for backends or kernels that do not require it.
-    std::size_t workspace_bytes = 0;
-};
-
-class ExecutionContext {
-public:
-    ExecutionContext(ExecutionContext&&) noexcept;
-    ExecutionContext& operator=(ExecutionContext&&) noexcept;
-
-    ExecutionContext(const ExecutionContext&) = delete;
-    ExecutionContext& operator=(const ExecutionContext&) = delete;
-
-    ~ExecutionContext();
-
-    [[nodiscard]] Backend& backend() const noexcept;
-
-    // Waits for all previously submitted operations on this context.
-    Status synchronize();
+protected:
+    Tensor(TensorSpec spec,
+           BackendKind backend_kind,
+           std::uint32_t backend_device);
 
 private:
-    friend class Backend;
-
-    Backend* backend_ = nullptr;
-    std::unique_ptr<detail::BackendExecutionContext> implementation_;
+    TensorSpec spec_;
+    BackendKind backend_kind_;
+    std::uint32_t backend_device_;
 };
 
-class Backend {
-public:
-    virtual ~Backend() = default;
-
-    [[nodiscard]] virtual BackendKind kind() const noexcept = 0;
-
-    [[nodiscard]] virtual Status
-    validate_tensor_spec(const TensorSpec& spec) const = 0;
-
-    [[nodiscard]] virtual Result<StorageRequirements>
-    storage_requirements(const TensorSpec& spec) const = 0;
-
-    [[nodiscard]] virtual Result<Tensor>
-    create_tensor(const TensorSpec& spec) = 0;
-
-    [[nodiscard]] virtual Result<ExecutionContext>
-    create_context(const ContextOptions& options) = 0;
-};
-
-} // namespace llm
+}  // namespace iom
 ```
 
-The execution context owns:
+The protected constructor validates and stores the metadata. Concrete CPU, CUDA, ROCm, and TTNN tensor implementations 
+provide storage and transfer behavior. Object creation remains backend-specific and is outside this change; 
+the public API does not add a `Backend` or `ExecutionContext` abstraction.
 
-* a CPU execution queue, CUDA stream, HIP stream, or TTNN command-queue state;
-* one fixed workspace allocation where applicable;
-* backend-specific launch state.
+A tensor is always materialized after successful construction. There is no default constructor, empty state, 
+`valid()`, `has_storage()`, `reset()`, or replaceable public view.
 
-Operations are submitted in order to an `ExecutionContext`.
+### 6.1 Native handle
 
-No operation creates temporary allocations through the general allocator. A kernel that needs scratch memory uses the context workspace.
+`native_handle()` exposes the storage already owned by the concrete tensor:
 
-If the workspace is insufficient, the operation returns an error before launch.
+- CPU: the allocation address;
+- CUDA: the device allocation address returned by the CUDA allocation API;
+- ROCm: the device allocation address;
+- TTNN: a pointer to the backend-owned native `ttnn::Tensor` object.
 
-# 6. Row-major host access
+Only code selected for `backend_kind()` may interpret this type-erased handle. It must not be retained beyond the tensor lifetime. 
+The handle is stable for the tensor lifetime on CPU, CUDA, and ROCm. TTNN may update the native value behind its stable handle, 
+but the public `Tensor` object, `TensorSpec`, backend kind, and device remain unchanged.
 
-Raw tiled device data should not be exposed through the public API.
+This intentionally uses the same `Tensor` object at the `DeviceOps` and kernel boundaries. It does not duplicate metadata 
+in a persistent device-side descriptor.
 
-Instead, the public API provides explicit copies between engine tensors and contiguous logical row-major host views.
+### 6.2 Host and tensor copies
 
-```c++
-namespace llm {
+All three copy methods are synchronous: when a method returns, the destination contains the copied logical values and is 
+ready for the caller to use.
 
-struct ConstHostTensorView {
-    const void* data = nullptr;
-    std::size_t bytes = 0;
-    Shape shape;
-    DType dtype;
-};
+`copy_from_host` and `copy_to_host` use a contiguous logical row-major host buffer:
 
-struct HostTensorView {
-    void* data = nullptr;
-    std::size_t bytes = 0;
-    Shape shape;
-    DType dtype;
-};
+- the host encoding is exactly the tensor's `DataType`;
+- the span size must equal `spec().logical_nbytes()`;
+- the methods translate between row-major logical order and the tensor's native tiled order;
+- padding is not read from or written to the host buffer;
+- no dtype conversion occurs.
 
-template<typename T>
-ConstHostTensorView make_host_view(
-    std::span<const T> values,
-    const Shape& shape,
-    DType dtype);
+`destination.copy_from(source)`:
 
-template<typename T>
-HostTensorView make_host_view(
-    std::span<T> values,
-    const Shape& shape,
-    DType dtype);
+- copies complete logical tensors only;
+- requires equal logical ranks, dimensions, and dtypes;
+- permits different tile sizes and retiles as part of the copy;
+- permits different backend kinds or devices only when the destination implementation has a direct transfer path;
+- never silently stages through a host buffer;
+- performs no numeric conversion;
+- treats `destination.copy_from(destination)` as a no-op.
 
-Status copy_from_host(
-    ExecutionContext& context,
-    const ConstHostTensorView& source,
-    Tensor& destination);
+An unsupported direct path throws `std::runtime_error`. Region copies and asynchronous copies are outside this change.
 
-Status copy_to_host(
-    ExecutionContext& context,
-    const Tensor& source,
-    const HostTensorView& destination);
+Before calling a synchronous host or tensor copy, the caller must wait for every outstanding `DeviceOps` operation that 
+writes a participating tensor. Before submitting a `DeviceOps` operation that consumes a copy destination, the synchronous copy must have returned.
 
-} // namespace llm
-```
+## 7. Storage ownership and allocation
 
-These operations:
+CPU, CUDA, and ROCm concrete tensors receive an existing `iom::Allocator&` during backend-specific construction.
 
-* require matching logical shapes;
-* require matching dtypes;
-* convert between logical row-major ordering and backend tiled ordering;
-* ignore physical padding;
-* are submitted to the context;
-* do not implicitly synchronize.
+- The allocator must outlive every tensor using it.
+- Construction calls `allocator.alloc(spec.tiled_storage_nbytes())` exactly once.
+- A successful construction owns the returned non-null allocation.
+- Destruction calls `allocator.free(address)` exactly once.
+- If construction fails after allocation, it frees the allocation before propagating the exception.
+- Manual-storage tensor transfers do not call `alloc` or `free` on the injected `iom::Allocator`.
+- The allocator is assumed to return a pointer aligned to at least 32 bytes.
 
-Example:
+TTNN owns native materialized storage through its runtime and does not force that storage through `iom::Allocator`.
 
-```c++
-std::vector<float> input_values(hidden_size);
+`Allocator::reset()` invalidates allocations owned by the allocator. Calling it while any corresponding tensor is alive 
+is a caller error. Tensor destruction after such a reset is also invalid unless the concrete allocator explicitly documents 
+otherwise; the normal lifetime order is tensors first, allocator second.
 
-Shape input_shape{
-    .rank = 2,
-    .dimensions = {1, hidden_size}
-};
+## 8. Asynchronous `DeviceOps` integration
 
-auto host_input = make_host_view(
-    std::span<const float>(input_values),
-    input_shape,
-    DType::Float32);
+Existing compute methods on `iom::DeviceOps` remain asynchronous and continue to return `oid`. No status return, 
+validation wrapper, backend dispatch interface, or execution context is added.
 
-LLM_RETURN_IF_ERROR(
-    copy_from_host(cuda_context, host_input, input));
-
-LLM_RETURN_IF_ERROR(cuda_context.synchronize());
-```
-
-For reading:
-
-```c++
-std::vector<float> output_values(vocabulary_size);
-
-auto host_output = make_host_view(
-    std::span<float>(output_values),
-    output.spec().shape,
-    DType::Float32);
-
-LLM_RETURN_IF_ERROR(
-    copy_to_host(cuda_context, output, host_output));
-
-LLM_RETURN_IF_ERROR(cuda_context.synchronize());
-```
-
-This API is also the primary mechanism for backend-independent numerical unit tests.
-
-# 7. Tensor-to-tensor copies
-
-Tensor transfers are represented by one explicit operation:
-
-```c++
-Status copy(
-    ExecutionContext& context,
-    const Tensor& source,
-    Tensor& destination);
-```
-
-The operation copies logical tensor values, not raw storage bytes.
-
-Requirements:
-
-* source and destination logical shapes must match;
-* source and destination dtypes must match;
-* tile shapes may differ;
-* the responsible backend may retile during the copy;
-* no numeric dtype conversion is performed;
-* no hidden host staging is permitted.
-
-The execution context identifies the backend responsible for the transfer.
-
-Examples:
-
-```c++
-copy(cuda0_context, cpu_expert, cuda0_expert);
-copy(cuda1_context, cuda0_tensor, cuda1_tensor);
-copy(ttnn_context, host_tensor, ttnn_tensor);
-```
-
-A backend may reject a transfer path.
-
-For example, a CUDA-to-TTNN copy may not have a direct implementation. The caller must then stage it explicitly:
+The existing `DeviceOps::copy(const Tensor&, Tensor&)` method is replaced by `Tensor::copy_from`, because data movement 
+belongs to the tensor surface. Existing call sites change from:
 
 ```cpp
-copy_to_host(cuda_context, cuda_tensor, host_view);
-cuda_context.synchronize();
-
-copy_from_host(ttnn_context, host_view, ttnn_tensor);
-ttnn_context.synchronize();
+dev.copy(source, destination);
 ```
 
-There is no implicit fallback through host memory.
-
-Initially, `copy` should operate on complete tensors only. Expert streaming can model each streamable expert as a separate tensor. Tile-aligned region copies can be added later if concrete use cases require them.
-
-# 8. Public operation API
-
-Operations are free functions in an `ops` namespace.
-
-Every operation:
-
-* receives an execution context;
-* receives input tensors by `const Tensor&`;
-* receives outputs by `Tensor&`;
-* returns `Status`;
-* performs validation before backend dispatch;
-* never creates an engine tensor;
-* never performs an implicit transfer.
+to:
 
 ```cpp
-namespace llm::ops {
-
-struct LinearOptions {
-    bool transpose_weight = false;
-};
-
-Status linear(
-    ExecutionContext& context,
-    const Tensor& input,
-    const Tensor& weight,
-    const Tensor* bias,
-    Tensor& output,
-    const LinearOptions& options = {});
-
-Status matmul(
-    ExecutionContext& context,
-    const Tensor& left,
-    const Tensor& right,
-    Tensor& output);
-
-Status add(
-    ExecutionContext& context,
-    const Tensor& left,
-    const Tensor& right,
-    Tensor& output);
-
-Status multiply(
-    ExecutionContext& context,
-    const Tensor& left,
-    const Tensor& right,
-    Tensor& output);
-
-struct RmsNormOptions {
-    float epsilon;
-};
-
-Status rms_norm(
-    ExecutionContext& context,
-    const Tensor& input,
-    const Tensor& weight,
-    Tensor& output,
-    const RmsNormOptions& options);
-
-struct SoftmaxOptions {
-    std::int32_t axis = -1;
-};
-
-Status softmax(
-    ExecutionContext& context,
-    const Tensor& input,
-    Tensor& output,
-    const SoftmaxOptions& options = {});
-
-} // namespace llm::ops
+destination.copy_from(source);
 ```
 
-A decoding step looks like:
+All other `DeviceOps` method signatures remain unchanged.
 
-```cpp
-LLM_RETURN_IF_ERROR(
-    ops::rms_norm(ctx, hidden, norm_weight, normalized, {.epsilon = 1e-5f}));
+For every submitted compute operation:
 
-LLM_RETURN_IF_ERROR(
-    ops::linear(ctx, normalized, qkv_weight, qkv_bias, qkv));
+- every referenced input, output, and scratch `Tensor` object must remain alive and at the same address until `DeviceOps::wait(returned_oid)` completes;
+- their underlying native storage must also remain alive and unchanged during that interval;
+- callers must wait before reading an output through `copy_to_host`, overwriting it through a copy, or destroying it;
+- whether a particular operation supports input/output aliasing remains part of that existing operation's contract. This tensor specification does not reject the in-place calls already present in the repository.
 
-LLM_RETURN_IF_ERROR(
-    ops::linear(ctx, attention_output, output_weight, nullptr, projected));
+Deleting Tensor moves makes the object-address rule explicit and prevents accidental relocation while an asynchronous operation may hold references.
 
-LLM_RETURN_IF_ERROR(
-    ops::add(ctx, hidden, projected, next_hidden));
-```
+## 9. Error behavior
 
-No output allocation occurs during this sequence.
+The API uses exceptions, consistently with `iom::Allocator`:
 
-## 8.1 Validation rules
+- `TensorSpec::validate()` and the Tensor constructor throw `std::invalid_argument` for invalid rank, zero logical dimensions, nonzero unused dimensions, invalid enum values, or unsupported metadata combinations;
+- checked size and padding calculations throw `std::overflow_error`;
+- `dimension()` throws `std::out_of_range` for an invalid logical index;
+- copy methods throw `std::invalid_argument` for a wrong host byte count or incompatible tensor metadata;
+- copy methods throw `std::runtime_error` for an unsupported transfer path or backend failure;
+- allocator exceptions propagate after ownership cleanup.
 
-The public operation layer should perform inexpensive common validation:
+Copy methods validate host sizes, tensor metadata, and direct-path support before writing. Those validation and capability failures leave the destination unchanged. A backend failure after a transfer has begun may leave destination values unspecified; it must not change the Tensor metadata or storage ownership.
 
-* context is valid;
-* all non-copy tensors belong to `context.backend()`;
-* logical ranks and dimensions are valid;
-* output shape and dtype match the operation contract;
-* output has storage;
-* tile shapes are supported by the backend;
-* inputs and outputs do not alias unless the operation explicitly permits it.
+## 10. Implementation touchpoints
 
-The backend performs any additional kernel-specific validation.
+The implementation of this specification is limited to these current surfaces:
 
-## 8.2 Aliasing
+- `include/iom/iom.hpp`: add `TileSize`, `BackendKind`, `TensorSpec`, and the `Tensor` contract; remove `DeviceOps::copy` while leaving other `DeviceOps` methods unchanged;
+- `src/iom.cpp`: implement checked metadata helpers and common Tensor accessors;
+- backend-specific concrete Tensor implementations: own native storage and implement the native-handle and copy methods;
+- `src/llama.cpp`: replace the current `dev.copy(x, r)` call with `r.copy_from(x)` and use the final host-copy method for tensor initialization;
+- `test/test_iom.cpp`: replace the dummy test with the behavior tests below.
 
-Aliasing should be disallowed by default.
+`include/iom/alloc.hpp` is reused without interface changes.
 
-Instead of permitting ambiguous calls such as:
+## 11. Automated acceptance criteria
 
-```cpp
-add(ctx, x, y, x);
-```
+### 11.1 Metadata and validation tests
 
-provide a specifically documented in-place operation where required:
+Unit tests must verify:
 
-```cpp
-Status add_in_place(
-    ExecutionContext& context,
-    Tensor& destination,
-    const Tensor& source);
-```
+- ranks 2, 3, and 4 with nonzero dimensions validate;
+- rank 0, rank 1, rank greater than 4, zero logical dimensions, and nonzero unused dimensions are rejected;
+- invalid `TileSize`, `DataType`, and `BackendKind` values are rejected at their owning API boundary;
+- `[1, N]` is the valid vector representation;
+- `dimension(rank)` is rejected;
+- element-count, logical-byte-count, padding, and storage-byte overflow are detected;
+- every existing `DataType` maps to the width in section 4.2.
 
-This keeps kernel requirements and tests unambiguous.
+### 11.2 Padding and layout tests
 
-# 9. Backend dispatch API
+Pure deterministic tests must cover both tile sizes, all supported ranks, multiple leading planes, non-square shapes, and padding on each final dimension.
 
-The public operation functions dispatch to backend methods.
-
-The backend-facing interface can remain direct rather than introducing an operation graph or generalized command object.
-
-```cpp
-namespace llm {
-
-class Backend {
-public:
-    // Resource methods omitted here.
-
-    virtual Status enqueue_copy_from_host(
-        ExecutionContext& context,
-        const ConstHostTensorView& source,
-        Tensor& destination) = 0;
-
-    virtual Status enqueue_copy_to_host(
-        ExecutionContext& context,
-        const Tensor& source,
-        const HostTensorView& destination) = 0;
-
-    virtual Status enqueue_copy(
-        ExecutionContext& context,
-        const Tensor& source,
-        Tensor& destination) = 0;
-
-    virtual Status enqueue_linear(
-        ExecutionContext& context,
-        const Tensor& input,
-        const Tensor& weight,
-        const Tensor* bias,
-        Tensor& output,
-        const ops::LinearOptions& options) = 0;
-
-    virtual Status enqueue_matmul(
-        ExecutionContext& context,
-        const Tensor& left,
-        const Tensor& right,
-        Tensor& output) = 0;
-
-    virtual Status enqueue_add(
-        ExecutionContext& context,
-        const Tensor& left,
-        const Tensor& right,
-        Tensor& output) = 0;
-
-    virtual Status enqueue_rms_norm(
-        ExecutionContext& context,
-        const Tensor& input,
-        const Tensor& weight,
-        Tensor& output,
-        const ops::RmsNormOptions& options) = 0;
-};
-
-} // namespace llm
-```
-
-This creates one virtual method per public operation. For an inference engine with a controlled operation set, that is simpler than:
-
-* a general command union;
-* runtime operation registration;
-* type-erased attribute dictionaries;
-* graph nodes;
-* generic variadic tensor arrays.
-
-The public wrapper remains responsible for portable validation:
-
-```c++
-Status ops::linear(
-    ExecutionContext& context,
-    const Tensor& input,
-    const Tensor& weight,
-    const Tensor* bias,
-    Tensor& output,
-    const LinearOptions& options) {
-
-    LLM_RETURN_IF_ERROR(
-        validate_linear(context, input, weight, bias, output, options));
-
-    return context.backend().enqueue_linear(
-        context, input, weight, bias, output, options);
-}
-```
-
-# 10. Kernel API for CPU, CUDA, and ROCm
-
-CPU, CUDA, and ROCm share a common host-side tiled descriptor.
-
-```c++
-namespace llm::kernel {
-
-struct TiledTensorDesc {
-    DType dtype;
-
-    std::uint8_t rank;
-    std::array<std::uint32_t, kMaxRank> logical_dimensions;
-    std::array<std::uint32_t, kMaxRank> padded_dimensions;
-
-    std::uint16_t tile_rows;
-    std::uint16_t tile_columns;
-
-    std::size_t storage_bytes;
-};
-
-template<typename Address>
-struct ConstTensorArg {
-    Address address{};
-    TiledTensorDesc desc{};
-};
-
-template<typename Address>
-struct TensorArg {
-    Address address{};
-    TiledTensorDesc desc{};
-};
-
-} // namespace llm::kernel
-```
-
-The backend converts the public `Tensor` into this form through a private accessor.
-
-No persistent tensor metadata is stored on the device.
-
-For CUDA and ROCm:
-
-* metadata is maintained in the host-side `Tensor`;
-* the launch wrapper extracts the required fields;
-* small kernel parameters are passed by value during launch;
-* a device-side metadata allocation is not created.
-
-## 10.1 CPU kernel interface
-
-```cpp
-namespace llm::cpu::kernel {
-
-using ConstTensorArg =
-    llm::kernel::ConstTensorArg<const std::byte*>;
-
-using TensorArg =
-    llm::kernel::TensorArg<std::byte*>;
-
-struct Context {
-    std::byte* workspace = nullptr;
-    std::size_t workspace_bytes = 0;
-    ThreadPool* thread_pool = nullptr;
-};
-
-Status linear(
-    Context& context,
-    const ConstTensorArg& input,
-    const ConstTensorArg& weight,
-    const ConstTensorArg* bias,
-    TensorArg& output,
-    const ops::LinearOptions& options);
-
-} // namespace llm::cpu::kernel
-```
-
-## 10.2 CUDA kernel interface
-
-```cpp
-namespace llm::cuda::kernel {
-
-using ConstTensorArg =
-    llm::kernel::ConstTensorArg<CUdeviceptr>;
-
-using TensorArg =
-    llm::kernel::TensorArg<CUdeviceptr>;
-
-struct Context {
-    CUstream stream = nullptr;
-    CUdeviceptr workspace = 0;
-    std::size_t workspace_bytes = 0;
-};
-
-Status linear(
-    Context& context,
-    const ConstTensorArg& input,
-    const ConstTensorArg& weight,
-    const ConstTensorArg* bias,
-    TensorArg& output,
-    const ops::LinearOptions& options);
-
-} // namespace llm::cuda::kernel
-```
-
-## 10.3 ROCm kernel interface
-
-```cpp
-namespace llm::rocm::kernel {
-
-using ConstTensorArg =
-    llm::kernel::ConstTensorArg<const void*>;
-
-using TensorArg =
-    llm::kernel::TensorArg<void*>;
-
-struct Context {
-    hipStream_t stream = nullptr;
-    void* workspace = nullptr;
-    std::size_t workspace_bytes = 0;
-};
-
-Status linear(
-    Context& context,
-    const ConstTensorArg& input,
-    const ConstTensorArg& weight,
-    const ConstTensorArg* bias,
-    TensorArg& output,
-    const ops::LinearOptions& options);
-
-} // namespace llm::rocm::kernel
-```
-
-The kernel launch interfaces do not need to be binary-compatible with one another. They only need equivalent behavior behind the common public operation contract.
-
-## 10.4 Operation-specific launch parameters
-
-Individual kernels should not be required to consume the entire generic tensor descriptor.
-
-The backend launch wrapper may lower it into a smaller operation-specific structure:
-
-```cpp
-struct LinearLaunchParams {
-    std::uint32_t batch;
-    std::uint32_t input_features;
-    std::uint32_t output_features;
-
-    std::uint16_t input_tile_rows;
-    std::uint16_t input_tile_columns;
-
-    std::uint32_t input_tile_columns_count;
-    std::uint32_t output_tile_columns_count;
-};
-```
-
-This keeps device kernel interfaces small while preserving one common host-side tensor representation.
-
-# 11. Backend-private tensor access
-
-Raw storage access is not public.
-
-Backends use one internal helper:
-
-```cpp
-namespace llm::detail {
-
-struct ManualStorageView {
-    void* address = nullptr;
-    std::size_t bytes = 0;
-};
-
-class TensorAccess {
-public:
-    static ManualStorageView manual_storage(Tensor& tensor);
-    static ManualStorageView manual_storage(const Tensor& tensor);
-
-    static TensorStorage& storage(Tensor& tensor);
-    static const TensorStorage& storage(const Tensor& tensor);
-
-    static void replace_storage(
-        Tensor& tensor,
-        std::unique_ptr<TensorStorage> replacement);
-
-    static void clear_storage(Tensor& tensor) noexcept;
-};
-
-} // namespace llm::detail
-```
-
-`replace_storage` performs common checks:
-
-* the replacement belongs to the same backend;
-* its logical shape matches `Tensor::spec()`;
-* its dtype matches `Tensor::spec()`;
-* its tile shape is compatible;
-* the old storage is destroyed only after validation succeeds.
-
-CPU, CUDA, and ROCm normally call only `manual_storage()`.
-
-The TTNN adapter uses `replace_storage()` and `clear_storage()`.
-
-# 12. TTNN backend adapter
-
-The TTNN backend uses a backend-private storage implementation:
-
-```cpp
-namespace llm::ttnn_backend {
-
-class TensorStorage final : public detail::TensorStorage {
-public:
-    explicit TensorStorage(ttnn::Tensor tensor);
-
-    ttnn::Tensor& native() noexcept;
-    const ttnn::Tensor& native() const noexcept;
-
-private:
-    ttnn::Tensor tensor_;
-};
-
-} // namespace llm::ttnn_backend
-```
-
-The adapter exposes internal helpers:
-
-```cpp
-class TtnnBackend final : public Backend {
-private:
-    ttnn::Tensor& native(Tensor& tensor);
-    const ttnn::Tensor& native(const Tensor& tensor) const;
-
-    Status replace_native(
-        Tensor& destination,
-        ttnn::Tensor replacement);
-
-    void clear_native(Tensor& tensor) noexcept;
-};
-```
-
-A TTNN linear operation may then use a return-value-based native API while preserving the engine’s predeclared output API:
-
-```cpp
-Status TtnnBackend::enqueue_linear(
-    ExecutionContext& context,
-    const Tensor& input,
-    const Tensor& weight,
-    const Tensor* bias,
-    Tensor& output,
-    const ops::LinearOptions& options) {
-
-    const auto& native_input = native(input);
-    const auto& native_weight = native(weight);
-
-    ttnn::Tensor native_output;
-
-    if (bias != nullptr) {
-        native_output = ttnn::linear(
-            native_input,
-            native_weight,
-            native(*bias));
-    } else {
-        native_output = ttnn::linear(
-            native_input,
-            native_weight);
-    }
-
-    return replace_native(output, std::move(native_output));
-}
-```
-
-The public call remains:
-
-```cpp
-ops::linear(ctx, input, weight, bias, output);
-```
-
-The old native output tensor is released when its storage wrapper is replaced.
-
-## 12.1 TTNN output rules
-
-For TTNN, an output tensor is a stable logical slot rather than necessarily a stable allocation.
-
-The following remain fixed:
-
-* public `Tensor` identity;
-* logical shape;
-* dtype;
-* tile dimensions;
-* owning backend.
-
-The following may change after an operation:
-
-* native `ttnn::Tensor`;
-* TTNN buffer handle;
-* TTNN memory placement;
-* backend-private native metadata.
-
-If a TTNN operation returns a tensor that is incompatible with the declared output `TensorSpec`, the adapter returns an error and leaves the existing output unchanged.
-
-# 13. Tensor creation examples
-
-## 13.1 CUDA with a static pool
-
-```cpp
-void* cuda_pool_address = allocate_cuda_pool(pool_bytes);
-
-FixedPoolAllocator allocator(cuda_pool_address, pool_bytes);
-CudaBackend cuda_backend(/*device=*/0, allocator);
-
-TensorSpec hidden_spec{
-    .shape = Shape{
-        .rank = 2,
-        .dimensions = {1, hidden_size}
-    },
-    .dtype = DType::Float16,
-    .tile = TileShape{16, 16}
-};
-
-auto hidden = LLM_TRY(cuda_backend.create_tensor(hidden_spec));
-auto normalized = LLM_TRY(cuda_backend.create_tensor(hidden_spec));
-auto output = LLM_TRY(cuda_backend.create_tensor(hidden_spec));
-
-auto context = LLM_TRY(cuda_backend.create_context({
-    .workspace_bytes = 16 * 1024 * 1024
-}));
-```
-
-All tensor and workspace allocations occur before inference.
-
-## 13.2 TTNN
-
-```cpp
-TtnnBackend ttnn_backend(mesh_device, default_memory_config);
-
-TensorSpec hidden_spec{
-    .shape = Shape{
-        .rank = 2,
-        .dimensions = {1, hidden_size}
-    },
-    .dtype = DType::BFloat16,
-    .tile = TileShape{32, 32}
-};
-
-auto hidden = LLM_TRY(ttnn_backend.create_tensor(hidden_spec));
-auto normalized = LLM_TRY(ttnn_backend.create_tensor(hidden_spec));
-auto output = LLM_TRY(ttnn_backend.create_tensor(hidden_spec));
-
-auto context = LLM_TRY(ttnn_backend.create_context({}));
-```
-
-`create_tensor` may initially create native TTNN storage. Subsequent output-producing operations may replace that storage.
-
-# 14. Error handling
-
-Use explicit `Status` and `Result<T>` types rather than exceptions in the core API.
-
-```cpp
-enum class StatusCode {
-    Ok,
-    InvalidArgument,
-    InvalidShape,
-    InvalidDType,
-    InvalidTileShape,
-    BackendMismatch,
-    Unsupported,
-    InsufficientStorage,
-    InsufficientWorkspace,
-    TransferNotSupported,
-    BackendError
-};
-
-class Status {
-public:
-    [[nodiscard]] bool ok() const noexcept;
-    [[nodiscard]] StatusCode code() const noexcept;
-    [[nodiscard]] std::string_view message() const noexcept;
-};
-
-template<typename T>
-class Result {
-public:
-    [[nodiscard]] bool ok() const noexcept;
-    [[nodiscard]] const Status& status() const noexcept;
-
-    T& value() &;
-    T&& value() &&;
-};
-```
-
-Backend-native errors should be translated into stable engine error codes while retaining a diagnostic message.
-
-# 15. Unit-test design
-
-## 15.1 Pure layout tests
-
-Test without any backend:
-
-* logical-to-tiled offset calculation;
-* tile padding;
-* storage size calculation;
-* rank validation;
-* `[1, N]` vector layout;
-* multiple leading dimensions;
-* non-square tiles.
-
-Example:
-
-```cpp
-TEST(TiledLayout, VectorUsesOneByNTiling);
-TEST(TiledLayout, PadsFinalTwoDimensions);
-TEST(TiledLayout, LeadingDimensionsAreIndependentTilePlanes);
-```
-
-## 15.2 Allocator tests
-
-Use a fake allocator that records calls:
-
-```cpp
-class RecordingAllocator final : public Allocator {
-public:
-    std::vector<AllocationRequest> allocations;
-    std::vector<Allocation> deallocations;
-};
-```
-
-Verify:
-
-* tensor creation requests the expected size and alignment;
-* tensor destruction calls `deallocate`;
-* no allocation occurs during `linear`, `add`, or `copy`;
-* execution-context workspace is allocated only during context creation.
-
-## 15.3 Mock backend tests
-
-A mock backend can record public operation dispatch:
-
-```cpp
-struct RecordedLinearCall {
-    const Tensor* input;
-    const Tensor* weight;
-    const Tensor* bias;
-    Tensor* output;
-};
-
-class MockBackend final : public Backend {
-public:
-    std::vector<RecordedLinearCall> linear_calls;
-};
-```
-
-Verify:
-
-* `ops::linear` validates before dispatch;
-* backend mismatch is rejected;
-* incorrect output shape is rejected;
-* output aliasing is rejected;
-* valid calls reach the backend exactly once.
-
-## 15.4 Host-copy tests
-
-For every backend:
-
-1. write row-major host values to a tensor;
-2. read them back;
-3. compare only the logical region;
-4. test shapes that require padding;
-5. test `[1, N]` decode tensors.
-
-This verifies the backend’s tile conversion independently of compute kernels.
-
-## 15.5 Manual-storage stability tests
-
-For CPU, CUDA, and ROCm:
-
-* record output storage address;
-* execute an operation;
-* verify that the address did not change;
-* verify that no allocator call occurred.
-
-## 15.6 TTNN replacement tests
-
-Use a fake native tensor wrapper when unit-testing without hardware.
-
-Verify:
-
-* a returned native tensor replaces the previous output storage;
-* the previous native object is destroyed exactly once;
-* incompatible replacement metadata is rejected;
-* a failed operation leaves the old output unchanged;
-* `Tensor::reset()` frees the current native object.
-
-## 15.7 Copy-path tests
-
-Verify that:
-
-* supported direct copies succeed;
-* unsupported backend pairs return `TransferNotSupported`;
-* no hidden host staging occurs;
-* different tile shapes are correctly retiled;
-* dtype conversion is rejected.
-
-# 16. Intentionally omitted abstractions
-
-The initial API should not include:
-
-* compute graphs;
-* automatic memory planning during execution;
-* automatic transfers;
-* automatic layout conversion inside compute operations;
-* a distributed tensor abstraction;
-* implicit tensor parallelism;
-* implicit expert streaming;
-* implicit KV-page movement;
-* arbitrary strided tensor views;
-* general operation registration;
-* dynamic attribute maps;
-* runtime tensor allocation by operations;
-* a common binary kernel ABI across CPU, CUDA, ROCm, and TTNN;
-* persistent device-side tensor metadata.
-
-Higher-level code can represent multiple devices with ordinary containers:
-
-```cpp
-std::array<Tensor, 4> weight_shards;
-std::array<ExecutionContext, 4> device_contexts;
-```
-
-Tensor parallelism can then explicitly invoke:
-
-```cpp
-for (std::size_t rank = 0; rank < 4; ++rank) {
-    ops::linear(
-        device_contexts[rank],
-        input_shards[rank],
-        weight_shards[rank],
-        nullptr,
-        output_shards[rank]);
-}
-
-collective_all_reduce(device_contexts, output_shards);
-```
-
-Expert streaming can similarly issue explicit copies:
-
-```cpp
-copy(
-    gpu_context,
-    host_experts[selected_expert],
-    gpu_expert_slot);
-
-ops::linear(
-    gpu_context,
-    routed_tokens,
-    gpu_expert_slot,
-    nullptr,
-    expert_output);
-```
-
-The tensor layer therefore supplies the required mechanisms without embedding policy.
-
-# 17. Suggested source layout
+At minimum, tests verify:
 
 ```text
-include/llm/
-    status.hpp
-    shape.hpp
-    tensor_spec.hpp
-    tensor.hpp
-    allocator.hpp
-    backend.hpp
-    execution_context.hpp
-    copy.hpp
-    ops/
-        linear.hpp
-        elementwise.hpp
-        normalization.hpp
-        attention.hpp
-
-src/core/
-    tensor.cpp
-    validation.cpp
-    tiled_layout.cpp
-    copy.cpp
-
-src/backends/cpu/
-    cpu_backend.hpp
-    cpu_backend.cpp
-    cpu_kernel_api.hpp
-
-src/backends/cuda/
-    cuda_backend.hpp
-    cuda_backend.cpp
-    cuda_kernel_api.hpp
-
-src/backends/rocm/
-    rocm_backend.hpp
-    rocm_backend.cpp
-    rocm_kernel_api.hpp
-
-src/backends/ttnn/
-    ttnn_backend.hpp
-    ttnn_backend.cpp
-    ttnn_tensor_storage.hpp
+[1, 17] with TILE_16 pads to [16, 32]
+[2, 8, 31, 33] with TILE_32 pads to [2, 8, 32, 64]
 ```
 
-The core library does not include CUDA, HIP, or TTNN headers. Those remain isolated in their respective backend modules.
+For one 32x32 tile, slot offsets must demonstrate the four-microtile order:
 
-# 18. Final API summary
-
-The minimum public surface consists of:
-
-```cpp
-// Tensor lifecycle.
-Backend::create_tensor(spec);
-Backend::create_context(options);
-Tensor::reset();
-
-// Explicit data movement.
-copy_from_host(context, host_view, tensor);
-copy_to_host(context, tensor, host_view);
-copy(context, source_tensor, destination_tensor);
-
-// Imperative preallocated operations.
-ops::linear(context, x, weight, bias, y);
-ops::matmul(context, a, b, output);
-ops::add(context, a, b, output);
-ops::rms_norm(context, input, weight, output, options);
-
-// Completion.
-context.synchronize();
+```text
+[0, 0]   ->   0
+[0, 16]  -> 256
+[16, 0]  -> 512
+[16, 16] -> 768
 ```
 
-The minimum backend surface consists of:
+For every current `DataType`, tests verify that the byte size of a 16x16 microtile is a multiple of 32. An allocator-backed integration test verifies the actual native base address is 32-byte aligned.
 
-```cpp
-validate_tensor_spec();
-storage_requirements();
-create_tensor();
-create_context();
+### 11.3 Ownership tests
 
-enqueue_copy_from_host();
-enqueue_copy_to_host();
-enqueue_copy();
+A recording `iom::Allocator` must verify:
 
-enqueue_linear();
-enqueue_matmul();
-enqueue_add();
-enqueue_rms_norm();
-```
+- successful manual tensor construction performs one allocation of exactly `tiled_storage_nbytes()`;
+- destruction frees the same pointer exactly once;
+- a construction failure after allocation frees the pointer;
+- host and manual-storage tensor copies do not invoke `alloc` or `free`;
+- copy and move construction and assignment are disabled at compile time.
 
-CPU, CUDA, and ROCm lower tensors into:
+### 11.4 Copy tests
 
-```cpp
-address + host-side tiled descriptor
-```
+A CPU test tensor provides deterministic end-to-end tests:
 
-TTNN lowers tensors into:
+1. copy row-major host bytes into a padded tensor;
+2. copy them back and compare the complete logical host buffer;
+3. run the round trip for `TILE_16` and `TILE_32` and for ranks 2 through 4;
+4. verify padding never appears in the host buffer;
+5. copy between equal specs with different tile sizes and compare logical values;
+6. verify self-copy is a no-op;
+7. verify mismatched rank, dimensions, dtype, and host byte count fail without changing the destination;
+8. use a fake unsupported backend pair to verify that capability checking occurs before any destination write and that no hidden host staging occurs.
 
-```cpp
-ttnn::Tensor
-```
+At least one packed type and one 16-bit floating type must be included so tests distinguish element-slot ordering from byte-only assumptions.
 
-and may replace the native value held by an output tensor.
+### 11.5 Asynchronous lifetime test
 
-This keeps the core API uniform without forcing fundamentally different storage systems into one artificial low-level representation.
+A fake `DeviceOps` implementation must deliberately defer a write until `wait(oid)`. The integration test verifies that:
 
-The design can next be narrowed into concrete compilable headers and a mock backend test scaffold without changing its core contracts.
+- submission returns a token without performing the deferred write;
+- `wait(token)` completes the write;
+- the same stable Tensor objects are seen at submission and completion.
 
+This test exercises the Tensor lifetime contract without requiring CUDA, ROCm, or TTNN hardware.
+
+## 12. Completion criteria
+
+The change is complete when:
+
+- the public types and behavior above compile in namespace `iom`;
+- no `Shape`, `TileShape`, `PaddedShape`, tensor-view, allocator replacement, `Backend` class, execution-context, workspace, status, result, or operation-dispatch abstraction is added;
+- the existing `DeviceOps` compute interface remains asynchronous and otherwise unchanged;
+- CPU layout and copy tests prove logical row-major round trips across both tile sizes;
+- allocator tests prove fixed storage ownership and 32-byte alignment;
+- the test suite deterministically covers every validation and failure guarantee listed above.
