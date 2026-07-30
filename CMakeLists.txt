@@ -23,6 +23,7 @@ set(IOM_SOURCES
         src/llama.cpp
         src/mmap.cpp
         src/safetensors.cpp
+        src/alloc.cpp
 )
 
 set(IOM_HEADERS
@@ -30,6 +31,7 @@ set(IOM_HEADERS
         include/iom/llama.hpp
         include/iom/mmap.hpp
         include/iom/safetensors.hpp
+        include/iom/alloc.hpp
 )
 
 set(IOM_KERNEL_SOURCES
