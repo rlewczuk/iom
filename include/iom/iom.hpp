@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace iom {
     enum class DataType {
@@ -26,18 +27,15 @@ namespace iom {
         F4
     };
 
-    enum class DataOrder {
-        ROW_MAJOR, /// Row-major layout
-        TILED  /// Tiled layout
-    };
-
+    /**
+     * Represents a tensor.
+     */
     class Tensor {
-        // tbd
+        // TBD private fields here
     public:
-        [[nodiscard]] std::vector<size_t> shape() const;
-        [[nodiscard]] DataType dtype() const;
 
-        void set_float(float *data, size_t sz);
+        virtual ~Tensor() = default;
+
     };
 
     typedef uint64_t oid;
