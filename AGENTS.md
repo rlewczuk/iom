@@ -1,1 +1,1 @@
-For top level design overview, please read `docs/DESIGN.md`.
+For top level design overview, please read `docs/design/README.md`.

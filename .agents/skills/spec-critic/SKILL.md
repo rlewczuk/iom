@@ -28,6 +28,7 @@ Modify only `spec.md` unless the user explicitly requests another file change. N
 - Do not broaden scope merely because another improvement would be useful. Mention an adjacent issue only when it blocks correctness of this specification.
 - Apply clear factual and editorial corrections directly. Use questions for genuine decisions, not for permission to fix obvious errors.
 - Do not implement the change. The output of this workflow is the revised `spec.md` and a concise review summary.
+- Ignore previous changes to `spec.md` and `spec-fixme.md` (if visible in git history), focus on current version. 
 
 ## Workflow
 
@@ -115,6 +116,19 @@ For each unresolved decision:
 6. Re-check affected sections and continue with the next unresolved decision.
 
 Do not dump a questionnaire. Do not ask the user to decide facts available in the code. Do not manufacture choices merely to prolong the interview. Stop questioning only when no material ambiguity remains and the user and model have a common, written understanding.
+
+### 7. Resolve unnecessary complexities
+
+Look for ways to shorten and simplify dsign and the spec whenever possible.
+  
+For each accidental complexity or non-essential/redundant feature found:
+
+1. State the concrete ambiguity and why it matters.
+2. Assess if feature should be kept or removed.
+3. Check if removing feature will affect other features or aspects of design.
+4. If unsure, ask user to decide what to do with it; wait for user response if asked.
+5. If feature is decided to be removed or simplified, edit `spec.md`.
+6. Re-check affected sections and spec for consistency. 
 
 ### 7. Finalize the specification
 

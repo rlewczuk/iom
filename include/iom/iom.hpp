@@ -1,42 +1,13 @@
 #pragma once
 
 #include <cstdint>
+
 #include <string>
 #include <vector>
 
+#include "tensor.hpp"
+
 namespace iom {
-    enum class DataType {
-        BOOL,
-        U8,
-        I8,
-        U16,
-        I16,
-        U32,
-        I32,
-        U64,
-        I64,
-        F16,
-        BF16,
-        F32,
-        F64,
-        F8_E5M2,
-        F8_E4M3,
-        F8_E8M0,
-        F6_E2M3,
-        F6_E3M2,
-        F4
-    };
-
-    /**
-     * Represents a tensor.
-     */
-    class Tensor {
-        // TBD private fields here
-    public:
-
-        virtual ~Tensor() = default;
-
-    };
 
     typedef uint64_t oid;
 
