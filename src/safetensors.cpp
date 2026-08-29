@@ -35,11 +35,11 @@ DataType parse_dtype(const std::string& dtype) {
     if (dtype == "F32") return DataType::F32;
     if (dtype == "F64") return DataType::F64;
     if (dtype == "F8_E5M2") return DataType::F8_E5M2;
-    if (dtype == "F8_E4M3") return DataType::F8_E4M3;
+    if (dtype == "F8_E4M3") return DataType::F8_E4M3FN;
     if (dtype == "F8_E8M0") return DataType::F8_E8M0;
     if (dtype == "F6_E2M3") return DataType::F6_E2M3;
     if (dtype == "F6_E3M2") return DataType::F6_E3M2;
-    if (dtype == "F4") return DataType::F4;
+    if (dtype == "F4") return DataType::F4_E2M1;
 
     throw std::runtime_error("unsupported safetensors dtype: " + dtype);
 }
