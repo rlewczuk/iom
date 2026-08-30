@@ -75,9 +75,12 @@ if(ROCM_ENABLED)
             "ROCm 7.2 or newer is required for WMMA; detected ${hip_VERSION}"
         )
     endif()
+    enable_language(HIP)
 
     add_library(iom_rocm STATIC
         src/rocm/device.cpp
+        src/rocm/copy.hip
+        src/rocm/copy.hpp
         include/iom/rocm/device.hpp
     )
 
@@ -95,6 +98,7 @@ if(ROCM_ENABLED)
     target_compile_definitions(iom_rocm
         PRIVATE
             IOM_ROCM_ENABLED=1
+            __HIP_PLATFORM_AMD__
     )
 endif()
 

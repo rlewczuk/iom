@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <new>
 
 #include "iom/alloc.hpp"
 #include "iom/device.hpp"
@@ -17,12 +18,20 @@ namespace {
 
 class UnusedAllocator final : public iom::Allocator {
 public:
-    void* alloc(std::size_t) override {
+    void* alloc(std::size_t size) override {
         ++allocations;
-        throw std::runtime_error("ROCm scaffold unexpectedly allocated storage");
+        void* block = nullptr;
+        if (hipMalloc(&block, size) != hipSuccess) {
+            throw std::bad_alloc();
+        }
+        return block;
     }
 
-    void free(void*) override { ++frees; }
+    void free(void* buffer) override {
+        ++frees;
+        CHECK(hipFree(buffer) == hipSuccess);
+    }
+
     void reset() override { ++resets; }
 
     std::size_t allocations = 0;
@@ -48,15 +57,15 @@ TEST_CASE("ROCm factory reports a live hardware device and owns its context") {
         REQUIRE(hipCtxGetCurrent(&current_context) == hipSuccess);
         CHECK(current_context != nullptr);
 
-        CHECK_THROWS_AS(
-                device->create_tensor(
-                        iom::TensorSpec{
-                                iom::TensorShape{{16, 16}}, iom::DataType::F32}),
-                std::runtime_error);
-        CHECK_THROWS_AS(device->create_ops(), std::runtime_error);
-        CHECK(allocator.allocations == 0);
-        CHECK(allocator.frees == 0);
+        auto tensor = device->create_tensor(
+                iom::TensorSpec{
+                        iom::TensorShape{{16, 16}}, iom::DataType::F32});
+        CHECK(tensor != nullptr);
+        auto queue = device->create_ops();
+        CHECK(queue != nullptr);
+        CHECK(allocator.allocations == 1);
     }
+    CHECK(allocator.frees == 1);
 
     // A second construction after the first owner leaves scope exercises
     // deterministic context teardown without relying on a process-global
@@ -65,7 +74,7 @@ TEST_CASE("ROCm factory reports a live hardware device and owns its context") {
     REQUIRE(recreated != nullptr);
     CHECK(recreated->backend_kind() == iom::BackendKind::ROCM);
     CHECK(recreated->backend_device() == 0);
-    CHECK(allocator.allocations == 0);
+    CHECK(allocator.allocations == 1);
 }
 
 TEST_CASE("ROCm factory rejects the first unavailable ordinal") {

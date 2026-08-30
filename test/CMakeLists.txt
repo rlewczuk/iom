@@ -42,6 +42,11 @@ if(ROCM_ENABLED)
         COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
     )
 
+    target_compile_definitions(iom_rocm_smoke_tests
+        PRIVATE
+            __HIP_PLATFORM_AMD__
+    )
+
     target_link_libraries(iom_rocm_smoke_tests
         PRIVATE
             doctest::doctest
@@ -50,6 +55,34 @@ if(ROCM_ENABLED)
     )
 
     add_test(NAME iom_rocm_smoke_tests COMMAND iom_rocm_smoke_tests)
+    add_executable(iom_rocm_conformance_tests
+            rocm/test_rocm_conformance.cpp
+    )
+
+    set_source_files_properties(rocm/test_rocm_conformance.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_compile_definitions(iom_rocm_conformance_tests
+        PRIVATE
+            __HIP_PLATFORM_AMD__
+    )
+
+    target_include_directories(iom_rocm_conformance_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_link_libraries(iom_rocm_conformance_tests
+        PRIVATE
+            doctest::doctest
+            iom_rocm
+            libiom
+            hip::host
+    )
+
+    add_test(NAME iom_rocm_conformance_tests
+             COMMAND iom_rocm_conformance_tests)
 endif()
 
 add_executable(iom_backend_conformance_cpu_tests

@@ -2,14 +2,20 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
+
+#include "copy.hpp"
 
 namespace iom {
 
     namespace {
+
+        constexpr std::size_t kStorageAlignment = 32;
 
         [[nodiscard]] std::runtime_error hip_error(
                 const char* operation, hipError_t status) {
@@ -45,9 +51,6 @@ namespace iom {
 
             ~RocmDevice() override {
                 if (context_ != nullptr) {
-                    // Destruction is deliberately unconditional and occurs
-                    // once. HIP teardown errors cannot be reported by a
-                    // noexcept destructor without terminating the caller.
                     (void)hipCtxDestroy(context_);
                     context_ = nullptr;
                 }
@@ -62,21 +65,96 @@ namespace iom {
             }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
-                    const TensorSpec&) override {
-                throw std::runtime_error(
-                        "ROCm tensor storage is not implemented yet");
-            }
+                    const TensorSpec& spec) override;
 
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
-                throw std::runtime_error(
-                        "ROCm operation queues are not implemented yet");
+                activate();
+                return rocm_detail::make_queue(*this, context_);
+            }
+
+            void activate() const {
+                check_hip("hipCtxSetCurrent", hipCtxSetCurrent(context_));
+            }
+
+            [[nodiscard]] hipCtx_t context() const noexcept {
+                return context_;
             }
 
         private:
             std::uint32_t ordinal_;
             hipCtx_t context_;
             Allocator& allocator_;
+
+            friend class RocmTensor;
         };
+
+        class RocmTensor final : public Tensor {
+        public:
+            RocmTensor(const TensorSpec& spec, RocmDevice& device,
+                       Allocator& allocator)
+                    : Tensor(spec, device), device_(device),
+                      allocator_(allocator) {
+                device_.activate();
+                address_ = allocator_.alloc(view().spec().tiled_storage_nbytes());
+                if (address_ == nullptr) {
+                    throw std::bad_alloc();
+                }
+                if (reinterpret_cast<std::uintptr_t>(address_)
+                                % kStorageAlignment
+                        != 0) {
+                    allocator_.free(address_);
+                    address_ = nullptr;
+                    throw std::runtime_error(
+                            "ROCm tensor storage is not 32-byte aligned");
+                }
+            }
+
+            ~RocmTensor() override {
+                if (address_ == nullptr) {
+                    return;
+                }
+                try {
+                    device_.activate();
+                } catch (...) {
+                }
+                try {
+                    allocator_.free(address_);
+                } catch (...) {
+                }
+                address_ = nullptr;
+            }
+
+        private:
+            [[nodiscard]] void* storage_handle() noexcept override {
+                return address_;
+            }
+
+            void region_from_host(
+                    const TensorView& destination,
+                    std::span<const std::byte> source) override {
+                device_.activate();
+                rocm_detail::region_from_host(
+                        device_.context(), destination, source);
+            }
+
+            void region_to_host(
+                    const TensorView& source,
+                    std::span<std::byte> destination) const override {
+                device_.activate();
+                rocm_detail::region_to_host(
+                        device_.context(), source, destination);
+            }
+
+            RocmDevice& device_;
+            Allocator& allocator_;
+            void* address_ = nullptr;
+        };
+
+        std::unique_ptr<Tensor> RocmDevice::create_tensor(
+                const TensorSpec& spec) {
+            activate();
+            return std::make_unique<RocmTensor>(spec, *this, allocator_);
+        }
 
     }  // namespace
 
