@@ -38,10 +38,6 @@ set(IOM_HEADERS
         include/iom/tensor.hpp
 )
 
-if(CUDA_ENABLED)
-    set(CMAKE_CUDA_COMPILER "${CUDA_PATH}/bin/nvcc")
-    enable_language(CUDA)
-endif()
 
 add_library(libiom STATIC
         ${IOM_SOURCES}
@@ -62,6 +58,30 @@ target_link_libraries(libiom
     PUBLIC
         nlohmann_json::nlohmann_json
 )
+if(CUDA_ENABLED)
+    set(CUDAToolkit_ROOT "${CUDA_PATH}")
+    find_package(CUDAToolkit REQUIRED MODULE)
+    add_library(iom_cuda STATIC
+        src/cuda/device.cpp
+        include/iom/cuda/device.hpp
+    )
+
+    target_include_directories(iom_cuda
+        PUBLIC
+            ${PROJECT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(iom_cuda
+        PRIVATE
+            libiom
+            CUDA::cuda_driver
+    )
+
+    target_compile_definitions(iom_cuda
+        PRIVATE
+            IOM_CUDA_ENABLED=1
+    )
+endif()
 if(ROCM_ENABLED)
     # Config mode discovers the configured SDK and exposes hip::host for the
     # backend target. Check the package version separately so newer major

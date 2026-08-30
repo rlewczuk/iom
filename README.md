@@ -9,6 +9,30 @@ sudo apt install build-essential cmake doctest-dev doxygen clangd lldb-20 nlohma
 Install ROCm 7.2 or newer separately when accelerator builds are needed. The
 ROCm SDK must provide its HIP CMake package, normally under `/opt/rocm`.
 
+Install the CUDA Toolkit separately when NVIDIA accelerator builds are
+needed. The default toolkit path is `/usr/local/cuda`.
+
+Build with CUDA support:
+
+```sh
+cmake -S . -B build/cuda \
+  -DBUILD_TESTING=ON \
+  -DCUDA_ENABLED=ON \
+  -DROCM_ENABLED=OFF \
+  -DCUDA_PATH=/usr/local/cuda
+cmake --build build/cuda --target iom_cuda
+```
+
+Set `-DCUDA_PATH=/path/to/cuda` when the toolkit is installed elsewhere.
+Enabling CUDA fails configuration if the toolkit or its driver library is
+unavailable; it does not silently disable the backend. The CUDA smoke test
+requires a usable NVIDIA GPU/runtime and does not skip when CUDA is enabled:
+
+```sh
+cmake --build build/cuda --target iom_cuda_smoke_tests
+ctest --test-dir build/cuda --output-on-failure \
+  -R '^iom_cuda_smoke_tests$'
+```
 Build:
 
 ```sh

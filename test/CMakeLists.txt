@@ -85,6 +85,25 @@ if(ROCM_ENABLED)
              COMMAND iom_rocm_conformance_tests)
 endif()
 
+if(CUDA_ENABLED)
+    add_executable(iom_cuda_smoke_tests
+            cuda/test_cuda_smoke.cpp
+    )
+
+    set_source_files_properties(cuda/test_cuda_smoke.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_link_libraries(iom_cuda_smoke_tests
+        PRIVATE
+            doctest::doctest
+            iom_cuda
+            CUDA::cuda_driver
+    )
+
+    add_test(NAME iom_cuda_smoke_tests COMMAND iom_cuda_smoke_tests)
+endif()
+
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
 )
