@@ -33,6 +33,25 @@ target_link_libraries(iom_cpu_tests
 
 add_test(NAME iom_cpu_tests COMMAND iom_cpu_tests)
 
+if(ROCM_ENABLED)
+    add_executable(iom_rocm_smoke_tests
+            rocm/test_rocm_smoke.cpp
+    )
+
+    set_source_files_properties(rocm/test_rocm_smoke.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_link_libraries(iom_rocm_smoke_tests
+        PRIVATE
+            doctest::doctest
+            iom_rocm
+            hip::host
+    )
+
+    add_test(NAME iom_rocm_smoke_tests COMMAND iom_rocm_smoke_tests)
+endif()
+
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
 )

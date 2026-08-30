@@ -38,34 +38,9 @@ set(IOM_HEADERS
         include/iom/tensor.hpp
 )
 
-set(IOM_KERNEL_SOURCES
-)
-
-if(CUDA_ENABLED AND ROCM_ENABLED)
-    message(FATAL_ERROR "CUDA_ENABLED and ROCM_ENABLED cannot both be enabled")
-elseif(CUDA_ENABLED)
+if(CUDA_ENABLED)
     set(CMAKE_CUDA_COMPILER "${CUDA_PATH}/bin/nvcc")
     enable_language(CUDA)
-    set(IOM_KERNEL_LANGUAGE CUDA)
-elseif(ROCM_ENABLED)
-    file(STRINGS "${ROCM_PATH}/.info/version" IOM_ROCM_VERSION LIMIT_COUNT 1)
-    if(IOM_ROCM_VERSION VERSION_LESS 7.2)
-        message(FATAL_ERROR
-            "ROCm 7.2 or newer is required for WMMA; detected ${IOM_ROCM_VERSION}"
-        )
-    endif()
-
-    set(CMAKE_HIP_COMPILER_ROCM_ROOT "${ROCM_PATH}")
-    set(CMAKE_HIP_COMPILER "${ROCM_PATH}/llvm/bin/clang++")
-    enable_language(HIP)
-    set(IOM_KERNEL_LANGUAGE HIP)
-endif()
-
-if(IOM_KERNEL_LANGUAGE AND IOM_KERNEL_SOURCES)
-    set_source_files_properties(${IOM_KERNEL_SOURCES} PROPERTIES
-        LANGUAGE "${IOM_KERNEL_LANGUAGE}"
-    )
-    list(APPEND IOM_SOURCES ${IOM_KERNEL_SOURCES})
 endif()
 
 add_library(libiom STATIC
@@ -77,22 +52,50 @@ set_target_properties(libiom PROPERTIES
     OUTPUT_NAME iom
 )
 
-if(IOM_KERNEL_LANGUAGE)
-    set_target_properties(libiom PROPERTIES
-        "${IOM_KERNEL_LANGUAGE}_STANDARD" 20
-        "${IOM_KERNEL_LANGUAGE}_STANDARD_REQUIRED" ON
-    )
-endif()
 
 target_include_directories(libiom
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
 )
 
-if(CUDA_ENABLED)
-    target_compile_definitions(libiom PUBLIC IOM_CUDA_ENABLED=1)
-elseif(ROCM_ENABLED)
-    target_compile_definitions(libiom PUBLIC IOM_ROCM_ENABLED=1)
+target_link_libraries(libiom
+    PUBLIC
+        nlohmann_json::nlohmann_json
+)
+if(ROCM_ENABLED)
+    # Config mode discovers the configured SDK and exposes hip::host for the
+    # backend target. Check the package version separately so newer major
+    # ROCm releases remain valid while preserving the 7.2 minimum.
+    find_package(hip CONFIG REQUIRED
+        PATHS "${ROCM_PATH}"
+        NO_DEFAULT_PATH
+    )
+    if(NOT DEFINED hip_VERSION OR hip_VERSION VERSION_LESS 7.2)
+        message(FATAL_ERROR
+            "ROCm 7.2 or newer is required for WMMA; detected ${hip_VERSION}"
+        )
+    endif()
+
+    add_library(iom_rocm STATIC
+        src/rocm/device.cpp
+        include/iom/rocm/device.hpp
+    )
+
+    target_include_directories(iom_rocm
+        PUBLIC
+            ${PROJECT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(iom_rocm
+        PRIVATE
+            libiom
+            hip::host
+    )
+
+    target_compile_definitions(iom_rocm
+        PRIVATE
+            IOM_ROCM_ENABLED=1
+    )
 endif()
 
 add_executable(iom
