@@ -69,6 +69,8 @@ if(TTNN_ENABLED)
 
     add_library(iom_ttnn STATIC
         src/ttnn/device.cpp
+        src/ttnn/copy.cpp
+        src/ttnn/copy.hpp
         include/iom/ttnn/device.hpp
     )
 

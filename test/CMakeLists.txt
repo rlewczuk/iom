@@ -167,4 +167,29 @@ if(TTNN_ENABLED)
     )
 
     add_test(NAME iom_ttnn_smoke_tests COMMAND iom_ttnn_smoke_tests)
+
+    add_executable(iom_ttnn_conformance_tests
+            ttnn/test_ttnn_conformance.cpp
+    )
+
+    set_source_files_properties(ttnn/test_ttnn_conformance.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_include_directories(iom_ttnn_conformance_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_link_libraries(iom_ttnn_conformance_tests
+        PRIVATE
+            doctest::doctest
+            iom_ttnn
+            libiom
+            TT::Metalium
+            TTNN::TTNN
+    )
+
+    add_test(NAME iom_ttnn_conformance_tests
+             COMMAND iom_ttnn_conformance_tests)
 endif()

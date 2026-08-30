@@ -23,12 +23,22 @@ TEST_CASE("TTNN factory reports a live hardware device and owns its context") {
         CHECK(device->backend_kind() == iom::BackendKind::TTNN);
         CHECK(device->backend_device() == 0);
 
+        // An unsupported leaf type is rejected before native allocation.
         CHECK_THROWS_AS(
                 device->create_tensor(
                         iom::TensorSpec{
-                                iom::TensorShape{{16, 16}}, iom::DataType::F32}),
+                                iom::TensorShape{{16, 16}}, iom::DataType::F64}),
                 std::runtime_error);
-        CHECK_THROWS_AS(device->create_ops(), std::runtime_error);
+
+        // Supported storage and a queue are now live capabilities.
+        {
+            auto tensor = device->create_tensor(
+                    iom::TensorSpec{
+                            iom::TensorShape{{16, 16}}, iom::DataType::BF16});
+            CHECK(tensor != nullptr);
+        }
+        auto ops = device->create_ops();
+        CHECK(ops != nullptr);
     }
 
     // Reopening after the first owner leaves scope exercises deterministic
