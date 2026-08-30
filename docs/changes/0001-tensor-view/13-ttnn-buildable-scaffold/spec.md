@@ -2,7 +2,7 @@
 
 **Order:** 13
 **Priority:** P0 — TTNN dependency discovery and native device ownership must pass before TTNN tensor work.
-**Blocked by:** `12-sycl-storage-copy`
+**Blocked by:** `10-cuda-storage-copy`
 **Source:** `docs/changes/0001-tensor-view/spec.md`
 
 ## Outcome
@@ -22,6 +22,19 @@ With `TTNN_ENABLED=ON`, TTNN is an independent optional library with a public fa
 - **Modify:** `CMakeLists.txt` — add independent `TTNN_ENABLED` and optional target `iom_ttnn` with target-local TTNN dependencies.
 - **Modify:** `test/CMakeLists.txt` — add `iom_ttnn_smoke_tests` only when TTNN is enabled.
 - **Read:** existing backend factory headers — preserve the same backend-neutral layering while omitting `Allocator&` only for TTNN as specified.
+
+TTNN SDK will be installed system wide and is available to cmake as libraries, for example:
+
+```
+target_link_libraries(my-lib PRIVATE
+    TT::Metalium
+    TTNN::TTNN
+)
+```
+
+Use this formula when modifying build scripts.
+
+Current version of tt-metalium/ttnn source code is in `/home/rlew/tt/src/tt-metal`, you can look at it for reference.
 
 ## Requirements
 
