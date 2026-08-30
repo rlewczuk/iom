@@ -1,8 +1,14 @@
 #include "iom/device.hpp"
+#include "iom/iom.hpp"
 #include "iom/tensor.hpp"
 
+#include <bitset>
+#include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -489,8 +495,97 @@ namespace iom {
         return full_view_;
     }
 
+
     const TensorView& Tensor::view() const noexcept {
         return full_view_;
     }
 
+    namespace {
+
+        // The only global queue state: the live eight-bit queue ids. Bit i
+        // represents id i + 1. It never selects a backend, device, or
+        // runtime context.
+        std::mutex g_queue_ids_mutex;
+        std::bitset<255> g_live_queue_ids;
+
+    }  // namespace
+
+    DeviceOps::DeviceOps()
+            : queue_id_(lease_queue_id()) {}
+
+    DeviceOps::~DeviceOps() {
+        release_queue_id(queue_id_);
+    }
+
+    std::uint8_t DeviceOps::lease_queue_id() {
+        std::lock_guard<std::mutex> lock(g_queue_ids_mutex);
+        for (std::size_t i = 0; i < g_live_queue_ids.size(); ++i) {
+            if (!g_live_queue_ids.test(i)) {
+                g_live_queue_ids.set(i);
+                return static_cast<std::uint8_t>(i + 1);
+            }
+        }
+        throw std::runtime_error("all 255 DeviceOps queue ids are live");
+    }
+
+    void DeviceOps::release_queue_id(std::uint8_t queue_id) noexcept {
+        std::lock_guard<std::mutex> lock(g_queue_ids_mutex);
+        g_live_queue_ids.reset(queue_id - 1);
+    }
+
+    oid DeviceOps::encode_token(std::uint64_t sequence) const noexcept {
+        return (static_cast<oid>(queue_id_) << kSequenceBits) | sequence;
+    }
+
+    void DeviceOps::wait(oid token) {
+        const std::uint64_t id = token >> kSequenceBits;
+        const std::uint64_t sequence = token & kSequenceMask;
+        if (id == 0) {
+            throw std::invalid_argument("oid queue id is zero");
+        }
+        if (sequence == 0) {
+            throw std::invalid_argument("oid sequence is zero");
+        }
+        if (id != queue_id_) {
+            throw std::invalid_argument("oid belongs to another queue");
+        }
+
+        std::unique_lock<std::mutex> lock(completion_mutex_);
+        if (sequence >= next_sequence_) {
+            throw std::invalid_argument("oid sequence was never submitted");
+        }
+        completion_cv_.wait(lock, [&] {
+            return completed_ >= sequence || failures_.count(sequence) != 0;
+        });
+        if (const auto failure = failures_.find(sequence);
+                failure != failures_.end()) {
+            std::rethrow_exception(failure->second);
+        }
+    }
+
+    void DeviceOps::complete(std::uint64_t sequence, std::exception_ptr failure) {
+        if (sequence == 0) {
+            throw std::invalid_argument("completion sequence is zero");
+        }
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        if (sequence >= next_sequence_) {
+            throw std::invalid_argument(
+                "completion of a sequence that was never submitted");
+        }
+        if (failure) {
+            failures_[sequence] = std::move(failure);
+        }
+        if (completed_ < sequence) {
+            completed_ = sequence;
+        }
+        completion_cv_.notify_all();
+    }
+
+    void DeviceOps::seek_next_sequence(std::uint64_t next_sequence) {
+        if (next_sequence == 0 || next_sequence < next_sequence_) {
+            throw std::invalid_argument("queue sequence numbers only move forward");
+        }
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        next_sequence_ = next_sequence;
+    }
 }  // namespace iom

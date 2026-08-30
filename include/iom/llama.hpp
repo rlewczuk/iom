@@ -22,23 +22,24 @@ namespace iom::models {
 
     class LlamaAttention : public Block {
         DeviceOps& dev;
-        Tensor& wq,  wk, wv, wo;  /// Weights: Wq, Wk, Wv, Wo
-        Tensor& q, k, v, a;       /// Internal Activations: Q, K, V, A
+        Tensor& wq, &wk, &wv, &wo;  /// Weights: Wq, Wk, Wv, Wo
+        Tensor& q, &k, &v, &a;      /// Internal Activations: Q, K, V, A
         size_t h;                 /// Hidden size
         size_t n_head, n_kv;      /// Number of heads (overall, KV)
         LlamaRoPE& rope;
     public:
         LlamaAttention(DeviceOps& dev,
             size_t hidden_size, size_t num_heads, size_t num_hv_heads,
-            Tensor& wq, Tensor& wk, Tensor& wv, Tensor& wo, Tensor& q, Tensor& k, Tensor& v, LlamaRoPE& rope);
+            Tensor& wq, Tensor& wk, Tensor& wv, Tensor& wo,
+            Tensor& q, Tensor& k, Tensor& v, Tensor& a, LlamaRoPE& rope);
 
         void forward(const Tensor& x, Tensor& y) override;
     };
 
     class LlamaMlp : public Block {
         DeviceOps& dev;
-        Tensor& wu, wd, wg;
-        Tensor& u, g;
+        Tensor& wu, &wd, &wg;
+        Tensor& u, &g;
     public:
         LlamaMlp(DeviceOps& dev, Tensor& wu, Tensor& wd, Tensor& wg, Tensor& w, Tensor& g);
 
@@ -49,8 +50,8 @@ namespace iom::models {
         DeviceOps& dev;
         LlamaAttention& attn;
         LlamaMlp& mlp;
-        const Tensor& wi, wm;    /// Input/output normalization weights: input norm, mlp norm
-        Tensor& t, r;            /// Internal Activations: temporary, residual
+        const Tensor& wi, &wm;  /// Input/output normalization weights: input norm, mlp norm
+        Tensor& t, &r;          /// Internal Activations: temporary, residual
     public:
         LlamaDecoder(DeviceOps& dev, LlamaAttention& attn, LlamaMlp& mlp, const Tensor& wi, const Tensor& wm, Tensor& t, Tensor& r);
 

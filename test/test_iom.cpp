@@ -1,13 +1,20 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <span>
 #include <stdexcept>
+#include <string_view>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -15,6 +22,7 @@
 
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
+#include "iom/llama.hpp"
 #include "iom/tensor.hpp"
 
 namespace {
@@ -449,7 +457,109 @@ public:
     mutable std::size_t to_destination_size = 0;
 };
 
+// Deterministic deferred operation queue: submissions are recorded and the
+// test thread plays the in-order worker by completing sequences through the
+// common DeviceOps machinery. No threads, backends, or real work involved.
+class FakeQueue final : public iom::DeviceOps {
+public:
+    FakeQueue() = default;
+
+    using iom::DeviceOps::complete;
+    using iom::DeviceOps::seek_next_sequence;
+
+    struct Submission {
+        std::uint64_t sequence;
+        const char* op;
+    };
+
+    // Successfully queued operations in submission order.
+    std::vector<Submission> submissions;
+
+    bool silu_aliased = false;
+
+    // A view-less submission used to observe queue identity and sequence
+    // allocation directly.
+    iom::oid probe() {
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "probe"});
+        });
+    }
+
+    iom::oid copy(const iom::TensorView& source, iom::TensorView& destination) override {
+        if (source.spec() != destination.spec()) {
+            throw std::invalid_argument("fake copy requires identical specs");
+        }
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "copy"});
+        });
+    }
+
+    iom::oid add(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "add"});
+        });
+    }
+
+    iom::oid mul(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "mul"});
+        });
+    }
+
+    iom::oid silu(const iom::TensorView& x, iom::TensorView& y) override {
+        silu_aliased = &x == &y;
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "silu"});
+        });
+    }
+
+    iom::oid linear(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "linear"});
+        });
+    }
+
+    iom::oid rmsnorm(const iom::TensorView&, iom::TensorView&, const iom::TensorView&,
+                     float, size_t) override {
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "rmsnorm"});
+        });
+    }
+
+    iom::oid sdpa(const iom::TensorView&, const iom::TensorView&, const iom::TensorView&,
+                  size_t, size_t, size_t, iom::TensorView&) override {
+        return submit([&](std::uint64_t sequence) {
+            submissions.push_back({sequence, "sdpa"});
+        });
+    }
+};
+
+constexpr std::uint64_t kTokenSequenceBits = 56;
+constexpr std::uint64_t kTokenSequenceMask = (std::uint64_t{1} << kTokenSequenceBits) - 1;
+constexpr std::uint64_t kMaxSequence = kTokenSequenceMask;
+
+std::uint8_t token_queue(iom::oid token) {
+    return static_cast<std::uint8_t>(token >> kTokenSequenceBits);
+}
+
+std::uint64_t token_sequence(iom::oid token) {
+    return token & kTokenSequenceMask;
+}
+
+iom::oid make_token(std::uint64_t queue_id, std::uint64_t sequence) {
+    return (queue_id << kTokenSequenceBits) | sequence;
+}
+
+std::vector<std::string_view> op_names(const FakeQueue& queue) {
+    std::vector<std::string_view> names;
+    for (const FakeQueue::Submission& entry : queue.submissions) {
+        names.push_back(entry.op);
+    }
+    return names;
+}
+
 class FakeDevice final : public iom::Device {
+
 public:
     [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
         return iom::BackendKind::CPU;
@@ -464,9 +574,9 @@ public:
         return std::make_unique<FakeTensor>(spec, *this);
     }
 
-    // Concrete operation queues arrive with the DeviceOps contract change.
+    // The deterministic deferred queue stands in for the concrete backends.
     [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
-        return nullptr;
+        return std::make_unique<FakeQueue>();
     }
 };
 
@@ -1114,4 +1224,382 @@ TEST_CASE("TensorView transforms leave owner storage untouched") {
     iom::TensorView copy = derived;
     CHECK(copy.native_handle() == handle);
     CHECK(&copy.device() == &device);
+}
+
+TEST_CASE("DeviceOps view signatures are exact and view-only") {
+    using iom::DeviceOps;
+    using iom::TensorView;
+
+    static_assert(std::is_same_v<iom::oid, std::uint64_t>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::wait), void (DeviceOps::*)(iom::oid)>);
+
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::copy),
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&)>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::add),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&)>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::mul),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&)>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::silu),
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&)>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::linear),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&)>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::rmsnorm),
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&, const TensorView&,
+                                float, size_t)>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::sdpa),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, const TensorView&,
+                                size_t, size_t, size_t, TensorView&)>);
+
+    // silu deliberately accepts the same window as const input and mutable
+    // output; a const view is refused as an output.
+    static_assert(std::is_invocable_v<
+        decltype(&DeviceOps::silu), DeviceOps*, const TensorView&, TensorView&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::silu), DeviceOps*, TensorView&, const TensorView&>);
+
+    // No Tensor operand overload survives the cutover: Tensor does not
+    // convert to TensorView.
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::copy), DeviceOps*, const iom::Tensor&, iom::Tensor&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::add),
+        DeviceOps*, const iom::Tensor&, const iom::Tensor&, iom::Tensor&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::sdpa), DeviceOps*, const iom::Tensor&, const iom::Tensor&,
+        const iom::Tensor&, size_t, size_t, size_t, iom::Tensor&>);
+
+    static_assert(std::is_abstract_v<DeviceOps>);
+    static_assert(!std::is_copy_constructible_v<DeviceOps>);
+    static_assert(!std::is_move_constructible_v<DeviceOps>);
+    static_assert(!std::is_copy_assignable_v<DeviceOps>);
+    static_assert(!std::is_move_assignable_v<DeviceOps>);
+}
+
+TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
+    FakeDevice device;
+    FakeQueue queue;
+    FakeTensor a = make_tensor(device, {2, 3, 16, 16});
+    const FakeTensor& frozen = a;
+    FakeTensor b = make_tensor(device, {2, 3, 16, 16});
+
+    CHECK_NOTHROW((void)queue.copy(a.view(), b.view()));
+    CHECK_NOTHROW((void)queue.add(frozen.view(), a.view(), b.view()));
+    CHECK_NOTHROW((void)queue.mul(a.view(), frozen.view(), b.view()));
+    CHECK_NOTHROW((void)queue.silu(b.view(), b.view()));
+    CHECK(queue.silu_aliased);
+    CHECK_NOTHROW((void)queue.linear(a.view(), b.view(), b.view()));
+    CHECK_NOTHROW((void)queue.rmsnorm(a.view(), b.view(), b.view(), 1e-6F, 1));
+    CHECK_NOTHROW((void)queue.sdpa(a.view(), b.view(), b.view(), 2, 1, 16, b.view()));
+
+    // Derived views are equally acceptable operands.
+    const iom::TensorView selected = a.view().select(1, 2);
+    iom::TensorView selected_b = b.view().select(1, 2);
+    CHECK_NOTHROW((void)queue.copy(selected, selected_b));
+
+    REQUIRE(queue.submissions.size() == 8);
+    CHECK_EQ(queue.submissions.back().sequence, 8);
+}
+
+TEST_CASE("DeviceOps queue ids lease exclusively across threads and are reused after release") {
+    std::mutex live_mutex;
+    std::vector<std::unique_ptr<FakeQueue>> live;
+    std::atomic<int> rejections = 0;
+    {
+        std::vector<std::thread> builders;
+        for (int builder = 0; builder < 8; ++builder) {
+            builders.emplace_back([&] {
+                for (;;) {
+                    std::unique_ptr<FakeQueue> queue;
+                    try {
+                        queue = std::make_unique<FakeQueue>();
+                    } catch (const std::runtime_error&) {
+                        ++rejections;
+                        return;
+                    }
+                    const std::lock_guard<std::mutex> lock(live_mutex);
+                    live.push_back(std::move(queue));
+                }
+            });
+        }
+        for (std::thread& builder : builders) {
+            builder.join();
+        }
+    }
+    REQUIRE(live.size() == 255);
+    CHECK_EQ(rejections.load(), 8);
+
+    std::set<std::uint8_t> ids;
+    for (const std::unique_ptr<FakeQueue>& queue : live) {
+        CHECK(ids.insert(token_queue(queue->probe())).second);
+    }
+    REQUIRE(ids.size() == 255);
+
+    // Releasing one live queue makes exactly its id reusable.
+    const std::uint8_t released = token_queue(live.back()->probe());
+    live.pop_back();
+    {
+        FakeQueue successor;
+        CHECK_EQ(token_queue(successor.probe()), released);
+        CHECK_THROWS_AS(FakeQueue{}, std::runtime_error);
+    }
+
+    // Every release is observed; an empty pool starts from a low id again.
+    live.clear();
+    FakeQueue fresh;
+    CHECK_EQ(token_queue(fresh.probe()), 1);
+}
+
+TEST_CASE("DeviceOps queue tokens encode queue id above monotonic sequences") {
+    FakeDevice device;
+    FakeQueue first;
+    FakeQueue second;
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    const iom::oid first_token = first.probe();
+    const iom::oid second_token = first.copy(a.view(), b.view());
+    const iom::oid other_token = second.probe();
+
+    CHECK_EQ(token_sequence(first_token), 1);
+    CHECK_EQ(token_sequence(second_token), 2);
+    CHECK_EQ(token_sequence(other_token), 1);
+    CHECK_NE(token_queue(first_token), 0);
+    CHECK_NE(token_queue(first_token), token_queue(other_token));
+    CHECK_EQ(first_token, make_token(token_queue(first_token), 1));
+
+    // A validation failure consumes no sequence.
+    FakeTensor wide = make_tensor(device, {5, 8});
+    CHECK_THROWS_AS(first.copy(a.view(), wide.view()), std::invalid_argument);
+    REQUIRE(first.submissions.size() == 2);
+    const iom::oid next = first.probe();
+    CHECK_EQ(token_sequence(next), 3);
+
+    // An identical-window copy is still a queued operation.
+    const iom::oid noop = first.copy(b.view(), b.view());
+    CHECK_EQ(token_sequence(noop), 4);
+    CHECK_EQ(first.submissions.back().sequence, 4);
+    CHECK(std::string_view(first.submissions.back().op) == "copy");
+}
+
+TEST_CASE("DeviceOps queue sequences exhaust at the 56-bit boundary") {
+    FakeDevice device;
+    FakeQueue queue;
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    // The seam only moves forward and never allocates a sequence.
+    CHECK_THROWS_AS(queue.seek_next_sequence(0), std::invalid_argument);
+    CHECK_EQ(token_sequence(queue.probe()), 1);
+    CHECK_THROWS_AS(queue.seek_next_sequence(1), std::invalid_argument);
+
+    queue.seek_next_sequence(kMaxSequence);
+    REQUIRE(queue.submissions.size() == 1);
+    const iom::oid last = queue.copy(a.view(), b.view());
+    CHECK_EQ(token_sequence(last), kMaxSequence);
+    REQUIRE(queue.submissions.size() == 2);
+
+    // Submission past the last sequence throws before queuing.
+    CHECK_THROWS_AS(queue.copy(a.view(), b.view()), std::overflow_error);
+    CHECK_EQ(queue.submissions.size(), 2);
+
+    // The boundary submission is still waitable.
+    queue.complete(kMaxSequence);
+    CHECK_NOTHROW(queue.wait(last));
+}
+
+TEST_CASE("DeviceOps queue waits reject invalid live tokens") {
+    FakeDevice device;
+    FakeQueue queue;
+    FakeQueue foreign;
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    const iom::oid own = queue.probe();
+    const iom::oid other = foreign.probe();
+
+    CHECK_THROWS_AS(queue.wait(0), std::invalid_argument);
+    CHECK_THROWS_AS(queue.wait(make_token(token_queue(own), 0)), std::invalid_argument);
+    CHECK_THROWS_AS(queue.wait(other), std::invalid_argument);
+    CHECK_THROWS_AS(queue.wait(make_token(200, 1)), std::invalid_argument);
+    CHECK_THROWS_AS(queue.wait(make_token(token_queue(own), 2)), std::invalid_argument);
+
+    // Rejections consumed nothing and completed nothing.
+    queue.complete(1);
+    CHECK_NOTHROW(queue.wait(own));
+    CHECK_THROWS_AS(foreign.wait(own), std::invalid_argument);
+}
+
+TEST_CASE("DeviceOps queue waits are idempotent and retain per-sequence results") {
+    FakeDevice device;
+    FakeQueue queue;
+    const iom::oid one = queue.probe();
+    const iom::oid two = queue.probe();
+    const iom::oid three = queue.probe();
+    const iom::oid four = queue.probe();
+
+    queue.complete(1);
+    CHECK_NOTHROW(queue.wait(one));
+    CHECK_NOTHROW(queue.wait(one));
+
+    // In-order completion with a retained failure at two.
+    queue.complete(2, std::make_exception_ptr(std::runtime_error("async boom")));
+    queue.complete(3);
+    CHECK_NOTHROW(queue.wait(one));
+    bool rethrown = false;
+    try {
+        queue.wait(two);
+    } catch (const std::runtime_error& error) {
+        rethrown = std::string_view(error.what()) == "async boom";
+    }
+    CHECK(rethrown);
+    CHECK_THROWS_AS(queue.wait(two), std::runtime_error);
+    CHECK_NOTHROW(queue.wait(three));
+    CHECK_THROWS_AS(queue.wait(two), std::runtime_error);
+
+    queue.complete(4);
+    CHECK_NOTHROW(queue.wait(four));
+}
+
+TEST_CASE("DeviceOps queue wait wakes a blocked waiter on completion") {
+    FakeDevice device;
+    FakeQueue queue;
+    const iom::oid token = queue.probe();
+
+    std::atomic<bool> returned = false;
+    auto waiter = std::async(std::launch::async, [&] {
+        queue.wait(token);
+        returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(returned.load());
+    queue.complete(1);
+    REQUIRE(waiter.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK(returned.load());
+}
+
+TEST_CASE("DeviceOps queue destruction neither waits nor cancels and releases the id") {
+    FakeDevice device;
+    std::uint8_t released = 0;
+    {
+        FakeQueue queue;
+        FakeTensor a = make_tensor(device, {4, 8});
+        FakeTensor b = make_tensor(device, {4, 8});
+        released = token_queue(queue.copy(a.view(), b.view()));
+        // Sequence one is left incomplete: destruction must neither block
+        // on it nor cancel it, and the id must return to the pool.
+    }
+    FakeQueue successor;
+    CHECK_EQ(token_queue(successor.probe()), released);
+}
+
+TEST_CASE("DeviceOps queue drives the llama models through owner views") {
+    FakeDevice device;
+    FakeQueue dev;
+
+    constexpr std::size_t kCtxLen = 8;
+    constexpr std::size_t kHeadDim = 4;
+    constexpr double kTheta = 10000.0;
+
+    FakeTensor sin = make_tensor(device, {kCtxLen, kHeadDim / 2});
+    FakeTensor cos = make_tensor(device, {kCtxLen, kHeadDim / 2});
+    iom::models::LlamaRoPE rope(dev, kCtxLen, kHeadDim, kTheta, sin, cos);
+
+    // Initialization sent exactly one logical_nbytes host span each and
+    // queued nothing.
+    REQUIRE(sin.from_host_calls == 1);
+    REQUIRE(cos.from_host_calls == 1);
+    REQUIRE(sin.from_bytes.size() == sin.view().spec().logical_nbytes());
+    REQUIRE(cos.from_bytes.size() == cos.view().spec().logical_nbytes());
+    REQUIRE(dev.submissions.empty());
+
+    // Exact float tables in row-major [ctx, head_dim / 2] order.
+    std::vector<double> inv_freq(kHeadDim / 2, 0.0);
+    for (std::size_t j = 0; j < kHeadDim / 2; ++j) {
+        inv_freq[j] = 1.0 / std::pow(10000.0, static_cast<double>((2 * j) / kHeadDim));
+    }
+    auto decode_le_float = [](const std::byte* bytes) {
+        std::uint32_t bits = 0;
+        for (std::size_t b = 0; b < 4; ++b) {
+            bits |= static_cast<std::uint32_t>(bytes[b]) << (8 * b);
+        }
+        float value = 0.0F;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    };
+    for (std::size_t i = 0; i < kCtxLen; ++i) {
+        for (std::size_t j = 0; j < kHeadDim / 2; ++j) {
+            CAPTURE(i);
+            CAPTURE(j);
+            const std::size_t offset = (i * kHeadDim / 2 + j) * 4;
+            CHECK_EQ(decode_le_float(sin.from_bytes.data() + offset),
+                     static_cast<float>(std::sin(kTheta * static_cast<double>(i) * inv_freq[j])));
+            CHECK_EQ(decode_le_float(cos.from_bytes.data() + offset),
+                     static_cast<float>(std::cos(kTheta * static_cast<double>(i) * inv_freq[j])));
+        }
+    }
+
+    FakeTensor x = make_tensor(device, {16, 16});
+    FakeTensor y = make_tensor(device, {16, 16});
+    FakeTensor t = make_tensor(device, {16, 16});
+    FakeTensor r = make_tensor(device, {16, 16});
+    FakeTensor wq = make_tensor(device, {16, 16});
+    FakeTensor wk = make_tensor(device, {16, 16});
+    FakeTensor wv = make_tensor(device, {16, 16});
+    FakeTensor wo = make_tensor(device, {16, 16});
+    FakeTensor q = make_tensor(device, {16, 16});
+    FakeTensor k = make_tensor(device, {16, 16});
+    FakeTensor v = make_tensor(device, {16, 16});
+    FakeTensor a = make_tensor(device, {16, 16});
+    FakeTensor wu = make_tensor(device, {16, 16});
+    FakeTensor wd = make_tensor(device, {16, 16});
+    FakeTensor wg = make_tensor(device, {16, 16});
+    FakeTensor u = make_tensor(device, {16, 16});
+    FakeTensor g = make_tensor(device, {16, 16});
+    FakeTensor wi = make_tensor(device, {16, 16});
+    FakeTensor wm = make_tensor(device, {16, 16});
+    FakeTensor wlm = make_tensor(device, {16, 16});
+    FakeTensor wn = make_tensor(device, {16, 16});
+
+    iom::models::LlamaAttention attn(dev, 16, 2, 1, wq, wk, wv, wo, q, k, v, a, rope);
+    iom::models::LlamaMlp mlp(dev, wu, wd, wg, u, g);
+    iom::models::LlamaDecoder decoder(dev, attn, mlp, wi, wm, t, r);
+    std::vector<std::reference_wrapper<iom::models::LlamaDecoder>> decoders{decoder};
+    iom::models::Llama2Model model(dev, decoders, wlm, wn, t);
+
+    decoder.forward(x, y);
+    const std::vector<std::string_view> decoder_ops = {
+        "rmsnorm",
+        "linear", "linear", "linear", "sdpa", "linear",
+        "add",
+        "copy",
+        "rmsnorm",
+        "linear", "linear", "silu", "mul", "linear",
+        "add",
+    };
+    REQUIRE(dev.submissions.size() == decoder_ops.size());
+    CHECK(op_names(dev) == decoder_ops);
+    CHECK(dev.silu_aliased);
+    CHECK_EQ(dev.submissions.back().sequence, decoder_ops.size());
+
+    model.forward(x, y);
+    // The model repeats the whole decoder, then closes with output norm
+    // and the LM head projection.
+    std::vector<std::string_view> expected_tail = decoder_ops;
+    expected_tail.push_back("rmsnorm");
+    expected_tail.push_back("linear");
+    const std::vector<std::string_view> model_ops = op_names(dev);
+    REQUIRE(model_ops.size() == decoder_ops.size() + expected_tail.size());
+    CHECK(std::vector<std::string_view>(
+              model_ops.begin() + static_cast<std::ptrdiff_t>(decoder_ops.size()),
+              model_ops.end()) == expected_tail);
+    CHECK_EQ(dev.submissions.back().sequence,
+             decoder_ops.size() + expected_tail.size());
 }
