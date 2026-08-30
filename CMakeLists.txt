@@ -32,6 +32,7 @@ set(IOM_HEADERS
         include/iom/mmap.hpp
         include/iom/safetensors.hpp
         include/iom/alloc.hpp
+        include/iom/device.hpp
         include/iom/tensor.hpp
 )
 
