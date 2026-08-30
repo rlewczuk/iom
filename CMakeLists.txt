@@ -20,6 +20,7 @@ set(ROCM_PATH "/opt/rocm" CACHE PATH "Path to the ROCm SDK")
 
 set(IOM_SOURCES
         src/iom.cpp
+        src/cpu/device.cpp
         src/llama.cpp
         src/mmap.cpp
         src/safetensors.cpp
@@ -28,6 +29,7 @@ set(IOM_SOURCES
 
 set(IOM_HEADERS
         include/iom/iom.hpp
+        include/iom/cpu/device.hpp
         include/iom/llama.hpp
         include/iom/mmap.hpp
         include/iom/safetensors.hpp

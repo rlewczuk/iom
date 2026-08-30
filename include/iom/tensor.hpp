@@ -111,12 +111,26 @@ namespace iom {
 
     namespace detail {
 
-        // Checked element-slot address in the standard 16x16 tiled layout
-        // (leading plane row-major, then tile row, tile column, row in tile,
-        // column in tile). Not a public tensor representation; shared by
-        // tests and the standard-layout backends.
+        // Checked element-slot address of full dense coordinates in the
+        // standard 16x16 tiled layout (leading plane row-major, then tile
+        // row, tile column, row in tile, column in tile). Not a public
+        // tensor representation; shared by tests and the standard-layout
+        // backends.
         [[nodiscard]] std::size_t standard_layout_slot(
             const TensorSpec& spec, std::span<const std::size_t> coordinates);
+
+        // Exact bit width of every declared leaf encoding.
+        [[nodiscard]] std::size_t leaf_bits(DataType type);
+
+        // Checked element-slot address of (row, column) within one owner
+        // plane of the standard 16x16 tiled layout. standard_layout_slot
+        // derives the plane from dense coordinates; standard-layout
+        // backends with strided views supply the owner plane directly.
+        // Preconditions: spec validates and plane, row, and column address
+        // existing planes and matrix elements.
+        [[nodiscard]] std::size_t standard_plane_slot(
+            const TensorSpec& spec, std::size_t plane,
+            std::size_t row, std::size_t column);
 
     }  // namespace detail
 

@@ -16,3 +16,19 @@ target_link_libraries(iom_tests
 )
 
 add_test(NAME iom_tests COMMAND iom_tests)
+
+add_executable(iom_cpu_tests
+        cpu/test_cpu.cpp
+)
+
+set_source_files_properties(cpu/test_cpu.cpp PROPERTIES
+    COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+)
+
+target_link_libraries(iom_cpu_tests
+    PRIVATE
+        doctest::doctest
+        libiom
+)
+
+add_test(NAME iom_cpu_tests COMMAND iom_cpu_tests)
