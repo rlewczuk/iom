@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+
+[[ $# -eq 2 ]] || fail "usage: remote-sync <profile> <task-id>"
+PROFILE_ARG="$1"
+TASK_ID="$2"
+
+require_cmd ssh
+require_cmd rsync
+validate_task_id "$TASK_ID"
+load_profile "$PROFILE_ARG"
+REMOTE_DIR="$(remote_dir_for "$TASK_ID")"
+
+# Create the destination first. This also validates SSH connectivity.
+ssh "$SSH_HOST" "mkdir -p $(quote_single "$REMOTE_DIR")"
+
+rsync -a --delete-delay --human-readable \
+  --exclude='/.git' \
+  --exclude='/.worktrees' \
+  --exclude='/.remote-hosts.conf' \
+  ./ "$SSH_HOST:$REMOTE_DIR/"
+
+printf 'Synced %s -> %s:%s\n' "$PWD" "$SSH_HOST" "$REMOTE_DIR"

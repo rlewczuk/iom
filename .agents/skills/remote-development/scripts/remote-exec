@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+
+[[ $# -ge 3 ]] || fail "usage: remote-exec <profile> <task-id> <command...>"
+PROFILE_ARG="$1"
+TASK_ID="$2"
+shift 2
+COMMAND="$*"
+
+require_cmd ssh
+validate_task_id "$TASK_ID"
+load_profile "$PROFILE_ARG"
+REMOTE_DIR="$(remote_dir_for "$TASK_ID")"
+
+REMOTE_SCRIPT="set -euo pipefail; cd $(quote_single "$REMOTE_DIR");"
+if [[ -n "${REMOTE_SETUP:-}" ]]; then
+  REMOTE_SCRIPT+=" ${REMOTE_SETUP};"
+fi
+REMOTE_SCRIPT+=" ${COMMAND}"
+
+ssh "$SSH_HOST" "bash -lc $(quote_single "$REMOTE_SCRIPT")"
