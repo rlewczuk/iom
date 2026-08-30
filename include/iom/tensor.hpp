@@ -1,12 +1,11 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <vector>
 
 namespace iom {
-
-    enum class TileSize {
-
-    };
 
     enum class DataType {
         BOOL,
@@ -72,9 +71,54 @@ namespace iom {
         TT_BFP8A,
     };
 
-    class TensorShape {
-        std::vector<int> shape;
+    enum class BackendKind : std::uint8_t {
+        CPU,
+        CUDA,
+        ROCM,
+        SYCL,
+        TTNN,
     };
+
+    class TensorShape {
+    public:
+        explicit TensorShape(std::vector<std::size_t> dimensions);
+
+        [[nodiscard]] std::size_t rank() const noexcept;
+        [[nodiscard]] std::size_t dimension(std::size_t index) const;
+        [[nodiscard]] std::span<const std::size_t> dimensions() const noexcept;
+        [[nodiscard]] std::size_t element_count() const;
+
+        friend bool operator==(const TensorShape&, const TensorShape&) = default;
+
+    private:
+        std::vector<std::size_t> dimensions_;
+    };
+
+    struct TensorSpec {
+        static constexpr std::size_t TILE = 16;
+
+        TensorShape shape;
+        DataType data_type;
+        QuantizationFormat quantization = QuantizationFormat::NONE;
+
+        [[nodiscard]] TensorShape standard_padded_shape() const;
+        [[nodiscard]] std::size_t logical_nbytes() const;
+        [[nodiscard]] std::size_t tiled_storage_nbytes() const;
+        void validate() const;
+
+        friend bool operator==(const TensorSpec&, const TensorSpec&) = default;
+    };
+
+    namespace detail {
+
+        // Checked element-slot address in the standard 16x16 tiled layout
+        // (leading plane row-major, then tile row, tile column, row in tile,
+        // column in tile). Not a public tensor representation; shared by
+        // tests and the standard-layout backends.
+        [[nodiscard]] std::size_t standard_layout_slot(
+            const TensorSpec& spec, std::span<const std::size_t> coordinates);
+
+    }  // namespace detail
 
     /**
      * Represents a tensor.
