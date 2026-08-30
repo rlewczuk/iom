@@ -17,6 +17,7 @@ option(CUDA_ENABLED "Build with CUDA support" OFF)
 set(CUDA_PATH "/usr/local/cuda" CACHE PATH "Path to the CUDA Toolkit")
 option(ROCM_ENABLED "Build with ROCm support" OFF)
 set(ROCM_PATH "/opt/rocm" CACHE PATH "Path to the ROCm SDK")
+option(TTNN_ENABLED "Build with TTNN support" OFF)
 
 set(IOM_SOURCES
         src/iom.cpp
@@ -58,6 +59,36 @@ target_link_libraries(libiom
     PUBLIC
         nlohmann_json::nlohmann_json
 )
+
+if(TTNN_ENABLED)
+    find_package(tt-nn CONFIG REQUIRED)
+    if(NOT TARGET TT::Metalium OR NOT TARGET TTNN::TTNN)
+        message(FATAL_ERROR
+                "TTNN SDK is missing required TT::Metalium or TTNN::TTNN targets")
+    endif()
+
+    add_library(iom_ttnn STATIC
+        src/ttnn/device.cpp
+        include/iom/ttnn/device.hpp
+    )
+
+    target_include_directories(iom_ttnn
+        PUBLIC
+            ${PROJECT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(iom_ttnn
+        PRIVATE
+            libiom
+            TT::Metalium
+            TTNN::TTNN
+    )
+
+    target_compile_definitions(iom_ttnn
+        PRIVATE
+            IOM_TTNN_ENABLED=1
+    )
+endif()
 if(CUDA_ENABLED)
     set(CUDAToolkit_ROOT "${CUDA_PATH}")
     find_package(CUDAToolkit REQUIRED MODULE)

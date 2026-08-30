@@ -148,3 +148,23 @@ target_link_libraries(iom_backend_conformance_cpu_tests
 )
 
 add_test(NAME iom_backend_conformance_cpu_tests COMMAND iom_backend_conformance_cpu_tests)
+
+if(TTNN_ENABLED)
+    add_executable(iom_ttnn_smoke_tests
+            ttnn/test_ttnn_smoke.cpp
+    )
+
+    set_source_files_properties(ttnn/test_ttnn_smoke.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_link_libraries(iom_ttnn_smoke_tests
+        PRIVATE
+            doctest::doctest
+            iom_ttnn
+            TT::Metalium
+            TTNN::TTNN
+    )
+
+    add_test(NAME iom_ttnn_smoke_tests COMMAND iom_ttnn_smoke_tests)
+endif()
