@@ -61,9 +61,17 @@ target_link_libraries(libiom
 if(CUDA_ENABLED)
     set(CUDAToolkit_ROOT "${CUDA_PATH}")
     find_package(CUDAToolkit REQUIRED MODULE)
+    enable_language(CUDA)
     add_library(iom_cuda STATIC
         src/cuda/device.cpp
+        src/cuda/copy.cu
+        src/cuda/copy.hpp
         include/iom/cuda/device.hpp
+    )
+
+    set_target_properties(iom_cuda PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
     )
 
     target_include_directories(iom_cuda
@@ -75,6 +83,7 @@ if(CUDA_ENABLED)
         PRIVATE
             libiom
             CUDA::cuda_driver
+            CUDA::cudart
     )
 
     target_compile_definitions(iom_cuda

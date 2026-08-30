@@ -102,7 +102,31 @@ if(CUDA_ENABLED)
     )
 
     add_test(NAME iom_cuda_smoke_tests COMMAND iom_cuda_smoke_tests)
+    add_executable(iom_cuda_conformance_tests
+            cuda/test_cuda_conformance.cpp
+    )
+
+    set_source_files_properties(cuda/test_cuda_conformance.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_include_directories(iom_cuda_conformance_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_link_libraries(iom_cuda_conformance_tests
+        PRIVATE
+            doctest::doctest
+            iom_cuda
+            libiom
+            CUDA::cuda_driver
+    )
+
+    add_test(NAME iom_cuda_conformance_tests
+             COMMAND iom_cuda_conformance_tests)
 endif()
+
 
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp

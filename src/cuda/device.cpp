@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 
+#include "copy.hpp"
 namespace iom {
 
     namespace {
+        constexpr std::size_t kStorageAlignment = 32;
 
         [[nodiscard]] std::runtime_error cuda_error(
                 const char* operation, CUresult status) {
@@ -40,9 +43,9 @@ namespace iom {
 
         class CudaDevice final : public Device {
         public:
-            CudaDevice(std::uint32_t ordinal, CUcontext context,
+            CudaDevice(std::uint32_t ordinal, CUdevice device, CUcontext context,
                        Allocator& allocator)
-                    : ordinal_(ordinal), context_(context),
+                    : ordinal_(ordinal), device_(device), context_(context),
                       allocator_(allocator) {}
 
             CudaDevice(const CudaDevice&) = delete;
@@ -50,7 +53,7 @@ namespace iom {
 
             ~CudaDevice() override {
                 if (context_ != nullptr) {
-                    (void)cuCtxDestroy(context_);
+                    (void)cuDevicePrimaryCtxRelease(device_);
                     context_ = nullptr;
                 }
             }
@@ -64,23 +67,100 @@ namespace iom {
             }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
-                    const TensorSpec&) override {
-                throw std::runtime_error(
-                        "CUDA tensor storage is not implemented in this scaffold");
-            }
+                    const TensorSpec& spec) override;
 
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
-                throw std::runtime_error(
-                        "CUDA operations are not implemented in this scaffold");
+                activate();
+                return cuda_detail::make_queue(*this, context_);
+            }
+
+            void activate() const {
+                check_cuda("cuCtxSetCurrent", cuCtxSetCurrent(context_));
+            }
+
+            [[nodiscard]] CUcontext context() const noexcept {
+                return context_;
             }
 
         private:
             std::uint32_t ordinal_;
+            CUdevice device_;
             CUcontext context_;
             Allocator& allocator_;
+
+            friend class CudaTensor;
+        };
+
+        class CudaTensor final : public Tensor {
+        public:
+            CudaTensor(const TensorSpec& spec, CudaDevice& device,
+                       Allocator& allocator)
+                    : Tensor(spec, device), device_(device),
+                      allocator_(allocator) {
+                device_.activate();
+                address_ = allocator_.alloc(view().spec().tiled_storage_nbytes());
+                if (address_ == nullptr) {
+                    throw std::bad_alloc();
+                }
+                if (reinterpret_cast<std::uintptr_t>(address_)
+                                % kStorageAlignment
+                        != 0) {
+                    void* misaligned = address_;
+                    address_ = nullptr;
+                    allocator_.free(misaligned);
+                    throw std::runtime_error(
+                        "CUDA tensor storage is not 32-byte aligned");
+                }
+            }
+
+            ~CudaTensor() override {
+                if (address_ == nullptr) {
+                    return;
+                }
+                try {
+                    device_.activate();
+                } catch (...) {
+                }
+                try {
+                    allocator_.free(address_);
+                } catch (...) {
+                }
+                address_ = nullptr;
+            }
+
+        private:
+            [[nodiscard]] void* storage_handle() noexcept override {
+                return address_;
+            }
+
+            void region_from_host(
+                    const TensorView& destination,
+                    std::span<const std::byte> source) override {
+                device_.activate();
+                cuda_detail::region_from_host(
+                        device_.context(), destination, source);
+            }
+
+            void region_to_host(
+                    const TensorView& source,
+                    std::span<std::byte> destination) const override {
+                device_.activate();
+                cuda_detail::region_to_host(
+                        device_.context(), source, destination);
+            }
+
+            CudaDevice& device_;
+            Allocator& allocator_;
+            void* address_ = nullptr;
         };
 
     }  // namespace
+
+    std::unique_ptr<Tensor> CudaDevice::create_tensor(
+            const TensorSpec& spec) {
+        activate();
+        return std::make_unique<CudaTensor>(spec, *this, allocator_);
+    }
 
     std::unique_ptr<Device> make_cuda_device(
             std::uint32_t device_ordinal, Allocator& allocator) {
@@ -105,21 +185,16 @@ namespace iom {
         check_cuda(
                 "cuDeviceGet",
                 cuDeviceGet(&device, static_cast<int>(device_ordinal)));
-
         CUcontext context = nullptr;
-#if CUDA_VERSION >= 13000
         check_cuda(
-                "cuCtxCreate",
-                cuCtxCreate(&context, nullptr, 0, device));
-#else
-        check_cuda("cuCtxCreate", cuCtxCreate(&context, 0, device));
-#endif
-
+                "cuDevicePrimaryCtxRetain",
+                cuDevicePrimaryCtxRetain(&context, device));
+        check_cuda("cuCtxSetCurrent", cuCtxSetCurrent(context));
         try {
             return std::make_unique<CudaDevice>(
-                    device_ordinal, context, allocator);
+                    device_ordinal, device, context, allocator);
         } catch (...) {
-            (void)cuCtxDestroy(context);
+            (void)cuDevicePrimaryCtxRelease(device);
             throw;
         }
     }
