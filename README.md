@@ -62,6 +62,43 @@ ctest --test-dir build/rocm --output-on-failure \
   -R '^iom_rocm_smoke_tests$'
 ```
 
+Build with TTNN support:
+
+```sh
+cmake -S . -B build/ttnn \
+  -DBUILD_TESTING=ON \
+  -DTTNN_ENABLED=ON \
+  -DCUDA_ENABLED=OFF \
+  -DROCM_ENABLED=OFF
+cmake --build build/ttnn --target iom_ttnn
+```
+
+The Tenstorrent SDK must be installed system-wide and expose its `tt-nn` and
+`tt-metalium` CMake packages (`TT::Metalium`, `TTNN::TTNN`). Enabling TTNN
+fails configuration when those packages are absent; it does not silently
+disable the backend. The supported leaf types are `BOOL`, `U8`, `I8`, `U16`,
+`I16`, `U32`, `I32`, `BF16`, and `F32`; every other declared leaf type and
+every grouped quantization format is rejected before native allocation. The
+smoke test requires a usable Tenstorrent device/runtime and does not skip
+when TTNN is enabled:
+
+```sh
+cmake --build build/ttnn --target iom_ttnn_smoke_tests
+ctest --test-dir build/ttnn --output-on-failure \
+  -R '^iom_ttnn_smoke_tests$'
+```
+
+The conformance test runs the shared storage, host transfer, asynchronous
+copy, error, lifetime, and capability suite against the CPU reference and a
+hardware-backed Tenstorrent device; it fails (never skips) when no device is
+available:
+
+```sh
+cmake --build build/ttnn --target iom_ttnn_conformance_tests
+ctest --test-dir build/ttnn --output-on-failure \
+  -R '^iom_ttnn_conformance_tests$'
+```
+
 Run:
 
 ```sh
