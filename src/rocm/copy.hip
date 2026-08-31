@@ -127,6 +127,13 @@ __device__ std::uint64_t read_bits(
 __device__ void write_bits(
         unsigned char* base, std::uint64_t bit_offset, unsigned int bits,
         std::uint64_t value) {
+    if (bits % 8 == 0) {
+        unsigned char* destination = base + bit_offset / 8;
+        for (unsigned int i = 0; i < bits / 8; ++i) {
+            destination[i] = static_cast<unsigned char>(value >> (i * 8));
+        }
+        return;
+    }
     for (unsigned int i = 0; i < bits; ++i) {
         const std::uint64_t bit = bit_offset + i;
         auto* word = reinterpret_cast<unsigned int*>(
@@ -354,7 +361,7 @@ public:
                 detail::leaf_bits(source.spec().data_type));
         const void* source_handle = source.native_handle();
         void* destination_handle = destination.native_handle();
-        return submit([&](std::uint64_t sequence) {
+        const oid token = submit([&](std::uint64_t sequence) {
             ContextGuard guard(context_);
             hipEvent_t event = nullptr;
             check_hip("hipEventCreateWithFlags",
@@ -373,6 +380,8 @@ public:
                 throw;
             }
         });
+        publish_staged();
+        return token;
     }
 
     oid add(const TensorView&, const TensorView&, TensorView&) override {

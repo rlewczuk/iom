@@ -99,6 +99,36 @@ ctest --test-dir build/ttnn --output-on-failure \
   -R '^iom_ttnn_conformance_tests$'
 ```
 
+## Build with every backend together
+
+`CUDA_ENABLED`, `ROCM_ENABLED`, and `TTNN_ENABLED` are independent: no
+option disables another, and each controls only its own library,
+dependencies, and tests. `libiom` always contains the common code and the
+CPU backend, so any combination of accelerator options configures and
+builds alongside it:
+
+```sh
+cmake -S . -B build/all \
+  -DBUILD_TESTING=ON \
+  -DCUDA_ENABLED=ON \
+  -DROCM_ENABLED=ON \
+  -DTTNN_ENABLED=ON \
+  -DCUDA_PATH=/usr/local/cuda \
+  -DROCM_PATH=/opt/rocm
+cmake --build build/all --target iom_backend_coexistence_tests
+```
+
+The coexistence test links `libiom` and every enabled backend library into
+one executable, constructs devices and queues from every backend in one
+process, interleaves asynchronous `BF16` copies across the queues, waits
+on each originating queue, and compares bit-identical logical results. It
+fails (never skips) when an enabled backend has no usable device:
+
+```sh
+ctest --test-dir build/all --output-on-failure \
+  -R '^iom_backend_coexistence_tests$'
+```
+
 Run:
 
 ```sh
