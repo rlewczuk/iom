@@ -5,6 +5,10 @@
 
 #include "iom/iom.hpp"
 
+// This is scratchpad file, it is only useful to point aspects of design yet to be implemented.
+// You can reference to it when designing new features but take into account it may be buggy and badly written.
+// Please omit it during review.
+
 namespace iom::models {
     class LlamaRoPE {
         DeviceOps& dev;
