@@ -41,20 +41,11 @@ namespace iom {
 
         class RocmDevice final : public Device {
         public:
-            RocmDevice(std::uint32_t ordinal, hipCtx_t context,
-                       Allocator& allocator)
-                    : ordinal_(ordinal), context_(context),
-                      allocator_(allocator) {}
+            RocmDevice(std::uint32_t ordinal, Allocator& allocator)
+                    : ordinal_(ordinal), allocator_(allocator) {}
 
             RocmDevice(const RocmDevice&) = delete;
             RocmDevice& operator=(const RocmDevice&) = delete;
-
-            ~RocmDevice() override {
-                if (context_ != nullptr) {
-                    (void)hipCtxDestroy(context_);
-                    context_ = nullptr;
-                }
-            }
 
             [[nodiscard]] BackendKind backend_kind() const noexcept override {
                 return BackendKind::ROCM;
@@ -69,20 +60,18 @@ namespace iom {
 
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 activate();
-                return rocm_detail::make_queue(*this, context_);
+                return rocm_detail::make_queue(
+                        *this, static_cast<int>(ordinal_));
             }
 
             void activate() const {
-                check_hip("hipCtxSetCurrent", hipCtxSetCurrent(context_));
-            }
-
-            [[nodiscard]] hipCtx_t context() const noexcept {
-                return context_;
+                check_hip(
+                        "hipSetDevice",
+                        hipSetDevice(static_cast<int>(ordinal_)));
             }
 
         private:
             std::uint32_t ordinal_;
-            hipCtx_t context_;
             Allocator& allocator_;
 
             friend class RocmTensor;
@@ -134,7 +123,8 @@ namespace iom {
                     std::span<const std::byte> source) override {
                 device_.activate();
                 rocm_detail::region_from_host(
-                        device_.context(), destination, source);
+                        static_cast<int>(device_.ordinal_), destination,
+                        source);
             }
 
             void region_to_host(
@@ -142,7 +132,8 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 device_.activate();
                 rocm_detail::region_to_host(
-                        device_.context(), source, destination);
+                        static_cast<int>(device_.ordinal_), source,
+                        destination);
             }
 
             RocmDevice& device_;
@@ -172,20 +163,11 @@ namespace iom {
             throw invalid_ordinal(device_ordinal, device_count);
         }
 
-        hipCtx_t context = nullptr;
         check_hip(
-                "hipCtxCreate",
-                hipCtxCreate(
-                        &context, 0,
-                        static_cast<hipDevice_t>(device_ordinal)));
+                "hipSetDevice",
+                hipSetDevice(static_cast<int>(device_ordinal)));
 
-        try {
-            return std::make_unique<RocmDevice>(
-                    device_ordinal, context, allocator);
-        } catch (...) {
-            (void)hipCtxDestroy(context);
-            throw;
-        }
+        return std::make_unique<RocmDevice>(device_ordinal, allocator);
     }
 
 }  // namespace iom

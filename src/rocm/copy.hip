@@ -34,9 +34,9 @@ void check_hip(const char* operation, hipError_t status) {
     }
 }
 
-struct ContextGuard {
-    explicit ContextGuard(hipCtx_t context) {
-        check_hip("hipCtxSetCurrent", hipCtxSetCurrent(context));
+struct DeviceGuard {
+    explicit DeviceGuard(int device_ordinal) {
+        check_hip("hipSetDevice", hipSetDevice(device_ordinal));
     }
 };
 
@@ -261,10 +261,10 @@ void launch_view_transfer(
 }
 
 void synchronous_transfer(
-        hipCtx_t context, const TensorView& view,
+        int device_ordinal, const TensorView& view,
         std::span<const std::byte> source, std::span<std::byte> destination,
         bool from_host) {
-    ContextGuard guard(context);
+    DeviceGuard guard(device_ordinal);
     void* staging = nullptr;
     hipStream_t stream = nullptr;
     try {
@@ -307,9 +307,9 @@ void synchronous_transfer(
 
 class RocmQueue final : public DeviceOps {
 public:
-    RocmQueue(const Device& device, hipCtx_t context)
-            : device_(&device), context_(context) {
-        ContextGuard guard(context_);
+    RocmQueue(const Device& device, int device_ordinal)
+            : device_(&device), device_ordinal_(device_ordinal) {
+        DeviceGuard guard(device_ordinal_);
         check_hip("hipStreamCreateWithFlags",
                   hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking));
         try {
@@ -331,7 +331,7 @@ public:
             worker_.join();
         }
         try {
-            ContextGuard guard(context_);
+            DeviceGuard guard(device_ordinal_);
             std::lock_guard<std::mutex> lock(mutex_);
             while (!staged_.empty()) {
                 (void)hipEventDestroy(staged_.front().event);
@@ -362,7 +362,7 @@ public:
         const void* source_handle = source.native_handle();
         void* destination_handle = destination.native_handle();
         const oid token = submit([&](std::uint64_t sequence) {
-            ContextGuard guard(context_);
+            DeviceGuard guard(device_ordinal_);
             hipEvent_t event = nullptr;
             check_hip("hipEventCreateWithFlags",
                       hipEventCreateWithFlags(&event, hipEventDisableTiming));
@@ -460,7 +460,7 @@ private:
 
     void run() {
         try {
-            ContextGuard guard(context_);
+            DeviceGuard guard(device_ordinal_);
             std::unique_lock<std::mutex> lock(mutex_);
             for (;;) {
                 completion_.wait(lock, [this] {
@@ -498,7 +498,7 @@ private:
     }
 
     const Device* device_;
-    hipCtx_t context_;
+    int device_ordinal_;
     hipStream_t stream_ = nullptr;
     std::mutex mutex_;
     std::condition_variable completion_;
@@ -511,19 +511,19 @@ private:
 }  // namespace
 
 void region_from_host(
-        hipCtx_t context, const TensorView& destination,
+        int device_ordinal, const TensorView& destination,
         std::span<const std::byte> source) {
-    synchronous_transfer(context, destination, source, {}, true);
+    synchronous_transfer(device_ordinal, destination, source, {}, true);
 }
 
 void region_to_host(
-        hipCtx_t context, const TensorView& source,
+        int device_ordinal, const TensorView& source,
         std::span<std::byte> destination) {
-    synchronous_transfer(context, source, {}, destination, false);
+    synchronous_transfer(device_ordinal, source, {}, destination, false);
 }
 
-std::unique_ptr<DeviceOps> make_queue(const Device& device, hipCtx_t context) {
-    return std::make_unique<RocmQueue>(device, context);
+std::unique_ptr<DeviceOps> make_queue(const Device& device, int device_ordinal) {
+    return std::make_unique<RocmQueue>(device, device_ordinal);
 }
 
 }  // namespace iom::rocm_detail

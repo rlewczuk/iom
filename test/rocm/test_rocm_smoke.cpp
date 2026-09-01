@@ -41,7 +41,7 @@ public:
 
 }  // namespace
 
-TEST_CASE("ROCm factory reports a live hardware device and owns its context") {
+TEST_CASE("ROCm factory reports a live hardware device and selects it current") {
     int device_count = 0;
     REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
     REQUIRE(device_count > 0);
@@ -53,9 +53,9 @@ TEST_CASE("ROCm factory reports a live hardware device and owns its context") {
         CHECK(device->backend_kind() == iom::BackendKind::ROCM);
         CHECK(device->backend_device() == 0);
 
-        hipCtx_t current_context = nullptr;
-        REQUIRE(hipCtxGetCurrent(&current_context) == hipSuccess);
-        CHECK(current_context != nullptr);
+        int current_device = -1;
+        REQUIRE(hipGetDevice(&current_device) == hipSuccess);
+        CHECK(current_device == 0);
 
         auto tensor = device->create_tensor(
                 iom::TensorSpec{
@@ -67,9 +67,8 @@ TEST_CASE("ROCm factory reports a live hardware device and owns its context") {
     }
     CHECK(allocator.frees == 1);
 
-    // A second construction after the first owner leaves scope exercises
-    // deterministic context teardown without relying on a process-global
-    // active-device selection.
+    // A second construction after the first owner leaves scope remains
+    // deterministic: the factory re-selects the device on this thread.
     auto recreated = iom::make_rocm_device(0, allocator);
     REQUIRE(recreated != nullptr);
     CHECK(recreated->backend_kind() == iom::BackendKind::ROCM);
