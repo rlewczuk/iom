@@ -268,13 +268,13 @@ void synchronous_transfer(
     void* staging = nullptr;
     hipStream_t stream = nullptr;
     try {
-        check_hip("hipMalloc", hipMalloc(&staging, view.spec().logical_nbytes()));
         check_hip("hipStreamCreateWithFlags",
                   hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        check_hip("hipMalloc", hipMalloc(&staging, view.spec().logical_nbytes()));
         if (from_host) {
-            check_hip("hipMemcpy HtoD",
-                      hipMemcpy(staging, source.data(), source.size(),
-                                hipMemcpyHostToDevice));
+            check_hip("hipMemcpyAsync HtoD",
+                      hipMemcpyAsync(staging, source.data(), source.size(),
+                                     hipMemcpyHostToDevice, stream));
             launch_view_transfer(
                     stream, view, staging,
                     const_cast<void*>(view.native_handle()), true);

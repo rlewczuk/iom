@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "backend/backend_conformance.hpp"
+#include "backend/backend_conformance_common.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/device.hpp"

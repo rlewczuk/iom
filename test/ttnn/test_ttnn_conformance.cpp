@@ -10,7 +10,9 @@
 #include <span>
 #include <vector>
 
-#include "backend/backend_conformance.hpp"
+#include "backend/backend_conformance_common.hpp"
+#include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_other.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/ttnn/device.hpp"
 
