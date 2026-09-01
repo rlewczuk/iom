@@ -10,6 +10,8 @@ Review one change specification until it is accurate, focused, testable, and mut
 
 The command supplies a **spec name**. Work from the project root and use exactly these paths:
 
+Note that `<spec-name>` may refer either to directory directly in `doc/changes` or any subdirectory, for example `0123-some-changes/03-cleanups`.
+
 - Specification: `docs/changes/<spec-name>/spec.md`
 - User remarks, optional: `docs/changes/<spec-name>/spec-fixme.md`
 
