@@ -5,9 +5,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "backend/backend_conformance_common.hpp"
@@ -111,6 +114,87 @@ TEST_CASE("TTNN supported-type table acceptance and rejection") {
                 iom::TensorShape{{16, 16}}, iom::DataType::BF16, format};
         CHECK_THROWS_AS(device->create_tensor(spec), std::runtime_error);
     }
+}
+
+// Every extent the TTNN native constructor cannot represent is rejected
+// with std::overflow_error before any native object or allocation exists.
+// The three review-cited shapes previously wrapped or narrowed silently;
+// the boundary case proves the largest representable extent is retained.
+TEST_CASE("TTNN rejects overflowing and narrowing extents before native allocation") {
+    require_hardware();
+    auto device = iom::make_ttnn_device(0);
+
+    // Leading-plane product wraps modulo 2^64 to zero: the unchecked path
+    // materialized zero native planes for a logical 2^63 * 2 * 16 * 16
+    // plane count, and copies silently did no work.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{std::size_t{1} << 63, 2, 16, 16}},
+                iom::DataType::BF16};
+        CHECK_THROWS_AS(device->create_tensor(spec), std::overflow_error);
+    }
+
+    // Column count exceeds the uint32_t native extent ceiling: the
+    // unchecked static_cast narrowed 2^32 + 1 columns to one, undersizing
+    // the native plane and later host-buffer copies.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, (std::size_t{1} << 32) + 1}},
+                iom::DataType::BF16};
+        CHECK_THROWS_AS(device->create_tensor(spec), std::overflow_error);
+    }
+
+    // The leading-plane product overflows even though every individual
+    // extent fits: 2 * (SIZE_MAX / 2 + 1) wraps modulo 2^64.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{
+                        {2,
+                         std::numeric_limits<std::size_t>::max() / 2 + 1,
+                         16, 16}},
+                iom::DataType::BF16};
+        CHECK_THROWS_AS(device->create_tensor(spec), std::overflow_error);
+    }
+
+    // The largest representable extent is retained: the maximal uint32_t
+    // column count passes every pre-allocation check, so the call is never
+    // rejected with std::overflow_error. On real hardware the only
+    // rejection is the TTNN native allocator, which cannot back the
+    // 256 GiB tiled plane of a {1, UINT32_MAX} BF16 tensor on any existing
+    // device. A std::overflow_error here would mean the fix over-rejects
+    // the largest extent the TTNN runtime can represent.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, std::numeric_limits<std::uint32_t>::max()}},
+                iom::DataType::BF16};
+        bool validation_rejected = false;
+        try {
+            auto tensor = device->create_tensor(spec);
+            // A device with enough memory: creation succeeds and the
+            // logical metadata stays unchanged.
+            if (tensor != nullptr) {
+                CHECK(tensor->view().spec().shape.dimension(0) == 1);
+                CHECK(tensor->view().spec().shape.dimension(1)
+                      == std::numeric_limits<std::uint32_t>::max());
+            }
+        } catch (const std::overflow_error&) {
+            validation_rejected = true;
+        } catch (const std::exception& e) {
+            // Any exception here is the native allocation path rejecting a
+            // validated extent; the pre-allocation checks accepted it. The
+            // TT_FATAL payload embeds a backtrace; keep its first line.
+            const std::string native_rejection = e.what();
+            const std::size_t end = native_rejection.find('\n');
+            MESSAGE("boundary extent passed validation; native rejection: "
+                    << native_rejection.substr(0, end));
+        }
+        CHECK_FALSE(validation_rejected);
+    }
+
+    // Rejections leave the device healthy: a minimal supported tensor still
+    // creates afterwards.
+    CHECK_NOTHROW(device->create_tensor(
+            iom::TensorSpec{iom::TensorShape{{16, 16}}, iom::DataType::BF16}));
 }
 
 TEST_CASE("TTNN conformance: storage and host transfers for every supported type") {

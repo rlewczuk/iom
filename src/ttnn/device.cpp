@@ -79,6 +79,55 @@ namespace iom {
                     + std::to_string(device_count));
         }
 
+        // Checked narrowing of a TTNN native extent. tt::tt_metal::Shape
+        // stores every dimension as uint32_t, so a logical dimension beyond
+        // that ceiling is unreachable on the native path and must be
+        // rejected before any native object is constructed.
+        [[nodiscard]] std::uint32_t checked_to_uint32(
+                std::size_t dimension, std::size_t index) {
+            constexpr std::size_t kMaxNativeExtent =
+                    std::numeric_limits<std::uint32_t>::max();
+            if (dimension > kMaxNativeExtent) {
+                throw std::overflow_error(
+                        "TTNN native dimension " + std::to_string(index)
+                        + " (" + std::to_string(dimension)
+                        + ") exceeds the uint32_t native extent limit "
+                        + std::to_string(kMaxNativeExtent));
+            }
+            return static_cast<std::uint32_t>(dimension);
+        }
+
+        // Checked leading-plane count for the TTNN creation path: validates
+        // the final two dimensions against the native extent ceiling and
+        // multiplies the leading dimensions with the checked-multiplication
+        // pattern of iom::detail::checked_mul, throwing
+        // std::overflow_error on the first wrap. Pure; runs before any
+        // TTNN native object or allocation exists.
+        [[nodiscard]] std::size_t checked_plane_count(const TensorSpec& spec) {
+            const std::span<const std::size_t> dimensions =
+                    spec.shape.dimensions();
+            static_cast<void>(checked_to_uint32(
+                    dimensions[dimensions.size() - 2],
+                    dimensions.size() - 2));
+            static_cast<void>(checked_to_uint32(
+                    dimensions[dimensions.size() - 1],
+                    dimensions.size() - 1));
+            std::size_t plane_count = 1;
+            for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
+                const std::size_t dimension = dimensions[i];
+                if (dimension != 0
+                        && plane_count
+                                > std::numeric_limits<std::size_t>::max()
+                                        / dimension) {
+                    throw std::overflow_error(
+                            "TTNN leading-plane count overflows at dimension "
+                            + std::to_string(i));
+                }
+                plane_count *= dimension;
+            }
+            return plane_count;
+        }
+
         class TtnnDevice final : public Device {
         public:
             TtnnDevice(
@@ -128,28 +177,30 @@ namespace iom {
         class TtnnTensor final : public Tensor {
         public:
             // The caller holds the device's API mutex and has already
-            // validated the specification against the supported-type table.
+            // validated the specification against the supported-type table
+            // and the representable native extents; the checks are repeated
+            // here so the native constructor can never be reached with a
+            // non-representable extent from any entry path.
             TtnnTensor(const TensorSpec& spec, TtnnDevice& device)
                     : Tensor(spec, device), device_(device) {
                 const std::span<const std::size_t> dimensions =
                         spec.shape.dimensions();
+                const std::size_t plane_count = checked_plane_count(spec);
                 const tt::tt_metal::TensorSpec plane_spec(
                         tt::tt_metal::Shape{
                                 1u,
-                                static_cast<std::uint32_t>(
-                                        dimensions[dimensions.size() - 2]),
-                                static_cast<std::uint32_t>(
-                                        dimensions[dimensions.size() - 1])},
+                                checked_to_uint32(
+                                        dimensions[dimensions.size() - 2],
+                                        dimensions.size() - 2),
+                                checked_to_uint32(
+                                        dimensions[dimensions.size() - 1],
+                                        dimensions.size() - 1)},
                         tt::tt_metal::TensorLayout(
                                 native_dtype(spec.data_type),
                                 tt::tt_metal::PageConfig(
                                         tt::tt_metal::Layout::TILE,
                                         tt::tt_metal::Tile()),
                                 tt::tt_metal::MemoryConfig{}));
-                std::size_t plane_count = 1;
-                for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
-                    plane_count *= dimensions[i];
-                }
                 planes_.reserve(plane_count);
                 for (std::size_t plane = 0; plane < plane_count; ++plane) {
                     planes_.push_back(ttnn::create_device_tensor(
@@ -393,6 +444,13 @@ namespace iom {
             throw std::runtime_error(
                     "TTNN backend does not support the requested DataType");
         }
+        // Reject every extent the TTNN native constructor cannot represent
+        // before any native object or allocation exists: the final two
+        // dimensions must fit the uint32_t native extent ceiling and the
+        // leading-plane product must fit std::size_t. These are pure size
+        // checks, so they run before the API lock and before the
+        // supported-type table membership decides on native access.
+        static_cast<void>(checked_plane_count(spec));
         std::lock_guard<std::mutex> lock(api_mutex_);
         return std::make_unique<TtnnTensor>(spec, *this);
     }
