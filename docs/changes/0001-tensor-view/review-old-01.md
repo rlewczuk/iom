@@ -2,6 +2,8 @@
 
 ## Review metadata
 
+This review is outdated, please ignore it.
+
 - **Scope:** whole-codebase, centered on the completed behavior claimed by `0001-tensor-view`
 - **Target commit:** n/a
 - **Baseline:** n/a
