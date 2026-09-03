@@ -57,13 +57,13 @@ Use when the user supplies a commit hash or commit message.
 Resolve without changing checkout state. Prefer:
 
 ```bash
-python .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
+python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
 ```
 
 or:
 
 ```bash
-python .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
+python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
 ```
 
 Resolution rules:
@@ -98,7 +98,7 @@ docs/changes/<change-name>[/<subchange>]
 
 then:
 
-1. Normalize it to a repository-relative directory. Prefer `python .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<path>'`.
+1. Normalize it to a repository-relative directory. Prefer `python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<path>'`.
 2. Verify that it exists and remains beneath `docs/changes/`.
 3. Read all relevant specification/design/task files recursively, excluding an existing `review.md` as review evidence unless the user explicitly asks to revisit it.
 4. Distinguish **required external behavior** from incidental implementation details.
@@ -243,7 +243,7 @@ If a specification directory was supplied, write the completed report to:
 Then validate:
 
 ```bash
-python .agents/cpp-review/scripts/validate_review.py \
+python3 .agents/cpp-review/scripts/validate_review.py \
   --review-file '<spec-dir>/review.md' \
   --spec-dir '<spec-dir>'
 ```
