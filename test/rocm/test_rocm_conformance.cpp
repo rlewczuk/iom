@@ -168,6 +168,30 @@ TEST_CASE("ROCm conformance: deferred queue lifetime and stability") {
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the staged atomic word") {
+    TrafficGate gate;
+    HipAllocator candidate_allocator(gate);
+    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    constexpr std::uint64_t salt = 0x180001ull;
+    for (const iom::DataType type : {
+                 iom::DataType::I2,
+                 iom::DataType::F6_E2M3,
+                 iom::DataType::F6_E3M2}) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{std::vector<std::size_t>{1, 17}}, type};
+        const std::vector<std::byte> expected =
+                iom_conformance::encode_logical(spec, salt);
+        CHECK_EQ(
+                spec.logical_nbytes(),
+                type == iom::DataType::I2 ? std::size_t{5} : std::size_t{13});
+        auto tensor = candidate->create_tensor(spec);
+        tensor->view().copy_from_host(expected);
+        iom_conformance::require_logical_bytes(
+                tensor->view(), expected, "odd-length sub-byte host read");
+    }
+    CHECK_FALSE(gate.armed());
+}
+
 TEST_CASE("ROCm conformance: compute methods reject capability without submitting") {
     TrafficGate gate;
     HipAllocator candidate_allocator(gate);

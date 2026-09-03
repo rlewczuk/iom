@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -264,13 +265,22 @@ void synchronous_transfer(
         int device_ordinal, const TensorView& view,
         std::span<const std::byte> source, std::span<std::byte> destination,
         bool from_host) {
+    const std::size_t logical_nbytes = view.spec().logical_nbytes();
+    constexpr std::size_t kWordBytes = sizeof(unsigned int);
+    const std::size_t padding =
+            (kWordBytes - logical_nbytes % kWordBytes) % kWordBytes;
+    if (padding
+            > std::numeric_limits<std::size_t>::max() - logical_nbytes) {
+        throw std::overflow_error("ROCm transfer staging size overflows");
+    }
+    const std::size_t staging_nbytes = logical_nbytes + padding;
     DeviceGuard guard(device_ordinal);
     void* staging = nullptr;
     hipStream_t stream = nullptr;
     try {
         check_hip("hipStreamCreateWithFlags",
                   hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-        check_hip("hipMalloc", hipMalloc(&staging, view.spec().logical_nbytes()));
+        check_hip("hipMalloc", hipMalloc(&staging, staging_nbytes));
         if (from_host) {
             check_hip("hipMemcpyAsync HtoD",
                       hipMemcpyAsync(staging, source.data(), source.size(),
@@ -279,10 +289,7 @@ void synchronous_transfer(
                     stream, view, staging,
                     const_cast<void*>(view.native_handle()), true);
         } else {
-            check_hip("hipMemset", hipMemset(
-                                              staging,
-                                              0,
-                                              view.spec().logical_nbytes()));
+            check_hip("hipMemset", hipMemset(staging, 0, staging_nbytes));
             launch_view_transfer(stream, view, view.native_handle(), staging, false);
         }
         check_hip("hipStreamSynchronize", hipStreamSynchronize(stream));
