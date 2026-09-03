@@ -14,12 +14,19 @@ namespace iom {
      * context and creates that context's tensors and operation queues. There
      * is no registry and no backend switch: each backend ships a separate
      * factory returning std::unique_ptr<Device>, and user code subclasses
-     * Device directly. The Device must outlive every tensor and queue it
-     * created. This header stays free of any CUDA, HIP, SYCL, or TTNN type.
+     * Device is non-copyable and non-movable so its owner address stays stable
+     * for the tensors and queues it created. The Device must outlive every
+     * tensor and queue it created. This header stays free of any CUDA, HIP,
+     * SYCL, or TTNN type.
      */
     class Device {
     public:
         virtual ~Device() = default;
+        Device() = default;
+        Device(const Device&) = delete;
+        Device& operator=(const Device&) = delete;
+        Device(Device&&) = delete;
+        Device& operator=(Device&&) = delete;
 
         [[nodiscard]] virtual BackendKind backend_kind() const noexcept = 0;
         [[nodiscard]] virtual std::uint32_t backend_device() const noexcept = 0;

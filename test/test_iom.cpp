@@ -779,6 +779,13 @@ TEST_CASE("Tensor owner constructs through a device with a stable full view") {
     CHECK(owned->view().native_handle() != nullptr);
 }
 
+TEST_CASE("Device owners are non-copyable and non-movable") {
+    static_assert(!std::is_copy_constructible_v<FakeDevice>);
+    static_assert(!std::is_copy_assignable_v<FakeDevice>);
+    static_assert(!std::is_move_constructible_v<FakeDevice>);
+    static_assert(!std::is_move_assignable_v<FakeDevice>);
+}
+
 TEST_CASE("Tensor owner validates its specification") {
     FakeDevice device;
 
