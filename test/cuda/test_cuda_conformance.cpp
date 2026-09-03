@@ -207,6 +207,36 @@ struct CudaDevices {
     }
 };
 
+class CudaStorageOracle final
+        : public iom_conformance::AcceleratorStorageOracle {
+public:
+    void seed(
+            iom::TensorView& view,
+            std::span<const std::byte> encoded) override {
+        const std::size_t bytes = owner_spec().tiled_storage_nbytes();
+        REQUIRE_EQ(encoded.size(), bytes);
+        REQUIRE(cudaMemcpy(
+                        view.native_handle(), encoded.data(), bytes,
+                        cudaMemcpyHostToDevice)
+                == cudaSuccess);
+        REQUIRE(cudaStreamSynchronize(0) == cudaSuccess);
+    }
+
+    [[nodiscard]] std::vector<std::byte> observe(
+            const iom::TensorView& view) const override {
+        const std::size_t bytes = owner_spec().tiled_storage_nbytes();
+        std::vector<std::byte> result(bytes);
+        REQUIRE(cudaStreamSynchronize(0) == cudaSuccess);
+        REQUIRE(cudaMemcpy(
+                        result.data(), view.native_handle(), bytes,
+                        cudaMemcpyDeviceToHost)
+                == cudaSuccess);
+        REQUIRE(cudaStreamSynchronize(0) == cudaSuccess);
+        return result;
+    }
+};
+
+
 void expect_repeated_runtime_failure(
         iom::DeviceOps& queue, iom::oid token) {
     std::string message;
@@ -236,6 +266,33 @@ TEST_CASE("CUDA conformance: storage and host transfers for every leaf type") {
             devices.conformance(), kCudaLeafTypes, &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
+
+TEST_CASE("CUDA conformance: storage oracle identifies perturbed transfer map") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    const std::span<const iom::DataType> one_type{
+            kCudaLeafTypes.begin(), 1};
+    iom_conformance::run_storage_and_transfer_conformance(
+            devices.conformance(), one_type, &devices.gate);
+
+    CudaStorageOracle direct;
+    iom_conformance::PermutingStorageOracle perturbed(
+            direct, iom_conformance::swap_first_adjacent_slots);
+    CHECK_FALSE(iom_conformance::run_storage_oracle_conformance(
+            devices.conformance(), one_type, perturbed, &devices.gate,
+            false, false));
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA conformance: storage oracle covers every leaf width and padded shape") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    REQUIRE(iom_conformance::run_storage_oracle_conformance(
+            devices.conformance(), kCudaLeafTypes, oracle, &devices.gate));
+    CHECK_FALSE(devices.gate.armed());
+}
+
 
 TEST_CASE("CUDA conformance: asynchronous copies against the CPU reference") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);

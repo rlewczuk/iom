@@ -201,6 +201,77 @@ TEST_CASE("ROCm conformance: storage and host transfers for every leaf type") {
     CHECK_FALSE(gate.armed());
 }
 
+class HipStorageOracle final
+        : public iom_conformance::AcceleratorStorageOracle {
+public:
+    void seed(
+            iom::TensorView& view,
+            std::span<const std::byte> encoded) override {
+        const std::size_t bytes = owner_spec().tiled_storage_nbytes();
+        REQUIRE_EQ(encoded.size(), bytes);
+        REQUIRE(hipMemcpy(
+                        view.native_handle(), encoded.data(), bytes,
+                        hipMemcpyHostToDevice)
+                == hipSuccess);
+        REQUIRE(hipDeviceSynchronize() == hipSuccess);
+    }
+
+    [[nodiscard]] std::vector<std::byte> observe(
+            const iom::TensorView& view) const override {
+        const std::size_t bytes = owner_spec().tiled_storage_nbytes();
+        std::vector<std::byte> result(bytes);
+        REQUIRE(hipDeviceSynchronize() == hipSuccess);
+        REQUIRE(hipMemcpy(
+                        result.data(), view.native_handle(), bytes,
+                        hipMemcpyDeviceToHost)
+                == hipSuccess);
+        REQUIRE(hipDeviceSynchronize() == hipSuccess);
+        return result;
+    }
+};
+TEST_CASE("ROCm conformance: storage oracle identifies perturbed transfer map") {
+    TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    HipAllocator candidate_allocator(gate);
+    HipAllocator foreign_allocator(gate);
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    const std::span<const iom::DataType> one_type{
+            kRocmLeafTypes.begin(), 1};
+    iom_conformance::run_storage_and_transfer_conformance(
+            devices, one_type, &gate);
+
+    HipStorageOracle direct;
+    iom_conformance::PermutingStorageOracle perturbed(
+            direct, iom_conformance::swap_first_adjacent_slots);
+    CHECK_FALSE(iom_conformance::run_storage_oracle_conformance(
+            devices, one_type, perturbed, &gate, false, false));
+    CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm conformance: storage oracle covers every leaf width and padded shape") {
+    TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    HipAllocator candidate_allocator(gate);
+    HipAllocator foreign_allocator(gate);
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
+    REQUIRE(iom_conformance::run_storage_oracle_conformance(
+            devices, kRocmLeafTypes, oracle, &gate));
+    CHECK_FALSE(gate.armed());
+}
+
+
+
 TEST_CASE("ROCm conformance: asynchronous copies against the CPU reference") {
     TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);

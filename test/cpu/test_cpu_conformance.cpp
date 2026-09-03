@@ -118,6 +118,14 @@ TEST_CASE("CPU conformance: storage and host transfers for every leaf type") {
     CHECK_FALSE(devices.gate.armed());
 }
 
+TEST_CASE("CPU conformance: standard storage oracle covers every leaf width and padded shape") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    REQUIRE(iom_conformance::run_storage_oracle_conformance(
+            devices.conformance(), kCpuLeafTypes, oracle, &devices.gate));
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("CPU conformance: asynchronous copies against the CPU reference") {
     CpuDevices devices;
     iom_conformance::run_async_copy_conformance(

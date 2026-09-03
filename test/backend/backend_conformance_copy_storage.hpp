@@ -10,10 +10,9 @@
 // bit-for-bit. All shared types, helpers, and the case-parameter structs
 // come from backend_conformance_common.hpp.
 
-#include "backend/backend_conformance_common.hpp"
+#include "backend/backend_conformance_oracle.hpp"
 
 #include <cstddef>
-#include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <iterator>
@@ -264,13 +263,137 @@ inline const std::vector<std::vector<std::size_t>>& copy_owner_shapes() {
 }
 
 // ---------------------------------------------------------------------------
+// Independent physical-storage oracle scenario.
+// ---------------------------------------------------------------------------
+
+inline bool require_storage_oracle_bytes(
+        std::span<const std::byte> actual,
+        std::span<const std::byte> expected,
+        std::string_view context,
+        bool require_match) {
+    if (actual.size() != expected.size()) {
+        if (require_match) {
+            REQUIRE_MESSAGE(
+                    false,
+                    context << ": storage oracle returned " << actual.size()
+                            << " bytes; expected " << expected.size());
+        }
+        return false;
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (actual[i] != expected[i]) {
+            if (require_match) {
+                REQUIRE_MESSAGE(
+                        false,
+                        context << ": storage diverges at byte " << i
+                                << " of " << expected.size());
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+inline std::vector<std::vector<std::size_t>> storage_oracle_owner_shapes() {
+    std::vector<std::vector<std::size_t>> shapes{
+            transfer_owner_shapes().begin(), transfer_owner_shapes().end()};
+    for (const std::vector<std::size_t>& dimensions : copy_owner_shapes()) {
+        if (std::find(shapes.begin(), shapes.end(), dimensions) == shapes.end()) {
+            shapes.push_back(dimensions);
+        }
+    }
+    return shapes;
+}
+
+// Seeds the candidate allocation through an independent backend-native path,
+// verifies the candidate's logical read, then writes every transformed view
+// through the candidate transfer and verifies the complete owner allocation
+// through the oracle. The owner model is reset for every view so padding and
+// untouched planes are checked as well as the view's modified region.
+inline bool run_storage_oracle_conformance(
+        const ConformanceDevices& devices,
+        const std::span<const iom::DataType> supported_types,
+        AcceleratorStorageOracle& oracle,
+        ConformanceObserver* observer = nullptr,
+        bool require_match = true,
+        bool verify_seed = true) {
+    for (const iom::DataType type : supported_types) {
+        CAPTURE(static_cast<int>(type));
+        for (const std::vector<std::size_t>& dimensions :
+             storage_oracle_owner_shapes()) {
+            const iom::TensorSpec spec{iom::TensorShape{dimensions}, type};
+            auto candidate = devices.candidate.create_tensor(spec);
+            oracle.set_owner_spec(spec);
+            if (observer != nullptr) {
+                observer->setup_complete();
+            }
+
+            const std::vector<std::byte> initial =
+                    encode_standard_tiled_storage(spec);
+            oracle.seed(candidate->view(), initial);
+            if (verify_seed) {
+                require_logical_bytes(
+                        candidate->view(),
+                        decode_standard_tiled_view(
+                                candidate->view(), spec, initial),
+                        "candidate oracle seed full view");
+            }
+
+            std::uint64_t salt = 1;
+            for (const ViewCase& view_case : view_cases_for(spec)) {
+                CAPTURE(view_case.label);
+                iom::TensorView candidate_view =
+                        view_case.build(candidate->view());
+                oracle.seed(candidate_view, initial);
+                if (verify_seed) {
+                    const std::vector<std::byte> initial_view =
+                            decode_standard_tiled_view(
+                                    candidate_view, spec, initial);
+                    require_logical_bytes(
+                            candidate_view, initial_view,
+                            std::string("candidate oracle seed ")
+                                    + view_case.label);
+                }
+
+                const std::vector<std::byte> pattern =
+                        encode_logical(candidate_view.spec(), salt);
+                ++salt;
+                candidate_view.copy_from_host(pattern);
+
+                std::vector<std::byte> expected = initial;
+                apply_standard_tiled_view(
+                        candidate_view, spec, pattern, expected);
+                const std::vector<std::byte> actual =
+                        oracle.observe(candidate_view);
+                if (!require_storage_oracle_bytes(
+                            actual, expected,
+                            std::string("candidate oracle ")
+                                    + view_case.label,
+                            require_match)) {
+                    if (observer != nullptr) {
+                        observer->case_complete();
+                    }
+                    return false;
+                }
+                require_logical_bytes(
+                        candidate_view, pattern,
+                        std::string("candidate oracle logical ")
+                                + view_case.label);
+            }
+
+            if (observer != nullptr) {
+                observer->case_complete();
+            }
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Copy and storage scenarios.
 // ---------------------------------------------------------------------------
 
-// Storage and host transfers: matching reference and candidate tensors are
-// seeded with identical logical host bytes, full and transformed views
-// transfer independently generated encodings on both devices, and every
-// readback is compared bit-for-bit against the expected encoding.
+// Storage and host transfers: matching reference and candidate tensors
 inline void run_storage_and_transfer_conformance(
         const ConformanceDevices& devices,
         const std::span<const iom::DataType> supported_types,
