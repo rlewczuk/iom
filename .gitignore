@@ -4,3 +4,4 @@ _*.sh
 .junie/
 .cache/
 _local/
+.work/
