@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <initializer_list>
 #include <cstdint>
@@ -9,6 +10,9 @@
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -18,6 +22,7 @@
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/rocm/device.hpp"
+#include "rocm/copy.hpp"
 
 namespace {
 
@@ -90,6 +95,91 @@ private:
     const TrafficGate& gate_;
     std::unordered_set<void*> live_;
 };
+class ReusingHipAllocator final : public iom::Allocator {
+public:
+    ~ReusingHipAllocator() override {
+        for (const Slot& slot : free_) {
+            (void)hipFree(slot.pointer);
+        }
+        for (const auto& [pointer, size] : live_) {
+            (void)size;
+            (void)hipFree(pointer);
+        }
+    }
+
+    void* alloc(std::size_t size) override {
+        for (auto it = free_.begin(); it != free_.end(); ++it) {
+            if (it->size != size) {
+                continue;
+            }
+            void* pointer = it->pointer;
+            live_.emplace(pointer, size);
+            free_.erase(it);
+            return pointer;
+        }
+
+        void* pointer = nullptr;
+        if (hipMalloc(&pointer, size) != hipSuccess) {
+            throw std::bad_alloc();
+        }
+        try {
+            live_.emplace(pointer, size);
+        } catch (...) {
+            (void)hipFree(pointer);
+            throw;
+        }
+        return pointer;
+    }
+
+    void free(void* buffer) override {
+        const auto found = live_.find(buffer);
+        if (found == live_.end()) {
+            throw std::runtime_error(
+                    "ROCm reuse allocator received an unknown address");
+        }
+        free_.push_back({buffer, found->second});
+        live_.erase(found);
+    }
+
+    void reset() override {}
+
+    void release_free() noexcept {
+        for (const Slot& slot : free_) {
+            (void)hipFree(slot.pointer);
+        }
+        free_.clear();
+    }
+
+private:
+    struct Slot {
+        void* pointer;
+        std::size_t size;
+    };
+
+    std::vector<Slot> free_;
+    std::unordered_map<void*, std::size_t> live_;
+};
+
+void expect_repeated_runtime_failure(
+        iom::DeviceOps& queue, iom::oid token) {
+    std::string message;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool caught = false;
+        try {
+            queue.wait(token);
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            if (message.empty()) {
+                message = error.what();
+            } else {
+                CHECK_EQ(std::string_view(error.what()), message);
+            }
+        }
+        CHECK(caught);
+    }
+    CHECK_FALSE(message.empty());
+}
+
 
 
 }  // namespace
@@ -216,4 +306,129 @@ TEST_CASE("ROCm conformance: full shared suite") {
             devices, std::span<const iom::DataType>{kRocmLeafTypes.begin(), 1},
             &gate);
     CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm submission remains transactional across post-enqueue failures") {
+    TrafficGate gate;
+    HipAllocator candidate_allocator(gate);
+    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    const iom::TensorSpec mismatch{
+            iom::TensorShape{{3, 16, 17}}, iom::DataType::U8};
+    auto source = candidate->create_tensor(spec);
+    auto destination = candidate->create_tensor(spec);
+    auto invalid_destination = candidate->create_tensor(mismatch);
+    auto queue = candidate->create_ops();
+    const std::vector<std::byte> logical_pattern(
+            spec.logical_nbytes(), static_cast<std::byte>(0x3c));
+
+    source->view().copy_from_host(logical_pattern);
+    destination->view().copy_from_host(logical_pattern);
+
+    CHECK_THROWS_AS(
+            queue->copy(source->view(), invalid_destination->view()),
+            std::invalid_argument);
+
+    const iom::oid first = queue->copy(source->view(), destination->view());
+    CHECK_EQ(iom_conformance::token_sequence(first), 1);
+    CHECK_NOTHROW(queue->wait(first));
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::event_create);
+    CHECK_THROWS_AS(
+            queue->copy(source->view(), destination->view()),
+            std::runtime_error);
+    const iom::oid second = queue->copy(source->view(), destination->view());
+    CHECK_EQ(iom_conformance::token_sequence(second), 2);
+    CHECK_NOTHROW(queue->wait(second));
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::third_plane_launch);
+    iom::oid launch_failure = 0;
+    CHECK_NOTHROW(
+            launch_failure = queue->copy(
+                    source->view(), destination->view()));
+    CHECK_NE(launch_failure, 0);
+    CHECK_EQ(iom_conformance::token_sequence(launch_failure), 3);
+    expect_repeated_runtime_failure(*queue, launch_failure);
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::event_record);
+    const iom::oid record_failure =
+            queue->copy(source->view(), destination->view());
+    CHECK_EQ(iom_conformance::token_sequence(record_failure), 4);
+    expect_repeated_runtime_failure(*queue, record_failure);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+
+    {
+        ReusingHipAllocator allocator;
+        auto device = iom::make_rocm_device(0, allocator);
+        auto canary_source = device->create_tensor(spec);
+        auto canary_destination = device->create_tensor(spec);
+        const std::vector<std::byte> storage_canary(
+                spec.tiled_storage_nbytes(), static_cast<std::byte>(0xa5));
+        REQUIRE(
+                hipMemcpy(
+                        canary_source->view().native_handle(),
+                        storage_canary.data(), storage_canary.size(),
+                        hipMemcpyHostToDevice)
+                == hipSuccess);
+        REQUIRE(
+                hipMemcpy(
+                        canary_destination->view().native_handle(),
+                        storage_canary.data(), storage_canary.size(),
+                        hipMemcpyHostToDevice)
+                == hipSuccess);
+        auto canary_queue = device->create_ops();
+        iom::rocm_detail::inject_submission_fault_for_testing(
+                iom::rocm_detail::SubmissionFault::third_plane_launch);
+        const iom::oid canary_failure = canary_queue->copy(
+                canary_source->view(), canary_destination->view());
+        CHECK_EQ(iom_conformance::token_sequence(canary_failure), 1);
+        expect_repeated_runtime_failure(*canary_queue, canary_failure);
+
+        const void* source_address = canary_source->view().native_handle();
+        const void* destination_address =
+                canary_destination->view().native_handle();
+        canary_source.reset();
+        canary_destination.reset();
+
+        auto fresh_source = device->create_tensor(spec);
+        auto fresh_destination = device->create_tensor(spec);
+        CHECK(
+                (fresh_source->view().native_handle() == source_address
+                 || fresh_source->view().native_handle()
+                         == destination_address));
+        CHECK(
+                (fresh_destination->view().native_handle() == source_address
+                 || fresh_destination->view().native_handle()
+                         == destination_address));
+        CHECK_NE(
+                fresh_source->view().native_handle(),
+                fresh_destination->view().native_handle());
+        std::vector<std::byte> fresh_source_bytes(spec.logical_nbytes());
+        std::vector<std::byte> fresh_destination_bytes(spec.logical_nbytes());
+        fresh_source->view().copy_to_host(fresh_source_bytes);
+        fresh_destination->view().copy_to_host(fresh_destination_bytes);
+        CHECK(std::all_of(
+                fresh_source_bytes.begin(), fresh_source_bytes.end(),
+                [](std::byte value) {
+                    return value == static_cast<std::byte>(0xa5);
+                }));
+        CHECK(std::all_of(
+                fresh_destination_bytes.begin(), fresh_destination_bytes.end(),
+                [](std::byte value) {
+                    return value == static_cast<std::byte>(0xa5);
+                }));
+
+        fresh_source.reset();
+        fresh_destination.reset();
+        canary_queue.reset();
+        allocator.release_free();
+        device.reset();
+    }
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
 }

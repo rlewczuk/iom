@@ -569,14 +569,20 @@ namespace iom {
         }
     }
 
-    void DeviceOps::complete(std::uint64_t sequence, std::exception_ptr failure) {
+    void DeviceOps::complete(
+            std::uint64_t sequence, std::exception_ptr failure) {
         if (sequence == 0) {
             throw std::invalid_argument("completion sequence is zero");
         }
         std::lock_guard<std::mutex> lock(completion_mutex_);
         if (sequence >= next_sequence_) {
             throw std::invalid_argument(
-                "completion of a sequence that was never submitted");
+                    "completion of a sequence that was never submitted");
+        }
+        if (const auto pending = pending_failures_.find(sequence);
+                pending != pending_failures_.end()) {
+            failure = std::move(pending->second);
+            pending_failures_.erase(pending);
         }
         if (failure) {
             failures_[sequence] = std::move(failure);
@@ -585,6 +591,22 @@ namespace iom {
             completed_ = sequence;
         }
         completion_cv_.notify_all();
+    }
+
+    void DeviceOps::commit_failure(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        if (sequence == 0) {
+            throw std::invalid_argument("retained failure sequence is zero");
+        }
+        if (!failure) {
+            throw std::invalid_argument("retained failure is empty");
+        }
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        if (sequence != next_sequence_) {
+            throw std::invalid_argument(
+                    "retained failure is not for the active submission");
+        }
+        pending_failures_[sequence] = std::move(failure);
     }
 
     void DeviceOps::seek_next_sequence(std::uint64_t next_sequence) {

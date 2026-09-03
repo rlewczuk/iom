@@ -71,6 +71,7 @@ if(ROCM_ENABLED)
     target_include_directories(iom_rocm_conformance_tests
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/src
     )
 
     target_link_libraries(iom_rocm_conformance_tests
@@ -113,6 +114,7 @@ if(CUDA_ENABLED)
     target_include_directories(iom_cuda_conformance_tests
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/src
     )
 
     target_link_libraries(iom_cuda_conformance_tests

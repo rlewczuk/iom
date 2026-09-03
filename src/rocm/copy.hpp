@@ -9,7 +9,17 @@
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
 
+
 namespace iom::rocm_detail {
+enum class SubmissionFault {
+    none,
+    event_create,
+    third_plane_launch,
+    event_record,
+};
+
+void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
+
 
 void region_from_host(
         int device_ordinal, const TensorView& destination,

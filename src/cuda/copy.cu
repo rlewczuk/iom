@@ -3,15 +3,17 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
+#include <exception>
+#include <list>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
-#include <limits>
 #include <vector>
 
 namespace iom::cuda_detail {
@@ -20,6 +22,15 @@ namespace {
 constexpr std::size_t kTile = TensorSpec::TILE;
 constexpr unsigned int kThreads = 256;
 constexpr std::size_t kLaunchChunk = 1u << 20;
+std::atomic<SubmissionFault> g_submission_fault{SubmissionFault::none};
+
+[[nodiscard]] bool consume_submission_fault(
+        SubmissionFault point) noexcept {
+    SubmissionFault expected = point;
+    return g_submission_fault.compare_exchange_strong(
+            expected, SubmissionFault::none, std::memory_order_acq_rel);
+}
+
 
 [[nodiscard]] std::runtime_error cuda_error(
         const char* operation, CUresult status) {
@@ -53,6 +64,26 @@ struct ContextGuard {
         check_cuda("cuCtxSetCurrent", cuCtxSetCurrent(context));
     }
 };
+struct PendingEvent {
+    cudaEvent_t event = nullptr;
+    bool linked = false;
+
+    ~PendingEvent() noexcept {
+        if (event != nullptr && !linked) {
+            (void)cudaEventDestroy(event);
+        }
+    }
+};
+
+[[nodiscard]] cudaError_t record_event(
+        cudaEvent_t event, cudaStream_t stream) noexcept {
+    const cudaError_t status = cudaEventRecord(event, stream);
+    if (consume_submission_fault(SubmissionFault::event_record)) {
+        return cudaErrorInvalidValue;
+    }
+    return status;
+}
+
 
 struct PlanePair {
     std::size_t source;
@@ -286,9 +317,9 @@ void launch_view_transfer(
 }
 
 void launch_copy_plane(
-        cudaStream_t stream, const PlanePair& pair, std::size_t rows,
-        std::size_t columns, unsigned int bits, const void* source,
-        void* destination) {
+        cudaStream_t stream, const PlanePair& pair, std::size_t plane_index,
+        std::size_t rows, std::size_t columns, unsigned int bits,
+        const void* source, void* destination) {
     const std::size_t elements = rows * columns;
     for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
         const std::size_t count = std::min(kLaunchChunk, elements - first);
@@ -311,6 +342,12 @@ void launch_copy_plane(
                 destination_plane_arg, first_arg, count_arg, rows_arg,
                 columns_arg, bits_arg);
         check_kernel("CUDA copy kernel launch", cudaGetLastError());
+        if (plane_index == 2
+                && consume_submission_fault(
+                        SubmissionFault::third_plane_launch)) {
+            check_kernel(
+                    "CUDA copy kernel launch", cudaErrorInvalidValue);
+        }
     }
 }
 
@@ -425,22 +462,36 @@ public:
         void* destination_handle = destination.native_handle();
         const oid token = submit([&](std::uint64_t sequence) {
             ContextGuard guard(context_);
-            cudaEvent_t event = nullptr;
+            PendingEvent event_guard;
+            if (consume_submission_fault(SubmissionFault::event_create)) {
+                check_kernel(
+                        "cudaEventCreateWithFlags", cudaErrorInvalidValue);
+            }
             check_kernel(
                     "cudaEventCreateWithFlags",
-                    cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                    cudaEventCreateWithFlags(
+                            &event_guard.event, cudaEventDisableTiming));
+            Task local{sequence, event_guard.event};
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                staged_.push_back(local);
+            }
+            event_guard.linked = true;
+
             try {
+                std::size_t plane_index = 0;
                 for (const PlanePair pair : pairs) {
                     launch_copy_plane(
-                            stream_, pair, rows, columns, bits,
+                            stream_, pair, plane_index++, rows, columns, bits,
                             source_handle, destination_handle);
                 }
-                check_kernel("cudaEventRecord", cudaEventRecord(event, stream_));
-                std::lock_guard<std::mutex> lock(mutex_);
-                staged_.push_back({sequence, event});
+                check_kernel(
+                        "cudaEventRecord",
+                        record_event(event_guard.event, stream_));
             } catch (...) {
-                (void)cudaEventDestroy(event);
-                throw;
+                const std::exception_ptr failure = std::current_exception();
+                (void)cudaEventRecord(event_guard.event, stream_);
+                commit_failure(sequence, failure);
             }
         });
         publish_staged();
@@ -492,10 +543,7 @@ private:
 
     void publish_staged() {
         std::lock_guard<std::mutex> lock(mutex_);
-        while (!staged_.empty()) {
-            tasks_.push_back(std::move(staged_.front()));
-            staged_.pop_front();
-        }
+        tasks_.splice(tasks_.end(), staged_);
         completion_.notify_one();
     }
 
@@ -544,13 +592,18 @@ private:
     cudaStream_t stream_ = nullptr;
     std::mutex mutex_;
     std::condition_variable completion_;
-    std::deque<Task> staged_;
-    std::deque<Task> tasks_;
+    std::list<Task> staged_;
+    std::list<Task> tasks_;
     bool shutdown_ = false;
     std::thread worker_;
 };
 
 }  // namespace
+void inject_submission_fault_for_testing(
+        SubmissionFault fault) noexcept {
+    g_submission_fault.store(fault, std::memory_order_release);
+}
+
 
 void region_from_host(
         CUcontext context, const TensorView& destination,

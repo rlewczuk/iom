@@ -42,6 +42,16 @@ namespace iom_conformance {
 class DeferredCopyQueue final : public iom::DeviceOps {
 public:
     using iom::DeviceOps::complete;
+    enum class CopyFailure {
+        none,
+        pre_enqueue,
+        post_enqueue,
+    };
+
+    void inject_copy_failure(CopyFailure failure) noexcept {
+        next_copy_failure_ = failure;
+    }
+
 
     struct Record {
         std::uint64_t sequence;
@@ -71,10 +81,22 @@ public:
     iom::oid copy(
             const iom::TensorView& source,
             iom::TensorView& destination) override {
-        return submit([&](std::uint64_t sequence) {
+        const CopyFailure failure =
+                std::exchange(next_copy_failure_, CopyFailure::none);
+        if (failure == CopyFailure::pre_enqueue) {
+            throw std::invalid_argument("deferred pre-enqueue failure");
+        }
+        return submit([&, failure](std::uint64_t sequence) {
             records_.push_back(
                     {sequence, nullptr, &source, source.native_handle(),
                      nullptr, &destination, destination.native_handle()});
+            if (failure == CopyFailure::post_enqueue) {
+                commit_failure(
+                        sequence,
+                        std::make_exception_ptr(
+                                std::runtime_error(
+                                        "deferred post-enqueue failure")));
+            }
         });
     }
 
@@ -137,6 +159,7 @@ private:
     }
 
     std::vector<Record> records_;
+    CopyFailure next_copy_failure_ = CopyFailure::none;
 };
 
 // ---------------------------------------------------------------------------
@@ -287,6 +310,53 @@ inline void run_lifetime_conformance(
         if (observer != nullptr) {
             observer->case_complete();
         }
+    }
+
+    // A post-enqueue failure retains the token while a pre-enqueue failure
+    // leaves the sequence counter untouched.
+    {
+        DeferredCopyQueue queue;
+        auto source = candidate.create_tensor(spec);
+        auto destination = candidate.create_tensor(spec);
+
+        queue.inject_copy_failure(DeferredCopyQueue::CopyFailure::pre_enqueue);
+        CHECK_THROWS_AS(
+                queue.copy(source->view(), destination->view()),
+                std::invalid_argument);
+        const iom::oid first =
+                queue.copy(*source, source->view(), *destination,
+                           destination->view());
+        CHECK_EQ(token_sequence(first), 1);
+        queue.complete(1);
+        CHECK_NOTHROW(queue.wait(first));
+
+        queue.inject_copy_failure(
+                DeferredCopyQueue::CopyFailure::post_enqueue);
+        const iom::oid failed =
+                queue.copy(*source, source->view(), *destination,
+                           destination->view());
+        CHECK_EQ(token_sequence(failed), 2);
+        REQUIRE(queue.records().size() == 2);
+        queue.expect_stable(
+                2, *source, source->view(), *destination, destination->view());
+        queue.complete(2);
+
+        std::string failure_message;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            bool rethrown = false;
+            try {
+                queue.wait(failed);
+            } catch (const std::runtime_error& error) {
+                rethrown = true;
+                if (failure_message.empty()) {
+                    failure_message = error.what();
+                } else {
+                    CHECK_EQ(std::string_view(error.what()), failure_message);
+                }
+            }
+            CHECK(rethrown);
+        }
+        CHECK_EQ(failure_message, "deferred post-enqueue failure");
     }
 
     // In-order completion: completing a later sequence implies every earlier

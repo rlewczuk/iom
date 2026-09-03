@@ -3,10 +3,11 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <exception>
+#include <list>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -21,6 +22,15 @@ namespace {
 constexpr std::size_t kTile = TensorSpec::TILE;
 constexpr std::size_t kThreads = 256;
 constexpr std::size_t kLaunchChunk = 1u << 20;
+std::atomic<SubmissionFault> g_submission_fault{SubmissionFault::none};
+
+[[nodiscard]] bool consume_submission_fault(
+        SubmissionFault point) noexcept {
+    SubmissionFault expected = point;
+    return g_submission_fault.compare_exchange_strong(
+            expected, SubmissionFault::none, std::memory_order_acq_rel);
+}
+
 
 [[nodiscard]] std::runtime_error hip_error(
         const char* operation, hipError_t status) {
@@ -40,6 +50,26 @@ struct DeviceGuard {
         check_hip("hipSetDevice", hipSetDevice(device_ordinal));
     }
 };
+struct PendingEvent {
+    hipEvent_t event = nullptr;
+    bool linked = false;
+
+    ~PendingEvent() noexcept {
+        if (event != nullptr && !linked) {
+            (void)hipEventDestroy(event);
+        }
+    }
+};
+
+[[nodiscard]] hipError_t record_event(
+        hipEvent_t event, hipStream_t stream) noexcept {
+    const hipError_t status = hipEventRecord(event, stream);
+    if (consume_submission_fault(SubmissionFault::event_record)) {
+        return hipErrorInvalidValue;
+    }
+    return status;
+}
+
 
 struct PlanePair {
     std::size_t source;
@@ -370,21 +400,36 @@ public:
         void* destination_handle = destination.native_handle();
         const oid token = submit([&](std::uint64_t sequence) {
             DeviceGuard guard(device_ordinal_);
-            hipEvent_t event = nullptr;
-            check_hip("hipEventCreateWithFlags",
-                      hipEventCreateWithFlags(&event, hipEventDisableTiming));
+            PendingEvent event_guard;
+            if (consume_submission_fault(SubmissionFault::event_create)) {
+                check_hip(
+                        "hipEventCreateWithFlags", hipErrorInvalidValue);
+            }
+            check_hip(
+                    "hipEventCreateWithFlags",
+                    hipEventCreateWithFlags(
+                            &event_guard.event, hipEventDisableTiming));
+            Task local{sequence, event_guard.event};
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                staged_.push_back(local);
+            }
+            event_guard.linked = true;
+
             try {
+                std::size_t plane_index = 0;
                 for (const PlanePair pair : pairs) {
                     launch_copy_plane(
-                            pair, rows, columns, bits,
+                            pair, plane_index++, rows, columns, bits,
                             source_handle, destination_handle);
                 }
-                check_hip("hipEventRecord", hipEventRecord(event, stream_));
-                std::lock_guard<std::mutex> lock(mutex_);
-                staged_.push_back({sequence, event});
+                check_hip(
+                        "hipEventRecord",
+                        record_event(event_guard.event, stream_));
             } catch (...) {
-                (void)hipEventDestroy(event);
-                throw;
+                const std::exception_ptr failure = std::current_exception();
+                (void)hipEventRecord(event_guard.event, stream_);
+                commit_failure(sequence, failure);
             }
         });
         publish_staged();
@@ -435,8 +480,9 @@ private:
     }
 
     void launch_copy_plane(
-            const PlanePair& pair, std::size_t rows, std::size_t columns,
-            unsigned int bits, const void* source, void* destination) {
+            const PlanePair& pair, std::size_t plane_index,
+            std::size_t rows, std::size_t columns, unsigned int bits,
+            const void* source, void* destination) {
         const std::size_t elements = rows * columns;
         for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
             const std::size_t count = std::min(kLaunchChunk, elements - first);
@@ -453,15 +499,18 @@ private:
                     static_cast<std::uint64_t>(rows),
                     static_cast<std::uint64_t>(columns), bits);
             check_hip("HIP kernel launch", hipGetLastError());
+            if (plane_index == 2
+                    && consume_submission_fault(
+                            SubmissionFault::third_plane_launch)) {
+                check_hip(
+                        "HIP kernel launch", hipErrorInvalidValue);
+            }
         }
     }
 
     void publish_staged() {
         std::lock_guard<std::mutex> lock(mutex_);
-        while (!staged_.empty()) {
-            tasks_.push_back(std::move(staged_.front()));
-            staged_.pop_front();
-        }
+        tasks_.splice(tasks_.end(), staged_);
         completion_.notify_one();
     }
 
@@ -509,13 +558,18 @@ private:
     hipStream_t stream_ = nullptr;
     std::mutex mutex_;
     std::condition_variable completion_;
-    std::deque<Task> staged_;
-    std::deque<Task> tasks_;
+    std::list<Task> staged_;
+    std::list<Task> tasks_;
     bool shutdown_ = false;
     std::thread worker_;
 };
 
 }  // namespace
+void inject_submission_fault_for_testing(
+        SubmissionFault fault) noexcept {
+    g_submission_fault.store(fault, std::memory_order_release);
+}
+
 
 void region_from_host(
         int device_ordinal, const TensorView& destination,

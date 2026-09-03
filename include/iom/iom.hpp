@@ -106,6 +106,14 @@ namespace iom {
          * it. Wakes every waiter.
          */
         void complete(std::uint64_t sequence, std::exception_ptr failure = {});
+        /**
+         * Retains a failure for the sequence currently being submitted.
+         * Unlike complete(), this does not mark the sequence complete: the
+         * backend worker must still call complete() after its event fence
+         * drains so callers cannot release operands early.
+         */
+        void commit_failure(
+                std::uint64_t sequence, std::exception_ptr failure);
 
         /**
          * Test seam: moves the next allocated sequence forward without
@@ -129,6 +137,7 @@ namespace iom {
         std::mutex completion_mutex_;
         std::condition_variable completion_cv_;
         std::map<std::uint64_t, std::exception_ptr> failures_;
+        std::map<std::uint64_t, std::exception_ptr> pending_failures_;
     };
 
     class Block {

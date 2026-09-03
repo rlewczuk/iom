@@ -9,6 +9,15 @@
 #include "iom/iom.hpp"
 
 namespace iom::cuda_detail {
+enum class SubmissionFault {
+    none,
+    event_create,
+    third_plane_launch,
+    event_record,
+};
+
+void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
+
 
 void region_from_host(
         CUcontext context, const TensorView& destination,
