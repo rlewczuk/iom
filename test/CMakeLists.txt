@@ -95,6 +95,11 @@ if(CUDA_ENABLED)
         COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
     )
 
+
+    target_include_directories(iom_cuda_smoke_tests
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/cuda
+    )
     target_link_libraries(iom_cuda_smoke_tests
         PRIVATE
             doctest::doctest
