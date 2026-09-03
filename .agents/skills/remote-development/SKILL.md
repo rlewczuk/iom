@@ -9,13 +9,13 @@ Use this skill when implementation must be validated on a specific remote Linux 
 
 ## Core rule
 
-The local Git workspace is authoritative.
+The selected local Git workspace is authoritative.
 
-- Edit files locally.
-- Before every remote build, test, benchmark, or execution, sync the local workspace to a unique remote task directory.
+- Edit files locally in the selected checkout or worktree.
+- Before every remote build, test, benchmark, or execution, sync that exact workspace to a unique remote task directory.
 - Run builds/tests/programs only through SSH on the selected remote host.
 - Do not edit the shared remote checkout directly unless explicitly required.
-- Do not sync `.git` or `.worktrees` to the remote mirror.
+- Do not sync `.git`, `.work`, or `.worktrees` to the remote mirror.
 - Keep one remote directory per concurrent task.
 
 ## Host configuration
@@ -28,11 +28,35 @@ Copy `references/hosts.example.conf` to a convenient project-local file such as:
 
 Then edit host aliases, remote base directories, and optional setup commands.
 
-The helper scripts read the config path from `REMOTE_DEV_CONFIG`. If unset, they use `.remote-hosts.conf` in the current working directory.
+The helper scripts read the config path from `REMOTE_DEV_CONFIG`. If unset, they first use `.remote-hosts.conf` in the selected workspace. A linked worktree without its own config falls back to `.remote-hosts.conf` in the primary checkout; the config is read from there, never synchronized.
+
+## Workspace selection
+
+The scripts resolve the selected workspace with Git:
+
+- By default, they use the worktree containing the current directory, even when the command is invoked from a subdirectory.
+- Set `REMOTE_DEV_WORKSPACE` to a path inside the intended checkout or worktree when invoking a script from elsewhere.
+- They compare the worktree Git directory with the common Git directory and report `checkout` or `worktree` in `remote-sync` output.
+
+For a `spec-run-task` task, run from its exact `.work/<task-path>` worktree:
+
+```bash
+cd .work/<task-path>
+.agents/skills/remote-development/scripts/remote-sync rocm task-123
+```
+
+Alternatively, select it explicitly from the primary checkout:
+
+```bash
+REMOTE_DEV_WORKSPACE=.work/<task-path> \
+  .agents/skills/remote-development/scripts/remote-sync rocm task-123
+```
+
+Never sync a `spec-run-task` task from the primary checkout. Confirm that the `remote-sync` output names the exact assigned worktree before remote execution.
 
 ## Typical workflow
 
-Assume the current directory is the local task/worktree root.
+Assume the selected workspace is the local task/worktree root.
 
 1. Pick a configured host and a unique task id.
 2. Sync the local workspace:
@@ -83,6 +107,9 @@ Use `tmux` or the site's scheduler on the remote host when a job should survive 
 ## Safety and consistency
 
 - `remote-sync` uses `rsync --delete-delay`; files removed locally are removed from the remote mirror.
+- Only tracked files are synchronized. Untracked and ignored paths are excluded using Git's ignore rules, including nested `.gitignore` files. Stage a new project file before remote validation so it becomes part of the synchronized workspace.
+- `_local/` is the sole non-versioned exception. Its contents are synchronized so agents can create and remotely run temporary helper programs and scripts.
+- `.git`, `.work`, and `.worktrees` are always excluded. The `.work/` container is therefore never copied when the primary checkout is selected, while selecting one of its worktrees still synchronizes that worktree's root.
 - The remote path is derived from the configured base directory plus the task id. The base directory is relative to the SSH user's home directory.
 - Task ids must contain only letters, digits, `.`, `_`, and `-`.
 - Host aliases must exist in the config.

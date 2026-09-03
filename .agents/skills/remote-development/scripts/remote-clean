@@ -9,6 +9,7 @@ PROFILE_ARG="$1"
 TASK_ID="$2"
 
 require_cmd ssh
+resolve_workspace
 validate_task_id "$TASK_ID"
 load_profile "$PROFILE_ARG"
 REMOTE_DIR="$(remote_dir_for "$TASK_ID")"

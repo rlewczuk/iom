@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_FILE="${REMOTE_DEV_CONFIG:-.remote-hosts.conf}"
+CONFIG_FILE=
+WORKSPACE_ROOT=
+PRIMARY_WORKTREE_ROOT=
+WORKSPACE_KIND=
 
 fail() {
   printf 'remote-development: %s\n' "$*" >&2
@@ -10,6 +13,43 @@ fail() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+resolve_workspace() {
+  require_cmd git
+
+  local requested="${REMOTE_DEV_WORKSPACE:-$PWD}"
+  [[ -d "$requested" ]] || fail "workspace path is not a directory: $requested"
+
+  local root git_dir common_git_dir
+  root="$(git -C "$requested" rev-parse --show-toplevel 2>/dev/null)" ||
+    fail "workspace path is not inside a Git worktree: $requested"
+  WORKSPACE_ROOT="$(cd -- "$root" && pwd -P)"
+
+  git_dir="$(git -C "$WORKSPACE_ROOT" rev-parse --git-dir)"
+  common_git_dir="$(git -C "$WORKSPACE_ROOT" rev-parse --git-common-dir)"
+  [[ "$git_dir" == /* ]] || git_dir="$WORKSPACE_ROOT/$git_dir"
+  [[ "$common_git_dir" == /* ]] || common_git_dir="$WORKSPACE_ROOT/$common_git_dir"
+  git_dir="$(cd -- "$git_dir" && pwd -P)"
+  common_git_dir="$(cd -- "$common_git_dir" && pwd -P)"
+  PRIMARY_WORKTREE_ROOT="$(cd -- "$common_git_dir/.." && pwd -P)"
+
+  if [[ "$git_dir" == "$common_git_dir" ]]; then
+    WORKSPACE_KIND=checkout
+  else
+    WORKSPACE_KIND=worktree
+  fi
+
+  if [[ -n "${REMOTE_DEV_CONFIG:-}" ]]; then
+    CONFIG_FILE="$REMOTE_DEV_CONFIG"
+  elif [[ -f "$WORKSPACE_ROOT/.remote-hosts.conf" ]]; then
+    CONFIG_FILE="$WORKSPACE_ROOT/.remote-hosts.conf"
+  elif [[ "$WORKSPACE_KIND" == worktree &&
+          -f "$PRIMARY_WORKTREE_ROOT/.remote-hosts.conf" ]]; then
+    CONFIG_FILE="$PRIMARY_WORKTREE_ROOT/.remote-hosts.conf"
+  else
+    CONFIG_FILE="$WORKSPACE_ROOT/.remote-hosts.conf"
+  fi
 }
 
 validate_task_id() {

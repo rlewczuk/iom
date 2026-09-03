@@ -11,6 +11,7 @@ shift 2
 COMMAND="$*"
 
 require_cmd ssh
+resolve_workspace
 validate_task_id "$TASK_ID"
 load_profile "$PROFILE_ARG"
 REMOTE_DIR="$(remote_dir_for "$TASK_ID")"
