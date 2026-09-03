@@ -10,7 +10,10 @@
 #include <string>
 
 #include "copy.hpp"
+#include "driver.hpp"
 namespace iom {
+
+    cuda_detail::DriverCalls cuda_detail::driver_calls{};
 
     namespace {
         constexpr std::size_t kStorageAlignment = 32;
@@ -41,6 +44,26 @@ namespace iom {
                     + std::to_string(device_count));
         }
 
+        class PrimaryCtxGuard final {
+        public:
+            explicit PrimaryCtxGuard(CUdevice device) : device_(device) {}
+
+            PrimaryCtxGuard(const PrimaryCtxGuard&) = delete;
+            PrimaryCtxGuard& operator=(const PrimaryCtxGuard&) = delete;
+
+            ~PrimaryCtxGuard() noexcept {
+                if (armed_) {
+                    (void)cuda_detail::driver_calls.primary_ctx_release(device_);
+                }
+            }
+
+            void dismiss() noexcept { armed_ = false; }
+
+        private:
+            CUdevice device_;
+            bool armed_ = true;
+        };
+
         class CudaDevice final : public Device {
         public:
             CudaDevice(std::uint32_t ordinal, CUdevice device, CUcontext context,
@@ -53,7 +76,7 @@ namespace iom {
 
             ~CudaDevice() override {
                 if (context_ != nullptr) {
-                    (void)cuDevicePrimaryCtxRelease(device_);
+                    (void)cuda_detail::driver_calls.primary_ctx_release(device_);
                     context_ = nullptr;
                 }
             }
@@ -75,7 +98,9 @@ namespace iom {
             }
 
             void activate() const {
-                check_cuda("cuCtxSetCurrent", cuCtxSetCurrent(context_));
+                check_cuda(
+                        "cuCtxSetCurrent",
+                        cuda_detail::driver_calls.ctx_set_current(context_));
             }
 
             [[nodiscard]] CUcontext context() const noexcept {
@@ -188,15 +213,15 @@ namespace iom {
         CUcontext context = nullptr;
         check_cuda(
                 "cuDevicePrimaryCtxRetain",
-                cuDevicePrimaryCtxRetain(&context, device));
-        check_cuda("cuCtxSetCurrent", cuCtxSetCurrent(context));
-        try {
-            return std::make_unique<CudaDevice>(
-                    device_ordinal, device, context, allocator);
-        } catch (...) {
-            (void)cuDevicePrimaryCtxRelease(device);
-            throw;
-        }
+                cuda_detail::driver_calls.primary_ctx_retain(&context, device));
+        PrimaryCtxGuard context_guard{device};
+        check_cuda(
+                "cuCtxSetCurrent",
+                cuda_detail::driver_calls.ctx_set_current(context));
+        auto result = std::make_unique<CudaDevice>(
+                device_ordinal, device, context, allocator);
+        context_guard.dismiss();
+        return result;
     }
 
 }  // namespace iom

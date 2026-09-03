@@ -99,6 +99,7 @@ if(CUDA_ENABLED)
         src/cuda/device.cpp
         src/cuda/copy.cu
         src/cuda/copy.hpp
+        src/cuda/driver.hpp
         include/iom/cuda/device.hpp
     )
 
