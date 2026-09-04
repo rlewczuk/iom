@@ -87,7 +87,7 @@ TEST_CASE("LinearAllocator throws when out of memory") {
 
     allocator.alloc(32);
 
-    CHECK_THROWS_AS(allocator.alloc(1), std::runtime_error);
+    CHECK_THROWS_AS(allocator.alloc(1), std::bad_alloc);
 }
 
 TEST_CASE("LinearAllocator rejects invalid construction arguments") {
