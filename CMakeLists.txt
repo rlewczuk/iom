@@ -219,7 +219,9 @@ endif()
 if(SYCL_ENABLED)
     add_library(iom_sycl STATIC
         src/sycl/device.cpp
+        src/sycl/copy.cpp
         src/sycl/runtime.hpp
+        src/sycl/copy.hpp
         include/iom/sycl/device.hpp
     )
 

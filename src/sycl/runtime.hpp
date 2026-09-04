@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sycl/sycl.hpp>
+
 #include <cstddef>
 
 namespace iom::sycl_detail {
@@ -9,6 +11,7 @@ namespace iom::sycl_detail {
     struct ContextCalls {
         void (*context_created)() = nullptr;
         void (*context_destroyed)() = nullptr;
+        void (*context_ready)(const sycl::context&) = nullptr;
     };
 
     extern ContextCalls context_calls;

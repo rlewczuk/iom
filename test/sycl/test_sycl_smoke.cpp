@@ -93,8 +93,9 @@ TEST_CASE("SYCL factory enumerates real accelerator devices") {
 
     const iom::TensorSpec spec{
             iom::TensorShape{{16, 16}}, iom::DataType::F32};
-    CHECK_THROWS_AS((void)device->create_tensor(spec), std::runtime_error);
-    CHECK_THROWS_AS((void)device->create_ops(), std::runtime_error);
+    CHECK_THROWS_AS((void)device->create_tensor(spec), std::bad_alloc);
+    auto queue = device->create_ops();
+    CHECK(queue != nullptr);
 }
 
 TEST_CASE("SYCL factory owns and tears down one context") {
