@@ -1,4 +1,56 @@
 cmake_minimum_required(VERSION 3.21)
+option(SYCL_ENABLED "Build with SYCL support" OFF)
+set(SYCL_COMPILER "" CACHE FILEPATH
+    "SYCL compiler executable (icpx or dpcpp)")
+
+if(SYCL_ENABLED)
+    if(SYCL_COMPILER)
+        if(NOT EXISTS "${SYCL_COMPILER}")
+            message(FATAL_ERROR
+                "SYCL compiler does not exist: ${SYCL_COMPILER}")
+        endif()
+        set(IOM_SYCL_COMPILER "${SYCL_COMPILER}")
+    else()
+        find_program(IOM_SYCL_COMPILER NAMES icpx dpcpp)
+    endif()
+
+    if(NOT IOM_SYCL_COMPILER)
+        message(FATAL_ERROR
+            "SYCL_ENABLED=ON requires the Intel oneAPI DPC++ compiler "
+            "(icpx or dpcpp) in PATH; set SYCL_COMPILER to its executable")
+    endif()
+
+    get_filename_component(IOM_SYCL_COMPILER_BIN
+        "${IOM_SYCL_COMPILER}" DIRECTORY)
+    get_filename_component(IOM_SYCL_ROOT
+        "${IOM_SYCL_COMPILER_BIN}/.." ABSOLUTE)
+    find_path(IOM_SYCL_INCLUDE_DIR
+        NAMES sycl/sycl.hpp
+        HINTS "${IOM_SYCL_ROOT}/include")
+    find_library(IOM_SYCL_RUNTIME_LIBRARY
+        NAMES sycl
+        HINTS "${IOM_SYCL_ROOT}/lib")
+    if(NOT IOM_SYCL_INCLUDE_DIR OR NOT IOM_SYCL_RUNTIME_LIBRARY)
+        message(FATAL_ERROR
+            "SYCL_ENABLED=ON requires sycl/sycl.hpp and libsycl; "
+            "searched under ${IOM_SYCL_ROOT}")
+    endif()
+
+    if(DEFINED CMAKE_CXX_COMPILER)
+        get_filename_component(IOM_CONFIGURED_CXX_NAME
+            "${CMAKE_CXX_COMPILER}" NAME)
+        if(NOT IOM_CONFIGURED_CXX_NAME STREQUAL "icpx"
+                AND NOT IOM_CONFIGURED_CXX_NAME STREQUAL "dpcpp")
+            message(FATAL_ERROR
+                "SYCL_ENABLED=ON requires an Intel oneAPI DPC++ compiler "
+                "(icpx or dpcpp); the configured compiler is "
+                "${CMAKE_CXX_COMPILER}")
+        endif()
+    else()
+        set(CMAKE_CXX_COMPILER "${IOM_SYCL_COMPILER}" CACHE FILEPATH
+            "C++ compiler selected for SYCL-enabled builds")
+    endif()
+endif()
 
 project(iom
     VERSION 0.0.1
@@ -162,6 +214,41 @@ if(ROCM_ENABLED)
         PRIVATE
             IOM_ROCM_ENABLED=1
             __HIP_PLATFORM_AMD__
+    )
+endif()
+if(SYCL_ENABLED)
+    add_library(iom_sycl STATIC
+        src/sycl/device.cpp
+        src/sycl/runtime.hpp
+        include/iom/sycl/device.hpp
+    )
+
+    target_include_directories(iom_sycl
+        PUBLIC
+            ${PROJECT_SOURCE_DIR}/include
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/sycl
+            ${IOM_SYCL_INCLUDE_DIR}
+    )
+
+    target_link_libraries(iom_sycl
+        PRIVATE
+            libiom
+    )
+
+    target_compile_options(iom_sycl
+        PRIVATE
+            -fsycl
+    )
+
+    target_link_options(iom_sycl
+        PRIVATE
+            -fsycl
+    )
+
+    target_compile_definitions(iom_sycl
+        PRIVATE
+            IOM_SYCL_ENABLED=1
     )
 endif()
 

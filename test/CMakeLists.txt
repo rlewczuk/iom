@@ -135,6 +135,41 @@ if(CUDA_ENABLED)
 endif()
 
 
+if(SYCL_ENABLED)
+    add_executable(iom_sycl_smoke_tests
+            sycl/test_sycl_smoke.cpp
+    )
+
+    set_source_files_properties(sycl/test_sycl_smoke.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+
+    target_include_directories(iom_sycl_smoke_tests
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/sycl
+            ${IOM_SYCL_INCLUDE_DIR}
+    )
+
+    target_compile_options(iom_sycl_smoke_tests
+        PRIVATE
+            -fsycl
+    )
+
+    target_link_options(iom_sycl_smoke_tests
+        PRIVATE
+            -fsycl
+    )
+
+    target_link_libraries(iom_sycl_smoke_tests
+        PRIVATE
+            doctest::doctest
+            iom_sycl
+    )
+
+    add_test(NAME iom_sycl_smoke_tests
+             COMMAND iom_sycl_smoke_tests)
+endif()
+
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
 )
