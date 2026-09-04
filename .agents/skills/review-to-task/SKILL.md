@@ -118,6 +118,8 @@ Keep the source ID uppercase. Derive a short lowercase kebab-case slug from the 
 
 If a proposed destination already exists but is not a prior conversion of the same finding, choose a distinct precise slug. Never overwrite the collision.
 
+Note that directory may contain subdirectories with the same finding IDs from previous reviews. Please ignore them and create new ones.
+
 ### 4. Establish order, priority, and blockers
 
 Use review order unless a real implementation dependency requires another selected finding to come first. A blocker exists only when one remediation needs an interface, invariant, or mechanism delivered by another task; thematic similarity is not a dependency. Every blocker must name an existing task directory or an earlier newly assigned task directory.
@@ -134,7 +136,7 @@ Build the complete assignment table before spawning any subagent. Each row must 
 
 ### 5. Delegate one complete task per finding
 
-Writing independent task specifications is mandatory subagent work. Launch one general-purpose writing subagent per selected finding in one parallel batch, up to the harness concurrency cap. If the selection exceeds that cap, use the fewest parallel waves needed. Give every subagent exclusive ownership of one destination `spec.md`; no two agents may edit the same file.
+Writing independent task specifications is mandatory subagent work. Launch one general-purpose writing subagent per selected finding in one parallel batch, up to the harness concurrency cap. If the selection exceeds that cap, use the fewest parallel waves needed. Give every subagent exclusive ownership of one destination `spec.md`; no two agents may edit the same file. Ensure that no more than 5 subagents work in parallel.
 
 #### Same-model requirement
 
