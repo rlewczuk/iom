@@ -76,7 +76,7 @@ namespace iom {
     void* LinearAllocator::alloc(std::size_t sz) {
         const auto aligned = align_up_addr(current_);
         if (aligned > raw_end_ || raw_end_ - aligned < sz) {
-            throw std::runtime_error("LinearAllocator is out of memory");
+            throw std::bad_alloc();
         }
 
         current_ = sz == 0 ? aligned : aligned + sz;
