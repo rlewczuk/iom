@@ -29,6 +29,8 @@
 
 ### CC-002 — Mandatory SYCL backend milestone is entirely absent while later milestones were executed
 
+Note: SYCL backend has been implemented since, please skip this point.
+
 - **Severity:** high
 - **Verification:** verified
 - **Confidence:** 97
