@@ -55,6 +55,41 @@ size_t json_size(const nlohmann::json& value, const char* field) {
     return static_cast<size_t>(raw);
 }
 
+std::size_t safetensors_checked_add(std::size_t lhs, std::size_t rhs,
+                                    const std::string& what) {
+    if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
+        throw std::runtime_error(what);
+    }
+    return lhs + rhs;
+}
+
+std::size_t safetensors_checked_mul(std::size_t lhs, std::size_t rhs,
+                                    const std::string& what) {
+    if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
+        throw std::runtime_error(what);
+    }
+    return lhs * rhs;
+}
+
+std::size_t safetensors_bits_to_bytes(std::size_t bits,
+                                      const std::string& what) {
+    return safetensors_checked_add(bits, 7, what) / 8;
+}
+
+std::size_t safetensors_expected_payload_bytes(
+    DataType dtype, const std::vector<std::size_t>& shape,
+    const std::string& name) {
+    const std::string overflow_message =
+        "safetensors tensor payload size overflows: " + name;
+    std::size_t elements = 1;
+    for (const std::size_t dimension : shape) {
+        elements = safetensors_checked_mul(elements, dimension, overflow_message);
+    }
+    const std::size_t bits = safetensors_checked_mul(
+        elements, iom::detail::leaf_bits(dtype), overflow_message);
+    return safetensors_bits_to_bytes(bits, overflow_message);
+}
+
 }  // namespace
 
 SafeTensorView::SafeTensorView(DataType dtype, std::vector<size_t> shape,
@@ -97,6 +132,8 @@ SafeTensorsFile::SafeTensorsFile(const std::string& filename)
         throw std::runtime_error("invalid safetensors header: " + filename);
     }
 
+    std::size_t prev_end = 0;
+    bool first_entry = true;
     for (const auto& [name, tensor] : header.items()) {
         if (name == "__metadata__") {
             continue;
@@ -126,9 +163,25 @@ SafeTensorsFile::SafeTensorsFile(const std::string& filename)
             throw std::runtime_error("safetensors data offset out of range: " + name);
         }
 
+        const DataType dtype = parse_dtype(dtype_it->get<std::string>());
+        const size_t expected_nbytes =
+            safetensors_expected_payload_bytes(dtype, shape, name);
+        if (end - begin != expected_nbytes) {
+            throw std::runtime_error(
+                "safetensors tensor payload size mismatch: " + name +
+                " (expected " + std::to_string(expected_nbytes) +
+                " bytes, got " + std::to_string(end - begin) + " bytes)");
+        }
+        if (!first_entry && begin < prev_end) {
+            throw std::runtime_error(
+                "safetensors tensor range out of order or overlapping: " + name);
+        }
+
         keys_.push_back(name);
-        tensors_.emplace(name, SafeTensorView(parse_dtype(dtype_it->get<std::string>()),
-                                             std::move(shape), data_begin + begin, end - begin));
+        tensors_.emplace(name, SafeTensorView(dtype, std::move(shape),
+                                              data_begin + begin, end - begin));
+        prev_end = end;
+        first_entry = false;
     }
 }
 

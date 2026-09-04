@@ -111,6 +111,58 @@ std::string write_safetensors_file(const std::filesystem::path& dir,
     return path.string();
 }
 
+struct RawTensorEntry {
+    std::string name;
+    std::string dtype;
+    std::vector<std::size_t> shape;
+    std::size_t begin;
+    std::size_t end;
+};
+
+std::string write_raw_safetensors_file(
+    const std::filesystem::path& dir, const std::string& filename,
+    const std::vector<RawTensorEntry>& entries, const std::string& payload) {
+    std::string header = "{";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const RawTensorEntry& entry = entries[i];
+        if (i > 0) {
+            header += ",";
+        }
+        header += "\"" + entry.name + "\":{\"dtype\":\"" + entry.dtype +
+                  "\",\"shape\":[";
+        for (std::size_t d = 0; d < entry.shape.size(); ++d) {
+            if (d > 0) {
+                header += ",";
+            }
+            header += std::to_string(entry.shape[d]);
+        }
+        header += "],\"data_offsets\":[" + std::to_string(entry.begin) + "," +
+                  std::to_string(entry.end) + "]}";
+    }
+    header += "}";
+
+    std::string bytes(8, '\0');
+    const auto header_len = static_cast<uint64_t>(header.size());
+    for (std::size_t i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<char>((header_len >> (8 * i)) & 0xFF);
+    }
+    bytes += header;
+    bytes += payload;
+
+    const auto path = dir / filename;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error(
+            "cannot write test safetensors file: " + path.string());
+    }
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out) {
+        throw std::runtime_error(
+            "cannot write test safetensors file: " + path.string());
+    }
+    return path.string();
+}
+
 TEST_CASE("SafeTensors dtype maps every accepted string to its DataType") {
     const std::pair<std::string, iom::DataType> cases[] = {
         {"BOOL", iom::DataType::BOOL},
@@ -136,10 +188,15 @@ TEST_CASE("SafeTensors dtype maps every accepted string to its DataType") {
 
     TempDir dir("dtype-map");
     std::vector<TensorEntry> tensors;
+    std::vector<std::size_t> payload_sizes;
     tensors.reserve(std::size(cases));
+    payload_sizes.reserve(std::size(cases));
     for (size_t i = 0; i < std::size(cases); ++i) {
+        const std::size_t payload_bytes =
+            (iom::detail::leaf_bits(cases[i].second) * 2 + 7) / 8;
+        payload_sizes.push_back(payload_bytes);
         tensors.push_back({key_name(i), cases[i].first, {2},
-                           deterministic_payload(2, i)});
+                           deterministic_payload(payload_bytes, i)});
     }
     const auto path = write_safetensors_file(
         dir.path(), "accepted.safetensors", tensors);
@@ -156,13 +213,121 @@ TEST_CASE("SafeTensors dtype maps every accepted string to its DataType") {
         REQUIRE(keys.count(key) == 1);
 
         const iom::SafeTensorView tensor = file[key];
+        const std::size_t payload_bytes = payload_sizes[i];
         CHECK(tensor.dtype() == cases[i].second);
         CHECK(tensor.shape() == std::vector<size_t>{2});
-        CHECK(tensor.nbytes() == 2);
+        CHECK(tensor.nbytes() == payload_bytes);
 
-        const std::string want = deterministic_payload(2, i);
+        const std::string want = deterministic_payload(payload_bytes, i);
         REQUIRE(tensor.raw<uint8_t>() != nullptr);
-        CHECK(std::memcmp(tensor.raw<uint8_t>(), want.data(), 2) == 0);
+        CHECK(std::memcmp(tensor.raw<uint8_t>(), want.data(), payload_bytes) == 0);
+    }
+}
+
+TEST_CASE("SafeTensorsFile rejects mismatched, overlapping, and out-of-order entries") {
+    {
+        TempDir dir("payload-truncated");
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "truncated.safetensors",
+            {{"a", "F32", {4096, 4096}, 0, 4}},
+            deterministic_payload(4, 0));
+        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsFile file(path);
+            (void)file;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        const bool message_matches =
+            message.find("payload size mismatch") != std::string::npos &&
+            message.find("a") != std::string::npos;
+        CHECK(message_matches);
+    }
+
+    {
+        TempDir dir("payload-oversized");
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "oversized.safetensors",
+            {{"b", "F16", {2, 2}, 0, 10}},
+            std::string(10, '\0'));
+        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsFile file(path);
+            (void)file;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        const bool message_matches =
+            message.find("payload size mismatch") != std::string::npos &&
+            message.find("b") != std::string::npos;
+        CHECK(message_matches);
+    }
+
+    {
+        TempDir dir("payload-overlap");
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "overlap.safetensors",
+            {{"c", "F32", {2}, 0, 8}, {"d", "F32", {2}, 4, 12}},
+            std::string(12, '\0'));
+        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsFile file(path);
+            (void)file;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        const bool message_matches =
+            message.find("out of order or overlapping") != std::string::npos &&
+            message.find("d") != std::string::npos;
+        CHECK(message_matches);
+    }
+
+    {
+        TempDir dir("payload-out-of-order");
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "out-of-order.safetensors",
+            {{"e", "F32", {2}, 8, 16}, {"f", "F32", {2}, 0, 8}},
+            std::string(16, '\0'));
+        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsFile file(path);
+            (void)file;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        const bool message_matches =
+            message.find("out of order or overlapping") != std::string::npos &&
+            message.find("f") != std::string::npos;
+        CHECK(message_matches);
+    }
+
+    {
+        TempDir dir("payload-overflow");
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "overflow.safetensors",
+            {{"g", "I64", {1ULL << 62, 2}, 0, 8}},
+            std::string(8, '\0'));
+        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsFile file(path);
+            (void)file;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        const bool message_matches =
+            message.find("payload size") != std::string::npos &&
+            message.find("g") != std::string::npos;
+        CHECK(message_matches);
     }
 }
 
