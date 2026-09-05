@@ -92,6 +92,14 @@ IOM_GPU_DEVICE void copy_value(
         unsigned char* destination, std::uint64_t destination_bit,
         const unsigned char* source, std::uint64_t source_bit,
         unsigned int bits) {
+    if (bits % 8 == 0) {
+        const std::uint64_t destination_byte = destination_bit / 8;
+        const std::uint64_t source_byte = source_bit / 8;
+        for (unsigned int i = 0; i < bits / 8; ++i) {
+            destination[destination_byte + i] = source[source_byte + i];
+        }
+        return;
+    }
     write_bits(
             destination, destination_bit, bits,
             read_bits(source, source_bit, bits));
