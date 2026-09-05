@@ -13,7 +13,6 @@
 #include "driver.hpp"
 namespace iom {
 
-    cuda_detail::DriverCalls cuda_detail::driver_calls{};
 
     namespace {
         constexpr std::size_t kStorageAlignment = 32;
@@ -33,23 +32,6 @@ namespace iom {
                 iom::DataType::F32, iom::DataType::F64,
         };
 
-        [[nodiscard]] std::runtime_error cuda_error(
-                const char* operation, CUresult status) {
-            const char* name = nullptr;
-            const char* description = nullptr;
-            (void)cuGetErrorName(status, &name);
-            (void)cuGetErrorString(status, &description);
-            return std::runtime_error(
-                    std::string(operation) + " failed with "
-                    + (name != nullptr ? name : "unknown CUDA error") + ": "
-                    + (description != nullptr ? description : "unknown error"));
-        }
-
-        void check_cuda(const char* operation, CUresult status) {
-            if (status != CUDA_SUCCESS) {
-                throw cuda_error(operation, status);
-            }
-        }
 
         [[nodiscard]] std::invalid_argument invalid_ordinal(
                 std::uint32_t ordinal, int device_count) {
@@ -209,10 +191,11 @@ namespace iom {
 
     std::unique_ptr<Device> make_cuda_device(
             std::uint32_t device_ordinal, Allocator& allocator) {
-        check_cuda("cuInit", cuInit(0));
+        check_cuda("cuInit", cuda_detail::driver_calls.init(0));
 
         int device_count = 0;
-        CUresult count_status = cuDeviceGetCount(&device_count);
+        CUresult count_status =
+                cuda_detail::driver_calls.device_get_count(&device_count);
         if (count_status == CUDA_ERROR_NO_DEVICE) {
             throw invalid_ordinal(device_ordinal, 0);
         }
@@ -229,7 +212,8 @@ namespace iom {
         CUdevice device = 0;
         check_cuda(
                 "cuDeviceGet",
-                cuDeviceGet(&device, static_cast<int>(device_ordinal)));
+                cuda_detail::driver_calls.device_get(
+                        &device, static_cast<int>(device_ordinal)));
         CUcontext context = nullptr;
         check_cuda(
                 "cuDevicePrimaryCtxRetain",

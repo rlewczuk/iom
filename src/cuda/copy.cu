@@ -23,23 +23,6 @@ std::atomic<SubmissionFault> g_submission_fault{SubmissionFault::none};
             expected, SubmissionFault::none, std::memory_order_acq_rel);
 }
 
-[[nodiscard]] std::runtime_error cuda_error(
-        const char* operation, CUresult status) {
-    const char* name = nullptr;
-    const char* description = nullptr;
-    (void)cuGetErrorName(status, &name);
-    (void)cuGetErrorString(status, &description);
-    return std::runtime_error(
-            std::string(operation) + " failed with "
-            + (name != nullptr ? name : "unknown CUDA error") + ": "
-            + (description != nullptr ? description : "unknown error"));
-}
-
-void check_cuda(const char* operation, CUresult status) {
-    if (status != CUDA_SUCCESS) {
-        throw cuda_error(operation, status);
-    }
-}
 
 void check_cuda_kernel(const char* operation, cudaError_t status) {
     if (status != cudaSuccess) {
