@@ -2,7 +2,7 @@
 
 #include <cuda.h>
 
-#include <cstdint>
+#include <array>
 #include <limits>
 #include <memory>
 #include <new>
@@ -17,6 +17,21 @@ namespace iom {
 
     namespace {
         constexpr std::size_t kStorageAlignment = 32;
+        constexpr std::array kCudaSupportedDataTypes = {
+                iom::DataType::BOOL,
+                iom::DataType::I2, iom::DataType::U2,
+                iom::DataType::I4, iom::DataType::U4,
+                iom::DataType::I8, iom::DataType::U8,
+                iom::DataType::I16, iom::DataType::U16,
+                iom::DataType::I32, iom::DataType::U32,
+                iom::DataType::I64, iom::DataType::U64,
+                iom::DataType::F4_E2M1,
+                iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+                iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+                iom::DataType::F8_E8M0,
+                iom::DataType::F16, iom::DataType::BF16,
+                iom::DataType::F32, iom::DataType::F64,
+        };
 
         [[nodiscard]] std::runtime_error cuda_error(
                 const char* operation, CUresult status) {
@@ -87,6 +102,11 @@ namespace iom {
 
             [[nodiscard]] std::uint32_t backend_device() const noexcept override {
                 return ordinal_;
+            }
+            [[nodiscard]] std::span<const iom::DataType>
+                    supported_data_types() const noexcept override {
+                return {kCudaSupportedDataTypes.data(),
+                        kCudaSupportedDataTypes.size()};
             }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(

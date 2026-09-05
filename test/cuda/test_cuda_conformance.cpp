@@ -25,21 +25,6 @@
 
 namespace {
 
-constexpr std::initializer_list<iom::DataType> kCudaLeafTypes = {
-    iom::DataType::BOOL,
-    iom::DataType::I2, iom::DataType::U2,
-    iom::DataType::I4, iom::DataType::U4,
-    iom::DataType::I8, iom::DataType::U8,
-    iom::DataType::I16, iom::DataType::U16,
-    iom::DataType::I32, iom::DataType::U32,
-    iom::DataType::I64, iom::DataType::U64,
-    iom::DataType::F4_E2M1,
-    iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-    iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
-    iom::DataType::F8_E8M0,
-    iom::DataType::F16, iom::DataType::BF16,
-    iom::DataType::F32, iom::DataType::F64,
-};
 
 class TrafficGate final : public iom_conformance::ConformanceObserver {
 public:
@@ -258,20 +243,50 @@ void expect_repeated_runtime_failure(
 }
 
 }  // namespace
+TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    TrafficGate gate;
+    CudaAllocator allocator(gate);
+    const std::unique_ptr<iom::Device> candidate =
+            iom::make_cuda_device(0, allocator);
+    const std::span<const iom::DataType> supported =
+            candidate->supported_data_types();
+    constexpr iom::DataType expected[] = {
+            iom::DataType::BOOL,
+            iom::DataType::I2, iom::DataType::U2,
+            iom::DataType::I4, iom::DataType::U4,
+            iom::DataType::I8, iom::DataType::U8,
+            iom::DataType::I16, iom::DataType::U16,
+            iom::DataType::I32, iom::DataType::U32,
+            iom::DataType::I64, iom::DataType::U64,
+            iom::DataType::F4_E2M1,
+            iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+            iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+            iom::DataType::F8_E8M0,
+            iom::DataType::F16, iom::DataType::BF16,
+            iom::DataType::F32, iom::DataType::F64,
+    };
+    REQUIRE_EQ(supported.size(), sizeof(expected) / sizeof(expected[0]));
+    for (std::size_t i = 0; i < supported.size(); ++i) {
+        CHECK_EQ(supported[i], expected[i]);
+    }
+}
+
 
 TEST_CASE("CUDA conformance: storage and host transfers for every leaf type") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_storage_and_transfer_conformance(
-            devices.conformance(), kCudaLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CUDA conformance: storage oracle identifies perturbed transfer map") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
-    const std::span<const iom::DataType> one_type{
-            kCudaLeafTypes.begin(), 1};
+    const std::span<const iom::DataType> one_type =
+            devices.candidate->supported_data_types().subspan(0, 1);
     iom_conformance::run_storage_and_transfer_conformance(
             devices.conformance(), one_type, &devices.gate);
 
@@ -289,16 +304,17 @@ TEST_CASE("CUDA conformance: storage oracle covers every leaf width and padded s
     CudaDevices devices;
     CudaStorageOracle oracle;
     REQUIRE(iom_conformance::run_storage_oracle_conformance(
-            devices.conformance(), kCudaLeafTypes, oracle, &devices.gate));
+            devices.conformance(), devices.candidate->supported_data_types(),
+            oracle, &devices.gate));
     CHECK_FALSE(devices.gate.armed());
 }
-
 
 TEST_CASE("CUDA conformance: asynchronous copies against the CPU reference") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_async_copy_conformance(
-            devices.conformance(), kCudaLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -306,7 +322,8 @@ TEST_CASE("CUDA conformance: copy validation fails before writes and sequences")
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_copy_error_conformance(
-            devices.conformance(), kCudaLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -314,7 +331,8 @@ TEST_CASE("CUDA conformance: transfer failures keep metadata and ownership") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_transfer_error_conformance(
-            devices.conformance(), kCudaLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -322,7 +340,8 @@ TEST_CASE("CUDA conformance: deferred queue lifetime and stability") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_lifetime_conformance(
-            *devices.candidate, kCudaLeafTypes, &devices.gate);
+            *devices.candidate, devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -330,7 +349,8 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_compute_capability_conformance(
-            *devices.candidate, kCudaLeafTypes, &devices.gate);
+            *devices.candidate, devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -339,7 +359,7 @@ TEST_CASE("CUDA conformance: full shared suite") {
     CudaDevices devices;
     iom_conformance::run_backend_conformance(
             devices.conformance(),
-            std::span<const iom::DataType>{kCudaLeafTypes.begin(), 1},
+            devices.candidate->supported_data_types().subspan(0, 1),
             &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }

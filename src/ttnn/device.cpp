@@ -147,6 +147,10 @@ namespace iom {
             [[nodiscard]] std::uint32_t backend_device() const noexcept override {
                 return ordinal_;
             }
+            [[nodiscard]] std::span<const iom::DataType>
+                    supported_data_types() const noexcept override {
+                return ttnn_supported_data_types();
+            }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;

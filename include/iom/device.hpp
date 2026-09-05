@@ -29,6 +29,12 @@ namespace iom {
         Device& operator=(Device&&) = delete;
 
         [[nodiscard]] virtual BackendKind backend_kind() const noexcept = 0;
+        /**
+         * Returns the immutable set of data types accepted with
+         * QuantizationFormat::NONE. The read-only predicate has no side
+         * effects on tensor creation.
+         */
+        [[nodiscard]] virtual std::span<const iom::DataType> supported_data_types() const noexcept = 0;
         [[nodiscard]] virtual std::uint32_t backend_device() const noexcept = 0;
 
         [[nodiscard]] virtual std::unique_ptr<Tensor> create_tensor(

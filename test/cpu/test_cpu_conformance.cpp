@@ -16,22 +16,6 @@
 
 namespace {
 
-// Every declared leaf type; the CPU backend stores all of them with
-// QuantizationFormat::NONE.
-constexpr std::initializer_list<iom::DataType> kCpuLeafTypes = {
-    iom::DataType::BOOL,
-    iom::DataType::I2, iom::DataType::U2,
-    iom::DataType::I4, iom::DataType::U4,
-    iom::DataType::I8, iom::DataType::U8,
-    iom::DataType::I16, iom::DataType::U16,
-    iom::DataType::I32, iom::DataType::U32,
-    iom::DataType::I64, iom::DataType::U64,
-    iom::DataType::F4_E2M1,
-    iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-    iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2, iom::DataType::F8_E8M0,
-    iom::DataType::F16, iom::DataType::BF16,
-    iom::DataType::F32, iom::DataType::F64,
-};
 
 // Observes harness phase boundaries and exposes the armed window in which
 // tensor-storage allocators must stay silent.
@@ -106,6 +90,34 @@ struct CpuDevices {
 };
 
 }  // namespace
+TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
+    std::vector<std::byte> storage(1024);
+    iom::LinearAllocator allocator(storage.data(), storage.size());
+    const std::unique_ptr<iom::Device> candidate =
+            iom::make_cpu_device(allocator);
+    const std::span<const iom::DataType> supported =
+            candidate->supported_data_types();
+    constexpr iom::DataType expected[] = {
+            iom::DataType::BOOL,
+            iom::DataType::I2, iom::DataType::U2,
+            iom::DataType::I4, iom::DataType::U4,
+            iom::DataType::I8, iom::DataType::U8,
+            iom::DataType::I16, iom::DataType::U16,
+            iom::DataType::I32, iom::DataType::U32,
+            iom::DataType::I64, iom::DataType::U64,
+            iom::DataType::F4_E2M1,
+            iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+            iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+            iom::DataType::F8_E8M0,
+            iom::DataType::F16, iom::DataType::BF16,
+            iom::DataType::F32, iom::DataType::F64,
+    };
+    REQUIRE_EQ(supported.size(), sizeof(expected) / sizeof(expected[0]));
+    for (std::size_t i = 0; i < supported.size(); ++i) {
+        CHECK_EQ(supported[i], expected[i]);
+    }
+}
+
 
 // The CPU reference instantiation passes every shared case for every declared
 // leaf type. Each entry point runs in its own test case with freshly and
@@ -114,7 +126,8 @@ struct CpuDevices {
 TEST_CASE("CPU conformance: storage and host transfers for every leaf type") {
     CpuDevices devices;
     iom_conformance::run_storage_and_transfer_conformance(
-            devices.conformance(), kCpuLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -122,49 +135,56 @@ TEST_CASE("CPU conformance: standard storage oracle covers every leaf width and 
     CpuDevices devices;
     iom_conformance::CpuStorageOracle oracle;
     REQUIRE(iom_conformance::run_storage_oracle_conformance(
-            devices.conformance(), kCpuLeafTypes, oracle, &devices.gate));
+            devices.conformance(), devices.candidate->supported_data_types(),
+            oracle, &devices.gate));
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CPU conformance: asynchronous copies against the CPU reference") {
     CpuDevices devices;
     iom_conformance::run_async_copy_conformance(
-            devices.conformance(), kCpuLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CPU conformance: copy validation fails before writes and sequences") {
     CpuDevices devices;
     iom_conformance::run_copy_error_conformance(
-            devices.conformance(), kCpuLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CPU conformance: transfer failures keep metadata and ownership") {
     CpuDevices devices;
     iom_conformance::run_transfer_error_conformance(
-            devices.conformance(), kCpuLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CPU conformance: deferred queue lifetime and stability") {
     CpuDevices devices;
     iom_conformance::run_lifetime_conformance(
-            *devices.candidate, kCpuLeafTypes, &devices.gate);
+            *devices.candidate, devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CPU conformance: compute methods reject capability without submitting") {
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
-            *devices.candidate, kCpuLeafTypes, &devices.gate);
+            *devices.candidate, devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: full suite composes every shared case") {
+TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     CpuDevices devices;
     iom_conformance::run_backend_conformance(
-            devices.conformance(), std::span<const iom::DataType>{kCpuLeafTypes.begin(), 1},
+            devices.conformance(),
+            devices.candidate->supported_data_types().subspan(0, 1),
             &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
