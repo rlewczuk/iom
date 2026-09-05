@@ -153,6 +153,7 @@ if(CUDA_ENABLED)
         src/cuda/copy.cu
         src/cuda/copy.hpp
         src/cuda/driver.hpp
+        src/cuda/transfer_pool.hpp
         src/shared/standard_tiled_copy.hpp
         include/iom/cuda/device.hpp
     )
