@@ -6,10 +6,10 @@ Added the backend-neutral header-only helpers `iom::detail::allocate_aligned_sto
 
 ## Verification
 
-- `cmake -S . -B build -DBUILD_TESTING=ON -DCPU_ENABLED=ON -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF -DSYCL_ENABLED=OFF -DTTNN_ENABLED=OFF && cmake --build build -j --target iom_cpu_tests iom_backend_conformance_cpu_tests iom_tests` — all three targets built successfully.
-- `ctest --test-dir build --output-on-failure` — 3/3 local tests passed.
-- CPU focused allocation, misalignment, exhaustion, backend-conformance, and supported-data-type mutation tests — passed; backend conformance reported 10 test cases and 21,041 assertions.
-- Remote CUDA build and `flock /tmp/agent-gpu0.lock ctest --test-dir build --output-on-failure -R "iom_cuda_(conformance|smoke)_tests"` — both suites passed; focused misaligned-allocation test passed with 5 assertions.
-- Remote ROCm build and `flock /tmp/agent-gpu1.lock ctest --test-dir build --output-on-failure -R "iom_rocm_(conformance|smoke)_tests"` — both suites passed.
-- Remote SYCL build and runtime-path-configured `flock /tmp/agent-gpu2.lock ctest --test-dir build --output-on-failure -R "iom_sycl_(conformance|smoke)_tests"` — both suites passed.
+- After merging the latest `main`, `cmake -S . -B build -DBUILD_TESTING=ON -DCPU_ENABLED=ON -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF -DSYCL_ENABLED=OFF -DTTNN_ENABLED=OFF && cmake --build build -j --target iom_cpu_tests iom_backend_conformance_cpu_tests iom_tests` — all three targets built successfully.
+- After merging the latest `main`, `ctest --test-dir build --output-on-failure` — 3/3 local tests passed.
+- CPU focused allocation, misalignment, allocator-failure, exhaustion, and supported-data-type mutation tests — passed; the misalignment case passed 12 assertions.
+- After merging the latest `main`, remote CUDA configure/build and `flock /tmp/agent-gpu0.lock ctest --test-dir build --output-on-failure -R "iom_cuda_(conformance|smoke)_tests"` — both suites passed; the focused CUDA misaligned-allocation case passed 5 assertions.
+- After merging the latest `main`, remote ROCm configure/build and `flock /tmp/agent-gpu1.lock ctest --test-dir build --output-on-failure -R "iom_rocm_(conformance|smoke)_tests"` — both suites passed.
+- After merging the latest `main`, remote SYCL configure/build and runtime-path-configured `flock /tmp/agent-gpu2.lock ctest --test-dir build --output-on-failure -R "iom_sycl_(conformance|smoke)_tests"` — both suites passed.
 - Static audits — one shared `kStorageAlignment` declaration, four backend alignment-message call sites, helper calls in all four standard-layout backends, and zero helper references in TTNN.
