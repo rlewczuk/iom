@@ -7,6 +7,7 @@
 #include <span>
 
 #include "transfer_pool.hpp"
+#include "registry_state.hpp"
 
 #include "iom/iom.hpp"
 
@@ -30,6 +31,7 @@ void region_to_host(
         const TensorView& source, std::span<std::byte> destination);
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
-        const Device& device, CUcontext context);
+        const Device& device, CUcontext context,
+        CudaRegistryState& registry_state);
 
 }  // namespace iom::cuda_detail

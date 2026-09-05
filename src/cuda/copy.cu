@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <mutex>
@@ -178,6 +179,43 @@ void synchronize_and_destroy_stream(cudaStream_t stream) noexcept {
 }
 
 
+detail::FenceResult fence_event(
+        CUcontext context, cudaEvent_t event,
+        std::exception_ptr retained_failure) noexcept {
+    if (event == nullptr && !retained_failure) {
+        return detail::FenceResult::success();
+    }
+    try {
+        const CUresult context_status = driver_calls.ctx_set_current(context);
+        if (context_status != CUDA_SUCCESS) {
+            throw cuda_error("cuCtxSetCurrent", context_status);
+        }
+        if (event != nullptr) {
+            const cudaError_t status = cudaEventSynchronize(event);
+            if (status != cudaSuccess) {
+                throw std::runtime_error(
+                        std::string("cudaEventSynchronize failed with ")
+                        + cudaGetErrorName(status) + ": "
+                        + cudaGetErrorString(status));
+            }
+        }
+        if (retained_failure) {
+            return detail::FenceResult::failed(std::move(retained_failure));
+        }
+        return detail::FenceResult::success();
+    } catch (...) {
+        return detail::FenceResult::failed(std::current_exception());
+    }
+}
+
+detail::Fence make_fence(
+        CUcontext context, cudaEvent_t event,
+        std::exception_ptr retained_failure = nullptr) {
+    return [context, event,
+            retained_failure = std::move(retained_failure)]() mutable noexcept {
+        return fence_event(context, event, retained_failure);
+    };
+}
 }  // namespace
 }  // namespace iom::cuda_detail
 
@@ -327,6 +365,7 @@ void synchronous_transfer(
 
 namespace {
 
+
 class CudaQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
@@ -335,11 +374,24 @@ class CudaQueue final : public DeviceOps {
         cudaEvent_t event = nullptr;
         bool no_op;
         void* fence = nullptr;
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+    };
+
+    struct SequenceOutcome {
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+        bool fence_succeeded = false;
+        std::exception_ptr retained_failure;
     };
 
 public:
-    CudaQueue(const Device& device, CUcontext context)
+    CudaQueue(
+            const Device& device, CUcontext context,
+            CudaRegistryState& registry_state)
             : device_(&device),
+              state_(&registry_state),
+              registry_queue_id_(allocate_queue_id(*state_)),
               context_(context),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
@@ -362,7 +414,8 @@ public:
                               [this](
                                       std::uint64_t sequence,
                                       std::exception_ptr failure) {
-                                  complete(sequence, std::move(failure));
+                                  complete_task(
+                                          sequence, std::move(failure));
                               }},
                       detail::StagedWorker<Task>::PublishPolicy::Splice) {
         gpu_policy::activate(context_);
@@ -377,6 +430,7 @@ public:
     }
 
     ~CudaQueue() override {
+        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
         worker_.shutdown_and_drain();
         try {
             gpu_policy::activate(context_);
@@ -438,6 +492,7 @@ private:
         const unsigned int bits = static_cast<unsigned int>(
                 detail::leaf_bits(task.source->spec().data_type));
 
+        std::exception_ptr retained_failure;
         try {
             std::size_t plane_index = 0;
             for (const detail::PlanePair pair : pairs) {
@@ -449,7 +504,7 @@ private:
             gpu_policy::record_event(task.event, stream_);
             event_guard.linked = true;
         } catch (...) {
-            const std::exception_ptr failure = std::current_exception();
+            retained_failure = std::current_exception();
             if constexpr (gpu_policy::discard_failure_event_on_error) {
                 task.fence = nullptr;
                 event_guard.linked = false;
@@ -457,17 +512,90 @@ private:
                 gpu_policy::record_event_no_fault(task.event, stream_);
                 event_guard.linked = true;
             }
-            commit_failure(task.sequence, failure);
+        }
+
+        const detail::Fence fence = make_fence(
+                context_, task.event, retained_failure);
+        detail::EntryRegistration entries;
+        try {
+            entries = register_copy_entries(
+                    *state_, registry_queue_id_, task.sequence,
+                    task.source->native_handle(),
+                    task.destination->native_handle(), fence);
+            task.source_entry_id = entries.source;
+            task.destination_entry_id = entries.destination;
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto [it, inserted] = outcomes_.emplace(
+                    task.sequence,
+                    SequenceOutcome{
+                            entries.source, entries.destination,
+                            retained_failure == nullptr, retained_failure});
+            if (!inserted) {
+                throw std::logic_error(
+                        "duplicate CUDA outstanding-work sequence");
+            }
+        } catch (...) {
+            if (entries.source != 0) {
+                state_->registry.remove_entry_if_present(
+                        entries.source, task.source->native_handle());
+            }
+            if (entries.destination != 0) {
+                state_->registry.remove_entry_if_present(
+                        entries.destination,
+                        task.destination->native_handle());
+            }
+            if (task.event != nullptr) {
+                fence_and_destroy(task.event);
+                event_guard.event = nullptr;
+                event_guard.linked = true;
+                task.fence = nullptr;
+            }
+            throw;
+        }
+
+        if (retained_failure) {
+            commit_failure(task.sequence, retained_failure);
         }
     }
 
+    void complete_task(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        SequenceOutcome outcome;
+        bool has_outcome = false;
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(sequence);
+            if (it != outcomes_.end()) {
+                outcome = std::move(it->second);
+                outcomes_.erase(it);
+                has_outcome = true;
+            }
+        }
+        if (has_outcome) {
+            outcome.fence_succeeded = !failure && !outcome.retained_failure;
+            const std::array<detail::EntryId, 2> entries{
+                    outcome.source_entry_id,
+                    outcome.destination_entry_id};
+            if (failure || outcome.retained_failure) {
+                state_->registry.invalidate_entries(entries);
+            } else {
+                (void)state_->registry.try_release_entry(entries[0]);
+                (void)state_->registry.try_release_entry(entries[1]);
+            }
+        }
+        complete(sequence, std::move(failure));
+    }
+
     const Device* device_;
+    CudaRegistryState* state_;
+    detail::QueueId registry_queue_id_;
     CUcontext context_;
     cudaStream_t stream_ = gpu_policy::null_stream();
     std::mutex submission_order_mutex_;
+    std::mutex outcome_mutex_;
+    std::map<std::uint64_t, SequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
-
 }  // namespace
 
 
@@ -488,8 +616,11 @@ void region_to_host(
     synchronous_transfer(pool, context, source, {}, destination, false);
 }
 
-std::unique_ptr<DeviceOps> make_queue(const Device& device, CUcontext context) {
-    return std::make_unique<CudaQueue>(device, context);
+std::unique_ptr<DeviceOps> make_queue(
+        const Device& device, CUcontext context,
+        CudaRegistryState& registry_state) {
+    return std::make_unique<CudaQueue>(
+            device, context, registry_state);
 }
 
 }  // namespace iom::cuda_detail

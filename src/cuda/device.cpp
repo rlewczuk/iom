@@ -12,6 +12,7 @@
 #include "copy.hpp"
 #include "driver.hpp"
 #include "iom/detail/aligned_storage.hpp"
+#include "registry_state.hpp"
 namespace iom {
 
 
@@ -78,8 +79,11 @@ namespace iom {
                         transfer_pool_.destroy();
                     } catch (...) {
                     }
+                    registry_state_.quarantine.drain();
                     (void)cuda_detail::driver_calls.primary_ctx_release(device_);
                     context_ = nullptr;
+                } else {
+                    registry_state_.quarantine.drain();
                 }
             }
 
@@ -101,7 +105,8 @@ namespace iom {
 
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 activate();
-                return cuda_detail::make_queue(*this, context_);
+                return cuda_detail::make_queue(
+                        *this, context_, registry_state_);
             }
 
             void activate() const {
@@ -114,10 +119,16 @@ namespace iom {
                 return context_;
             }
 
+            [[nodiscard]] cuda_detail::CudaRegistryState&
+                    registry_state() noexcept {
+                return registry_state_;
+            }
+
         private:
             std::uint32_t ordinal_;
             CUdevice device_;
             CUcontext context_;
+            cuda_detail::CudaRegistryState registry_state_;
             cuda_detail::TransferStreamPool transfer_pool_;
             Allocator& allocator_;
             friend class CudaTensor;
@@ -128,7 +139,7 @@ namespace iom {
             CudaTensor(const TensorSpec& spec, CudaDevice& device,
                        Allocator& allocator)
                     : Tensor(spec, device), device_(device),
-                      allocator_(allocator) {
+                      state_(&device.registry_state()), allocator_(allocator) {
                 address_ = iom::detail::allocate_aligned_storage(
                         allocator_,
                         view().spec().tiled_storage_nbytes(),
@@ -136,10 +147,59 @@ namespace iom {
                         "CUDA tensor storage is not 32-byte aligned");
             }
 
-            ~CudaTensor() override {
-                iom::detail::release_aligned_storage(
-                        allocator_, address_,
-                        [this] { device_.activate(); });
+            ~CudaTensor() noexcept override {
+                if (address_ == nullptr) {
+                    return;
+                }
+                std::vector<
+                        detail::OutstandingWorkRegistry::EntrySnapshot>
+                        snapshots;
+                try {
+                    snapshots = state_->registry.snapshot_for(address_);
+                } catch (...) {
+                    return;
+                }
+
+                bool safe_to_release = true;
+                for (const auto& snapshot : snapshots) {
+                    if (snapshot.state == detail::EntryState::Invalidated
+                            || !snapshot.fence) {
+                        safe_to_release = false;
+                        continue;
+                    }
+                    try {
+                        const detail::FenceResult result = snapshot.fence();
+                        safe_to_release = safe_to_release
+                                && result.succeeded && !result.failure;
+                    } catch (...) {
+                        safe_to_release = false;
+                    }
+                }
+
+                if (safe_to_release) {
+                    for (const auto& snapshot : snapshots) {
+                        state_->registry.remove_entry_if_present(
+                                snapshot.id, address_);
+                    }
+                    iom::detail::release_aligned_storage(
+                            allocator_, address_,
+                            [this] { device_.activate(); });
+                    return;
+                }
+
+                try {
+                    state_->quarantine.emplace<detail::AllocatorCleanupAction>(
+                            allocator_, address_,
+                            view().spec().tiled_storage_nbytes(),
+                            [device = &device_] { device->activate(); });
+                    address_ = nullptr;
+                } catch (...) {
+                }
+                for (const auto& snapshot : snapshots) {
+                    state_->registry.remove_entry_if_present(
+                            snapshot.id,
+                            address_ != nullptr ? address_ : snapshot.address);
+                }
             }
 
         private:
@@ -165,6 +225,7 @@ namespace iom {
                         source, destination);
             }
             CudaDevice& device_;
+            cuda_detail::CudaRegistryState* state_;
             Allocator& allocator_;
             void* address_ = nullptr;
         };

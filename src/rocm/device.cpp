@@ -11,6 +11,7 @@
 
 #include "copy.hpp"
 #include "iom/detail/aligned_storage.hpp"
+#include "registry_state.hpp"
 
 namespace iom {
 
@@ -62,6 +63,10 @@ namespace iom {
             RocmDevice(const RocmDevice&) = delete;
             RocmDevice& operator=(const RocmDevice&) = delete;
 
+            ~RocmDevice() override {
+                registry_state_.quarantine.drain();
+            }
+
             [[nodiscard]] BackendKind backend_kind() const noexcept override {
                 return BackendKind::ROCM;
             }
@@ -81,7 +86,7 @@ namespace iom {
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 activate();
                 return rocm_detail::make_queue(
-                        *this, static_cast<int>(ordinal_));
+                        *this, static_cast<int>(ordinal_), registry_state_);
             }
 
             void activate() const {
@@ -90,8 +95,14 @@ namespace iom {
                         hipSetDevice(static_cast<int>(ordinal_)));
             }
 
+            [[nodiscard]] rocm_detail::RocmRegistryState&
+                    registry_state() noexcept {
+                return registry_state_;
+            }
+
         private:
             std::uint32_t ordinal_;
+            rocm_detail::RocmRegistryState registry_state_;
             Allocator& allocator_;
 
             friend class RocmTensor;
@@ -102,7 +113,7 @@ namespace iom {
             RocmTensor(const TensorSpec& spec, RocmDevice& device,
                        Allocator& allocator)
                     : Tensor(spec, device), device_(device),
-                      allocator_(allocator) {
+                      state_(&device.registry_state()), allocator_(allocator) {
                 address_ = iom::detail::allocate_aligned_storage(
                         allocator_,
                         view().spec().tiled_storage_nbytes(),
@@ -110,10 +121,59 @@ namespace iom {
                         "ROCm tensor storage is not 32-byte aligned");
             }
 
-            ~RocmTensor() override {
-                iom::detail::release_aligned_storage(
-                        allocator_, address_,
-                        [this] { device_.activate(); });
+            ~RocmTensor() noexcept override {
+                if (address_ == nullptr) {
+                    return;
+                }
+                std::vector<
+                        detail::OutstandingWorkRegistry::EntrySnapshot>
+                        snapshots;
+                try {
+                    snapshots = state_->registry.snapshot_for(address_);
+                } catch (...) {
+                    return;
+                }
+
+                bool safe_to_release = true;
+                for (const auto& snapshot : snapshots) {
+                    if (snapshot.state == detail::EntryState::Invalidated
+                            || !snapshot.fence) {
+                        safe_to_release = false;
+                        continue;
+                    }
+                    try {
+                        const detail::FenceResult result = snapshot.fence();
+                        safe_to_release = safe_to_release
+                                && result.succeeded && !result.failure;
+                    } catch (...) {
+                        safe_to_release = false;
+                    }
+                }
+
+                if (safe_to_release) {
+                    for (const auto& snapshot : snapshots) {
+                        state_->registry.remove_entry_if_present(
+                                snapshot.id, address_);
+                    }
+                    iom::detail::release_aligned_storage(
+                            allocator_, address_,
+                            [this] { device_.activate(); });
+                    return;
+                }
+
+                try {
+                    state_->quarantine.emplace<detail::AllocatorCleanupAction>(
+                            allocator_, address_,
+                            view().spec().tiled_storage_nbytes(),
+                            [device = &device_] { device->activate(); });
+                    address_ = nullptr;
+                } catch (...) {
+                }
+                for (const auto& snapshot : snapshots) {
+                    state_->registry.remove_entry_if_present(
+                            snapshot.id,
+                            address_ != nullptr ? address_ : snapshot.address);
+                }
             }
 
         private:
@@ -135,11 +195,11 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 device_.activate();
                 rocm_detail::region_to_host(
-                        static_cast<int>(device_.ordinal_), source,
-                        destination);
+                        static_cast<int>(device_.ordinal_), source, destination);
             }
 
             RocmDevice& device_;
+            rocm_detail::RocmRegistryState* state_;
             Allocator& allocator_;
             void* address_ = nullptr;
         };

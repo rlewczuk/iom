@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <mutex>
@@ -195,6 +196,40 @@ void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
 }
 
 
+detail::FenceResult fence_event(
+        int device_ordinal, hipEvent_t event,
+        std::exception_ptr retained_failure) noexcept {
+    if (event == nullptr && !retained_failure) {
+        return detail::FenceResult::success();
+    }
+    try {
+        const hipError_t device_status = hipSetDevice(device_ordinal);
+        if (device_status != hipSuccess) {
+            throw hip_error("hipSetDevice", device_status);
+        }
+        if (event != nullptr) {
+            const hipError_t status = hipEventSynchronize(event);
+            if (status != hipSuccess) {
+                throw hip_error("hipEventSynchronize", status);
+            }
+        }
+        if (retained_failure) {
+            return detail::FenceResult::failed(std::move(retained_failure));
+        }
+        return detail::FenceResult::success();
+    } catch (...) {
+        return detail::FenceResult::failed(std::current_exception());
+    }
+}
+
+detail::Fence make_fence(
+        int device_ordinal, hipEvent_t event,
+        std::exception_ptr retained_failure = nullptr) {
+    return [device_ordinal, event,
+            retained_failure = std::move(retained_failure)]() mutable noexcept {
+        return fence_event(device_ordinal, event, retained_failure);
+    };
+}
 }  // namespace
 }  // namespace iom::rocm_detail
 
@@ -218,6 +253,7 @@ namespace iom::rocm_detail {
 
 namespace {
 
+
 class RocmQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
@@ -226,11 +262,24 @@ class RocmQueue final : public DeviceOps {
         hipEvent_t event = nullptr;
         bool no_op;
         void* fence = nullptr;
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+    };
+
+    struct SequenceOutcome {
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+        bool fence_succeeded = false;
+        std::exception_ptr retained_failure;
     };
 
 public:
-    RocmQueue(const Device& device, int device_ordinal)
+    RocmQueue(
+            const Device& device, int device_ordinal,
+            RocmRegistryState& registry_state)
             : device_(&device),
+              state_(&registry_state),
+              registry_queue_id_(allocate_queue_id(*state_)),
               context_(device_ordinal),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
@@ -253,7 +302,8 @@ public:
                               [this](
                                       std::uint64_t sequence,
                                       std::exception_ptr failure) {
-                                  complete(sequence, std::move(failure));
+                                  complete_task(
+                                          sequence, std::move(failure));
                               }},
                       detail::StagedWorker<Task>::PublishPolicy::Splice) {
         gpu_policy::activate(context_);
@@ -268,6 +318,7 @@ public:
     }
 
     ~RocmQueue() override {
+        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
         worker_.shutdown_and_drain();
         try {
             gpu_policy::activate(context_);
@@ -329,6 +380,7 @@ private:
         const unsigned int bits = static_cast<unsigned int>(
                 detail::leaf_bits(task.source->spec().data_type));
 
+        std::exception_ptr retained_failure;
         try {
             std::size_t plane_index = 0;
             for (const detail::PlanePair pair : pairs) {
@@ -340,20 +392,99 @@ private:
             gpu_policy::record_event(task.event, stream_);
             event_guard.linked = true;
         } catch (...) {
-            const std::exception_ptr failure = std::current_exception();
+            retained_failure = std::current_exception();
             task.fence = nullptr;
             event_guard.linked = false;
-            commit_failure(task.sequence, failure);
+        }
+
+        const hipEvent_t registry_event =
+                retained_failure != nullptr ? nullptr : task.event;
+        const detail::Fence fence = make_fence(
+                context_, registry_event, retained_failure);
+        detail::EntryRegistration entries;
+        try {
+            entries = register_copy_entries(
+                    *state_, registry_queue_id_, task.sequence,
+                    task.source->native_handle(),
+                    task.destination->native_handle(), fence);
+            task.source_entry_id = entries.source;
+            task.destination_entry_id = entries.destination;
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto [it, inserted] = outcomes_.emplace(
+                    task.sequence,
+                    SequenceOutcome{
+                            entries.source, entries.destination,
+                            retained_failure == nullptr, retained_failure});
+            if (!inserted) {
+                throw std::logic_error(
+                        "duplicate ROCm outstanding-work sequence");
+            }
+        } catch (...) {
+            if (entries.source != 0) {
+                state_->registry.remove_entry_if_present(
+                        entries.source, task.source->native_handle());
+            }
+            if (entries.destination != 0) {
+                state_->registry.remove_entry_if_present(
+                        entries.destination,
+                        task.destination->native_handle());
+            }
+            if (task.event != nullptr) {
+                if (retained_failure == nullptr) {
+                    fence_and_destroy(task.event);
+                } else {
+                    gpu_policy::destroy_event_noexcept(task.event);
+                }
+                event_guard.event = nullptr;
+                event_guard.linked = true;
+                task.fence = nullptr;
+            }
+            throw;
+        }
+
+        if (retained_failure) {
+            commit_failure(task.sequence, retained_failure);
         }
     }
 
+    void complete_task(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        SequenceOutcome outcome;
+        bool has_outcome = false;
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(sequence);
+            if (it != outcomes_.end()) {
+                outcome = std::move(it->second);
+                outcomes_.erase(it);
+                has_outcome = true;
+            }
+        }
+        if (has_outcome) {
+            outcome.fence_succeeded = !failure && !outcome.retained_failure;
+            const std::array<detail::EntryId, 2> entries{
+                    outcome.source_entry_id,
+                    outcome.destination_entry_id};
+            if (failure || outcome.retained_failure) {
+                state_->registry.invalidate_entries(entries);
+            } else {
+                (void)state_->registry.try_release_entry(entries[0]);
+                (void)state_->registry.try_release_entry(entries[1]);
+            }
+        }
+        complete(sequence, std::move(failure));
+    }
+
     const Device* device_;
+    RocmRegistryState* state_;
+    detail::QueueId registry_queue_id_;
     int context_;
     hipStream_t stream_ = gpu_policy::null_stream();
     std::mutex submission_order_mutex_;
+    std::mutex outcome_mutex_;
+    std::map<std::uint64_t, SequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
-
 }  // namespace
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
@@ -375,8 +506,10 @@ void region_to_host(
 }
 
 std::unique_ptr<DeviceOps> make_queue(
-        const Device& device, int device_ordinal) {
-    return std::make_unique<RocmQueue>(device, device_ordinal);
+        const Device& device, int device_ordinal,
+        RocmRegistryState& registry_state) {
+    return std::make_unique<RocmQueue>(
+            device, device_ordinal, registry_state);
 }
 
 

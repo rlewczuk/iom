@@ -82,6 +82,7 @@ set(IOM_SOURCES
 
 set(IOM_HEADERS
         include/iom/iom.hpp
+        include/iom/outstanding_work_registry.hpp
         include/iom/gpu_algorithm.hpp
         include/iom/cpu/device.hpp
         include/iom/llama.hpp
@@ -124,6 +125,7 @@ if(TTNN_ENABLED)
         src/ttnn/device.cpp
         src/ttnn/copy.cpp
         src/ttnn/copy.hpp
+        src/ttnn/registry_state.hpp
         include/iom/ttnn/device.hpp
     )
 
@@ -151,6 +153,7 @@ if(CUDA_ENABLED)
         src/cuda/driver.cpp
         src/cuda/driver.hpp
         src/cuda/transfer_pool.hpp
+        src/cuda/registry_state.hpp
         src/shared/standard_tiled_copy.hpp
         include/iom/cuda/device.hpp
     )
@@ -193,6 +196,7 @@ if(ROCM_ENABLED)
         src/rocm/copy.hip
         src/rocm/copy.hpp
         src/shared/standard_tiled_copy.hpp
+        src/rocm/registry_state.hpp
         include/iom/rocm/device.hpp
     )
 

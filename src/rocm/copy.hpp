@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 
+#include "registry_state.hpp"
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
 
@@ -30,6 +31,7 @@ void region_to_host(
         std::span<std::byte> destination);
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
-        const Device& device, int device_ordinal);
+        const Device& device, int device_ordinal,
+        RocmRegistryState& registry_state);
 
 }  // namespace iom::rocm_detail

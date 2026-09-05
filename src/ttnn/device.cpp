@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "copy.hpp"
+#include "registry_state.hpp"
 #include "iom/iom.hpp"
 
 namespace iom {
@@ -161,7 +162,9 @@ namespace iom {
             TtnnDevice(const TtnnDevice&) = delete;
             TtnnDevice& operator=(const TtnnDevice&) = delete;
 
-            ~TtnnDevice() override = default;
+            ~TtnnDevice() override {
+                registry_state_.quarantine.drain();
+            }
 
             [[nodiscard]] BackendKind backend_kind() const noexcept override {
                 return BackendKind::TTNN;
@@ -185,16 +188,20 @@ namespace iom {
                 return *native_device_;
             }
 
-            // Serializes every TTNN runtime interaction of this device's
-            // tensors, queues, and host transfers.
             [[nodiscard]] std::mutex& api_mutex() noexcept {
                 return api_mutex_;
+            }
+
+            [[nodiscard]] ttnn_detail::TtnnRegistryState&
+                    registry_state() noexcept {
+                return registry_state_;
             }
 
         private:
             std::uint32_t ordinal_;
             std::shared_ptr<ttnn::MeshDevice> native_device_;
             std::mutex api_mutex_;
+            ttnn_detail::TtnnRegistryState registry_state_;
         };
 
         // Owner of one TTNN-native tiled tensor per logical plane. Native
@@ -203,12 +210,9 @@ namespace iom {
         // from TensorSpec::tiled_storage_nbytes().
         class TtnnTensor final : public Tensor {
         public:
-            // The caller holds the device's API mutex and has already
-            // validated the specification against the supported-type table.
-            // The constructor performs native extent checks immediately
-            // before native construction, so no entry path can bypass them.
             TtnnTensor(const TensorSpec& spec, TtnnDevice& device)
-                    : Tensor(spec, device), device_(device) {
+                    : Tensor(spec, device), device_(device),
+                      state_(&device.registry_state()) {
                 const std::span<const std::size_t> dimensions =
                         spec.shape.dimensions();
                 const std::size_t plane_count = checked_plane_count(spec);
@@ -234,9 +238,61 @@ namespace iom {
                 }
             }
 
-            ~TtnnTensor() override {
-                std::lock_guard<std::mutex> lock(device_.api_mutex());
-                planes_.clear();
+            ~TtnnTensor() noexcept override {
+                std::vector<
+                        detail::OutstandingWorkRegistry::EntrySnapshot>
+                        snapshots;
+                try {
+                    snapshots = state_->registry.snapshot_for(planes_.data());
+                } catch (...) {
+                    return;
+                }
+
+                bool safe_to_release = true;
+                for (const auto& snapshot : snapshots) {
+                    if (snapshot.state == detail::EntryState::Invalidated
+                            || !snapshot.fence) {
+                        safe_to_release = false;
+                        continue;
+                    }
+                    try {
+                        const detail::FenceResult result = snapshot.fence();
+                        safe_to_release = safe_to_release
+                                && result.succeeded && !result.failure;
+                    } catch (...) {
+                        safe_to_release = false;
+                    }
+                }
+
+                const void* original_address = planes_.data();
+                if (safe_to_release) {
+                    for (const auto& snapshot : snapshots) {
+                        state_->registry.remove_entry_if_present(
+                                snapshot.id,
+                                const_cast<void*>(original_address));
+                    }
+                    std::lock_guard<std::mutex> lock(device_.api_mutex());
+                    planes_.clear();
+                    return;
+                }
+
+                std::vector<ttnn::Tensor> retained_planes =
+                        std::move(planes_);
+                try {
+                    state_->quarantine.emplace<
+                            ttnn_detail::TtnnNativeCleanupAction>(
+                            std::move(retained_planes),
+                            [device = &device_] {
+                                std::lock_guard<std::mutex> lock(
+                                        device->api_mutex());
+                                device->mesh().mesh_command_queue(0).finish();
+                            });
+                } catch (...) {
+                }
+                for (const auto& snapshot : snapshots) {
+                    state_->registry.remove_entry_if_present(
+                            snapshot.id, snapshot.address);
+                }
             }
 
         private:
@@ -261,125 +317,234 @@ namespace iom {
             }
 
             TtnnDevice& device_;
+            ttnn_detail::TtnnRegistryState* state_;
             std::vector<ttnn::Tensor> planes_;
         };
 
-        class TtnnQueue final : public DeviceOps {
-            struct Task {
-                std::uint64_t sequence;
-                TensorView source;
-                TensorView destination;
-                bool no_op;
-                void* fence = nullptr;
-
-                Task(std::uint64_t sequence_,
-                     const TensorView& source_,
-                     TensorView& destination_,
-                     bool no_op_)
-                    : sequence(sequence_),
-                      source(source_),
-                      destination(destination_),
-                      no_op(no_op_) {}
+        detail::Fence make_fence(TtnnDevice& device) {
+            TtnnDevice* stable_device = &device;
+            return [stable_device]() noexcept {
+                try {
+                    std::lock_guard<std::mutex> lock(
+                            stable_device->api_mutex());
+                    stable_device->mesh().mesh_command_queue(0).finish();
+                    return detail::FenceResult::success();
+                } catch (...) {
+                    return detail::FenceResult::failed(
+                            std::current_exception());
+                }
             };
+        }
 
-        public:
-            explicit TtnnQueue(TtnnDevice& device)
-                    : device_(&device),
-                      worker_(
-                              detail::StagedWorker<Task>::Callbacks{
-                                      [this](Task& task) {
-                                          if (!task.no_op) {
-                                              std::lock_guard<std::mutex>
-                                                      api_lock(
-                                                              device_->api_mutex());
-                                              const ttnn::Tensor* source_planes =
-                                                      static_cast<const ttnn::Tensor*>(
-                                                              task.source
-                                                                      .native_handle());
-                                              ttnn::Tensor* destination_planes =
-                                                      static_cast<ttnn::Tensor*>(
-                                                              task.destination
-                                                                      .native_handle());
-                                              ttnn_detail::copy_planes(
-                                                      task.source,
-                                                      source_planes,
-                                                      task.destination,
-                                                      destination_planes);
-                                          }
-                                      },
-                                      [](void*) {},
-                                      [](void*) {},
-                                      [this](
-                                              std::uint64_t sequence,
-                                              std::exception_ptr failure) {
-                                          complete(
-                                                  sequence,
-                                                  std::move(failure));
-                                      }},
-                              detail::StagedWorker<Task>::PublishPolicy::
-                                      CompleteOnThrow) {
-                worker_.start();
+        detail::FenceResult finish_native(TtnnDevice& device) noexcept {
+            try {
+                std::lock_guard<std::mutex> lock(device.api_mutex());
+                device.mesh().mesh_command_queue(0).finish();
+                return detail::FenceResult::success();
+            } catch (...) {
+                return detail::FenceResult::failed(
+                        std::current_exception());
             }
+        }
 
-            ~TtnnQueue() override {
-                worker_.shutdown_and_drain();
+class TtnnQueue final : public DeviceOps {
+    struct Task {
+        std::uint64_t sequence;
+        TensorView source;
+        TensorView destination;
+        bool no_op;
+        void* fence = nullptr;
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+
+        Task(std::uint64_t sequence_,
+             const TensorView& source_,
+             TensorView& destination_,
+             bool no_op_)
+            : sequence(sequence_),
+              source(source_),
+              destination(destination_),
+              no_op(no_op_) {}
+    };
+
+    struct SequenceOutcome {
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+        bool fence_succeeded = false;
+        std::exception_ptr retained_failure;
+    };
+
+public:
+    explicit TtnnQueue(TtnnDevice& device)
+            : device_(&device),
+              state_(&device.registry_state()),
+              registry_queue_id_(ttnn_detail::allocate_queue_id(*state_)),
+              worker_(
+                      detail::StagedWorker<Task>::Callbacks{
+                              [this](Task& task) {
+                                  execute(task);
+                              },
+                              [](void*) {},
+                              [](void*) {},
+                              [this](
+                                      std::uint64_t sequence,
+                                      std::exception_ptr failure) {
+                                  complete_task(
+                                          sequence, std::move(failure));
+                              }},
+                      detail::StagedWorker<Task>::PublishPolicy::
+                              CompleteOnThrow) {
+        worker_.start();
+    }
+
+    ~TtnnQueue() override {
+        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        worker_.shutdown_and_drain();
+    }
+
+    oid copy(
+            const TensorView& source,
+            TensorView& destination) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        validate_copy(*device_, source, destination);
+        const bool no_op = identical_window(source, destination);
+        return submit(
+                [this, &source, &destination, no_op](
+                        std::uint64_t sequence) {
+                    Task task(sequence, source, destination, no_op);
+                    worker_.submit_copy(std::move(task));
+                });
+    }
+
+    oid add(const TensorView&, const TensorView&, TensorView&)
+            override {
+        throw unsupported("TTNN", "add");
+    }
+
+    oid mul(const TensorView&, const TensorView&, TensorView&)
+            override {
+        throw unsupported("TTNN", "mul");
+    }
+
+    oid silu(const TensorView&, TensorView&) override {
+        throw unsupported("TTNN", "silu");
+    }
+
+    oid linear(const TensorView&, const TensorView&, TensorView&)
+            override {
+        throw unsupported("TTNN", "linear");
+    }
+
+    oid rmsnorm(
+            const TensorView&, TensorView&, const TensorView&, float,
+            size_t) override {
+        throw unsupported("TTNN", "rmsnorm");
+    }
+
+    oid sdpa(
+            const TensorView&, const TensorView&, const TensorView&,
+            size_t, size_t, size_t, TensorView&) override {
+        throw unsupported("TTNN", "sdpa");
+    }
+
+private:
+    void execute(Task& task) {
+        if (!task.no_op) {
+            std::lock_guard<std::mutex> api_lock(device_->api_mutex());
+            const ttnn::Tensor* source_planes =
+                    static_cast<const ttnn::Tensor*>(
+                            task.source.native_handle());
+            ttnn::Tensor* destination_planes =
+                    static_cast<ttnn::Tensor*>(
+                            task.destination.native_handle());
+            ttnn_detail::copy_planes(
+                    task.source, source_planes,
+                    task.destination, destination_planes);
+        }
+
+        const detail::Fence fence = make_fence(*device_);
+        detail::EntryRegistration entries;
+        try {
+            entries = ttnn_detail::register_copy_entries(
+                    *state_, registry_queue_id_, task.sequence,
+                    task.source.native_handle(),
+                    task.destination.native_handle(), fence);
+            task.source_entry_id = entries.source;
+            task.destination_entry_id = entries.destination;
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto [it, inserted] = outcomes_.emplace(
+                    task.sequence,
+                    SequenceOutcome{
+                            entries.source, entries.destination, true,
+                            nullptr});
+            if (!inserted) {
+                throw std::logic_error(
+                        "duplicate TTNN outstanding-work sequence");
             }
-
-            oid copy(
-                    const TensorView& source,
-                    TensorView& destination) override {
-                std::lock_guard<std::mutex> submission_lock(
-                        submission_order_mutex_);
-                validate_copy(*device_, source, destination);
-                const bool no_op = identical_window(source, destination);
-                return submit(
-                        [this, &source, &destination, no_op](
-                                std::uint64_t sequence) {
-                            Task task(sequence, source, destination, no_op);
-                            worker_.submit_copy(std::move(task));
-                        });
+        } catch (...) {
+            if (entries.source != 0) {
+                state_->registry.remove_entry_if_present(
+                        entries.source, task.source.native_handle());
             }
-
-            oid add(const TensorView&, const TensorView&, TensorView&)
-                    override {
-                throw unsupported("TTNN", "add");
+            if (entries.destination != 0) {
+                state_->registry.remove_entry_if_present(
+                        entries.destination,
+                        task.destination.native_handle());
             }
+            throw;
+        }
+    }
 
-            oid mul(const TensorView&, const TensorView&, TensorView&)
-                    override {
-                throw unsupported("TTNN", "mul");
+    void complete_task(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        SequenceOutcome outcome;
+        bool has_outcome = false;
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(sequence);
+            if (it != outcomes_.end()) {
+                outcome = std::move(it->second);
+                outcomes_.erase(it);
+                has_outcome = true;
             }
-
-            oid silu(const TensorView&, TensorView&) override {
-                throw unsupported("TTNN", "silu");
+        }
+        if (has_outcome) {
+            detail::FenceResult fence_result =
+                    failure ? detail::FenceResult::failed(failure)
+                            : finish_native(*device_);
+            outcome.fence_succeeded =
+                    fence_result.succeeded && !fence_result.failure;
+            const std::array<detail::EntryId, 2> entries{
+                    outcome.source_entry_id,
+                    outcome.destination_entry_id};
+            if (!outcome.fence_succeeded) {
+                state_->registry.invalidate_entries(entries);
+                if (!failure) {
+                    failure = fence_result.failure;
+                }
+            } else {
+                (void)state_->registry.try_release_entry(entries[0]);
+                (void)state_->registry.try_release_entry(entries[1]);
+                last_finished_seq_.store(
+                        sequence, std::memory_order_release);
             }
+        }
+        complete(sequence, std::move(failure));
+    }
 
-            oid linear(const TensorView&, const TensorView&, TensorView&)
-                    override {
-                throw unsupported("TTNN", "linear");
-            }
-
-            oid rmsnorm(
-                    const TensorView&, TensorView&, const TensorView&, float,
-                    size_t) override {
-                throw unsupported("TTNN", "rmsnorm");
-            }
-
-            oid sdpa(
-                    const TensorView&, const TensorView&, const TensorView&,
-                    size_t, size_t, size_t, TensorView&) override {
-                throw unsupported("TTNN", "sdpa");
-            }
-
-        private:
-            TtnnDevice* device_;
-            std::mutex submission_order_mutex_;
-            detail::StagedWorker<Task> worker_;
-            std::mutex fence_mutex_;
-            std::atomic<std::uint64_t> last_finished_seq_{0};
-            void fence_through_sequence(
-                    std::uint64_t sequence) noexcept override;
-        };
+    TtnnDevice* device_;
+    ttnn_detail::TtnnRegistryState* state_;
+    detail::QueueId registry_queue_id_;
+    std::mutex submission_order_mutex_;
+    std::mutex outcome_mutex_;
+    std::map<std::uint64_t, SequenceOutcome> outcomes_;
+    detail::StagedWorker<Task> worker_;
+    std::mutex fence_mutex_;
+    std::atomic<std::uint64_t> last_finished_seq_{0};
+    void fence_through_sequence(
+            std::uint64_t sequence) noexcept override;
+};
         void TtnnQueue::fence_through_sequence(
                 std::uint64_t sequence) noexcept {
             std::lock_guard<std::mutex> fence_lock(fence_mutex_);
@@ -388,17 +553,14 @@ namespace iom {
             if (sequence <= now) {
                 return;
             }
-            try {
-                {
-                    std::lock_guard<std::mutex> api_lock(
-                            device_->api_mutex());
-                    device_->mesh().mesh_command_queue(0).finish();
-                }
+            const detail::FenceResult result =
+                    finish_native(*device_);
+            if (result.succeeded && !result.failure) {
                 last_finished_seq_.store(
                         sequence, std::memory_order_release);
-            } catch (...) {
+            } else {
                 record_post_completion_failure(
-                        sequence, std::current_exception());
+                        sequence, result.failure);
             }
         }
 

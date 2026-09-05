@@ -16,6 +16,7 @@
 
 #include "iom/iom.hpp"
 #include "iom/detail/aligned_storage.hpp"
+#include "registry_state.hpp"
 
 namespace iom {
 
@@ -441,6 +442,10 @@ namespace iom {
         explicit CpuDevice(Allocator& allocator)
                 : allocator_(allocator) {}
 
+        ~CpuDevice() override {
+            registry_state_.quarantine.drain();
+        }
+
         [[nodiscard]] BackendKind backend_kind() const noexcept override {
             return BackendKind::CPU;
         }
@@ -458,7 +463,12 @@ namespace iom {
                 const TensorSpec& spec) override;
         [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override;
 
+        [[nodiscard]] cpu_detail::CpuRegistryState& registry_state() noexcept {
+            return registry_state_;
+        }
+
     private:
+        cpu_detail::CpuRegistryState registry_state_;
         Allocator& allocator_;
     };
 
@@ -471,7 +481,7 @@ namespace iom {
     public:
         CpuTensor(const TensorSpec& spec, CpuDevice& device,
                   Allocator& allocator)
-                : Tensor(spec, device),
+                : Tensor(spec, device), device_(device),
                   allocator_(allocator) {
             address_ = iom::detail::allocate_aligned_storage(
                     allocator_,
@@ -480,8 +490,62 @@ namespace iom {
                     "CPU tensor storage is not 32-byte aligned");
         }
 
-        ~CpuTensor() override {
-            iom::detail::release_aligned_storage(allocator_, address_);
+        ~CpuTensor() noexcept override {
+            if (address_ == nullptr) {
+                return;
+            }
+
+            std::vector<detail::OutstandingWorkRegistry::EntrySnapshot>
+                    snapshots;
+            try {
+                snapshots = device_.registry_state().registry.snapshot_for(
+                        address_);
+            } catch (...) {
+                // Losing the snapshot is safer than freeing storage whose
+                // queued users could not be classified.
+                return;
+            }
+
+            bool safe_to_release = true;
+            for (const auto& snapshot : snapshots) {
+                if (snapshot.state == detail::EntryState::Invalidated
+                        || !snapshot.fence) {
+                    safe_to_release = false;
+                    continue;
+                }
+                try {
+                    const detail::FenceResult result = snapshot.fence();
+                    safe_to_release = safe_to_release
+                            && result.succeeded && !result.failure;
+                } catch (...) {
+                    safe_to_release = false;
+                }
+            }
+
+            if (safe_to_release) {
+                for (const auto& snapshot : snapshots) {
+                    device_.registry_state().registry.remove_entry_if_present(
+                            snapshot.id, address_);
+                }
+                iom::detail::release_aligned_storage(allocator_, address_);
+                return;
+            }
+
+            try {
+                device_.registry_state().quarantine
+                        .emplace<detail::AllocatorCleanupAction>(
+                                allocator_, address_,
+                                view().spec().tiled_storage_nbytes());
+                address_ = nullptr;
+            } catch (...) {
+                // Do not free failed storage directly. It remains leaked
+                // rather than becoming available for unsafe reuse.
+            }
+            for (const auto& snapshot : snapshots) {
+                device_.registry_state().registry.remove_entry_if_present(
+                        snapshot.id, address_ != nullptr
+                                ? address_ : snapshot.address);
+            }
         }
 
     private:
@@ -658,6 +722,7 @@ namespace iom {
                         }
                     });
         }
+        CpuDevice& device_;
         Allocator& allocator_;
         void* address_ = nullptr;
     };
@@ -669,6 +734,8 @@ namespace iom {
             TensorView destination;
             bool no_op;
             void* fence = nullptr;
+            detail::EntryId source_entry_id = 0;
+            detail::EntryId destination_entry_id = 0;
 
             Task(std::uint64_t sequence_,
                  const TensorView& source_,
@@ -680,24 +747,30 @@ namespace iom {
                   no_op(no_op_) {}
         };
 
+        struct SequenceOutcome {
+            detail::EntryId source_entry_id = 0;
+            detail::EntryId destination_entry_id = 0;
+            bool fence_succeeded = false;
+            std::exception_ptr retained_failure;
+        };
+
     public:
         explicit CpuQueue(CpuDevice& device)
                 : device_(&device),
+                  state_(&device.registry_state()),
+                  registry_queue_id_(cpu_detail::allocate_queue_id(*state_)),
                   worker_(
                           detail::StagedWorker<Task>::Callbacks{
                                   [this](Task& task) {
-                                      if (!task.no_op) {
-                                          copy_elements(
-                                                  task.source,
-                                                  task.destination);
-                                      }
+                                      execute(task);
                                   },
                                   [](void*) {},
                                   [](void*) {},
                                   [this](
                                           std::uint64_t sequence,
                                           std::exception_ptr failure) {
-                                      complete(sequence, std::move(failure));
+                                      complete_task(
+                                              sequence, std::move(failure));
                                   }},
                           detail::StagedWorker<Task>::PublishPolicy::
                                   CompleteOnThrow) {
@@ -705,8 +778,11 @@ namespace iom {
         }
 
         ~CpuQueue() override {
+            state_->registry.invalidate_entries_for_queue(
+                    registry_queue_id_);
             worker_.shutdown_and_drain();
         }
+
 
         oid copy(const TensorView& source, TensorView& destination) override {
             std::lock_guard<std::mutex> submission_lock(
@@ -748,6 +824,66 @@ namespace iom {
         }
 
     private:
+        void execute(Task& task) {
+            if (!task.no_op) {
+                copy_elements(task.source, task.destination);
+            }
+
+            const detail::Fence fence = cpu_detail::completed_fence();
+            const detail::EntryRegistration entries =
+                    cpu_detail::register_copy_entries(
+                            *state_, registry_queue_id_, task.sequence,
+                            task.source.native_handle(),
+                            task.destination.native_handle(), fence);
+            task.source_entry_id = entries.source;
+            task.destination_entry_id = entries.destination;
+            try {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                const auto [it, inserted] = outcomes_.emplace(
+                        task.sequence,
+                        SequenceOutcome{
+                                entries.source, entries.destination, true,
+                                nullptr});
+                if (!inserted) {
+                    throw std::logic_error(
+                            "duplicate CPU outstanding-work sequence");
+                }
+            } catch (...) {
+                state_->registry.remove_entry_if_present(
+                        entries.source, task.source.native_handle());
+                state_->registry.remove_entry_if_present(
+                        entries.destination,
+                        task.destination.native_handle());
+                throw;
+            }
+        }
+
+        void complete_task(
+                std::uint64_t sequence, std::exception_ptr failure) {
+            SequenceOutcome outcome;
+            bool has_outcome = false;
+            {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                const auto it = outcomes_.find(sequence);
+                if (it != outcomes_.end()) {
+                    outcome = std::move(it->second);
+                    outcomes_.erase(it);
+                    has_outcome = true;
+                }
+            }
+            if (has_outcome) {
+                const std::array<detail::EntryId, 2> entries{
+                        outcome.source_entry_id,
+                        outcome.destination_entry_id};
+                if (failure) {
+                    state_->registry.invalidate_entries(entries);
+                } else {
+                    state_->registry.try_release_entry(entries[0]);
+                    state_->registry.try_release_entry(entries[1]);
+                }
+            }
+            complete(sequence, std::move(failure));
+        }
         static void copy_elements(
                 const TensorView& source, TensorView& destination) {
             const auto* source_base = static_cast<const unsigned char*>(
@@ -813,6 +949,10 @@ namespace iom {
         }
 
         CpuDevice* device_;
+        cpu_detail::CpuRegistryState* state_;
+        detail::QueueId registry_queue_id_;
+        std::mutex outcome_mutex_;
+        std::map<std::uint64_t, SequenceOutcome> outcomes_;
         std::mutex submission_order_mutex_;
         detail::StagedWorker<Task> worker_;
     };

@@ -23,6 +23,8 @@
 
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
+#include "iom/alloc.hpp"
+#include "iom/outstanding_work_registry.hpp"
 #include "iom/llama.hpp"
 #include "iom/tensor.hpp"
 
