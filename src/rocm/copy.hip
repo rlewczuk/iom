@@ -178,6 +178,22 @@ struct gpu_policy {
     }
 
 };
+void fence_and_destroy(hipEvent_t event) noexcept {
+    if (event == nullptr) {
+        return;
+    }
+    (void)hipEventSynchronize(event);
+    (void)hipEventDestroy(event);
+}
+
+void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
+    if (stream == nullptr) {
+        return;
+    }
+    (void)hipStreamSynchronize(stream);
+    (void)hipStreamDestroy(stream);
+}
+
 
 }  // namespace
 }  // namespace iom::rocm_detail
@@ -229,7 +245,7 @@ public:
                               [this](void* fence) {
                                   try {
                                       gpu_policy::activate(context_);
-                                      gpu_policy::destroy_event_noexcept(
+                                      fence_and_destroy(
                                               static_cast<hipEvent_t>(fence));
                                   } catch (...) {
                                   }
@@ -255,7 +271,7 @@ public:
         worker_.shutdown_and_drain();
         try {
             gpu_policy::activate(context_);
-            gpu_policy::destroy_queue_stream_noexcept(stream_);
+            synchronize_and_destroy_stream(stream_);
         } catch (...) {
         }
         stream_ = gpu_policy::null_stream();
