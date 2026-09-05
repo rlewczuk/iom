@@ -106,13 +106,14 @@ TEST_CASE("ROCm staging pool preserves accounting across allocation failures") {
     iom::rocm_detail::StagingSlotPool pool(0);
 
     CHECK_THROWS_AS(
-            pool.acquire(iom::rocm_detail::StagingSlotPool::kMaxStagingBytes + 1),
+            (void)pool.acquire(
+                    iom::rocm_detail::StagingSlotPool::kMaxStagingBytes + 1),
             std::invalid_argument);
     CHECK_EQ(pool.allocation_count_for_testing(), 0);
     CHECK_EQ(pool.idle_count_for_testing(), 0);
 
     pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS(pool.acquire(4), std::bad_alloc);
+    CHECK_THROWS_AS((void)pool.acquire(4), std::bad_alloc);
     CHECK_EQ(pool.allocation_count_for_testing(), 0);
     CHECK_EQ(pool.idle_count_for_testing(), 0);
 
@@ -125,7 +126,7 @@ TEST_CASE("ROCm staging pool preserves accounting across allocation failures") {
     CHECK_EQ(pool.idle_count_for_testing(), 1);
 
     pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS(pool.acquire(8), std::bad_alloc);
+    CHECK_THROWS_AS((void)pool.acquire(8), std::bad_alloc);
     CHECK_EQ(pool.allocation_count_for_testing(), 1);
     CHECK_EQ(pool.idle_count_for_testing(), 1);
 
@@ -134,7 +135,15 @@ TEST_CASE("ROCm staging pool preserves accounting across allocation failures") {
         lease.poison();
     }
     CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    for (std::size_t i = 0;
+         i < 2 * iom::rocm_detail::StagingSlotPool::kMaxSlotCount; ++i) {
+        auto lease = pool.acquire(4);
+        lease.poison();
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
 
     {
         auto lease = pool.acquire(4);

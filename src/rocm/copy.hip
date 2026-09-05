@@ -213,7 +213,12 @@ TransferStreamPool::Scope TransferStreamPool::acquire() {
         check_hip(
                 "hipStreamCreateWithFlags",
                 hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-        idle_.push_back(stream);
+        try {
+            idle_.push_back(stream);
+        } catch (...) {
+            (void)hipStreamDestroy(stream);
+            throw;
+        }
     }
     hipStream_t stream = idle_.back();
     idle_.pop_back();
@@ -231,7 +236,11 @@ void TransferStreamPool::release(hipStream_t stream) {
     const auto it = in_use_.find(stream);
     if (it != in_use_.end()) {
         in_use_.erase(it);
-        idle_.push_back(stream);
+        try {
+            idle_.push_back(stream);
+        } catch (...) {
+            (void)hipStreamDestroy(stream);
+        }
         cv_.notify_all();
     }
 }

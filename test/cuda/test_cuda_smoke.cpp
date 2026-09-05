@@ -591,7 +591,15 @@ TEST_CASE("CUDA staging pool preserves accounting across allocation failures") {
         lease.poison();
     }
     CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    for (std::size_t i = 0;
+         i < 2 * iom::cuda_detail::StagingSlotPool::kMaxSlotCount; ++i) {
+        auto lease = pool.acquire(4);
+        lease.poison();
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
 
     {
         auto lease = pool.acquire(4);

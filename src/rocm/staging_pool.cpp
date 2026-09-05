@@ -72,13 +72,34 @@ StagingSlotPool::Lease StagingSlotPool::acquire(std::size_t required_bytes) {
         throw std::runtime_error("ROCm staging pool is closing");
     }
     available_.wait(lock, [this] {
-        return closing_ || !free_.empty() || slots_.size() < kMaxSlotCount;
+        return closing_ || !free_.empty() || !vacant_.empty()
+                || slots_.size() < kMaxSlotCount;
     });
     if (closing_) {
         throw std::runtime_error("ROCm staging pool is closing");
     }
 
     if (free_.empty()) {
+        if (!vacant_.empty()) {
+            const std::size_t index = vacant_.back();
+            vacant_.pop_back();
+            const hipDeviceptr_t staging = [&] {
+                try {
+                    return allocate_locked(required_bytes);
+                } catch (...) {
+                    vacant_.push_back(index);
+                    throw;
+                }
+            }();
+            Slot& slot = slots_.at(index);
+            slot = Slot{staging, required_bytes, true};
+            ++active_count_;
+            if (staging != nullptr) {
+                ++allocation_count_;
+            }
+            return Lease{*this, index, staging, required_bytes};
+        }
+
         const std::size_t index = slots_.size();
         const hipDeviceptr_t staging = allocate_locked(required_bytes);
         try {
@@ -140,8 +161,10 @@ void StagingSlotPool::release(std::size_t index, bool poisoned) noexcept {
             }
         }
         slot.capacity = 0;
+        vacant_.push_back(index);
+    } else {
+        free_.push_back(index);
     }
-    free_.push_back(index);
     available_.notify_all();
 }
 
@@ -157,19 +180,33 @@ void StagingSlotPool::destroy() noexcept {
         slot.capacity = 0;
         slot.active = false;
     }
+    slots_.clear();
     free_.clear();
+    vacant_.clear();
     allocation_count_ = 0;
 }
 
+#ifdef IOM_ENABLE_TESTING
 std::size_t StagingSlotPool::idle_count_for_testing() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return free_.size();
 }
+#else
+std::size_t StagingSlotPool::idle_count_for_testing() const noexcept {
+    return 0;
+}
+#endif
 
+#ifdef IOM_ENABLE_TESTING
 std::size_t StagingSlotPool::allocation_count_for_testing() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return allocation_count_;
 }
+#else
+std::size_t StagingSlotPool::allocation_count_for_testing() const noexcept {
+    return 0;
+}
+#endif
 
 void StagingSlotPool::fail_next_allocation_for_testing() noexcept {
 #ifdef IOM_ENABLE_TESTING

@@ -43,7 +43,12 @@ public:
         friend class StagingSlotPool;
     };
 
-    explicit StagingSlotPool(CUcontext context) : context_(context) {}
+    explicit StagingSlotPool(CUcontext context)
+            : context_(context) {
+        slots_.reserve(kMaxSlotCount);
+        free_.reserve(kMaxSlotCount);
+        vacant_.reserve(kMaxSlotCount);
+    }
     ~StagingSlotPool() noexcept;
 
     StagingSlotPool(const StagingSlotPool&) = delete;
@@ -71,6 +76,7 @@ private:
     CUcontext context_;
     std::vector<Slot> slots_;
     std::vector<std::size_t> free_;
+    std::vector<std::size_t> vacant_;
     mutable std::mutex mutex_;
     std::condition_variable available_;
     std::size_t active_count_ = 0;

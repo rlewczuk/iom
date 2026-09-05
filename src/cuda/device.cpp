@@ -75,6 +75,7 @@ namespace iom {
             ~CudaDevice() override {
                 if (context_ != nullptr) {
                     try {
+                        activate();
                         transfer_pool_.destroy();
                         staging_pool_.destroy();
                     } catch (...) {

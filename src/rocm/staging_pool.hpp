@@ -44,7 +44,11 @@ public:
     };
 
     explicit StagingSlotPool(int device_ordinal)
-            : device_ordinal_(device_ordinal) {}
+            : device_ordinal_(device_ordinal) {
+        slots_.reserve(kMaxSlotCount);
+        free_.reserve(kMaxSlotCount);
+        vacant_.reserve(kMaxSlotCount);
+    }
     ~StagingSlotPool() noexcept;
 
     StagingSlotPool(const StagingSlotPool&) = delete;
@@ -72,6 +76,7 @@ private:
     int device_ordinal_;
     std::vector<Slot> slots_;
     std::vector<std::size_t> free_;
+    std::vector<std::size_t> vacant_;
     mutable std::mutex mutex_;
     std::condition_variable available_;
     std::size_t active_count_ = 0;
