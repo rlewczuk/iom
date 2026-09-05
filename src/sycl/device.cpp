@@ -13,6 +13,7 @@
 
 #include "copy.hpp"
 #include "runtime.hpp"
+#include "iom/detail/aligned_storage.hpp"
 
 
 namespace iom::sycl_detail {
@@ -24,7 +25,6 @@ namespace iom::sycl_detail {
 namespace iom {
 
     namespace {
-        constexpr std::size_t kStorageAlignment = 32;
         constexpr std::array kSyclSupportedDataTypes = {
                 iom::DataType::BOOL,
                 iom::DataType::I2, iom::DataType::U2,
@@ -131,20 +131,11 @@ namespace iom {
                     : Tensor(spec, device),
                       device_(device),
                       allocator_(allocator) {
-                const std::size_t storage_nbytes =
-                        view().spec().tiled_storage_nbytes();
-                address_ = allocator_.alloc(storage_nbytes);
-                if (address_ == nullptr) {
-                    throw std::bad_alloc();
-                }
-                if (reinterpret_cast<std::uintptr_t>(address_)
-                                % kStorageAlignment
-                        != 0) {
-                    void* rejected = std::exchange(address_, nullptr);
-                    allocator_.free(rejected);
-                    throw std::runtime_error(
-                            "SYCL tensor storage is not 32-byte aligned");
-                }
+                address_ = iom::detail::allocate_aligned_storage(
+                        allocator_,
+                        view().spec().tiled_storage_nbytes(),
+                        [] {},
+                        "SYCL tensor storage is not 32-byte aligned");
 
                 try {
                     if (sycl::get_pointer_type(address_, device_.context())
@@ -155,23 +146,13 @@ namespace iom {
                     }
                 } catch (...) {
                     void* rejected = std::exchange(address_, nullptr);
-                    try {
-                        allocator_.free(rejected);
-                    } catch (...) {
-                    }
+                    iom::detail::release_aligned_storage(allocator_, rejected);
                     throw;
                 }
             }
 
             ~SyclTensor() override {
-                if (address_ == nullptr) {
-                    return;
-                }
-                try {
-                    allocator_.free(address_);
-                } catch (...) {
-                }
-                address_ = nullptr;
+                iom::detail::release_aligned_storage(allocator_, address_);
             }
 
         private:
