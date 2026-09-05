@@ -4,8 +4,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include "driver.hpp"
 
 namespace iom::cuda_detail {
@@ -111,6 +114,7 @@ struct gpu_policy {
     static void synchronize_event(event_type event) {
         check_cuda_kernel("cudaEventSynchronize", cudaEventSynchronize(event));
     }
+    static constexpr bool discard_failure_event_on_error = false;
     static void record_event(event_type event, stream_type stream) {
         cudaError_t status = cudaEventRecord(event, stream);
         if (consume_submission_fault(SubmissionFault::event_record)) {
@@ -177,10 +181,6 @@ struct gpu_policy {
         return "CUDA copy kernel launch";
     }
 
-    [[nodiscard]] static std::runtime_error unsupported(const char* operation) {
-        return std::runtime_error(
-                std::string("CUDA backend does not implement ") + operation);
-    }
 };
 
 }  // namespace
@@ -202,6 +202,151 @@ struct gpu_policy {
 #undef IOM_GPU_DEVICE
 
 namespace iom::cuda_detail {
+namespace {
+
+class CudaQueue final : public DeviceOps {
+    struct Task {
+        std::uint64_t sequence;
+        const TensorView* source;
+        TensorView* destination;
+        cudaEvent_t event = nullptr;
+        bool no_op;
+        void* fence = nullptr;
+    };
+
+public:
+    CudaQueue(const Device& device, CUcontext context)
+            : device_(&device),
+              context_(context),
+              worker_(
+                      detail::StagedWorker<Task>::Callbacks{
+                              [this](Task& task) {
+                                  execute(task);
+                              },
+                              [this](void* fence) {
+                                  gpu_policy::activate(context_);
+                                  gpu_policy::synchronize_event(
+                                          static_cast<cudaEvent_t>(fence));
+                              },
+                              [this](void* fence) {
+                                  try {
+                                      gpu_policy::activate(context_);
+                                      gpu_policy::destroy_event_noexcept(
+                                              static_cast<cudaEvent_t>(fence));
+                                  } catch (...) {
+                                  }
+                              },
+                              [this](
+                                      std::uint64_t sequence,
+                                      std::exception_ptr failure) {
+                                  complete(sequence, std::move(failure));
+                              }},
+                      detail::StagedWorker<Task>::PublishPolicy::Splice) {
+        gpu_policy::activate(context_);
+        try {
+            stream_ = gpu_policy::create_queue_stream();
+            worker_.start();
+        } catch (...) {
+            gpu_policy::destroy_queue_stream_noexcept(stream_);
+            stream_ = gpu_policy::null_stream();
+            throw;
+        }
+    }
+
+    ~CudaQueue() override {
+        worker_.shutdown_and_drain();
+        try {
+            gpu_policy::activate(context_);
+            gpu_policy::destroy_queue_stream_noexcept(stream_);
+        } catch (...) {
+        }
+        stream_ = gpu_policy::null_stream();
+    }
+
+    oid copy(const TensorView& source, TensorView& destination) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        validate_copy(*device_, source, destination);
+        const bool no_op = identical_window(source, destination);
+        return submit(
+                [this, &source, &destination, no_op](
+                        std::uint64_t sequence) {
+                    worker_.submit_copy(
+                            Task{sequence, &source, &destination, nullptr,
+                                 no_op});
+                });
+    }
+
+    oid add(const TensorView&, const TensorView&, TensorView&) override {
+        throw unsupported("CUDA", "add");
+    }
+    oid mul(const TensorView&, const TensorView&, TensorView&) override {
+        throw unsupported("CUDA", "mul");
+    }
+    oid silu(const TensorView&, TensorView&) override {
+        throw unsupported("CUDA", "silu");
+    }
+    oid linear(const TensorView&, const TensorView&, TensorView&) override {
+        throw unsupported("CUDA", "linear");
+    }
+    oid rmsnorm(const TensorView&, TensorView&, const TensorView&, float,
+                size_t) override {
+        throw unsupported("CUDA", "rmsnorm");
+    }
+    oid sdpa(const TensorView&, const TensorView&, const TensorView&,
+             size_t, size_t, size_t, TensorView&) override {
+        throw unsupported("CUDA", "sdpa");
+    }
+
+private:
+    void execute(Task& task) {
+        gpu_policy::activate(context_);
+        detail::PendingEvent<gpu_policy> event_guard;
+        gpu_policy::create_event(&event_guard.event);
+        task.event = event_guard.event;
+        task.fence = static_cast<void*>(event_guard.event);
+        const std::vector<detail::PlanePair> pairs =
+                task.no_op ? std::vector<detail::PlanePair>{}
+                           : detail::plane_pairs(*task.source, *task.destination);
+        const std::span<const std::size_t> dimensions =
+                task.source->spec().shape.dimensions();
+        const std::size_t rows = dimensions[dimensions.size() - 2];
+        const std::size_t columns = dimensions[dimensions.size() - 1];
+        const unsigned int bits = static_cast<unsigned int>(
+                detail::leaf_bits(task.source->spec().data_type));
+
+        try {
+            std::size_t plane_index = 0;
+            for (const detail::PlanePair pair : pairs) {
+                detail::launch_copy_plane<gpu_policy>(
+                        stream_, pair, plane_index++, rows, columns, bits,
+                        task.source->native_handle(),
+                        task.destination->native_handle());
+            }
+            gpu_policy::record_event(task.event, stream_);
+            event_guard.linked = true;
+        } catch (...) {
+            const std::exception_ptr failure = std::current_exception();
+            if constexpr (gpu_policy::discard_failure_event_on_error) {
+                task.fence = nullptr;
+                event_guard.linked = false;
+            } else {
+                gpu_policy::record_event_no_fault(task.event, stream_);
+                event_guard.linked = true;
+            }
+            commit_failure(task.sequence, failure);
+        }
+    }
+
+    const Device* device_;
+    CUcontext context_;
+    cudaStream_t stream_ = gpu_policy::null_stream();
+    std::mutex submission_order_mutex_;
+    detail::StagedWorker<Task> worker_;
+};
+
+}  // namespace
+
 
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
@@ -221,7 +366,7 @@ void region_to_host(
 }
 
 std::unique_ptr<DeviceOps> make_queue(const Device& device, CUcontext context) {
-    return std::make_unique<detail::GpuQueue<gpu_policy>>(device, context);
+    return std::make_unique<CudaQueue>(device, context);
 }
 
 }  // namespace iom::cuda_detail

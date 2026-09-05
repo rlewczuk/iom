@@ -1,6 +1,6 @@
 #include <doctest/doctest.h>
 
-#include <algorithm>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -1879,4 +1879,121 @@ TEST_CASE("DeviceOps queue drives the llama models through owner views") {
               model_ops.end()) == expected_tail);
     CHECK_EQ(dev.submissions.back().sequence,
              decoder_ops.size() + expected_tail.size());
+}
+
+namespace {
+
+struct WorkerTask {
+    std::uint64_t sequence;
+    void* fence = nullptr;
+};
+
+}  // namespace
+
+TEST_CASE("StagedWorker preserves fenced callback order") {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<std::string> events;
+    int completions = 0;
+    int fence_value = 0;
+
+    iom::detail::StagedWorker<WorkerTask> worker(
+            {
+                    [&](WorkerTask& task) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        events.push_back("execute");
+                        task.fence = &fence_value;
+                    },
+                    [&](void* fence) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        CHECK_EQ(fence, &fence_value);
+                        events.push_back("fence_complete");
+                    },
+                    [&](void* fence) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        CHECK_EQ(fence, &fence_value);
+                        events.push_back("fence_destroy");
+                    },
+                    [&](std::uint64_t sequence, std::exception_ptr failure) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        CHECK_EQ(sequence, 1);
+                        CHECK_FALSE(failure);
+                        events.push_back("complete");
+                        ++completions;
+                        condition.notify_all();
+                    }},
+            iom::detail::StagedWorker<WorkerTask>::PublishPolicy::Splice);
+    worker.start();
+    worker.submit_copy(WorkerTask{1});
+
+    std::unique_lock<std::mutex> lock(mutex);
+    REQUIRE(condition.wait_for(
+            lock, std::chrono::seconds(2),
+            [&] { return completions == 1; }));
+    lock.unlock();
+    worker.shutdown_and_drain();
+
+    CHECK(events == std::vector<std::string>{
+                           "execute", "fence_complete", "fence_destroy",
+                           "complete"});
+}
+
+TEST_CASE("StagedWorker removes pre-link failures before sequence reuse") {
+    bool fail = true;
+    int completions = 0;
+    iom::detail::StagedWorker<WorkerTask> worker(
+            {
+                    [&](WorkerTask&) {
+                        if (fail) {
+                            throw std::runtime_error("pre-link failure");
+                        }
+                    },
+                    [](void*) {},
+                    [](void*) {},
+                    [&](std::uint64_t sequence, std::exception_ptr failure) {
+                        CHECK_EQ(sequence, 1);
+                        CHECK_FALSE(failure);
+                        ++completions;
+                    }},
+            iom::detail::StagedWorker<WorkerTask>::PublishPolicy::
+                    CompleteOnThrow);
+    worker.start();
+
+    CHECK_THROWS_WITH(
+            worker.submit_copy(WorkerTask{1}), "pre-link failure");
+    fail = false;
+    CHECK_NOTHROW(worker.submit_copy(WorkerTask{1}));
+    worker.shutdown_and_drain();
+    CHECK_EQ(completions, 1);
+}
+
+TEST_CASE("StagedWorker drains tasks without fence completion") {
+    int fence_completions = 0;
+    int fence_destroys = 0;
+    int completions = 0;
+    iom::detail::StagedWorker<WorkerTask> worker(
+            {
+                    [](WorkerTask& task) {
+                        if (task.sequence != 3) {
+                            task.fence = task.sequence == 1
+                                    ? reinterpret_cast<void*>(1)
+                                    : reinterpret_cast<void*>(2);
+                        }
+                    },
+                    [&](void*) { ++fence_completions; },
+                    [&](void*) { ++fence_destroys; },
+                    [&](std::uint64_t, std::exception_ptr failure) {
+                        CHECK_FALSE(failure);
+                        ++completions;
+                    }},
+            iom::detail::StagedWorker<WorkerTask>::PublishPolicy::Splice);
+
+    worker.submit_copy(WorkerTask{1});
+    worker.submit_copy(WorkerTask{2});
+    worker.submit_copy(WorkerTask{3});
+    worker.shutdown_and_drain();
+
+    CHECK_EQ(fence_completions, 0);
+    CHECK_EQ(fence_destroys, 2);
+    CHECK_EQ(completions, 3);
 }

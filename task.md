@@ -1,13 +1,14 @@
-**Status:** blocked
+**Status:** done
 
 ## Summary
 
-No implementation was attempted because the requested task has three unfinished prerequisites.
+Implemented the backend-neutral `iom::detail::StagedWorker<Task>` and migrated CPU, CUDA, ROCm, and TTNN queue scaffolds to it. Centralized copy validation, identical-window detection, and unsupported-operation errors in `DeviceOps`; retained native task payloads, event fences, failure seams, and public APIs. Removed the shared CUDA/ROCm `GpuQueue<Policy>` state machine while preserving shared tiled-copy algorithms. Added helper callback-order, pre-link rollback, null-fence, and shutdown-drain coverage.
 
-## Errors
+## Verification
 
-- `29-AR-001-share-cuda-rocm-copy-queue` — no `task.md` with `Status: done`; its branch is reachable from `main`, but the required shared queue implementation is not present in the integration tree.
-- `28-ST-007-commit-sequence-before-queue-work` — no `task.md` with `Status: done`; its deterministic feature branch is absent.
-- `27-ST-006-bound-rocm-failure-wait` — no `task.md` with `Status: done`; its deterministic feature branch is absent.
-
-The deterministic worktree and feature branch are retained for a later run after all blockers are completed.
+- Local CPU/common configure, build, focused `StagedWorker*` tests, and full CTest passed: 3/3 CTest tests; focused helper tests 3/3 with 17 assertions.
+- CUDA remote configure/build passed; CUDA smoke and conformance passed: 2/2 tests.
+- ROCm remote configure/build passed; ROCm smoke and conformance passed: 2/2 tests.
+- TTNN remote configure/build passed; TTNN smoke and conformance passed: 2/2 tests.
+- Source audit found one `StagedWorker` definition, no stale `GpuQueue` state machine, and canonical `DeviceOps` helper definitions.
+- Remote mirrors were cleaned after verification.
