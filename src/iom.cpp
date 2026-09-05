@@ -38,38 +38,6 @@ namespace iom {
             return checked_add(bits, 7, what) / 8;
         }
 
-
-        bool is_recognized(QuantizationFormat format) {
-            switch (format) {
-                case QuantizationFormat::NONE:
-                case QuantizationFormat::INT8_SYMMETRIC:
-                case QuantizationFormat::INT8_ASYMMETRIC:
-                case QuantizationFormat::INT4_SYMMETRIC:
-                case QuantizationFormat::INT4_ASYMMETRIC:
-                case QuantizationFormat::OCP_MXFP4:
-                case QuantizationFormat::OCP_MXFP8_E4M3:
-                case QuantizationFormat::OCP_MXFP8_E5M2:
-                case QuantizationFormat::NVIDIA_NVFP4:
-                case QuantizationFormat::GGML_Q4_0:
-                case QuantizationFormat::GGML_Q4_1:
-                case QuantizationFormat::GGML_Q5_0:
-                case QuantizationFormat::GGML_Q5_1:
-                case QuantizationFormat::GGML_Q8_0:
-                case QuantizationFormat::GGML_Q2_K:
-                case QuantizationFormat::GGML_Q3_K:
-                case QuantizationFormat::GGML_Q4_K:
-                case QuantizationFormat::GGML_Q5_K:
-                case QuantizationFormat::GGML_Q6_K:
-                case QuantizationFormat::TT_BFP2:
-                case QuantizationFormat::TT_BFP2A:
-                case QuantizationFormat::TT_BFP4:
-                case QuantizationFormat::TT_BFP4A:
-                case QuantizationFormat::TT_BFP8:
-                case QuantizationFormat::TT_BFP8A: return true;
-            }
-            return false;
-        }
-
     }  // namespace
 
     TensorShape::TensorShape(std::vector<std::size_t> dimensions)
@@ -106,13 +74,14 @@ namespace iom {
 
     void TensorSpec::validate() const {
         static_cast<void>(detail::leaf_bits(data_type));
-        if (quantization == QuantizationFormat::NONE) {
-            return;
+        const int raw_quantization = static_cast<int>(quantization);
+        if (raw_quantization < static_cast<int>(QuantizationFormat::NONE)
+            || raw_quantization > static_cast<int>(QuantizationFormat::TT_BFP8A)) {
+            throw std::invalid_argument("unknown QuantizationFormat value");
         }
-        if (is_recognized(quantization)) {
+        if (quantization != QuantizationFormat::NONE) {
             throw std::runtime_error("grouped quantization formats are not supported");
         }
-        throw std::invalid_argument("unknown QuantizationFormat value");
     }
 
     TensorShape TensorSpec::standard_padded_shape() const {
@@ -566,6 +535,25 @@ namespace iom {
         if (const auto failure = failures_.find(sequence);
                 failure != failures_.end()) {
             std::rethrow_exception(failure->second);
+        }
+        lock.unlock();
+        fence_through_sequence(sequence);
+        lock.lock();
+        if (const auto failure = failures_.find(sequence);
+                failure != failures_.end()) {
+            std::rethrow_exception(failure->second);
+        }
+    }
+
+    void DeviceOps::fence_through_sequence(
+            std::uint64_t /*sequence*/) noexcept {}
+
+    void DeviceOps::record_post_completion_failure(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        if (failures_.find(sequence) == failures_.end()) {
+            failures_.emplace(sequence, std::move(failure));
+            completion_cv_.notify_all();
         }
     }
 

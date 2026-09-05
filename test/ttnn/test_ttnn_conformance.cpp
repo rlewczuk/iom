@@ -333,6 +333,27 @@ TEST_CASE("TTNN supported-type table acceptance and rejection") {
         CHECK_THROWS_AS(device->create_tensor(spec), std::runtime_error);
     }
 }
+TEST_CASE("Device::supported_data_types returns the per-backend 9-entry span") {
+    require_hardware();
+    const std::unique_ptr<iom::Device> candidate =
+            iom::make_ttnn_device(0);
+    const std::span<const iom::DataType> supported =
+            candidate->supported_data_types();
+    const std::span<const iom::DataType> canonical =
+            iom::ttnn_supported_data_types();
+    constexpr iom::DataType expected[] = {
+            iom::DataType::BOOL, iom::DataType::U8, iom::DataType::I8,
+            iom::DataType::U16, iom::DataType::I16, iom::DataType::U32,
+            iom::DataType::I32, iom::DataType::BF16, iom::DataType::F32,
+    };
+    REQUIRE_EQ(supported.size(), sizeof(expected) / sizeof(expected[0]));
+    for (std::size_t i = 0; i < supported.size(); ++i) {
+        CHECK_EQ(supported[i], expected[i]);
+    }
+    CHECK_EQ(supported.data(), canonical.data());
+    CHECK_EQ(supported.size(), canonical.size());
+}
+
 
 // Every extent the TTNN native constructor cannot represent is rejected
 // with std::overflow_error before any native object or allocation exists.
@@ -450,8 +471,10 @@ TEST_CASE("TTNN conformance: storage oracle covers every leaf width and padded s
 TEST_CASE("TTNN conformance: asynchronous copies against the CPU reference") {
     require_hardware();
     TtnnDevices devices;
+    TtnnStorageOracle oracle;
     iom_conformance::run_async_copy_conformance(
-            devices.conformance(), iom::ttnn_supported_data_types());
+            devices.conformance(), iom::ttnn_supported_data_types(), nullptr,
+            &oracle);
 }
 
 TEST_CASE("TTNN conformance: copy validation fails before writes and sequences") {
@@ -487,6 +510,7 @@ TEST_CASE("TTNN conformance: full shared suite") {
     TtnnDevices devices;
     const std::span<const iom::DataType> supported =
             iom::ttnn_supported_data_types();
+    TtnnStorageOracle oracle;
     iom_conformance::run_backend_conformance(
-            devices.conformance(), supported.subspan(0, 1));
+            devices.conformance(), supported.subspan(0, 1), nullptr, &oracle);
 }

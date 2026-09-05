@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
-
+#include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
@@ -654,6 +655,38 @@ std::vector<std::string_view> op_names(const FakeQueue& queue) {
     return names;
 }
 
+constexpr std::array kFakeDeviceSupportedDataTypes = {
+        iom::DataType::BOOL,
+        iom::DataType::I2, iom::DataType::U2,
+        iom::DataType::I4, iom::DataType::U4,
+        iom::DataType::I8, iom::DataType::U8,
+        iom::DataType::I16, iom::DataType::U16,
+        iom::DataType::I32, iom::DataType::U32,
+        iom::DataType::I64, iom::DataType::U64,
+        iom::DataType::F4_E2M1,
+        iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+        iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+        iom::DataType::F8_E8M0,
+        iom::DataType::F16, iom::DataType::BF16,
+        iom::DataType::F32, iom::DataType::F64,
+};
+
+constexpr std::array kFakeShrunkDeviceSupportedDataTypes = {
+        iom::DataType::BOOL,
+        iom::DataType::I2, iom::DataType::U2,
+        iom::DataType::I4, iom::DataType::U4,
+        iom::DataType::I8, iom::DataType::U8,
+        iom::DataType::I16, iom::DataType::U16,
+        iom::DataType::I32, iom::DataType::U32,
+        iom::DataType::I64, iom::DataType::U64,
+        iom::DataType::F4_E2M1,
+        iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+        iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+        iom::DataType::F8_E8M0,
+        iom::DataType::F16, iom::DataType::BF16,
+        iom::DataType::F32,
+};
+
 class FakeDevice final : public iom::Device {
 
 public:
@@ -663,6 +696,11 @@ public:
 
     [[nodiscard]] std::uint32_t backend_device() const noexcept override {
         return 3;
+    }
+    [[nodiscard]] std::span<const iom::DataType>
+            supported_data_types() const noexcept override {
+        return {kFakeDeviceSupportedDataTypes.data(),
+                kFakeDeviceSupportedDataTypes.size()};
     }
 
     [[nodiscard]] std::unique_ptr<iom::Tensor> create_tensor(
@@ -675,6 +713,61 @@ public:
         return std::make_unique<FakeQueue>();
     }
 };
+class FakeShrunkDevice final : public iom::Device {
+public:
+    [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
+        return iom::BackendKind::CPU;
+    }
+
+    [[nodiscard]] std::uint32_t backend_device() const noexcept override {
+        return 3;
+    }
+
+    [[nodiscard]] std::span<const iom::DataType>
+            supported_data_types() const noexcept override {
+        return {kFakeShrunkDeviceSupportedDataTypes.data(),
+                kFakeShrunkDeviceSupportedDataTypes.size()};
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::Tensor> create_tensor(
+            const iom::TensorSpec& spec) override {
+        return std::make_unique<FakeTensor>(spec, *this);
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
+        return std::make_unique<FakeQueue>();
+    }
+};
+
+TEST_CASE("Device::supported_data_types mutation shrinks per-driver coverage") {
+    FakeDevice fake;
+    FakeShrunkDevice shrunk;
+    const std::span<const iom::DataType> full = fake.supported_data_types();
+    const std::span<const iom::DataType> reduced =
+            shrunk.supported_data_types();
+
+    REQUIRE_EQ(full.size(), kFakeDeviceSupportedDataTypes.size());
+    for (std::size_t i = 0; i < full.size(); ++i) {
+        CHECK_EQ(full[i], kFakeDeviceSupportedDataTypes[i]);
+    }
+    REQUIRE_EQ(reduced.size(), kFakeShrunkDeviceSupportedDataTypes.size());
+    for (std::size_t i = 0; i < reduced.size(); ++i) {
+        CHECK_EQ(reduced[i], kFakeShrunkDeviceSupportedDataTypes[i]);
+    }
+    CHECK_EQ(full.size() - reduced.size(), 1);
+    CHECK(std::find(
+                  reduced.begin(), reduced.end(), iom::DataType::F64)
+          == reduced.end());
+
+    const std::span<const iom::DataType> full_again =
+            fake.supported_data_types();
+    const std::span<const iom::DataType> reduced_again =
+            shrunk.supported_data_types();
+    CHECK_EQ(full_again.data(), full.data());
+    CHECK_EQ(full_again.size(), full.size());
+    CHECK_EQ(reduced_again.data(), reduced.data());
+    CHECK_EQ(reduced_again.size(), reduced.size());
+}
 
 FakeTensor make_tensor(
         iom::Device& device,

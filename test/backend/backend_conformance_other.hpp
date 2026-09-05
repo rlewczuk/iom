@@ -507,9 +507,10 @@ inline void run_compute_capability_conformance(
 inline void run_backend_conformance(
         const ConformanceDevices& devices,
         const std::span<const iom::DataType> supported_types,
-        ConformanceObserver* observer = nullptr) {
+        ConformanceObserver* observer = nullptr,
+        AcceleratorStorageOracle* oracle = nullptr) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
-    run_async_copy_conformance(devices, supported_types, observer);
+    run_async_copy_conformance(devices, supported_types, observer, oracle);
     run_copy_error_conformance(devices, supported_types, observer);
     run_transfer_error_conformance(devices, supported_types, observer);
     run_lifetime_conformance(devices.candidate, supported_types, observer);

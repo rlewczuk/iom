@@ -2,7 +2,7 @@
 
 #include <hip/hip_runtime_api.h>
 
-#include <cstdint>
+#include <array>
 #include <limits>
 #include <memory>
 #include <new>
@@ -10,12 +10,27 @@
 #include <string>
 
 #include "copy.hpp"
+#include "iom/detail/aligned_storage.hpp"
 
 namespace iom {
 
     namespace {
 
-        constexpr std::size_t kStorageAlignment = 32;
+        constexpr std::array kRocmSupportedDataTypes = {
+                iom::DataType::BOOL,
+                iom::DataType::I2, iom::DataType::U2,
+                iom::DataType::I4, iom::DataType::U4,
+                iom::DataType::I8, iom::DataType::U8,
+                iom::DataType::I16, iom::DataType::U16,
+                iom::DataType::I32, iom::DataType::U32,
+                iom::DataType::I64, iom::DataType::U64,
+                iom::DataType::F4_E2M1,
+                iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+                iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+                iom::DataType::F8_E8M0,
+                iom::DataType::F16, iom::DataType::BF16,
+                iom::DataType::F32, iom::DataType::F64,
+        };
 
         [[nodiscard]] std::runtime_error hip_error(
                 const char* operation, hipError_t status) {
@@ -54,6 +69,11 @@ namespace iom {
             [[nodiscard]] std::uint32_t backend_device() const noexcept override {
                 return ordinal_;
             }
+            [[nodiscard]] std::span<const iom::DataType>
+                    supported_data_types() const noexcept override {
+                return {kRocmSupportedDataTypes.data(),
+                        kRocmSupportedDataTypes.size()};
+            }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;
@@ -83,34 +103,17 @@ namespace iom {
                        Allocator& allocator)
                     : Tensor(spec, device), device_(device),
                       allocator_(allocator) {
-                device_.activate();
-                address_ = allocator_.alloc(view().spec().tiled_storage_nbytes());
-                if (address_ == nullptr) {
-                    throw std::bad_alloc();
-                }
-                if (reinterpret_cast<std::uintptr_t>(address_)
-                                % kStorageAlignment
-                        != 0) {
-                    allocator_.free(address_);
-                    address_ = nullptr;
-                    throw std::runtime_error(
-                            "ROCm tensor storage is not 32-byte aligned");
-                }
+                address_ = iom::detail::allocate_aligned_storage(
+                        allocator_,
+                        view().spec().tiled_storage_nbytes(),
+                        [this] { device_.activate(); },
+                        "ROCm tensor storage is not 32-byte aligned");
             }
 
             ~RocmTensor() override {
-                if (address_ == nullptr) {
-                    return;
-                }
-                try {
-                    device_.activate();
-                } catch (...) {
-                }
-                try {
-                    allocator_.free(address_);
-                } catch (...) {
-                }
-                address_ = nullptr;
+                iom::detail::release_aligned_storage(
+                        allocator_, address_,
+                        [this] { device_.activate(); });
             }
 
         private:

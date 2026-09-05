@@ -254,6 +254,10 @@ namespace iom {
 
     protected:
         DeviceOps();
+        virtual void fence_through_sequence(
+                std::uint64_t sequence) noexcept;
+        void record_post_completion_failure(
+                std::uint64_t sequence, std::exception_ptr failure);
         static void validate_copy(
                 const Device& device, const TensorView& source,
                 const TensorView& destination) {

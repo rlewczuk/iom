@@ -2,7 +2,7 @@
 
 #include <cuda.h>
 
-#include <cstdint>
+#include <array>
 #include <limits>
 #include <memory>
 #include <new>
@@ -11,30 +11,27 @@
 
 #include "copy.hpp"
 #include "driver.hpp"
+#include "iom/detail/aligned_storage.hpp"
 namespace iom {
 
-    cuda_detail::DriverCalls cuda_detail::driver_calls{};
 
     namespace {
-        constexpr std::size_t kStorageAlignment = 32;
+        constexpr std::array kCudaSupportedDataTypes = {
+                iom::DataType::BOOL,
+                iom::DataType::I2, iom::DataType::U2,
+                iom::DataType::I4, iom::DataType::U4,
+                iom::DataType::I8, iom::DataType::U8,
+                iom::DataType::I16, iom::DataType::U16,
+                iom::DataType::I32, iom::DataType::U32,
+                iom::DataType::I64, iom::DataType::U64,
+                iom::DataType::F4_E2M1,
+                iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+                iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+                iom::DataType::F8_E8M0,
+                iom::DataType::F16, iom::DataType::BF16,
+                iom::DataType::F32, iom::DataType::F64,
+        };
 
-        [[nodiscard]] std::runtime_error cuda_error(
-                const char* operation, CUresult status) {
-            const char* name = nullptr;
-            const char* description = nullptr;
-            (void)cuGetErrorName(status, &name);
-            (void)cuGetErrorString(status, &description);
-            return std::runtime_error(
-                    std::string(operation) + " failed with "
-                    + (name != nullptr ? name : "unknown CUDA error") + ": "
-                    + (description != nullptr ? description : "unknown error"));
-        }
-
-        void check_cuda(const char* operation, CUresult status) {
-            if (status != CUDA_SUCCESS) {
-                throw cuda_error(operation, status);
-            }
-        }
 
         [[nodiscard]] std::invalid_argument invalid_ordinal(
                 std::uint32_t ordinal, int device_count) {
@@ -76,6 +73,11 @@ namespace iom {
 
             ~CudaDevice() override {
                 if (context_ != nullptr) {
+                    try {
+                        activate();
+                        transfer_pool_.destroy();
+                    } catch (...) {
+                    }
                     (void)cuda_detail::driver_calls.primary_ctx_release(device_);
                     context_ = nullptr;
                 }
@@ -87,6 +89,11 @@ namespace iom {
 
             [[nodiscard]] std::uint32_t backend_device() const noexcept override {
                 return ordinal_;
+            }
+            [[nodiscard]] std::span<const iom::DataType>
+                    supported_data_types() const noexcept override {
+                return {kCudaSupportedDataTypes.data(),
+                        kCudaSupportedDataTypes.size()};
             }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
@@ -111,8 +118,8 @@ namespace iom {
             std::uint32_t ordinal_;
             CUdevice device_;
             CUcontext context_;
+            cuda_detail::TransferStreamPool transfer_pool_;
             Allocator& allocator_;
-
             friend class CudaTensor;
         };
 
@@ -122,35 +129,17 @@ namespace iom {
                        Allocator& allocator)
                     : Tensor(spec, device), device_(device),
                       allocator_(allocator) {
-                device_.activate();
-                address_ = allocator_.alloc(view().spec().tiled_storage_nbytes());
-                if (address_ == nullptr) {
-                    throw std::bad_alloc();
-                }
-                if (reinterpret_cast<std::uintptr_t>(address_)
-                                % kStorageAlignment
-                        != 0) {
-                    void* misaligned = address_;
-                    address_ = nullptr;
-                    allocator_.free(misaligned);
-                    throw std::runtime_error(
+                address_ = iom::detail::allocate_aligned_storage(
+                        allocator_,
+                        view().spec().tiled_storage_nbytes(),
+                        [this] { device_.activate(); },
                         "CUDA tensor storage is not 32-byte aligned");
-                }
             }
 
             ~CudaTensor() override {
-                if (address_ == nullptr) {
-                    return;
-                }
-                try {
-                    device_.activate();
-                } catch (...) {
-                }
-                try {
-                    allocator_.free(address_);
-                } catch (...) {
-                }
-                address_ = nullptr;
+                iom::detail::release_aligned_storage(
+                        allocator_, address_,
+                        [this] { device_.activate(); });
             }
 
         private:
@@ -163,7 +152,8 @@ namespace iom {
                     std::span<const std::byte> source) override {
                 device_.activate();
                 cuda_detail::region_from_host(
-                        device_.context(), destination, source);
+                        device_.transfer_pool_, device_.context(),
+                        destination, source);
             }
 
             void region_to_host(
@@ -171,9 +161,9 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 device_.activate();
                 cuda_detail::region_to_host(
-                        device_.context(), source, destination);
+                        device_.transfer_pool_, device_.context(),
+                        source, destination);
             }
-
             CudaDevice& device_;
             Allocator& allocator_;
             void* address_ = nullptr;
@@ -189,10 +179,11 @@ namespace iom {
 
     std::unique_ptr<Device> make_cuda_device(
             std::uint32_t device_ordinal, Allocator& allocator) {
-        check_cuda("cuInit", cuInit(0));
+        check_cuda("cuInit", cuda_detail::driver_calls.init(0));
 
         int device_count = 0;
-        CUresult count_status = cuDeviceGetCount(&device_count);
+        CUresult count_status =
+                cuda_detail::driver_calls.device_get_count(&device_count);
         if (count_status == CUDA_ERROR_NO_DEVICE) {
             throw invalid_ordinal(device_ordinal, 0);
         }
@@ -209,7 +200,8 @@ namespace iom {
         CUdevice device = 0;
         check_cuda(
                 "cuDeviceGet",
-                cuDeviceGet(&device, static_cast<int>(device_ordinal)));
+                cuda_detail::driver_calls.device_get(
+                        &device, static_cast<int>(device_ordinal)));
         CUcontext context = nullptr;
         check_cuda(
                 "cuDevicePrimaryCtxRetain",

@@ -8,6 +8,7 @@ namespace iom {
     class Allocator {
     public:
         virtual ~Allocator() = default;
+        // Every backend's create_tensor requires the returned address to satisfy the engine's 32-byte base-address alignment. Backends must inject an allocator configured to honor this requirement (LinearAllocator(..., alignment = 32) by default). The contract is enforced by iom::detail::allocate_aligned_storage.
         virtual void* alloc(std::size_t sz) = 0;
         virtual void free(void* buffer) = 0;
         virtual void reset() = 0;
@@ -23,7 +24,6 @@ namespace iom {
     protected:
         [[nodiscard]] void* ptr_from_addr(std::uintptr_t address) const;
         [[nodiscard]] std::uintptr_t addr_from_ptr(void* ptr) const;
-        [[nodiscard]] bool owns(void* ptr) const;
         [[nodiscard]] std::size_t offset_of(void* ptr) const;
         [[nodiscard]] std::uintptr_t align_up_addr(std::uintptr_t address) const;
 

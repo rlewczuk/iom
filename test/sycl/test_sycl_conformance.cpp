@@ -23,21 +23,6 @@
 
 namespace {
 
-constexpr std::initializer_list<iom::DataType> kSyclLeafTypes = {
-    iom::DataType::BOOL,
-    iom::DataType::I2, iom::DataType::U2,
-    iom::DataType::I4, iom::DataType::U4,
-    iom::DataType::I8, iom::DataType::U8,
-    iom::DataType::I16, iom::DataType::U16,
-    iom::DataType::I32, iom::DataType::U32,
-    iom::DataType::I64, iom::DataType::U64,
-    iom::DataType::F4_E2M1,
-    iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-    iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
-    iom::DataType::F8_E8M0,
-    iom::DataType::F16, iom::DataType::BF16,
-    iom::DataType::F32, iom::DataType::F64,
-};
 
 class TrafficGate final : public iom_conformance::ConformanceObserver {
 public:
@@ -255,6 +240,31 @@ private:
 };
 
 }  // namespace
+TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
+    SyclDevices devices;
+    const std::span<const iom::DataType> supported =
+            devices.candidate->supported_data_types();
+    constexpr iom::DataType expected[] = {
+            iom::DataType::BOOL,
+            iom::DataType::I2, iom::DataType::U2,
+            iom::DataType::I4, iom::DataType::U4,
+            iom::DataType::I8, iom::DataType::U8,
+            iom::DataType::I16, iom::DataType::U16,
+            iom::DataType::I32, iom::DataType::U32,
+            iom::DataType::I64, iom::DataType::U64,
+            iom::DataType::F4_E2M1,
+            iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+            iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+            iom::DataType::F8_E8M0,
+            iom::DataType::F16, iom::DataType::BF16,
+            iom::DataType::F32, iom::DataType::F64,
+    };
+    REQUIRE_EQ(supported.size(), sizeof(expected) / sizeof(expected[0]));
+    for (std::size_t i = 0; i < supported.size(); ++i) {
+        CHECK_EQ(supported[i], expected[i]);
+    }
+}
+
 
 TEST_CASE("SYCL rejects aligned non-USM allocator storage") {
     REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
@@ -272,14 +282,15 @@ TEST_CASE("SYCL rejects aligned non-USM allocator storage") {
 TEST_CASE("SYCL conformance: storage and host transfers for every leaf type") {
     SyclDevices devices;
     iom_conformance::run_storage_and_transfer_conformance(
-            devices.conformance(), kSyclLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: storage oracle identifies perturbed transfer map") {
     SyclDevices devices;
-    const std::span<const iom::DataType> one_type{
-            kSyclLeafTypes.begin(), 1};
+    const std::span<const iom::DataType> one_type =
+            devices.candidate->supported_data_types().subspan(0, 1);
     iom_conformance::run_storage_and_transfer_conformance(
             devices.conformance(), one_type, &devices.gate);
 
@@ -296,42 +307,48 @@ TEST_CASE("SYCL conformance: storage oracle covers every leaf width and padded s
     SyclDevices devices;
     SyclStorageOracle oracle(devices.candidate_allocator);
     REQUIRE(iom_conformance::run_storage_oracle_conformance(
-            devices.conformance(), kSyclLeafTypes, oracle, &devices.gate));
+            devices.conformance(), devices.candidate->supported_data_types(),
+            oracle, &devices.gate));
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: asynchronous copies against the CPU reference") {
     SyclDevices devices;
     iom_conformance::run_async_copy_conformance(
-            devices.conformance(), kSyclLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: copy validation fails before writes and sequences") {
     SyclDevices devices;
     iom_conformance::run_copy_error_conformance(
-            devices.conformance(), kSyclLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: transfer failures keep metadata and ownership") {
     SyclDevices devices;
     iom_conformance::run_transfer_error_conformance(
-            devices.conformance(), kSyclLeafTypes, &devices.gate);
+            devices.conformance(), devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: deferred queue lifetime and stability") {
     SyclDevices devices;
     iom_conformance::run_lifetime_conformance(
-            *devices.candidate, kSyclLeafTypes, &devices.gate);
+            *devices.candidate, devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: compute methods reject capability without submitting") {
     SyclDevices devices;
     iom_conformance::run_compute_capability_conformance(
-            *devices.candidate, kSyclLeafTypes, &devices.gate);
+            *devices.candidate, devices.candidate->supported_data_types(),
+            &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -339,7 +356,7 @@ TEST_CASE("SYCL conformance: full shared suite") {
     SyclDevices devices;
     iom_conformance::run_backend_conformance(
             devices.conformance(),
-            std::span<const iom::DataType>{kSyclLeafTypes.begin(), 1},
+            devices.candidate->supported_data_types().subspan(0, 1),
             &devices.gate);
     CHECK_FALSE(devices.gate.armed());
 }
