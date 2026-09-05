@@ -94,6 +94,7 @@ private:
     std::vector<std::unique_ptr<SafeTensorsFile>> files_;
     std::unordered_map<std::string, SafeTensorView> tensors_;
     std::vector<std::string> keys_;
+    std::unordered_map<std::string, std::string> existing_shard_paths_;
 };
 
 }  // namespace ec
