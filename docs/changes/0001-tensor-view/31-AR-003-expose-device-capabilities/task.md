@@ -1,4 +1,4 @@
-**Status:** blocked
+**Status:** done
 
 ## Summary
 
@@ -11,8 +11,4 @@ Added `Device::supported_data_types()` and authoritative capability spans for CP
 - CUDA remote configure/build/conformance and focused membership, compute-capability, and storage tests on `bv1` — passed.
 - ROCm remote configure/build/conformance and focused membership, compute-capability, and storage tests on `bv2` — passed.
 - TTNN remote configure/build/conformance and focused membership, compute-capability, and storage tests on `bv1` — passed.
-- SYCL remote configure with explicit `/opt/intel/oneapi/compiler/latest/bin/icpx` and build on `bv2` — passed; runtime conformance could not execute because the host reports no eligible SYCL device (`eligible_device_count() == 0`).
-
-## Errors
-
-- SYCL `ctest --test-dir build --output-on-failure -R iom_sycl_conformance_tests` — failed because the configured host has no eligible GPU or accelerator device; the retained feature worktree is not eligible for integration until this required verification succeeds.
+- SYCL remote configure/build with `/opt/intel/oneapi/compiler/2026.1/bin/icpx`, full conformance, and focused membership, compute-capability, and storage tests on `bv2` after sourcing `/opt/intel/oneapi/setvars.sh --force` — passed; `sycl-ls` reported two Level Zero GPU devices.
