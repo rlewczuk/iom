@@ -396,6 +396,93 @@ TEST_CASE("SafeTensorsFile satisfies SafeTensorsStore interface") {
     CHECK_THROWS_AS(store["missing"], std::out_of_range);
 }
 
+TEST_CASE("SafeTensorsDir rejects duplicate keys across shards") {
+    {
+        TempDir dir("duplicate-shards");
+        const auto shard_a = write_safetensors_file(
+            dir.path(), "a.safetensors",
+            {{"k", "F32", {1}, "AAAA"}});
+        const auto shard_b = write_safetensors_file(
+            dir.path(), "b.safetensors",
+            {{"k", "F32", {1}, "BBBB"}});
+
+        CHECK_THROWS_AS((void)iom::SafeTensorsDir(dir.path().string()),
+                        std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsDir shards(dir.path().string());
+            (void)shards;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        CHECK(message.find("duplicate tensor key across shards") !=
+              std::string::npos);
+        CHECK(message.find("'k'") != std::string::npos);
+        CHECK(message.find(shard_a) != std::string::npos);
+        CHECK(message.find(shard_b) != std::string::npos);
+    }
+
+    {
+        TempDir dir("disjoint-shards");
+        write_safetensors_file(
+            dir.path(), "a.safetensors",
+            {{"a1", "F32", {1}, "A001"}});
+        write_safetensors_file(
+            dir.path(), "b.safetensors",
+            {{"b1", "F32", {1}, "B001"}, {"b2", "F32", {1}, "B002"}});
+        write_safetensors_file(
+            dir.path(), "c.safetensors",
+            {{"c1", "F32", {1}, "C001"}});
+
+        const iom::SafeTensorsDir shards(dir.path().string());
+        REQUIRE(shards.size() == 4);
+        REQUIRE(shards.keys().size() == 4);
+        CHECK(shards.keys() ==
+              std::vector<std::string>{"a1", "b1", "b2", "c1"});
+        CHECK(shards.keys()[0] == "a1");
+        CHECK(shards.keys()[1] == "b1");
+        CHECK(shards.keys()[2] == "b2");
+        CHECK(shards.keys()[3] == "c1");
+
+        const std::pair<const char*, const char*> expected[] = {
+            {"a1", "A001"}, {"b1", "B001"}, {"b2", "B002"}, {"c1", "C001"}};
+        for (const auto& [key, payload] : expected) {
+            const auto tensor = shards[key];
+            REQUIRE(tensor.nbytes() == 4);
+            REQUIRE(tensor.raw<uint8_t>() != nullptr);
+            CHECK(std::memcmp(tensor.raw<uint8_t>(), payload, 4) == 0);
+        }
+    }
+
+    {
+        TempDir dir("duplicate-three-way");
+        const auto shard_a = write_safetensors_file(
+            dir.path(), "a.safetensors",
+            {{"k", "F32", {1}, "AAAA"}});
+        const auto shard_b = write_safetensors_file(
+            dir.path(), "b.safetensors",
+            {{"k", "F32", {1}, "BBBB"}});
+        write_safetensors_file(
+            dir.path(), "c.safetensors",
+            {{"k", "F32", {1}, "CCCC"}});
+
+        CHECK_THROWS_AS((void)iom::SafeTensorsDir(dir.path().string()),
+                        std::runtime_error);
+
+        std::string message;
+        try {
+            const iom::SafeTensorsDir shards(dir.path().string());
+            (void)shards;
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        CHECK(message.find("'k'") != std::string::npos);
+        CHECK(message.find(shard_a) != std::string::npos);
+        CHECK(message.find(shard_b) != std::string::npos);
+    }
+}
+
 TEST_CASE("SafeTensorsDir exposes tensors from every file in a directory") {
     TempDir dir("shards");
     const auto shard_a = write_safetensors_file(
