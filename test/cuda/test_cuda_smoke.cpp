@@ -25,6 +25,7 @@
 #include "copy.hpp"
 #include "driver.hpp"
 #include "transfer_pool.hpp"
+#include "staging_pool.hpp"
 
 namespace cuda_test {
 bool fail_next_allocation = false;
@@ -516,13 +517,14 @@ TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
     std::vector<std::byte> input(spec.logical_nbytes());
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    iom::cuda_detail::StagingSlotPool staging_pool(context);
     iom::cuda_detail::TransferStreamPool pool;
 
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::third_plane_launch);
     CHECK_THROWS_AS(
             iom::cuda_detail::region_from_host(
-                    pool, context, tensor->view(), input),
+                    pool, staging_pool, context, tensor->view(), input),
             std::runtime_error);
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::none);
@@ -530,7 +532,7 @@ TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
     CHECK_EQ(pool.idle_count_for_testing(), 0);
     CHECK_NOTHROW(
             iom::cuda_detail::region_from_host(
-                    pool, context, tensor->view(), input));
+                    pool, staging_pool, context, tensor->view(), input));
     CHECK_EQ(pool.idle_count_for_testing(), 1);
     pool.destroy();
 }
@@ -550,6 +552,63 @@ TEST_CASE("CUDA poisoned Scope drops its stream from the pool") {
     }
     CHECK_EQ(pool.idle_count_for_testing(), 1);
     pool.destroy();
+}
+
+TEST_CASE("CUDA staging pool preserves accounting across allocation failures") {
+    require_cuda_hardware();
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    iom::cuda_detail::StagingSlotPool pool(context);
+
+    CHECK_THROWS_AS(
+            pool.acquire(iom::cuda_detail::StagingSlotPool::kMaxStagingBytes + 1),
+            std::invalid_argument);
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    pool.fail_next_allocation_for_testing();
+    CHECK_THROWS_AS(pool.acquire(4), std::bad_alloc);
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    {
+        auto lease = pool.acquire(4);
+        CHECK_EQ(lease.capacity(), 4);
+        CHECK(lease.staging() != 0);
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+
+    pool.fail_next_allocation_for_testing();
+    CHECK_THROWS_AS(pool.acquire(8), std::bad_alloc);
+    CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+
+    {
+        auto lease = pool.acquire(4);
+        lease.poison();
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    for (std::size_t i = 0;
+         i < 2 * iom::cuda_detail::StagingSlotPool::kMaxSlotCount; ++i) {
+        auto lease = pool.acquire(4);
+        lease.poison();
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    {
+        auto lease = pool.acquire(4);
+        CHECK_EQ(lease.capacity(), 4);
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    pool.destroy();
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
 }
 
 TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {

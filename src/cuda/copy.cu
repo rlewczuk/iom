@@ -106,8 +106,8 @@ struct gpu_policy {
         check_cuda("cuMemAlloc", cuMemAlloc(&address, bytes));
         return reinterpret_cast<void*>(address);
     }
-    static void free(void* address) {
-        check_cuda("cuMemFree", cuMemFree(reinterpret_cast<CUdeviceptr>(address)));
+    [[nodiscard]] static void* staging_address(CUdeviceptr address) noexcept {
+        return reinterpret_cast<void*>(address);
     }
     static void free_noexcept(void* address) noexcept {
         if (address != nullptr) {
@@ -219,8 +219,6 @@ detail::Fence make_fence(
 #define IOM_GPU_DEVICE __device__
 #define IOM_GPU_GLOBAL __global__
 #define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
-#define IOM_GPU_ATOMIC_OR atomicOr
-#define IOM_GPU_ATOMIC_AND atomicAnd
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
 namespace iom::cuda_detail {
@@ -271,11 +269,6 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
         const std::uint64_t logical_plane =
                 word / words_per_plane;
         const std::uint64_t word_in_plane = word % words_per_plane;
-        const std::uint64_t first_bit = word_in_plane * 32;
-        const std::uint64_t end_bit =
-                first_bit + 32 < plane_bits ? first_bit + 32 : plane_bits;
-        const std::uint64_t first_element =
-                (first_bit + metadata->bits - 1) / metadata->bits;
         std::uint64_t source_plane = metadata->source_plane_offset;
         std::uint64_t destination_plane =
                 metadata->destination_plane_offset;
@@ -287,36 +280,16 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
             source_plane += coordinate * source_strides[axis];
             destination_plane += coordinate * destination_strides[axis];
         }
-        for (std::uint64_t element = first_element;
-             element < padded_elements
-             && element * metadata->bits < end_bit; ++element) {
-            const std::uint64_t row = element / padded_columns;
-            const std::uint64_t column = element % padded_columns;
-            if (row >= metadata->rows || column >= metadata->columns) {
-                continue;
-            }
-            const std::uint64_t source_bit =
-                    detail::plane_slot(
-                            source_plane, row, column, metadata->rows,
-                            metadata->columns)
-                    * metadata->bits;
-            const std::uint64_t destination_bit =
-                    detail::plane_slot(
-                            destination_plane, row, column, metadata->rows,
-                            metadata->columns)
-                    * metadata->bits;
-            detail::copy_value(
-                    destination, destination_bit, source, source_bit,
-                    metadata->bits);
-        }
+        detail::copy_tiled_to_tiled_word(
+                source, destination, source_plane, destination_plane,
+                word_in_plane, metadata->rows, metadata->columns,
+                metadata->bits);
+    }
 }
 }
 
-}  // namespace
 }  // namespace iom::cuda_detail
 #undef IOM_LAUNCH_KERNEL
-#undef IOM_GPU_ATOMIC_AND
-#undef IOM_GPU_ATOMIC_OR
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_GLOBAL
 #undef IOM_GPU_DEVICE
@@ -359,7 +332,12 @@ TransferStreamPool::Scope TransferStreamPool::acquire() {
         check_cuda_kernel(
                 "cudaStreamCreateWithFlags",
                 cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        idle_.push_back(stream);
+        try {
+            idle_.push_back(stream);
+        } catch (...) {
+            (void)cudaStreamDestroy(stream);
+            throw;
+        }
     }
     cudaStream_t stream = idle_.back();
     idle_.pop_back();
@@ -377,7 +355,11 @@ void TransferStreamPool::release(cudaStream_t stream) {
     const auto it = in_use_.find(stream);
     if (it != in_use_.end()) {
         in_use_.erase(it);
-        idle_.push_back(stream);
+        try {
+            idle_.push_back(stream);
+        } catch (...) {
+            (void)cudaStreamDestroy(stream);
+        }
         cv_.notify_all();
     }
 }
@@ -392,63 +374,6 @@ void TransferStreamPool::destroy() {
     idle_.clear();
 }
 
-namespace {
-
-void synchronous_transfer(
-        TransferStreamPool& pool, CUcontext context, const TensorView& view,
-        std::span<const std::byte> source, std::span<std::byte> destination,
-        bool from_host) {
-    const std::size_t logical_nbytes = view.spec().logical_nbytes();
-    const std::size_t staging_nbytes =
-            gpu_algorithm::compute_staging_size(logical_nbytes);
-    gpu_policy::activate(context);
-
-    void* staging = nullptr;
-    std::exception_ptr failure;
-    try {
-        staging = gpu_policy::allocate(staging_nbytes);
-        {
-            auto scope = pool.acquire();
-            const cudaStream_t stream = scope.stream();
-            try {
-                if (from_host) {
-                    gpu_policy::copy_from_host(
-                            stream, staging, source.data(), source.size());
-                    detail::launch_view_transfer<gpu_policy>(
-                            stream, view, staging,
-                            const_cast<void*>(view.native_handle()), true);
-                    gpu_policy::after_copy_plane_launch(2);
-                } else {
-                    gpu_policy::memset(stream, staging, staging_nbytes);
-                    detail::launch_view_transfer<gpu_policy>(
-                            stream, view, view.native_handle(), staging, false);
-                    gpu_policy::after_copy_plane_launch(2);
-                }
-                gpu_policy::synchronize_stream(stream);
-                if (!from_host) {
-                    gpu_policy::copy_to_host(
-                            stream, destination.data(), staging,
-                            destination.size());
-                }
-            } catch (...) {
-                scope.poison();
-                throw;
-            }
-        }
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    if (failure) {
-        if (staging != nullptr) {
-            gpu_policy::free_noexcept(staging);
-            staging = nullptr;
-        }
-        std::rethrow_exception(failure);
-    }
-    gpu_policy::free(staging);
-}
-
-}  // namespace
 
 namespace {
 
@@ -980,15 +905,21 @@ void inject_submission_fault_for_testing(
 }
 
 void region_from_host(
-        TransferStreamPool& pool, CUcontext context,
-        const TensorView& destination, std::span<const std::byte> source) {
-    synchronous_transfer(pool, context, destination, source, {}, true);
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
+        CUcontext context, const TensorView& destination,
+        std::span<const std::byte> source) {
+    detail::synchronous_transfer<gpu_policy>(
+            transfer_pool, staging_pool, context, destination, source, {},
+            true);
 }
 
 void region_to_host(
-        TransferStreamPool& pool, CUcontext context, const TensorView& source,
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
+        CUcontext context, const TensorView& source,
         std::span<std::byte> destination) {
-    synchronous_transfer(pool, context, source, {}, destination, false);
+    detail::synchronous_transfer<gpu_policy>(
+            transfer_pool, staging_pool, context, source, {}, destination,
+            false);
 }
 
 std::unique_ptr<DeviceOps> make_queue(

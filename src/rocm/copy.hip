@@ -70,21 +70,6 @@ struct gpu_policy {
         }
     }
 
-    [[nodiscard]] static stream_type create_transfer_stream() {
-        stream_type stream = nullptr;
-        check_hip(
-                "hipStreamCreateWithFlags",
-                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-        return stream;
-    }
-    static void destroy_transfer_stream(stream_type stream) {
-        check_hip("hipStreamDestroy", hipStreamDestroy(stream));
-    }
-    static void destroy_transfer_stream_noexcept(stream_type stream) noexcept {
-        if (stream != nullptr) {
-            (void)hipStreamDestroy(stream);
-        }
-    }
 
     static void create_event(event_type* event) {
         if (consume_submission_fault(SubmissionFault::event_create)) {
@@ -118,6 +103,10 @@ struct gpu_policy {
         void* address = nullptr;
         check_hip("hipMalloc", hipMalloc(&address, bytes));
         return address;
+    }
+    [[nodiscard]] static void* staging_address(
+            hipDeviceptr_t address) noexcept {
+        return static_cast<void*>(address);
     }
     static void free(void* address) {
         check_hip("hipFree", hipFree(address));
@@ -231,13 +220,86 @@ detail::Fence make_fence(
     };
 }
 }  // namespace
+TransferStreamPool::Scope::~Scope() noexcept {
+    const hipError_t sync_status = hipStreamSynchronize(stream_);
+    const bool drop_stream = poisoned_ || (sync_status != hipSuccess);
+    if (drop_stream) {
+        std::lock_guard<std::mutex> lock(pool_->mutex_);
+        const auto it = pool_->in_use_.find(stream_);
+        if (it != pool_->in_use_.end()) {
+            pool_->in_use_.erase(it);
+            pool_->cv_.notify_all();
+        }
+        (void)hipStreamDestroy(stream_);
+    } else {
+        pool_->release(stream_);
+    }
+}
+
+TransferStreamPool::Scope TransferStreamPool::acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (closing_) {
+        throw std::runtime_error(
+                "hipStreamCreateWithFlags failed with "
+                "hipErrorContextIsDestroyed: TransferStreamPool is closing");
+    }
+    if (idle_.empty()) {
+        hipStream_t stream = nullptr;
+        check_hip(
+                "hipStreamCreateWithFlags",
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        try {
+            idle_.push_back(stream);
+        } catch (...) {
+            (void)hipStreamDestroy(stream);
+            throw;
+        }
+    }
+    hipStream_t stream = idle_.back();
+    idle_.pop_back();
+    try {
+        in_use_.insert(stream);
+    } catch (...) {
+        idle_.push_back(stream);
+        throw;
+    }
+    return Scope{*this, stream};
+}
+
+void TransferStreamPool::release(hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = in_use_.find(stream);
+    if (it != in_use_.end()) {
+        in_use_.erase(it);
+        try {
+            idle_.push_back(stream);
+        } catch (...) {
+            (void)hipStreamDestroy(stream);
+        }
+        cv_.notify_all();
+    }
+}
+
+void TransferStreamPool::destroy() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    closing_ = true;
+    cv_.wait(lock, [this] { return in_use_.empty(); });
+    for (const hipStream_t stream : idle_) {
+        (void)hipStreamDestroy(stream);
+    }
+    idle_.clear();
+}
+
+std::size_t TransferStreamPool::idle_count_for_testing() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return idle_.size();
+}
+
 }  // namespace iom::rocm_detail
 
 #define IOM_GPU_DEVICE __device__
 #define IOM_GPU_GLOBAL __global__
 #define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
-#define IOM_GPU_ATOMIC_OR atomicOr
-#define IOM_GPU_ATOMIC_AND atomicAnd
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     hipLaunchKernelGGL( \
             kernel, dim3(blocks), dim3(threads), 0, stream, __VA_ARGS__)
@@ -290,11 +352,6 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
         const std::uint64_t logical_plane =
                 word / words_per_plane;
         const std::uint64_t word_in_plane = word % words_per_plane;
-        const std::uint64_t first_bit = word_in_plane * 32;
-        const std::uint64_t end_bit =
-                first_bit + 32 < plane_bits ? first_bit + 32 : plane_bits;
-        const std::uint64_t first_element =
-                (first_bit + metadata->bits - 1) / metadata->bits;
         std::uint64_t source_plane = metadata->source_plane_offset;
         std::uint64_t destination_plane =
                 metadata->destination_plane_offset;
@@ -306,36 +363,16 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
             source_plane += coordinate * source_strides[axis];
             destination_plane += coordinate * destination_strides[axis];
         }
-        for (std::uint64_t element = first_element;
-             element < padded_elements
-             && element * metadata->bits < end_bit; ++element) {
-            const std::uint64_t row = element / padded_columns;
-            const std::uint64_t column = element % padded_columns;
-            if (row >= metadata->rows || column >= metadata->columns) {
-                continue;
-            }
-            const std::uint64_t source_bit =
-                    detail::plane_slot(
-                            source_plane, row, column, metadata->rows,
-                            metadata->columns)
-                    * metadata->bits;
-            const std::uint64_t destination_bit =
-                    detail::plane_slot(
-                            destination_plane, row, column, metadata->rows,
-                            metadata->columns)
-                    * metadata->bits;
-            detail::copy_value(
-                    destination, destination_bit, source, source_bit,
-                    metadata->bits);
-        }
+        detail::copy_tiled_to_tiled_word(
+                source, destination, source_plane, destination_plane,
+                word_in_plane, metadata->rows, metadata->columns,
+                metadata->bits);
     }
 }
 
 }  // namespace
 }  // namespace iom::rocm_detail
 #undef IOM_LAUNCH_KERNEL
-#undef IOM_GPU_ATOMIC_AND
-#undef IOM_GPU_ATOMIC_OR
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_GLOBAL
 #undef IOM_GPU_DEVICE
@@ -866,17 +903,21 @@ void inject_submission_fault_for_testing(
 }
 
 void region_from_host(
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
         int device_ordinal, const TensorView& destination,
         std::span<const std::byte> source) {
     detail::synchronous_transfer<gpu_policy>(
-            device_ordinal, destination, source, {}, true);
+            transfer_pool, staging_pool, device_ordinal, destination, source,
+            {}, true);
 }
 
 void region_to_host(
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
         int device_ordinal, const TensorView& source,
         std::span<std::byte> destination) {
     detail::synchronous_transfer<gpu_policy>(
-            device_ordinal, source, {}, destination, false);
+            transfer_pool, staging_pool, device_ordinal, source, {}, destination,
+            false);
 }
 
 std::unique_ptr<DeviceOps> make_queue(

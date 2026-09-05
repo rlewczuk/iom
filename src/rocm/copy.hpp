@@ -8,6 +8,8 @@
 
 #include "registry_state.hpp"
 #include "iom/iom.hpp"
+#include "staging_pool.hpp"
+#include "transfer_pool.hpp"
 #include "iom/tensor.hpp"
 
 
@@ -23,10 +25,12 @@ void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
 
 
 void region_from_host(
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
         int device_ordinal, const TensorView& destination,
         std::span<const std::byte> source);
 
 void region_to_host(
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
         int device_ordinal, const TensorView& source,
         std::span<std::byte> destination);
 

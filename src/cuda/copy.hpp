@@ -8,6 +8,7 @@
 
 #include "transfer_pool.hpp"
 #include "registry_state.hpp"
+#include "staging_pool.hpp"
 
 #include "iom/iom.hpp"
 
@@ -23,12 +24,14 @@ void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
 
 
 void region_from_host(
-        TransferStreamPool& pool, CUcontext context,
-        const TensorView& destination, std::span<const std::byte> source);
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
+        CUcontext context, const TensorView& destination,
+        std::span<const std::byte> source);
 
 void region_to_host(
-        TransferStreamPool& pool, CUcontext context,
-        const TensorView& source, std::span<std::byte> destination);
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
+        CUcontext context, const TensorView& source,
+        std::span<std::byte> destination);
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, CUcontext context,
