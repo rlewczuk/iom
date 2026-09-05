@@ -82,6 +82,7 @@ set(IOM_SOURCES
 
 set(IOM_HEADERS
         include/iom/iom.hpp
+        include/iom/gpu_algorithm.hpp
         include/iom/cpu/device.hpp
         include/iom/llama.hpp
         include/iom/mmap.hpp
@@ -152,6 +153,7 @@ if(CUDA_ENABLED)
         src/cuda/copy.cu
         src/cuda/copy.hpp
         src/cuda/driver.hpp
+        src/shared/standard_tiled_copy.hpp
         include/iom/cuda/device.hpp
     )
 
@@ -196,6 +198,7 @@ if(ROCM_ENABLED)
         src/rocm/device.cpp
         src/rocm/copy.hip
         src/rocm/copy.hpp
+        src/shared/standard_tiled_copy.hpp
         include/iom/rocm/device.hpp
     )
 
@@ -214,6 +217,16 @@ if(ROCM_ENABLED)
         PRIVATE
             IOM_ROCM_ENABLED=1
             __HIP_PLATFORM_AMD__
+    )
+
+    # Unoptimized HIP device images retain the runtime assertion/hostcall
+    # support even for kernels that do not use it. APUs without PCIe atomics
+    # reject those images at dispatch, so keep debug and unconfigured builds
+    # debuggable while applying the minimum optimization that removes the
+    # unreachable hostcall path.
+    target_compile_options(iom_rocm
+        PRIVATE
+            $<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>>>:-O1>
     )
 endif()
 if(SYCL_ENABLED)

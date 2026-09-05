@@ -70,16 +70,6 @@ std::vector<PlanePair> plane_pairs(
     return pairs;
 }
 
-bool identical_window(
-        const TensorView& source, const TensorView& destination) {
-    return source.native_handle() == destination.native_handle()
-            && source.plane_offset() == destination.plane_offset()
-            && std::equal(
-                    source.plane_strides().begin(),
-                    source.plane_strides().end(),
-                    destination.plane_strides().begin(),
-                    destination.plane_strides().end());
-}
 
 std::uint64_t device_plane_slot(
         std::uint64_t plane, std::uint64_t row, std::uint64_t column,
@@ -280,7 +270,7 @@ public:
     oid copy(
             const TensorView& source,
             TensorView& destination) override {
-        validate_copy(source, destination);
+        validate_copy(*device_, source, destination);
         const bool no_op = identical_window(source, destination);
         std::vector<PlanePair> pairs;
         if (!no_op) {
@@ -362,31 +352,31 @@ public:
     }
 
     oid add(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("add");
+        throw unsupported("SYCL", "add");
     }
 
     oid mul(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("mul");
+        throw unsupported("SYCL", "mul");
     }
 
     oid silu(const TensorView&, TensorView&) override {
-        throw unsupported("silu");
+        throw unsupported("SYCL", "silu");
     }
 
     oid linear(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("linear");
+        throw unsupported("SYCL", "linear");
     }
 
     oid rmsnorm(
             const TensorView&, TensorView&, const TensorView&, float,
             size_t) override {
-        throw unsupported("rmsnorm");
+        throw unsupported("SYCL", "rmsnorm");
     }
 
     oid sdpa(
             const TensorView&, const TensorView&, const TensorView&, size_t,
             size_t, size_t, TensorView&) override {
-        throw unsupported("sdpa");
+        throw unsupported("SYCL", "sdpa");
     }
 
 private:
@@ -395,25 +385,6 @@ private:
         std::optional<sycl::event> event;
     };
 
-    static std::runtime_error unsupported(const char* operation) {
-        return std::runtime_error(
-                std::string("SYCL backend does not implement ") + operation);
-    }
-
-    void validate_copy(
-            const TensorView& source,
-            const TensorView& destination) const {
-        if (&source.device() != device_
-                || &destination.device() != device_) {
-            throw std::invalid_argument(
-                    "copy views must belong to the queue's own device");
-        }
-        if (!(source.spec() == destination.spec())) {
-            throw std::invalid_argument(
-                    "copy views must have identical shape, leaf type, and "
-                    "quantization");
-        }
-    }
 
     void publish_staged() {
         std::lock_guard<std::mutex> lock(mutex_);

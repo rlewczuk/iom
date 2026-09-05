@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -459,6 +460,25 @@ TEST_CASE("CPU tensors reject null and misaligned allocations exactly once") {
           == RecordingAllocator::Event::Kind::free);
     CHECK(allocator.events[2].address == allocator.events[1].address);
     CHECK(allocator.live_empty());
+}
+
+TEST_CASE("CPU create_tensor propagates LinearAllocator exhaustion") {
+    alignas(32) std::array<std::byte, 256> buffer{};
+    iom::LinearAllocator allocator(buffer.data(), buffer.size());
+    auto device = iom::make_cpu_device(allocator);
+    const iom::TensorSpec spec = make_spec({16, 16}, iom::DataType::U8);
+
+    auto first = device->create_tensor(spec);
+    REQUIRE(first != nullptr);
+    fill_storage(*first, kSentinel);
+    const auto expected_storage = snapshot_storage(*first);
+    void* first_storage = first->view().native_handle();
+
+    std::unique_ptr<iom::Tensor> second;
+    CHECK_THROWS_AS(second = device->create_tensor(spec), std::bad_alloc);
+    CHECK(second == nullptr);
+    CHECK_EQ(first->view().native_handle(), first_storage);
+    expect_storage_matches(*first, expected_storage);
 }
 
 TEST_CASE("CPU create_tensor propagates allocator failures without freeing") {
