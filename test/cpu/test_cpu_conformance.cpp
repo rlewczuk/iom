@@ -213,6 +213,27 @@ TEST_CASE("CPU conformance: standard storage oracle covers every leaf width and 
             oracle, &devices.gate));
     CHECK_FALSE(devices.gate.armed());
 }
+TEST_CASE("CPU conformance: storage oracle identifies perturbed transfer map") {
+    CpuDevices devices;
+    const std::span<const iom::DataType> supported =
+            devices.candidate->supported_data_types();
+    REQUIRE(supported.size() >= 1);
+    const std::span<const iom::DataType> one_type =
+            supported.subspan(0, 1);
+
+    iom_conformance::CpuStorageOracle direct;
+    iom_conformance::PermutingStorageOracle perturbed(
+            direct, iom_conformance::swap_first_adjacent_slots);
+    CHECK_FALSE(iom_conformance::run_storage_oracle_conformance(
+            devices.conformance(), one_type, perturbed, &devices.gate,
+            false, false));
+
+    iom_conformance::PermutingStorageOracle identity(
+            direct, [](std::size_t logical) { return logical; });
+    REQUIRE(iom_conformance::run_storage_oracle_conformance(
+            devices.conformance(), one_type, identity, &devices.gate));
+    CHECK_FALSE(devices.gate.armed());
+}
 
 TEST_CASE("CPU conformance: asynchronous copies against the CPU reference") {
     CpuDevices devices;
