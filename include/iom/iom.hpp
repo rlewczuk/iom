@@ -72,13 +72,17 @@ namespace iom {
         DeviceOps();
 
         /**
-         * Allocates this queue's next submission sequence, hands it to
-         * queue_work, and returns the waitable token
-         * (queue_id << 56) | sequence. The sequence is consumed only when
-         * queue_work returns: a validation or synchronous pre-queue
-         * failure propagates without burning a sequence number. Allocating
-         * a sequence past 2^56 - 1 throws std::overflow_error before
-         * queue_work runs.
+         * Reserves this queue's next submission sequence before invoking
+         * queue_work, then returns the waitable token
+         * (queue_id << 56) | sequence. Allocating a sequence past 2^56 - 1
+         * throws std::overflow_error before queue_work runs. If queue_work
+         * throws synchronously, submit reclaims the reservation only when no
+         * later submission has reserved a sequence and the failing sequence
+         * has not already completed, so the single-threaded backend call
+         * shape can reuse the sequence. Under concurrent submit calls, a
+         * later reservation leaves a monotonic gap. An inline-completing
+         * backend may call complete(sequence) from queue_work; if it then
+         * throws, the completed sequence is never rolled back.
          */
         template <typename QueueWork>
         oid submit(QueueWork queue_work) {
@@ -89,28 +93,25 @@ namespace iom {
                     throw std::overflow_error(
                         "DeviceOps 56-bit submission sequence is exhausted");
                 }
-                sequence = next_sequence_;
+                sequence = next_sequence_++;
             }
-            queue_work(sequence);
-            {
+            try {
+                queue_work(sequence);
+            } catch (...) {
                 std::lock_guard<std::mutex> lock(completion_mutex_);
-                ++next_sequence_;
+                if (next_sequence_ == sequence + 1 && completed_ < sequence) {
+                    next_sequence_ = sequence;
+                }
+                throw;
             }
             return encode_token(sequence);
         }
-
         /**
-         * Records the in-order completion of sequence, and therefore of
-         * every earlier submitted sequence. failure, when set, is retained
-         * for exactly this sequence and rethrown by every later wait for
-         * it. Wakes every waiter.
-         */
-        void complete(std::uint64_t sequence, std::exception_ptr failure = {});
-        /**
-         * Retains a failure for the sequence currently being submitted.
-         * Unlike complete(), this does not mark the sequence complete: the
-         * backend worker must still call complete() after its event fence
-         * drains so callers cannot release operands early.
+         * Retains a failure for any reserved-but-not-completed sequence
+         * (sequence < next_sequence_ && sequence > completed_). A
+         * never-submitted sequence and an already-completed sequence are
+         * rejected with std::invalid_argument; the backend worker must still
+         * call complete() after its event fence drains.
          */
         void commit_failure(
                 std::uint64_t sequence, std::exception_ptr failure);
@@ -130,6 +131,8 @@ namespace iom {
         static constexpr std::uint64_t kSequenceBits = 56;
         static constexpr std::uint64_t kSequenceMask = (std::uint64_t{1} << kSequenceBits) - 1;
         static constexpr std::uint64_t kMaxSequence = kSequenceMask;
+        // Sequence ranges skipped by seek_next_sequence are never submitted.
+        std::map<std::uint64_t, std::uint64_t> skipped_sequences_;
 
         std::uint8_t queue_id_;
         std::uint64_t next_sequence_ = 1;

@@ -534,6 +534,102 @@ public:
     }
 };
 
+class InlineQueue final : public iom::DeviceOps {
+public:
+    enum class Mode {
+        complete,
+        complete_with_failure,
+        throw_before_complete,
+        complete_then_throw,
+        commit_failure_then_complete,
+    };
+
+    explicit InlineQueue(Mode mode = Mode::complete)
+            : mode(mode) {}
+
+    using iom::DeviceOps::commit_failure;
+    using iom::DeviceOps::complete;
+    using iom::DeviceOps::seek_next_sequence;
+    using iom::DeviceOps::submit;
+
+    iom::oid copy(
+            const iom::TensorView& source,
+            iom::TensorView& destination) override {
+        if (source.spec() != destination.spec()) {
+            throw std::invalid_argument("inline copy requires identical specs");
+        }
+        return submit([this](std::uint64_t sequence) {
+            ++inline_calls;
+            switch (mode) {
+            case Mode::complete:
+                complete(sequence);
+                break;
+            case Mode::complete_with_failure:
+                complete(
+                        sequence,
+                        std::make_exception_ptr(
+                                std::runtime_error("inline boom")));
+                break;
+            case Mode::throw_before_complete:
+                throw std::runtime_error("event_create boom");
+            case Mode::complete_then_throw:
+                complete(sequence);
+                throw std::runtime_error("post-complete boom");
+            case Mode::commit_failure_then_complete:
+                commit_failure(
+                        sequence,
+                        std::make_exception_ptr(
+                                std::runtime_error("post-link boom")));
+                complete(sequence);
+                break;
+            }
+        });
+    }
+
+    iom::oid add(
+            const iom::TensorView&, const iom::TensorView&, iom::TensorView&)
+            override {
+        throw unsupported("add");
+    }
+
+    iom::oid mul(
+            const iom::TensorView&, const iom::TensorView&, iom::TensorView&)
+            override {
+        throw unsupported("mul");
+    }
+
+    iom::oid silu(const iom::TensorView&, iom::TensorView&) override {
+        throw unsupported("silu");
+    }
+
+    iom::oid linear(
+            const iom::TensorView&, const iom::TensorView&, iom::TensorView&)
+            override {
+        throw unsupported("linear");
+    }
+
+    iom::oid rmsnorm(
+            const iom::TensorView&, iom::TensorView&, const iom::TensorView&,
+            float, size_t) override {
+        throw unsupported("rmsnorm");
+    }
+
+    iom::oid sdpa(
+            const iom::TensorView&, const iom::TensorView&, const iom::TensorView&,
+            size_t, size_t, size_t, iom::TensorView&) override {
+        throw unsupported("sdpa");
+    }
+
+    Mode mode;
+    std::size_t inline_calls = 0;
+
+private:
+    static std::runtime_error unsupported(const char* operation) {
+        return std::runtime_error(
+                std::string("inline queue does not implement ") + operation);
+    }
+};
+
 constexpr std::uint64_t kTokenSequenceBits = 56;
 constexpr std::uint64_t kTokenSequenceMask = (std::uint64_t{1} << kTokenSequenceBits) - 1;
 constexpr std::uint64_t kMaxSequence = kTokenSequenceMask;
@@ -1420,6 +1516,180 @@ TEST_CASE("DeviceOps queue sequences exhaust at the 56-bit boundary") {
     // The boundary submission is still waitable.
     queue.complete(kMaxSequence);
     CHECK_NOTHROW(queue.wait(last));
+}
+
+TEST_CASE("DeviceOps submit commits the sequence before queue_work runs and survives inline complete") {
+    FakeDevice device;
+    InlineQueue queue;
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    const iom::oid first = queue.copy(a.view(), b.view());
+    CHECK_EQ(queue.inline_calls, 1);
+    for (int i = 0; i < 3; ++i) {
+        CHECK_NOTHROW(queue.wait(first));
+    }
+
+    const iom::oid second = queue.copy(a.view(), b.view());
+    CHECK_EQ(token_sequence(second), token_sequence(first) + 1);
+    CHECK_NOTHROW(queue.wait(second));
+
+    queue.mode = InlineQueue::Mode::complete_with_failure;
+    const iom::oid failed = queue.copy(a.view(), b.view());
+    for (int i = 0; i < 3; ++i) {
+        bool matched = false;
+        try {
+            queue.wait(failed);
+        } catch (const std::runtime_error& error) {
+            matched = std::string_view(error.what()) == "inline boom";
+        }
+        CHECK(matched);
+    }
+
+    InlineQueue exhausted;
+    FakeTensor exhausted_a = make_tensor(device, {4, 8});
+    FakeTensor exhausted_b = make_tensor(device, {4, 8});
+    exhausted.seek_next_sequence(kMaxSequence + 1);
+    const std::size_t calls_before = exhausted.inline_calls;
+    CHECK_THROWS_AS(
+            exhausted.copy(exhausted_a.view(), exhausted_b.view()),
+            std::overflow_error);
+    CHECK_EQ(exhausted.inline_calls, calls_before);
+}
+
+TEST_CASE("DeviceOps submit rolls back a synchronous queue_work failure") {
+    FakeDevice device;
+    InlineQueue queue(InlineQueue::Mode::throw_before_complete);
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    bool matched = false;
+    try {
+        queue.copy(a.view(), b.view());
+    } catch (const std::runtime_error& error) {
+        matched = std::string_view(error.what()) == "event_create boom";
+    }
+    CHECK(matched);
+
+    queue.mode = InlineQueue::Mode::complete;
+    const iom::oid next = queue.copy(a.view(), b.view());
+    CHECK_EQ(token_sequence(next), 1);
+    CHECK_NOTHROW(queue.wait(next));
+}
+
+TEST_CASE("submit suppresses rollback when queue_work completes inline and then throws") {
+    FakeDevice device;
+    InlineQueue queue;
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+    const iom::oid seed = queue.copy(a.view(), b.view());
+    CHECK_NOTHROW(queue.wait(seed));
+    queue.mode = InlineQueue::Mode::complete_then_throw;
+
+    bool matched = false;
+    try {
+        queue.copy(a.view(), b.view());
+    } catch (const std::runtime_error& error) {
+        matched = std::string_view(error.what()) == "post-complete boom";
+    }
+    CHECK(matched);
+
+    queue.mode = InlineQueue::Mode::complete;
+    const iom::oid next = queue.copy(a.view(), b.view());
+    CHECK_EQ(token_sequence(next), 3);
+    CHECK_NOTHROW(queue.wait(next));
+}
+
+TEST_CASE("commit_failure accepts a reserved-but-not-completed sequence after submit reservation") {
+    FakeDevice device;
+    InlineQueue queue(InlineQueue::Mode::commit_failure_then_complete);
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    const iom::oid token = queue.copy(a.view(), b.view());
+    for (int i = 0; i < 3; ++i) {
+        bool matched = false;
+        try {
+            queue.wait(token);
+        } catch (const std::runtime_error& error) {
+            matched = std::string_view(error.what()) == "post-link boom";
+        }
+        CHECK(matched);
+    }
+}
+
+TEST_CASE("commit_failure accepts a reserved sequence under concurrent submit") {
+    InlineQueue queue;
+    std::promise<iom::oid> second_token_promise;
+    std::future<iom::oid> second_token_future = second_token_promise.get_future();
+
+    const iom::oid first = queue.submit([&](std::uint64_t sequence) {
+        std::thread second([&] {
+            try {
+                second_token_promise.set_value(queue.submit(
+                        [](std::uint64_t) {}));
+            } catch (...) {
+                second_token_promise.set_exception(std::current_exception());
+            }
+        });
+
+        const iom::oid second_token = second_token_future.get();
+        queue.commit_failure(
+                sequence,
+                std::make_exception_ptr(
+                        std::runtime_error("concurrent boom")));
+        queue.complete(sequence);
+        queue.complete(token_sequence(second_token));
+        second.join();
+    });
+
+    for (int i = 0; i < 3; ++i) {
+        bool matched = false;
+        try {
+            queue.wait(first);
+        } catch (const std::runtime_error& error) {
+            matched = std::string_view(error.what()) == "concurrent boom";
+        }
+        CHECK(matched);
+    }
+}
+
+TEST_CASE("commit_failure rejects a never-submitted sequence") {
+    InlineQueue queue;
+    const auto failure = std::make_exception_ptr(std::runtime_error("x"));
+    queue.seek_next_sequence(3);
+
+    for (const std::uint64_t sequence : {std::uint64_t{1}, std::uint64_t{2}}) {
+        bool matched = false;
+        try {
+            queue.commit_failure(sequence, failure);
+        } catch (const std::invalid_argument& error) {
+            matched = std::string_view(error.what())
+                    == "retained failure is not for a reserved submission";
+        }
+        CHECK(matched);
+    }
+}
+
+TEST_CASE("commit_failure rejects an already-completed sequence") {
+    FakeDevice device;
+    InlineQueue queue;
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    const iom::oid token = queue.copy(a.view(), b.view());
+    CHECK_NOTHROW(queue.wait(token));
+
+    bool matched = false;
+    try {
+        queue.commit_failure(
+                token_sequence(token),
+                std::make_exception_ptr(std::runtime_error("late failure")));
+    } catch (const std::invalid_argument& error) {
+        matched = std::string_view(error.what())
+                == "retained failure is for a sequence that has already been completed";
+    }
+    CHECK(matched);
 }
 
 TEST_CASE("DeviceOps queue waits reject invalid live tokens") {

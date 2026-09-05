@@ -60,7 +60,7 @@ if(ROCM_ENABLED)
     )
 
     set_source_files_properties(rocm/test_rocm_conformance.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT
     )
 
     target_compile_definitions(iom_rocm_conformance_tests
