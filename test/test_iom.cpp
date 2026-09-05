@@ -9,6 +9,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <new>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -2091,4 +2092,71 @@ TEST_CASE("StagedWorker drains tasks without fence completion") {
     CHECK_EQ(fence_completions, 0);
     CHECK_EQ(fence_destroys, 2);
     CHECK_EQ(completions, 3);
+}
+
+TEST_CASE("OutstandingWorkRegistry releases exact same-address entries") {
+    iom::detail::OutstandingWorkRegistry registry;
+    void* address = reinterpret_cast<void*>(0x1000);
+    int fence_calls = 0;
+    const iom::detail::Fence fence = [&] {
+        ++fence_calls;
+        return iom::detail::FenceResult::success();
+    };
+
+    registry.register_entry(1, address, 1, 1, fence);
+    registry.register_entry(2, address, 1, 1, fence);
+    registry.register_entry(3, address, 2, 1, fence);
+    registry.register_entry(4, address, 2, 1, fence);
+
+    const auto initial = registry.snapshot_for(address);
+    REQUIRE_EQ(initial.size(), 4);
+    CHECK(registry.try_release_entry(1));
+    CHECK(registry.try_release_entry(2));
+    CHECK_FALSE(registry.try_release_entry(1));
+
+    const auto concurrent = registry.snapshot_for(address);
+    REQUIRE_EQ(concurrent.size(), 2);
+    CHECK_EQ(concurrent[0].id, 3);
+    CHECK_EQ(concurrent[1].id, 4);
+    CHECK_EQ(fence_calls, 0);
+
+    registry.invalidate_entries_for_sequence(2, 1);
+    const auto invalidated = registry.snapshot_for(address);
+    REQUIRE_EQ(invalidated.size(), 2);
+    CHECK(invalidated[0].state == iom::detail::EntryState::Invalidated);
+    CHECK(invalidated[1].state == iom::detail::EntryState::Invalidated);
+    const iom::detail::FenceResult result = invalidated[0].fence();
+    CHECK_FALSE(result.succeeded);
+    CHECK(result.failure != nullptr);
+
+    const std::array<iom::detail::EntryId, 2> remaining{3, 4};
+    registry.remove_entries(remaining, address);
+    CHECK(registry.snapshot_for(address).empty());
+}
+
+TEST_CASE("Quarantine runs allocator cleanup at most once") {
+    class CountingAllocator final : public iom::Allocator {
+    public:
+        void* alloc(std::size_t size) override {
+            return ::operator new(size, std::align_val_t(32));
+        }
+
+        void free(void* buffer) override {
+            ++free_calls;
+            ::operator delete(buffer, std::align_val_t(32));
+        }
+
+        void reset() override {}
+
+        int free_calls = 0;
+    };
+
+    CountingAllocator allocator;
+    void* address = allocator.alloc(64);
+    iom::detail::Quarantine quarantine;
+    quarantine.emplace<iom::detail::AllocatorCleanupAction>(
+            allocator, address, 64);
+    quarantine.drain();
+    quarantine.drain();
+    CHECK_EQ(allocator.free_calls, 1);
 }

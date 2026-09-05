@@ -16,6 +16,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -239,12 +240,45 @@ namespace iom {
             }
 
             ~TtnnTensor() noexcept override {
+                const void* original_address = planes_.data();
+                const auto quarantine_native = [this]() noexcept {
+                    auto retained = std::unique_ptr<
+                            std::vector<ttnn::Tensor>>(
+                            new (std::nothrow) std::vector<ttnn::Tensor>);
+                    if (!retained) {
+                        std::terminate();
+                    }
+                    retained->swap(planes_);
+                    try {
+                        auto action = std::unique_ptr<
+                                ttnn_detail::TtnnNativeCleanupAction>(
+                                new ttnn_detail::TtnnNativeCleanupAction(
+                                        std::move(*retained),
+                                        [device = &device_] {
+                                            std::lock_guard<std::mutex> lock(
+                                                    device->api_mutex());
+                                            device->mesh()
+                                                    .mesh_command_queue(0)
+                                                    .finish();
+                                        }));
+                        state_->quarantine.add(std::move(action));
+                        (void)retained.release();
+                    } catch (...) {
+                        // Preserve native ownership if action allocation
+                        // fails; the intentionally leaked vector cannot be
+                        // returned to the runtime before device teardown.
+                        (void)retained.release();
+                    }
+                };
+
                 std::vector<
                         detail::OutstandingWorkRegistry::EntrySnapshot>
                         snapshots;
                 try {
-                    snapshots = state_->registry.snapshot_for(planes_.data());
+                    snapshots = state_->registry.snapshot_for(
+                            const_cast<void*>(original_address));
                 } catch (...) {
+                    quarantine_native();
                     return;
                 }
 
@@ -264,7 +298,6 @@ namespace iom {
                     }
                 }
 
-                const void* original_address = planes_.data();
                 if (safe_to_release) {
                     for (const auto& snapshot : snapshots) {
                         state_->registry.remove_entry_if_present(
@@ -276,22 +309,11 @@ namespace iom {
                     return;
                 }
 
-                std::vector<ttnn::Tensor> retained_planes =
-                        std::move(planes_);
-                try {
-                    state_->quarantine.emplace<
-                            ttnn_detail::TtnnNativeCleanupAction>(
-                            std::move(retained_planes),
-                            [device = &device_] {
-                                std::lock_guard<std::mutex> lock(
-                                        device->api_mutex());
-                                device->mesh().mesh_command_queue(0).finish();
-                            });
-                } catch (...) {
-                }
+                quarantine_native();
                 for (const auto& snapshot : snapshots) {
                     state_->registry.remove_entry_if_present(
-                            snapshot.id, snapshot.address);
+                            snapshot.id,
+                            const_cast<void*>(original_address));
                 }
             }
 

@@ -781,7 +781,7 @@ private:
         try {
             entries = register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
-                    task.source->native_handle(),
+                    const_cast<void*>(task.source->native_handle()),
                     task.destination->native_handle(), fence);
             task.source_entry_id = entries.source;
             task.destination_entry_id = entries.destination;
@@ -798,7 +798,8 @@ private:
         } catch (...) {
             if (entries.source != 0) {
                 state_->registry.remove_entry_if_present(
-                        entries.source, task.source->native_handle());
+                        entries.source,
+                        const_cast<void*>(task.source->native_handle()));
             }
             if (entries.destination != 0) {
                 state_->registry.remove_entry_if_present(
@@ -818,6 +819,35 @@ private:
         if (retained_failure) {
             commit_failure(task.sequence, retained_failure);
         }
+    }
+    void complete_task(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        SequenceOutcome outcome;
+        bool has_outcome = false;
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(sequence);
+            if (it != outcomes_.end()) {
+                outcome = std::move(it->second);
+                outcomes_.erase(it);
+                has_outcome = true;
+            }
+        }
+        if (has_outcome) {
+            outcome.fence_succeeded = !failure && !outcome.retained_failure;
+            const std::array<detail::EntryId, 2> entries{
+                    outcome.source_entry_id,
+                    outcome.destination_entry_id};
+            if (failure || outcome.retained_failure) {
+                state_->registry.invalidate_entries(entries);
+            } else {
+                (void)state_->registry.try_release_entry(entries[0]);
+                (void)state_->registry.try_release_entry(entries[1]);
+            }
+        }
+        complete(sequence, std::move(failure));
+    }
+
     const Device* device_;
     RocmRegistryState* state_;
     detail::QueueId registry_queue_id_;

@@ -892,7 +892,7 @@ private:
         try {
             entries = register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
-                    task.source->native_handle(),
+                    const_cast<void*>(task.source->native_handle()),
                     task.destination->native_handle(), fence);
             task.source_entry_id = entries.source;
             task.destination_entry_id = entries.destination;
@@ -909,7 +909,8 @@ private:
         } catch (...) {
             if (entries.source != 0) {
                 state_->registry.remove_entry_if_present(
-                        entries.source, task.source->native_handle());
+                        entries.source,
+                        const_cast<void*>(task.source->native_handle()));
             }
             if (entries.destination != 0) {
                 state_->registry.remove_entry_if_present(

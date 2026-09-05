@@ -143,6 +143,10 @@ public:
         free_.clear();
     }
 
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return free_.size();
+    }
+
 private:
     struct Slot {
         void* pointer;
@@ -577,6 +581,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::none);
 
+    // Failed work remains quarantined until device teardown; the allocator
+    // must not recycle either operand while its failed entries are retained.
     {
         ReusingHipAllocator allocator;
         auto device = iom::make_rocm_device(0, allocator);
@@ -612,37 +618,21 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
 
         auto fresh_source = device->create_tensor(spec);
         auto fresh_destination = device->create_tensor(spec);
-        CHECK(
-                (fresh_source->view().native_handle() == source_address
-                 || fresh_source->view().native_handle()
-                         == destination_address));
-        CHECK(
-                (fresh_destination->view().native_handle() == source_address
-                 || fresh_destination->view().native_handle()
-                         == destination_address));
+        CHECK_NE(fresh_source->view().native_handle(), source_address);
+        CHECK_NE(fresh_source->view().native_handle(), destination_address);
+        CHECK_NE(fresh_destination->view().native_handle(), source_address);
+        CHECK_NE(fresh_destination->view().native_handle(), destination_address);
         CHECK_NE(
                 fresh_source->view().native_handle(),
                 fresh_destination->view().native_handle());
-        std::vector<std::byte> fresh_source_bytes(spec.logical_nbytes());
-        std::vector<std::byte> fresh_destination_bytes(spec.logical_nbytes());
-        fresh_source->view().copy_to_host(fresh_source_bytes);
-        fresh_destination->view().copy_to_host(fresh_destination_bytes);
-        CHECK(std::all_of(
-                fresh_source_bytes.begin(), fresh_source_bytes.end(),
-                [](std::byte value) {
-                    return value == static_cast<std::byte>(0xa5);
-                }));
-        CHECK(std::all_of(
-                fresh_destination_bytes.begin(), fresh_destination_bytes.end(),
-                [](std::byte value) {
-                    return value == static_cast<std::byte>(0xa5);
-                }));
 
         fresh_source.reset();
         fresh_destination.reset();
         canary_queue.reset();
         allocator.release_free();
+        CHECK_EQ(allocator.free_count(), 0);
         device.reset();
+        CHECK_EQ(allocator.free_count(), 2);
     }
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::none);

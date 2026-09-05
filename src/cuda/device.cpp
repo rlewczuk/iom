@@ -151,12 +151,32 @@ namespace iom {
                 if (address_ == nullptr) {
                     return;
                 }
+
+                const void* original_address = address_;
+                const std::size_t bytes =
+                        view().spec().tiled_storage_nbytes();
+                const auto quarantine_storage = [this, bytes]() noexcept {
+                    try {
+                        state_->quarantine
+                                .emplace<detail::AllocatorCleanupAction>(
+                                        allocator_, address_, bytes,
+                                        [device = &device_] {
+                                            device->activate();
+                                        });
+                    } catch (...) {
+                        // Keep failed storage unavailable if quarantine
+                        // allocation itself fails.
+                    }
+                    address_ = nullptr;
+                };
+
                 std::vector<
                         detail::OutstandingWorkRegistry::EntrySnapshot>
                         snapshots;
                 try {
                     snapshots = state_->registry.snapshot_for(address_);
                 } catch (...) {
+                    quarantine_storage();
                     return;
                 }
 
@@ -179,7 +199,8 @@ namespace iom {
                 if (safe_to_release) {
                     for (const auto& snapshot : snapshots) {
                         state_->registry.remove_entry_if_present(
-                                snapshot.id, address_);
+                                snapshot.id,
+                                const_cast<void*>(original_address));
                     }
                     iom::detail::release_aligned_storage(
                             allocator_, address_,
@@ -187,18 +208,11 @@ namespace iom {
                     return;
                 }
 
-                try {
-                    state_->quarantine.emplace<detail::AllocatorCleanupAction>(
-                            allocator_, address_,
-                            view().spec().tiled_storage_nbytes(),
-                            [device = &device_] { device->activate(); });
-                    address_ = nullptr;
-                } catch (...) {
-                }
+                quarantine_storage();
                 for (const auto& snapshot : snapshots) {
                     state_->registry.remove_entry_if_present(
                             snapshot.id,
-                            address_ != nullptr ? address_ : snapshot.address);
+                            const_cast<void*>(original_address));
                 }
             }
 

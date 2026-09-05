@@ -495,14 +495,27 @@ namespace iom {
                 return;
             }
 
+            const void* original_address = address_;
+            const std::size_t bytes = view().spec().tiled_storage_nbytes();
+            const auto quarantine_storage = [this, bytes]() noexcept {
+                try {
+                    device_.registry_state().quarantine
+                            .emplace<detail::AllocatorCleanupAction>(
+                                    allocator_, address_, bytes);
+                } catch (...) {
+                    // Leaking is safer than returning failed storage to the
+                    // allocator when quarantine allocation itself fails.
+                }
+                address_ = nullptr;
+            };
+
             std::vector<detail::OutstandingWorkRegistry::EntrySnapshot>
                     snapshots;
             try {
                 snapshots = device_.registry_state().registry.snapshot_for(
                         address_);
             } catch (...) {
-                // Losing the snapshot is safer than freeing storage whose
-                // queued users could not be classified.
+                quarantine_storage();
                 return;
             }
 
@@ -525,26 +538,17 @@ namespace iom {
             if (safe_to_release) {
                 for (const auto& snapshot : snapshots) {
                     device_.registry_state().registry.remove_entry_if_present(
-                            snapshot.id, address_);
+                            snapshot.id,
+                            const_cast<void*>(original_address));
                 }
                 iom::detail::release_aligned_storage(allocator_, address_);
                 return;
             }
 
-            try {
-                device_.registry_state().quarantine
-                        .emplace<detail::AllocatorCleanupAction>(
-                                allocator_, address_,
-                                view().spec().tiled_storage_nbytes());
-                address_ = nullptr;
-            } catch (...) {
-                // Do not free failed storage directly. It remains leaked
-                // rather than becoming available for unsafe reuse.
-            }
+            quarantine_storage();
             for (const auto& snapshot : snapshots) {
                 device_.registry_state().registry.remove_entry_if_present(
-                        snapshot.id, address_ != nullptr
-                                ? address_ : snapshot.address);
+                        snapshot.id, const_cast<void*>(original_address));
             }
         }
 
@@ -878,8 +882,8 @@ namespace iom {
                 if (failure) {
                     state_->registry.invalidate_entries(entries);
                 } else {
-                    state_->registry.try_release_entry(entries[0]);
-                    state_->registry.try_release_entry(entries[1]);
+                    (void)state_->registry.try_release_entry(entries[0]);
+                    (void)state_->registry.try_release_entry(entries[1]);
                 }
             }
             complete(sequence, std::move(failure));
