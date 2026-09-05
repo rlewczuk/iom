@@ -139,10 +139,6 @@ if(TTNN_ENABLED)
             TTNN::TTNN
     )
 
-    target_compile_definitions(iom_ttnn
-        PRIVATE
-            IOM_TTNN_ENABLED=1
-    )
 endif()
 if(CUDA_ENABLED)
     set(CUDAToolkit_ROOT "${CUDA_PATH}")
@@ -176,10 +172,6 @@ if(CUDA_ENABLED)
             CUDA::cudart
     )
 
-    target_compile_definitions(iom_cuda
-        PRIVATE
-            IOM_CUDA_ENABLED=1
-    )
 endif()
 if(ROCM_ENABLED)
     # Config mode discovers the configured SDK and exposes hip::host for the
@@ -217,7 +209,6 @@ if(ROCM_ENABLED)
 
     target_compile_definitions(iom_rocm
         PRIVATE
-            IOM_ROCM_ENABLED=1
             __HIP_PLATFORM_AMD__
     )
 
@@ -263,20 +254,8 @@ if(SYCL_ENABLED)
             -fsycl
     )
 
-    target_compile_definitions(iom_sycl
-        PRIVATE
-            IOM_SYCL_ENABLED=1
-    )
 endif()
 
-add_executable(iom
-        src/main.cpp
-)
-
-target_link_libraries(iom
-    PRIVATE
-        libiom
-)
 
 include(CTest)
 

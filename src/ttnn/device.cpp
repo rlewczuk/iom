@@ -34,41 +34,63 @@ namespace iom {
         // 8/16-bit integers ride the unsigned tiles of the same width
         // (two's-complement fields are bit-identical); BOOL rides UINT8 with
         // canonical zero/one bytes validated by the common TensorView base.
-        constexpr std::array kSupportedDataTypes = {
-                DataType::BOOL,
-                DataType::U8,
-                DataType::I8,
-                DataType::U16,
-                DataType::I16,
-                DataType::U32,
-                DataType::I32,
-                DataType::BF16,
-                DataType::F32,
+        constexpr auto kSupportedToNative = std::array{
+                std::pair{
+                        DataType::BOOL, tt::tt_metal::DataType::UINT8},
+                std::pair{DataType::U8, tt::tt_metal::DataType::UINT8},
+                std::pair{DataType::I8, tt::tt_metal::DataType::UINT8},
+                std::pair{
+                        DataType::U16, tt::tt_metal::DataType::UINT16},
+                std::pair{
+                        DataType::I16, tt::tt_metal::DataType::UINT16},
+                std::pair{DataType::U32, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::I32, tt::tt_metal::DataType::INT32},
+                std::pair{
+                        DataType::BF16,
+                        tt::tt_metal::DataType::BFLOAT16},
+                std::pair{DataType::F32, tt::tt_metal::DataType::FLOAT32},
         };
 
+        constexpr auto kSupportedKeys = [] {
+            std::array<DataType, kSupportedToNative.size()> keys{};
+            for (std::size_t i = 0; i < kSupportedToNative.size(); ++i) {
+                keys[i] = kSupportedToNative[i].first;
+            }
+            return keys;
+        }();
+
+        static_assert(kSupportedKeys.size() == kSupportedToNative.size());
+
+        constexpr bool kSupportedKeysUnique = [] {
+            for (std::size_t i = 0; i < kSupportedToNative.size(); ++i) {
+                for (std::size_t j = i + 1; j < kSupportedToNative.size();
+                     ++j) {
+                    if (kSupportedToNative[i].first
+                            == kSupportedToNative[j].first) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }();
+        static_assert(kSupportedKeysUnique);
+
         [[nodiscard]] bool is_supported(DataType type) {
-            return std::find(
-                           kSupportedDataTypes.begin(),
-                           kSupportedDataTypes.end(), type)
-                   != kSupportedDataTypes.end();
+            const std::span<const DataType> supported = kSupportedKeys;
+            return std::find(supported.begin(), supported.end(), type)
+                   != supported.end();
         }
 
         // Native tile dtype carrying the leaf encoding bit-for-bit.
         [[nodiscard]] tt::tt_metal::DataType native_dtype(DataType type) {
-            switch (type) {
-                case DataType::BOOL:
-                case DataType::U8:
-                case DataType::I8: return tt::tt_metal::DataType::UINT8;
-                case DataType::U16:
-                case DataType::I16: return tt::tt_metal::DataType::UINT16;
-                case DataType::U32: return tt::tt_metal::DataType::UINT32;
-                case DataType::I32: return tt::tt_metal::DataType::INT32;
-                case DataType::BF16: return tt::tt_metal::DataType::BFLOAT16;
-                case DataType::F32: return tt::tt_metal::DataType::FLOAT32;
-                default:
-                    throw std::invalid_argument(
-                            "DataType has no TTNN native tile dtype");
+            for (const auto& [supported_type, native_type] :
+                 kSupportedToNative) {
+                if (supported_type == type) {
+                    return native_type;
+                }
             }
+            throw std::invalid_argument(
+                    "DataType has no TTNN native tile dtype");
         }
 
         [[nodiscard]] std::invalid_argument invalid_ordinal(
@@ -181,10 +203,9 @@ namespace iom {
         class TtnnTensor final : public Tensor {
         public:
             // The caller holds the device's API mutex and has already
-            // validated the specification against the supported-type table
-            // and the representable native extents; the checks are repeated
-            // here so the native constructor can never be reached with a
-            // non-representable extent from any entry path.
+            // validated the specification against the supported-type table.
+            // The constructor performs native extent checks immediately
+            // before native construction, so no entry path can bypass them.
             TtnnTensor(const TensorSpec& spec, TtnnDevice& device)
                     : Tensor(spec, device), device_(device) {
                 const std::span<const std::size_t> dimensions =
@@ -353,7 +374,7 @@ namespace iom {
     }  // namespace
 
     std::span<const DataType> ttnn_supported_data_types() noexcept {
-        return kSupportedDataTypes;
+        return {kSupportedKeys.data(), kSupportedKeys.size()};
     }
 
     std::unique_ptr<Tensor> TtnnDevice::create_tensor(const TensorSpec& spec) {
@@ -362,13 +383,6 @@ namespace iom {
             throw std::runtime_error(
                     "TTNN backend does not support the requested DataType");
         }
-        // Reject every extent the TTNN native constructor cannot represent
-        // before any native object or allocation exists: the final two
-        // dimensions must fit the uint32_t native extent ceiling and the
-        // leading-plane product must fit std::size_t. These are pure size
-        // checks, so they run before the API lock and before the
-        // supported-type table membership decides on native access.
-        static_cast<void>(checked_plane_count(spec));
         std::lock_guard<std::mutex> lock(api_mutex_);
         return std::make_unique<TtnnTensor>(spec, *this);
     }

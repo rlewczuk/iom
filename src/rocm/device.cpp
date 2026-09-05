@@ -10,12 +10,12 @@
 #include <string>
 
 #include "copy.hpp"
+#include "iom/detail/aligned_storage.hpp"
 
 namespace iom {
 
     namespace {
 
-        constexpr std::size_t kStorageAlignment = 32;
         constexpr std::array kRocmSupportedDataTypes = {
                 iom::DataType::BOOL,
                 iom::DataType::I2, iom::DataType::U2,
@@ -103,34 +103,17 @@ namespace iom {
                        Allocator& allocator)
                     : Tensor(spec, device), device_(device),
                       allocator_(allocator) {
-                device_.activate();
-                address_ = allocator_.alloc(view().spec().tiled_storage_nbytes());
-                if (address_ == nullptr) {
-                    throw std::bad_alloc();
-                }
-                if (reinterpret_cast<std::uintptr_t>(address_)
-                                % kStorageAlignment
-                        != 0) {
-                    allocator_.free(address_);
-                    address_ = nullptr;
-                    throw std::runtime_error(
-                            "ROCm tensor storage is not 32-byte aligned");
-                }
+                address_ = iom::detail::allocate_aligned_storage(
+                        allocator_,
+                        view().spec().tiled_storage_nbytes(),
+                        [this] { device_.activate(); },
+                        "ROCm tensor storage is not 32-byte aligned");
             }
 
             ~RocmTensor() override {
-                if (address_ == nullptr) {
-                    return;
-                }
-                try {
-                    device_.activate();
-                } catch (...) {
-                }
-                try {
-                    allocator_.free(address_);
-                } catch (...) {
-                }
-                address_ = nullptr;
+                iom::detail::release_aligned_storage(
+                        allocator_, address_,
+                        [this] { device_.activate(); });
             }
 
         private:

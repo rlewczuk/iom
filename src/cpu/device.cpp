@@ -15,12 +15,12 @@
 #include <vector>
 
 #include "iom/iom.hpp"
+#include "iom/detail/aligned_storage.hpp"
 
 namespace iom {
 
     namespace {
 
-        constexpr std::size_t kStorageAlignment = 32;
         constexpr std::array kCpuSupportedDataTypes = {
                 iom::DataType::BOOL,
                 iom::DataType::I2, iom::DataType::U2,
@@ -185,23 +185,15 @@ namespace iom {
                   Allocator& allocator)
                 : Tensor(spec, device),
                   allocator_(allocator) {
-            void* address =
-                    allocator_.alloc(view().spec().tiled_storage_nbytes());
-            if (address == nullptr) {
-                throw std::bad_alloc();
-            }
-            if (reinterpret_cast<std::uintptr_t>(address)
-                            % kStorageAlignment
-                    != 0) {
-                allocator_.free(address);
-                throw std::runtime_error(
+            address_ = iom::detail::allocate_aligned_storage(
+                    allocator_,
+                    view().spec().tiled_storage_nbytes(),
+                    [] {},
                     "CPU tensor storage is not 32-byte aligned");
-            }
-            address_ = address;
         }
 
         ~CpuTensor() override {
-            allocator_.free(address_);
+            iom::detail::release_aligned_storage(allocator_, address_);
         }
 
     private:
