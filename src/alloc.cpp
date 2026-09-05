@@ -50,10 +50,6 @@ namespace iom {
         return reinterpret_cast<std::uintptr_t>(ptr);
     }
 
-    bool SingleBufferAllocatorBase::owns(void* ptr) const {
-        const auto address = addr_from_ptr(ptr);
-        return address >= begin_ && address < raw_end_;
-    }
 
     std::size_t SingleBufferAllocatorBase::offset_of(void* ptr) const {
         const auto address = addr_from_ptr(ptr);
