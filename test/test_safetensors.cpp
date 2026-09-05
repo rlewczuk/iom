@@ -396,6 +396,26 @@ TEST_CASE("SafeTensorsFile satisfies SafeTensorsStore interface") {
     CHECK_THROWS_AS(store["missing"], std::out_of_range);
 }
 
+TEST_CASE("SafeTensorView is non-owning: copy bytes before store destruction") {
+    TempDir dir("view-lifetime");
+    const std::string payload = deterministic_payload(16, 7);
+    const auto path = write_safetensors_file(
+        dir.path(), "view-lifetime.safetensors",
+        {{"w", "F32", {4}, payload}});
+
+    std::vector<std::uint8_t> copied;
+    {
+        const iom::SafeTensorsFile file(path);
+        const iom::SafeTensorView view = file["w"];
+        REQUIRE(view.nbytes() == payload.size());
+        copied.resize(view.nbytes());
+        std::memcpy(copied.data(), view.raw<std::uint8_t>(), view.nbytes());
+    }
+
+    REQUIRE(copied.size() == payload.size());
+    CHECK(std::memcmp(copied.data(), payload.data(), payload.size()) == 0);
+}
+
 TEST_CASE("SafeTensorsDir rejects duplicate keys across shards") {
     {
         TempDir dir("duplicate-shards");
