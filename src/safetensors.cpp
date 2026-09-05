@@ -212,8 +212,16 @@ SafeTensorsDir::SafeTensorsDir(const std::string& dirname) {
 
     for (const auto& path : paths) {
         auto file = std::make_unique<SafeTensorsFile>(path.string());
+        const std::string path_str = path.string();
         for (const auto& key : file->keys()) {
-            tensors_.emplace(key, (*file)[key]);
+            const auto [it, inserted] = tensors_.emplace(key, (*file)[key]);
+            if (!inserted) {
+                throw std::runtime_error(
+                    "safetensors duplicate tensor key across shards: '" + key +
+                    "' in " + path_str +
+                    " (already loaded from " + existing_shard_paths_.at(key) + ")");
+            }
+            existing_shard_paths_.emplace(key, path_str);
             keys_.push_back(key);
         }
         files_.push_back(std::move(file));
