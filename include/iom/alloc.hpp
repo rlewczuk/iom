@@ -24,7 +24,6 @@ namespace iom {
     protected:
         [[nodiscard]] void* ptr_from_addr(std::uintptr_t address) const;
         [[nodiscard]] std::uintptr_t addr_from_ptr(void* ptr) const;
-        [[nodiscard]] bool owns(void* ptr) const;
         [[nodiscard]] std::size_t offset_of(void* ptr) const;
         [[nodiscard]] std::uintptr_t align_up_addr(std::uintptr_t address) const;
 
