@@ -8,7 +8,8 @@ Extracted the standard-tiled CUDA/ROCm kernels, view mapping, host-transfer disp
 
 - `cmake -S . -B build -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF -DTTNN_ENABLED=OFF -DSYCL_ENABLED=OFF -DBUILD_TESTING=ON && cmake --build build -j2` — passed.
 - `ctest --test-dir build --output-on-failure -R 'iom_(tests|cpu_tests|backend_conformance_cpu_tests)'` — 3/3 tests passed.
-- Remote ROCm configure/build — passed on `bv2`.
+- C++20 staging-helper smoke program — `compute_staging_size(0) == 0`, `(1) == 4`, `(4) == 4`, and `size_t` maximum throws `std::overflow_error`.
+- `REMOTE_DEV_WORKSPACE=. .agents/skills/remote-development/scripts/remote-exec rocm ar001 'cmake --build build -j2'` — passed on `bv2` after remote configuration.
 
 ## Errors
 
