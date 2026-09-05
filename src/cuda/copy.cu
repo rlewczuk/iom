@@ -7,6 +7,11 @@
 #include <cstdint>
 #include <exception>
 #include <mutex>
+#include <array>
+#include <condition_variable>
+#include <limits>
+#include <type_traits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -42,9 +47,6 @@ struct gpu_policy {
     [[nodiscard]] static constexpr stream_type null_stream() noexcept {
         return nullptr;
     }
-    [[nodiscard]] static constexpr event_type null_event() noexcept {
-        return nullptr;
-    }
 
     static void activate(context_type context) {
         check_cuda(
@@ -78,9 +80,6 @@ struct gpu_policy {
                 "cudaEventCreateWithFlags",
                 cudaEventCreateWithFlags(event, cudaEventDisableTiming));
     }
-    [[nodiscard]] static bool event_is_valid(event_type event) noexcept {
-        return event != nullptr;
-    }
     static void destroy_event_noexcept(event_type event) noexcept {
         if (event != nullptr) {
             (void)cudaEventDestroy(event);
@@ -89,7 +88,6 @@ struct gpu_policy {
     static void synchronize_event(event_type event) {
         check_cuda_kernel("cudaEventSynchronize", cudaEventSynchronize(event));
     }
-    static constexpr bool discard_failure_event_on_error = false;
     static void record_event(event_type event, stream_type stream) {
         cudaError_t status = cudaEventRecord(event, stream);
         if (consume_submission_fault(SubmissionFault::event_record)) {
@@ -150,6 +148,12 @@ struct gpu_policy {
                     copy_kernel_operation(), cudaErrorInvalidValue);
         }
     }
+    static void after_grid_stride_launch() {
+        if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
+            ::iom::cuda_detail::check_cuda_kernel(
+                    copy_kernel_operation(), cudaErrorInvalidValue);
+        }
+    }
     [[nodiscard]] static constexpr const char* scatter_kernel_operation() noexcept {
         return "CUDA scatter kernel launch";
     }
@@ -172,7 +176,97 @@ struct gpu_policy {
 #define IOM_GPU_ATOMIC_AND atomicAnd
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
+namespace iom::cuda_detail {
+
+struct CudaCopyMetadataHeader {
+    std::uint64_t source_plane_offset;
+    std::uint64_t destination_plane_offset;
+    std::uint64_t rows;
+    std::uint64_t columns;
+    std::uint64_t plane_count;
+    std::uint32_t bits;
+    std::uint32_t leading_rank;
+};
+static_assert(std::is_trivially_copyable_v<CudaCopyMetadataHeader>);
+
+}  // namespace iom::cuda_detail
 #include "../shared/standard_tiled_copy.inl"
+namespace iom::cuda_detail {
+namespace {
+
+IOM_GPU_GLOBAL void grid_stride_copy_kernel(
+        const unsigned char* source, unsigned char* destination,
+        const CudaCopyMetadataHeader* metadata) {
+    const std::uint64_t padded_rows =
+            (metadata->rows / TensorSpec::TILE
+             + (metadata->rows % TensorSpec::TILE != 0))
+            * TensorSpec::TILE;
+    const std::uint64_t padded_columns =
+            (metadata->columns / TensorSpec::TILE
+             + (metadata->columns % TensorSpec::TILE != 0))
+            * TensorSpec::TILE;
+    const std::uint64_t padded_elements = padded_rows * padded_columns;
+    const std::uint64_t plane_bits = padded_elements * metadata->bits;
+    const std::uint64_t words_per_plane = (plane_bits + 31) / 32;
+    const std::uint64_t total_words =
+            metadata->plane_count * words_per_plane;
+    const std::uint64_t* source_strides =
+            reinterpret_cast<const std::uint64_t*>(metadata + 1);
+    const std::uint64_t* destination_strides =
+            source_strides + metadata->leading_rank;
+    const std::uint64_t* leading_dimensions =
+            destination_strides + metadata->leading_rank;
+    const std::uint64_t stride =
+            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+
+    for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < total_words;
+         word += stride) {
+        const std::uint64_t logical_plane =
+                word / words_per_plane;
+        const std::uint64_t word_in_plane = word % words_per_plane;
+        const std::uint64_t first_bit = word_in_plane * 32;
+        const std::uint64_t end_bit =
+                first_bit + 32 < plane_bits ? first_bit + 32 : plane_bits;
+        const std::uint64_t first_element =
+                (first_bit + metadata->bits - 1) / metadata->bits;
+        std::uint64_t source_plane = metadata->source_plane_offset;
+        std::uint64_t destination_plane =
+                metadata->destination_plane_offset;
+        std::uint64_t rest = logical_plane;
+        for (std::uint32_t axis = metadata->leading_rank; axis-- > 0;) {
+            const std::uint64_t coordinate =
+                    rest % leading_dimensions[axis];
+            rest /= leading_dimensions[axis];
+            source_plane += coordinate * source_strides[axis];
+            destination_plane += coordinate * destination_strides[axis];
+        }
+        for (std::uint64_t element = first_element;
+             element < padded_elements
+             && element * metadata->bits < end_bit; ++element) {
+            const std::uint64_t row = element / padded_columns;
+            const std::uint64_t column = element % padded_columns;
+            if (row >= metadata->rows || column >= metadata->columns) {
+                continue;
+            }
+            const std::uint64_t source_bit =
+                    detail::plane_slot(
+                            source_plane, row, column, metadata->rows,
+                            metadata->columns)
+                    * metadata->bits;
+            const std::uint64_t destination_bit =
+                    detail::plane_slot(
+                            destination_plane, row, column, metadata->rows,
+                            metadata->columns)
+                    * metadata->bits;
+            detail::copy_value(
+                    destination, destination_bit, source, source_bit,
+                    metadata->bits);
+        }
+}
+}
+
+}  // namespace
+}  // namespace iom::cuda_detail
 #undef IOM_LAUNCH_KERNEL
 #undef IOM_GPU_ATOMIC_AND
 #undef IOM_GPU_ATOMIC_OR
@@ -311,6 +405,264 @@ void synchronous_transfer(
 
 namespace {
 
+[[nodiscard]] std::size_t checked_metadata_mul(
+        std::size_t left, std::size_t right, const char* message) {
+    if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
+        throw std::overflow_error(message);
+    }
+    return left * right;
+}
+
+[[nodiscard]] std::size_t checked_metadata_add(
+        std::size_t left, std::size_t right, const char* message) {
+    if (left > std::numeric_limits<std::size_t>::max() - right) {
+        throw std::overflow_error(message);
+    }
+    return left + right;
+}
+
+[[nodiscard]] std::uint64_t metadata_u64(
+        std::size_t value, const char* message) {
+    if (value > std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error(message);
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+[[nodiscard]] std::size_t padded_dimension(std::size_t value) {
+    const std::size_t tiles =
+            value / TensorSpec::TILE + (value % TensorSpec::TILE != 0);
+    return checked_metadata_mul(
+            tiles, TensorSpec::TILE, "metadata size overflows");
+}
+
+struct CudaMetadataLayout {
+    std::size_t bytes;
+    std::size_t total_words;
+};
+
+[[nodiscard]] CudaMetadataLayout metadata_layout(
+        const TensorView& source, const TensorView& destination) {
+    const std::span<const std::size_t> dimensions =
+            source.spec().shape.dimensions();
+    const std::size_t leading_rank = dimensions.size() - 2;
+    if (leading_rank > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("metadata leading rank overflows");
+    }
+    const std::size_t rows = dimensions[leading_rank];
+    const std::size_t columns = dimensions[leading_rank + 1];
+    std::size_t plane_count = 1;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        plane_count = checked_metadata_mul(
+                plane_count, dimensions[axis], "metadata plane count overflows");
+    }
+    const std::size_t padded_elements = checked_metadata_mul(
+            padded_dimension(rows), padded_dimension(columns),
+            "metadata element count overflows");
+    const std::size_t plane_bits = checked_metadata_mul(
+            padded_elements, detail::leaf_bits(source.spec().data_type),
+            "metadata plane bits overflows");
+    const std::size_t words_per_plane = checked_metadata_add(
+            plane_bits, 31, "metadata word count overflows")
+            / 32;
+    const std::size_t total_words_size = checked_metadata_mul(
+            plane_count, words_per_plane, "metadata total words overflows");
+    const std::size_t array_count = checked_metadata_mul(
+            leading_rank, 3, "metadata array count overflows");
+    const std::size_t array_bytes = checked_metadata_mul(
+            array_count, sizeof(std::uint64_t),
+            "metadata array bytes overflows");
+    const std::size_t bytes = checked_metadata_add(
+            sizeof(CudaCopyMetadataHeader), array_bytes,
+            "metadata allocation size overflows");
+    (void)metadata_u64(rows, "metadata rows overflows");
+    (void)metadata_u64(columns, "metadata columns overflows");
+    (void)metadata_u64(plane_count, "metadata plane count overflows");
+    (void)metadata_u64(total_words_size, "metadata total words overflows");
+    for (const std::size_t stride : source.plane_strides()) {
+        (void)metadata_u64(stride, "metadata source stride overflows");
+    }
+    for (const std::size_t stride : destination.plane_strides()) {
+        (void)metadata_u64(stride, "metadata destination stride overflows");
+    }
+    (void)metadata_u64(
+            source.plane_offset(), "metadata source offset overflows");
+    (void)metadata_u64(
+            destination.plane_offset(), "metadata destination offset overflows");
+    return {bytes, total_words_size};
+}
+
+class CudaMetadataSlotPool final {
+public:
+    static constexpr std::size_t kMetadataSlotCount = 16;
+
+    explicit CudaMetadataSlotPool(CUcontext context) : context_(context) {}
+
+    ~CudaMetadataSlotPool() {
+        try {
+            gpu_policy::activate(context_);
+        } catch (...) {
+        }
+        for (Slot& slot : slots_) {
+            gpu_policy::free_noexcept(slot.device);
+            slot.device = nullptr;
+        }
+    }
+
+    CudaMetadataSlotPool(const CudaMetadataSlotPool&) = delete;
+    CudaMetadataSlotPool& operator=(const CudaMetadataSlotPool&) = delete;
+
+    [[nodiscard]] std::size_t acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        completion_.wait(lock, [this] {
+            for (const Slot& slot : slots_) {
+                if (!slot.in_use) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        for (std::size_t index = 0; index < slots_.size(); ++index) {
+            if (!slots_[index].in_use) {
+                slots_[index].in_use = true;
+                return index;
+            }
+        }
+        throw std::logic_error("metadata slot acquisition lost a free slot");
+    }
+
+    void release(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < slots_.size() && slots_[index].in_use) {
+            slots_[index].in_use = false;
+            completion_.notify_one();
+        }
+    }
+
+    void ensure_slot_capacity(
+            std::size_t index, std::size_t required_bytes,
+            cudaStream_t stream) {
+        Slot& slot = slots_.at(index);
+        if (slot.capacity >= required_bytes) {
+            return;
+        }
+        std::size_t capacity = slot.capacity == 0 ? 256 : slot.capacity;
+        while (capacity < required_bytes) {
+            if (capacity > std::numeric_limits<std::size_t>::max() / 2) {
+                capacity = required_bytes;
+                break;
+            }
+            capacity *= 2;
+        }
+        gpu_policy::synchronize_stream(stream);
+        std::unique_ptr<std::byte[]> replacement(
+                new std::byte[capacity]);
+        void* replacement_device = gpu_policy::allocate(capacity);
+        void* old_device = slot.device;
+        slot.host = std::move(replacement);
+        slot.device = replacement_device;
+        slot.capacity = capacity;
+        gpu_policy::free_noexcept(old_device);
+    }
+
+    [[nodiscard]] std::byte* host_data(std::size_t index) {
+        return slots_.at(index).host.get();
+    }
+
+    [[nodiscard]] void* device_data(std::size_t index) {
+        return slots_.at(index).device;
+    }
+
+private:
+    struct Slot {
+        std::unique_ptr<std::byte[]> host;
+        void* device = nullptr;
+        std::size_t capacity = 0;
+        bool in_use = false;
+    };
+
+    CUcontext context_;
+    std::array<Slot, kMetadataSlotCount> slots_;
+    std::mutex mutex_;
+    std::condition_variable completion_;
+};
+
+void write_cuda_metadata(
+        std::byte* storage, const TensorView& source,
+        const TensorView& destination) {
+    const std::span<const std::size_t> dimensions =
+            source.spec().shape.dimensions();
+    const std::size_t leading_rank = dimensions.size() - 2;
+    const std::size_t rows = dimensions[leading_rank];
+    const std::size_t columns = dimensions[leading_rank + 1];
+    std::size_t plane_count = 1;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        plane_count = checked_metadata_mul(
+                plane_count, dimensions[axis], "metadata plane count overflows");
+    }
+    auto* header = reinterpret_cast<CudaCopyMetadataHeader*>(storage);
+    header->source_plane_offset = metadata_u64(
+            source.plane_offset(), "metadata source offset overflows");
+    header->destination_plane_offset = metadata_u64(
+            destination.plane_offset(), "metadata destination offset overflows");
+    header->rows = metadata_u64(rows, "metadata rows overflows");
+    header->columns = metadata_u64(columns, "metadata columns overflows");
+    header->plane_count = metadata_u64(
+            plane_count, "metadata plane count overflows");
+    header->bits = static_cast<std::uint32_t>(
+            detail::leaf_bits(source.spec().data_type));
+    header->leading_rank = static_cast<std::uint32_t>(leading_rank);
+    auto* values = reinterpret_cast<std::uint64_t*>(header + 1);
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        values[axis] = metadata_u64(
+                source.plane_strides()[axis],
+                "metadata source stride overflows");
+        values[leading_rank + axis] = metadata_u64(
+                destination.plane_strides()[axis],
+                "metadata destination stride overflows");
+        values[2 * leading_rank + axis] = metadata_u64(
+                dimensions[axis], "metadata leading dimension overflows");
+    }
+}
+
+struct CudaFenceResource {
+    cudaEvent_t event = nullptr;
+    std::size_t metadata_slot = 0;
+    CudaMetadataSlotPool* pool = nullptr;
+    CUcontext context = nullptr;
+};
+
+void destroy_cuda_resource_noexcept(CudaFenceResource* resource) noexcept {
+    if (resource == nullptr) {
+        return;
+    }
+    gpu_policy::destroy_event_noexcept(resource->event);
+    resource->pool->release(resource->metadata_slot);
+    delete resource;
+}
+
+void cuda_fence_complete(void* opaque) {
+    auto* resource = static_cast<CudaFenceResource*>(opaque);
+    gpu_policy::activate(resource->context);
+    gpu_policy::synchronize_event(resource->event);
+}
+
+void cuda_fence_destroy(void* opaque) noexcept {
+    auto* resource = static_cast<CudaFenceResource*>(opaque);
+    if (resource == nullptr) {
+        return;
+    }
+    try {
+        gpu_policy::activate(resource->context);
+    } catch (...) {
+    }
+    destroy_cuda_resource_noexcept(resource);
+}
+
+}  // namespace
+
+namespace {
+
 class CudaQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
@@ -325,23 +677,17 @@ public:
     CudaQueue(const Device& device, CUcontext context)
             : device_(&device),
               context_(context),
+              metadata_pool_(context_),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
                               [this](Task& task) {
                                   execute(task);
                               },
-                              [this](void* fence) {
-                                  gpu_policy::activate(context_);
-                                  gpu_policy::synchronize_event(
-                                          static_cast<cudaEvent_t>(fence));
+                              [](void* fence) {
+                                  cuda_fence_complete(fence);
                               },
-                              [this](void* fence) {
-                                  try {
-                                      gpu_policy::activate(context_);
-                                      gpu_policy::destroy_event_noexcept(
-                                              static_cast<cudaEvent_t>(fence));
-                                  } catch (...) {
-                                  }
+                              [](void* fence) {
+                                  cuda_fence_destroy(fence);
                               },
                               [this](
                                       std::uint64_t sequence,
@@ -407,47 +753,83 @@ public:
 
 private:
     void execute(Task& task) {
-        gpu_policy::activate(context_);
-        detail::PendingEvent<gpu_policy> event_guard;
-        gpu_policy::create_event(&event_guard.event);
-        task.event = event_guard.event;
-        task.fence = static_cast<void*>(event_guard.event);
-        const std::vector<detail::PlanePair> pairs =
-                task.no_op ? std::vector<detail::PlanePair>{}
-                           : detail::plane_pairs(*task.source, *task.destination);
-        const std::span<const std::size_t> dimensions =
-                task.source->spec().shape.dimensions();
-        const std::size_t rows = dimensions[dimensions.size() - 2];
-        const std::size_t columns = dimensions[dimensions.size() - 1];
-        const unsigned int bits = static_cast<unsigned int>(
-                detail::leaf_bits(task.source->spec().data_type));
+        if (task.no_op) {
+            task.event = nullptr;
+            task.fence = nullptr;
+            return;
+        }
 
+        gpu_policy::activate(context_);
+        const std::size_t metadata_slot = metadata_pool_.acquire();
+        cudaEvent_t event = nullptr;
+        std::unique_ptr<CudaFenceResource> resource;
+        bool kernel_enqueued = false;
+        bool event_recorded = false;
         try {
-            std::size_t plane_index = 0;
-            for (const detail::PlanePair pair : pairs) {
-                detail::launch_copy_plane<gpu_policy>(
-                        stream_, pair, plane_index++, rows, columns, bits,
-                        task.source->native_handle(),
-                        task.destination->native_handle());
-            }
-            gpu_policy::record_event(task.event, stream_);
-            event_guard.linked = true;
+            const CudaMetadataLayout layout =
+                    metadata_layout(*task.source, *task.destination);
+            metadata_pool_.ensure_slot_capacity(
+                    metadata_slot, layout.bytes, stream_);
+            write_cuda_metadata(
+                    metadata_pool_.host_data(metadata_slot),
+                    *task.source, *task.destination);
+            gpu_policy::create_event(&event);
+            resource = std::make_unique<CudaFenceResource>(
+                    CudaFenceResource{
+                            event, metadata_slot, &metadata_pool_, context_});
+            gpu_policy::copy_from_host(
+                    stream_, metadata_pool_.device_data(metadata_slot),
+                    metadata_pool_.host_data(metadata_slot), layout.bytes);
+            const std::size_t launch_words = checked_metadata_add(
+                    layout.total_words, 255,
+                    "metadata launch count overflows");
+            const unsigned int blocks = static_cast<unsigned int>(
+                    std::min<std::size_t>(launch_words / 256, 65535));
+            grid_stride_copy_kernel<<<dim3(blocks), dim3(256), 0, stream_>>>(
+                    static_cast<const unsigned char*>(
+                            task.source->native_handle()),
+                    static_cast<unsigned char*>(
+                            task.destination->native_handle()),
+                    static_cast<const CudaCopyMetadataHeader*>(
+                            metadata_pool_.device_data(metadata_slot)));
+            kernel_enqueued = true;
+            gpu_policy::check_kernel(gpu_policy::copy_kernel_operation());
+            gpu_policy::after_grid_stride_launch();
+            gpu_policy::record_event(event, stream_);
+            event_recorded = true;
+            task.event = event;
+            task.fence = resource.release();
         } catch (...) {
             const std::exception_ptr failure = std::current_exception();
-            if constexpr (gpu_policy::discard_failure_event_on_error) {
-                task.fence = nullptr;
-                event_guard.linked = false;
-            } else {
-                gpu_policy::record_event_no_fault(task.event, stream_);
-                event_guard.linked = true;
+            if (kernel_enqueued) {
+                if (!event_recorded && resource) {
+                    gpu_policy::record_event_no_fault(event, stream_);
+                    event_recorded = true;
+                }
+                if (event_recorded && resource) {
+                    task.event = event;
+                    task.fence = resource.release();
+                    commit_failure(task.sequence, failure);
+                    return;
+                }
+                commit_failure(task.sequence, failure);
+                return;
             }
-            commit_failure(task.sequence, failure);
+            if (resource) {
+                resource->event = event;
+                destroy_cuda_resource_noexcept(resource.release());
+            } else {
+                gpu_policy::destroy_event_noexcept(event);
+                metadata_pool_.release(metadata_slot);
+            }
+            throw;
         }
     }
 
     const Device* device_;
     CUcontext context_;
     cudaStream_t stream_ = gpu_policy::null_stream();
+    CudaMetadataSlotPool metadata_pool_;
     std::mutex submission_order_mutex_;
     detail::StagedWorker<Task> worker_;
 };
