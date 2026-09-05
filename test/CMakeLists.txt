@@ -33,6 +33,22 @@ target_link_libraries(iom_cpu_tests
 
 add_test(NAME iom_cpu_tests COMMAND iom_cpu_tests)
 
+add_executable(iom_cpu_bench
+        cpu/test_cpu_bench.cpp
+)
+
+target_link_libraries(iom_cpu_bench
+    PRIVATE
+        doctest::doctest
+        libiom
+)
+
+set_source_files_properties(cpu/test_cpu_bench.cpp PROPERTIES
+    COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+)
+
+add_test(NAME iom_cpu_bench COMMAND iom_cpu_bench)
+
 if(ROCM_ENABLED)
     add_executable(iom_rocm_smoke_tests
             rocm/test_rocm_smoke.cpp

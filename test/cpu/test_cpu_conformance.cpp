@@ -2,12 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
 #include <unordered_set>
 #include <vector>
-
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -67,6 +67,10 @@ public:
         ++traffic_;
     }
 
+    [[nodiscard]] std::size_t traffic() const noexcept {
+        return traffic_;
+    }
+
 private:
     const TrafficGate& gate_;
     std::unordered_set<void*> live_;
@@ -84,12 +88,82 @@ struct CpuDevices {
     std::unique_ptr<iom::Device> candidate = iom::make_cpu_device(candidate_allocator);
     std::unique_ptr<iom::Device> foreign = iom::make_cpu_device(foreign_allocator);
 
+
+
     [[nodiscard]] iom_conformance::ConformanceDevices conformance() const {
         return {*reference, *candidate, *foreign};
     }
 };
 
 }  // namespace
+
+void require_storage_outside_view_is_zero(
+        const iom::TensorSpec& owner_spec, const iom::TensorView& view) {
+    std::vector<unsigned char> touched(
+            owner_spec.tiled_storage_nbytes(), 0);
+    const std::span<const std::size_t> dimensions =
+            view.spec().shape.dimensions();
+    const std::span<const std::size_t> strides =
+            view.plane_strides();
+    REQUIRE_EQ(dimensions.size(), 4);
+    for (std::size_t first = 0; first < dimensions[0]; ++first) {
+        for (std::size_t second = 0; second < dimensions[1]; ++second) {
+            const std::size_t plane =
+                    view.plane_offset()
+                    + first * strides[0] + second * strides[1];
+            for (std::size_t row = 0; row < dimensions[2]; ++row) {
+                for (std::size_t column = 0;
+                     column < dimensions[3]; ++column) {
+                    const std::size_t byte =
+                            iom::detail::standard_plane_slot(
+                                    owner_spec, plane, row, column);
+                    REQUIRE_LT(byte, touched.size());
+                    touched[byte] = 1;
+                }
+            }
+        }
+    }
+
+    const auto* storage = static_cast<const unsigned char*>(
+            view.native_handle());
+    for (std::size_t byte = 0; byte < touched.size(); ++byte) {
+        if (touched[byte] == 0) {
+            CHECK_EQ(storage[byte], 0);
+        }
+    }
+}
+
+void require_subbyte_storage_scope_is_zero(
+        const iom::TensorSpec& owner_spec, const iom::TensorView& view) {
+    const std::size_t bits =
+            iom::detail::leaf_bits(owner_spec.data_type);
+    std::vector<unsigned char> touched(
+            owner_spec.tiled_storage_nbytes(), 0);
+    const std::span<const std::size_t> dimensions =
+            view.spec().shape.dimensions();
+    REQUIRE_EQ(dimensions.size(), 2);
+    for (std::size_t row = 0; row < dimensions[0]; ++row) {
+        for (std::size_t column = 0; column < dimensions[1]; ++column) {
+            const std::size_t bit =
+                    iom::detail::standard_plane_slot(
+                            owner_spec, view.plane_offset(), row, column)
+                    * bits;
+            for (std::size_t offset = 0; offset < bits; ++offset) {
+                touched[(bit + offset) / 8] |=
+                        static_cast<unsigned char>(
+                                1u << ((bit + offset) % 8));
+            }
+        }
+    }
+
+    const auto* storage = static_cast<const unsigned char*>(
+            view.native_handle());
+    for (std::size_t byte = 0; byte < touched.size(); ++byte) {
+        CHECK_EQ(
+                static_cast<unsigned char>(storage[byte] & ~touched[byte]),
+                0);
+    }
+}
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
     std::vector<std::byte> storage(1024);
     iom::LinearAllocator allocator(storage.data(), storage.size());
@@ -238,4 +312,142 @@ TEST_CASE("conformance harness detects perturbed candidate bytes") {
                         .has_value());
     CHECK(iom_conformance::first_logical_mismatch(stepped_window, earlier_pattern)
                   .has_value());
+}
+
+TEST_CASE("CPU conformance: tile-blocked copy preserves logical and physical window scope") {
+    CpuDevices devices;
+    const iom::TensorSpec owner_spec{
+            iom::TensorShape{{4, 3, 17, 33}}, iom::DataType::U8};
+    auto reference = devices.candidate->create_tensor(owner_spec);
+    auto candidate = devices.candidate->create_tensor(owner_spec);
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(owner_spec, 0x1234);
+    reference->view().copy_from_host(pattern);
+    std::memset(
+            candidate->view().native_handle(), 0,
+            owner_spec.tiled_storage_nbytes());
+
+    const iom::TensorView source =
+            reference->view().slice(0, 0, 2, 2);
+    iom::TensorView destination =
+            candidate->view().slice(0, 1, 2, 1);
+    const std::vector<std::byte> expected =
+            iom_conformance::read_logical(source);
+    const std::size_t candidate_traffic =
+            devices.candidate_allocator.traffic();
+    devices.gate.setup_complete();
+    auto queue = devices.candidate->create_ops();
+    const iom::oid token = queue->copy(source, destination);
+    queue->wait(token);
+    CHECK_EQ(
+            devices.candidate_allocator.traffic(), candidate_traffic);
+    devices.gate.case_complete();
+
+    iom_conformance::require_logical_bytes(
+            destination, expected, "tile-blocked window copy");
+    require_storage_outside_view_is_zero(owner_spec, destination);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU conformance: blocked byte-aligned copy matches `std::memcpy` byte-for-byte") {
+    CpuDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{4096, 4096}}, iom::DataType::F32};
+    auto reference = devices.candidate->create_tensor(spec);
+    auto candidate = devices.candidate->create_tensor(spec);
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(spec, 0x5678);
+    reference->view().copy_from_host(pattern);
+    std::memset(
+            candidate->view().native_handle(), 0,
+            spec.tiled_storage_nbytes());
+
+    const std::size_t candidate_traffic =
+            devices.candidate_allocator.traffic();
+    devices.gate.setup_complete();
+    auto queue = devices.candidate->create_ops();
+    const iom::oid token =
+            queue->copy(reference->view(), candidate->view());
+    queue->wait(token);
+    CHECK_EQ(
+            devices.candidate_allocator.traffic(), candidate_traffic);
+    devices.gate.case_complete();
+
+    CHECK_EQ(
+            std::memcmp(
+                    reference->view().native_handle(),
+                    candidate->view().native_handle(),
+                    spec.tiled_storage_nbytes()),
+            0);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU conformance: blocked sub-byte copy preserves LSB-first packing and zero tail bits") {
+    CpuDevices devices;
+    for (const iom::DataType data_type : {
+                 iom::DataType::I2,
+                 iom::DataType::F6_E2M3,
+                 iom::DataType::F6_E3M2}) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, 17}}, data_type};
+        auto reference = devices.candidate->create_tensor(spec);
+        auto candidate = devices.candidate->create_tensor(spec);
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(spec, 0x9ABC);
+        reference->view().copy_from_host(pattern);
+        std::memset(
+                candidate->view().native_handle(), 0,
+                spec.tiled_storage_nbytes());
+
+        const std::size_t candidate_traffic =
+                devices.candidate_allocator.traffic();
+        devices.gate.setup_complete();
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token =
+                queue->copy(reference->view(), candidate->view());
+        queue->wait(token);
+        CHECK_EQ(
+                devices.candidate_allocator.traffic(), candidate_traffic);
+        devices.gate.case_complete();
+
+        iom_conformance::require_logical_bytes(
+                candidate->view(), pattern, "sub-byte blocked copy");
+        require_subbyte_storage_scope_is_zero(
+                spec, candidate->view());
+        CHECK_FALSE(devices.gate.armed());
+    }
+}
+
+TEST_CASE("CPU conformance: blocked copy walks lockstep planes without scratch allocation") {
+    CpuDevices devices;
+    const iom::TensorSpec owner_spec{
+            iom::TensorShape{{4, 3, 17, 33}}, iom::DataType::U8};
+    auto reference = devices.candidate->create_tensor(owner_spec);
+    auto candidate = devices.candidate->create_tensor(owner_spec);
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(owner_spec, 0xDEF0);
+    reference->view().copy_from_host(pattern);
+    std::memset(
+            candidate->view().native_handle(), 0,
+            owner_spec.tiled_storage_nbytes());
+
+    const iom::TensorView source =
+            reference->view().slice(0, 0, 2, 2);
+    iom::TensorView destination =
+            candidate->view().slice(0, 1, 2, 1);
+    const std::vector<std::byte> expected =
+            iom_conformance::read_logical(source);
+    const std::size_t candidate_traffic =
+            devices.candidate_allocator.traffic();
+    devices.gate.setup_complete();
+    auto queue = devices.candidate->create_ops();
+    const iom::oid token = queue->copy(source, destination);
+    queue->wait(token);
+    CHECK_EQ(
+            devices.candidate_allocator.traffic(), candidate_traffic);
+    devices.gate.case_complete();
+
+    iom_conformance::require_logical_bytes(
+            destination, expected, "lockstep plane copy");
+    CHECK_FALSE(devices.gate.armed());
 }

@@ -92,6 +92,294 @@ namespace iom {
                     read_bits(source, source_bit, nbits));
         }
 
+        template <std::size_t kElementBytes>
+        static inline void copy_tile_row_byte_aligned(
+                unsigned char* destination, const unsigned char* source,
+                std::size_t elements) {
+            if (elements >= TensorSpec::TILE) {
+                if (destination != source) {
+                    std::memcpy(
+                            destination, source,
+                            elements * kElementBytes);
+                }
+                return;
+            }
+            for (std::size_t index = 0; index < elements; ++index) {
+                if (destination + index * kElementBytes
+                        != source + index * kElementBytes) {
+                    std::memcpy(
+                            destination + index * kElementBytes,
+                            source + index * kElementBytes,
+                            kElementBytes);
+                }
+            }
+        }
+
+        static inline void copy_tile_row_subbyte(
+                unsigned char* destination, std::size_t destination_bit,
+                const unsigned char* source, std::size_t source_bit,
+                std::size_t elements, std::size_t leaf_bits,
+                std::array<std::uint32_t, TensorSpec::TILE>& shift_table,
+                std::array<std::uint32_t, TensorSpec::TILE>& mask_table) {
+            const std::size_t total_bits = elements * leaf_bits;
+            const bool word_aligned =
+                    source_bit % (sizeof(std::uint32_t) * 8) == 0
+                    && destination_bit % (sizeof(std::uint32_t) * 8) == 0;
+            if (word_aligned && elements > TensorSpec::TILE
+                    && total_bits % 8 == 0) {
+                std::memcpy(
+                        destination + destination_bit / 8,
+                        source + source_bit / 8, total_bits / 8);
+                return;
+            }
+            if (word_aligned) {
+                const std::size_t whole_word_bits =
+                        total_bits / (sizeof(std::uint32_t) * 8)
+                        * (sizeof(std::uint32_t) * 8);
+                const std::size_t word_elements =
+                        whole_word_bits % leaf_bits == 0
+                        ? whole_word_bits / leaf_bits
+                        : 0;
+                const std::size_t word_count =
+                        word_elements * leaf_bits
+                        / (sizeof(std::uint32_t) * 8);
+                std::uint32_t covered_mask = 0;
+                for (std::size_t element_index = 0;
+                     element_index < word_elements; ++element_index) {
+                    covered_mask |= mask_table[element_index];
+                    covered_mask |=
+                            (1u << shift_table[element_index])
+                            & mask_table[element_index];
+                }
+                for (std::size_t word_index = 0;
+                     word_index < word_count; ++word_index) {
+                    std::uint32_t source_word = 0;
+                    std::memcpy(
+                            &source_word,
+                            source + source_bit / 8
+                                    + word_index * sizeof(std::uint32_t),
+                            sizeof(std::uint32_t));
+                    const std::uint32_t destination_word =
+                            source_word & covered_mask;
+                    std::memcpy(
+                            destination + destination_bit / 8
+                                    + word_index * sizeof(std::uint32_t),
+                            &destination_word, sizeof(std::uint32_t));
+                }
+                for (std::size_t index = word_elements;
+                     index < elements; ++index) {
+                    copy_value(
+                            destination, destination_bit + index * leaf_bits,
+                            source, source_bit + index * leaf_bits,
+                            leaf_bits);
+                }
+                return;
+            }
+
+            for (std::size_t index = 0; index < elements; ++index) {
+                copy_value(
+                        destination, destination_bit + index * leaf_bits,
+                        source, source_bit + index * leaf_bits,
+                        leaf_bits);
+            }
+        }
+
+        template <typename Op>
+        static inline void for_each_tile(
+                const TensorView& view, Op&& op) {
+            const TensorSpec& spec = view.spec();
+            const std::span<const std::size_t> dimensions =
+                    spec.shape.dimensions();
+            const std::size_t leading_rank = dimensions.size() - 2;
+            const std::size_t rows = dimensions[leading_rank];
+            const std::size_t columns = dimensions[leading_rank + 1];
+            const std::size_t tile_rows =
+                    rows / TensorSpec::TILE
+                    + (rows % TensorSpec::TILE != 0);
+            const std::size_t tile_columns =
+                    columns / TensorSpec::TILE
+                    + (columns % TensorSpec::TILE != 0);
+            const std::size_t bits = detail::leaf_bits(spec.data_type);
+            const std::span<const std::size_t> strides =
+                    view.plane_strides();
+
+            auto visit = [&](
+                                 auto&& self, std::size_t leading_index,
+                                 std::size_t plane) -> void {
+                if (leading_index != leading_rank) {
+                    for (std::size_t index = 0;
+                         index < dimensions[leading_index]; ++index) {
+                        self(
+                                self, leading_index + 1,
+                                plane + index * strides[leading_index]);
+                    }
+                    return;
+                }
+
+                const std::size_t tile_bytes =
+                        TensorSpec::TILE * TensorSpec::TILE * bits / 8;
+                for (std::size_t tile_row = 0;
+                     tile_row < tile_rows; ++tile_row) {
+                    const std::size_t first_row =
+                            tile_row * TensorSpec::TILE;
+                    const std::size_t tile_row_byte =
+                            detail::standard_plane_slot(
+                                    spec, plane, first_row, 0)
+                            * bits / 8;
+                    for (std::size_t row_in_tile = 0;
+                         row_in_tile < TensorSpec::TILE; ++row_in_tile) {
+                        const std::size_t row = first_row + row_in_tile;
+                        if (row >= rows) {
+                            break;
+                        }
+                        const std::size_t row_byte =
+                                tile_row_byte + row_in_tile * TensorSpec::TILE
+                                        * bits / 8;
+                        if (columns % TensorSpec::TILE == 0) {
+                            op(row, 0, row_byte, columns);
+                            continue;
+                        }
+                        for (std::size_t tile_column = 0;
+                             tile_column < tile_columns; ++tile_column) {
+                            const std::size_t column =
+                                    tile_column * TensorSpec::TILE;
+                            const std::size_t remaining = columns - column;
+                            const std::size_t elements =
+                                    remaining < TensorSpec::TILE
+                                    ? remaining
+                                    : TensorSpec::TILE;
+                            op(
+                                    row, column,
+                                    row_byte + tile_column * tile_bytes,
+                                    elements);
+                        }
+                    }
+                }
+            };
+            visit(visit, 0, view.plane_offset());
+        }
+
+        template <typename Op>
+        static inline void for_each_tile_lockstep(
+                const TensorView& source, const TensorView& destination,
+                Op&& op) {
+            const TensorSpec& source_spec = source.spec();
+            const TensorSpec& destination_spec = destination.spec();
+            const std::span<const std::size_t> source_dimensions =
+                    source_spec.shape.dimensions();
+            const std::size_t leading_rank = source_dimensions.size() - 2;
+            const std::size_t rows = source_dimensions[leading_rank];
+            const std::size_t columns =
+                    source_dimensions[leading_rank + 1];
+            const std::size_t tile_rows =
+                    rows / TensorSpec::TILE
+                    + (rows % TensorSpec::TILE != 0);
+            const std::size_t tile_columns =
+                    columns / TensorSpec::TILE
+                    + (columns % TensorSpec::TILE != 0);
+            const std::size_t source_bits =
+                    detail::leaf_bits(source_spec.data_type);
+            const std::size_t destination_bits =
+                    detail::leaf_bits(destination_spec.data_type);
+            const std::span<const std::size_t> source_strides =
+                    source.plane_strides();
+            const std::span<const std::size_t> destination_strides =
+                    destination.plane_strides();
+            bool identical_layout =
+                    source.plane_offset() == destination.plane_offset()
+                    && source_strides.size() == destination_strides.size();
+            for (std::size_t index = 0;
+                 identical_layout && index < source_strides.size(); ++index) {
+                identical_layout =
+                        source_strides[index] == destination_strides[index];
+            }
+
+            auto visit = [&](
+                                 auto&& self, std::size_t leading_index,
+                                 std::size_t source_plane,
+                                 std::size_t destination_plane) -> void {
+                if (leading_index != leading_rank) {
+                    for (std::size_t index = 0;
+                         index < source_dimensions[leading_index]; ++index) {
+                        self(
+                                self, leading_index + 1,
+                                source_plane
+                                        + index
+                                                * source_strides[leading_index],
+                                destination_plane
+                                        + index
+                                                * destination_strides[
+                                                        leading_index]);
+                    }
+                    return;
+                }
+
+                const std::size_t source_tile_bytes =
+                        TensorSpec::TILE * TensorSpec::TILE * source_bits / 8;
+                const std::size_t destination_tile_bytes =
+                        TensorSpec::TILE * TensorSpec::TILE
+                        * destination_bits / 8;
+                for (std::size_t tile_row = 0;
+                     tile_row < tile_rows; ++tile_row) {
+                    const std::size_t first_row =
+                            tile_row * TensorSpec::TILE;
+                    const std::size_t source_tile_row_byte =
+                            detail::standard_plane_slot(
+                                    source_spec, source_plane, first_row, 0)
+                            * source_bits / 8;
+                    const std::size_t destination_tile_row_byte =
+                            identical_layout
+                            ? source_tile_row_byte
+                            : detail::standard_plane_slot(
+                                      destination_spec, destination_plane,
+                                      first_row, 0)
+                                      * destination_bits / 8;
+                    for (std::size_t row_in_tile = 0;
+                         row_in_tile < TensorSpec::TILE; ++row_in_tile) {
+                        const std::size_t row = first_row + row_in_tile;
+                        if (row >= rows) {
+                            break;
+                        }
+                        const std::size_t source_row_byte =
+                                source_tile_row_byte
+                                + row_in_tile * TensorSpec::TILE
+                                        * source_bits / 8;
+                        const std::size_t destination_row_byte =
+                                destination_tile_row_byte
+                                + row_in_tile * TensorSpec::TILE
+                                        * destination_bits / 8;
+                        if (columns % TensorSpec::TILE == 0) {
+                            op(
+                                    row, 0, source_row_byte,
+                                    destination_row_byte, columns);
+                            continue;
+                        }
+                        for (std::size_t tile_column = 0;
+                             tile_column < tile_columns; ++tile_column) {
+                            const std::size_t column =
+                                    tile_column * TensorSpec::TILE;
+                            const std::size_t remaining = columns - column;
+                            const std::size_t elements =
+                                    remaining < TensorSpec::TILE
+                                    ? remaining
+                                    : TensorSpec::TILE;
+                            op(
+                                    row, column,
+                                    source_row_byte
+                                            + tile_column * source_tile_bytes,
+                                    destination_row_byte
+                                            + tile_column
+                                                    * destination_tile_bytes,
+                                    elements);
+                        }
+                    }
+                }
+            };
+            visit(
+                    visit, 0, source.plane_offset(),
+                    destination.plane_offset());
+        }
+
         // Calls op(owner_plane, row, column, linear_index) for every
         // logical element of the view in row-major coordinate order. The
         // view's plane offset and strides carry the leading coordinates.
@@ -210,18 +498,79 @@ namespace iom {
                     source.data());
             const std::size_t bits =
                     detail::leaf_bits(destination.spec().data_type);
-            for_each_coordinate(
+            const std::size_t columns =
+                    destination.spec().shape.dimensions().back();
+            const std::span<const std::size_t> dimensions =
+                    destination.spec().shape.dimensions();
+            const std::size_t rows = dimensions[dimensions.size() - 2];
+            const std::size_t tile_columns =
+                    columns / TensorSpec::TILE
+                    + (columns % TensorSpec::TILE != 0);
+            const std::size_t row_runs_per_plane =
+                    columns % TensorSpec::TILE == 0 ? 1 : tile_columns;
+            const std::size_t callbacks_per_plane =
+                    rows * row_runs_per_plane;
+            const std::size_t elements_per_plane = rows * columns;
+            std::size_t callback_index = 0;
+            std::array<std::uint32_t, TensorSpec::TILE> shift_table{};
+            std::array<std::uint32_t, TensorSpec::TILE> mask_table{};
+            if (bits % 8 != 0) {
+                for (std::size_t index = 0;
+                     index < TensorSpec::TILE; ++index) {
+                    shift_table[index] =
+                            (index * bits) % (sizeof(std::uint32_t) * 8);
+                    mask_table[index] =
+                            ((1u << bits) - 1u) << shift_table[index];
+                }
+            }
+            for_each_tile(
                     destination,
-                    [&](std::size_t plane, std::size_t row,
-                        std::size_t column, std::size_t linear) {
-                        copy_value(
-                                storage,
-                                detail::standard_plane_slot(
-                                        destination.spec(), plane, row, column)
-                                        * bits,
-                                host,
-                                linear * bits,
-                                bits);
+                    [&](std::size_t row, std::size_t column,
+                        std::size_t destination_byte,
+                        std::size_t elements) {
+                        const std::size_t plane_index =
+                                callback_index / callbacks_per_plane;
+                        ++callback_index;
+                        const std::size_t host_bit =
+                                (plane_index * elements_per_plane
+                                        + row * columns + column)
+                                * bits;
+                        if (bits % 8 == 0) {
+                            const auto* row_source =
+                                    host + host_bit / 8;
+                            auto* row_destination =
+                                    storage + destination_byte;
+                            switch (bits) {
+                                case 8:
+                                    copy_tile_row_byte_aligned<1>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                case 16:
+                                    copy_tile_row_byte_aligned<2>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                case 32:
+                                    copy_tile_row_byte_aligned<4>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                case 64:
+                                    copy_tile_row_byte_aligned<8>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                default:
+                                    throw std::invalid_argument(
+                                            "unsupported byte-aligned CPU leaf width");
+                            }
+                        } else {
+                            copy_tile_row_subbyte(
+                                    storage, destination_byte * 8,
+                                    host, host_bit, elements, bits,
+                                    shift_table, mask_table);
+                        }
                     });
         }
 
@@ -237,21 +586,78 @@ namespace iom {
                     static_cast<const unsigned char*>(address_);
             const std::size_t bits =
                     detail::leaf_bits(source.spec().data_type);
-            for_each_coordinate(
+            const std::size_t columns =
+                    source.spec().shape.dimensions().back();
+            const std::span<const std::size_t> dimensions =
+                    source.spec().shape.dimensions();
+            const std::size_t rows = dimensions[dimensions.size() - 2];
+            const std::size_t tile_columns =
+                    columns / TensorSpec::TILE
+                    + (columns % TensorSpec::TILE != 0);
+            const std::size_t row_runs_per_plane =
+                    columns % TensorSpec::TILE == 0 ? 1 : tile_columns;
+            const std::size_t callbacks_per_plane =
+                    rows * row_runs_per_plane;
+            const std::size_t elements_per_plane = rows * columns;
+            std::size_t callback_index = 0;
+            std::array<std::uint32_t, TensorSpec::TILE> shift_table{};
+            std::array<std::uint32_t, TensorSpec::TILE> mask_table{};
+            if (bits % 8 != 0) {
+                for (std::size_t index = 0;
+                     index < TensorSpec::TILE; ++index) {
+                    shift_table[index] =
+                            (index * bits) % (sizeof(std::uint32_t) * 8);
+                    mask_table[index] =
+                            ((1u << bits) - 1u) << shift_table[index];
+                }
+            }
+            for_each_tile(
                     source,
-                    [&](std::size_t plane, std::size_t row,
-                        std::size_t column, std::size_t linear) {
-                        copy_value(
-                                host,
-                                linear * bits,
-                                storage,
-                                detail::standard_plane_slot(
-                                        source.spec(), plane, row, column)
-                                        * bits,
-                                bits);
+                    [&](std::size_t row, std::size_t column,
+                        std::size_t source_byte, std::size_t elements) {
+                        const std::size_t plane_index =
+                                callback_index / callbacks_per_plane;
+                        ++callback_index;
+                        const std::size_t host_bit =
+                                (plane_index * elements_per_plane
+                                        + row * columns + column)
+                                * bits;
+                        auto* row_destination = host + host_bit / 8;
+                        const auto* row_source = storage + source_byte;
+                        if (bits % 8 == 0) {
+                            switch (bits) {
+                                case 8:
+                                    copy_tile_row_byte_aligned<1>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                case 16:
+                                    copy_tile_row_byte_aligned<2>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                case 32:
+                                    copy_tile_row_byte_aligned<4>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                case 64:
+                                    copy_tile_row_byte_aligned<8>(
+                                            row_destination, row_source,
+                                            elements);
+                                    break;
+                                default:
+                                    throw std::invalid_argument(
+                                            "unsupported byte-aligned CPU leaf width");
+                            }
+                        } else {
+                            copy_tile_row_subbyte(
+                                    host, host_bit, storage,
+                                    source_byte * 8, elements, bits,
+                                    shift_table, mask_table);
+                        }
                     });
         }
-
         Allocator& allocator_;
         void* address_ = nullptr;
     };
@@ -341,24 +747,59 @@ namespace iom {
                     destination.native_handle());
             const std::size_t bits =
                     detail::leaf_bits(source.spec().data_type);
-            for_each_coordinate(
-                    source,
-                    [&](std::size_t source_plane, std::size_t row,
-                        std::size_t column, std::size_t linear) {
-                        const std::size_t destination_plane =
-                                plane_at(destination, linear);
-                        copy_value(
-                                destination_base,
-                                detail::standard_plane_slot(
-                                        destination.spec(), destination_plane,
-                                        row, column)
-                                        * bits,
-                                source_base,
-                                detail::standard_plane_slot(
-                                        source.spec(), source_plane, row,
-                                        column)
-                                        * bits,
-                                bits);
+            std::array<std::uint32_t, TensorSpec::TILE> shift_table{};
+            std::array<std::uint32_t, TensorSpec::TILE> mask_table{};
+            if (bits % 8 != 0) {
+                for (std::size_t index = 0;
+                     index < TensorSpec::TILE; ++index) {
+                    shift_table[index] =
+                            (index * bits) % (sizeof(std::uint32_t) * 8);
+                    mask_table[index] =
+                            ((1u << bits) - 1u) << shift_table[index];
+                }
+            }
+            for_each_tile_lockstep(
+                    source, destination,
+                    [&](std::size_t, std::size_t,
+                        std::size_t source_byte,
+                        std::size_t destination_byte,
+                        std::size_t elements) {
+                        if (bits % 8 == 0) {
+                            switch (bits) {
+                                case 8:
+                                    copy_tile_row_byte_aligned<1>(
+                                            destination_base + destination_byte,
+                                            source_base + source_byte,
+                                            elements);
+                                    break;
+                                case 16:
+                                    copy_tile_row_byte_aligned<2>(
+                                            destination_base + destination_byte,
+                                            source_base + source_byte,
+                                            elements);
+                                    break;
+                                case 32:
+                                    copy_tile_row_byte_aligned<4>(
+                                            destination_base + destination_byte,
+                                            source_base + source_byte,
+                                            elements);
+                                    break;
+                                case 64:
+                                    copy_tile_row_byte_aligned<8>(
+                                            destination_base + destination_byte,
+                                            source_base + source_byte,
+                                            elements);
+                                    break;
+                                default:
+                                    throw std::invalid_argument(
+                                            "unsupported byte-aligned CPU leaf width");
+                            }
+                        } else {
+                            copy_tile_row_subbyte(
+                                    destination_base, destination_byte * 8,
+                                    source_base, source_byte * 8,
+                                    elements, bits, shift_table, mask_table);
+                        }
                     });
         }
 
