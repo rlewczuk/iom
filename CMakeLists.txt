@@ -218,6 +218,16 @@ if(ROCM_ENABLED)
             IOM_ROCM_ENABLED=1
             __HIP_PLATFORM_AMD__
     )
+
+    # Unoptimized HIP device images retain the runtime assertion/hostcall
+    # support even for kernels that do not use it. APUs without PCIe atomics
+    # reject those images at dispatch, so keep debug and unconfigured builds
+    # debuggable while applying the minimum optimization that removes the
+    # unreachable hostcall path.
+    target_compile_options(iom_rocm
+        PRIVATE
+            $<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>>>:-O1>
+    )
 endif()
 if(SYCL_ENABLED)
     add_library(iom_sycl STATIC

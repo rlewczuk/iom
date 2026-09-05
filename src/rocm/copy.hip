@@ -142,8 +142,10 @@ struct gpu_policy {
                 hipMemcpy(destination, source, bytes, hipMemcpyDeviceToHost));
     }
     static void memset(
-            stream_type, void* destination, std::size_t bytes) {
-        check_hip("hipMemset", hipMemset(destination, 0, bytes));
+            stream_type stream, void* destination, std::size_t bytes) {
+        check_hip(
+                "hipMemset",
+                hipMemsetAsync(destination, 0, bytes, stream));
     }
 
     static void synchronize_stream(stream_type stream) {
