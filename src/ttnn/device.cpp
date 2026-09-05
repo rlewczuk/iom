@@ -7,6 +7,7 @@
 #include <ttnn/tensor/tensor_ops.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -289,9 +290,6 @@ namespace iom {
                                                       task.source_planes,
                                                       *task.destination,
                                                       task.destination_planes);
-                                              device_->mesh()
-                                                      .mesh_command_queue(0)
-                                                      .finish();
                                           }
                                       },
                                       [](void*) {},
@@ -369,7 +367,33 @@ namespace iom {
             TtnnDevice* device_;
             std::mutex submission_order_mutex_;
             detail::StagedWorker<Task> worker_;
+            std::mutex fence_mutex_;
+            std::atomic<std::uint64_t> last_finished_seq_{0};
+            void fence_through_sequence(
+                    std::uint64_t sequence) noexcept override;
         };
+        void TtnnQueue::fence_through_sequence(
+                std::uint64_t sequence) noexcept {
+            std::lock_guard<std::mutex> fence_lock(fence_mutex_);
+            const std::uint64_t now =
+                    last_finished_seq_.load(std::memory_order_acquire);
+            if (sequence <= now) {
+                return;
+            }
+            try {
+                {
+                    std::lock_guard<std::mutex> api_lock(
+                            device_->api_mutex());
+                    device_->mesh().mesh_command_queue(0).finish();
+                }
+                last_finished_seq_.store(
+                        sequence, std::memory_order_release);
+            } catch (...) {
+                record_post_completion_failure(
+                        sequence, std::current_exception());
+            }
+        }
+
 
     }  // namespace
 

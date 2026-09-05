@@ -536,6 +536,25 @@ namespace iom {
                 failure != failures_.end()) {
             std::rethrow_exception(failure->second);
         }
+        lock.unlock();
+        fence_through_sequence(sequence);
+        lock.lock();
+        if (const auto failure = failures_.find(sequence);
+                failure != failures_.end()) {
+            std::rethrow_exception(failure->second);
+        }
+    }
+
+    void DeviceOps::fence_through_sequence(
+            std::uint64_t /*sequence*/) noexcept {}
+
+    void DeviceOps::record_post_completion_failure(
+            std::uint64_t sequence, std::exception_ptr failure) {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        if (failures_.find(sequence) == failures_.end()) {
+            failures_.emplace(sequence, std::move(failure));
+            completion_cv_.notify_all();
+        }
     }
 
     void DeviceOps::complete(

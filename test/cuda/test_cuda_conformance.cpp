@@ -491,3 +491,38 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::none);
 }
+
+TEST_CASE("CUDA queue destruction fences pending copies") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    TrafficGate gate;
+    CudaAllocator allocator(gate);
+    auto device = iom::make_cuda_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    const std::vector<std::byte> pattern(
+            spec.logical_nbytes(), static_cast<std::byte>(0x5a));
+    source->view().copy_from_host(pattern);
+    destination->view().copy_from_host(pattern);
+
+    {
+        auto queue = device->create_ops();
+        for (int i = 0; i < 2; ++i) {
+            CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        }
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::third_plane_launch);
+        iom::oid failure = 0;
+        CHECK_NOTHROW(
+                failure = queue->copy(source->view(), destination->view()));
+        CHECK_NE(failure, 0);
+        for (int i = 0; i < 6; ++i) {
+            CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        }
+        queue.reset();
+    }
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+    CHECK_FALSE(gate.armed());
+}

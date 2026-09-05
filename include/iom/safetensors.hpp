@@ -11,6 +11,15 @@
 
 namespace iom {
 
+/**
+ * Copyable, non-owning byte view into mapped bytes owned by the enclosing
+ * SafeTensorsStore. raw<T>() borrows those bytes and nbytes() describes their
+ * borrowed size; the store must outlive this view and every raw pointer
+ * obtained from it. Copying a view copies only its pointer and metadata and
+ * does not retain the store. Destroying the store invalidates the view's
+ * mapped bytes and all raw pointers obtained from it.
+ */
+
 class SafeTensorView {
 public:
     SafeTensorView() = default;
@@ -38,6 +47,13 @@ private:
     const uint8_t* data_ = nullptr;
     size_t nbytes_ = 0;
 };
+
+/**
+ * A concrete SafeTensorsStore owns the backing mapping resources for the
+ * views it returns and must outlive every SafeTensorView and raw pointer it
+ * produced. Destroying the store invalidates all such views and raw pointers;
+ * copying a returned view does not extend this lifetime.
+ */
 
 class SafeTensorsStore {
 public:
@@ -88,6 +104,13 @@ private:
 
 }  // namespace detail
 
+/**
+ * SafeTensorsFile owns its mapped bytes through MappedFile file_. It must
+ * outlive every SafeTensorView and raw pointer produced from it; destroying
+ * the file invalidates them. A view returned by value is non-owning and does
+ * not retain file_.
+ */
+
 class SafeTensorsFile : public SafeTensorsStore {
 public:
     explicit SafeTensorsFile(const std::string& filename);
@@ -108,6 +131,15 @@ private:
     MappedFile file_;
     iom::detail::SafeTensorsStoreBase base_;
 };
+
+/**
+ * SafeTensorsDir owns shard mappings through
+ * std::vector<std::unique_ptr<SafeTensorsFile>> files_. The directory store
+ * must outlive every SafeTensorView and raw pointer produced from it;
+ * destroying the directory invalidates them. Its by-value operator[] returns
+ * a non-owning SafeTensorView and does not extend the selected
+ * SafeTensorsFile lifetime.
+ */
 
 class SafeTensorsDir : public SafeTensorsStore {
 public:

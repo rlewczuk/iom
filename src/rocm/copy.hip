@@ -186,6 +186,15 @@ struct gpu_policy {
 
 };
 
+void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
+    if (stream == nullptr) {
+        return;
+    }
+    (void)hipStreamSynchronize(stream);
+    (void)hipStreamDestroy(stream);
+}
+
+
 }  // namespace
 }  // namespace iom::rocm_detail
 
@@ -605,7 +614,7 @@ public:
         worker_.shutdown_and_drain();
         try {
             gpu_policy::activate(context_);
-            gpu_policy::destroy_queue_stream_noexcept(stream_);
+            synchronize_and_destroy_stream(stream_);
         } catch (...) {
         }
         stream_ = gpu_policy::null_stream();

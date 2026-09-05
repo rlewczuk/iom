@@ -166,6 +166,15 @@ struct gpu_policy {
 
 };
 
+void synchronize_and_destroy_stream(cudaStream_t stream) noexcept {
+    if (stream == nullptr) {
+        return;
+    }
+    (void)cudaStreamSynchronize(stream);
+    (void)cudaStreamDestroy(stream);
+}
+
+
 }  // namespace
 }  // namespace iom::cuda_detail
 
@@ -710,7 +719,7 @@ public:
         worker_.shutdown_and_drain();
         try {
             gpu_policy::activate(context_);
-            gpu_policy::destroy_queue_stream_noexcept(stream_);
+            synchronize_and_destroy_stream(stream_);
         } catch (...) {
         }
         stream_ = gpu_policy::null_stream();
