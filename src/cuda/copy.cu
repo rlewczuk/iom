@@ -38,7 +38,7 @@ void check_cuda(const char* operation, CUresult status) {
     }
 }
 
-void check_kernel(const char* operation, cudaError_t status) {
+void check_cuda_kernel(const char* operation, cudaError_t status) {
     if (status != cudaSuccess) {
         throw std::runtime_error(
                 std::string(operation) + " failed with "
@@ -67,7 +67,7 @@ struct gpu_policy {
 
     [[nodiscard]] static stream_type create_queue_stream() {
         stream_type stream = nullptr;
-        check_kernel(
+        check_cuda_kernel(
                 "cudaStreamCreateWithFlags",
                 cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         return stream;
@@ -88,15 +88,15 @@ struct gpu_policy {
     static void destroy_transfer_stream_noexcept(stream_type) noexcept {}
     static void synchronize_stream_noexcept(stream_type) noexcept {}
     static void synchronize_stream(stream_type stream) {
-        check_kernel("cudaStreamSynchronize", cudaStreamSynchronize(stream));
+        check_cuda_kernel("cudaStreamSynchronize", cudaStreamSynchronize(stream));
     }
 
     static void create_event(event_type* event) {
         if (consume_submission_fault(SubmissionFault::event_create)) {
-            check_kernel(
+            check_cuda_kernel(
                     "cudaEventCreateWithFlags", cudaErrorInvalidValue);
         }
-        check_kernel(
+        check_cuda_kernel(
                 "cudaEventCreateWithFlags",
                 cudaEventCreateWithFlags(event, cudaEventDisableTiming));
     }
@@ -109,14 +109,14 @@ struct gpu_policy {
         }
     }
     static void synchronize_event(event_type event) {
-        check_kernel("cudaEventSynchronize", cudaEventSynchronize(event));
+        check_cuda_kernel("cudaEventSynchronize", cudaEventSynchronize(event));
     }
     static void record_event(event_type event, stream_type stream) {
         cudaError_t status = cudaEventRecord(event, stream);
         if (consume_submission_fault(SubmissionFault::event_record)) {
             status = cudaErrorInvalidValue;
         }
-        check_kernel("cudaEventRecord", status);
+        check_cuda_kernel("cudaEventRecord", status);
     }
     static void record_event_no_fault(
             event_type event, stream_type stream) noexcept {
@@ -140,30 +140,30 @@ struct gpu_policy {
     static void copy_from_host(
             stream_type, void* destination, const void* source,
             std::size_t bytes) {
-        check_kernel(
+        check_cuda_kernel(
                 "cudaMemcpy HtoD",
                 cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
     }
     static void copy_to_host(
             stream_type, void* destination, const void* source,
             std::size_t bytes) {
-        check_kernel(
+        check_cuda_kernel(
                 "cudaMemcpy DtoH",
                 cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost));
     }
     static void memset(
             stream_type, void* destination, std::size_t bytes) {
-        check_kernel("cudaMemset", cudaMemset(destination, 0, bytes));
+        check_cuda_kernel("cudaMemset", cudaMemset(destination, 0, bytes));
     }
 
     static void check_kernel(const char* operation) {
-        ::iom::cuda_detail::check_kernel(operation, cudaGetLastError());
+        ::iom::cuda_detail::check_cuda_kernel(operation, cudaGetLastError());
     }
     static void after_copy_plane_launch(std::size_t plane_index) {
         if (plane_index == 2
                 && consume_submission_fault(
                         SubmissionFault::third_plane_launch)) {
-            ::iom::cuda_detail::check_kernel(
+            ::iom::cuda_detail::check_cuda_kernel(
                     copy_kernel_operation(), cudaErrorInvalidValue);
         }
     }

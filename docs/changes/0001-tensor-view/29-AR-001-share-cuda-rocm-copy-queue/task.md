@@ -1,4 +1,4 @@
-**Status:** blocked
+**Status:** done
 
 ## Summary
 
@@ -10,7 +10,9 @@ policy front ends, the existing CUDA driver-call seam, and CMake source-list
 entries. Fixed ROCm staging zeroing to use the operation stream, avoiding a
 default-stream race with the nonblocking gather stream. Unoptimized ROCm
 builds now use the minimum `-O1` device optimization required to avoid
-unsupported hostcall code objects on the target APU.
+unsupported hostcall code objects on the target APU. Disambiguated the CUDA
+runtime error checker from the policy launch-check hook so the shared frontend
+compiles with nvcc.
 
 ## Verification
 
@@ -20,16 +22,12 @@ unsupported hostcall code objects on the target APU.
   `std::overflow_error` with the required message.
 - Clean pre-change `main`, configured as ROCm Release on `bv2`, reproduced the
   original ROCm logical transfer mismatch for `DataType::BOOL` at byte 1.
-- Fixed branch, configured on `bv2` both without `CMAKE_BUILD_TYPE` and as
-  Release, built all targets and passed `ctest --test-dir build
-  --output-on-failure`: 6/6 tests in each configuration, including ROCm
-  conformance and backend coexistence.
+- Fixed branch, configured on `bv2` without `CMAKE_BUILD_TYPE`, as Debug, and
+  as Release, built and passed the ROCm conformance suite; the full default
+  and Release CTest runs each passed 6/6 tests.
+- Fixed branch, configured on `bv1` with CUDA enabled, built all targets and
+  passed `ctest --test-dir build --output-on-failure`: 6/6 tests, including
+  CUDA conformance and backend coexistence.
 - Source audit — no vendor tokens in shared files, exactly one shared inclusion
   per CUDA/ROCm frontend, no backend duplicate tiled-copy or queue definitions,
   one staging-size helper, and the exact five-field shared `Task`.
-
-## Errors
-
-- CUDA remote synchronization via `remote-sync cuda ar001` — `Host key
-  verification failed`; CUDA configure, build, and conformance verification
-  remain unavailable. Do not accept the unknown host key automatically.
