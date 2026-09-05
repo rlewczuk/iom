@@ -44,11 +44,21 @@ struct DriverCallProbe {
     CUcontext retained_context = nullptr;
     std::size_t release_count = 0;
     CUdevice released_device = 0;
+    std::size_t primary_ctx_retain_count = 0;
+    std::size_t init_count = 0;
+    std::size_t device_get_count_count = 0;
+    int device_get_count_value = 0;
+    CUdevice device_get_device = 0;
+    int device_get_ordinal = -1;
+    std::size_t ctx_set_current_count = 0;
 };
 
 DriverCallProbe* active_probe = nullptr;
 
 CUresult counting_primary_ctx_retain(CUcontext* context, CUdevice device) {
+    if (active_probe != nullptr) {
+        ++active_probe->primary_ctx_retain_count;
+    }
     const CUresult status = cuDevicePrimaryCtxRetain(context, device);
     if (status == CUDA_SUCCESS && active_probe != nullptr) {
         active_probe->retained = true;
@@ -63,6 +73,9 @@ CUresult failing_ctx_set_current(CUcontext) {
 }
 
 CUresult pass_through_ctx_set_current(CUcontext context) {
+    if (active_probe != nullptr) {
+        ++active_probe->ctx_set_current_count;
+    }
     return cuCtxSetCurrent(context);
 }
 
@@ -72,6 +85,35 @@ CUresult counting_primary_ctx_release(CUdevice device) {
         active_probe->released_device = device;
     }
     return cuDevicePrimaryCtxRelease(device);
+}
+
+CUresult counting_init(unsigned int flags) {
+    if (active_probe != nullptr) {
+        ++active_probe->init_count;
+    }
+    return cuInit(flags);
+}
+
+CUresult counting_device_get_count(int* count) {
+    const CUresult status = cuDeviceGetCount(count);
+    if (active_probe != nullptr) {
+        ++active_probe->device_get_count_count;
+        if (status == CUDA_SUCCESS) {
+            active_probe->device_get_count_value = *count;
+        }
+    }
+    return status;
+}
+
+CUresult counting_device_get(CUdevice* device, int ordinal) {
+    const CUresult status = cuDeviceGet(device, ordinal);
+    if (active_probe != nullptr) {
+        active_probe->device_get_ordinal = ordinal;
+        if (status == CUDA_SUCCESS) {
+            active_probe->device_get_device = *device;
+        }
+    }
+    return status;
 }
 
 class DriverCallsRestore final {
@@ -215,6 +257,9 @@ TEST_CASE("CUDA factory releases retained context when activation fails") {
     calls.primary_ctx_retain = &counting_primary_ctx_retain;
     calls.ctx_set_current = &failing_ctx_set_current;
     calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
     UnusedAllocator allocator;
@@ -249,6 +294,9 @@ TEST_CASE("CUDA factory releases retained context when device allocation fails")
     calls.primary_ctx_retain = &counting_primary_ctx_retain;
     calls.ctx_set_current = &pass_through_ctx_set_current;
     calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
     UnusedAllocator allocator;
@@ -283,6 +331,9 @@ TEST_CASE("CUDA factory dismisses the primary-context guard on success") {
     calls.primary_ctx_retain = &counting_primary_ctx_retain;
     calls.ctx_set_current = &pass_through_ctx_set_current;
     calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
     UnusedAllocator allocator;
@@ -294,4 +345,39 @@ TEST_CASE("CUDA factory dismisses the primary-context guard on success") {
     CHECK(probe.retained);
     CHECK(probe.release_count == 1);
     CHECK(probe.released_device == probe.retained_device);
+}
+
+TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+
+    int device_count = 0;
+    REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
+    REQUIRE(device_count > 0);
+
+    DriverCallsRestore restore;
+    DriverCallProbe probe;
+    active_probe = &probe;
+    auto calls = iom::cuda_detail::driver_calls;
+    calls.primary_ctx_retain = &counting_primary_ctx_retain;
+    calls.ctx_set_current = &pass_through_ctx_set_current;
+    calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
+    iom::cuda_detail::driver_calls = calls;
+
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    REQUIRE(device != nullptr);
+    CHECK(probe.init_count == 1);
+    CHECK(probe.device_get_count_count == 1);
+    CHECK(probe.device_get_count_value > 0);
+    CHECK(probe.device_get_count_value == probe.device_get_ordinal + 1);
+    CHECK(probe.primary_ctx_retain_count == 1);
+    CHECK(probe.retained);
+    CHECK(probe.ctx_set_current_count >= 1);
+    CHECK(probe.release_count == 0);
+
+    device.reset();
+    CHECK(probe.release_count == 1);
 }
