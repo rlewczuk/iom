@@ -8,6 +8,7 @@ Implemented a device-owned CUDA `TransferStreamPool` with exclusive non-blocking
 
 - `cmake -S . -B build/cuda-st005 -DBUILD_TESTING=ON -DCUDA_ENABLED=ON -DROCM_ENABLED=OFF -DSYCL_ENABLED=OFF -DTTNN_ENABLED=OFF -DCUDA_PATH=/usr/local/cuda && cmake --build build/cuda-st005 --target iom_cuda_smoke_tests iom_cuda_conformance_tests` — passed on CUDA host `bv1` after merging the current integration branch.
 - `ctest --test-dir build/cuda-st005 --output-on-failure -R "^iom_cuda_(smoke|conformance)_tests$"` — 2/2 tests passed.
+- The same CUDA build and CTest command was rerun after the latest integration merge — passed; both CUDA targets built and both tests passed.
 - `nsys profile --stats=true --output=st005-overlap-final ./build/cuda-st005/test/iom_cuda_smoke_tests --test-case="CUDA host transfers on independent threads do not share a stream"` — passed; exported synchronization data showed distinct streams 13 and 14 with overlapping intervals, including stream 14 `[359920897,359954811]` and stream 13 `[359945243,359971644]`.
 - `nsys profile --stats=true --output=st005-multi-queue-final ./build/cuda-st005/test/iom_cuda_smoke_tests --test-case="CUDA host transfers from multiple queues on one device share the transfer-stream pool"` — passed.
 - `nsys profile --stats=true --output=st005-errored-final ./build/cuda-st005/test/iom_cuda_smoke_tests --test-case="CUDA errored host transfer drops its stream from the pool"` — passed.
