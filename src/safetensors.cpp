@@ -177,29 +177,13 @@ SafeTensorsFile::SafeTensorsFile(const std::string& filename)
                 "safetensors tensor range out of order or overlapping: " + name);
         }
 
-        keys_.push_back(name);
-        tensors_.emplace(name, SafeTensorView(dtype, std::move(shape),
-                                              data_begin + begin, end - begin));
+        base_.insert(name, SafeTensorView(dtype, std::move(shape),
+                                           data_begin + begin, end - begin));
         prev_end = end;
         first_entry = false;
     }
 }
 
-SafeTensorView SafeTensorsFile::operator[](const std::string& name) const {
-    const auto it = tensors_.find(name);
-    if (it == tensors_.end()) {
-        throw std::out_of_range("safetensors tensor not found: " + name);
-    }
-    return it->second;
-}
-
-size_t SafeTensorsFile::size() const {
-    return tensors_.size();
-}
-
-const std::vector<std::string>& SafeTensorsFile::keys() const {
-    return keys_;
-}
 
 SafeTensorsDir::SafeTensorsDir(const std::string& dirname) {
     std::vector<std::filesystem::path> paths;
@@ -214,34 +198,19 @@ SafeTensorsDir::SafeTensorsDir(const std::string& dirname) {
         auto file = std::make_unique<SafeTensorsFile>(path.string());
         const std::string path_str = path.string();
         for (const auto& key : file->keys()) {
-            const auto [it, inserted] = tensors_.emplace(key, (*file)[key]);
-            if (!inserted) {
+            const bool inserted = base_.insert(key, (*file)[key]);
+            if (inserted) {
+                existing_shard_paths_.emplace(key, path_str);
+            } else {
                 throw std::runtime_error(
                     "safetensors duplicate tensor key across shards: '" + key +
                     "' in " + path_str +
                     " (already loaded from " + existing_shard_paths_.at(key) + ")");
             }
-            existing_shard_paths_.emplace(key, path_str);
-            keys_.push_back(key);
         }
         files_.push_back(std::move(file));
     }
 }
 
-SafeTensorView SafeTensorsDir::operator[](const std::string& name) const {
-    const auto it = tensors_.find(name);
-    if (it == tensors_.end()) {
-        throw std::out_of_range("safetensors tensor not found: " + name);
-    }
-    return it->second;
-}
-
-size_t SafeTensorsDir::size() const {
-    return tensors_.size();
-}
-
-const std::vector<std::string>& SafeTensorsDir::keys() const {
-    return keys_;
-}
 
 }  // namespace ec
