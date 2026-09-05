@@ -471,8 +471,10 @@ TEST_CASE("TTNN conformance: storage oracle covers every leaf width and padded s
 TEST_CASE("TTNN conformance: asynchronous copies against the CPU reference") {
     require_hardware();
     TtnnDevices devices;
+    TtnnStorageOracle oracle;
     iom_conformance::run_async_copy_conformance(
-            devices.conformance(), iom::ttnn_supported_data_types());
+            devices.conformance(), iom::ttnn_supported_data_types(), nullptr,
+            &oracle);
 }
 
 TEST_CASE("TTNN conformance: copy validation fails before writes and sequences") {
@@ -508,6 +510,7 @@ TEST_CASE("TTNN conformance: full shared suite") {
     TtnnDevices devices;
     const std::span<const iom::DataType> supported =
             iom::ttnn_supported_data_types();
+    TtnnStorageOracle oracle;
     iom_conformance::run_backend_conformance(
-            devices.conformance(), supported.subspan(0, 1));
+            devices.conformance(), supported.subspan(0, 1), nullptr, &oracle);
 }

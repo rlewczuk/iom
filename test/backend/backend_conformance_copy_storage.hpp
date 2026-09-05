@@ -452,10 +452,13 @@ inline void run_storage_and_transfer_conformance(
 // submission chain and full, offset, stepped, permuted, nested, and
 // identical-window copies on both devices; destination logical bytes are
 // compared bit-for-bit against the independently generated source encoding.
+// Accelerator callers can additionally provide a native storage oracle, which
+// checks the complete candidate owner allocation after every queued copy.
 inline void run_async_copy_conformance(
         const ConformanceDevices& devices,
         const std::span<const iom::DataType> supported_types,
-        ConformanceObserver* observer = nullptr) {
+        ConformanceObserver* observer = nullptr,
+        AcceleratorStorageOracle* oracle = nullptr) {
     for (const iom::DataType type : supported_types) {
         CAPTURE(static_cast<int>(type));
 
@@ -540,7 +543,41 @@ inline void run_async_copy_conformance(
                         encode_logical(candidate_source_view.spec(), salt);
                 ++salt;
                 reference_source_view.copy_from_host(pattern);
-                candidate_source_view.copy_from_host(pattern);
+
+                std::vector<std::byte> initial_source;
+                std::vector<std::byte> initial_destination;
+                if (oracle != nullptr) {
+                    initial_source = encode_standard_tiled_storage(spec);
+                    apply_standard_tiled_view(
+                            candidate_source_view, spec, pattern, initial_source);
+                    initial_destination = encode_standard_tiled_storage(spec);
+
+                    oracle->set_owner_spec(spec);
+                    oracle->seed(candidate_source->view(), initial_source);
+                    oracle->set_owner_spec(spec);
+                    const std::vector<std::byte> observed_source_seed =
+                            oracle->observe(candidate_source->view());
+                    require_storage_oracle_bytes(
+                            observed_source_seed, initial_source,
+                            std::string("candidate oracle source seed ")
+                                    + copy_case.label,
+                            true);
+
+                    oracle->set_owner_spec(spec);
+                    oracle->seed(
+                            candidate_destination->view(),
+                            initial_destination);
+                    oracle->set_owner_spec(spec);
+                    const std::vector<std::byte> observed_destination_seed =
+                            oracle->observe(candidate_destination->view());
+                    require_storage_oracle_bytes(
+                            observed_destination_seed, initial_destination,
+                            std::string("candidate oracle destination seed ")
+                                    + copy_case.label,
+                            true);
+                } else {
+                    candidate_source_view.copy_from_host(pattern);
+                }
 
                 const iom::oid reference_token = reference_queue->copy(
                         reference_source_view, reference_destination_view);
@@ -555,6 +592,32 @@ inline void run_async_copy_conformance(
                 require_logical_bytes(
                         candidate_destination_view, pattern,
                         std::string("candidate ") + copy_case.label);
+
+                if (oracle != nullptr) {
+                    std::vector<std::byte> expected_destination =
+                            initial_destination;
+                    apply_standard_tiled_view(
+                            candidate_destination_view, spec, pattern,
+                            expected_destination);
+
+                    oracle->set_owner_spec(spec);
+                    const std::vector<std::byte> observed_destination =
+                            oracle->observe(candidate_destination->view());
+                    require_storage_oracle_bytes(
+                            observed_destination, expected_destination,
+                            std::string("candidate oracle destination ")
+                                    + copy_case.label,
+                            true);
+
+                    oracle->set_owner_spec(spec);
+                    const std::vector<std::byte> observed_source =
+                            oracle->observe(candidate_source->view());
+                    require_storage_oracle_bytes(
+                            observed_source, initial_source,
+                            std::string("candidate oracle source ")
+                                    + copy_case.label,
+                            true);
+                }
             }
 
             // Every successful submission was waited; queues die explicitly.

@@ -312,9 +312,10 @@ TEST_CASE("CUDA conformance: storage oracle covers every leaf width and padded s
 TEST_CASE("CUDA conformance: asynchronous copies against the CPU reference") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
+    CudaStorageOracle oracle;
     iom_conformance::run_async_copy_conformance(
             devices.conformance(), devices.candidate->supported_data_types(),
-            &devices.gate);
+            &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -357,10 +358,11 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
 TEST_CASE("CUDA conformance: full shared suite") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
+    CudaStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate);
+            &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 
