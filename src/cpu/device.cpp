@@ -665,10 +665,19 @@ namespace iom {
     class CpuQueue final : public DeviceOps {
         struct Task {
             std::uint64_t sequence;
-            const TensorView* source;
-            TensorView* destination;
+            TensorView source;
+            TensorView destination;
             bool no_op;
             void* fence = nullptr;
+
+            Task(std::uint64_t sequence_,
+                 const TensorView& source_,
+                 TensorView& destination_,
+                 bool no_op_)
+                : sequence(sequence_),
+                  source(source_),
+                  destination(destination_),
+                  no_op(no_op_) {}
         };
 
     public:
@@ -679,8 +688,8 @@ namespace iom {
                                   [this](Task& task) {
                                       if (!task.no_op) {
                                           copy_elements(
-                                                  *task.source,
-                                                  *task.destination);
+                                                  task.source,
+                                                  task.destination);
                                       }
                                   },
                                   [](void*) {},
@@ -707,8 +716,8 @@ namespace iom {
             return submit(
                     [this, &source, &destination, no_op](
                             std::uint64_t sequence) {
-                        worker_.submit_copy(
-                                Task{sequence, &source, &destination, no_op});
+                        Task task(sequence, source, destination, no_op);
+                        worker_.submit_copy(std::move(task));
                     });
         }
 
