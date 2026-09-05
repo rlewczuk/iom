@@ -7,6 +7,7 @@
 #include <ttnn/tensor/tensor_ops.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -266,12 +267,19 @@ namespace iom {
         class TtnnQueue final : public DeviceOps {
             struct Task {
                 std::uint64_t sequence;
-                const TensorView* source;
-                const ttnn::Tensor* source_planes;
-                TensorView* destination;
-                ttnn::Tensor* destination_planes;
+                TensorView source;
+                TensorView destination;
                 bool no_op;
                 void* fence = nullptr;
+
+                Task(std::uint64_t sequence_,
+                     const TensorView& source_,
+                     TensorView& destination_,
+                     bool no_op_)
+                    : sequence(sequence_),
+                      source(source_),
+                      destination(destination_),
+                      no_op(no_op_) {}
             };
 
         public:
@@ -284,14 +292,19 @@ namespace iom {
                                               std::lock_guard<std::mutex>
                                                       api_lock(
                                                               device_->api_mutex());
+                                              const ttnn::Tensor* source_planes =
+                                                      static_cast<const ttnn::Tensor*>(
+                                                              task.source
+                                                                      .native_handle());
+                                              ttnn::Tensor* destination_planes =
+                                                      static_cast<ttnn::Tensor*>(
+                                                              task.destination
+                                                                      .native_handle());
                                               ttnn_detail::copy_planes(
-                                                      *task.source,
-                                                      task.source_planes,
-                                                      *task.destination,
-                                                      task.destination_planes);
-                                              device_->mesh()
-                                                      .mesh_command_queue(0)
-                                                      .finish();
+                                                      task.source,
+                                                      source_planes,
+                                                      task.destination,
+                                                      destination_planes);
                                           }
                                       },
                                       [](void*) {},
@@ -322,15 +335,8 @@ namespace iom {
                 return submit(
                         [this, &source, &destination, no_op](
                                 std::uint64_t sequence) {
-                            worker_.submit_copy(Task{
-                                    sequence,
-                                    &source,
-                                    static_cast<const ttnn::Tensor*>(
-                                            source.native_handle()),
-                                    &destination,
-                                    static_cast<ttnn::Tensor*>(
-                                            destination.native_handle()),
-                                    no_op});
+                            Task task(sequence, source, destination, no_op);
+                            worker_.submit_copy(std::move(task));
                         });
             }
 
@@ -369,7 +375,33 @@ namespace iom {
             TtnnDevice* device_;
             std::mutex submission_order_mutex_;
             detail::StagedWorker<Task> worker_;
+            std::mutex fence_mutex_;
+            std::atomic<std::uint64_t> last_finished_seq_{0};
+            void fence_through_sequence(
+                    std::uint64_t sequence) noexcept override;
         };
+        void TtnnQueue::fence_through_sequence(
+                std::uint64_t sequence) noexcept {
+            std::lock_guard<std::mutex> fence_lock(fence_mutex_);
+            const std::uint64_t now =
+                    last_finished_seq_.load(std::memory_order_acquire);
+            if (sequence <= now) {
+                return;
+            }
+            try {
+                {
+                    std::lock_guard<std::mutex> api_lock(
+                            device_->api_mutex());
+                    device_->mesh().mesh_command_queue(0).finish();
+                }
+                last_finished_seq_.store(
+                        sequence, std::memory_order_release);
+            } catch (...) {
+                record_post_completion_failure(
+                        sequence, std::current_exception());
+            }
+        }
+
 
     }  // namespace
 
