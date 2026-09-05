@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +53,41 @@ public:
     virtual const std::vector<std::string>& keys() const = 0;
 };
 
+namespace detail {
+
+class SafeTensorsStoreBase {
+public:
+    bool insert(const std::string& name, const SafeTensorView& view) {
+        auto [it, inserted] = tensors_.emplace(name, view);
+        if (inserted) {
+            keys_.push_back(name);
+        }
+        return inserted;
+    }
+
+    const SafeTensorView& at(const std::string& name) const {
+        auto it = tensors_.find(name);
+        if (it == tensors_.end()) {
+            throw std::out_of_range("safetensors tensor not found: " + name);
+        }
+        return it->second;
+    }
+
+    size_t size() const noexcept {
+        return tensors_.size();
+    }
+
+    const std::vector<std::string>& keys() const noexcept {
+        return keys_;
+    }
+
+private:
+    std::unordered_map<std::string, SafeTensorView> tensors_;
+    std::vector<std::string> keys_;
+};
+
+}  // namespace detail
+
 class SafeTensorsFile : public SafeTensorsStore {
 public:
     explicit SafeTensorsFile(const std::string& filename);
@@ -60,18 +96,17 @@ public:
     SafeTensorsFile& operator=(const SafeTensorsFile&) = delete;
 
     [[nodiscard]]
-    SafeTensorView operator[](const std::string& name) const override;
+    SafeTensorView operator[](const std::string& name) const override { return base_.at(name); }
 
     [[nodiscard]]
-    size_t size() const override;
+    size_t size() const override { return base_.size(); }
 
     [[nodiscard]]
-    const std::vector<std::string>& keys() const override;
+    const std::vector<std::string>& keys() const override { return base_.keys(); }
 
 private:
     MappedFile file_;
-    std::unordered_map<std::string, SafeTensorView> tensors_;
-    std::vector<std::string> keys_;
+    iom::detail::SafeTensorsStoreBase base_;
 };
 
 class SafeTensorsDir : public SafeTensorsStore {
@@ -82,18 +117,17 @@ public:
     SafeTensorsDir& operator=(const SafeTensorsDir&) = delete;
 
     [[nodiscard]]
-    SafeTensorView operator[](const std::string& name) const override;
+    SafeTensorView operator[](const std::string& name) const override { return base_.at(name); }
 
     [[nodiscard]]
-    size_t size() const override;
+    size_t size() const override { return base_.size(); }
 
     [[nodiscard]]
-    const std::vector<std::string>& keys() const override;
+    const std::vector<std::string>& keys() const override { return base_.keys(); }
 
 private:
     std::vector<std::unique_ptr<SafeTensorsFile>> files_;
-    std::unordered_map<std::string, SafeTensorView> tensors_;
-    std::vector<std::string> keys_;
+    iom::detail::SafeTensorsStoreBase base_;
     std::unordered_map<std::string, std::string> existing_shard_paths_;
 };
 
