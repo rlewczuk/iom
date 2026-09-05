@@ -1,6 +1,7 @@
 #include "standard_tiled_copy.hpp"
 
 #include <algorithm>
+#include <cstdint>
 
 #include "iom/gpu_algorithm.hpp"
 
@@ -13,12 +14,6 @@
 #ifndef IOM_GPU_GLOBAL_INDEX
 #error "IOM_GPU_GLOBAL_INDEX must be defined before including standard_tiled_copy.inl"
 #endif
-#ifndef IOM_GPU_ATOMIC_OR
-#error "IOM_GPU_ATOMIC_OR must be defined before including standard_tiled_copy.inl"
-#endif
-#ifndef IOM_GPU_ATOMIC_AND
-#error "IOM_GPU_ATOMIC_AND must be defined before including standard_tiled_copy.inl"
-#endif
 #ifndef IOM_LAUNCH_KERNEL
 #error "IOM_LAUNCH_KERNEL must be defined before including standard_tiled_copy.inl"
 #endif
@@ -26,44 +21,51 @@
 namespace iom::detail {
 namespace {
 
-constexpr std::size_t kTile = TensorSpec::TILE;
+constexpr std::uint64_t kTile = TensorSpec::TILE;
+constexpr std::uint64_t kTileSlots = kTile * kTile;
 constexpr unsigned int kThreads = 256;
-constexpr std::size_t kLaunchChunk = 1u << 20;
+constexpr unsigned int kMaxBlocks = 65535;
 
-IOM_GPU_DEVICE std::uint64_t read_bits(
-        const unsigned char* base, std::uint64_t bit_offset,
-        unsigned int bits) {
-    std::uint64_t value = 0;
-    for (unsigned int i = 0; i < bits; ++i) {
-        const std::uint64_t bit = bit_offset + i;
-        value |= static_cast<std::uint64_t>(
-                         (base[bit / 8] >> (bit % 8)) & 1)
-                << i;
-    }
-    return value;
+struct WordPair {
+    std::uint32_t low;
+    std::uint32_t high;
+};
+
+IOM_GPU_DEVICE std::uint32_t field_mask(unsigned int bits) {
+    return bits == 32 ? 0xffffffffu : ((std::uint32_t{1} << bits) - 1);
 }
 
-IOM_GPU_DEVICE void write_bits(
-        unsigned char* base, std::uint64_t bit_offset, unsigned int bits,
-        std::uint64_t value) {
-    if (bits % 8 == 0) {
-        unsigned char* destination = base + bit_offset / 8;
-        for (unsigned int i = 0; i < bits / 8; ++i) {
-            destination[i] = static_cast<unsigned char>(value >> (i * 8));
-        }
-        return;
+IOM_GPU_DEVICE std::uint32_t read_field_extracted(
+        const std::uint32_t* source_word_ptr, unsigned int bit_offset,
+        unsigned int bits) {
+    std::uint64_t joined = source_word_ptr[0];
+    if (bit_offset + bits > 32) {
+        joined |= static_cast<std::uint64_t>(source_word_ptr[1]) << 32;
     }
-    for (unsigned int i = 0; i < bits; ++i) {
-        const std::uint64_t bit = bit_offset + i;
-        auto* word = reinterpret_cast<unsigned int*>(
-                base + (bit / 32) * sizeof(unsigned int));
-        const unsigned int mask = 1u << (bit % 32);
-        if ((value >> i) & 1) {
-            IOM_GPU_ATOMIC_OR(word, mask);
-        } else {
-            IOM_GPU_ATOMIC_AND(word, ~mask);
-        }
-    }
+    return static_cast<std::uint32_t>(
+            (joined >> bit_offset) & field_mask(bits));
+}
+
+IOM_GPU_DEVICE void read_field_pair_64(
+        const std::uint32_t* low_word_ptr,
+        const std::uint32_t* high_word_ptr, std::uint32_t& low,
+        std::uint32_t& high) {
+    low = *low_word_ptr;
+    high = *high_word_ptr;
+}
+
+IOM_GPU_DEVICE void merge_field(
+        std::uint32_t& destination_word, std::uint32_t value,
+        unsigned int bit_offset, unsigned int bits) {
+    const std::uint32_t mask = field_mask(bits) << bit_offset;
+    destination_word =
+            (destination_word & ~mask) | ((value << bit_offset) & mask);
+}
+
+IOM_GPU_DEVICE void store_word(
+        std::uint32_t* destination_word_ptr,
+        std::uint32_t destination_word) {
+    *destination_word_ptr = destination_word;
 }
 
 IOM_GPU_DEVICE std::uint64_t plane_slot(
@@ -74,64 +76,235 @@ IOM_GPU_DEVICE std::uint64_t plane_slot(
     const std::uint64_t tile_index =
             plane * tile_rows * tile_columns
             + (row / kTile) * tile_columns + column / kTile;
-    return tile_index * kTile * kTile
+    return tile_index * kTileSlots
             + (row % kTile) * kTile + column % kTile;
 }
 
-IOM_GPU_DEVICE void copy_value(
-        unsigned char* destination, std::uint64_t destination_bit,
-        const unsigned char* source, std::uint64_t source_bit,
+struct PhysicalCoordinate {
+    std::uint64_t row;
+    std::uint64_t column;
+};
+
+IOM_GPU_DEVICE PhysicalCoordinate physical_coordinate(
+        std::uint64_t slot, std::uint64_t rows, std::uint64_t columns) {
+    const std::uint64_t tile_columns = (columns + kTile - 1) / kTile;
+    const std::uint64_t tile_index = slot / kTileSlots;
+    const std::uint64_t in_tile = slot % kTileSlots;
+    return PhysicalCoordinate{
+            (tile_index / tile_columns) * kTile + in_tile / kTile,
+            (tile_index % tile_columns) * kTile + in_tile % kTile};
+}
+
+IOM_GPU_DEVICE void merge_overlapping_field(
+        std::uint32_t& destination_word, const unsigned char* source,
+        std::uint64_t source_bit, std::uint64_t destination_bit,
+        std::uint64_t word_first_bit, std::uint64_t word_end_bit,
         unsigned int bits) {
-    if (bits % 8 == 0) {
-        const std::uint64_t destination_byte = destination_bit / 8;
-        const std::uint64_t source_byte = source_bit / 8;
-        for (unsigned int i = 0; i < bits / 8; ++i) {
-            destination[destination_byte + i] = source[source_byte + i];
-        }
+    const std::uint64_t field_end = destination_bit + bits;
+    const std::uint64_t overlap_first =
+            destination_bit > word_first_bit
+            ? destination_bit
+            : word_first_bit;
+    const std::uint64_t overlap_end =
+            field_end < word_end_bit ? field_end : word_end_bit;
+    if (overlap_first >= overlap_end) {
         return;
     }
-    write_bits(
-            destination, destination_bit, bits,
-            read_bits(source, source_bit, bits));
+    const unsigned int destination_offset = static_cast<unsigned int>(
+            overlap_first - word_first_bit);
+    const unsigned int source_offset = static_cast<unsigned int>(
+            overlap_first - destination_bit);
+    const unsigned int part_bits = static_cast<unsigned int>(
+            overlap_end - overlap_first);
+    const auto* source_words =
+            reinterpret_cast<const std::uint32_t*>(source);
+    if (bits == 64) {
+        std::uint32_t low = 0;
+        std::uint32_t high = 0;
+        const std::uint64_t source_word = source_bit / 32;
+        read_field_pair_64(
+                source_words + source_word, source_words + source_word + 1,
+                low, high);
+        const std::uint32_t value = source_offset < 32 ? low : high;
+        merge_field(destination_word, value, destination_offset, part_bits);
+        return;
+    }
+    const std::uint32_t value = read_field_extracted(
+            source_words + source_bit / 32,
+            static_cast<unsigned int>(source_bit % 32), bits);
+    merge_field(
+            destination_word, value >> source_offset, destination_offset,
+            part_bits);
+}
+
+IOM_GPU_DEVICE void copy_tiled_to_tiled_word(
+        const unsigned char* source, unsigned char* destination,
+        std::uint64_t source_plane, std::uint64_t destination_plane,
+        std::uint64_t word_in_plane, std::uint64_t rows,
+        std::uint64_t columns, unsigned int bits) {
+    const std::uint64_t padded_rows = (rows + kTile - 1) / kTile * kTile;
+    const std::uint64_t padded_columns =
+            (columns + kTile - 1) / kTile * kTile;
+    const std::uint64_t padded_elements = padded_rows * padded_columns;
+    const std::uint64_t plane_bits = padded_elements * bits;
+    const std::uint64_t word_first_bit = word_in_plane * 32;
+    const std::uint64_t word_end_bit =
+            word_first_bit + 32 < plane_bits
+            ? word_first_bit + 32
+            : plane_bits;
+    const std::uint64_t first_slot = word_first_bit / bits;
+    const std::uint64_t last_slot =
+            (word_end_bit + bits - 1) / bits;
+    const std::uint64_t destination_base_word =
+            plane_slot(destination_plane, 0, 0, rows, columns) * bits / 32;
+    auto* destination_words =
+            reinterpret_cast<std::uint32_t*>(destination)
+            + destination_base_word + word_in_plane;
+    std::uint32_t destination_word = *destination_words;
+    for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
+        const PhysicalCoordinate coordinate =
+                physical_coordinate(slot, rows, columns);
+        if (coordinate.row >= rows || coordinate.column >= columns) {
+            continue;
+        }
+        const std::uint64_t source_bit =
+                plane_slot(
+                        source_plane, coordinate.row, coordinate.column, rows,
+                        columns)
+                * bits;
+        const std::uint64_t destination_bit =
+                plane_slot(
+                        destination_plane, coordinate.row, coordinate.column,
+                        rows, columns)
+                * bits;
+        merge_overlapping_field(
+                destination_word, source, source_bit, destination_bit,
+                word_first_bit + destination_base_word * 32,
+                word_end_bit + destination_base_word * 32, bits);
+    }
+    store_word(destination_words, destination_word);
+}
+
+IOM_GPU_DEVICE void copy_logical_to_tiled_word(
+        const unsigned char* source, unsigned char* destination,
+        std::uint64_t destination_plane, std::uint64_t logical_base,
+        std::uint64_t word_in_plane, std::uint64_t rows,
+        std::uint64_t columns, unsigned int bits) {
+    const std::uint64_t padded_rows = (rows + kTile - 1) / kTile * kTile;
+    const std::uint64_t padded_columns =
+            (columns + kTile - 1) / kTile * kTile;
+    const std::uint64_t padded_elements = padded_rows * padded_columns;
+    const std::uint64_t plane_bits = padded_elements * bits;
+    const std::uint64_t word_first_bit = word_in_plane * 32;
+    const std::uint64_t word_end_bit =
+            word_first_bit + 32 < plane_bits
+            ? word_first_bit + 32
+            : plane_bits;
+    const std::uint64_t first_slot = word_first_bit / bits;
+    const std::uint64_t last_slot =
+            (word_end_bit + bits - 1) / bits;
+    const std::uint64_t destination_base_word =
+            plane_slot(destination_plane, 0, 0, rows, columns) * bits / 32;
+    auto* destination_words =
+            reinterpret_cast<std::uint32_t*>(destination)
+            + destination_base_word + word_in_plane;
+    std::uint32_t destination_word = *destination_words;
+    for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
+        const PhysicalCoordinate coordinate =
+                physical_coordinate(slot, rows, columns);
+        if (coordinate.row >= rows || coordinate.column >= columns) {
+            continue;
+        }
+        const std::uint64_t source_bit =
+                (logical_base
+                 + coordinate.row * columns + coordinate.column)
+                * bits;
+        const std::uint64_t destination_bit =
+                plane_slot(
+                        destination_plane, coordinate.row, coordinate.column,
+                        rows, columns)
+                * bits;
+        merge_overlapping_field(
+                destination_word, source, source_bit, destination_bit,
+                word_first_bit + destination_base_word * 32,
+                word_end_bit + destination_base_word * 32, bits);
+    }
+    store_word(destination_words, destination_word);
+}
+
+IOM_GPU_DEVICE void copy_tiled_to_logical_word(
+        const unsigned char* source, unsigned char* destination,
+        std::uint64_t source_plane, std::uint64_t logical_base,
+        std::uint64_t word, std::uint64_t rows, std::uint64_t columns,
+        unsigned int bits) {
+    const std::uint64_t elements = rows * columns;
+    const std::uint64_t logical_first_bit = logical_base * bits;
+    const std::uint64_t logical_end_bit =
+            (logical_base + elements) * bits;
+    const std::uint64_t word_first_bit = word * 32;
+    if (word_first_bit >= logical_end_bit) {
+        return;
+    }
+    const std::uint64_t word_end_bit =
+            word_first_bit + 32 < logical_end_bit
+            ? word_first_bit + 32
+            : logical_end_bit;
+    const std::uint64_t first_bit =
+            word_first_bit > logical_first_bit
+            ? word_first_bit
+            : logical_first_bit;
+    const std::uint64_t first_slot = first_bit / bits;
+    const std::uint64_t last_slot =
+            (word_end_bit + bits - 1) / bits;
+    auto* destination_words =
+            reinterpret_cast<std::uint32_t*>(destination);
+    std::uint32_t destination_word = destination_words[word];
+    for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
+        if (slot < logical_base || slot >= logical_base + elements) {
+            continue;
+        }
+        const std::uint64_t local = slot - logical_base;
+        const std::uint64_t row = local / columns;
+        const std::uint64_t column = local % columns;
+        const std::uint64_t source_bit =
+                plane_slot(source_plane, row, column, rows, columns) * bits;
+        const std::uint64_t destination_bit = slot * bits;
+        merge_overlapping_field(
+                destination_word, source, source_bit, destination_bit,
+                word_first_bit, word_end_bit, bits);
+    }
+    store_word(destination_words + word, destination_word);
 }
 
 IOM_GPU_GLOBAL void scatter_plane_kernel(
         const unsigned char* source, unsigned char* destination,
         std::uint64_t destination_plane, std::uint64_t logical_base,
-        std::uint64_t first, std::uint64_t count, std::uint64_t rows,
+        std::uint64_t word_count, std::uint64_t rows,
         std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t local = first + IOM_GPU_GLOBAL_INDEX;
-    if (local >= first + count) {
-        return;
+    const std::uint64_t stride =
+            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+    for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < word_count;
+         word += stride) {
+        copy_logical_to_tiled_word(
+                source, destination, destination_plane, logical_base, word,
+                rows, columns, bits);
     }
-    const std::uint64_t row = local / columns;
-    const std::uint64_t column = local % columns;
-    const std::uint64_t destination_bit =
-            plane_slot(destination_plane, row, column, rows, columns) * bits;
-    copy_value(
-            destination, destination_bit, source,
-            (logical_base + local) * bits, bits);
 }
 
 IOM_GPU_GLOBAL void gather_plane_kernel(
         const unsigned char* source, unsigned char* destination,
         std::uint64_t source_plane, std::uint64_t logical_base,
-        std::uint64_t first, std::uint64_t count, std::uint64_t rows,
-        std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t local = first + IOM_GPU_GLOBAL_INDEX;
-    if (local >= first + count) {
-        return;
+        std::uint64_t first_word, std::uint64_t word_count,
+        std::uint64_t rows, std::uint64_t columns, unsigned int bits) {
+    const std::uint64_t stride =
+            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+    for (std::uint64_t index = IOM_GPU_GLOBAL_INDEX; index < word_count;
+         index += stride) {
+        copy_tiled_to_logical_word(
+                source, destination, source_plane, logical_base,
+                first_word + index, rows, columns, bits);
     }
-    const std::uint64_t row = local / columns;
-    const std::uint64_t column = local % columns;
-    const std::uint64_t source_bit =
-            plane_slot(source_plane, row, column, rows, columns) * bits;
-    copy_value(
-            destination, (logical_base + local) * bits, source, source_bit,
-            bits);
 }
-
-
 
 template <typename Policy>
 void launch_view_transfer(
@@ -149,6 +322,14 @@ void launch_view_transfer(
     const unsigned int bits =
             static_cast<unsigned int>(leaf_bits(view.spec().data_type));
     const std::size_t elements = rows * columns;
+    const std::size_t padded_rows =
+            (rows + TensorSpec::TILE - 1) / TensorSpec::TILE
+            * TensorSpec::TILE;
+    const std::size_t padded_columns =
+            (columns + TensorSpec::TILE - 1) / TensorSpec::TILE
+            * TensorSpec::TILE;
+    const std::size_t words_per_plane =
+            padded_rows * padded_columns * bits / 32;
     for (std::size_t logical_plane = 0; logical_plane < plane_count;
          ++logical_plane) {
         std::size_t rest = logical_plane;
@@ -157,35 +338,42 @@ void launch_view_transfer(
             plane += (rest % dimensions[k]) * plane_strides[k];
             rest /= dimensions[k];
         }
-        for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
-            const std::size_t count = std::min(kLaunchChunk, elements - first);
-            const unsigned int blocks = static_cast<unsigned int>(
-                    (count + kThreads - 1) / kThreads);
-            if (from_host) {
-                IOM_LAUNCH_KERNEL(
-                        scatter_plane_kernel, blocks, kThreads, stream,
-                        static_cast<const unsigned char*>(source),
-                        static_cast<unsigned char*>(destination),
-                        static_cast<std::uint64_t>(plane),
-                        static_cast<std::uint64_t>(logical_plane * elements),
-                        static_cast<std::uint64_t>(first),
-                        static_cast<std::uint64_t>(count),
-                        static_cast<std::uint64_t>(rows),
-                        static_cast<std::uint64_t>(columns), bits);
-                Policy::check_kernel(Policy::scatter_kernel_operation());
-            } else {
-                IOM_LAUNCH_KERNEL(
-                        gather_plane_kernel, blocks, kThreads, stream,
-                        static_cast<const unsigned char*>(source),
-                        static_cast<unsigned char*>(destination),
-                        static_cast<std::uint64_t>(plane),
-                        static_cast<std::uint64_t>(logical_plane * elements),
-                        static_cast<std::uint64_t>(first),
-                        static_cast<std::uint64_t>(count),
-                        static_cast<std::uint64_t>(rows),
-                        static_cast<std::uint64_t>(columns), bits);
-                Policy::check_kernel(Policy::gather_kernel_operation());
-            }
+        const std::uint64_t logical_base =
+                static_cast<std::uint64_t>(logical_plane * elements);
+        std::size_t first_word = 0;
+        std::size_t word_count = words_per_plane;
+        if (!from_host) {
+            first_word = logical_base * bits / 32;
+            const std::size_t last_word =
+                    (logical_base + elements) * bits / 32
+                    + (((logical_base + elements) * bits) % 32 != 0);
+            word_count = last_word - first_word;
+        }
+        const unsigned int blocks = static_cast<unsigned int>(
+                std::min<std::size_t>(
+                        (word_count + kThreads - 1) / kThreads,
+                        kMaxBlocks));
+        if (from_host) {
+            IOM_LAUNCH_KERNEL(
+                    scatter_plane_kernel, blocks, kThreads, stream,
+                    static_cast<const unsigned char*>(source),
+                    static_cast<unsigned char*>(destination),
+                    static_cast<std::uint64_t>(plane), logical_base,
+                    static_cast<std::uint64_t>(word_count),
+                    static_cast<std::uint64_t>(rows),
+                    static_cast<std::uint64_t>(columns), bits);
+            Policy::check_kernel(Policy::scatter_kernel_operation());
+        } else {
+            IOM_LAUNCH_KERNEL(
+                    gather_plane_kernel, blocks, kThreads, stream,
+                    static_cast<const unsigned char*>(source),
+                    static_cast<unsigned char*>(destination),
+                    static_cast<std::uint64_t>(plane), logical_base,
+                    static_cast<std::uint64_t>(first_word),
+                    static_cast<std::uint64_t>(word_count),
+                    static_cast<std::uint64_t>(rows),
+                    static_cast<std::uint64_t>(columns), bits);
+            Policy::check_kernel(Policy::gather_kernel_operation());
         }
     }
 }
@@ -249,7 +437,6 @@ void synchronous_transfer_impl(
     }
 }
 
-
 }  // namespace
 
 template <typename Policy, typename StreamPool, typename StagingPool>
@@ -262,6 +449,5 @@ void synchronous_transfer(
             transfer_pool, staging_pool, context, view, source, destination,
             from_host);
 }
-
 
 }  // namespace iom::detail

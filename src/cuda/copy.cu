@@ -181,8 +181,6 @@ void synchronize_and_destroy_stream(cudaStream_t stream) noexcept {
 #define IOM_GPU_DEVICE __device__
 #define IOM_GPU_GLOBAL __global__
 #define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
-#define IOM_GPU_ATOMIC_OR atomicOr
-#define IOM_GPU_ATOMIC_AND atomicAnd
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
 namespace iom::cuda_detail {
@@ -233,11 +231,6 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
         const std::uint64_t logical_plane =
                 word / words_per_plane;
         const std::uint64_t word_in_plane = word % words_per_plane;
-        const std::uint64_t first_bit = word_in_plane * 32;
-        const std::uint64_t end_bit =
-                first_bit + 32 < plane_bits ? first_bit + 32 : plane_bits;
-        const std::uint64_t first_element =
-                (first_bit + metadata->bits - 1) / metadata->bits;
         std::uint64_t source_plane = metadata->source_plane_offset;
         std::uint64_t destination_plane =
                 metadata->destination_plane_offset;
@@ -249,36 +242,16 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
             source_plane += coordinate * source_strides[axis];
             destination_plane += coordinate * destination_strides[axis];
         }
-        for (std::uint64_t element = first_element;
-             element < padded_elements
-             && element * metadata->bits < end_bit; ++element) {
-            const std::uint64_t row = element / padded_columns;
-            const std::uint64_t column = element % padded_columns;
-            if (row >= metadata->rows || column >= metadata->columns) {
-                continue;
-            }
-            const std::uint64_t source_bit =
-                    detail::plane_slot(
-                            source_plane, row, column, metadata->rows,
-                            metadata->columns)
-                    * metadata->bits;
-            const std::uint64_t destination_bit =
-                    detail::plane_slot(
-                            destination_plane, row, column, metadata->rows,
-                            metadata->columns)
-                    * metadata->bits;
-            detail::copy_value(
-                    destination, destination_bit, source, source_bit,
-                    metadata->bits);
-        }
+        detail::copy_tiled_to_tiled_word(
+                source, destination, source_plane, destination_plane,
+                word_in_plane, metadata->rows, metadata->columns,
+                metadata->bits);
+    }
 }
 }
 
-}  // namespace
 }  // namespace iom::cuda_detail
 #undef IOM_LAUNCH_KERNEL
-#undef IOM_GPU_ATOMIC_AND
-#undef IOM_GPU_ATOMIC_OR
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_GLOBAL
 #undef IOM_GPU_DEVICE
