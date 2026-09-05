@@ -648,6 +648,40 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
             iom::rocm_detail::SubmissionFault::none);
 }
 
+TEST_CASE("ROCm queue destruction fences pending copies") {
+    TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto device = iom::make_rocm_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    const std::vector<std::byte> pattern(
+            spec.logical_nbytes(), static_cast<std::byte>(0x5a));
+    source->view().copy_from_host(pattern);
+    destination->view().copy_from_host(pattern);
+
+    {
+        auto queue = device->create_ops();
+        for (int i = 0; i < 2; ++i) {
+            CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        }
+        iom::rocm_detail::inject_submission_fault_for_testing(
+                iom::rocm_detail::SubmissionFault::third_plane_launch);
+        iom::oid failure = 0;
+        CHECK_NOTHROW(
+                failure = queue->copy(source->view(), destination->view()));
+        CHECK_NE(failure, 0);
+        for (int i = 0; i < 6; ++i) {
+            CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        }
+        queue.reset();
+    }
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+    CHECK_FALSE(gate.armed());
+}
+
 int main(int argc, char** argv) {
     if (std::getenv("IOM_ROCM_WATCHDOG_CHILD") != nullptr) {
         run_watchdog_child(argc, argv);
