@@ -593,6 +593,14 @@ namespace iom {
         completion_cv_.notify_all();
     }
 
+    /**
+     * Retains a backend failure for a reserved sequence without completing
+     * it. A normally allocated sequence is accepted when
+     * sequence < next_sequence_ && sequence > completed_. A sequence at or
+     * beyond next_sequence_ was never submitted, while one at or below
+     * completed_ has already completed; ranges skipped by the test seam are
+     * also never submitted.
+     */
     void DeviceOps::commit_failure(
             std::uint64_t sequence, std::exception_ptr failure) {
         if (sequence == 0) {
@@ -602,18 +610,35 @@ namespace iom {
             throw std::invalid_argument("retained failure is empty");
         }
         std::lock_guard<std::mutex> lock(completion_mutex_);
-        if (sequence != next_sequence_) {
+        if (sequence >= next_sequence_) {
             throw std::invalid_argument(
-                    "retained failure is not for the active submission");
+                    "retained failure is not for a reserved submission");
+        }
+        if (sequence <= completed_) {
+            throw std::invalid_argument(
+                    "retained failure is for a sequence that has already been completed");
+        }
+        const auto skipped = skipped_sequences_.upper_bound(sequence);
+        if (skipped != skipped_sequences_.begin()) {
+            auto previous = skipped;
+            --previous;
+            if (previous->second > sequence) {
+                throw std::invalid_argument(
+                        "retained failure is not for a reserved submission");
+            }
         }
         pending_failures_[sequence] = std::move(failure);
     }
 
     void DeviceOps::seek_next_sequence(std::uint64_t next_sequence) {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
         if (next_sequence == 0 || next_sequence < next_sequence_) {
             throw std::invalid_argument("queue sequence numbers only move forward");
         }
-        std::lock_guard<std::mutex> lock(completion_mutex_);
+        if (next_sequence > next_sequence_) {
+            skipped_sequences_.emplace(next_sequence_, next_sequence);
+        }
         next_sequence_ = next_sequence;
     }
+
 }  // namespace iom
