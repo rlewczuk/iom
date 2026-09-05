@@ -407,12 +407,20 @@ public:
             Policy::activate(context_);
             std::lock_guard<std::mutex> lock(mutex_);
             while (!staged_.empty()) {
-                Policy::destroy_event_noexcept(staged_.front().event);
+                Task task = std::move(staged_.front());
                 staged_.pop_front();
+                if (Policy::event_is_valid(task.event)) {
+                    Policy::destroy_event_noexcept(task.event);
+                }
+                complete(task.sequence, nullptr);
             }
             while (!tasks_.empty()) {
-                Policy::destroy_event_noexcept(tasks_.front().event);
+                Task task = std::move(tasks_.front());
                 tasks_.pop_front();
+                if (Policy::event_is_valid(task.event)) {
+                    Policy::destroy_event_noexcept(task.event);
+                }
+                complete(task.sequence, nullptr);
             }
             Policy::destroy_queue_stream_noexcept(stream_);
         } catch (...) {
@@ -460,7 +468,20 @@ public:
                     } catch (...) {
                         const std::exception_ptr failure =
                                 std::current_exception();
-                        Policy::record_event_no_fault(local.event, stream_);
+                        if constexpr (requires {
+                                          Policy::discard_failure_event_on_error;
+                                      }) {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            for (Task& staged : staged_) {
+                                if (staged.sequence == sequence) {
+                                    staged.event = Policy::null_event();
+                                    break;
+                                }
+                            }
+                            event_guard.linked = false;
+                        } else {
+                            Policy::record_event_no_fault(local.event, stream_);
+                        }
                         commit_failure(sequence, failure);
                     }
                 });
@@ -532,6 +553,11 @@ private:
                 Task task = std::move(tasks_.front());
                 tasks_.pop_front();
                 lock.unlock();
+                if (!Policy::event_is_valid(task.event)) {
+                    complete(task.sequence, nullptr);
+                    lock.lock();
+                    continue;
+                }
 
                 std::exception_ptr failure;
                 try {
@@ -545,13 +571,14 @@ private:
                 lock.lock();
             }
         } catch (...) {
-            const std::exception_ptr failure = std::current_exception();
             std::lock_guard<std::mutex> lock(mutex_);
             while (!tasks_.empty()) {
                 Task task = std::move(tasks_.front());
                 tasks_.pop_front();
-                Policy::destroy_event_noexcept(task.event);
-                complete(task.sequence, failure);
+                if (Policy::event_is_valid(task.event)) {
+                    Policy::destroy_event_noexcept(task.event);
+                }
+                complete(task.sequence, nullptr);
             }
         }
     }

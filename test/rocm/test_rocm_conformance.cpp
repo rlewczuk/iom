@@ -2,12 +2,13 @@
 
 #include <hip/hip_runtime_api.h>
 
-#include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <initializer_list>
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <spawn.h>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,13 +17,20 @@
 #include <unordered_set>
 #include <vector>
 
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "backend/backend_conformance_common.hpp"
+
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/rocm/device.hpp"
 #include "rocm/copy.hpp"
+extern char** environ;
+
 
 namespace {
 
@@ -159,6 +167,123 @@ private:
     std::vector<Slot> free_;
     std::unordered_map<void*, std::size_t> live_;
 };
+const char* g_executable_path = nullptr;
+
+[[nodiscard]] const char* watchdog_fault_name(
+        iom::rocm_detail::SubmissionFault fault) {
+    switch (fault) {
+    case iom::rocm_detail::SubmissionFault::third_plane_launch:
+        return "third_plane_launch";
+    case iom::rocm_detail::SubmissionFault::event_record:
+        return "event_record";
+    default:
+        return nullptr;
+    }
+}
+
+[[nodiscard]] bool parse_watchdog_fault(
+        int argc, char** argv,
+        iom::rocm_detail::SubmissionFault& fault) {
+    if (argc != 3
+            || std::string_view(argv[1]) != "--iom-rocm-watchdog-fault") {
+        return false;
+    }
+    const std::string_view name(argv[2]);
+    if (name == "third_plane_launch") {
+        fault = iom::rocm_detail::SubmissionFault::third_plane_launch;
+    } else if (name == "event_record") {
+        fault = iom::rocm_detail::SubmissionFault::event_record;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+
+[[noreturn]] void run_watchdog_child(int argc, char** argv) {
+    iom::rocm_detail::SubmissionFault fault =
+            iom::rocm_detail::SubmissionFault::none;
+
+    if (!parse_watchdog_fault(argc, argv, fault)) {
+        _exit(1);
+    }
+
+    try {
+        ReusingHipAllocator allocator;
+        auto device = iom::make_rocm_device(0, allocator);
+        const iom::TensorSpec spec{
+                iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+        auto source = device->create_tensor(spec);
+        auto destination = device->create_tensor(spec);
+        auto queue = device->create_ops();
+        const std::vector<std::byte> pattern(
+                spec.logical_nbytes(), static_cast<std::byte>(0x3c));
+        source->view().copy_from_host(pattern);
+        destination->view().copy_from_host(pattern);
+
+        iom::rocm_detail::inject_submission_fault_for_testing(fault);
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        queue->wait(token);
+    } catch (const std::runtime_error&) {
+        _exit(0);
+    } catch (...) {
+        _exit(1);
+    }
+    _exit(1);
+}
+
+void expect_bounded_wait_in_subprocess(
+        iom::rocm_detail::SubmissionFault fault) {
+    const char* fault_name = watchdog_fault_name(fault);
+    REQUIRE(fault_name != nullptr);
+    REQUIRE(g_executable_path != nullptr);
+
+    char fault_option[] = "--iom-rocm-watchdog-fault";
+    char* child_argv[] = {
+            const_cast<char*>(g_executable_path), fault_option,
+            const_cast<char*>(fault_name), nullptr};
+    std::vector<char*> child_environment;
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+        child_environment.push_back(*entry);
+    }
+    child_environment.push_back(
+            const_cast<char*>("IOM_ROCM_WATCHDOG_CHILD=1"));
+    child_environment.push_back(nullptr);
+
+    pid_t child = 0;
+    const int spawn_status = posix_spawn(
+            &child, g_executable_path, nullptr, nullptr, child_argv,
+            child_environment.data());
+    REQUIRE_MESSAGE(spawn_status == 0, "posix_spawn failed");
+    if (spawn_status != 0) {
+        return;
+    }
+
+    int status = 0;
+    const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        const pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) {
+            break;
+        }
+        REQUIRE_MESSAGE(result != -1, "waitpid failed");
+        if (result == -1) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            (void)kill(child, SIGKILL);
+            (void)waitpid(child, &status, 0);
+            std::exit(2);
+        }
+        const timespec pause{0, 10'000'000};
+        (void)nanosleep(&pause, nullptr);
+    }
+
+    REQUIRE(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 0);
+}
 
 void expect_repeated_runtime_failure(
         iom::DeviceOps& queue, iom::oid token) {
@@ -423,6 +548,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     CHECK_NE(launch_failure, 0);
     CHECK_EQ(iom_conformance::token_sequence(launch_failure), 3);
     expect_repeated_runtime_failure(*queue, launch_failure);
+    expect_bounded_wait_in_subprocess(
+            iom::rocm_detail::SubmissionFault::third_plane_launch);
 
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::event_record);
@@ -430,6 +557,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
             queue->copy(source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(record_failure), 4);
     expect_repeated_runtime_failure(*queue, record_failure);
+    expect_bounded_wait_in_subprocess(
+            iom::rocm_detail::SubmissionFault::event_record);
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::none);
 
@@ -502,4 +631,13 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     }
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::none);
+}
+
+int main(int argc, char** argv) {
+    if (std::getenv("IOM_ROCM_WATCHDOG_CHILD") != nullptr) {
+        run_watchdog_child(argc, argv);
+    }
+    g_executable_path = argv[0];
+    doctest::Context context(argc, argv);
+    return context.run();
 }
