@@ -6,11 +6,11 @@ Completed the CUDA driver-call injection seam and centralized the driver error h
 
 ## Verification
 
-- `remote-sync cuda ar005-cuda` from the assigned worktree — synchronized to `bv1:agent-work/iom/ar005-cuda`.
-- Remote CMake configure/build with CUDA enabled for `iom_cuda_smoke_tests` and `iom_cuda_conformance_tests` — both targets built successfully.
-- `iom_cuda_smoke_tests -tc="*driver-call seam intercepts every claimed driver call*"` — 1 test case and 13 assertions passed.
-- The activation-failure, allocation-failure, and primary-context-success CUDA smoke cases — each ran individually; 1 test case passed in each run with 8, 7, and 8 assertions respectively.
-- `ctest --test-dir build --output-on-failure -R "^iom_cuda_smoke_tests$"` — 1/1 test passed.
-- `ctest --test-dir build --output-on-failure -R "^iom_cuda_conformance_tests$"` — 1/1 test passed.
+- `remote-sync cuda ar005-cuda` from the assigned worktree — synchronized to `bv1:agent-work/iom/ar005-cuda`; the mirror was cleaned after the first verification pass.
+- Remote CMake configure/build with CUDA enabled for `iom_cuda_smoke_tests` and `iom_cuda_conformance_tests` — both targets built successfully before and after merging the latest `main`.
+- `iom_cuda_smoke_tests -tc="*driver-call seam intercepts every claimed driver call*"` — 1 test case and 13 assertions passed before and after the latest-`main` merge.
+- The activation-failure, allocation-failure, and primary-context-success CUDA smoke cases — each ran individually before the merge; 1 test case passed in each run with 8, 7, and 8 assertions respectively.
+- `ctest --test-dir build --output-on-failure -R "^iom_cuda_smoke_tests$"` — 1/1 test passed after the latest-`main` merge.
+- `ctest --test-dir build --output-on-failure -R "^iom_cuda_conformance_tests$"` — 1/1 test passed after the latest-`main` merge.
 - Remote source/default/helper audits — no direct claimed driver calls, exactly six driver default initializers, and one inline helper definition site in `src/cuda/driver.hpp`.
-- `remote-clean cuda ar005-cuda` — verified remote mirror removed.
+- `remote-clean cuda ar005-cuda` — verified remote mirror removed after the final verification pass.
