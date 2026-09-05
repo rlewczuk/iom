@@ -472,3 +472,49 @@ TEST_CASE("CPU conformance: blocked copy walks lockstep planes without scratch a
             destination, expected, "lockstep plane copy");
     CHECK_FALSE(devices.gate.armed());
 }
+
+namespace {
+// Submits the copy from a frame that returns before the caller waits: the
+// derived-view temporaries die when this function returns, so a queue that
+// stored their addresses would leave the worker dereferencing dead stack
+// storage. No named local binds either view; `copy`'s destination
+// parameter is a non-const reference, so the rvalue destination view is
+// bound through const_cast — the view object is never modified, the worker
+// writes through the owner's storage.
+iom::oid submit_temporary_copy(
+        iom::DeviceOps& queue, iom::Tensor& t, iom::Tensor& u,
+        std::size_t half) {
+    return queue.copy(
+            t.view().slice(0, 0, half),
+            const_cast<iom::TensorView&>(
+                    static_cast<const iom::TensorView&>(
+                            u.view().slice(0, 0, half))));
+}
+}  // namespace
+
+TEST_CASE("CPU copy survives derived-view temporaries") {
+    CpuDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{4, 3, 17, 33}}, iom::DataType::U8};
+    std::unique_ptr<iom::Tensor> t = devices.candidate->create_tensor(spec);
+    std::unique_ptr<iom::Tensor> u = devices.candidate->create_tensor(spec);
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(spec, 0x5A7C);
+    t->view().copy_from_host(pattern);
+    std::memset(
+            u->view().native_handle(), 0, spec.tiled_storage_nbytes());
+
+    auto queue = devices.candidate->create_ops();
+    const std::vector<std::size_t> dims = {4, 3, 17, 33};
+    const iom::oid token =
+            submit_temporary_copy(*queue, *t, *u, dims[0] / 2);
+    REQUIRE_NOTHROW(queue->wait(token));
+
+    const iom::TensorView expected_view = t->view().slice(0, 0, dims[0] / 2);
+    const iom::TensorView actual_view = u->view().slice(0, 0, dims[0] / 2);
+    const std::vector<std::byte> expected =
+            iom_conformance::read_logical(expected_view);
+    iom_conformance::require_logical_bytes(
+            actual_view, expected, "temporary-view copy");
+    CHECK_FALSE(devices.gate.armed());
+}

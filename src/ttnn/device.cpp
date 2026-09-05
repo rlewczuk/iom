@@ -266,12 +266,19 @@ namespace iom {
         class TtnnQueue final : public DeviceOps {
             struct Task {
                 std::uint64_t sequence;
-                const TensorView* source;
-                const ttnn::Tensor* source_planes;
-                TensorView* destination;
-                ttnn::Tensor* destination_planes;
+                TensorView source;
+                TensorView destination;
                 bool no_op;
                 void* fence = nullptr;
+
+                Task(std::uint64_t sequence_,
+                     const TensorView& source_,
+                     TensorView& destination_,
+                     bool no_op_)
+                    : sequence(sequence_),
+                      source(source_),
+                      destination(destination_),
+                      no_op(no_op_) {}
             };
 
         public:
@@ -284,11 +291,19 @@ namespace iom {
                                               std::lock_guard<std::mutex>
                                                       api_lock(
                                                               device_->api_mutex());
+                                              const ttnn::Tensor* source_planes =
+                                                      static_cast<const ttnn::Tensor*>(
+                                                              task.source
+                                                                      .native_handle());
+                                              ttnn::Tensor* destination_planes =
+                                                      static_cast<ttnn::Tensor*>(
+                                                              task.destination
+                                                                      .native_handle());
                                               ttnn_detail::copy_planes(
-                                                      *task.source,
-                                                      task.source_planes,
-                                                      *task.destination,
-                                                      task.destination_planes);
+                                                      task.source,
+                                                      source_planes,
+                                                      task.destination,
+                                                      destination_planes);
                                               device_->mesh()
                                                       .mesh_command_queue(0)
                                                       .finish();
@@ -322,15 +337,8 @@ namespace iom {
                 return submit(
                         [this, &source, &destination, no_op](
                                 std::uint64_t sequence) {
-                            worker_.submit_copy(Task{
-                                    sequence,
-                                    &source,
-                                    static_cast<const ttnn::Tensor*>(
-                                            source.native_handle()),
-                                    &destination,
-                                    static_cast<ttnn::Tensor*>(
-                                            destination.native_handle()),
-                                    no_op});
+                            Task task(sequence, source, destination, no_op);
+                            worker_.submit_copy(std::move(task));
                         });
             }
 
