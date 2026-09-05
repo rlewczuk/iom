@@ -2,26 +2,14 @@
 
 #include <hip/hip_runtime.h>
 
-#include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
-#include <exception>
-#include <list>
-#include <limits>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <utility>
-#include <vector>
 
 namespace iom::rocm_detail {
 namespace {
 
-constexpr std::size_t kTile = TensorSpec::TILE;
-constexpr std::size_t kThreads = 256;
-constexpr std::size_t kLaunchChunk = 1u << 20;
 std::atomic<SubmissionFault> g_submission_fault{SubmissionFault::none};
 
 [[nodiscard]] bool consume_submission_fault(
@@ -30,7 +18,6 @@ std::atomic<SubmissionFault> g_submission_fault{SubmissionFault::none};
     return g_submission_fault.compare_exchange_strong(
             expected, SubmissionFault::none, std::memory_order_acq_rel);
 }
-
 
 [[nodiscard]] std::runtime_error hip_error(
         const char* operation, hipError_t status) {
@@ -45,546 +32,199 @@ void check_hip(const char* operation, hipError_t status) {
     }
 }
 
-struct DeviceGuard {
-    explicit DeviceGuard(int device_ordinal) {
+struct gpu_policy {
+    using context_type = int;
+    using stream_type = hipStream_t;
+    using event_type = hipEvent_t;
+
+    [[nodiscard]] static constexpr stream_type null_stream() noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] static constexpr event_type null_event() noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] static bool stream_is_valid(stream_type stream) noexcept {
+        return stream != nullptr;
+    }
+    [[nodiscard]] static bool event_is_valid(event_type event) noexcept {
+        return event != nullptr;
+    }
+
+    static void activate(context_type device_ordinal) {
         check_hip("hipSetDevice", hipSetDevice(device_ordinal));
     }
-};
-struct PendingEvent {
-    hipEvent_t event = nullptr;
-    bool linked = false;
 
-    ~PendingEvent() noexcept {
-        if (event != nullptr && !linked) {
+    [[nodiscard]] static stream_type create_queue_stream() {
+        stream_type stream = nullptr;
+        check_hip(
+                "hipStreamCreateWithFlags",
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        return stream;
+    }
+    static void destroy_queue_stream_noexcept(stream_type stream) noexcept {
+        if (stream != nullptr) {
+            (void)hipStreamDestroy(stream);
+        }
+    }
+
+    [[nodiscard]] static stream_type create_transfer_stream() {
+        stream_type stream = nullptr;
+        check_hip(
+                "hipStreamCreateWithFlags",
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        return stream;
+    }
+    static void destroy_transfer_stream(stream_type stream) {
+        check_hip("hipStreamDestroy", hipStreamDestroy(stream));
+    }
+    static void destroy_transfer_stream_noexcept(stream_type stream) noexcept {
+        if (stream != nullptr) {
+            (void)hipStreamDestroy(stream);
+        }
+    }
+
+    static void create_event(event_type* event) {
+        if (consume_submission_fault(SubmissionFault::event_create)) {
+            check_hip("hipEventCreateWithFlags", hipErrorInvalidValue);
+        }
+        check_hip(
+                "hipEventCreateWithFlags",
+                hipEventCreateWithFlags(event, hipEventDisableTiming));
+    }
+    static void destroy_event_noexcept(event_type event) noexcept {
+        if (event != nullptr) {
             (void)hipEventDestroy(event);
         }
     }
-};
-
-[[nodiscard]] hipError_t record_event(
-        hipEvent_t event, hipStream_t stream) noexcept {
-    const hipError_t status = hipEventRecord(event, stream);
-    if (consume_submission_fault(SubmissionFault::event_record)) {
-        return hipErrorInvalidValue;
+    static void synchronize_event(event_type event) {
+        check_hip("hipEventSynchronize", hipEventSynchronize(event));
     }
-    return status;
-}
-
-
-struct PlanePair {
-    std::size_t source;
-    std::size_t destination;
-};
-
-[[nodiscard]] std::vector<PlanePair> plane_pairs(
-        const TensorView& source, const TensorView& destination) {
-    const std::span<const std::size_t> dimensions = source.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    const std::size_t plane_elements = rows * columns;
-    const std::size_t plane_count =
-            source.spec().shape.element_count() / plane_elements;
-
-    std::vector<PlanePair> pairs;
-    pairs.reserve(plane_count);
-    for (std::size_t logical_plane = 0; logical_plane < plane_count;
-         ++logical_plane) {
-        std::size_t source_rest = logical_plane;
-        std::size_t destination_rest = logical_plane;
-        std::size_t source_plane = source.plane_offset();
-        std::size_t destination_plane = destination.plane_offset();
-        for (std::size_t k = leading_rank; k-- > 0;) {
-            const std::size_t source_coordinate = source_rest % dimensions[k];
-            const std::size_t destination_coordinate =
-                    destination_rest % dimensions[k];
-            source_rest /= dimensions[k];
-            destination_rest /= dimensions[k];
-            source_plane += source_coordinate * source.plane_strides()[k];
-            destination_plane +=
-                    destination_coordinate * destination.plane_strides()[k];
+    static void record_event(event_type event, stream_type stream) {
+        hipError_t status = hipEventRecord(event, stream);
+        if (consume_submission_fault(SubmissionFault::event_record)) {
+            status = hipErrorInvalidValue;
         }
-        pairs.push_back({source_plane, destination_plane});
+        check_hip("hipEventRecord", status);
     }
-    return pairs;
-}
-
-[[nodiscard]] std::vector<std::size_t> view_planes(const TensorView& view) {
-    const std::span<const std::size_t> dimensions = view.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    const std::size_t plane_count =
-            view.spec().shape.element_count() / (rows * columns);
-
-    std::vector<std::size_t> planes;
-    planes.reserve(plane_count);
-    for (std::size_t logical_plane = 0; logical_plane < plane_count;
-         ++logical_plane) {
-        std::size_t rest = logical_plane;
-        std::size_t plane = view.plane_offset();
-        for (std::size_t k = leading_rank; k-- > 0;) {
-            const std::size_t coordinate = rest % dimensions[k];
-            rest /= dimensions[k];
-            plane += coordinate * view.plane_strides()[k];
-        }
-        planes.push_back(plane);
+    static void record_event_no_fault(
+            event_type event, stream_type stream) noexcept {
+        (void)hipEventRecord(event, stream);
     }
-    return planes;
-}
 
-[[nodiscard]] bool identical_window(
-        const TensorView& source, const TensorView& destination) {
-    return source.native_handle() == destination.native_handle()
-            && source.plane_offset() == destination.plane_offset()
-            && std::equal(
-                    source.plane_strides().begin(), source.plane_strides().end(),
-                    destination.plane_strides().begin(),
-                    destination.plane_strides().end());
-}
-
-__device__ std::uint64_t read_bits(
-        const unsigned char* base, std::uint64_t bit_offset,
-        unsigned int bits) {
-    std::uint64_t value = 0;
-    for (unsigned int i = 0; i < bits; ++i) {
-        const std::uint64_t bit = bit_offset + i;
-        value |= static_cast<std::uint64_t>((base[bit / 8] >> (bit % 8)) & 1)
-                << i;
+    [[nodiscard]] static void* allocate(std::size_t bytes) {
+        void* address = nullptr;
+        check_hip("hipMalloc", hipMalloc(&address, bytes));
+        return address;
     }
-    return value;
-}
-
-__device__ void write_bits(
-        unsigned char* base, std::uint64_t bit_offset, unsigned int bits,
-        std::uint64_t value) {
-    if (bits % 8 == 0) {
-        unsigned char* destination = base + bit_offset / 8;
-        for (unsigned int i = 0; i < bits / 8; ++i) {
-            destination[i] = static_cast<unsigned char>(value >> (i * 8));
-        }
-        return;
+    static void free(void* address) {
+        check_hip("hipFree", hipFree(address));
     }
-    for (unsigned int i = 0; i < bits; ++i) {
-        const std::uint64_t bit = bit_offset + i;
-        auto* word = reinterpret_cast<unsigned int*>(
-                base + (bit / 32) * sizeof(unsigned int));
-        const unsigned int mask =
-                static_cast<unsigned int>(1u << (bit % 32));
-        if ((value >> i) & 1) {
-            atomicOr(word, mask);
-        } else {
-            atomicAnd(word, ~mask);
+    static void free_noexcept(void* address) noexcept {
+        if (address != nullptr) {
+            (void)hipFree(address);
         }
     }
-}
 
-__device__ std::uint64_t plane_slot(
-        std::uint64_t plane, std::uint64_t row, std::uint64_t column,
-        std::uint64_t rows, std::uint64_t columns) {
-    const std::uint64_t tile_rows = (rows + kTile - 1) / kTile;
-    const std::uint64_t tile_columns = (columns + kTile - 1) / kTile;
-    const std::uint64_t tile_index =
-            plane * tile_rows * tile_columns
-            + (row / kTile) * tile_columns + column / kTile;
-    return tile_index * kTile * kTile
-            + (row % kTile) * kTile + column % kTile;
-}
-
-__global__ void scatter_plane_kernel(
-        const unsigned char* source, unsigned char* destination,
-        std::uint64_t destination_plane, std::uint64_t logical_base,
-        std::uint64_t first, std::uint64_t count, std::uint64_t rows,
-        std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t local = first + blockIdx.x * blockDim.x + threadIdx.x;
-    if (local >= first + count) {
-        return;
+    static void copy_from_host(
+            stream_type stream, void* destination, const void* source,
+            std::size_t bytes) {
+        check_hip(
+                "hipMemcpyAsync HtoD",
+                hipMemcpyAsync(
+                        destination, source, bytes,
+                        hipMemcpyHostToDevice, stream));
     }
-    const std::uint64_t row = local / columns;
-    const std::uint64_t column = local % columns;
-    const std::uint64_t destination_bit =
-            plane_slot(destination_plane, row, column, rows, columns) * bits;
-    write_bits(destination, destination_bit, bits,
-               read_bits(source, (logical_base + local) * bits, bits));
-}
-
-__global__ void gather_plane_kernel(
-        const unsigned char* source, unsigned char* destination,
-        std::uint64_t source_plane, std::uint64_t logical_base,
-        std::uint64_t first, std::uint64_t count, std::uint64_t rows,
-        std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t local = first + blockIdx.x * blockDim.x + threadIdx.x;
-    if (local >= first + count) {
-        return;
+    static void copy_to_host(
+            stream_type, void* destination, const void* source,
+            std::size_t bytes) {
+        check_hip(
+                "hipMemcpy DtoH",
+                hipMemcpy(destination, source, bytes, hipMemcpyDeviceToHost));
     }
-    const std::uint64_t row = local / columns;
-    const std::uint64_t column = local % columns;
-    const std::uint64_t source_bit =
-            plane_slot(source_plane, row, column, rows, columns) * bits;
-    write_bits(destination, (logical_base + local) * bits, bits,
-               read_bits(source, source_bit, bits));
-}
-
-__global__ void copy_plane_kernel(
-        const unsigned char* source, unsigned char* destination,
-        std::uint64_t source_plane, std::uint64_t destination_plane,
-        std::uint64_t first, std::uint64_t count, std::uint64_t rows,
-        std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t local = first + blockIdx.x * blockDim.x + threadIdx.x;
-    if (local >= first + count) {
-        return;
+    static void memset(
+            stream_type, void* destination, std::size_t bytes) {
+        check_hip("hipMemset", hipMemset(destination, 0, bytes));
     }
-    const std::uint64_t row = local / columns;
-    const std::uint64_t column = local % columns;
-    const std::uint64_t source_bit =
-            plane_slot(source_plane, row, column, rows, columns) * bits;
-    const std::uint64_t destination_bit =
-            plane_slot(destination_plane, row, column, rows, columns) * bits;
-    write_bits(destination, destination_bit, bits,
-               read_bits(source, source_bit, bits));
-}
 
-void launch_view_transfer(
-        hipStream_t stream, const TensorView& view, const void* source,
-        void* destination, bool from_host) {
-    const std::span<const std::size_t> dimensions = view.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    const std::size_t plane_count =
-            view.spec().shape.element_count() / (rows * columns);
-    const unsigned int bits = static_cast<unsigned int>(
-            detail::leaf_bits(view.spec().data_type));
-    const std::vector<std::size_t> planes = view_planes(view);
-    const std::size_t elements = rows * columns;
-    for (std::size_t logical_plane = 0; logical_plane < plane_count;
-         ++logical_plane) {
-        for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
-            const std::size_t count = std::min(kLaunchChunk, elements - first);
-            const unsigned int blocks = static_cast<unsigned int>(
-                    (count + kThreads - 1) / kThreads);
-            if (from_host) {
-                hipLaunchKernelGGL(
-                        scatter_plane_kernel, dim3(blocks), dim3(kThreads), 0,
-                        stream, static_cast<const unsigned char*>(source),
-                        static_cast<unsigned char*>(destination),
-                        static_cast<std::uint64_t>(planes[logical_plane]),
-                        static_cast<std::uint64_t>(logical_plane * elements),
-                        static_cast<std::uint64_t>(first),
-                        static_cast<std::uint64_t>(count),
-                        static_cast<std::uint64_t>(rows),
-                        static_cast<std::uint64_t>(columns), bits);
-            } else {
-                hipLaunchKernelGGL(
-                        gather_plane_kernel, dim3(blocks), dim3(kThreads), 0,
-                        stream, static_cast<const unsigned char*>(source),
-                        static_cast<unsigned char*>(destination),
-                        static_cast<std::uint64_t>(planes[logical_plane]),
-                        static_cast<std::uint64_t>(logical_plane * elements),
-                        static_cast<std::uint64_t>(first),
-                        static_cast<std::uint64_t>(count),
-                        static_cast<std::uint64_t>(rows),
-                        static_cast<std::uint64_t>(columns), bits);
-            }
-            check_hip("HIP kernel launch", hipGetLastError());
-        }
-    }
-}
-
-void synchronous_transfer(
-        int device_ordinal, const TensorView& view,
-        std::span<const std::byte> source, std::span<std::byte> destination,
-        bool from_host) {
-    const std::size_t logical_nbytes = view.spec().logical_nbytes();
-    constexpr std::size_t kWordBytes = sizeof(unsigned int);
-    const std::size_t padding =
-            (kWordBytes - logical_nbytes % kWordBytes) % kWordBytes;
-    if (padding
-            > std::numeric_limits<std::size_t>::max() - logical_nbytes) {
-        throw std::overflow_error("ROCm transfer staging size overflows");
-    }
-    const std::size_t staging_nbytes = logical_nbytes + padding;
-    DeviceGuard guard(device_ordinal);
-    void* staging = nullptr;
-    hipStream_t stream = nullptr;
-    try {
-        check_hip("hipStreamCreateWithFlags",
-                  hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-        check_hip("hipMalloc", hipMalloc(&staging, staging_nbytes));
-        if (from_host) {
-            check_hip("hipMemcpyAsync HtoD",
-                      hipMemcpyAsync(staging, source.data(), source.size(),
-                                     hipMemcpyHostToDevice, stream));
-            launch_view_transfer(
-                    stream, view, staging,
-                    const_cast<void*>(view.native_handle()), true);
-        } else {
-            check_hip("hipMemset", hipMemset(staging, 0, staging_nbytes));
-            launch_view_transfer(stream, view, view.native_handle(), staging, false);
-        }
+    static void synchronize_stream(stream_type stream) {
         check_hip("hipStreamSynchronize", hipStreamSynchronize(stream));
-        if (!from_host) {
-            check_hip("hipMemcpy DtoH",
-                      hipMemcpy(destination.data(), staging, destination.size(),
-                                hipMemcpyDeviceToHost));
-        }
-    } catch (...) {
+    }
+    static void synchronize_stream_noexcept(stream_type stream) noexcept {
         if (stream != nullptr) {
             (void)hipStreamSynchronize(stream);
-            (void)hipStreamDestroy(stream);
-        }
-        if (staging != nullptr) {
-            (void)hipFree(staging);
-        }
-        throw;
-    }
-    check_hip("hipStreamDestroy", hipStreamDestroy(stream));
-    check_hip("hipFree", hipFree(staging));
-}
-
-class RocmQueue final : public DeviceOps {
-public:
-    RocmQueue(const Device& device, int device_ordinal)
-            : device_(&device), device_ordinal_(device_ordinal) {
-        DeviceGuard guard(device_ordinal_);
-        check_hip("hipStreamCreateWithFlags",
-                  hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking));
-        try {
-            worker_ = std::thread([this] { run(); });
-        } catch (...) {
-            (void)hipStreamDestroy(stream_);
-            stream_ = nullptr;
-            throw;
         }
     }
 
-    ~RocmQueue() override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            shutdown_ = true;
+    static void check_kernel(const char* operation) {
+        check_hip(operation, hipGetLastError());
+    }
+    static void after_copy_plane_launch(std::size_t plane_index) {
+        if (plane_index == 2
+                && consume_submission_fault(
+                        SubmissionFault::third_plane_launch)) {
+            check_hip("HIP copy kernel launch", hipErrorInvalidValue);
         }
-        completion_.notify_one();
-        if (worker_.joinable()) {
-            worker_.join();
-        }
-        try {
-            DeviceGuard guard(device_ordinal_);
-            std::lock_guard<std::mutex> lock(mutex_);
-            while (!staged_.empty()) {
-                (void)hipEventDestroy(staged_.front().event);
-                staged_.pop_front();
-            }
-            while (!tasks_.empty()) {
-                (void)hipEventDestroy(tasks_.front().event);
-                tasks_.pop_front();
-            }
-            (void)hipStreamDestroy(stream_);
-        } catch (...) {
-            // Queue destruction is noexcept; callers must wait successful
-            // submissions before destroying a queue.
-        }
-        stream_ = nullptr;
+    }
+    [[nodiscard]] static constexpr const char* scatter_kernel_operation() noexcept {
+        return "HIP kernel launch";
+    }
+    [[nodiscard]] static constexpr const char* gather_kernel_operation() noexcept {
+        return "HIP kernel launch";
+    }
+    [[nodiscard]] static constexpr const char* copy_kernel_operation() noexcept {
+        return "HIP kernel launch";
     }
 
-    oid copy(const TensorView& source, TensorView& destination) override {
-        validate_copy(source, destination);
-        const bool no_op = identical_window(source, destination);
-        const std::vector<PlanePair> pairs =
-                no_op ? std::vector<PlanePair>{} : plane_pairs(source, destination);
-        const std::span<const std::size_t> dimensions = source.spec().shape.dimensions();
-        const std::size_t rows = dimensions[dimensions.size() - 2];
-        const std::size_t columns = dimensions[dimensions.size() - 1];
-        const unsigned int bits = static_cast<unsigned int>(
-                detail::leaf_bits(source.spec().data_type));
-        const void* source_handle = source.native_handle();
-        void* destination_handle = destination.native_handle();
-        const oid token = submit([&](std::uint64_t sequence) {
-            DeviceGuard guard(device_ordinal_);
-            PendingEvent event_guard;
-            if (consume_submission_fault(SubmissionFault::event_create)) {
-                check_hip(
-                        "hipEventCreateWithFlags", hipErrorInvalidValue);
-            }
-            check_hip(
-                    "hipEventCreateWithFlags",
-                    hipEventCreateWithFlags(
-                            &event_guard.event, hipEventDisableTiming));
-            Task local{sequence, event_guard.event};
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                staged_.push_back(local);
-            }
-            event_guard.linked = true;
-
-            try {
-                std::size_t plane_index = 0;
-                for (const PlanePair pair : pairs) {
-                    launch_copy_plane(
-                            pair, plane_index++, rows, columns, bits,
-                            source_handle, destination_handle);
-                }
-                check_hip(
-                        "hipEventRecord",
-                        record_event(event_guard.event, stream_));
-            } catch (...) {
-                const std::exception_ptr failure = std::current_exception();
-                (void)hipEventRecord(event_guard.event, stream_);
-                commit_failure(sequence, failure);
-            }
-        });
-        publish_staged();
-        return token;
-    }
-
-    oid add(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("add");
-    }
-    oid mul(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("mul");
-    }
-    oid silu(const TensorView&, TensorView&) override {
-        throw unsupported("silu");
-    }
-    oid linear(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("linear");
-    }
-    oid rmsnorm(const TensorView&, TensorView&, const TensorView&, float, size_t) override {
-        throw unsupported("rmsnorm");
-    }
-    oid sdpa(const TensorView&, const TensorView&, const TensorView&,
-             size_t, size_t, size_t, TensorView&) override {
-        throw unsupported("sdpa");
-    }
-
-private:
-    struct Task {
-        std::uint64_t sequence;
-        hipEvent_t event;
-    };
-
-    static std::runtime_error unsupported(const char* operation) {
+    [[nodiscard]] static std::runtime_error unsupported(const char* operation) {
         return std::runtime_error(
                 std::string("ROCm backend does not implement ") + operation);
     }
-
-    void validate_copy(
-            const TensorView& source, const TensorView& destination) const {
-        if (&source.device() != device_ || &destination.device() != device_) {
-            throw std::invalid_argument(
-                    "copy views must belong to the queue's own device");
-        }
-        if (!(source.spec() == destination.spec())) {
-            throw std::invalid_argument(
-                    "copy views must have identical shape, leaf type, and quantization");
-        }
-    }
-
-    void launch_copy_plane(
-            const PlanePair& pair, std::size_t plane_index,
-            std::size_t rows, std::size_t columns, unsigned int bits,
-            const void* source, void* destination) {
-        const std::size_t elements = rows * columns;
-        for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
-            const std::size_t count = std::min(kLaunchChunk, elements - first);
-            const unsigned int blocks = static_cast<unsigned int>(
-                    (count + kThreads - 1) / kThreads);
-            hipLaunchKernelGGL(
-                    copy_plane_kernel, dim3(blocks), dim3(kThreads), 0, stream_,
-                    static_cast<const unsigned char*>(source),
-                    static_cast<unsigned char*>(destination),
-                    static_cast<std::uint64_t>(pair.source),
-                    static_cast<std::uint64_t>(pair.destination),
-                    static_cast<std::uint64_t>(first),
-                    static_cast<std::uint64_t>(count),
-                    static_cast<std::uint64_t>(rows),
-                    static_cast<std::uint64_t>(columns), bits);
-            check_hip("HIP kernel launch", hipGetLastError());
-            if (plane_index == 2
-                    && consume_submission_fault(
-                            SubmissionFault::third_plane_launch)) {
-                check_hip(
-                        "HIP kernel launch", hipErrorInvalidValue);
-            }
-        }
-    }
-
-    void publish_staged() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        tasks_.splice(tasks_.end(), staged_);
-        completion_.notify_one();
-    }
-
-    void run() {
-        try {
-            DeviceGuard guard(device_ordinal_);
-            std::unique_lock<std::mutex> lock(mutex_);
-            for (;;) {
-                completion_.wait(lock, [this] {
-                    return shutdown_ || !tasks_.empty();
-                });
-                if (shutdown_) {
-                    return;
-                }
-                const Task task = tasks_.front();
-                tasks_.pop_front();
-                lock.unlock();
-
-                std::exception_ptr failure;
-                try {
-                    check_hip("hipEventSynchronize",
-                              hipEventSynchronize(task.event));
-                } catch (...) {
-                    failure = std::current_exception();
-                }
-                (void)hipEventDestroy(task.event);
-                complete(task.sequence, failure);
-
-                lock.lock();
-            }
-        } catch (...) {
-            const std::exception_ptr failure = std::current_exception();
-            std::lock_guard<std::mutex> lock(mutex_);
-            while (!tasks_.empty()) {
-                const Task task = tasks_.front();
-                tasks_.pop_front();
-                (void)hipEventDestroy(task.event);
-                complete(task.sequence, failure);
-            }
-        }
-    }
-
-    const Device* device_;
-    int device_ordinal_;
-    hipStream_t stream_ = nullptr;
-    std::mutex mutex_;
-    std::condition_variable completion_;
-    std::list<Task> staged_;
-    std::list<Task> tasks_;
-    bool shutdown_ = false;
-    std::thread worker_;
 };
 
 }  // namespace
+}  // namespace iom::rocm_detail
+
+#define IOM_GPU_DEVICE __device__
+#define IOM_GPU_GLOBAL __global__
+#define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
+#define IOM_GPU_ATOMIC_OR atomicOr
+#define IOM_GPU_ATOMIC_AND atomicAnd
+#define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
+    hipLaunchKernelGGL( \
+            kernel, dim3(blocks), dim3(threads), 0, stream, __VA_ARGS__)
+#include "../shared/standard_tiled_copy.inl"
+#undef IOM_LAUNCH_KERNEL
+#undef IOM_GPU_ATOMIC_AND
+#undef IOM_GPU_ATOMIC_OR
+#undef IOM_GPU_GLOBAL_INDEX
+#undef IOM_GPU_GLOBAL
+#undef IOM_GPU_DEVICE
+
+namespace iom::rocm_detail {
+
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
     g_submission_fault.store(fault, std::memory_order_release);
 }
 
-
 void region_from_host(
         int device_ordinal, const TensorView& destination,
         std::span<const std::byte> source) {
-    synchronous_transfer(device_ordinal, destination, source, {}, true);
+    detail::synchronous_transfer<gpu_policy>(
+            device_ordinal, destination, source, {}, true);
 }
 
 void region_to_host(
         int device_ordinal, const TensorView& source,
         std::span<std::byte> destination) {
-    synchronous_transfer(device_ordinal, source, {}, destination, false);
+    detail::synchronous_transfer<gpu_policy>(
+            device_ordinal, source, {}, destination, false);
 }
 
-std::unique_ptr<DeviceOps> make_queue(const Device& device, int device_ordinal) {
-    return std::make_unique<RocmQueue>(device, device_ordinal);
+std::unique_ptr<DeviceOps> make_queue(
+        const Device& device, int device_ordinal) {
+    return std::make_unique<detail::GpuQueue<gpu_policy>>(
+            device, device_ordinal);
 }
 
 }  // namespace iom::rocm_detail
