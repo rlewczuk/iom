@@ -69,27 +69,6 @@ namespace iom::ttnn_detail {
             return tt::tt_metal::HostBuffer(std::move(typed));
         }
 
-        tt::tt_metal::HostBuffer make_host_buffer(
-                tt::tt_metal::DataType dtype, std::vector<std::byte>& bytes) {
-            switch (dtype) {
-                case tt::tt_metal::DataType::BFLOAT16:
-                    return typed_buffer<bfloat16>(bytes);
-                case tt::tt_metal::DataType::FLOAT32:
-                    return typed_buffer<float>(bytes);
-                case tt::tt_metal::DataType::UINT32:
-                    return typed_buffer<std::uint32_t>(bytes);
-                case tt::tt_metal::DataType::INT32:
-                    return typed_buffer<std::int32_t>(bytes);
-                case tt::tt_metal::DataType::UINT16:
-                    return typed_buffer<std::uint16_t>(bytes);
-                case tt::tt_metal::DataType::UINT8:
-                    return typed_buffer<std::uint8_t>(bytes);
-                default:
-                    throw std::logic_error(
-                            "TTNN native dtype has no host element type");
-            }
-        }
-
         // Uploads one plane's logical row-major bytes into the plane's
         // TTNN-native tiled tensor, zero-filling native padding.
         void upload_plane(
@@ -100,23 +79,62 @@ namespace iom::ttnn_detail {
                     static_cast<std::size_t>(plane.padded_shape()[-2]);
             const std::size_t padded_columns =
                     static_cast<std::size_t>(plane.padded_shape()[-1]);
-            std::vector<std::byte> padded(
-                    padded_rows * padded_columns * element_size,
-                    std::byte{0});
-            for (std::size_t row = 0; row < rows; ++row) {
-                std::memcpy(
-                        padded.data() + row * padded_columns * element_size,
-                        source + row * columns * element_size,
-                        columns * element_size);
+            const std::size_t num_tile_cols = padded_columns / 32;
+            const std::size_t padded_elements = padded_rows * padded_columns;
+
+            auto upload_typed = [&]<typename T>() {
+                std::vector<T> typed(padded_elements, T{0});
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::size_t col = 0;
+                    while (col < columns) {
+                        const std::size_t seg_columns = std::min<std::size_t>(
+                                16 - (col % 16), columns - col);
+                        const std::size_t tile_index =
+                                (row / 32) * num_tile_cols + (col / 32);
+                        const std::size_t face_index =
+                                ((row % 32) / 16) * 2 + ((col % 32) / 16);
+                        const std::size_t first_element_index =
+                                tile_index * 1024 + face_index * 256
+                                + (row % 16) * 16 + (col % 16);
+                        std::memcpy(
+                                reinterpret_cast<std::byte*>(typed.data())
+                                        + first_element_index * element_size,
+                                source + (row * columns + col) * element_size,
+                                seg_columns * element_size);
+                        col += seg_columns;
+                    }
+                }
+                tt::tt_metal::HostBuffer host_buffer(std::move(typed));
+                ttnn::Tensor host_tiled(
+                        std::move(host_buffer), plane.logical_shape(),
+                        plane.padded_shape(), plane.dtype(),
+                        tt::tt_metal::Layout::TILE);
+                ttnn::copy_to_device(host_tiled, plane);
+            };
+
+            switch (plane.dtype()) {
+                case tt::tt_metal::DataType::BFLOAT16:
+                    upload_typed.template operator()<bfloat16>();
+                    break;
+                case tt::tt_metal::DataType::FLOAT32:
+                    upload_typed.template operator()<float>();
+                    break;
+                case tt::tt_metal::DataType::UINT32:
+                    upload_typed.template operator()<std::uint32_t>();
+                    break;
+                case tt::tt_metal::DataType::INT32:
+                    upload_typed.template operator()<std::int32_t>();
+                    break;
+                case tt::tt_metal::DataType::UINT16:
+                    upload_typed.template operator()<std::uint16_t>();
+                    break;
+                case tt::tt_metal::DataType::UINT8:
+                    upload_typed.template operator()<std::uint8_t>();
+                    break;
+                default:
+                    throw std::logic_error(
+                            "TTNN native dtype has no host element type");
             }
-            ttnn::Tensor host_row_major(
-                    make_host_buffer(plane.dtype(), padded),
-                    plane.logical_shape(), plane.padded_shape(),
-                    plane.dtype(), tt::tt_metal::Layout::ROW_MAJOR);
-            const ttnn::Tensor host_tiled =
-                    tt::tt_metal::to_layout(
-                            host_row_major, tt::tt_metal::Layout::TILE);
-            ttnn::copy_to_device(host_tiled, plane);
         }
 
         // Downloads one plane's logical row-major bytes from the plane's
@@ -129,19 +147,31 @@ namespace iom::ttnn_detail {
             ttnn::Tensor host_tiled =
                     ttnn::allocate_tensor_on_host(plane.tensor_spec(), &device);
             ttnn::copy_to_host(plane, host_tiled, /*blocking=*/true);
-            const ttnn::Tensor host_row_major = tt::tt_metal::to_layout(
-                    host_tiled, tt::tt_metal::Layout::ROW_MAJOR);
             const tt::tt_metal::HostBuffer buffer =
                     tt::tt_metal::host_buffer::get_host_buffer(
-                            host_row_major.host_tensor());
+                            host_tiled.host_tensor());
             const auto bytes = buffer.view_bytes();
-            const std::size_t padded_columns = static_cast<std::size_t>(
-                    host_row_major.padded_shape()[-1]);
+            const std::size_t num_tile_cols = static_cast<std::size_t>(
+                    host_tiled.padded_shape()[-1]) / 32;
             for (std::size_t row = 0; row < rows; ++row) {
-                std::memcpy(
-                        destination + row * columns * element_size,
-                        bytes.data() + row * padded_columns * element_size,
-                        columns * element_size);
+                std::size_t col = 0;
+                while (col < columns) {
+                    const std::size_t seg_columns = std::min<std::size_t>(
+                            16 - (col % 16), columns - col);
+                    const std::size_t tile_index =
+                            (row / 32) * num_tile_cols + (col / 32);
+                    const std::size_t face_index =
+                            ((row % 32) / 16) * 2 + ((col % 32) / 16);
+                    const std::size_t first_element_index =
+                            tile_index * 1024 + face_index * 256
+                            + (row % 16) * 16 + (col % 16);
+                    std::memcpy(
+                            destination + (row * columns + col) * element_size,
+                            bytes.data()
+                                    + first_element_index * element_size,
+                            seg_columns * element_size);
+                    col += seg_columns;
+                }
             }
         }
 

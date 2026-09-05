@@ -1,7 +1,6 @@
 #include "standard_tiled_copy.hpp"
 
 #include <algorithm>
-#include <vector>
 
 #include "iom/gpu_algorithm.hpp"
 
@@ -132,85 +131,7 @@ IOM_GPU_GLOBAL void gather_plane_kernel(
             bits);
 }
 
-IOM_GPU_GLOBAL void copy_plane_kernel(
-        const unsigned char* source, unsigned char* destination,
-        std::uint64_t source_plane, std::uint64_t destination_plane,
-        std::uint64_t first, std::uint64_t count, std::uint64_t rows,
-        std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t local = first + IOM_GPU_GLOBAL_INDEX;
-    if (local >= first + count) {
-        return;
-    }
-    const std::uint64_t row = local / columns;
-    const std::uint64_t column = local % columns;
-    const std::uint64_t source_bit =
-            plane_slot(source_plane, row, column, rows, columns) * bits;
-    const std::uint64_t destination_bit =
-            plane_slot(destination_plane, row, column, rows, columns) * bits;
-    copy_value(destination, destination_bit, source, source_bit, bits);
-}
 
-struct PlanePair {
-    std::size_t source;
-    std::size_t destination;
-};
-
-[[nodiscard]] std::vector<std::size_t> view_planes(const TensorView& view) {
-    const std::span<const std::size_t> dimensions = view.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    const std::size_t plane_count =
-            view.spec().shape.element_count() / (rows * columns);
-
-    std::vector<std::size_t> planes;
-    planes.reserve(plane_count);
-    for (std::size_t logical_plane = 0; logical_plane < plane_count;
-         ++logical_plane) {
-        std::size_t rest = logical_plane;
-        std::size_t plane = view.plane_offset();
-        for (std::size_t k = leading_rank; k-- > 0;) {
-            const std::size_t coordinate = rest % dimensions[k];
-            rest /= dimensions[k];
-            plane += coordinate * view.plane_strides()[k];
-        }
-        planes.push_back(plane);
-    }
-    return planes;
-}
-
-[[nodiscard]] std::vector<PlanePair> plane_pairs(
-        const TensorView& source, const TensorView& destination) {
-    const std::span<const std::size_t> dimensions =
-            source.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    const std::size_t plane_count =
-            source.spec().shape.element_count() / (rows * columns);
-
-    std::vector<PlanePair> pairs;
-    pairs.reserve(plane_count);
-    for (std::size_t logical_plane = 0; logical_plane < plane_count;
-         ++logical_plane) {
-        std::size_t source_rest = logical_plane;
-        std::size_t destination_rest = logical_plane;
-        std::size_t source_plane = source.plane_offset();
-        std::size_t destination_plane = destination.plane_offset();
-        for (std::size_t k = leading_rank; k-- > 0;) {
-            const std::size_t source_coordinate = source_rest % dimensions[k];
-            const std::size_t destination_coordinate =
-                    destination_rest % dimensions[k];
-            source_rest /= dimensions[k];
-            destination_rest /= dimensions[k];
-            source_plane += source_coordinate * source.plane_strides()[k];
-            destination_plane +=
-                    destination_coordinate * destination.plane_strides()[k];
-        }
-        pairs.push_back({source_plane, destination_plane});
-    }
-    return pairs;
-}
 
 template <typename Policy>
 void launch_view_transfer(
@@ -221,14 +142,21 @@ void launch_view_transfer(
     const std::size_t leading_rank = dimensions.size() - 2;
     const std::size_t rows = dimensions[leading_rank];
     const std::size_t columns = dimensions[leading_rank + 1];
+    const std::span<const std::size_t> plane_strides =
+            view.plane_strides();
     const std::size_t plane_count =
             view.spec().shape.element_count() / (rows * columns);
     const unsigned int bits =
             static_cast<unsigned int>(leaf_bits(view.spec().data_type));
-    const std::vector<std::size_t> planes = view_planes(view);
     const std::size_t elements = rows * columns;
     for (std::size_t logical_plane = 0; logical_plane < plane_count;
          ++logical_plane) {
+        std::size_t rest = logical_plane;
+        std::size_t plane = view.plane_offset();
+        for (std::size_t k = leading_rank; k-- > 0;) {
+            plane += (rest % dimensions[k]) * plane_strides[k];
+            rest /= dimensions[k];
+        }
         for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
             const std::size_t count = std::min(kLaunchChunk, elements - first);
             const unsigned int blocks = static_cast<unsigned int>(
@@ -238,7 +166,7 @@ void launch_view_transfer(
                         scatter_plane_kernel, blocks, kThreads, stream,
                         static_cast<const unsigned char*>(source),
                         static_cast<unsigned char*>(destination),
-                        static_cast<std::uint64_t>(planes[logical_plane]),
+                        static_cast<std::uint64_t>(plane),
                         static_cast<std::uint64_t>(logical_plane * elements),
                         static_cast<std::uint64_t>(first),
                         static_cast<std::uint64_t>(count),
@@ -250,7 +178,7 @@ void launch_view_transfer(
                         gather_plane_kernel, blocks, kThreads, stream,
                         static_cast<const unsigned char*>(source),
                         static_cast<unsigned char*>(destination),
-                        static_cast<std::uint64_t>(planes[logical_plane]),
+                        static_cast<std::uint64_t>(plane),
                         static_cast<std::uint64_t>(logical_plane * elements),
                         static_cast<std::uint64_t>(first),
                         static_cast<std::uint64_t>(count),
@@ -259,31 +187,6 @@ void launch_view_transfer(
                 Policy::check_kernel(Policy::gather_kernel_operation());
             }
         }
-    }
-}
-
-template <typename Policy>
-void launch_copy_plane(
-        typename Policy::stream_type stream, const PlanePair& pair,
-        std::size_t plane_index, std::size_t rows, std::size_t columns,
-        unsigned int bits, const void* source, void* destination) {
-    const std::size_t elements = rows * columns;
-    for (std::size_t first = 0; first < elements; first += kLaunchChunk) {
-        const std::size_t count = std::min(kLaunchChunk, elements - first);
-        const unsigned int blocks = static_cast<unsigned int>(
-                (count + kThreads - 1) / kThreads);
-        IOM_LAUNCH_KERNEL(
-                copy_plane_kernel, blocks, kThreads, stream,
-                static_cast<const unsigned char*>(source),
-                static_cast<unsigned char*>(destination),
-                static_cast<std::uint64_t>(pair.source),
-                static_cast<std::uint64_t>(pair.destination),
-                static_cast<std::uint64_t>(first),
-                static_cast<std::uint64_t>(count),
-                static_cast<std::uint64_t>(rows),
-                static_cast<std::uint64_t>(columns), bits);
-        Policy::check_kernel(Policy::copy_kernel_operation());
-        Policy::after_copy_plane_launch(plane_index);
     }
 }
 
@@ -331,17 +234,6 @@ void synchronous_transfer_impl(
     Policy::free(staging);
 }
 
-template <typename Policy>
-struct PendingEvent {
-    typename Policy::event_type event = Policy::null_event();
-    bool linked = false;
-
-    ~PendingEvent() noexcept {
-        if (Policy::event_is_valid(event) && !linked) {
-            Policy::destroy_event_noexcept(event);
-        }
-    }
-};
 
 }  // namespace
 

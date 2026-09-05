@@ -6,6 +6,11 @@
 #include <array>
 #include <cstdint>
 #include <exception>
+#include <array>
+#include <condition_variable>
+#include <limits>
+#include <type_traits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -44,14 +49,8 @@ struct gpu_policy {
     [[nodiscard]] static constexpr stream_type null_stream() noexcept {
         return nullptr;
     }
-    [[nodiscard]] static constexpr event_type null_event() noexcept {
-        return nullptr;
-    }
     [[nodiscard]] static bool stream_is_valid(stream_type stream) noexcept {
         return stream != nullptr;
-    }
-    [[nodiscard]] static bool event_is_valid(event_type event) noexcept {
-        return event != nullptr;
     }
 
     static void activate(context_type device_ordinal) {
@@ -103,13 +102,16 @@ struct gpu_policy {
     static void synchronize_event(event_type event) {
         check_hip("hipEventSynchronize", hipEventSynchronize(event));
     }
-    static constexpr bool discard_failure_event_on_error = true;
     static void record_event(event_type event, stream_type stream) {
         hipError_t status = hipEventRecord(event, stream);
         if (consume_submission_fault(SubmissionFault::event_record)) {
             status = hipErrorInvalidValue;
         }
         check_hip("hipEventRecord", status);
+    }
+    static void record_event_no_fault(
+            event_type event, stream_type stream) noexcept {
+        (void)hipEventRecord(event, stream);
     }
 
     [[nodiscard]] static void* allocate(std::size_t bytes) {
@@ -168,6 +170,11 @@ struct gpu_policy {
             check_hip("HIP copy kernel launch", hipErrorInvalidValue);
         }
     }
+    static void after_grid_stride_launch() {
+        if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
+            check_hip("HIP copy kernel launch", hipErrorInvalidValue);
+        }
+    }
     [[nodiscard]] static constexpr const char* scatter_kernel_operation() noexcept {
         return "HIP kernel launch";
     }
@@ -179,13 +186,6 @@ struct gpu_policy {
     }
 
 };
-void fence_and_destroy(hipEvent_t event) noexcept {
-    if (event == nullptr) {
-        return;
-    }
-    (void)hipEventSynchronize(event);
-    (void)hipEventDestroy(event);
-}
 
 void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
     if (stream == nullptr) {
@@ -241,7 +241,98 @@ detail::Fence make_fence(
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     hipLaunchKernelGGL( \
             kernel, dim3(blocks), dim3(threads), 0, stream, __VA_ARGS__)
+namespace iom::rocm_detail {
+
+struct HipCopyMetadataHeader {
+    std::uint64_t source_plane_offset;
+    std::uint64_t destination_plane_offset;
+    std::uint64_t rows;
+    std::uint64_t columns;
+    std::uint64_t plane_count;
+    std::uint32_t bits;
+    std::uint32_t leading_rank;
+};
+static_assert(std::is_trivially_copyable_v<HipCopyMetadataHeader>);
+
+}  // namespace iom::rocm_detail
 #include "../shared/standard_tiled_copy.inl"
+namespace iom::rocm_detail {
+
+namespace {
+
+IOM_GPU_GLOBAL void grid_stride_copy_kernel(
+        const unsigned char* source, unsigned char* destination,
+        const HipCopyMetadataHeader* metadata) {
+    const std::uint64_t padded_rows =
+            (metadata->rows / TensorSpec::TILE
+             + (metadata->rows % TensorSpec::TILE != 0))
+            * TensorSpec::TILE;
+    const std::uint64_t padded_columns =
+            (metadata->columns / TensorSpec::TILE
+             + (metadata->columns % TensorSpec::TILE != 0))
+            * TensorSpec::TILE;
+    const std::uint64_t padded_elements = padded_rows * padded_columns;
+    const std::uint64_t plane_bits = padded_elements * metadata->bits;
+    const std::uint64_t words_per_plane = (plane_bits + 31) / 32;
+    const std::uint64_t total_words =
+            metadata->plane_count * words_per_plane;
+    const std::uint64_t* source_strides =
+            reinterpret_cast<const std::uint64_t*>(metadata + 1);
+    const std::uint64_t* destination_strides =
+            source_strides + metadata->leading_rank;
+    const std::uint64_t* leading_dimensions =
+            destination_strides + metadata->leading_rank;
+    const std::uint64_t stride =
+            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+
+    for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < total_words;
+         word += stride) {
+        const std::uint64_t logical_plane =
+                word / words_per_plane;
+        const std::uint64_t word_in_plane = word % words_per_plane;
+        const std::uint64_t first_bit = word_in_plane * 32;
+        const std::uint64_t end_bit =
+                first_bit + 32 < plane_bits ? first_bit + 32 : plane_bits;
+        const std::uint64_t first_element =
+                (first_bit + metadata->bits - 1) / metadata->bits;
+        std::uint64_t source_plane = metadata->source_plane_offset;
+        std::uint64_t destination_plane =
+                metadata->destination_plane_offset;
+        std::uint64_t rest = logical_plane;
+        for (std::uint32_t axis = metadata->leading_rank; axis-- > 0;) {
+            const std::uint64_t coordinate =
+                    rest % leading_dimensions[axis];
+            rest /= leading_dimensions[axis];
+            source_plane += coordinate * source_strides[axis];
+            destination_plane += coordinate * destination_strides[axis];
+        }
+        for (std::uint64_t element = first_element;
+             element < padded_elements
+             && element * metadata->bits < end_bit; ++element) {
+            const std::uint64_t row = element / padded_columns;
+            const std::uint64_t column = element % padded_columns;
+            if (row >= metadata->rows || column >= metadata->columns) {
+                continue;
+            }
+            const std::uint64_t source_bit =
+                    detail::plane_slot(
+                            source_plane, row, column, metadata->rows,
+                            metadata->columns)
+                    * metadata->bits;
+            const std::uint64_t destination_bit =
+                    detail::plane_slot(
+                            destination_plane, row, column, metadata->rows,
+                            metadata->columns)
+                    * metadata->bits;
+            detail::copy_value(
+                    destination, destination_bit, source, source_bit,
+                    metadata->bits);
+        }
+    }
+}
+
+}  // namespace
+}  // namespace iom::rocm_detail
 #undef IOM_LAUNCH_KERNEL
 #undef IOM_GPU_ATOMIC_AND
 #undef IOM_GPU_ATOMIC_OR
@@ -253,6 +344,263 @@ namespace iom::rocm_detail {
 
 namespace {
 
+[[nodiscard]] std::size_t checked_metadata_mul(
+        std::size_t left, std::size_t right, const char* message) {
+    if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
+        throw std::overflow_error(message);
+    }
+    return left * right;
+}
+
+[[nodiscard]] std::size_t checked_metadata_add(
+        std::size_t left, std::size_t right, const char* message) {
+    if (left > std::numeric_limits<std::size_t>::max() - right) {
+        throw std::overflow_error(message);
+    }
+    return left + right;
+}
+
+[[nodiscard]] std::uint64_t metadata_u64(
+        std::size_t value, const char* message) {
+    if (value > std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error(message);
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+[[nodiscard]] std::size_t padded_dimension(std::size_t value) {
+    const std::size_t tiles =
+            value / TensorSpec::TILE + (value % TensorSpec::TILE != 0);
+    return checked_metadata_mul(
+            tiles, TensorSpec::TILE, "metadata size overflows");
+}
+
+struct HipMetadataLayout {
+    std::size_t bytes;
+    std::size_t total_words;
+};
+
+[[nodiscard]] HipMetadataLayout metadata_layout(
+        const TensorView& source, const TensorView& destination) {
+    const std::span<const std::size_t> dimensions =
+            source.spec().shape.dimensions();
+    const std::size_t leading_rank = dimensions.size() - 2;
+    if (leading_rank > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("metadata leading rank overflows");
+    }
+    const std::size_t rows = dimensions[leading_rank];
+    const std::size_t columns = dimensions[leading_rank + 1];
+    std::size_t plane_count = 1;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        plane_count = checked_metadata_mul(
+                plane_count, dimensions[axis], "metadata plane count overflows");
+    }
+    const std::size_t padded_elements = checked_metadata_mul(
+            padded_dimension(rows), padded_dimension(columns),
+            "metadata element count overflows");
+    const std::size_t plane_bits = checked_metadata_mul(
+            padded_elements, detail::leaf_bits(source.spec().data_type),
+            "metadata plane bits overflows");
+    const std::size_t words_per_plane = checked_metadata_add(
+            plane_bits, 31, "metadata word count overflows")
+            / 32;
+    const std::size_t total_words_size = checked_metadata_mul(
+            plane_count, words_per_plane, "metadata total words overflows");
+    const std::size_t array_count = checked_metadata_mul(
+            leading_rank, 3, "metadata array count overflows");
+    const std::size_t array_bytes = checked_metadata_mul(
+            array_count, sizeof(std::uint64_t),
+            "metadata array bytes overflows");
+    const std::size_t bytes = checked_metadata_add(
+            sizeof(HipCopyMetadataHeader), array_bytes,
+            "metadata allocation size overflows");
+    (void)metadata_u64(rows, "metadata rows overflows");
+    (void)metadata_u64(columns, "metadata columns overflows");
+    (void)metadata_u64(plane_count, "metadata plane count overflows");
+    (void)metadata_u64(total_words_size, "metadata total words overflows");
+    for (const std::size_t stride : source.plane_strides()) {
+        (void)metadata_u64(stride, "metadata source stride overflows");
+    }
+    for (const std::size_t stride : destination.plane_strides()) {
+        (void)metadata_u64(stride, "metadata destination stride overflows");
+    }
+    (void)metadata_u64(
+            source.plane_offset(), "metadata source offset overflows");
+    (void)metadata_u64(
+            destination.plane_offset(), "metadata destination offset overflows");
+    return {bytes, total_words_size};
+}
+
+class HipMetadataSlotPool final {
+public:
+    static constexpr std::size_t kMetadataSlotCount = 16;
+
+    explicit HipMetadataSlotPool(int context) : context_(context) {}
+
+    ~HipMetadataSlotPool() {
+        try {
+            gpu_policy::activate(context_);
+        } catch (...) {
+        }
+        for (Slot& slot : slots_) {
+            gpu_policy::free_noexcept(slot.device);
+            slot.device = nullptr;
+        }
+    }
+
+    HipMetadataSlotPool(const HipMetadataSlotPool&) = delete;
+    HipMetadataSlotPool& operator=(const HipMetadataSlotPool&) = delete;
+
+    [[nodiscard]] std::size_t acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        completion_.wait(lock, [this] {
+            for (const Slot& slot : slots_) {
+                if (!slot.in_use) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        for (std::size_t index = 0; index < slots_.size(); ++index) {
+            if (!slots_[index].in_use) {
+                slots_[index].in_use = true;
+                return index;
+            }
+        }
+        throw std::logic_error("metadata slot acquisition lost a free slot");
+    }
+
+    void release(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < slots_.size() && slots_[index].in_use) {
+            slots_[index].in_use = false;
+            completion_.notify_one();
+        }
+    }
+
+    void ensure_slot_capacity(
+            std::size_t index, std::size_t required_bytes,
+            hipStream_t stream) {
+        Slot& slot = slots_.at(index);
+        if (slot.capacity >= required_bytes) {
+            return;
+        }
+        std::size_t capacity = slot.capacity == 0 ? 256 : slot.capacity;
+        while (capacity < required_bytes) {
+            if (capacity > std::numeric_limits<std::size_t>::max() / 2) {
+                capacity = required_bytes;
+                break;
+            }
+            capacity *= 2;
+        }
+        gpu_policy::synchronize_stream(stream);
+        std::unique_ptr<std::byte[]> replacement(
+                new std::byte[capacity]);
+        void* replacement_device = gpu_policy::allocate(capacity);
+        void* old_device = slot.device;
+        slot.host = std::move(replacement);
+        slot.device = replacement_device;
+        slot.capacity = capacity;
+        gpu_policy::free_noexcept(old_device);
+    }
+
+    [[nodiscard]] std::byte* host_data(std::size_t index) {
+        return slots_.at(index).host.get();
+    }
+
+    [[nodiscard]] void* device_data(std::size_t index) {
+        return slots_.at(index).device;
+    }
+
+private:
+    struct Slot {
+        std::unique_ptr<std::byte[]> host;
+        void* device = nullptr;
+        std::size_t capacity = 0;
+        bool in_use = false;
+    };
+
+    int context_;
+    std::array<Slot, kMetadataSlotCount> slots_;
+    std::mutex mutex_;
+    std::condition_variable completion_;
+};
+
+void write_hip_metadata(
+        std::byte* storage, const TensorView& source,
+        const TensorView& destination) {
+    const std::span<const std::size_t> dimensions =
+            source.spec().shape.dimensions();
+    const std::size_t leading_rank = dimensions.size() - 2;
+    const std::size_t rows = dimensions[leading_rank];
+    const std::size_t columns = dimensions[leading_rank + 1];
+    std::size_t plane_count = 1;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        plane_count = checked_metadata_mul(
+                plane_count, dimensions[axis], "metadata plane count overflows");
+    }
+    auto* header = reinterpret_cast<HipCopyMetadataHeader*>(storage);
+    header->source_plane_offset = metadata_u64(
+            source.plane_offset(), "metadata source offset overflows");
+    header->destination_plane_offset = metadata_u64(
+            destination.plane_offset(), "metadata destination offset overflows");
+    header->rows = metadata_u64(rows, "metadata rows overflows");
+    header->columns = metadata_u64(columns, "metadata columns overflows");
+    header->plane_count = metadata_u64(
+            plane_count, "metadata plane count overflows");
+    header->bits = static_cast<std::uint32_t>(
+            detail::leaf_bits(source.spec().data_type));
+    header->leading_rank = static_cast<std::uint32_t>(leading_rank);
+    auto* values = reinterpret_cast<std::uint64_t*>(header + 1);
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        values[axis] = metadata_u64(
+                source.plane_strides()[axis],
+                "metadata source stride overflows");
+        values[leading_rank + axis] = metadata_u64(
+                destination.plane_strides()[axis],
+                "metadata destination stride overflows");
+        values[2 * leading_rank + axis] = metadata_u64(
+                dimensions[axis], "metadata leading dimension overflows");
+    }
+}
+
+struct HipFenceResource {
+    hipEvent_t event = nullptr;
+    std::size_t metadata_slot = 0;
+    HipMetadataSlotPool* pool = nullptr;
+    int context = 0;
+};
+
+void destroy_hip_resource_noexcept(HipFenceResource* resource) noexcept {
+    if (resource == nullptr) {
+        return;
+    }
+    gpu_policy::destroy_event_noexcept(resource->event);
+    resource->pool->release(resource->metadata_slot);
+    delete resource;
+}
+
+void hip_fence_complete(void* opaque) {
+    auto* resource = static_cast<HipFenceResource*>(opaque);
+    gpu_policy::activate(resource->context);
+    gpu_policy::synchronize_event(resource->event);
+}
+
+void hip_fence_destroy(void* opaque) noexcept {
+    auto* resource = static_cast<HipFenceResource*>(opaque);
+    if (resource == nullptr) {
+        return;
+    }
+    try {
+        gpu_policy::activate(resource->context);
+    } catch (...) {
+    }
+    destroy_hip_resource_noexcept(resource);
+}
+
+}  // namespace
+
+namespace {
 
 class RocmQueue final : public DeviceOps {
     struct Task {
@@ -281,23 +629,17 @@ public:
               state_(&registry_state),
               registry_queue_id_(allocate_queue_id(*state_)),
               context_(device_ordinal),
+              metadata_pool_(context_),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
                               [this](Task& task) {
                                   execute(task);
                               },
-                              [this](void* fence) {
-                                  gpu_policy::activate(context_);
-                                  gpu_policy::synchronize_event(
-                                          static_cast<hipEvent_t>(fence));
+                              [](void* fence) {
+                                  hip_fence_complete(fence);
                               },
-                              [this](void* fence) {
-                                  try {
-                                      gpu_policy::activate(context_);
-                                      fence_and_destroy(
-                                              static_cast<hipEvent_t>(fence));
-                                  } catch (...) {
-                                  }
+                              [](void* fence) {
+                                  hip_fence_destroy(fence);
                               },
                               [this](
                                       std::uint64_t sequence,
@@ -365,42 +707,76 @@ public:
 
 private:
     void execute(Task& task) {
-        gpu_policy::activate(context_);
-        detail::PendingEvent<gpu_policy> event_guard;
-        gpu_policy::create_event(&event_guard.event);
-        task.event = event_guard.event;
-        task.fence = static_cast<void*>(event_guard.event);
-        const std::vector<detail::PlanePair> pairs =
-                task.no_op ? std::vector<detail::PlanePair>{}
-                           : detail::plane_pairs(*task.source, *task.destination);
-        const std::span<const std::size_t> dimensions =
-                task.source->spec().shape.dimensions();
-        const std::size_t rows = dimensions[dimensions.size() - 2];
-        const std::size_t columns = dimensions[dimensions.size() - 1];
-        const unsigned int bits = static_cast<unsigned int>(
-                detail::leaf_bits(task.source->spec().data_type));
-
-        std::exception_ptr retained_failure;
-        try {
-            std::size_t plane_index = 0;
-            for (const detail::PlanePair pair : pairs) {
-                detail::launch_copy_plane<gpu_policy>(
-                        stream_, pair, plane_index++, rows, columns, bits,
-                        task.source->native_handle(),
-                        task.destination->native_handle());
-            }
-            gpu_policy::record_event(task.event, stream_);
-            event_guard.linked = true;
-        } catch (...) {
-            retained_failure = std::current_exception();
+        if (task.no_op) {
+            task.event = nullptr;
             task.fence = nullptr;
-            event_guard.linked = false;
+            return;
         }
 
-        const hipEvent_t registry_event =
-                retained_failure != nullptr ? nullptr : task.event;
+        gpu_policy::activate(context_);
+        const std::size_t metadata_slot = metadata_pool_.acquire();
+        hipEvent_t event = nullptr;
+        std::unique_ptr<HipFenceResource> resource;
+        bool kernel_enqueued = false;
+        std::exception_ptr retained_failure;
+        try {
+            const HipMetadataLayout layout =
+                    metadata_layout(*task.source, *task.destination);
+            metadata_pool_.ensure_slot_capacity(
+                    metadata_slot, layout.bytes, stream_);
+            write_hip_metadata(
+                    metadata_pool_.host_data(metadata_slot),
+                    *task.source, *task.destination);
+            gpu_policy::create_event(&event);
+            resource = std::make_unique<HipFenceResource>(
+                    HipFenceResource{
+                            event, metadata_slot, &metadata_pool_, context_});
+            gpu_policy::copy_from_host(
+                    stream_, metadata_pool_.device_data(metadata_slot),
+                    metadata_pool_.host_data(metadata_slot), layout.bytes);
+            const std::size_t launch_words = checked_metadata_add(
+                    layout.total_words, 255,
+                    "metadata launch count overflows");
+            const unsigned int blocks = static_cast<unsigned int>(
+                    std::min<std::size_t>(launch_words / 256, 65535));
+            hipLaunchKernelGGL(
+                    grid_stride_copy_kernel, dim3(blocks), dim3(256), 0,
+                    stream_,
+                    static_cast<const unsigned char*>(
+                            task.source->native_handle()),
+                    static_cast<unsigned char*>(
+                            task.destination->native_handle()),
+                    static_cast<const HipCopyMetadataHeader*>(
+                            metadata_pool_.device_data(metadata_slot)));
+            kernel_enqueued = true;
+            gpu_policy::check_kernel(gpu_policy::copy_kernel_operation());
+            gpu_policy::after_grid_stride_launch();
+            gpu_policy::record_event(event, stream_);
+            task.event = event;
+            task.fence = resource.release();
+        } catch (...) {
+            const std::exception_ptr failure = std::current_exception();
+            if (kernel_enqueued) {
+                if (resource) {
+                    gpu_policy::record_event_no_fault(event, stream_);
+                    task.event = event;
+                    task.fence = resource.release();
+                }
+                retained_failure = failure;
+            } else {
+                if (resource) {
+                    resource->event = event;
+                    destroy_hip_resource_noexcept(resource.release());
+                } else {
+                    gpu_policy::destroy_event_noexcept(event);
+                    metadata_pool_.release(metadata_slot);
+                }
+                throw;
+            }
+        }
+
         const detail::Fence fence = make_fence(
-                context_, registry_event, retained_failure);
+                context_, task.event, retained_failure);
         detail::EntryRegistration entries;
         try {
             entries = register_copy_entries(
@@ -429,15 +805,12 @@ private:
                         entries.destination,
                         task.destination->native_handle());
             }
-            if (task.event != nullptr) {
-                if (retained_failure == nullptr) {
-                    fence_and_destroy(task.event);
-                } else {
-                    gpu_policy::destroy_event_noexcept(task.event);
-                }
-                event_guard.event = nullptr;
-                event_guard.linked = true;
+            if (task.fence != nullptr) {
+                hip_fence_destroy(task.fence);
                 task.fence = nullptr;
+                task.event = nullptr;
+            } else {
+                metadata_pool_.release(metadata_slot);
             }
             throw;
         }
@@ -445,41 +818,12 @@ private:
         if (retained_failure) {
             commit_failure(task.sequence, retained_failure);
         }
-    }
-
-    void complete_task(
-            std::uint64_t sequence, std::exception_ptr failure) {
-        SequenceOutcome outcome;
-        bool has_outcome = false;
-        {
-            std::lock_guard<std::mutex> lock(outcome_mutex_);
-            const auto it = outcomes_.find(sequence);
-            if (it != outcomes_.end()) {
-                outcome = std::move(it->second);
-                outcomes_.erase(it);
-                has_outcome = true;
-            }
-        }
-        if (has_outcome) {
-            outcome.fence_succeeded = !failure && !outcome.retained_failure;
-            const std::array<detail::EntryId, 2> entries{
-                    outcome.source_entry_id,
-                    outcome.destination_entry_id};
-            if (failure || outcome.retained_failure) {
-                state_->registry.invalidate_entries(entries);
-            } else {
-                (void)state_->registry.try_release_entry(entries[0]);
-                (void)state_->registry.try_release_entry(entries[1]);
-            }
-        }
-        complete(sequence, std::move(failure));
-    }
-
     const Device* device_;
     RocmRegistryState* state_;
     detail::QueueId registry_queue_id_;
     int context_;
     hipStream_t stream_ = gpu_policy::null_stream();
+    HipMetadataSlotPool metadata_pool_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
     std::map<std::uint64_t, SequenceOutcome> outcomes_;
