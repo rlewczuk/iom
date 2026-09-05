@@ -16,11 +16,11 @@ namespace iom::detail {
             std::span<const std::byte> source,
             std::span<std::byte> destination, bool from_host);
 
+}  // namespace iom::detail
+
 namespace iom {
 
     template <typename Policy>
     using GpuQueue = detail::GpuQueue<Policy>;
 
 }  // namespace iom
-
-}  // namespace iom::detail
