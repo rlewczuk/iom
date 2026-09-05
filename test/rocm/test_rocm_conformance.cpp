@@ -421,8 +421,9 @@ TEST_CASE("ROCm conformance: asynchronous copies against the CPU reference") {
     auto foreign = iom::make_rocm_device(0, foreign_allocator);
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
     iom_conformance::run_async_copy_conformance(
-            devices, candidate->supported_data_types(), &gate);
+            devices, candidate->supported_data_types(), &gate, &oracle);
     CHECK_FALSE(gate.armed());
 }
 
@@ -511,9 +512,10 @@ TEST_CASE("ROCm conformance: full shared suite") {
     auto foreign = iom::make_rocm_device(0, foreign_allocator);
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate);
+            &gate, &oracle);
     CHECK_FALSE(gate.armed());
 }
 

@@ -1,4 +1,5 @@
 #include "copy.hpp"
+#include "transfer_pool.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -64,15 +65,6 @@ struct gpu_policy {
         }
     }
 
-    [[nodiscard]] static stream_type create_transfer_stream() noexcept {
-        return nullptr;
-    }
-    [[nodiscard]] static bool stream_is_valid(stream_type stream) noexcept {
-        return stream != nullptr;
-    }
-    static void destroy_transfer_stream(stream_type) noexcept {}
-    static void destroy_transfer_stream_noexcept(stream_type) noexcept {}
-    static void synchronize_stream_noexcept(stream_type) noexcept {}
     static void synchronize_stream(stream_type stream) {
         check_cuda_kernel("cudaStreamSynchronize", cudaStreamSynchronize(stream));
     }
@@ -125,11 +117,13 @@ struct gpu_policy {
     }
 
     static void copy_from_host(
-            stream_type, void* destination, const void* source,
+            stream_type stream, void* destination, const void* source,
             std::size_t bytes) {
         check_cuda_kernel(
-                "cudaMemcpy HtoD",
-                cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
+                "cudaMemcpyAsync HtoD",
+                cudaMemcpyAsync(
+                        destination, source, bytes,
+                        cudaMemcpyHostToDevice, stream));
     }
     static void copy_to_host(
             stream_type, void* destination, const void* source,
@@ -139,8 +133,10 @@ struct gpu_policy {
                 cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost));
     }
     static void memset(
-            stream_type, void* destination, std::size_t bytes) {
-        check_cuda_kernel("cudaMemset", cudaMemset(destination, 0, bytes));
+            stream_type stream, void* destination, std::size_t bytes) {
+        check_cuda_kernel(
+                "cudaMemsetAsync",
+                cudaMemsetAsync(destination, 0, bytes, stream));
     }
 
     static void check_kernel(const char* operation) {
@@ -185,6 +181,134 @@ struct gpu_policy {
 #undef IOM_GPU_DEVICE
 
 namespace iom::cuda_detail {
+void TransferStreamPool::Scope::poison() noexcept {
+    poisoned_ = true;
+}
+
+std::size_t TransferStreamPool::idle_count_for_testing() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return idle_.size();
+}
+
+TransferStreamPool::Scope::~Scope() noexcept {
+    const cudaError_t sync_status = cudaStreamSynchronize(stream_);
+    const bool drop_stream = poisoned_ || (sync_status != cudaSuccess);
+    if (drop_stream) {
+        std::lock_guard<std::mutex> lock(pool_->mutex_);
+        const auto it = pool_->in_use_.find(stream_);
+        if (it != pool_->in_use_.end()) {
+            pool_->in_use_.erase(it);
+            pool_->cv_.notify_all();
+        }
+        (void)cudaStreamDestroy(stream_);
+    } else {
+        pool_->release(stream_);
+    }
+}
+
+TransferStreamPool::Scope TransferStreamPool::acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (closing_) {
+        throw std::runtime_error(
+                "cudaStreamCreateWithFlags failed with "
+                "cudaErrorStreamDestroyed: TransferStreamPool is closing");
+    }
+    if (idle_.empty()) {
+        cudaStream_t stream = nullptr;
+        check_cuda_kernel(
+                "cudaStreamCreateWithFlags",
+                cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        idle_.push_back(stream);
+    }
+    cudaStream_t stream = idle_.back();
+    idle_.pop_back();
+    try {
+        in_use_.insert(stream);
+    } catch (...) {
+        idle_.push_back(stream);
+        throw;
+    }
+    return Scope{*this, stream};
+}
+
+void TransferStreamPool::release(cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = in_use_.find(stream);
+    if (it != in_use_.end()) {
+        in_use_.erase(it);
+        idle_.push_back(stream);
+        cv_.notify_all();
+    }
+}
+
+void TransferStreamPool::destroy() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    closing_ = true;
+    cv_.wait(lock, [this] { return in_use_.empty(); });
+    for (const cudaStream_t stream : idle_) {
+        (void)cudaStreamDestroy(stream);
+    }
+    idle_.clear();
+}
+
+namespace {
+
+void synchronous_transfer(
+        TransferStreamPool& pool, CUcontext context, const TensorView& view,
+        std::span<const std::byte> source, std::span<std::byte> destination,
+        bool from_host) {
+    const std::size_t logical_nbytes = view.spec().logical_nbytes();
+    const std::size_t staging_nbytes =
+            gpu_algorithm::compute_staging_size(logical_nbytes);
+    gpu_policy::activate(context);
+
+    void* staging = nullptr;
+    std::exception_ptr failure;
+    try {
+        staging = gpu_policy::allocate(staging_nbytes);
+        {
+            auto scope = pool.acquire();
+            const cudaStream_t stream = scope.stream();
+            try {
+                if (from_host) {
+                    gpu_policy::copy_from_host(
+                            stream, staging, source.data(), source.size());
+                    detail::launch_view_transfer<gpu_policy>(
+                            stream, view, staging,
+                            const_cast<void*>(view.native_handle()), true);
+                    gpu_policy::after_copy_plane_launch(2);
+                } else {
+                    gpu_policy::memset(stream, staging, staging_nbytes);
+                    detail::launch_view_transfer<gpu_policy>(
+                            stream, view, view.native_handle(), staging, false);
+                    gpu_policy::after_copy_plane_launch(2);
+                }
+                gpu_policy::synchronize_stream(stream);
+                if (!from_host) {
+                    gpu_policy::copy_to_host(
+                            stream, destination.data(), staging,
+                            destination.size());
+                }
+            } catch (...) {
+                scope.poison();
+                throw;
+            }
+        }
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    if (failure) {
+        if (staging != nullptr) {
+            gpu_policy::free_noexcept(staging);
+            staging = nullptr;
+        }
+        std::rethrow_exception(failure);
+    }
+    gpu_policy::free(staging);
+}
+
+}  // namespace
+
 namespace {
 
 class CudaQueue final : public DeviceOps {
@@ -337,15 +461,15 @@ void inject_submission_fault_for_testing(
 }
 
 void region_from_host(
-        CUcontext context, const TensorView& destination,
-        std::span<const std::byte> source) {
-    detail::synchronous_transfer<gpu_policy>(context, destination, source, {}, true);
+        TransferStreamPool& pool, CUcontext context,
+        const TensorView& destination, std::span<const std::byte> source) {
+    synchronous_transfer(pool, context, destination, source, {}, true);
 }
 
 void region_to_host(
-        CUcontext context, const TensorView& source,
+        TransferStreamPool& pool, CUcontext context, const TensorView& source,
         std::span<std::byte> destination) {
-    detail::synchronous_transfer<gpu_policy>(context, source, {}, destination, false);
+    synchronous_transfer(pool, context, source, {}, destination, false);
 }
 
 std::unique_ptr<DeviceOps> make_queue(const Device& device, CUcontext context) {

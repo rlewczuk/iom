@@ -1,21 +1,30 @@
 #include <doctest/doctest.h>
 
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 
+#include <atomic>
+#include <barrier>
+#include <chrono>
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <new>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 #include "iom/alloc.hpp"
 #include "iom/cuda/device.hpp"
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
+#include "copy.hpp"
 #include "driver.hpp"
+#include "transfer_pool.hpp"
 
 namespace cuda_test {
 bool fail_next_allocation = false;
@@ -178,6 +187,25 @@ public:
 
 private:
     void* raw_ = nullptr;
+};
+
+class CudaAllocator final : public iom::Allocator {
+public:
+    void* alloc(std::size_t size) override {
+        void* pointer = nullptr;
+        if (cudaMalloc(&pointer, size) != cudaSuccess) {
+            throw std::bad_alloc();
+        }
+        return pointer;
+    }
+
+    void free(void* pointer) override {
+        if (pointer != nullptr && cudaFree(pointer) != cudaSuccess) {
+            throw std::runtime_error("cudaFree failed in smoke allocator");
+        }
+    }
+
+    void reset() override {}
 };
 
 TEST_CASE("CUDA factory reports a live hardware device and owns its context") {
@@ -345,6 +373,183 @@ TEST_CASE("CUDA factory dismisses the primary-context guard on success") {
     CHECK(probe.retained);
     CHECK(probe.release_count == 1);
     CHECK(probe.released_device == probe.retained_device);
+}
+
+namespace {
+
+void require_cuda_hardware() {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    int device_count = 0;
+    REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
+    REQUIRE(device_count > 0);
+}
+
+}  // namespace
+
+TEST_CASE("CUDA host transfers on independent threads do not share a stream") {
+    require_cuda_hardware();
+    CudaAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2048, 2048}}, iom::DataType::F32};
+    auto tensor_a = device->create_tensor(spec);
+    auto tensor_b = device->create_tensor(spec);
+    const std::vector<std::byte> input(
+            spec.logical_nbytes(), static_cast<std::byte>(0x3c));
+    std::vector<std::byte> output_a(spec.logical_nbytes());
+    std::vector<std::byte> output_b(spec.logical_nbytes());
+    constexpr int transfers = 4;
+
+    const auto serial_begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < transfers; ++i) {
+        tensor_a->view().copy_from_host(input);
+        tensor_a->view().copy_to_host(output_a);
+        tensor_b->view().copy_from_host(input);
+        tensor_b->view().copy_to_host(output_b);
+    }
+    const auto serial_end = std::chrono::steady_clock::now();
+    const auto serial_total = serial_end - serial_begin;
+
+    std::barrier start_gate(3);
+    std::atomic<bool> failed = false;
+    const auto concurrent_begin = std::chrono::steady_clock::now();
+    std::thread thread_a([&] {
+        try {
+            start_gate.arrive_and_wait();
+            for (int i = 0; i < transfers; ++i) {
+                tensor_a->view().copy_from_host(input);
+                tensor_a->view().copy_to_host(output_a);
+            }
+        } catch (...) {
+            failed.store(true, std::memory_order_release);
+        }
+    });
+    std::thread thread_b([&] {
+        try {
+            start_gate.arrive_and_wait();
+            for (int i = 0; i < transfers; ++i) {
+                tensor_b->view().copy_from_host(input);
+                tensor_b->view().copy_to_host(output_b);
+            }
+        } catch (...) {
+            failed.store(true, std::memory_order_release);
+        }
+    });
+    start_gate.arrive_and_wait();
+    thread_a.join();
+    thread_b.join();
+    const auto concurrent_end = std::chrono::steady_clock::now();
+
+    CHECK_FALSE(failed.load(std::memory_order_acquire));
+    CHECK(concurrent_end - concurrent_begin < 2 * serial_total);
+}
+
+TEST_CASE(
+        "CUDA host transfers from multiple queues on one device share the "
+        "transfer-stream pool") {
+    require_cuda_hardware();
+    CudaAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
+    auto tensor_a = device->create_tensor(spec);
+    auto tensor_b = device->create_tensor(spec);
+    auto tensor_c = device->create_tensor(spec);
+    auto queue_a = device->create_ops();
+    auto queue_b = device->create_ops();
+    const std::vector<std::byte> input(
+            spec.logical_nbytes(), static_cast<std::byte>(0x5a));
+    std::vector<std::byte> output(spec.logical_nbytes());
+    constexpr int transfers = 4;
+
+    const auto serial_begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < transfers; ++i) {
+        tensor_a->view().copy_from_host(input);
+        tensor_a->view().copy_to_host(output);
+    }
+    const auto serial_end = std::chrono::steady_clock::now();
+    const auto serial_total = serial_end - serial_begin;
+
+    std::barrier start_gate(3);
+    std::atomic<bool> failed = false;
+    const auto concurrent_begin = std::chrono::steady_clock::now();
+    std::thread host_thread([&] {
+        try {
+            start_gate.arrive_and_wait();
+            for (int i = 0; i < transfers; ++i) {
+                tensor_a->view().copy_from_host(input);
+                tensor_a->view().copy_to_host(output);
+            }
+        } catch (...) {
+            failed.store(true, std::memory_order_release);
+        }
+    });
+    std::thread queue_thread([&] {
+        try {
+            start_gate.arrive_and_wait();
+            for (int i = 0; i < transfers; ++i) {
+                const iom::oid token =
+                        queue_b->copy(tensor_b->view(), tensor_c->view());
+                queue_b->wait(token);
+            }
+        } catch (...) {
+            failed.store(true, std::memory_order_release);
+        }
+    });
+    start_gate.arrive_and_wait();
+    host_thread.join();
+    queue_thread.join();
+    const auto concurrent_end = std::chrono::steady_clock::now();
+
+    CHECK_FALSE(failed.load(std::memory_order_acquire));
+    CHECK(concurrent_end - concurrent_begin < 2 * serial_total);
+    queue_a.reset();
+}
+
+TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
+    require_cuda_hardware();
+    CudaAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto tensor = device->create_tensor(spec);
+    std::vector<std::byte> input(spec.logical_nbytes());
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    iom::cuda_detail::TransferStreamPool pool;
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::third_plane_launch);
+    CHECK_THROWS_AS(
+            iom::cuda_detail::region_from_host(
+                    pool, context, tensor->view(), input),
+            std::runtime_error);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+    CHECK_NOTHROW(
+            iom::cuda_detail::region_from_host(
+                    pool, context, tensor->view(), input));
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+    pool.destroy();
+}
+
+TEST_CASE("CUDA poisoned Scope drops its stream from the pool") {
+    require_cuda_hardware();
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    iom::cuda_detail::TransferStreamPool pool;
+    {
+        auto scope = pool.acquire();
+        scope.poison();
+    }
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+    {
+        auto scope = pool.acquire();
+    }
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+    pool.destroy();
 }
 
 TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {
