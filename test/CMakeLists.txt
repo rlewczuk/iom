@@ -62,6 +62,10 @@ if(ROCM_ENABLED)
         PRIVATE
             __HIP_PLATFORM_AMD__
     )
+    target_include_directories(iom_rocm_smoke_tests
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/rocm
+    )
 
     target_link_libraries(iom_rocm_smoke_tests
         PRIVATE

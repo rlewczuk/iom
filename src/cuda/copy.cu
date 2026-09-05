@@ -105,8 +105,8 @@ struct gpu_policy {
         check_cuda("cuMemAlloc", cuMemAlloc(&address, bytes));
         return reinterpret_cast<void*>(address);
     }
-    static void free(void* address) {
-        check_cuda("cuMemFree", cuMemFree(reinterpret_cast<CUdeviceptr>(address)));
+    [[nodiscard]] static void* staging_address(CUdeviceptr address) noexcept {
+        return reinterpret_cast<void*>(address);
     }
     static void free_noexcept(void* address) noexcept {
         if (address != nullptr) {
@@ -354,63 +354,6 @@ void TransferStreamPool::destroy() {
     idle_.clear();
 }
 
-namespace {
-
-void synchronous_transfer(
-        TransferStreamPool& pool, CUcontext context, const TensorView& view,
-        std::span<const std::byte> source, std::span<std::byte> destination,
-        bool from_host) {
-    const std::size_t logical_nbytes = view.spec().logical_nbytes();
-    const std::size_t staging_nbytes =
-            gpu_algorithm::compute_staging_size(logical_nbytes);
-    gpu_policy::activate(context);
-
-    void* staging = nullptr;
-    std::exception_ptr failure;
-    try {
-        staging = gpu_policy::allocate(staging_nbytes);
-        {
-            auto scope = pool.acquire();
-            const cudaStream_t stream = scope.stream();
-            try {
-                if (from_host) {
-                    gpu_policy::copy_from_host(
-                            stream, staging, source.data(), source.size());
-                    detail::launch_view_transfer<gpu_policy>(
-                            stream, view, staging,
-                            const_cast<void*>(view.native_handle()), true);
-                    gpu_policy::after_copy_plane_launch(2);
-                } else {
-                    gpu_policy::memset(stream, staging, staging_nbytes);
-                    detail::launch_view_transfer<gpu_policy>(
-                            stream, view, view.native_handle(), staging, false);
-                    gpu_policy::after_copy_plane_launch(2);
-                }
-                gpu_policy::synchronize_stream(stream);
-                if (!from_host) {
-                    gpu_policy::copy_to_host(
-                            stream, destination.data(), staging,
-                            destination.size());
-                }
-            } catch (...) {
-                scope.poison();
-                throw;
-            }
-        }
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    if (failure) {
-        if (staging != nullptr) {
-            gpu_policy::free_noexcept(staging);
-            staging = nullptr;
-        }
-        std::rethrow_exception(failure);
-    }
-    gpu_policy::free(staging);
-}
-
-}  // namespace
 
 namespace {
 
@@ -852,15 +795,21 @@ void inject_submission_fault_for_testing(
 }
 
 void region_from_host(
-        TransferStreamPool& pool, CUcontext context,
-        const TensorView& destination, std::span<const std::byte> source) {
-    synchronous_transfer(pool, context, destination, source, {}, true);
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
+        CUcontext context, const TensorView& destination,
+        std::span<const std::byte> source) {
+    detail::synchronous_transfer<gpu_policy>(
+            transfer_pool, staging_pool, context, destination, source, {},
+            true);
 }
 
 void region_to_host(
-        TransferStreamPool& pool, CUcontext context, const TensorView& source,
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
+        CUcontext context, const TensorView& source,
         std::span<std::byte> destination) {
-    synchronous_transfer(pool, context, source, {}, destination, false);
+    detail::synchronous_transfer<gpu_policy>(
+            transfer_pool, staging_pool, context, source, {}, destination,
+            false);
 }
 
 std::unique_ptr<DeviceOps> make_queue(const Device& device, CUcontext context) {

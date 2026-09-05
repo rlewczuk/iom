@@ -57,10 +57,21 @@ namespace iom {
         class RocmDevice final : public Device {
         public:
             RocmDevice(std::uint32_t ordinal, Allocator& allocator)
-                    : ordinal_(ordinal), allocator_(allocator) {}
+                    : ordinal_(ordinal),
+                      transfer_pool_{},
+                      staging_pool_(static_cast<int>(ordinal)),
+                      allocator_(allocator) {}
 
             RocmDevice(const RocmDevice&) = delete;
             RocmDevice& operator=(const RocmDevice&) = delete;
+            ~RocmDevice() override {
+                try {
+                    activate();
+                    transfer_pool_.destroy();
+                    staging_pool_.destroy();
+                } catch (...) {
+                }
+            }
 
             [[nodiscard]] BackendKind backend_kind() const noexcept override {
                 return BackendKind::ROCM;
@@ -92,8 +103,9 @@ namespace iom {
 
         private:
             std::uint32_t ordinal_;
+            rocm_detail::TransferStreamPool transfer_pool_;
+            rocm_detail::StagingSlotPool staging_pool_;
             Allocator& allocator_;
-
             friend class RocmTensor;
         };
 
@@ -126,8 +138,8 @@ namespace iom {
                     std::span<const std::byte> source) override {
                 device_.activate();
                 rocm_detail::region_from_host(
-                        static_cast<int>(device_.ordinal_), destination,
-                        source);
+                        device_.transfer_pool_, device_.staging_pool_,
+                        static_cast<int>(device_.ordinal_), destination, source);
             }
 
             void region_to_host(
@@ -135,8 +147,8 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 device_.activate();
                 rocm_detail::region_to_host(
-                        static_cast<int>(device_.ordinal_), source,
-                        destination);
+                        device_.transfer_pool_, device_.staging_pool_,
+                        static_cast<int>(device_.ordinal_), source, destination);
             }
 
             RocmDevice& device_;

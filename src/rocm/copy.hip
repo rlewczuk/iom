@@ -69,21 +69,6 @@ struct gpu_policy {
         }
     }
 
-    [[nodiscard]] static stream_type create_transfer_stream() {
-        stream_type stream = nullptr;
-        check_hip(
-                "hipStreamCreateWithFlags",
-                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-        return stream;
-    }
-    static void destroy_transfer_stream(stream_type stream) {
-        check_hip("hipStreamDestroy", hipStreamDestroy(stream));
-    }
-    static void destroy_transfer_stream_noexcept(stream_type stream) noexcept {
-        if (stream != nullptr) {
-            (void)hipStreamDestroy(stream);
-        }
-    }
 
     static void create_event(event_type* event) {
         if (consume_submission_fault(SubmissionFault::event_create)) {
@@ -117,6 +102,10 @@ struct gpu_policy {
         void* address = nullptr;
         check_hip("hipMalloc", hipMalloc(&address, bytes));
         return address;
+    }
+    [[nodiscard]] static void* staging_address(
+            hipDeviceptr_t address) noexcept {
+        return static_cast<void*>(address);
     }
     static void free(void* address) {
         check_hip("hipFree", hipFree(address));
@@ -196,6 +185,72 @@ void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
 
 
 }  // namespace
+TransferStreamPool::Scope::~Scope() noexcept {
+    const hipError_t sync_status = hipStreamSynchronize(stream_);
+    const bool drop_stream = poisoned_ || (sync_status != hipSuccess);
+    if (drop_stream) {
+        std::lock_guard<std::mutex> lock(pool_->mutex_);
+        const auto it = pool_->in_use_.find(stream_);
+        if (it != pool_->in_use_.end()) {
+            pool_->in_use_.erase(it);
+            pool_->cv_.notify_all();
+        }
+        (void)hipStreamDestroy(stream_);
+    } else {
+        pool_->release(stream_);
+    }
+}
+
+TransferStreamPool::Scope TransferStreamPool::acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (closing_) {
+        throw std::runtime_error(
+                "hipStreamCreateWithFlags failed with "
+                "hipErrorContextIsDestroyed: TransferStreamPool is closing");
+    }
+    if (idle_.empty()) {
+        hipStream_t stream = nullptr;
+        check_hip(
+                "hipStreamCreateWithFlags",
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        idle_.push_back(stream);
+    }
+    hipStream_t stream = idle_.back();
+    idle_.pop_back();
+    try {
+        in_use_.insert(stream);
+    } catch (...) {
+        idle_.push_back(stream);
+        throw;
+    }
+    return Scope{*this, stream};
+}
+
+void TransferStreamPool::release(hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = in_use_.find(stream);
+    if (it != in_use_.end()) {
+        in_use_.erase(it);
+        idle_.push_back(stream);
+        cv_.notify_all();
+    }
+}
+
+void TransferStreamPool::destroy() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    closing_ = true;
+    cv_.wait(lock, [this] { return in_use_.empty(); });
+    for (const hipStream_t stream : idle_) {
+        (void)hipStreamDestroy(stream);
+    }
+    idle_.clear();
+}
+
+std::size_t TransferStreamPool::idle_count_for_testing() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return idle_.size();
+}
+
 }  // namespace iom::rocm_detail
 
 #define IOM_GPU_DEVICE __device__
@@ -740,17 +795,21 @@ void inject_submission_fault_for_testing(
 }
 
 void region_from_host(
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
         int device_ordinal, const TensorView& destination,
         std::span<const std::byte> source) {
     detail::synchronous_transfer<gpu_policy>(
-            device_ordinal, destination, source, {}, true);
+            transfer_pool, staging_pool, device_ordinal, destination, source,
+            {}, true);
 }
 
 void region_to_host(
+        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
         int device_ordinal, const TensorView& source,
         std::span<std::byte> destination) {
     detail::synchronous_transfer<gpu_policy>(
-            device_ordinal, source, {}, destination, false);
+            transfer_pool, staging_pool, device_ordinal, source, {}, destination,
+            false);
 }
 
 std::unique_ptr<DeviceOps> make_queue(

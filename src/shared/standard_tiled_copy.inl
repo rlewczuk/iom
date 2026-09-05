@@ -190,60 +190,77 @@ void launch_view_transfer(
     }
 }
 
-template <typename Policy>
+template <typename Policy, typename StreamPool, typename StagingPool>
 void synchronous_transfer_impl(
+        StreamPool& transfer_pool, StagingPool& staging_pool,
         typename Policy::context_type context, const TensorView& view,
         std::span<const std::byte> source, std::span<std::byte> destination,
         bool from_host) {
     const std::size_t logical_nbytes = view.spec().logical_nbytes();
     const std::size_t staging_nbytes =
             gpu_algorithm::compute_staging_size(logical_nbytes);
+    const std::size_t logical_bits =
+            view.spec().shape.element_count()
+            * leaf_bits(view.spec().data_type);
     Policy::activate(context);
 
-    typename Policy::stream_type stream = Policy::create_transfer_stream();
-    void* staging = nullptr;
+    auto staging_lease = staging_pool.acquire(staging_nbytes);
     try {
-        staging = Policy::allocate(staging_nbytes);
-        if (from_host) {
-            Policy::copy_from_host(
-                    stream, staging, source.data(), source.size());
-            launch_view_transfer<Policy>(
-                    stream, view, staging,
-                    const_cast<void*>(view.native_handle()), true);
-        } else {
-            Policy::memset(stream, staging, staging_nbytes);
-            launch_view_transfer<Policy>(
-                    stream, view, view.native_handle(), staging, false);
-        }
-        Policy::synchronize_stream(stream);
-        if (!from_host) {
-            Policy::copy_to_host(
-                    stream, destination.data(), staging, destination.size());
+        auto stream_scope = transfer_pool.acquire();
+        const typename Policy::stream_type stream = stream_scope.stream();
+        void* staging = Policy::staging_address(staging_lease.staging());
+        try {
+            if (from_host) {
+                Policy::copy_from_host(
+                        stream, staging, source.data(), source.size());
+                launch_view_transfer<Policy>(
+                        stream, view, staging,
+                        const_cast<void*>(view.native_handle()), true);
+                Policy::after_copy_plane_launch(2);
+            } else {
+                const std::size_t tail_word_start =
+                        (logical_bits / 32) * sizeof(std::uint32_t);
+                const std::size_t tail_bytes =
+                        staging_nbytes - tail_word_start;
+                if (tail_bytes != 0) {
+                    Policy::memset(
+                            stream,
+                            static_cast<std::byte*>(staging) + tail_word_start,
+                            tail_bytes);
+                }
+                launch_view_transfer<Policy>(
+                        stream, view, view.native_handle(), staging, false);
+                Policy::after_copy_plane_launch(2);
+            }
+            Policy::synchronize_stream(stream);
+            if (!from_host) {
+                Policy::copy_to_host(
+                        stream, destination.data(), staging,
+                        destination.size());
+            }
+        } catch (...) {
+            stream_scope.poison();
+            staging_lease.poison();
+            throw;
         }
     } catch (...) {
-        if (Policy::stream_is_valid(stream)) {
-            Policy::synchronize_stream_noexcept(stream);
-            Policy::destroy_transfer_stream_noexcept(stream);
-        }
-        if (staging != nullptr) {
-            Policy::free_noexcept(staging);
-        }
+        staging_lease.poison();
         throw;
     }
-    Policy::destroy_transfer_stream(stream);
-    Policy::free(staging);
 }
 
 
 }  // namespace
 
-template <typename Policy>
+template <typename Policy, typename StreamPool, typename StagingPool>
 void synchronous_transfer(
+        StreamPool& transfer_pool, StagingPool& staging_pool,
         typename Policy::context_type context, const TensorView& view,
         std::span<const std::byte> source, std::span<std::byte> destination,
         bool from_host) {
     synchronous_transfer_impl<Policy>(
-            context, view, source, destination, from_host);
+            transfer_pool, staging_pool, context, view, source, destination,
+            from_host);
 }
 
 

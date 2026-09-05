@@ -66,6 +66,7 @@ namespace iom {
             CudaDevice(std::uint32_t ordinal, CUdevice device, CUcontext context,
                        Allocator& allocator)
                     : ordinal_(ordinal), device_(device), context_(context),
+                      transfer_pool_{}, staging_pool_(context),
                       allocator_(allocator) {}
 
             CudaDevice(const CudaDevice&) = delete;
@@ -74,8 +75,8 @@ namespace iom {
             ~CudaDevice() override {
                 if (context_ != nullptr) {
                     try {
-                        activate();
                         transfer_pool_.destroy();
+                        staging_pool_.destroy();
                     } catch (...) {
                     }
                     (void)cuda_detail::driver_calls.primary_ctx_release(device_);
@@ -119,6 +120,7 @@ namespace iom {
             CUdevice device_;
             CUcontext context_;
             cuda_detail::TransferStreamPool transfer_pool_;
+            cuda_detail::StagingSlotPool staging_pool_;
             Allocator& allocator_;
             friend class CudaTensor;
         };
@@ -152,8 +154,8 @@ namespace iom {
                     std::span<const std::byte> source) override {
                 device_.activate();
                 cuda_detail::region_from_host(
-                        device_.transfer_pool_, device_.context(),
-                        destination, source);
+                        device_.transfer_pool_, device_.staging_pool_,
+                        device_.context(), destination, source);
             }
 
             void region_to_host(
@@ -161,8 +163,8 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 device_.activate();
                 cuda_detail::region_to_host(
-                        device_.transfer_pool_, device_.context(),
-                        source, destination);
+                        device_.transfer_pool_, device_.staging_pool_,
+                        device_.context(), source, destination);
             }
             CudaDevice& device_;
             Allocator& allocator_;

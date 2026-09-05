@@ -151,6 +151,8 @@ if(CUDA_ENABLED)
         src/cuda/driver.cpp
         src/cuda/driver.hpp
         src/cuda/transfer_pool.hpp
+        src/cuda/staging_pool.cpp
+        src/cuda/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
         include/iom/cuda/device.hpp
     )
@@ -192,6 +194,9 @@ if(ROCM_ENABLED)
         src/rocm/device.cpp
         src/rocm/copy.hip
         src/rocm/copy.hpp
+        src/rocm/staging_pool.cpp
+        src/rocm/staging_pool.hpp
+        src/rocm/transfer_pool.hpp
         src/shared/standard_tiled_copy.hpp
         include/iom/rocm/device.hpp
     )
@@ -258,6 +263,14 @@ endif()
 
 
 include(CTest)
+if(BUILD_TESTING)
+    if(CUDA_ENABLED)
+        target_compile_definitions(iom_cuda PRIVATE IOM_ENABLE_TESTING)
+    endif()
+    if(ROCM_ENABLED)
+        target_compile_definitions(iom_rocm PRIVATE IOM_ENABLE_TESTING)
+    endif()
+endif()
 
 if(BUILD_TESTING)
   find_package(doctest CONFIG QUIET)
