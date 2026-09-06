@@ -231,26 +231,11 @@ public:
                     "outstanding-work entry id is already registered");
         }
         try {
-            auto address_it = by_address_.emplace(address, id);
-            try {
-                auto sequence_it = by_sequence_.emplace(sequence, id);
-                try {
-                    auto queue_it = by_queue_.emplace(queue_id, id);
-                    (void)address_it;
-                    (void)sequence_it;
-                    (void)queue_it;
-                } catch (...) {
-                    by_sequence_.erase(sequence_it);
-                    by_address_.erase(address_it);
-                    by_id_.erase(entry_it);
-                    throw;
-                }
-            } catch (...) {
-                by_address_.erase(address_it);
-                by_id_.erase(entry_it);
-                throw;
-            }
+            by_address_.emplace(address, id);
+            by_sequence_.emplace(sequence, id);
+            by_queue_.emplace(queue_id, id);
         } catch (...) {
+            erase_entry_locked(entry_it);
             throw;
         }
     }
