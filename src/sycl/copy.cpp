@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "iom/gpu_algorithm.hpp"
+#include "runtime.hpp"
 
 #define IOM_GPU_DEVICE
 #define IOM_GPU_GLOBAL
@@ -372,6 +373,9 @@ void launch_scatter_words(
                         destination_plane, logical_base, item[0], rows, columns,
                         bits);
             });
+    if (launch_calls.kernel_launched != nullptr) {
+        launch_calls.kernel_launched();
+    }
 }
 
 void launch_gather_words(
@@ -388,6 +392,9 @@ void launch_gather_words(
                         logical_base, first_word + item[0], rows, columns,
                         bits);
             });
+    if (launch_calls.kernel_launched != nullptr) {
+        launch_calls.kernel_launched();
+    }
 }
 
 void launch_view_transfer(
@@ -713,6 +720,9 @@ private:
                                 word_in_plane, metadata->rows,
                                 metadata->columns, metadata->bits);
                     });
+            if (launch_calls.kernel_launched != nullptr) {
+                launch_calls.kernel_launched();
+            }
             task.state->set_event(std::move(event));
             submitted_any = true;
             if (consume_submission_fault(SubmissionFault::post_launch)) {

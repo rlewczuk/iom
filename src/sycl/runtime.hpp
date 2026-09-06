@@ -13,6 +13,11 @@ namespace iom::sycl_detail {
         void (*context_destroyed)() = nullptr;
         void (*context_ready)(const sycl::context&) = nullptr;
     };
+    struct LaunchCalls {
+        void (*kernel_launched)() = nullptr;
+    };
+
+    extern LaunchCalls launch_calls;
 
     extern ContextCalls context_calls;
 

@@ -19,6 +19,7 @@
 namespace iom::sycl_detail {
 
     ContextCalls context_calls{};
+    LaunchCalls launch_calls{};
 
 }  // namespace iom::sycl_detail
 
