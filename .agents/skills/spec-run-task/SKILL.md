@@ -14,7 +14,9 @@ The command supplies one path relative to `docs/changes/`:
 <change-name>[/subpath...]
 ```
 
-For target `<target>`, the requested specification is exactly `docs/changes/<target>/spec.md` and its optional annotation is `docs/changes/<target>/task.md`.
+For target `<target>`, the requested specification is exactly `docs/changes/<target>/spec.md` and its optional annotation is exactly the sibling file `docs/changes/<target>/task.md`.
+
+**Annotation location is an invariant, not a convention.** For every leaf or container specification, derive its annotation path from that specification path as `<directory-containing-spec.md>/task.md`. Preserve the complete nested task path. Never create or update a bare `task.md` relative to the current working directory, `<repo-root>/task.md`, `<worktree>/task.md`, `docs/changes/task.md`, or any other non-sibling location. The corresponding `spec.md` and `task.md` must always have the same parent directory.
 
 ## Mandatory worktree execution boundary
 
@@ -36,6 +38,7 @@ Never edit in the integration checkout with the intent to copy or commit the cha
 - Use one feature branch and one registered Git worktree per executable task. Reuse the deterministic branch and exact worktree when they already exist; never discard unfinished contents.
 - The exact worktree for task path `<task-path>` is `<repo-root>/.work/<task-path>`. For example, `0001-foo/02-bar` uses `.work/0001-foo/02-bar`.
 - Keep `.work/` ignored. Never stage files through the integration checkout merely because a worktree lives below it.
+- For any specification at `<repo-root>/.work/<owner-task-path>/docs/changes/<annotated-task-path>/spec.md`, its only valid annotation path is `<repo-root>/.work/<owner-task-path>/docs/changes/<annotated-task-path>/task.md`. Always pass this full worktree-prefixed path to Read, Edit, Write, and staging commands; a bare or repository-root-relative `task.md` path is prohibited.
 - A task's implementation, tests, and `task.md` update must be grouped into exactly one final task-local commit on its feature branch. Its subject must be `spec-run-task(<task-path>): <concise outcome>`, using the exact task or subtask path so the commit is immediately identifiable.
 - Rebase task-local commits onto the latest integration branch or current wave train; never merge the integration branch or another feature branch into a task branch. Resolve rebase conflicts in the owning task worktree. The integration checkout accepts only a verified fast-forward.
 - Temporary checkpoints needed to preserve reused work must be squashed into that one task commit before the task is retained as `ready`, `done`, `failed`, or `blocked`. After consolidation, fold every fix, conflict resolution, and annotation refresh into the same commit with `git commit --amend`; never stack follow-up commits.
@@ -59,6 +62,14 @@ Quote every path and ref passed to Git or a shell. Do not evaluate the target as
 ## Task annotations
 
 `task.md` is persistent execution state. A missing file means a fresh, unfinished task. The first case-insensitive `**Status:** <value>` field is authoritative. Multiple status fields are malformed and must be repaired by the task owner before completion.
+
+Before every annotation creation or update, apply this mandatory location gate:
+
+1. Start from the exact full path of the associated `spec.md` inside the assigned worktree.
+2. Compute the annotation path by replacing only the final filename `spec.md` with `task.md`; do not reconstruct it from the shell working directory or shorten it to a basename.
+3. Verify that the computed `task.md` parent is identical to the `spec.md` parent and that the path remains under that worktree's `docs/changes/`.
+4. Use the computed full worktree-prefixed path for the file operation. Never use bare `task.md`, even when a command's `cwd` appears correct.
+5. After writing, re-read that exact path and inspect the task commit diff. The intended sibling annotation must be present, and the invocation must not add or modify any `task.md` outside the explicitly owned leaf or container specification directories. If this invocation created a misplaced annotation, remove it before committing and create the sibling annotation at the computed path.
 
 Use these lowercase values:
 
@@ -119,7 +130,7 @@ A specification directory is an **executable leaf** only when it has no descenda
 - If the requested directory has no descendant `spec.md`, the requested target itself is the sole executable task. Run it with the main agent.
 - If descendant `spec.md` files exist, the requested directory is a container. Do not implement its own `spec.md`. Recursively select leaf specification directories beneath it and orchestrate them through subagents.
 - An intermediate directory with both its own `spec.md` and deeper task specifications is also a container; run its leaf descendants, not its own spec.
-- Read each leaf's `task.md` when present. Skip leaves whose status is `done`; run every other leaf whose dependencies can be satisfied.
+- For each leaf spec at `docs/changes/<leaf-task-path>/spec.md`, read only its sibling annotation at `docs/changes/<leaf-task-path>/task.md` when present. Do not treat a repository-root, `docs/changes/`-root, ancestor, or other misplaced `task.md` as that leaf's state. Skip leaves whose sibling annotation status is `done`; run every other leaf whose dependencies can be satisfied.
 - Child status is authoritative over stale container status. If a container says `done` but any leaf is unfinished, run the leaf and later correct the container roll-up.
 
 Do not infer that a task is complete merely from existing implementation or an old feature branch. The annotation contract controls scheduling; the task's verification controls the next transition to `done`.
@@ -185,9 +196,9 @@ When the requested target has no descendant task specs, the main agent is the ta
 3. Read the complete `spec.md`, repository guidance, referenced implementation and tests, and applicable skills. Resume coherent prior work when reusing a worktree.
 4. Reproduce a bug before editing when the spec requires a reproduction and it remains reachable.
 5. Implement the complete specified behavior and acceptance criteria. Run the focused verification in the spec and the repository-required conformance coverage.
-6. Update `task.md` to `done` with grounded Summary and Verification sections. Stage only task-owned implementation, tests, and annotation changes. Create the single task commit with subject `spec-run-task(<target>): <concise outcome>`, or amend and squash existing task-local commits into it. If only verified completion state changed, the one commit may be annotation-only.
+6. Update the exact sibling annotation `.work/<target>/docs/changes/<target>/task.md` to `done` with grounded Summary and Verification sections. Derive this path from `.work/<target>/docs/changes/<target>/spec.md`; do not write a bare `task.md` or any repository-root annotation. Re-read the exact sibling path after writing. Stage only task-owned implementation, tests, and annotation changes. Create the single task commit with subject `spec-run-task(<target>): <concise outcome>`, or amend and squash existing task-local commits into it. If only verified completion state changed, the one commit may be annotation-only.
 7. Rebase the single task commit onto the latest integration branch. Resolve conflicts in this task worktree, keep the resolution in that same rebased commit, rerun affected verification, and amend the commit and annotation if the observed evidence changed. Never merge the integration branch into the feature branch.
-8. Confirm that the feature branch is exactly one non-merge task commit ahead of the current integration tip, that its subject contains the exact target path, and that its diff contains the final `task.md` plus every task-owned change. From the clean integration checkout, advance only with `git merge --ff-only <feature-branch>`. If the fast-forward fails because the integration branch advanced, return to step 7.
+8. Confirm that the feature branch is exactly one non-merge task commit ahead of the current integration tip, that its subject contains the exact target path, and that its diff contains the final annotation at `docs/changes/<target>/task.md` plus every task-owned change, with no annotation added or modified outside the associated specification directory. From the clean integration checkout, advance only with `git merge --ff-only <feature-branch>`. If the fast-forward fails because the integration branch advanced, return to step 7.
 
 On failure, update the task's `failed` or `blocked` annotation with concrete errors and retained state, consolidate all task-owned partial work and that annotation into the one named task commit, leave the feature branch/worktree intact, and do not integrate it.
 
@@ -222,11 +233,11 @@ Use this assignment shape:
 - If needed, preserve dirty task-owned state in a temporary checkpoint, rebase the task-local work onto the integration branch, resolve conflicts here, and squash all task-local commits into one. Never merge.
 - Implement every requirement and acceptance criterion without unrelated changes.
 - Do not run formatters, builds, linters, tests, or project-wide validation in this parallel implementation pass; the orchestrator runs verification once after the wave barrier.
-- Update task.md to ready with a factual provisional summary, or to failed/blocked with an Errors section.
+- **ANNOTATION PATH:** update exactly `<worktree>/docs/changes/<task-path>/task.md`, the sibling of the assigned `spec.md`. Derive it by replacing only `spec.md` with `task.md`, use that full worktree-prefixed path for every file operation, and re-read it after writing. Never create or update bare `task.md`, `<worktree>/task.md`, repository-root `task.md`, `docs/changes/task.md`, an ancestor task's annotation, or any other path. Set this exact file to `ready` with a factual provisional summary, or to `failed`/`blocked` with an Errors section.
 - Group every task-owned code, test, and annotation change into exactly one commit with subject `spec-run-task(<task-path>): <concise outcome>`. Amend that commit for later fixes; do not add follow-up commits or merge into the integration checkout.
 
 # Acceptance
-- The assigned feature branch contributes exactly one non-merge task commit whose diff includes the complete implementation and its `task.md`; the annotation is `ready`, or precisely `failed`/`blocked`.
+- The assigned feature branch contributes exactly one non-merge task commit whose diff includes the complete implementation and exactly its sibling annotation at `docs/changes/<task-path>/task.md`; it adds or modifies no `task.md` at the repository/worktree root or outside the explicitly owned specification directory. The annotation is `ready`, or precisely `failed`/`blocked`.
 - The commit subject contains the exact full task/subtask path.
 - No integration-checkout or sibling-worktree files changed.
 - The response names the single task commit, changed paths, unresolved risks, and verification still required; it does not claim unrun checks passed.
@@ -248,7 +259,7 @@ Never merge divergent feature branches. Combine ready branches into a verified *
 1. Choose the first ready feature branch in stable dependency/priority/path order. Rebase its single task commit onto the current integration tip if necessary; this branch is the initial train.
 2. For each remaining ready feature branch in that order, send its owner the current train commit. In the owner's feature worktree, rebase only its recorded task commit onto the train, equivalent to `git rebase --onto <train-commit> <recorded-task-parent> <feature-branch>`. The owner resolves conflicts during that rebase and keeps every resolution in the rebased task commit. The owner's branch becomes the new train. Never replay another task's commits from the old branch prefix and never create a merge or conflict-resolution commit.
 3. Run the repository-required combined verification, including applicable backend conformance suites, once in the final train worktree. On failure, route the concrete failure to the owner of the responsible task. That owner amends its single task commit; then rebuild the train from that task onward by rebasing each later task's single recorded commit in stable order. Re-run affected focused checks and combined checks until the rebuilt train passes. Do not add fix commits or advance the integration branch on failure.
-4. Only after combined checks pass, rebuild the final train from the integration tip in stable order. For each ready leaf, send its owner the grounded focused and combined evidence. The owner rebases only that leaf's single task commit onto the current finalized train, changes its own `task.md` from `ready` to `done`, writes the final Summary and Verification sections, removes stale generated errors, and amends the task commit. Re-read the annotation and verify the commit subject and diff before using that branch as the next finalized train. If this fold changes implementation rather than annotations or rebase metadata, rerun affected focused and combined verification.
+4. Only after combined checks pass, rebuild the final train from the integration tip in stable order. For each ready leaf, send its owner the grounded focused and combined evidence. The owner rebases only that leaf's single task commit onto the current finalized train, derives the exact sibling annotation path from `<worktree>/docs/changes/<task-path>/spec.md`, changes that exact `<worktree>/docs/changes/<task-path>/task.md` from `ready` to `done`, writes the final Summary and Verification sections, removes stale generated errors, and amends the task commit. A bare `task.md` path is prohibited. Re-read the exact sibling annotation and verify the commit subject and diff before using that branch as the next finalized train. If this fold changes implementation rather than annotations or rebase metadata, rerun affected focused and combined verification.
 5. If this wave completes every leaf beneath the requested container, perform the container roll-up below in the final train owner's worktree and amend it into that owner's still-HEAD task commit; do not create a separate roll-up commit.
 6. Confirm the integration checkout is still on the recorded integration branch and clean. Advance it only with `git merge --ff-only <final-train-branch>`.
 7. If the fast-forward fails because the integration branch advanced, rebuild the finalized train onto the latest integration tip by rebasing each task's one commit in stable order through its owner. Resolve every conflict in the owning task worktree, amend the same task commit when resolution or evidence changes, rerun affected focused and combined verification, and retry the fast-forward. Never merge the new integration tip into the train.
@@ -263,7 +274,7 @@ When all executable leaves beneath the requested container are `done` in the fin
 
 - Work bottom-up through every specification directory at or below the requested target that has descendant executable leaves.
 - Set a container to `done` only when every executable leaf below it is `done` in that train.
-- Create `task.md` when missing; otherwise preserve unrelated annotations. Replace generated Summary/Verification/Errors sections consistently.
+- For each container specification, derive its annotation by replacing that container's final `spec.md` filename with `task.md`; create or update exactly that sibling path inside the final train owner's worktree. Never use a bare filename or place the roll-up at the repository root, worktree root, `docs/changes/` root, leaf directory, or a different ancestor. Preserve unrelated annotations and replace generated Summary/Verification/Errors sections consistently.
 - The Summary states that all leaf subtasks completed and gives a concise count or list. The Verification section records the combined checks that covered the integrated train. Remove stale generated errors.
 - Stage the roll-up with the final leaf's own final annotation and amend both into that leaf's single task commit, then rerun metadata validation and fast-forward the integration branch. Do not create a separate roll-up commit.
 
@@ -279,6 +290,7 @@ Before completing the command, establish all of the following from observed stat
 - no container `spec.md` was implemented while it had descendant specs;
 - each attempted task used its exact `.work/<task-path>` worktree and deterministic `run-task/<task-name>[--<subtask-name>...]` feature branch;
 - each integrated task has `Status: done`, grounded verification evidence, and exactly one non-merge task commit containing its implementation and annotation changes;
+- every leaf annotation exists exactly beside its associated `spec.md` at `docs/changes/<task-path>/task.md`, every container roll-up exists exactly beside that container's `spec.md`, and no attempted commit adds or modifies a misplaced `task.md` elsewhere;
 - every task commit subject contains the exact task/subtask path in the required `spec-run-task(<task-path>): ...` form;
 - every integrated task-local commit was rebased onto the applicable integration tip or preceding train commit and is reachable from the recorded integration branch;
 - no separate fix, conflict-resolution, completion-annotation, or roll-up commit was left in the integrated history;
