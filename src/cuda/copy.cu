@@ -58,40 +58,6 @@ void synchronize_and_destroy_stream(cudaStream_t stream) noexcept {
 
 namespace iom::cuda_detail {
 namespace {
-void cuda_fence_copy_construct(
-        detail::Fence* destination, const detail::Fence& source) noexcept {
-    const auto& capture =
-            *std::launder(reinterpret_cast<const EventLeaseWithFailure*>(
-                    source.storage));
-    ::new (destination->storage) EventLeaseWithFailure{
-            capture.state, capture.slot_index, capture.retained_failure};
-}
-
-static_assert(noexcept(cuda_fence_copy_construct(
-        std::declval<detail::Fence*>(),
-        std::declval<const detail::Fence&>())));
-
-void cuda_fence_move_construct(
-        detail::Fence* destination, detail::Fence* source) noexcept {
-    ::new (destination->storage) EventLeaseWithFailure{
-            std::move(*std::launder(reinterpret_cast<EventLeaseWithFailure*>(
-                    source->storage)))};
-    std::destroy_at(std::launder(reinterpret_cast<EventLeaseWithFailure*>(
-            source->storage)));
-}
-
-static_assert(noexcept(cuda_fence_move_construct(
-        std::declval<detail::Fence*>(),
-        std::declval<detail::Fence*>())));
-
-void cuda_fence_storage_destroy(detail::Fence* fence) noexcept {
-    std::destroy_at(std::launder(reinterpret_cast<EventLeaseWithFailure*>(
-            fence->storage)));
-}
-
-static_assert(noexcept(cuda_fence_storage_destroy(
-        std::declval<detail::Fence*>())));
-
 detail::FenceResult cuda_fence_invoke(
         const detail::Fence& fence) noexcept {
     const auto& capture =
@@ -106,8 +72,6 @@ detail::FenceResult cuda_fence_invoke(
 static_assert(noexcept(cuda_fence_invoke(
         std::declval<const detail::Fence&>())));
 
-static_assert(sizeof(EventLeaseWithFailure) <= iom::detail::kFenceStorageBytes);
-static_assert(alignof(EventLeaseWithFailure) <= iom::detail::kFenceStorageAlign);
 detail::Fence build_cuda_fence(
         const std::shared_ptr<EventRingState>& state,
         std::size_t slot_index, std::exception_ptr retained_failure) noexcept {
@@ -115,9 +79,11 @@ detail::Fence build_cuda_fence(
     ::new (fence.storage) EventLeaseWithFailure{
             state, slot_index, std::move(retained_failure)};
     fence.invoke = &cuda_fence_invoke;
-    fence.copy_construct = &cuda_fence_copy_construct;
-    fence.move_construct = &cuda_fence_move_construct;
-    fence.destroy = &cuda_fence_storage_destroy;
+    fence.copy_construct =
+            &detail::FenceCaptureOps<EventLeaseWithFailure>::copy_construct;
+    fence.move_construct =
+            &detail::FenceCaptureOps<EventLeaseWithFailure>::move_construct;
+    fence.destroy = &detail::FenceCaptureOps<EventLeaseWithFailure>::destroy;
     return fence;
 }
 

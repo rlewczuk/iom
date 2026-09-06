@@ -10,7 +10,7 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -138,6 +138,35 @@ static_assert(std::is_nothrow_move_constructible_v<Fence>);
 static_assert(std::is_nothrow_destructible_v<Fence>);
 static_assert(std::is_nothrow_copy_assignable_v<Fence>);
 static_assert(std::is_nothrow_move_assignable_v<Fence>);
+
+template <typename Capture>
+struct FenceCaptureOps {
+    static_assert(std::is_nothrow_copy_constructible_v<Capture>
+            && std::is_nothrow_move_constructible_v<Capture>
+            && std::is_nothrow_destructible_v<Capture>);
+    static_assert(sizeof(Capture) <= kFenceStorageBytes);
+    static_assert(alignof(Capture) <= kFenceStorageAlign);
+
+    static void copy_construct(
+            Fence* destination, const Fence& source) noexcept {
+        ::new (destination->storage) Capture{
+                *std::launder(reinterpret_cast<const Capture*>(
+                        source.storage))};
+    }
+
+    static void move_construct(Fence* destination, Fence* source) noexcept {
+        ::new (destination->storage) Capture{
+                std::move(*std::launder(reinterpret_cast<Capture*>(
+                        source->storage)))};
+        std::destroy_at(std::launder(reinterpret_cast<Capture*>(
+                source->storage)));
+    }
+
+    static void destroy(Fence* fence) noexcept {
+        std::destroy_at(
+                std::launder(reinterpret_cast<Capture*>(fence->storage)));
+    }
+};
 
 inline FenceResult failed_invalidated_fence_invoke(
         const Fence&) noexcept {

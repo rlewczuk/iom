@@ -264,11 +264,6 @@ struct SyclFenceCapture {
     std::shared_ptr<SyclFenceState> state;
 };
 
-static_assert(
-        sizeof(SyclFenceCapture) <= detail::kFenceStorageBytes);
-static_assert(
-        alignof(SyclFenceCapture) <= detail::kFenceStorageAlign);
-
 detail::FenceResult sycl_fence_invoke(
         const detail::Fence& fence) noexcept {
     const auto& capture =
@@ -283,46 +278,16 @@ detail::FenceResult sycl_fence_invoke(
 static_assert(noexcept(sycl_fence_invoke(
         std::declval<const detail::Fence&>())));
 
-void sycl_fence_copy_construct(
-        detail::Fence* destination, const detail::Fence& source) noexcept {
-    ::new (destination->storage) SyclFenceCapture{
-            *std::launder(reinterpret_cast<const SyclFenceCapture*>(
-                    source.storage))};
-}
-
-static_assert(noexcept(sycl_fence_copy_construct(
-        std::declval<detail::Fence*>(),
-        std::declval<const detail::Fence&>())));
-
-void sycl_fence_move_construct(
-        detail::Fence* destination, detail::Fence* source) noexcept {
-    ::new (destination->storage) SyclFenceCapture{
-            std::move(*std::launder(reinterpret_cast<SyclFenceCapture*>(
-                    source->storage)))};
-    std::destroy_at(std::launder(reinterpret_cast<SyclFenceCapture*>(
-            source->storage)));
-}
-
-static_assert(noexcept(sycl_fence_move_construct(
-        std::declval<detail::Fence*>(),
-        std::declval<detail::Fence*>())));
-
-void sycl_fence_storage_destroy(detail::Fence* fence) noexcept {
-    std::destroy_at(std::launder(reinterpret_cast<SyclFenceCapture*>(
-            fence->storage)));
-}
-
-static_assert(noexcept(sycl_fence_storage_destroy(
-        std::declval<detail::Fence*>())));
-
 detail::Fence build_sycl_fence(
         const std::shared_ptr<SyclFenceState>& state) noexcept {
     detail::Fence fence;
     ::new (fence.storage) SyclFenceCapture{state};
     fence.invoke = &sycl_fence_invoke;
-    fence.copy_construct = &sycl_fence_copy_construct;
-    fence.move_construct = &sycl_fence_move_construct;
-    fence.destroy = &sycl_fence_storage_destroy;
+    fence.copy_construct =
+            &detail::FenceCaptureOps<SyclFenceCapture>::copy_construct;
+    fence.move_construct =
+            &detail::FenceCaptureOps<SyclFenceCapture>::move_construct;
+    fence.destroy = &detail::FenceCaptureOps<SyclFenceCapture>::destroy;
     return fence;
 }
 
