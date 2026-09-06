@@ -7,7 +7,7 @@
 #include <span>
 
 #include "iom/iom.hpp"
-#include "registry_state.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 #include "staging_pool.hpp"
 
 namespace iom::sycl_detail {
@@ -38,6 +38,6 @@ void region_to_host(
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, const sycl::context& context,
-        const sycl::device& native_device, SyclRegistryState& registry_state);
+        const sycl::device& native_device, detail::RegistryState& registry_state);
 
 }  // namespace iom::sycl_detail

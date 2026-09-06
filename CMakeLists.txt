@@ -151,7 +151,6 @@ if(CUDA_ENABLED)
         src/cuda/copy.hpp
         src/cuda/driver.cpp
         src/cuda/driver.hpp
-        src/cuda/registry_state.hpp
         src/shared/metadata_slot_pool.hpp
         src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
@@ -196,7 +195,6 @@ if(ROCM_ENABLED)
         src/rocm/device.cpp
         src/rocm/copy.hip
         src/rocm/copy.hpp
-        src/rocm/registry_state.hpp
         src/shared/metadata_slot_pool.hpp
         src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
@@ -238,7 +236,6 @@ if(SYCL_ENABLED)
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
         src/sycl/staging_pool.hpp
-        src/sycl/registry_state.hpp
         include/iom/sycl/device.hpp
     )
 

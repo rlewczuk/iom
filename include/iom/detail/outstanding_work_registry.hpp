@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <concepts>
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -378,6 +379,77 @@ private:
     std::multimap<void*, EntryId> by_address_;
 };
 
+template <typename MakeCleanup, typename Release>
+    requires std::invocable<MakeCleanup> && std::invocable<Release>
+inline void release_or_quarantine(
+        OutstandingWorkRegistry& registry, void* address,
+        MakeCleanup make_cleanup, Release release) noexcept {
+    std::vector<OutstandingWorkRegistry::EntrySnapshot> snapshots;
+    try {
+        snapshots = registry.snapshot_for(address);
+    } catch (...) {
+        make_cleanup();
+        return;
+    }
+
+    bool safe_to_release = true;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.state == EntryState::Invalidated || !snapshot.fence) {
+            safe_to_release = false;
+            continue;
+        }
+        try {
+            const FenceResult result = snapshot.fence();
+            safe_to_release =
+                    safe_to_release && result.succeeded && !result.failure;
+        } catch (...) {
+            safe_to_release = false;
+        }
+    }
+
+    if (safe_to_release) {
+        for (const auto& snapshot : snapshots) {
+            registry.remove_entry_if_present(snapshot.id, address);
+        }
+        release();
+        return;
+    }
+
+    make_cleanup();
+    for (const auto& snapshot : snapshots) {
+        registry.remove_entry_if_present(snapshot.id, address);
+    }
+}
+
+struct SequenceOutcome {
+    EntryId source_entry_id = 0;
+    EntryId destination_entry_id = 0;
+    bool fence_succeeded = false;
+    std::exception_ptr retained_failure;
+};
+
+[[nodiscard]] inline bool release_or_invalidate_entries(
+        OutstandingWorkRegistry& registry, const SequenceOutcome& outcome,
+        bool failure) noexcept {
+    const std::array<EntryId, 2> entries{
+            outcome.source_entry_id, outcome.destination_entry_id};
+    if (failure || !outcome.fence_succeeded) {
+        registry.invalidate_entries(entries);
+        return false;
+    }
+    (void)registry.try_release_entry(entries[0]);
+    (void)registry.try_release_entry(entries[1]);
+    return true;
+}
+
+struct RegistryState {
+    OutstandingWorkRegistry registry;
+    Quarantine quarantine;
+    EntryId next_entry_id = 1;
+    QueueId next_queue_id = 1;
+};
+
+
 inline EntryId allocate_registry_id(EntryId& next_id) {
     if (next_id == 0) {
         throw std::overflow_error("outstanding-work entry id is exhausted");
@@ -428,6 +500,19 @@ inline EntryRegistration register_registry_entries(
         throw;
     }
     return {source, destination};
+}
+
+
+inline QueueId allocate_queue_id(RegistryState& state) {
+    return allocate_registry_queue_id(state.next_queue_id);
+}
+
+inline EntryRegistration register_copy_entries(
+        RegistryState& state, QueueId queue_id, std::uint64_t sequence,
+        void* source, void* destination, const Fence& fence) {
+    return register_registry_entries(
+            state.registry, state.next_entry_id, queue_id, sequence, source,
+            destination, fence);
 }
 
 }  // namespace iom::detail

@@ -11,7 +11,7 @@
 
 #include "driver.hpp"
 #include "../shared/metadata_slot_pool.hpp"
-#include "registry_state.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 #include "../shared/staging_pool.hpp"
 #include "../shared/transfer_pool.hpp"
 
@@ -232,6 +232,6 @@ void region_to_host(
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, CUcontext context,
-        CudaRegistryState& registry_state);
+        detail::RegistryState& registry_state);
 
 }  // namespace iom::cuda_detail

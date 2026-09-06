@@ -148,20 +148,14 @@ class CudaQueue final : public DeviceOps {
         detail::EntryId destination_entry_id = 0;
     };
 
-    struct SequenceOutcome {
-        detail::EntryId source_entry_id = 0;
-        detail::EntryId destination_entry_id = 0;
-        bool fence_succeeded = false;
-        std::exception_ptr retained_failure;
-    };
 
 public:
     CudaQueue(
             const Device& device, CUcontext context,
-            CudaRegistryState& registry_state)
+            detail::RegistryState& registry_state)
             : device_(&device),
               state_(&registry_state),
-              registry_queue_id_(allocate_queue_id(*state_)),
+              registry_queue_id_(detail::allocate_queue_id(*state_)),
               context_(context),
               metadata_pool_(context_),
               worker_(
@@ -297,7 +291,7 @@ private:
                 context_, task.event, retained_failure);
         detail::EntryRegistration entries;
         try {
-            entries = register_copy_entries(
+            entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
                     const_cast<void*>(task.source->native_handle()),
                     task.destination->native_handle(), fence);
@@ -306,7 +300,7 @@ private:
             std::lock_guard<std::mutex> lock(outcome_mutex_);
             const auto [it, inserted] = outcomes_.emplace(
                     task.sequence,
-                    SequenceOutcome{
+                    detail::SequenceOutcome{
                             entries.source, entries.destination,
                             retained_failure == nullptr, retained_failure});
             if (!inserted) {
@@ -341,7 +335,7 @@ private:
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
-        SequenceOutcome outcome;
+        detail::SequenceOutcome outcome;
         bool has_outcome = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -354,28 +348,21 @@ private:
         }
         if (has_outcome) {
             outcome.fence_succeeded = !failure && !outcome.retained_failure;
-            const std::array<detail::EntryId, 2> entries{
-                    outcome.source_entry_id,
-                    outcome.destination_entry_id};
-            if (failure || outcome.retained_failure) {
-                state_->registry.invalidate_entries(entries);
-            } else {
-                (void)state_->registry.try_release_entry(entries[0]);
-                (void)state_->registry.try_release_entry(entries[1]);
-            }
+            (void)detail::release_or_invalidate_entries(
+                    state_->registry, outcome, static_cast<bool>(failure));
         }
         complete(sequence, std::move(failure));
     }
 
     const Device* device_;
-    CudaRegistryState* state_;
+    detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
     CUcontext context_;
     cudaStream_t stream_ = gpu_policy::null_stream();
     detail::MetadataSlotPool<gpu_policy> metadata_pool_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
-    std::map<std::uint64_t, SequenceOutcome> outcomes_;
+    std::map<std::uint64_t, detail::SequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
 }  // namespace
@@ -406,7 +393,7 @@ void region_to_host(
 
 std::unique_ptr<DeviceOps> make_queue(
         const Device& device, CUcontext context,
-        CudaRegistryState& registry_state) {
+        detail::RegistryState& registry_state) {
     return std::make_unique<CudaQueue>(
             device, context, registry_state);
 }

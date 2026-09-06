@@ -12,7 +12,6 @@
 #include "copy.hpp"
 #include "driver.hpp"
 #include "iom/detail/aligned_storage.hpp"
-#include "registry_state.hpp"
 namespace iom {
 
 
@@ -121,7 +120,7 @@ namespace iom {
                 return context_;
             }
 
-            [[nodiscard]] cuda_detail::CudaRegistryState&
+            [[nodiscard]] detail::RegistryState&
                     registry_state() noexcept {
                 return registry_state_;
             }
@@ -130,7 +129,7 @@ namespace iom {
             std::uint32_t ordinal_;
             CUdevice device_;
             CUcontext context_;
-            cuda_detail::CudaRegistryState registry_state_;
+            detail::RegistryState registry_state_;
             cuda_detail::TransferStreamPool transfer_pool_;
             cuda_detail::StagingSlotPool staging_pool_;
             Allocator& allocator_;
@@ -155,7 +154,6 @@ namespace iom {
                     return;
                 }
 
-                const void* original_address = address_;
                 const std::size_t bytes =
                         view().spec().tiled_storage_nbytes();
                 const auto quarantine_storage = [this, bytes]() noexcept {
@@ -172,51 +170,14 @@ namespace iom {
                     }
                     address_ = nullptr;
                 };
-
-                std::vector<
-                        detail::OutstandingWorkRegistry::EntrySnapshot>
-                        snapshots;
-                try {
-                    snapshots = state_->registry.snapshot_for(address_);
-                } catch (...) {
-                    quarantine_storage();
-                    return;
-                }
-
-                bool safe_to_release = true;
-                for (const auto& snapshot : snapshots) {
-                    if (snapshot.state == detail::EntryState::Invalidated
-                            || !snapshot.fence) {
-                        safe_to_release = false;
-                        continue;
-                    }
-                    try {
-                        const detail::FenceResult result = snapshot.fence();
-                        safe_to_release = safe_to_release
-                                && result.succeeded && !result.failure;
-                    } catch (...) {
-                        safe_to_release = false;
-                    }
-                }
-
-                if (safe_to_release) {
-                    for (const auto& snapshot : snapshots) {
-                        state_->registry.remove_entry_if_present(
-                                snapshot.id,
-                                const_cast<void*>(original_address));
-                    }
+                const auto release_storage = [this]() noexcept {
                     iom::detail::release_aligned_storage(
                             allocator_, address_,
                             [this] { device_.activate(); });
-                    return;
-                }
-
-                quarantine_storage();
-                for (const auto& snapshot : snapshots) {
-                    state_->registry.remove_entry_if_present(
-                            snapshot.id,
-                            const_cast<void*>(original_address));
-                }
+                };
+                iom::detail::release_or_quarantine(
+                        state_->registry, address_, quarantine_storage,
+                        release_storage);
             }
 
         private:
@@ -242,7 +203,7 @@ namespace iom {
                         device_.context(), source, destination);
             }
             CudaDevice& device_;
-            cuda_detail::CudaRegistryState* state_;
+            detail::RegistryState* state_;
             Allocator& allocator_;
             void* address_ = nullptr;
         };

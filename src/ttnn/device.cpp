@@ -207,7 +207,7 @@ namespace iom {
                 return api_mutex_;
             }
 
-            [[nodiscard]] ttnn_detail::TtnnRegistryState&
+            [[nodiscard]] detail::RegistryState&
                     registry_state() noexcept {
                 return registry_state_;
             }
@@ -216,7 +216,7 @@ namespace iom {
             std::uint32_t ordinal_;
             std::shared_ptr<ttnn::MeshDevice> native_device_;
             std::mutex api_mutex_;
-            ttnn_detail::TtnnRegistryState registry_state_;
+            detail::RegistryState registry_state_;
         };
 
         // Owner of one TTNN-native tiled tensor per logical plane. Native
@@ -257,7 +257,6 @@ namespace iom {
             }
 
             ~TtnnTensor() noexcept override {
-                const void* original_address = planes_->data();
                 const auto quarantine_native = [this]() noexcept {
                     std::unique_ptr<std::vector<ttnn::Tensor>> retained(
                             planes_.release());
@@ -286,51 +285,13 @@ namespace iom {
                         (void)retained.release();
                     }
                 };
-
-                std::vector<
-                        detail::OutstandingWorkRegistry::EntrySnapshot>
-                        snapshots;
-                try {
-                    snapshots = state_->registry.snapshot_for(
-                            const_cast<void*>(original_address));
-                } catch (...) {
-                    quarantine_native();
-                    return;
-                }
-
-                bool safe_to_release = true;
-                for (const auto& snapshot : snapshots) {
-                    if (snapshot.state == detail::EntryState::Invalidated
-                            || !snapshot.fence) {
-                        safe_to_release = false;
-                        continue;
-                    }
-                    try {
-                        const detail::FenceResult result = snapshot.fence();
-                        safe_to_release = safe_to_release
-                                && result.succeeded && !result.failure;
-                    } catch (...) {
-                        safe_to_release = false;
-                    }
-                }
-
-                if (safe_to_release) {
-                    for (const auto& snapshot : snapshots) {
-                        state_->registry.remove_entry_if_present(
-                                snapshot.id,
-                                const_cast<void*>(original_address));
-                    }
+                const auto release_native = [this]() noexcept {
                     std::lock_guard<std::mutex> lock(device_.api_mutex());
                     planes_->clear();
-                    return;
-                }
-
-                quarantine_native();
-                for (const auto& snapshot : snapshots) {
-                    state_->registry.remove_entry_if_present(
-                            snapshot.id,
-                            const_cast<void*>(original_address));
-                }
+                };
+                iom::detail::release_or_quarantine(
+                        state_->registry, planes_->data(), quarantine_native,
+                        release_native);
             }
 
         private:
@@ -355,7 +316,7 @@ namespace iom {
             }
 
             TtnnDevice& device_;
-            ttnn_detail::TtnnRegistryState* state_;
+            detail::RegistryState* state_;
             std::unique_ptr<std::vector<ttnn::Tensor>> planes_;
         };
 
@@ -405,18 +366,12 @@ class TtnnQueue final : public DeviceOps {
               no_op(no_op_) {}
     };
 
-    struct SequenceOutcome {
-        detail::EntryId source_entry_id = 0;
-        detail::EntryId destination_entry_id = 0;
-        bool fence_succeeded = false;
-        std::exception_ptr retained_failure;
-    };
 
 public:
     explicit TtnnQueue(TtnnDevice& device)
             : device_(&device),
               state_(&device.registry_state()),
-              registry_queue_id_(ttnn_detail::allocate_queue_id(*state_)),
+              registry_queue_id_(detail::allocate_queue_id(*state_)),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
                               [this](Task& task) {
@@ -477,7 +432,7 @@ private:
         const detail::Fence fence = make_fence(*device_);
         detail::EntryRegistration entries;
         try {
-            entries = ttnn_detail::register_copy_entries(
+            entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
                     task.source.native_handle(),
                     task.destination.native_handle(), fence);
@@ -486,7 +441,7 @@ private:
             std::lock_guard<std::mutex> lock(outcome_mutex_);
             const auto [it, inserted] = outcomes_.emplace(
                     task.sequence,
-                    SequenceOutcome{
+                    detail::SequenceOutcome{
                             entries.source, entries.destination, true,
                             nullptr});
             if (!inserted) {
@@ -509,7 +464,7 @@ private:
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
-        SequenceOutcome outcome;
+        detail::SequenceOutcome outcome;
         bool has_outcome = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -521,22 +476,19 @@ private:
             }
         }
         if (has_outcome) {
-            detail::FenceResult fence_result =
+            const detail::FenceResult fence_result =
                     failure ? detail::FenceResult::failed(failure)
                             : finish_native(*device_);
             outcome.fence_succeeded =
                     fence_result.succeeded && !fence_result.failure;
-            const std::array<detail::EntryId, 2> entries{
-                    outcome.source_entry_id,
-                    outcome.destination_entry_id};
-            if (!outcome.fence_succeeded) {
-                state_->registry.invalidate_entries(entries);
-                if (!failure) {
-                    failure = fence_result.failure;
-                }
-            } else {
-                (void)state_->registry.try_release_entry(entries[0]);
-                (void)state_->registry.try_release_entry(entries[1]);
+            const bool released =
+                    detail::release_or_invalidate_entries(
+                            state_->registry, outcome,
+                            static_cast<bool>(failure));
+            if (!released && !failure) {
+                failure = fence_result.failure;
+            }
+            if (released) {
                 last_finished_seq_.store(
                         sequence, std::memory_order_release);
             }
@@ -545,11 +497,11 @@ private:
     }
 
     TtnnDevice* device_;
-    ttnn_detail::TtnnRegistryState* state_;
+    detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
-    std::map<std::uint64_t, SequenceOutcome> outcomes_;
+    std::map<std::uint64_t, detail::SequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
     std::mutex fence_mutex_;
     std::atomic<std::uint64_t> last_finished_seq_{0};

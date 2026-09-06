@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "iom/iom.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/detail/aligned_storage.hpp"
 #include "registry_state.hpp"
 
@@ -473,7 +474,6 @@ namespace iom {
                 return;
             }
 
-            const void* original_address = address_;
             const std::size_t bytes = view().spec().tiled_storage_nbytes();
             const auto quarantine_storage = [this, bytes]() noexcept {
                 try {
@@ -486,48 +486,12 @@ namespace iom {
                 }
                 address_ = nullptr;
             };
-
-            std::vector<detail::OutstandingWorkRegistry::EntrySnapshot>
-                    snapshots;
-            try {
-                snapshots = device_.registry_state().registry.snapshot_for(
-                        address_);
-            } catch (...) {
-                quarantine_storage();
-                return;
-            }
-
-            bool safe_to_release = true;
-            for (const auto& snapshot : snapshots) {
-                if (snapshot.state == detail::EntryState::Invalidated
-                        || !snapshot.fence) {
-                    safe_to_release = false;
-                    continue;
-                }
-                try {
-                    const detail::FenceResult result = snapshot.fence();
-                    safe_to_release = safe_to_release
-                            && result.succeeded && !result.failure;
-                } catch (...) {
-                    safe_to_release = false;
-                }
-            }
-
-            if (safe_to_release) {
-                for (const auto& snapshot : snapshots) {
-                    device_.registry_state().registry.remove_entry_if_present(
-                            snapshot.id,
-                            const_cast<void*>(original_address));
-                }
+            const auto release_storage = [this]() noexcept {
                 iom::detail::release_aligned_storage(allocator_, address_);
-                return;
-            }
-
-            quarantine_storage();
-            for (const auto& snapshot : snapshots) {
-                device_.registry_state().registry.remove_entry_if_present(
-                        snapshot.id, const_cast<void*>(original_address));
-            }
+            };
+            iom::detail::release_or_quarantine(
+                    device_.registry_state().registry, address_,
+                    quarantine_storage, release_storage);
         }
 
     private:

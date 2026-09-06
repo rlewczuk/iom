@@ -11,7 +11,7 @@
 #include "../shared/metadata_slot_pool.hpp"
 #include "../shared/staging_pool.hpp"
 #include "../shared/transfer_pool.hpp"
-#include "registry_state.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/iom.hpp"
 
 namespace iom::rocm_detail {
@@ -236,6 +236,6 @@ void region_to_host(
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, int device_ordinal,
-        RocmRegistryState& registry_state);
+        detail::RegistryState& registry_state);
 
 }  // namespace iom::rocm_detail

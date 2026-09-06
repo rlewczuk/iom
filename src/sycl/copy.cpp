@@ -497,20 +497,20 @@ class SyclQueue final : public DeviceOps {
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
     };
-
-    struct SequenceOutcome {
-        detail::EntryId source_entry_id = 0;
-        detail::EntryId destination_entry_id = 0;
+    struct SyclSequenceOutcome {
+        detail::SequenceOutcome common;
         std::shared_ptr<SyclFenceState> state;
     };
+
 
 public:
     SyclQueue(
             const Device& device, const sycl::context& context,
-            const sycl::device& native_device, SyclRegistryState& state)
+            const sycl::device& native_device,
+            detail::RegistryState& state)
             : device_(&device),
               state_(&state),
-              registry_queue_id_(allocate_queue_id(*state_)),
+              registry_queue_id_(detail::allocate_queue_id(*state_)),
               queue_(
                       context, native_device,
                       sycl::property_list{
@@ -597,7 +597,7 @@ private:
                     [state = task.state]() noexcept -> detail::FenceResult {
                 return state->result();
             };
-            entries = register_copy_entries(
+            entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
                     const_cast<void*>(task.source->native_handle()),
                     task.destination->native_handle(), fence);
@@ -611,8 +611,10 @@ private:
             std::lock_guard<std::mutex> lock(outcome_mutex_);
             const auto [it, inserted] = outcomes_.emplace(
                     task.sequence,
-                    SequenceOutcome{
-                            entries.source, entries.destination, task.state});
+                    SyclSequenceOutcome{
+                            detail::SequenceOutcome{
+                                    entries.source, entries.destination},
+                            task.state});
             if (!inserted) {
                 throw std::logic_error(
                         "duplicate SYCL outstanding-work sequence");
@@ -745,7 +747,7 @@ private:
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr callback_failure) {
-        SequenceOutcome outcome;
+        SyclSequenceOutcome outcome;
         bool has_outcome = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -757,33 +759,32 @@ private:
             }
         }
 
-        std::exception_ptr combined_failure = std::move(callback_failure);
+        std::exception_ptr combined_failure;
         if (has_outcome) {
-            const detail::FenceResult result = outcome.state->result();
-            if (!combined_failure) {
-                combined_failure = result.failure;
-            }
-            const std::array<detail::EntryId, 2> ids{
-                    outcome.source_entry_id,
-                    outcome.destination_entry_id};
-            if (combined_failure || !result.succeeded) {
-                state_->registry.invalidate_entries(ids);
-            } else {
-                (void)state_->registry.try_release_entry(ids[0]);
-                (void)state_->registry.try_release_entry(ids[1]);
-            }
+            const detail::FenceResult fence_result =
+                    outcome.state->result();
+            combined_failure =
+                    fence_result.failure ? fence_result.failure
+                                          : callback_failure;
+            outcome.common.fence_succeeded =
+                    fence_result.succeeded && !fence_result.failure;
+            (void)detail::release_or_invalidate_entries(
+                    state_->registry, outcome.common,
+                    static_cast<bool>(callback_failure));
+        } else {
+            combined_failure = callback_failure;
         }
         complete(sequence, std::move(combined_failure));
     }
 
     const Device* device_;
-    SyclRegistryState* state_;
+    detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
     sycl::queue queue_;
     SyclMetadataSlotPool metadata_pool_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
-    std::map<std::uint64_t, SequenceOutcome> outcomes_;
+    std::map<std::uint64_t, SyclSequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
 
@@ -860,7 +861,8 @@ void region_to_host(
 
 std::unique_ptr<DeviceOps> make_queue(
         const Device& device, const sycl::context& context,
-        const sycl::device& native_device, SyclRegistryState& registry_state) {
+        const sycl::device& native_device,
+        detail::RegistryState& registry_state) {
     return std::make_unique<SyclQueue>(
             device, context, native_device, registry_state);
 }
