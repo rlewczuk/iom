@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,13 @@ constexpr int kHipSuccess = 0;
 #include "iom/ttnn/device.hpp"
 #endif
 
+#ifdef IOM_COEXIST_SYCL
+#include <sycl/sycl.hpp>
+
+#include "iom/sycl/device.hpp"
+#include "runtime.hpp"
+#endif
+
 namespace {
 
 // One BF16 specification every enabled backend materializes, transfers,
@@ -76,6 +84,83 @@ public:
 
     void reset() override {}
 };
+
+#ifdef IOM_COEXIST_SYCL
+class SyclUsmAllocator final : public iom::Allocator {
+public:
+    void bind_context(const sycl::context& context) {
+        context_ = context;
+        const std::vector<sycl::device> devices = context.get_devices();
+        REQUIRE(!devices.empty());
+        device_ = devices.front();
+    }
+
+    void* alloc(std::size_t size) override {
+        REQUIRE(context_.has_value());
+        void* pointer = sycl::malloc_shared(size, device_, *context_);
+        if (pointer == nullptr) {
+            throw std::bad_alloc();
+        }
+        return pointer;
+    }
+
+    void free(void* buffer) override {
+        REQUIRE(context_.has_value());
+        sycl::free(buffer, *context_);
+    }
+
+    void reset() override {}
+
+private:
+    std::optional<sycl::context> context_;
+    sycl::device device_;
+};
+
+SyclUsmAllocator* active_sycl_allocator = nullptr;
+
+void capture_sycl_context(const sycl::context& context) {
+    REQUIRE(active_sycl_allocator != nullptr);
+    active_sycl_allocator->bind_context(context);
+}
+
+class SyclContextCallsRestore final {
+public:
+    SyclContextCallsRestore()
+            : saved_(iom::sycl_detail::context_calls),
+              saved_allocator_(active_sycl_allocator) {}
+
+    SyclContextCallsRestore(const SyclContextCallsRestore&) = delete;
+    SyclContextCallsRestore& operator=(const SyclContextCallsRestore&) = delete;
+
+    ~SyclContextCallsRestore() {
+        iom::sycl_detail::context_calls = saved_;
+        active_sycl_allocator = saved_allocator_;
+    }
+
+private:
+    iom::sycl_detail::ContextCalls saved_;
+    SyclUsmAllocator* saved_allocator_;
+};
+
+std::unique_ptr<iom::Device> make_sycl_device_with_allocator(
+        std::uint32_t ordinal, SyclUsmAllocator& allocator) {
+    SyclContextCallsRestore restore;
+    active_sycl_allocator = &allocator;
+    iom::sycl_detail::context_calls.context_ready = &capture_sycl_context;
+    return iom::make_sycl_device(ordinal, allocator);
+}
+
+[[nodiscard]] std::size_t sycl_runtime_device_count() {
+    const auto devices = sycl::device::get_devices();
+    const std::size_t count = static_cast<std::size_t>(std::count_if(
+            devices.begin(), devices.end(), [](const sycl::device& device) {
+                return device.is_gpu() || device.is_accelerator();
+            }));
+    REQUIRE(count > 0);
+    return count;
+}
+#endif
+
 
 #ifdef IOM_COEXIST_CUDA
 class CudaMemoryAllocator final : public iom::Allocator {
@@ -207,6 +292,26 @@ BackendParticipant make_rocm_participant(HipMemoryAllocator& allocator) {
 }
 #endif
 
+#ifdef IOM_COEXIST_SYCL
+BackendParticipant make_sycl_participant(SyclUsmAllocator& allocator) {
+    BackendParticipant participant;
+    participant.name = "sycl";
+    participant.kind = iom::BackendKind::SYCL;
+    participant.owned_device =
+            make_sycl_device_with_allocator(0, allocator);
+    participant.device = participant.owned_device.get();
+    participant.source = participant.device->create_tensor(coexistence_spec());
+    participant.queues.push_back(participant.device->create_ops());
+    participant.queues.push_back(participant.device->create_ops());
+    for (std::size_t i = 0; i < participant.queues.size(); ++i) {
+        participant.destinations.push_back(
+                participant.device->create_tensor(coexistence_spec()));
+    }
+    participant.submitted.resize(participant.queues.size());
+    return participant;
+}
+#endif
+
 #ifdef IOM_COEXIST_TTNN
 BackendParticipant make_ttnn_participant() {
     BackendParticipant participant;
@@ -249,6 +354,12 @@ TEST_CASE("Backend coexistence: enabled backends interleave in one process") {
     HipMemoryAllocator rocm_allocator;
     BackendParticipant rocm_participant = make_rocm_participant(rocm_allocator);
     participants.push_back(&rocm_participant);
+#endif
+#ifdef IOM_COEXIST_SYCL
+    SyclUsmAllocator sycl_allocator;
+    BackendParticipant sycl_participant =
+            make_sycl_participant(sycl_allocator);
+    participants.push_back(&sycl_participant);
 #endif
 #ifdef IOM_COEXIST_TTNN
     BackendParticipant ttnn_participant = make_ttnn_participant();
@@ -398,6 +509,19 @@ TEST_CASE("Backend coexistence: queues reject views from another device") {
         check_rejection("rocm", *device, *foreign);
     }
 #endif
+#ifdef IOM_COEXIST_SYCL
+    {
+        SyclUsmAllocator device_allocator;
+        SyclUsmAllocator foreign_device_allocator;
+        auto device = make_sycl_device_with_allocator(0, device_allocator);
+        auto foreign =
+                make_sycl_device_with_allocator(0, foreign_device_allocator);
+        CHECK(device->backend_kind() == iom::BackendKind::SYCL);
+        CHECK(foreign->backend_kind() == iom::BackendKind::SYCL);
+        CHECK(device->backend_device() == foreign->backend_device());
+        check_rejection("sycl", *device, *foreign);
+    }
+#endif
 #ifdef IOM_COEXIST_TTNN
     {
         // tt-metal permits only one live context per physical device per
@@ -437,6 +561,16 @@ TEST_CASE("Backend coexistence: second devices report their own ordinal") {
         auto second = iom::make_rocm_device(1, second_allocator);
         REQUIRE(second != nullptr);
         CHECK(second->backend_kind() == iom::BackendKind::ROCM);
+        CHECK(second->backend_device() == 1);
+    }
+#endif
+#ifdef IOM_COEXIST_SYCL
+    if (sycl_runtime_device_count() > 1) {
+        SyclUsmAllocator second_allocator;
+        auto second =
+                make_sycl_device_with_allocator(1, second_allocator);
+        REQUIRE(second != nullptr);
+        CHECK(second->backend_kind() == iom::BackendKind::SYCL);
         CHECK(second->backend_device() == 1);
     }
 #endif
