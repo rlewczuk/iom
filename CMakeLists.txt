@@ -152,6 +152,7 @@ if(CUDA_ENABLED)
         src/cuda/driver.cpp
         src/cuda/driver.hpp
         src/shared/metadata_slot_pool.hpp
+        src/shared/event_ring.hpp
         src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
         src/shared/transfer_pool.hpp
@@ -196,6 +197,7 @@ if(ROCM_ENABLED)
         src/rocm/copy.hip
         src/rocm/copy.hpp
         src/shared/metadata_slot_pool.hpp
+        src/shared/event_ring.hpp
         src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
         src/shared/transfer_pool.hpp

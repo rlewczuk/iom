@@ -2,12 +2,14 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <exception>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 
+#include "../shared/event_ring.hpp"
 #include "../shared/metadata_slot_pool.hpp"
 #include "../shared/staging_pool.hpp"
 #include "../shared/transfer_pool.hpp"
@@ -70,10 +72,13 @@ struct gpu_policy {
         }
     }
 
-    static void create_event(event_type* event) {
+    static void check_acquire_event_fault() {
         if (consume_submission_fault(SubmissionFault::event_create)) {
             check_hip("hipEventCreateWithFlags", hipErrorInvalidValue);
         }
+    }
+
+    static void create_event(event_type* event) {
         check_hip(
                 "hipEventCreateWithFlags",
                 hipEventCreateWithFlags(event, hipEventDisableTiming));
@@ -220,9 +225,19 @@ struct gpu_policy {
         return "HIP kernel launch";
     }
 };
+using EventRingState = iom::detail::EventRingState<gpu_policy>;
+
+struct EventLeaseWithFailure {
+    std::shared_ptr<EventRingState> state;
+    std::size_t slot_index = 0;
+    std::exception_ptr retained_failure;
+};
+static_assert(sizeof(EventLeaseWithFailure) <= iom::detail::kFenceStorageBytes);
+static_assert(alignof(EventLeaseWithFailure) <= iom::detail::kFenceStorageAlign);
 
 using StagingSlotPool = iom::detail::StagingSlotPool<gpu_policy>;
 using TransferStreamPool = iom::detail::TransferStreamPool<gpu_policy>;
+
 
 void region_from_host(
         TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,

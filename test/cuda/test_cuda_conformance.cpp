@@ -514,3 +514,37 @@ TEST_CASE("CUDA queue destruction fences pending copies") {
             iom::cuda_detail::SubmissionFault::none);
     CHECK_FALSE(gate.armed());
 }
+
+TEST_CASE("CUDA conformance: inline and pooled metadata rank boundaries") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    TrafficGate gate;
+    CudaAllocator allocator(gate);
+    auto device = iom::make_cuda_device(0, allocator);
+    CudaStorageOracle oracle;
+    const std::vector<std::vector<std::size_t>> shapes = {
+            {2, 2, 2, 2, 2, 2, 2, 2, 16, 16},
+            {2, 2, 2, 2, 2, 2, 2, 2, 2, 17, 33}};
+
+    for (const auto& dimensions : shapes) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{dimensions}, iom::DataType::F32};
+        auto source = device->create_tensor(spec);
+        auto destination = device->create_tensor(spec);
+        const std::vector<std::byte> expected =
+                iom_conformance::encode_standard_tiled_storage(spec);
+        const std::vector<std::byte> empty(
+                spec.tiled_storage_nbytes(), std::byte{0});
+        oracle.set_owner_spec(spec);
+        oracle.seed(source->view(), expected);
+        oracle.set_owner_spec(spec);
+        oracle.seed(destination->view(), empty);
+
+        auto queue = device->create_ops();
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        CHECK_NOTHROW(queue->wait(token));
+        oracle.set_owner_spec(spec);
+        CHECK_EQ(oracle.observe(destination->view()), expected);
+    }
+    CHECK_FALSE(gate.armed());
+}

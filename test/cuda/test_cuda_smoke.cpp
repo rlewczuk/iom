@@ -641,3 +641,130 @@ TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {
     device.reset();
     CHECK(probe.release_count == 1);
 }
+
+TEST_CASE("CUDA event ring reuses events and enforces bounded capacity") {
+    require_cuda_hardware();
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
+            context);
+    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
+            context, metadata_pool);
+
+    for (int i = 0; i < 32; ++i) {
+        auto& slot = state->acquire();
+        state->release(slot);
+    }
+    CHECK_EQ(state->created_event_count_for_testing(), 1);
+    CHECK_EQ(state->in_use_count_for_testing(), 0);
+
+    std::vector<iom::cuda_detail::EventRingState::Slot*> held;
+    held.reserve(iom::cuda_detail::EventRingState::kEventRingCount);
+    for (std::size_t i = 0;
+         i < iom::cuda_detail::EventRingState::kEventRingCount; ++i) {
+        held.push_back(&state->acquire());
+    }
+    CHECK_EQ(state->created_event_count_for_testing(), 16);
+    CHECK_EQ(state->in_use_count_for_testing(), 16);
+
+    std::atomic<bool> waiter_started = false;
+    std::atomic<bool> waiter_acquired = false;
+    std::thread waiter([&] {
+        waiter_started.store(true, std::memory_order_release);
+        auto& slot = state->acquire();
+        waiter_acquired.store(true, std::memory_order_release);
+        state->release(slot);
+    });
+    while (!waiter_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    CHECK_EQ(state->in_use_count_for_testing(), 16);
+    state->release(*held.front());
+    waiter.join();
+    CHECK(waiter_acquired.load(std::memory_order_acquire));
+    for (auto* slot : held) {
+        state->release(*slot);
+    }
+}
+
+TEST_CASE("CUDA event ring consumes create faults before allocating") {
+    require_cuda_hardware();
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
+            context);
+    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
+            context, metadata_pool);
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::event_create);
+    CHECK_THROWS_AS((void)state->acquire(), std::runtime_error);
+    CHECK_EQ(state->created_event_count_for_testing(), 0);
+    CHECK_EQ(state->in_use_count_for_testing(), 0);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+}
+
+TEST_CASE("CUDA event ring releases metadata when state is destroyed") {
+    require_cuda_hardware();
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
+            context);
+    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
+            context, metadata_pool);
+    auto& event_slot = state->acquire();
+    std::vector<std::size_t> metadata_slots;
+    metadata_slots.reserve(
+            iom::detail::MetadataSlotPool<
+                    iom::cuda_detail::gpu_policy>::kMetadataSlotCount);
+    for (std::size_t i = 0;
+         i < iom::detail::MetadataSlotPool<
+                     iom::cuda_detail::gpu_policy>::kMetadataSlotCount;
+         ++i) {
+        metadata_slots.push_back(metadata_pool.acquire());
+    }
+    event_slot.attached_metadata_slot = metadata_slots.front();
+    auto lease = std::move(state);
+    lease.reset();
+    for (std::size_t i = 1; i < metadata_slots.size(); ++i) {
+        metadata_pool.release(metadata_slots[i]);
+    }
+    std::vector<std::size_t> reacquired_slots;
+    reacquired_slots.reserve(metadata_slots.size());
+    for (std::size_t i = 0; i < metadata_slots.size(); ++i) {
+        reacquired_slots.push_back(metadata_pool.acquire());
+    }
+    CHECK_EQ(reacquired_slots.size(), metadata_slots.size());
+    for (const std::size_t slot : reacquired_slots) {
+        metadata_pool.release(slot);
+    }
+}
+
+TEST_CASE("CUDA event ring preserves cached results across reuse") {
+    require_cuda_hardware();
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
+            context);
+    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
+            context, metadata_pool);
+    auto& first = state->acquire();
+    const std::size_t index = state->slot_index(first);
+    state->on_worker_complete(first);
+    state->on_worker_destroy(first);
+    const iom::detail::FenceResult recorded = state->invoke_result(index);
+    CHECK(recorded.succeeded);
+    auto& reused = state->acquire();
+    CHECK_EQ(state->slot_index(reused), index);
+    CHECK(state->invoke_result(index).succeeded);
+    state->release(reused);
+}

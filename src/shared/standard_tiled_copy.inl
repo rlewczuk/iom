@@ -318,6 +318,17 @@ struct CopyMetadataHeader {
     std::uint32_t bits;
     std::uint32_t leading_rank;
 };
+inline constexpr std::size_t kInlineMetadataMaxRank = 8;
+
+struct InlineCopyMetadata {
+    CopyMetadataHeader header;
+    std::uint64_t values[3 * kInlineMetadataMaxRank];
+};
+static_assert(std::is_trivially_copyable_v<InlineCopyMetadata>);
+static_assert(sizeof(InlineCopyMetadata) == 240);
+static_assert(sizeof(InlineCopyMetadata) % 16 == 0);
+static_assert(sizeof(InlineCopyMetadata) <= 1024);
+
 static_assert(std::is_trivially_copyable_v<CopyMetadataHeader>);
 
 [[nodiscard]] std::size_t checked_metadata_mul(
@@ -444,30 +455,36 @@ void write_copy_metadata(
                 dimensions[axis], "metadata leading dimension overflows");
     }
 }
+void write_copy_metadata(
+        InlineCopyMetadata& storage, const TensorView& source,
+        const TensorView& destination) {
+    write_copy_metadata(
+            reinterpret_cast<std::byte*>(&storage), source, destination);
+}
 
 
-IOM_GPU_GLOBAL void grid_stride_copy_kernel(
+IOM_GPU_DEVICE void grid_stride_copy_body(
         const unsigned char* source, unsigned char* destination,
-        const CopyMetadataHeader* metadata) {
+        const CopyMetadataHeader& metadata,
+        const std::uint64_t* values) {
     const std::uint64_t padded_rows =
-            (metadata->rows / TensorSpec::TILE
-             + (metadata->rows % TensorSpec::TILE != 0))
+            (metadata.rows / TensorSpec::TILE
+             + (metadata.rows % TensorSpec::TILE != 0))
             * TensorSpec::TILE;
     const std::uint64_t padded_columns =
-            (metadata->columns / TensorSpec::TILE
-             + (metadata->columns % TensorSpec::TILE != 0))
+            (metadata.columns / TensorSpec::TILE
+             + (metadata.columns % TensorSpec::TILE != 0))
             * TensorSpec::TILE;
     const std::uint64_t padded_elements = padded_rows * padded_columns;
-    const std::uint64_t plane_bits = padded_elements * metadata->bits;
+    const std::uint64_t plane_bits = padded_elements * metadata.bits;
     const std::uint64_t words_per_plane = (plane_bits + 31) / 32;
     const std::uint64_t total_words =
-            metadata->plane_count * words_per_plane;
-    const std::uint64_t* source_strides =
-            reinterpret_cast<const std::uint64_t*>(metadata + 1);
+            metadata.plane_count * words_per_plane;
+    const std::uint64_t* source_strides = values;
     const std::uint64_t* destination_strides =
-            source_strides + metadata->leading_rank;
+            source_strides + metadata.leading_rank;
     const std::uint64_t* leading_dimensions =
-            destination_strides + metadata->leading_rank;
+            destination_strides + metadata.leading_rank;
     const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
 
     for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < total_words;
@@ -475,11 +492,11 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
         const std::uint64_t logical_plane =
                 word / words_per_plane;
         const std::uint64_t word_in_plane = word % words_per_plane;
-        std::uint64_t source_plane = metadata->source_plane_offset;
+        std::uint64_t source_plane = metadata.source_plane_offset;
         std::uint64_t destination_plane =
-                metadata->destination_plane_offset;
+                metadata.destination_plane_offset;
         std::uint64_t rest = logical_plane;
-        for (std::uint32_t axis = metadata->leading_rank; axis-- > 0;) {
+        for (std::uint32_t axis = metadata.leading_rank; axis-- > 0;) {
             const std::uint64_t coordinate =
                     rest % leading_dimensions[axis];
             rest /= leading_dimensions[axis];
@@ -488,9 +505,24 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
         }
         copy_tiled_to_tiled_word(
                 source, destination, source_plane, destination_plane,
-                word_in_plane, metadata->rows, metadata->columns,
-                metadata->bits);
+                word_in_plane, metadata.rows, metadata.columns,
+                metadata.bits);
     }
+}
+
+IOM_GPU_GLOBAL void grid_stride_copy_kernel(
+        const unsigned char* source, unsigned char* destination,
+        const CopyMetadataHeader* metadata) {
+    grid_stride_copy_body(
+            source, destination, *metadata,
+            reinterpret_cast<const std::uint64_t*>(metadata + 1));
+}
+
+IOM_GPU_GLOBAL void grid_stride_copy_inline_kernel(
+        const unsigned char* source, unsigned char* destination,
+        InlineCopyMetadata metadata) {
+    grid_stride_copy_body(
+            source, destination, metadata.header, metadata.values);
 }
 
 template <typename Policy>
@@ -504,6 +536,20 @@ void launch_grid_stride_copy(
             std::min<std::size_t>(launch_words / kThreads, kMaxBlocks));
     IOM_LAUNCH_KERNEL(
             grid_stride_copy_kernel, blocks, kThreads, stream,
+            source, destination, metadata);
+}
+
+template <typename Policy>
+void launch_grid_stride_copy(
+        typename Policy::stream_type stream, const unsigned char* source,
+        unsigned char* destination, const InlineCopyMetadata& metadata,
+        std::size_t total_words) {
+    const std::size_t launch_words = checked_metadata_add(
+            total_words, 255, "metadata launch count overflows");
+    const unsigned int blocks = static_cast<unsigned int>(
+            std::min<std::size_t>(launch_words / kThreads, kMaxBlocks));
+    IOM_LAUNCH_KERNEL(
+            grid_stride_copy_inline_kernel, blocks, kThreads, stream,
             source, destination, metadata);
 }
 

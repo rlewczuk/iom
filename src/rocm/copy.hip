@@ -3,7 +3,6 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic>
-#include <array>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -11,7 +10,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -59,135 +57,13 @@ void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
 
 namespace iom::rocm_detail {
 namespace {
-struct HipFenceResource {
-    hipEvent_t event = nullptr;
-    std::size_t metadata_slot = 0;
-    detail::MetadataSlotPool<gpu_policy>* pool = nullptr;
-    int context = 0;
-    std::exception_ptr retained_failure;
-    std::atomic<std::size_t> refcount{1};
-    std::optional<detail::FenceResult> cached_result;
-    std::mutex cached_result_mu;
-};
-
-struct HipFenceLease {
-    HipFenceResource* resource = nullptr;
-
-    HipFenceLease() noexcept = default;
-
-    static HipFenceLease acquire_lease(HipFenceResource* resource) noexcept {
-        HipFenceLease lease;
-        lease.resource = resource;
-        if (resource != nullptr) {
-            resource->refcount.fetch_add(1, std::memory_order_relaxed);
-        }
-        return lease;
-    }
-
-    HipFenceLease(const HipFenceLease& other) noexcept
-            : resource(other.resource) {
-        if (resource != nullptr) {
-            resource->refcount.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    HipFenceLease(HipFenceLease&& other) noexcept
-            : resource(other.resource) {
-        other.resource = nullptr;
-    }
-
-    HipFenceLease& operator=(const HipFenceLease&) = delete;
-    HipFenceLease& operator=(HipFenceLease&&) = delete;
-
-    ~HipFenceLease() noexcept {
-        if (resource != nullptr
-                && resource->refcount.fetch_sub(
-                           1, std::memory_order_acq_rel)
-                        == 1) {
-            try {
-                gpu_policy::activate(resource->context);
-            } catch (...) {
-            }
-            gpu_policy::destroy_event_noexcept(resource->event);
-            delete resource;
-        }
-    }
-};
-
-static_assert(sizeof(HipFenceLease) <= detail::kFenceStorageBytes);
-static_assert(alignof(HipFenceLease) <= detail::kFenceStorageAlign);
-static_assert(noexcept(
-        HipFenceLease(std::declval<const HipFenceLease&>())));
-static_assert(noexcept(
-        HipFenceLease(std::declval<HipFenceLease&&>())));
-static_assert(noexcept(std::declval<HipFenceLease&>().~HipFenceLease()));
-static_assert(!std::is_copy_assignable_v<HipFenceLease>);
-static_assert(!std::is_move_assignable_v<HipFenceLease>);
-
-detail::FenceResult hip_synchronized_fence_event(
-        HipFenceResource& resource) noexcept {
-    std::lock_guard<std::mutex> lock(resource.cached_result_mu);
-    if (resource.cached_result.has_value()) {
-        return *resource.cached_result;
-    }
-    try {
-        gpu_policy::activate(resource.context);
-        gpu_policy::synchronize_event(resource.event);
-        if (resource.retained_failure) {
-            resource.cached_result.emplace(
-                    detail::FenceResult::failed(
-                            std::move(resource.retained_failure)));
-        } else {
-            resource.cached_result.emplace(detail::FenceResult::success());
-        }
-    } catch (...) {
-        resource.cached_result.emplace(
-                detail::FenceResult::failed(std::current_exception()));
-    }
-    return *resource.cached_result;
-}
-
-static_assert(noexcept(hip_synchronized_fence_event(
-        std::declval<HipFenceResource&>())));
-
-void hip_fence_complete(void* opaque) {
-    if (opaque == nullptr) {
-        return;
-    }
-    const detail::FenceResult result =
-            hip_synchronized_fence_event(
-                    *static_cast<HipFenceResource*>(opaque));
-    if (result.failure) {
-        std::rethrow_exception(result.failure);
-    }
-}
-
-void hip_fence_destroy(void* opaque) noexcept {
-    if (opaque == nullptr) {
-        return;
-    }
-    auto* resource = static_cast<HipFenceResource*>(opaque);
-    (void)hip_synchronized_fence_event(*resource);
-    detail::MetadataSlotPool<gpu_policy>* pool = resource->pool;
-    resource->pool = nullptr;
-    if (pool != nullptr) {
-        pool->release(resource->metadata_slot);
-    }
-    if (resource->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        try {
-            gpu_policy::activate(resource->context);
-        } catch (...) {
-        }
-        gpu_policy::destroy_event_noexcept(resource->event);
-        delete resource;
-    }
-}
-
 void hip_fence_copy_construct(
         detail::Fence* destination, const detail::Fence& source) noexcept {
-    ::new (destination->storage) HipFenceLease{
-            *std::launder(reinterpret_cast<const HipFenceLease*>(
-                    source.storage))};
+    const auto& capture =
+            *std::launder(reinterpret_cast<const EventLeaseWithFailure*>(
+                    source.storage));
+    ::new (destination->storage) EventLeaseWithFailure{
+            capture.state, capture.slot_index, capture.retained_failure};
 }
 
 static_assert(noexcept(hip_fence_copy_construct(
@@ -196,10 +72,10 @@ static_assert(noexcept(hip_fence_copy_construct(
 
 void hip_fence_move_construct(
         detail::Fence* destination, detail::Fence* source) noexcept {
-    ::new (destination->storage) HipFenceLease{
-            std::move(*std::launder(reinterpret_cast<HipFenceLease*>(
+    ::new (destination->storage) EventLeaseWithFailure{
+            std::move(*std::launder(reinterpret_cast<EventLeaseWithFailure*>(
                     source->storage)))};
-    std::destroy_at(std::launder(reinterpret_cast<HipFenceLease*>(
+    std::destroy_at(std::launder(reinterpret_cast<EventLeaseWithFailure*>(
             source->storage)));
 }
 
@@ -208,7 +84,7 @@ static_assert(noexcept(hip_fence_move_construct(
         std::declval<detail::Fence*>())));
 
 void hip_fence_storage_destroy(detail::Fence* fence) noexcept {
-    std::destroy_at(std::launder(reinterpret_cast<HipFenceLease*>(
+    std::destroy_at(std::launder(reinterpret_cast<EventLeaseWithFailure*>(
             fence->storage)));
 }
 
@@ -217,21 +93,26 @@ static_assert(noexcept(hip_fence_storage_destroy(
 
 detail::FenceResult hip_fence_invoke(
         const detail::Fence& fence) noexcept {
-    const auto& lease = *std::launder(reinterpret_cast<const HipFenceLease*>(
-            fence.storage));
-    if (lease.resource == nullptr) {
+    const auto& capture =
+            *std::launder(reinterpret_cast<const EventLeaseWithFailure*>(
+                    fence.storage));
+    if (capture.state == nullptr) {
         return detail::FenceResult::success();
     }
-    return hip_synchronized_fence_event(*lease.resource);
+    return capture.state->invoke_result(capture.slot_index);
 }
 
 static_assert(noexcept(hip_fence_invoke(
         std::declval<const detail::Fence&>())));
 
-detail::Fence build_hip_fence(HipFenceResource* resource) noexcept {
+static_assert(sizeof(EventLeaseWithFailure) <= iom::detail::kFenceStorageBytes);
+static_assert(alignof(EventLeaseWithFailure) <= iom::detail::kFenceStorageAlign);
+detail::Fence build_hip_fence(
+        const std::shared_ptr<EventRingState>& state,
+        std::size_t slot_index, std::exception_ptr retained_failure) noexcept {
     detail::Fence fence;
-    ::new (fence.storage) HipFenceLease{
-            HipFenceLease::acquire_lease(resource)};
+    ::new (fence.storage) EventLeaseWithFailure{
+            state, slot_index, std::move(retained_failure)};
     fence.invoke = &hip_fence_invoke;
     fence.copy_construct = &hip_fence_copy_construct;
     fence.move_construct = &hip_fence_move_construct;
@@ -249,7 +130,7 @@ class RocmQueue final : public DeviceOps {
         TensorView* destination;
         hipEvent_t event = nullptr;
         bool no_op;
-        void* fence = nullptr;
+        EventRingState::Slot* fence = nullptr;
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
     };
@@ -260,20 +141,27 @@ public:
             const Device& device, int device_ordinal,
             detail::RegistryState& registry_state)
             : device_(&device),
-              state_(&registry_state),
-              registry_queue_id_(detail::allocate_queue_id(*state_)),
+              registry_state_(&registry_state),
+              registry_queue_id_(detail::allocate_queue_id(*registry_state_)),
               context_(device_ordinal),
               metadata_pool_(context_),
+              state_(
+                      std::make_shared<EventRingState>(
+                              context_, metadata_pool_)),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
                               [this](Task& task) {
                                   execute(task);
                               },
-                              [](void* fence) {
-                                  hip_fence_complete(fence);
+                              [state = state_](void* fence) {
+                                  state->on_worker_complete(
+                                          *static_cast<EventRingState::Slot*>(
+                                                  fence));
                               },
-                              [](void* fence) {
-                                  hip_fence_destroy(fence);
+                              [state = state_](void* fence) {
+                                  state->on_worker_destroy(
+                                          *static_cast<EventRingState::Slot*>(
+                                                  fence));
                               },
                               [this](
                                       std::uint64_t sequence,
@@ -294,7 +182,7 @@ public:
     }
 
     ~RocmQueue() override {
-        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        registry_state_->registry.invalidate_entries_for_queue(registry_queue_id_);
         worker_.shutdown_and_drain();
         try {
             gpu_policy::activate(context_);
@@ -302,6 +190,7 @@ public:
         } catch (...) {
         }
         stream_ = gpu_policy::null_stream();
+        state_.reset();
     }
 
     oid copy(const TensorView& source, TensorView& destination) override {
@@ -335,84 +224,89 @@ private:
         }
 
         gpu_policy::activate(context_);
-        const std::size_t metadata_slot = metadata_pool_.acquire();
-        hipEvent_t event = nullptr;
-        std::unique_ptr<HipFenceResource> resource;
+        const detail::CopyMetadataLayout layout =
+                detail::copy_metadata_layout(source, destination);
+        EventRingState::Slot* slot = nullptr;
+        std::size_t slot_index = 0;
+        std::size_t metadata_slot = EventRingState::kNoAttachedSlot;
+        bool metadata_acquired = false;
         bool kernel_enqueued = false;
         bool event_recorded = false;
         std::exception_ptr retained_failure;
+        detail::InlineCopyMetadata inline_metadata{};
         try {
-            const detail::CopyMetadataLayout layout =
-                    detail::copy_metadata_layout(
-                            source, destination);
-            metadata_pool_.ensure_slot_capacity(
-                    metadata_slot, layout.bytes, stream_);
-            detail::write_copy_metadata(
-                    metadata_pool_.host_data(metadata_slot),
-                    source, destination);
-            gpu_policy::create_event(&event);
-            gpu_policy::copy_from_host(
-                    stream_, metadata_pool_.device_data(metadata_slot),
-                    metadata_pool_.host_data(metadata_slot), layout.bytes);
-            detail::launch_grid_stride_copy<gpu_policy>(
-                    stream_,
-                    static_cast<const unsigned char*>(
-                            source.native_handle()),
-                    static_cast<unsigned char*>(
-                            destination.native_handle()),
-                    static_cast<const detail::CopyMetadataHeader*>(
-                            metadata_pool_.device_data(metadata_slot)),
-                    layout.total_words);
+            slot = &state_->acquire();
+            slot_index = state_->slot_index(*slot);
+            if (layout.bytes <= sizeof(detail::InlineCopyMetadata)) {
+                detail::write_copy_metadata(
+                        inline_metadata, source, destination);
+                slot->attached_metadata_slot =
+                        EventRingState::kNoAttachedSlot;
+                detail::launch_grid_stride_copy<gpu_policy>(
+                        stream_,
+                        static_cast<const unsigned char*>(
+                                source.native_handle()),
+                        static_cast<unsigned char*>(
+                                destination.native_handle()),
+                        inline_metadata, layout.total_words);
+            } else {
+                metadata_slot = metadata_pool_.acquire();
+                metadata_acquired = true;
+                metadata_pool_.ensure_slot_capacity(
+                        metadata_slot, layout.bytes, stream_);
+                detail::write_copy_metadata(
+                        metadata_pool_.host_data(metadata_slot),
+                        source, destination);
+                slot->attached_metadata_slot = metadata_slot;
+                gpu_policy::copy_from_host(
+                        stream_, metadata_pool_.device_data(metadata_slot),
+                        metadata_pool_.host_data(metadata_slot), layout.bytes);
+                detail::launch_grid_stride_copy<gpu_policy>(
+                        stream_,
+                        static_cast<const unsigned char*>(
+                                source.native_handle()),
+                        static_cast<unsigned char*>(
+                                destination.native_handle()),
+                        static_cast<const detail::CopyMetadataHeader*>(
+                                metadata_pool_.device_data(metadata_slot)),
+                        layout.total_words);
+            }
             kernel_enqueued = true;
             gpu_policy::check_kernel(gpu_policy::copy_kernel_operation());
             gpu_policy::after_grid_stride_launch();
-            gpu_policy::record_event(event, stream_);
+            gpu_policy::record_event(slot->event, stream_);
             event_recorded = true;
-            resource = std::make_unique<HipFenceResource>();
-            resource->event = event;
-            resource->metadata_slot = metadata_slot;
-            resource->pool = &metadata_pool_;
-            resource->context = context_;
-            task.event = event;
-            task.fence = resource.release();
+            task.event = slot->event;
+            task.fence = slot;
         } catch (...) {
             const std::exception_ptr failure = std::current_exception();
+            if (slot == nullptr) {
+                throw;
+            }
             if (kernel_enqueued) {
                 if (!event_recorded) {
-                    gpu_policy::record_event_no_fault(event, stream_);
+                    gpu_policy::record_event_no_fault(slot->event, stream_);
                     event_recorded = true;
                 }
-                if (!resource) {
-                    try {
-                        resource = std::make_unique<HipFenceResource>();
-                    } catch (...) {
-                        gpu_policy::synchronize_event_noexcept(event);
-                        gpu_policy::destroy_event_noexcept(event);
-                        metadata_pool_.release(metadata_slot);
-                        throw;
-                    }
-                    resource->event = event;
-                    resource->metadata_slot = metadata_slot;
-                    resource->pool = &metadata_pool_;
-                    resource->context = context_;
-                }
-                resource->retained_failure = failure;
-                task.event = event;
-                task.fence = resource.release();
+                task.event = slot->event;
+                task.fence = slot;
                 retained_failure = failure;
             } else {
-                gpu_policy::destroy_event_noexcept(event);
-                metadata_pool_.release(metadata_slot);
+                if (metadata_acquired) {
+                    metadata_pool_.release(metadata_slot);
+                }
+                state_->release(*slot);
                 throw;
             }
         }
 
+        const std::exception_ptr outcome_failure = retained_failure;
         const detail::Fence fence = build_hip_fence(
-                static_cast<HipFenceResource*>(task.fence));
+                state_, slot_index, std::move(retained_failure));
         detail::EntryRegistration entries;
         try {
             entries = detail::register_copy_entries(
-                    *state_, registry_queue_id_, task.sequence,
+                    *registry_state_, registry_queue_id_, task.sequence,
                     const_cast<void*>(source.native_handle()),
                     destination.native_handle(), fence);
             task.source_entry_id = entries.source;
@@ -422,36 +316,40 @@ private:
                     task.sequence,
                     detail::SequenceOutcome{
                             entries.source, entries.destination,
-                            retained_failure});
+                            outcome_failure});
             if (!inserted) {
                 throw std::logic_error(
                         "duplicate ROCm outstanding-work sequence");
             }
         } catch (...) {
             if (entries.source != 0) {
-                state_->registry.remove_entry_if_present(
+                registry_state_->registry.remove_entry_if_present(
                         entries.source,
                         const_cast<void*>(source.native_handle()));
             }
             if (entries.destination != 0) {
-                state_->registry.remove_entry_if_present(
+                registry_state_->registry.remove_entry_if_present(
                         entries.destination,
                         destination.native_handle());
             }
             if (task.fence != nullptr) {
-                hip_fence_destroy(task.fence);
+                state_->on_worker_destroy(*task.fence);
                 task.fence = nullptr;
                 task.event = nullptr;
             } else {
-                metadata_pool_.release(metadata_slot);
+                if (metadata_acquired) {
+                    metadata_pool_.release(metadata_slot);
+                }
+                state_->release(*slot);
             }
             throw;
         }
 
-        if (retained_failure) {
-            commit_failure(task.sequence, retained_failure);
+        if (outcome_failure) {
+            commit_failure(task.sequence, outcome_failure);
         }
     }
+
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
         detail::SequenceOutcome outcome;
@@ -468,24 +366,26 @@ private:
         if (has_outcome) {
             const bool fence_succeeded = !failure && !outcome.retained_failure;
             (void)detail::release_or_invalidate_entries(
-                    state_->registry, outcome, static_cast<bool>(failure),
+                    registry_state_->registry, outcome, static_cast<bool>(failure),
                     fence_succeeded);
         }
         complete(sequence, std::move(failure));
     }
 
     const Device* device_;
-    detail::RegistryState* state_;
+    detail::RegistryState* registry_state_;
     detail::QueueId registry_queue_id_;
     int context_;
     hipStream_t stream_ = gpu_policy::null_stream();
     detail::MetadataSlotPool<gpu_policy> metadata_pool_;
+    std::shared_ptr<EventRingState> state_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
     std::map<std::uint64_t, detail::SequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
 }  // namespace
+
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
     g_submission_fault.store(fault, std::memory_order_release);

@@ -672,6 +672,42 @@ TEST_CASE("ROCm queue destruction fences pending copies") {
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm conformance: inline and pooled metadata rank boundaries") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+    TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto device = iom::make_rocm_device(0, allocator);
+    HipStorageOracle oracle;
+    const std::vector<std::vector<std::size_t>> shapes = {
+            {2, 2, 2, 2, 2, 2, 2, 2, 16, 16},
+            {2, 2, 2, 2, 2, 2, 2, 2, 2, 17, 33}};
+
+    for (const auto& dimensions : shapes) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{dimensions}, iom::DataType::F32};
+        auto source = device->create_tensor(spec);
+        auto destination = device->create_tensor(spec);
+        const std::vector<std::byte> expected =
+                iom_conformance::encode_standard_tiled_storage(spec);
+        const std::vector<std::byte> empty(
+                spec.tiled_storage_nbytes(), std::byte{0});
+        oracle.set_owner_spec(spec);
+        oracle.seed(source->view(), expected);
+        oracle.set_owner_spec(spec);
+        oracle.seed(destination->view(), empty);
+
+        auto queue = device->create_ops();
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        CHECK_NOTHROW(queue->wait(token));
+        oracle.set_owner_spec(spec);
+        CHECK_EQ(oracle.observe(destination->view()), expected);
+    }
+    CHECK_FALSE(gate.armed());
+}
+
 int main(int argc, char** argv) {
     if (std::getenv("IOM_ROCM_WATCHDOG_CHILD") != nullptr) {
         run_watchdog_child(argc, argv);

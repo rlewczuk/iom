@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
+#include <exception>
 #include <cstddef>
 #include <memory>
 #include <span>
@@ -10,6 +11,7 @@
 #include <string>
 
 #include "driver.hpp"
+#include "../shared/event_ring.hpp"
 #include "../shared/metadata_slot_pool.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "../shared/staging_pool.hpp"
@@ -78,11 +80,14 @@ struct gpu_policy {
                 || cudaStreamSynchronize(stream) == cudaSuccess;
     }
 
-    static void create_event(event_type* event) {
+    static void check_acquire_event_fault() {
         if (consume_submission_fault(SubmissionFault::event_create)) {
             check_cuda_kernel(
                     "cudaEventCreateWithFlags", cudaErrorInvalidValue);
         }
+    }
+
+    static void create_event(event_type* event) {
         check_cuda_kernel(
                 "cudaEventCreateWithFlags",
                 cudaEventCreateWithFlags(event, cudaEventDisableTiming));
@@ -216,9 +221,18 @@ struct gpu_policy {
         return "CUDA copy kernel launch";
     }
 };
+using EventRingState = iom::detail::EventRingState<gpu_policy>;
+struct EventLeaseWithFailure {
+    std::shared_ptr<EventRingState> state;
+    std::size_t slot_index = 0;
+    std::exception_ptr retained_failure;
+};
+static_assert(sizeof(EventLeaseWithFailure) <= iom::detail::kFenceStorageBytes);
+static_assert(alignof(EventLeaseWithFailure) <= iom::detail::kFenceStorageAlign);
 
 using StagingSlotPool = iom::detail::StagingSlotPool<gpu_policy>;
 using TransferStreamPool = iom::detail::TransferStreamPool<gpu_policy>;
+
 
 void region_from_host(
         TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
