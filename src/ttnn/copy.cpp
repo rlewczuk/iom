@@ -11,6 +11,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -137,22 +141,21 @@ namespace iom::ttnn_detail {
             }
         }
 
-        // Downloads one plane's logical row-major bytes from the plane's
-        // TTNN-native tiled tensor. Native padding never reaches the output.
-        void download_plane(
-                tt::tt_metal::distributed::MeshDevice& device,
-                const ttnn::Tensor& plane, std::byte* destination,
+        // Enqueues one plane's padded tile-major bytes into a caller-owned
+        // staging window without waiting for the device read to complete.
+        void submit_download_plane(
+                tt::tt_metal::distributed::MeshCommandQueue& queue,
+                const ttnn::Tensor& plane, std::byte* staging) {
+            ttnn::copy_to_host(
+                    queue, plane, staging, std::nullopt, /*blocking=*/false);
+        }
+
+        // Assembles one completed padded tile-major staging window into the
+        // logical row-major destination. Native padding never reaches it.
+        void assemble_download_plane(
+                const std::byte* staging, std::byte* destination,
                 std::size_t rows, std::size_t columns,
-                std::size_t element_size) {
-            ttnn::Tensor host_tiled =
-                    ttnn::allocate_tensor_on_host(plane.tensor_spec(), &device);
-            ttnn::copy_to_host(plane, host_tiled, /*blocking=*/true);
-            const tt::tt_metal::HostBuffer buffer =
-                    tt::tt_metal::host_buffer::get_host_buffer(
-                            host_tiled.host_tensor());
-            const auto bytes = buffer.view_bytes();
-            const std::size_t num_tile_cols = static_cast<std::size_t>(
-                    host_tiled.padded_shape()[-1]) / 32;
+                std::size_t element_size, std::size_t num_tile_cols) {
             for (std::size_t row = 0; row < rows; ++row) {
                 std::size_t col = 0;
                 while (col < columns) {
@@ -167,8 +170,7 @@ namespace iom::ttnn_detail {
                             + (row % 16) * 16 + (col % 16);
                     std::memcpy(
                             destination + (row * columns + col) * element_size,
-                            bytes.data()
-                                    + first_element_index * element_size,
+                            staging + first_element_index * element_size,
                             seg_columns * element_size);
                     col += seg_columns;
                 }
@@ -216,12 +218,66 @@ namespace iom::ttnn_detail {
                 element_bytes(source.spec().data_type);
         const std::size_t plane_bytes = rows * columns * element_size;
         const std::size_t count = view_plane_count(source);
-        for (std::size_t index = 0; index < count; ++index) {
-            download_plane(
-                    device, planes[owner_plane_at(source, index)],
-                    reinterpret_cast<std::byte*>(destination.data())
-                            + index * plane_bytes,
-                    rows, columns, element_size);
+        const ttnn::Tensor& first_plane =
+                planes[owner_plane_at(source, 0)];
+        const std::size_t padded_rows = static_cast<std::size_t>(
+                first_plane.padded_shape()[-2]);
+        const std::size_t padded_columns = static_cast<std::size_t>(
+                first_plane.padded_shape()[-1]);
+        if (padded_rows != 0
+                && padded_columns
+                        > std::numeric_limits<std::size_t>::max()
+                                / padded_rows) {
+            throw std::overflow_error(
+                    "TTNN padded plane element count overflows");
+        }
+        const std::size_t padded_elements = padded_rows * padded_columns;
+        if (padded_elements != 0
+                && element_size
+                        > std::numeric_limits<std::size_t>::max()
+                                / padded_elements) {
+            throw std::overflow_error("TTNN padded plane byte count overflows");
+        }
+        const std::size_t padded_plane_bytes =
+                padded_elements * element_size;
+        if (padded_plane_bytes != 0
+                && count
+                        > std::numeric_limits<std::size_t>::max()
+                                / padded_plane_bytes) {
+            throw std::overflow_error(
+                    "TTNN download staging byte count overflows");
+        }
+        const std::size_t total_bytes = count * padded_plane_bytes;
+        std::unique_ptr<std::byte[]> staging =
+                std::make_unique_for_overwrite<std::byte[]>(total_bytes);
+        auto& queue = device.mesh_command_queue(0);
+        std::exception_ptr original_failure;
+        try {
+            for (std::size_t index = 0; index < count; ++index) {
+                submit_download_plane(
+                        queue, planes[owner_plane_at(source, index)],
+                        staging.get() + index * padded_plane_bytes);
+            }
+            queue.finish();
+
+            const std::size_t num_tile_cols = padded_columns / 32;
+            for (std::size_t index = 0; index < count; ++index) {
+                assemble_download_plane(
+                        staging.get() + index * padded_plane_bytes,
+                        destination.data() + index * plane_bytes, rows,
+                        columns, element_size, num_tile_cols);
+            }
+        } catch (...) {
+            if (!original_failure) {
+                original_failure = std::current_exception();
+            }
+            try {
+                queue.finish();
+            } catch (...) {
+                std::byte* leaked = staging.release();
+                (void)leaked;
+            }
+            std::rethrow_exception(original_failure);
         }
     }
 
