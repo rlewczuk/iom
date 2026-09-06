@@ -1,105 +1,103 @@
 ---
 name: cpp-inference-gpu-stability
-description: Review C++ inference-engine code for ownership/lifetime, asynchronous GPU execution, synchronization, memory visibility, concurrency, error propagation, cleanup, integer-size safety, and multi-device stability across GPU backends. Use independently or as Area 2 of cpp-inference-code-review.
-argument-hint: "[scope] [backend(s) optional]"
+description: Independently review C++ inference-engine ownership, asynchronous GPU lifetime, synchronization, visibility, concurrency, cleanup, errors, integer safety, and multi-device state, then emit direct remediation subtasks. Also serves as Area 2 of cpp-inference-code-review.
+argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [backend focus optional]"
 ---
 
 # C++ / GPU Stability Review
 
-Treat asynchronous accelerator execution as a first-class correctness model. C++ lexical scope does **not** prove device work has completed.
+Treat asynchronous accelerator execution as a first-class correctness model. C++ lexical scope does not prove device work completed.
 
-Read `.agents/cpp-review/references/cpp-gpu-stability.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/checklists/common.md`, and the checklist for every affected backend.
+Read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/cpp-gpu-stability.md`, `.agents/cpp-review/checklists/common.md`, and every affected backend checklist.
+
+## Invocation modes
+
+- **Orchestrated:** use the supplied resolved scope and return only `ST-###` candidate packets. Do not write tasks before cross-area synthesis.
+- **Standalone:** resolve scope and optional task destination, perform this stability pass, then invoke `cpp-inference-review-synthesis` to adversarially verify and directly materialize tasks.
+
+In selected-commit mode, accept only root causes introduced or materially exposed/worsened by the target.
 
 ## Review order
 
 ### 1. Resource ownership
 
-For every changed or central resource, establish:
+For each changed or central buffer, allocation, stream/queue, event/fence, module/kernel, graph, descriptor, command object, mapped region, cache entry, or context/device handle, establish:
 
-- resource type: buffer/allocation, stream/queue, event/fence, module/kernel, graph, descriptor, command object, mapped memory, cache entry, context/device handle;
-- owner vs borrower;
-- move/copy behavior;
+- owner versus borrower;
+- copy/move behavior;
+- acquisition and release protocol;
 - partial-construction cleanup;
 - destruction thread/context/device assumptions;
-- whether RAII correctly matches the backend acquire/release protocol.
+- whether destruction synchronizes or can fail.
 
-Raw handles are acceptable only when ownership and lifetime are still explicit.
+RAII must match host ownership, but it does not by itself prove safe release after asynchronous device use.
 
 ### 2. Asynchronous lifetime
 
-For each async enqueue/copy/kernel/graph operation ask:
+For every enqueue, copy, kernel, graph, or callback:
 
-- Which host/device resources remain referenced after the API call returns?
-- What event/fence/queue completion establishes safe reuse or destruction?
+- Which host/device resources remain referenced after the API returns?
+- Which completion establishes safe reuse/destruction?
 - Can allocator reuse race with in-flight work?
-- Can pageable/pinned host memory disappear before an async transfer completes?
+- Can host staging memory disappear early?
 - Can callbacks capture destroyed state?
-- Does a temporary command/descriptor object outlive submission requirements?
+- Do command/descriptor objects meet backend submission-lifetime rules?
 
-### 3. Ordering and synchronization
+### 3. Ordering, synchronization, and visibility
 
-Trace producer → dependency → consumer. Hunt for:
+Trace producer → dependency → consumer. Check:
 
-- missing event/fence/dependency;
-- event recorded/waited on the wrong queue;
-- default/global stream assumptions;
-- whole-device synchronization where a narrower dependency suffices;
-- synchronization inserted in destructors or hot-path accessors;
-- missing memory visibility/barrier semantics;
-- graph-capture incompatibilities;
-- cross-device events/handles used with invalid semantics.
+- missing, misplaced, or wrong-device event/fence dependencies;
+- implicit default/global stream assumptions;
+- whole-device synchronization where queue/event ordering suffices;
+- synchronization hidden in destructors or hot accessors;
+- incomplete visibility/barrier semantics;
+- graph capture incompatibility;
+- invalid cross-device handle/event use.
 
-Treat **missing synchronization** as correctness risk and **excess synchronization** as potential performance risk. Cross-reference performance review rather than duplicating symptoms.
+Missing ordering is correctness risk. Excess ordering is a performance consequence of the same root when one mechanism causes both; do not duplicate it.
 
-### 4. Concurrency and state
+### 4. Concurrency and multi-device state
 
-Inspect writable shared state such as:
+Inspect allocator pools, module/graph/capability caches, initialization flags, registries, queue pools, scratch arenas, and mutable globals. Verify:
 
-- allocator pools;
-- kernel/module caches;
-- compiled graph caches;
-- per-device capability caches;
-- initialization flags;
-- mutable singleton/backend registries;
-- queue pools and scratch arenas.
+- keys include every required backend/device/context/architecture fact;
+- supported concurrent calls cannot race;
+- current-device/context state is explicit and restored;
+- peer access is capability checked with correct fallback;
+- synchronization does not serialize unrelated devices.
 
-Check whether state is correctly keyed by device/context/backend and whether supported concurrent calls can race.
+### 5. Error propagation and cleanup
 
-### 5. Error propagation
+Verify:
 
-Accelerator enqueue APIs may return before device execution fails. Verify:
-
-- launch/enqueue errors are observed;
-- deferred execution errors are eventually surfaced;
-- synchronization/reporting does not attribute an old error to an unrelated later operation;
-- exceptions/status values cannot bypass required cleanup;
-- error paths do not continue with partially valid device state.
+- immediate enqueue errors are observed;
+- deferred execution errors remain observable and correctly attributed;
+- completed failures remain repeatable when the contract requires it;
+- exceptions/status paths cannot bypass cleanup;
+- partial state is not used after failure;
+- cleanup failure does not mask the primary failure improperly.
 
 ### 6. Size and arithmetic safety
 
-Check shape/stride/byte computations for:
+Check multiplication/addition/round-up before casts and narrowing for dimensions, strides, bytes, launch geometry, kernel indices, and backend parameter widths.
 
-- signed/unsigned conversion;
-- multiplication/addition overflow;
-- truncation to 32-bit kernel/index parameters;
-- alignment round-up overflow;
-- negative dimensions converted to huge sizes;
-- host/device type-width mismatches.
+## Mandatory simplicity pass
 
-### 7. Multi-device state
+Stability code becomes unsafe when ownership and state are represented repeatedly. Look for:
 
-When multiple devices are supported, verify:
+- multiple lifetime trackers for the same in-flight work;
+- duplicated event/quarantine/release protocols across backends when semantics match;
+- flags whose combinations represent invalid resource states;
+- wrapper owners that do not add a release invariant;
+- caches or registries duplicating backend/runtime state;
+- cleanup paths copied with inconsistent failure behavior;
+- synchronization added to compensate for unclear ownership instead of fixing ownership.
 
-- explicit current-device/context assumptions;
-- handles/events/allocations belong to the correct device;
-- caches are device-qualified;
-- peer-to-peer support is capability checked;
-- fallback for unavailable peer access is correct;
-- per-thread device selection is not leaked unexpectedly;
-- synchronization does not accidentally serialize all devices.
+Prefer one explicit owner and one completion mechanism. Preserve backend-specific lifetime primitives where semantics differ.
 
-## Evidence
+## Candidate acceptance
 
-Prefer concrete call-path reasoning plus backend documentation/tool evidence. Static analysis or sanitizers are corroboration, not substitutes for understanding the lifetime/order model.
+Use IDs `ST-###` and the full common packet. State the exact asynchronous timeline, owner/reuse point, device/context, error path, current symbols/tests, remediation, and falsifier.
 
-Use IDs `ST-###`. If the same root cause also creates a performance problem, keep one stability finding and cross-reference the performance impact in synthesis.
+When standalone, always finish through `cpp-inference-review-synthesis`. If no candidate survives, return `No material findings; no remediation tasks generated.` with coverage and verification limits.

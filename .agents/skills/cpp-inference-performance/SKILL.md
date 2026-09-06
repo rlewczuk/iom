@@ -1,87 +1,83 @@
 ---
 name: cpp-inference-performance
-description: Review performance of C++ multi-GPU inference engines with evidence-first analysis of synchronization, transfers, fallback, allocations, scheduling, overlap, memory footprint, graph capture/compilation, launch count, and material kernel bottlenecks. Use independently or as Area 5 of cpp-inference-code-review.
-argument-hint: "[scope] [workload/backend optional]"
+description: Independently review C++ multi-backend inference performance using evidence-first analysis of synchronization, transfers, fallback, allocations, scheduling, overlap, memory, capture/compilation, launch count, redundant work, and material kernels, then emit direct remediation subtasks. Also serves as Area 5 of cpp-inference-code-review.
+argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [workload/backend focus optional]"
 ---
 
 # Performance Review
 
-Performance is a correctness-like requirement for inference engines, but claims must be disciplined.
+Performance is a correctness-like requirement for inference engines, but claims require workload relevance and evidence.
 
-Read `.agents/cpp-review/references/performance.md`, `.agents/cpp-review/references/finding-rubric.md`, and relevant backend checklists.
+Read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/performance.md`, and applicable backend checklists.
+
+## Invocation modes
+
+- **Orchestrated:** use the supplied resolved scope and return only `PF-###` candidate packets. Do not write task files before cross-area synthesis.
+- **Standalone:** resolve scope and optional destination, perform this performance pass, then invoke `cpp-inference-review-synthesis` for adversarial verification and direct task output.
+
+In selected-commit mode, accept only regressions introduced or materially exposed/worsened by the target.
 
 ## Evidence classes
 
-Classify every performance candidate as one of:
+Classify every candidate:
 
-1. **Measured regression** — benchmark/profile data demonstrates material degradation.
-2. **Mechanically clear critical-path regression** — e.g. a newly unconditional device-wide synchronization or host round-trip in a per-token path. Benchmarking should quantify it, but the mechanism is certain enough to report.
-3. **Performance hypothesis** — plausible mechanism without sufficient evidence. Never state it as an established regression; include an exact verification experiment.
+1. **Measured regression** — controlled benchmark/profile data shows material degradation.
+2. **Mechanically clear critical-path regression** — code proves an unconditional relevant synchronization, transfer, fallback, allocation, recompilation, or work increase.
+3. **Hypothesis** — plausible mechanism without enough evidence; the task must be the exact measurement/falsification experiment and must not state the suspected effect as fact.
 
-Do not report subjective claims such as “virtual calls are slow” or “this loop may be expensive” without workload relevance and evidence.
+Reject claims such as “virtual calls are slow” or “this loop may be expensive” without material workload evidence.
 
-## Review order: system first, kernel second
+## Review system behavior before kernels
 
-### System/timeline pass
+### Timeline/system pass
 
-Before micro-optimizing kernels, inspect whether the change causes:
+Inspect:
 
-- new host/device/device-device copies;
-- CPU fallback or larger fallback regions;
+- host/device and device/device copies;
+- CPU or alternate-backend fallback boundaries;
 - layout/conversion kernels;
-- device-wide/stream synchronization;
-- reduced overlap between independent work;
-- allocator churn or synchronization-inducing allocation APIs;
-- kernel/module/pipeline recompilation;
-- graph-capture invalidation/loss;
-- many tiny launches replacing fused/coarser work;
-- serialized queues/streams/devices;
-- communication/collective overhead;
-- load imbalance;
-- larger persistent/scratch memory footprint;
-- cache invalidation/rebuild on hot paths.
+- device-wide, stream, queue, and host synchronization;
+- lost overlap or unintended serialization;
+- allocator churn and synchronization-inducing allocation APIs;
+- module/kernel/pipeline recompilation;
+- graph capture invalidation;
+- launch fragmentation and lost fusion;
+- collective/communication overhead and load imbalance;
+- persistent/scratch/peak memory growth;
+- cache invalidation/rebuild and capability queries on hot paths.
 
-For autoregressive inference, explicitly consider prompt processing and token generation separately; a one-time setup cost and a per-token cost have very different impact.
+Separate model load/compile, prompt/prefill, token/decode, batch throughput, and multi-device scaling. One-time setup cost is not per-token cost.
 
 ### Kernel pass
 
-Only after establishing a material kernel matters, inspect:
-
-- memory bandwidth and coalescing;
-- arithmetic intensity/roofline position;
-- occupancy only insofar as it limits throughput;
-- register pressure/spills;
-- shared/local memory;
-- warp/wave divergence;
-- launch/workgroup geometry;
-- cache behavior;
-- redundant computation;
-- precision/conversion overhead.
-
-Avoid optimizing metrics in isolation.
+Only after proving a kernel is material, inspect bandwidth/coalescing, arithmetic intensity, register spills, shared/local memory, divergence, geometry, cache behavior, redundant computation, and precision conversions. Do not optimize isolated counters.
 
 ## Benchmark discipline
 
-Prefer:
+Use representative shapes/workloads, warmups, repeated samples, variance, controlled hardware/software/power state, recorded backend/device identity, comparable profiler instrumentation, and explicit latency/throughput/memory thresholds.
 
-- representative model/operator shapes;
-- warmups;
-- repeated samples;
-- variance/statistical context;
-- same hardware/software/power settings;
-- backend identity recorded;
-- machine-readable baseline/current results;
-- separate latency/throughput/memory dimensions;
-- configured regression thresholds rather than eyeballing noise.
+A semantically correct fallback can be a severe performance defect when it adds critical-path transfers, device changes, conversions, or prevents fusion/partitioning.
 
-Do not compare results collected under materially different profiler instrumentation as if they were normal execution. Some kernel profilers serialize or perturb execution.
+## Mandatory simplicity pass
 
-## Fallback rule
+Prefer removing work over managing it:
 
-A semantically correct fallback can still be a severe performance finding when it introduces critical-path host transfers, device changes, conversion boundaries, or prevents graph fusion/partitioning.
+- delete redundant transfers, conversions, synchronization, validation, or recomputation;
+- hoist invariant work out of hot paths;
+- reuse existing allocation/capture/cache mechanisms before creating another cache;
+- challenge caches whose invalidation/state cost exceeds recomputation;
+- reject schedulers, batching frameworks, tuning layers, or configuration knobs without present measured need;
+- consolidate duplicated backend launch/setup code only when semantics and generated work remain equivalent;
+- remove instrumentation or bookkeeping that executes unconditionally without a current consumer.
 
-## Cross-area deduplication
+Do not introduce a framework to solve a local hotspot. The smallest remediation should remove the proven mechanism.
 
-If a synchronization/lifetime defect already belongs to stability, avoid duplicating it. Attach performance consequence as secondary evidence and let synthesis choose one root-cause finding.
+## Cross-area ownership
 
-Use IDs `PF-###`.
+If a lifetime/order defect belongs to stability, keep one stability root cause and attach performance as secondary impact. If duplicated dispatch or conversion policy is the cause, let architecture own it. Do not produce parallel tasks for the same remediation.
+
+## Candidate acceptance
+
+Use IDs `PF-###` and the full packet. Include workload/critical path, baseline and target evidence when measured, exact mechanism, expected metric, current symbols, remediation, and falsifier.
+
+When standalone, always finish through `cpp-inference-review-synthesis`. If no candidate survives, return `No material findings; no remediation tasks generated.` with coverage and verification limits.

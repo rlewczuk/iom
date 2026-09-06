@@ -1,60 +1,60 @@
 ---
 name: cpp-inference-code-review
-description: Orchestrate rigorous code-quality reviews of C++ inference engines with multiple GPU backends. Use for whole-codebase reviews or exact single-commit reviews selected by hash/message, especially when simplicity, stability, numerical parity, backend architecture, and performance matter. When a docs/changes/<change>[/<subchange>] specification is supplied, write the final review to that directory's review.md.
-argument-hint: "[whole codebase | commit <hash|message>] [spec docs/changes/... optional]"
+description: Orchestrate rigorous C++ inference-engine reviews across correctness, GPU stability, backend simplicity, numerical integrity, and performance, then emit implementation-ready remediation subtasks directly. Use for whole-codebase or exact selected-commit reviews, optionally linked to docs/changes/<change>[/<subchange>].
+argument-hint: "[whole codebase | commit <hash|message>] [spec docs/changes/... optional] [focus optional]"
 ---
 
 # C++ Inference Engine Code Review — Orchestrator
 
-Perform a high-signal review of a C++ inference engine that may use CUDA, HIP/ROCm, Vulkan, SYCL/oneAPI, Metal, OpenCL, CPU, or other execution backends. Optimize for **semantic correctness, stability, structural simplicity, cross-backend integrity, and measured performance**.
+Review a C++ inference engine with CPU and accelerator backends. Optimize for **semantic correctness, stability, low conceptual complexity, cross-backend integrity, and measured performance**.
 
-This is an orchestrator. Delegate or conceptually separate work using the six sibling skills listed below. If subagents/skill delegation are unavailable, perform the same passes sequentially and keep their candidate findings separate until synthesis.
+The deliverable is a set of accepted, implementation-ready remediation subtasks. Do not create an intermediate `review.md` or run a second conversion pass.
 
-## Sibling specialist skills
+## Review areas
 
 1. `cpp-inference-contract-correctness`
 2. `cpp-inference-gpu-stability`
 3. `cpp-inference-backend-simplicity`
 4. `cpp-inference-numerical-testing`
 5. `cpp-inference-performance`
-6. `cpp-inference-review-synthesis`
+6. `cpp-inference-review-synthesis` — mandatory final adversarial check, deduplication, prioritization, and task materialization
 
-Shared guidance is under `.agents/cpp-review/references/`, backend checklists under `.agents/cpp-review/checklists/`, helper scripts under `.agents/cpp-review/scripts/`, and the report template under `.agents/cpp-review/templates/` relative to this file.
+Shared guidance is under `.agents/cpp-review/references/`, backend checklists under `.agents/cpp-review/checklists/`, helper scripts under `.agents/cpp-review/scripts/`, and the remediation template is `.agents/cpp-review/templates/remediation-task.md`.
 
-## Non-negotiable review principles
+## Non-negotiable principles
 
-1. Review **invariants**, not aesthetics.
-2. Correctness/stability constraints dominate simplification.
-3. Do not recommend a simplification of performance-critical code unless semantic and performance invariants are preserved or the change is explicitly proposed for measurement.
-4. Treat CPU/GPU asynchronous lifetime separately from C++ lexical lifetime.
-5. Treat backend capability declaration, implementation constraints, fallback, tests, and performance as one coupled contract.
-6. A correct fallback may still be a material performance regression.
-7. Do not claim a performance regression without either measured evidence or a mechanically clear critical-path mechanism. Otherwise classify it as a hypothesis and prescribe verification.
-8. Deduplicate by **root cause**, not symptom.
-9. Ignore unrelated pre-existing issues during selected-commit reviews unless the commit materially exposes/worsens them.
-10. Zero material findings is a successful review outcome.
-11. Do not modify implementation files during a review. If a specification path is supplied, only `review.md` should be written unless the user explicitly requests fixes.
+1. Review invariants, not aesthetics.
+2. Correctness and stability dominate simplification.
+3. Every area performs a deletion/simplification pass: identify duplicated sources of truth, redundant state, repeated policy, unnecessary wrappers, and one-off abstractions.
+4. Prefer deleting a concept, branch, representation, or responsibility over adding a framework around it.
+5. Do not recommend unification when backend differences materially affect correctness, synchronization, memory placement, compilation, or performance.
+6. Do not recommend hot-path simplification unless semantic and performance invariants are preserved or the task explicitly requires measurement before adoption.
+7. Treat CPU/GPU asynchronous lifetime separately from C++ lexical lifetime.
+8. Treat capability declaration, implementation constraints, dispatch/fallback, tests, and performance as one coupled contract.
+9. A correct fallback may still be a material performance defect.
+10. Performance claims require measurement or a mechanically clear critical-path mechanism. Otherwise retain them as hypotheses with a decisive experiment.
+11. Deduplicate by root cause, not symptom or review area.
+12. Ignore unrelated pre-existing issues during selected-commit reviews unless the commit materially exposes or worsens them.
+13. Zero accepted tasks is a successful review result.
+14. Do not modify implementation files or existing specifications during a review. Only create new remediation task specifications when a destination specification directory is supplied.
 
-## Step 1 — Resolve review scope exactly
+## Step 1 — Resolve exactly one review scope
 
-Determine one and only one scope from the user's prompt.
+Read `.agents/cpp-review/references/review-process.md` and `.agents/cpp-review/references/finding-rubric.md` first.
 
-### A. Whole-codebase mode
+### Whole-codebase mode
 
-Use when the user explicitly requests the whole repository/current codebase/system/architecture, or provides no commit selector but clearly asks for a repository-wide review.
+Use when the user requests the current repository/system/architecture or gives no commit selector but clearly requests a repository-wide review.
 
-In this mode:
+- Review the checked-out working tree as a system.
+- Risk-rank central abstractions and backend boundaries before sampling local code.
+- Cover architecture, ownership, queues, allocation, model/operator paths, capability/fallback logic, tests, build configurations, and performance infrastructure as applicable.
+- Record the HEAD hash and whether reviewed files had working-tree changes so generated tasks identify the reviewed state.
+- State sampled versus exhaustive coverage. Never imply every file was inspected when it was not.
 
-- Review the current checked-out repository state as a system.
-- Include architecture, backend layering, common abstractions, critical lifetime/synchronization paths, tests, build configuration, and performance infrastructure.
-- Do not pretend every file was deeply inspected if the repository is too large. Use risk-based sampling and state coverage limits in the report.
-- Prioritize central abstractions and backend boundaries over local style.
+### Selected-commit mode
 
-### B. Selected-commit mode
-
-Use when the user supplies a commit hash or commit message.
-
-Resolve without changing checkout state. Prefer:
+Use when the user supplies a commit hash or commit message. Resolve without changing checkout state:
 
 ```bash
 python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
@@ -66,190 +66,128 @@ or:
 python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
 ```
 
-Resolution rules:
+Rules:
 
-1. A hash must resolve to exactly one commit.
-2. For a message, first match the complete commit message exactly; then exact subject if needed.
-3. Never silently choose among multiple matches.
-4. Never silently fall back to a fuzzy/substring match.
-5. If the selector is ambiguous or missing, report that review scope cannot be established rather than reviewing an arbitrary commit.
-6. For a root commit, use the empty tree as the baseline.
-7. Review the exact commit diff plus necessary surrounding code, interfaces, tests, call sites, history/blame, and backend counterparts.
-8. Findings must be introduced by the target commit or materially exposed/worsened by it.
+1. Resolve a hash to exactly one commit.
+2. For a message, match the complete message exactly, then exact subject if needed.
+3. Never select among multiple matches or fall back to fuzzy matching.
+4. For a root commit, use the empty tree as baseline.
+5. Inspect the exact diff plus necessary surrounding code, interfaces, callers, tests, history, and backend counterparts.
+6. Accept only root causes introduced or materially exposed/worsened by the target commit.
 
-Capture and report:
+Capture the target hash/subject, baseline, changed and renamed/copied files, affected build/backends, and supplied specification path. `collect_review_context.py` is a convenience; inspect source and diff directly.
 
-- commit hash and subject;
-- parent/baseline hash;
-- changed files;
-- rename/copy status when present;
-- build/backend areas touched;
-- specification path, if any.
+## Step 2 — Resolve optional specification and task destination
 
-Use `collect_review_context.py` as a convenience, but inspect the actual source and diff directly.
+For a supplied `docs/changes/<change>[/<subchange>]` directory, run:
 
-## Step 2 — Resolve specification context
-
-If the user identifies a specification directory of the form:
-
-```text
-docs/changes/<change-name>[/<subchange>]
+```bash
+python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<path>'
 ```
 
-then:
+Then:
 
-1. Normalize it to a repository-relative directory. Prefer `python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<path>'`.
-2. Verify that it exists and remains beneath `docs/changes/`.
-3. Read all relevant specification/design/task files recursively, excluding an existing `review.md` as review evidence unless the user explicitly asks to revisit it.
-4. Distinguish **required external behavior** from incidental implementation details.
-5. Build a compact requirement-to-code map before judging correctness.
-6. Set the final report target to exactly:
+1. Verify the path remains beneath `docs/changes/`.
+2. Read relevant specification, design, and existing task files recursively.
+3. Exclude prior review prose as evidence unless the user explicitly requests re-verification of it.
+4. Separate required observable behavior from suggested implementation details.
+5. Build a compact requirement-to-code/test map.
+6. Use the returned `next_task_order` and `order_width` only as initial numbering input; the finalizer rechecks collisions before writing.
+
+Accepted findings become new direct children:
 
 ```text
-<spec-dir>/review.md
+<spec-dir>/<NN>-<FINDING-ID>-<remediation-slug>/spec.md
 ```
 
-If no specification directory is supplied, do not invent one and do not write into `docs/changes/`.
+Do not create or update `<spec-dir>/review.md`, an index, manifest, or TODO file.
 
-## Step 3 — Establish review invariants
+If no specification directory is supplied, do not invent one or write under `docs/changes/`. Return the same self-contained remediation subtasks in chat unless the user names another output destination.
 
-Before producing findings, identify which invariants are affected:
+## Step 3 — Establish affected invariants
+
+Before delegating, identify affected:
 
 - semantic/operator behavior;
-- tensor shape/dtype/stride/layout/alignment/aliasing;
+- tensor shape, dtype, stride, layout, alignment, and aliasing;
 - numerical accuracy and precision;
-- ownership and lifetime;
-- ordering/synchronization;
-- memory visibility;
-- backend capability and fallback;
-- concurrency/thread safety;
+- ownership and asynchronous lifetime;
+- ordering, synchronization, and visibility;
+- capability, dispatch, and fallback;
+- concurrency and multi-device state;
 - error propagation and cleanup;
-- critical-path latency/throughput/memory;
-- cross-backend/build compatibility.
+- latency, throughput, memory, transfers, allocation, and overlap;
+- cross-backend/build compatibility;
+- concept count, sources of truth, duplicated policy, and invalid state combinations.
 
-Use `.agents/cpp-review/references/review-process.md` and `.agents/cpp-review/references/finding-rubric.md`.
+## Step 4 — Run five separated specialist passes
 
-## Step 4 — Run six separated review areas
+When delegation is available, give all five specialists the same resolved scope, specification map, affected backend list, and candidate packet contract. Run independent passes concurrently. Each specialist owns only its area and returns candidate packets; it must not write task files in orchestrated mode. If delegation is unavailable, run the same passes sequentially and keep candidates partitioned until synthesis.
 
-Keep candidate findings partitioned by area until synthesis.
+Each candidate must satisfy `.agents/cpp-review/references/finding-rubric.md`, including a complete remediation seed. This is what eliminates the second repository-wide conversion pass.
 
 ### Area 1 — Contract & correctness
 
-Invoke/follow `cpp-inference-contract-correctness`.
-
-Focus on implemented requirements, public/internal contracts, graph/operator semantics, capability/fallback accuracy, compatibility, and missing cases.
+Use `cpp-inference-contract-correctness` for requirements, public/internal contracts, operator/tensor semantics, capability/fallback accuracy, error behavior, compatibility, and duplicated contract enforcement.
 
 ### Area 2 — C++/GPU stability
 
-Invoke/follow `cpp-inference-gpu-stability`.
-
-Focus on ownership, resource lifetime, async execution, stream/queue/event ordering, device/context state, race conditions, cleanup, deferred errors, and size/overflow hazards.
+Use `cpp-inference-gpu-stability` for ownership, async lifetime, ordering, visibility, concurrency, context/device state, cleanup, deferred errors, integer safety, and redundant lifetime/state mechanisms.
 
 ### Area 3 — Backend architecture & simplicity
 
-Invoke/follow `cpp-inference-backend-simplicity`.
-
-Focus on correct abstraction altitude, backend leakage into common code, duplicated dispatch/capabilities/state, needless wrappers, special cases, and opportunities to reduce concepts without weakening semantics or performance.
+Use `cpp-inference-backend-simplicity` for backend leakage, abstraction altitude, duplicated dispatch/capabilities/state, redundant code, needless wrappers, special cases, over-generalized frameworks, and safe concept deletion.
 
 ### Area 4 — Numerical correctness & tests
 
-Invoke/follow `cpp-inference-numerical-testing`.
-
-Focus on reference parity, dtype/operator-specific tolerance, mixed precision, reductions, quantization, edge shapes/layouts, cross-backend differential tests, and regression-test adequacy.
+Use `cpp-inference-numerical-testing` for reference parity, tolerance, mixed precision, quantization, reductions, edge shapes/layouts, differential tests, and duplicated or low-value test infrastructure.
 
 ### Area 5 — Performance
 
-Invoke/follow `cpp-inference-performance`.
+Use `cpp-inference-performance` for synchronization, transfers, fallback, allocation, scheduling, overlap, memory footprint, capture/compilation, launch count, and material kernels. Prefer removing work over adding caches or schedulers.
 
-First inspect system-level effects: synchronization, copies, fallback, allocations, scheduling, overlap, compilation/capture, kernel launch count, and memory footprint. Only then inspect kernel-level behavior where material.
+## Step 5 — Verify candidate hypotheses
 
-### Area 6 — Synthesis & adversarial verification
+Use `.agents/cpp-review/references/tooling.md` and applicable backend checklists. Tools verify hypotheses; raw diagnostics are not findings.
 
-Invoke/follow `cpp-inference-review-synthesis` only after Areas 1–5 produce candidate findings.
+Possible evidence:
 
-For each candidate, try to disprove it before publishing it.
+- focused compiler/build/test runs;
+- ASan/UBSan/TSan or backend validation/sanitizer tools;
+- differential operator tests;
+- profiler/benchmark comparisons;
+- deterministic call-path, lifetime, or size reasoning.
 
-## Step 5 — Verification and tooling
+Do not fabricate unavailable tool results. Record exact validation and missing verification in each affected candidate.
 
-Use mechanical tools to **verify hypotheses**, not to flood the review with diagnostics.
+## Step 6 — Mandatory synthesis and direct task materialization
 
-Read `.agents/cpp-review/references/tooling.md` and the relevant backend checklist(s).
+Invoke/follow `cpp-inference-review-synthesis` once with:
 
-Examples include:
+- resolved review scope and reviewed-state identity;
+- specification/destination context, if any;
+- coverage and validation performed;
+- all candidate packets from Areas 1–5.
 
-- compiler/build/tests;
-- clang-tidy / static analysis;
-- ASan/UBSan/TSan where applicable;
-- CUDA Compute Sanitizer;
-- Vulkan validation/synchronization validation;
-- ROCm tracing/profiling;
-- cross-backend differential operator tests;
-- benchmark/profile comparisons.
+The finalizer must:
 
-If a tool cannot be run, do not fabricate results. State the missing verification explicitly.
+1. try to disprove every candidate;
+2. reject weak, out-of-scope, duplicate, or purely aesthetic claims;
+3. merge symptoms with one root cause;
+4. verify that simplification tasks delete objective complexity without hiding required semantics;
+5. choose final IDs, severity, confidence, priority, order, blockers, and precise slugs;
+6. ensure each accepted root cause has exactly one self-contained task;
+7. write and validate task specs directly when a spec directory exists, or return them directly otherwise.
 
-## Step 6 — Finding acceptance gate
+Never write an intermediate review document.
 
-A final finding should normally have all of:
+## Final response
 
-- a concrete affected invariant;
-- the smallest useful code location;
-- a reproducible or clearly reasoned failure scenario;
-- evidence tied to the reviewed scope;
-- observable impact;
-- a smallest reasonable structural fix;
-- a verification method;
-- severity, confidence, and verification state.
+If files were written, report:
 
-Do not publish:
+- reviewed scope and material validation;
+- ordered new task paths with finding ID, priority, and blockers;
+- accepted candidates not written because an equivalent task already exists;
+- rejected or unresolved hypotheses only when their omission materially affects confidence.
 
-- formatting/style trivia;
-- ordinary linter/compiler diagnostics without deeper impact;
-- unsupported personal preferences;
-- unrelated pre-existing issues in commit mode;
-- speculative micro-optimizations stated as facts;
-- abstractions that merely move complexity around;
-- duplicate symptoms of one root cause.
-
-## Step 7 — Produce the report
-
-Use `.agents/cpp-review/templates/review.md` as the structural contract.
-
-The final report must contain these top-level review areas in this order:
-
-1. Contract & correctness
-2. C++/GPU stability
-3. Backend architecture & simplicity
-4. Numerical correctness & tests
-5. Performance
-6. Synthesis / overall assessment
-
-Within each area, order material findings by severity. If there are no material findings in an area, write `No material findings.` and optionally note verification performed.
-
-Every final finding uses the schema in `.agents/cpp-review/references/finding-rubric.md`.
-
-For selected-commit reviews, explicitly state whether each finding is introduced by the selected commit or materially exposed by it.
-
-For whole-codebase reviews, state the reviewed coverage and sampling limitations.
-
-### Specification-linked output
-
-If a specification directory was supplied, write the completed report to:
-
-```text
-<spec-dir>/review.md
-```
-
-Then validate:
-
-```bash
-python3 .agents/cpp-review/scripts/validate_review.py \
-  --review-file '<spec-dir>/review.md' \
-  --spec-dir '<spec-dir>'
-```
-
-If no specification directory was supplied, return the report to the user; only write a file if the user asked for one.
-
-## Final response behavior
-
-When a file was written, state the path and summarize only the highest-impact conclusions. Do not duplicate the entire report in chat.
+If no files were written, return the ordered self-contained subtasks. For zero accepted findings, say `No material findings; no remediation tasks generated.` and state coverage/validation limits.
