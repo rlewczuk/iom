@@ -173,6 +173,8 @@ inline const std::vector<std::vector<std::size_t>>& transfer_owner_shapes() {
         {4, 3, 17, 33},             // leading rank two
         {2, 3, 4, 17, 33},          // leading rank three
         {2, 2, 2, 3, 17, 33},       // rank six: leading rank above three
+        {16, 32},                   // rank-two, two tile columns
+        {2, 3, 16, 48},              // leading rank two, three tile columns
     };
     return shapes;
 }
@@ -258,6 +260,8 @@ inline const std::vector<std::vector<std::size_t>>& copy_owner_shapes() {
         {2, 3, 16, 16},             // exact tiles
         {2, 3, 4, 17, 33},          // leading rank three with padding
         {2, 2, 2, 3, 17, 33},       // rank six
+        {16, 32},                   // rank-two, two tile columns
+        {2, 3, 16, 48},              // leading rank two, three tile columns
     };
     return shapes;
 }
