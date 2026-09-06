@@ -210,9 +210,6 @@ namespace iom::ttnn_detail {
             tt::tt_metal::distributed::MeshDevice& device,
             const TensorView& source, const ttnn::Tensor* planes,
             std::span<std::byte> destination) {
-        // Zero first: unused tail bits read as zero and padding never
-        // reaches the host buffer.
-        std::fill(destination.begin(), destination.end(), std::byte{0});
         const std::size_t rows = view_rows(source);
         const std::size_t columns = view_columns(source);
         const std::size_t element_size =

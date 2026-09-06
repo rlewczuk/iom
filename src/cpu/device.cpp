@@ -586,15 +586,22 @@ namespace iom {
         void region_to_host(
                 const TensorView& source,
                 std::span<std::byte> destination) const override {
-            // Zero first: padding never reaches the host buffer and unused
-            // tail bits read as zero.
-            std::fill(destination.begin(), destination.end(), std::byte{0});
             unsigned char* host =
                     reinterpret_cast<unsigned char*>(destination.data());
             const unsigned char* storage =
                     static_cast<const unsigned char*>(address_);
             const std::size_t bits =
                     detail::leaf_bits(source.spec().data_type);
+            if (bits % 8 != 0) {
+                const std::size_t tail_bits =
+                        (source.spec().shape.element_count() % 8)
+                        * (bits % 8) % 8;
+                if (tail_bits != 0) {
+                    std::fill_n(
+                            destination.data() + (destination.size() - 1),
+                            1, std::byte{0});
+                }
+            }
             const std::size_t columns =
                     source.spec().shape.dimensions().back();
             const std::span<const std::size_t> dimensions =
