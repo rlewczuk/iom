@@ -15,4 +15,4 @@ Implemented SYCL queue lifetime hardening across `src/sycl/registry_state.hpp`, 
 
 ## Errors
 
-- Required USM diagnostics verification could not run: the SYCL host has neither `valgrind` nor `ze_validator` installed (`no-usm-diagnostic`). The implementation remains committed on the retained task branch but is not eligible for integration until one required diagnostics environment is available and the focused regressions pass under it.
+- Integration checkout is currently dirty (`test/CMakeLists.txt`), so `spec-run-task` cannot merge the latest integration branch or rerun the required diagnostics yet; the implementation remains committed on the retained feature branch.
