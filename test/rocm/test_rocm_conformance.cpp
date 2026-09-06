@@ -653,7 +653,7 @@ TEST_CASE("ROCm queue destruction fences pending copies") {
 
     {
         auto queue = device->create_ops();
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 32; ++i) {
             CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
         }
         iom::rocm_detail::inject_submission_fault_for_testing(
@@ -662,7 +662,7 @@ TEST_CASE("ROCm queue destruction fences pending copies") {
         CHECK_NOTHROW(
                 failure = queue->copy(source->view(), destination->view()));
         CHECK_NE(failure, 0);
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 32; ++i) {
             CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
         }
         queue.reset();
