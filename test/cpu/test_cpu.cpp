@@ -567,6 +567,96 @@ TEST_CASE("CPU host writes land in exact tiled slots and reads hide padding") {
     }
 }
 
+TEST_CASE("CPU tile-aligned transfers use canonical storage slots") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+
+    {
+        const iom::TensorSpec spec =
+                make_spec({1, 32}, iom::DataType::F32);
+        auto tensor = device->create_tensor(spec);
+        fill_storage(*tensor, kSentinel);
+
+        std::array<float, 32> values{};
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = 1000.0f + static_cast<float>(index);
+        }
+        std::vector<std::byte> host(sizeof(values));
+        std::memcpy(host.data(), values.data(), host.size());
+        tensor->view().copy_from_host(host);
+
+        const auto* storage = static_cast<const std::byte*>(
+                tensor->view().native_handle());
+        float canonical = 0.0f;
+        float broken = 0.0f;
+        std::memcpy(&canonical, storage + 1024, sizeof(canonical));
+        std::memcpy(&broken, storage + 64, sizeof(broken));
+        CHECK_EQ(canonical, 1016.0f);
+        CHECK_NE(broken, 1016.0f);
+        for (std::size_t index = 0; index < sizeof(broken); ++index) {
+            CHECK_EQ(storage[64 + index], kSentinel);
+        }
+
+        auto destination = device->create_tensor(spec);
+        fill_storage(*destination, kSentinel);
+        auto queue = device->create_ops();
+        const iom::oid token =
+                queue->copy(tensor->view(), destination->view());
+        queue->wait(token);
+        const auto* destination_storage = static_cast<const std::byte*>(
+                destination->view().native_handle());
+        CHECK(std::equal(
+                storage, storage + spec.tiled_storage_nbytes(),
+                destination_storage));
+    }
+
+    {
+        const iom::TensorSpec spec =
+                make_spec({1, 32}, iom::DataType::I4);
+        auto tensor = device->create_tensor(spec);
+        fill_storage(*tensor, kSentinel);
+        iom::TensorView& view = tensor->view();
+        const std::vector<std::byte> host = encoded_host(view, 43);
+        view.copy_from_host(host);
+
+        const auto* storage = reinterpret_cast<const unsigned char*>(
+                tensor->view().native_handle());
+        const std::size_t bits = iom::detail::leaf_bits(spec.data_type);
+        const std::size_t canonical_bit =
+                iom::detail::standard_plane_slot(spec, 0, 0, 16) * bits;
+        CHECK_EQ(
+                read_test_bits(storage, canonical_bit, bits),
+                element_pattern(spec.data_type, 16, 43));
+        CHECK_EQ(read_test_bits(storage, 16 * bits, bits), std::uint64_t{0xA});
+    }
+
+    {
+        const iom::TensorSpec spec =
+                make_spec({2, 3, 16, 48}, iom::DataType::U8);
+        auto tensor = device->create_tensor(spec);
+        fill_storage(*tensor, kSentinel);
+        iom::TensorView& view = tensor->view();
+        const std::vector<std::byte> host = encoded_host(view, 47);
+        view.copy_from_host(host);
+
+        const auto* storage = static_cast<const std::byte*>(
+                tensor->view().native_handle());
+        for (std::size_t plane = 0; plane < 6; ++plane) {
+            for (std::size_t row = 0; row < 16; ++row) {
+                for (std::size_t column = 0; column < 48; ++column) {
+                    const std::size_t linear =
+                            (plane * 16 + row) * 48 + column;
+                    const std::size_t slot =
+                            iom::detail::standard_plane_slot(
+                                    spec, plane, row, column);
+                    CHECK_EQ(storage[slot], host[linear]);
+                }
+            }
+        }
+    }
+}
+
+
 TEST_CASE("CPU storage places fields at exact little-endian bit offsets") {
     RecordingAllocator allocator;
     auto device = iom::make_cpu_device(allocator);

@@ -84,6 +84,11 @@ struct gpu_policy {
             (void)hipEventDestroy(event);
         }
     }
+    static void synchronize_event_noexcept(event_type event) noexcept {
+        if (event != nullptr) {
+            (void)hipEventSynchronize(event);
+        }
+    }
     static void synchronize_event(event_type event) {
         check_hip("hipEventSynchronize", hipEventSynchronize(event));
     }
@@ -632,6 +637,7 @@ void hip_fence_destroy(void* opaque) noexcept {
         gpu_policy::activate(resource->context);
     } catch (...) {
     }
+    gpu_policy::synchronize_event_noexcept(resource->event);
     destroy_hip_resource_noexcept(resource);
 }
 

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -28,6 +29,120 @@
 #include "iom/outstanding_work_registry.hpp"
 #include "iom/llama.hpp"
 #include "iom/tensor.hpp"
+
+namespace iom_test {
+
+std::atomic<bool> allocation_fault_armed{false};
+std::atomic<std::size_t> allocation_fault_at{0};
+std::atomic<std::size_t> allocation_count{0};
+
+bool should_fail_allocation() noexcept {
+    if (!allocation_fault_armed.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const std::size_t ordinal =
+            allocation_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    return allocation_fault_at.load(std::memory_order_relaxed) != 0
+            && ordinal
+                    == allocation_fault_at.load(std::memory_order_relaxed);
+}
+
+void arm_counting() noexcept {
+    allocation_fault_armed.store(false, std::memory_order_relaxed);
+    allocation_fault_at.store(0, std::memory_order_relaxed);
+    allocation_count.store(0, std::memory_order_relaxed);
+    allocation_fault_armed.store(true, std::memory_order_relaxed);
+}
+
+void arm_failure(std::size_t ordinal) noexcept {
+    allocation_fault_armed.store(false, std::memory_order_relaxed);
+    allocation_fault_at.store(ordinal, std::memory_order_relaxed);
+    allocation_count.store(0, std::memory_order_relaxed);
+    allocation_fault_armed.store(true, std::memory_order_relaxed);
+}
+
+std::size_t disarm() noexcept {
+    allocation_fault_armed.store(false, std::memory_order_relaxed);
+    return allocation_count.load(std::memory_order_relaxed);
+}
+
+void* allocate(std::size_t size, std::size_t alignment) {
+    if (should_fail_allocation()) {
+        throw std::bad_alloc();
+    }
+    size = std::max<std::size_t>(size, 1);
+    void* allocation = nullptr;
+    if (alignment <= alignof(std::max_align_t)) {
+        allocation = std::malloc(size);
+    } else {
+        const std::size_t remainder = size % alignment;
+        if (remainder != 0) {
+            const std::size_t padding = alignment - remainder;
+            if (size > std::numeric_limits<std::size_t>::max() - padding) {
+                throw std::bad_alloc();
+            }
+            size += padding;
+        }
+        allocation = std::aligned_alloc(alignment, size);
+    }
+    if (allocation == nullptr) {
+        throw std::bad_alloc();
+    }
+    return allocation;
+}
+
+}  // namespace iom_test
+
+void* operator new(std::size_t size) {
+    return iom_test::allocate(size, alignof(std::max_align_t));
+}
+
+void* operator new[](std::size_t size) {
+    return iom_test::allocate(size, alignof(std::max_align_t));
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment) {
+    return iom_test::allocate(size, static_cast<std::size_t>(alignment));
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+    return iom_test::allocate(size, static_cast<std::size_t>(alignment));
+}
+
+void operator delete(void* allocation) noexcept {
+    std::free(allocation);
+}
+
+void operator delete[](void* allocation) noexcept {
+    std::free(allocation);
+}
+
+void operator delete(void* allocation, std::size_t) noexcept {
+    std::free(allocation);
+}
+
+void operator delete[](void* allocation, std::size_t) noexcept {
+    std::free(allocation);
+}
+
+void operator delete(void* allocation, std::align_val_t) noexcept {
+    std::free(allocation);
+}
+
+void operator delete[](void* allocation, std::align_val_t) noexcept {
+    std::free(allocation);
+}
+
+void operator delete(
+        void* allocation, std::size_t, std::align_val_t) noexcept {
+    std::free(allocation);
+}
+
+void operator delete[](
+        void* allocation, std::size_t, std::align_val_t) noexcept {
+    std::free(allocation);
+}
+
 
 namespace {
 
@@ -2132,6 +2247,66 @@ TEST_CASE("OutstandingWorkRegistry releases exact same-address entries") {
     const std::array<iom::detail::EntryId, 2> remaining{3, 4};
     registry.remove_entries(remaining, address);
     CHECK(registry.snapshot_for(address).empty());
+}
+
+TEST_CASE("OutstandingWorkRegistry rolls back every registry index") {
+    static int fence_calls = 0;
+    fence_calls = 0;
+    const iom::detail::Fence fence = [] {
+        ++fence_calls;
+        return iom::detail::FenceResult::success();
+    };
+
+    iom::detail::OutstandingWorkRegistry registry;
+    const auto probe_address = reinterpret_cast<void*>(0x1000);
+    iom_test::arm_counting();
+    registry.register_entry(1, probe_address, 1, 1, fence);
+    const std::size_t allocation_count = iom_test::disarm();
+    REQUIRE_EQ(allocation_count, 4);
+    CHECK(registry.try_release_entry(1));
+
+    for (std::size_t ordinal = 1; ordinal <= allocation_count; ++ordinal) {
+        const iom::detail::EntryId id =
+                static_cast<iom::detail::EntryId>(ordinal + 1);
+        void* address = reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(0x2000 + ordinal * 0x100));
+        const std::uint64_t sequence = ordinal + 1;
+        const iom::detail::QueueId queue_id = ordinal + 1;
+
+        iom_test::arm_failure(ordinal);
+        bool threw_bad_alloc = false;
+        bool threw_unexpected = false;
+        try {
+            registry.register_entry(id, address, sequence, queue_id, fence);
+        } catch (const std::bad_alloc&) {
+            threw_bad_alloc = true;
+        } catch (...) {
+            threw_unexpected = true;
+        }
+        const std::size_t allocations_seen = iom_test::disarm();
+
+        REQUIRE_EQ(allocations_seen, ordinal);
+        REQUIRE(threw_bad_alloc);
+        CHECK_FALSE(threw_unexpected);
+        CHECK(registry.snapshot_for(address).empty());
+        CHECK_FALSE(registry.try_release_entry(id));
+        CHECK_EQ(fence_calls, 0);
+
+        CHECK_NOTHROW(
+                registry.register_entry(id, address, sequence, queue_id, fence));
+        const auto registered = registry.snapshot_for(address);
+        REQUIRE_EQ(registered.size(), 1);
+        CHECK_EQ(registered[0].id, id);
+        CHECK(registered[0].state == iom::detail::EntryState::Live);
+
+        registry.invalidate_entries_for_sequence(sequence, queue_id);
+        const auto invalidated = registry.snapshot_for(address);
+        REQUIRE_EQ(invalidated.size(), 1);
+        CHECK(invalidated[0].state == iom::detail::EntryState::Invalidated);
+
+        registry.remove_entry_if_present(id, address);
+        CHECK(registry.snapshot_for(address).empty());
+    }
 }
 
 TEST_CASE("Quarantine runs allocator cleanup at most once") {

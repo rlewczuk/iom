@@ -1,5 +1,6 @@
 #include "iom/cpu/device.hpp"
 
+#include <cassert>
 #include <array>
 #include <condition_variable>
 #include <cstdint>
@@ -97,14 +98,7 @@ namespace iom {
         static inline void copy_tile_row_byte_aligned(
                 unsigned char* destination, const unsigned char* source,
                 std::size_t elements) {
-            if (elements >= TensorSpec::TILE) {
-                if (destination != source) {
-                    std::memcpy(
-                            destination, source,
-                            elements * kElementBytes);
-                }
-                return;
-            }
+            assert(elements <= TensorSpec::TILE);
             for (std::size_t index = 0; index < elements; ++index) {
                 if (destination + index * kElementBytes
                         != source + index * kElementBytes) {
@@ -122,17 +116,11 @@ namespace iom {
                 std::size_t elements, std::size_t leaf_bits,
                 std::array<std::uint32_t, TensorSpec::TILE>& shift_table,
                 std::array<std::uint32_t, TensorSpec::TILE>& mask_table) {
+            assert(elements <= TensorSpec::TILE);
             const std::size_t total_bits = elements * leaf_bits;
             const bool word_aligned =
                     source_bit % (sizeof(std::uint32_t) * 8) == 0
                     && destination_bit % (sizeof(std::uint32_t) * 8) == 0;
-            if (word_aligned && elements > TensorSpec::TILE
-                    && total_bits % 8 == 0) {
-                std::memcpy(
-                        destination + destination_bit / 8,
-                        source + source_bit / 8, total_bits / 8);
-                return;
-            }
             if (word_aligned) {
                 const std::size_t whole_word_bits =
                         total_bits / (sizeof(std::uint32_t) * 8)
@@ -236,10 +224,6 @@ namespace iom {
                         const std::size_t row_byte =
                                 tile_row_byte + row_in_tile * TensorSpec::TILE
                                         * bits / 8;
-                        if (columns % TensorSpec::TILE == 0) {
-                            op(row, 0, row_byte, columns);
-                            continue;
-                        }
                         for (std::size_t tile_column = 0;
                              tile_column < tile_columns; ++tile_column) {
                             const std::size_t column =
@@ -349,12 +333,6 @@ namespace iom {
                                 destination_tile_row_byte
                                 + row_in_tile * TensorSpec::TILE
                                         * destination_bits / 8;
-                        if (columns % TensorSpec::TILE == 0) {
-                            op(
-                                    row, 0, source_row_byte,
-                                    destination_row_byte, columns);
-                            continue;
-                        }
                         for (std::size_t tile_column = 0;
                              tile_column < tile_columns; ++tile_column) {
                             const std::size_t column =
@@ -574,8 +552,7 @@ namespace iom {
             const std::size_t tile_columns =
                     columns / TensorSpec::TILE
                     + (columns % TensorSpec::TILE != 0);
-            const std::size_t row_runs_per_plane =
-                    columns % TensorSpec::TILE == 0 ? 1 : tile_columns;
+            const std::size_t row_runs_per_plane = tile_columns;
             const std::size_t callbacks_per_plane =
                     rows * row_runs_per_plane;
             const std::size_t elements_per_plane = rows * columns;
@@ -662,8 +639,7 @@ namespace iom {
             const std::size_t tile_columns =
                     columns / TensorSpec::TILE
                     + (columns % TensorSpec::TILE != 0);
-            const std::size_t row_runs_per_plane =
-                    columns % TensorSpec::TILE == 0 ? 1 : tile_columns;
+            const std::size_t row_runs_per_plane = tile_columns;
             const std::size_t callbacks_per_plane =
                     rows * row_runs_per_plane;
             const std::size_t elements_per_plane = rows * columns;
