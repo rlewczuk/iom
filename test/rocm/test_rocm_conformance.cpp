@@ -35,21 +35,9 @@ extern char** environ;
 namespace {
 
 
-class TrafficGate final : public iom_conformance::ConformanceObserver {
-public:
-    void setup_complete() override { armed_ = true; }
-    void case_complete() override { armed_ = false; }
-    ~TrafficGate() override { armed_ = false; }
-
-    [[nodiscard]] bool armed() const noexcept { return armed_; }
-
-private:
-    bool armed_ = false;
-};
-
 class HipAllocator final : public iom::Allocator {
 public:
-    explicit HipAllocator(const TrafficGate& gate) : gate_(gate) {}
+    explicit HipAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
 
     void* alloc(std::size_t size) override {
         CHECK_MESSAGE(
@@ -85,7 +73,7 @@ public:
     std::size_t resets = 0;
 
 private:
-    const TrafficGate& gate_;
+    const iom_conformance::TrafficGate& gate_;
     std::unordered_set<void*> live_;
 };
 class ReusingHipAllocator final : public iom::Allocator {
@@ -274,31 +262,9 @@ void expect_bounded_wait_in_subprocess(
     CHECK_EQ(WEXITSTATUS(status), 0);
 }
 
-void expect_repeated_runtime_failure(
-        iom::DeviceOps& queue, iom::oid token) {
-    std::string message;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        bool caught = false;
-        try {
-            queue.wait(token);
-        } catch (const std::runtime_error& error) {
-            caught = true;
-            if (message.empty()) {
-                message = error.what();
-            } else {
-                CHECK_EQ(std::string_view(error.what()), message);
-            }
-        }
-        CHECK(caught);
-    }
-    CHECK_FALSE(message.empty());
-}
-
-
-
 }  // namespace
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
     const std::unique_ptr<iom::Device> candidate =
             iom::make_rocm_device(0, allocator);
@@ -328,7 +294,7 @@ TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") 
 
 TEST_CASE("ROCm conformance: storage and host transfers for every leaf type") {
     // Keep the CPU allocator large enough for the largest shared case.
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -372,7 +338,7 @@ public:
     }
 };
 TEST_CASE("ROCm conformance: storage oracle identifies perturbed transfer map") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -396,7 +362,7 @@ TEST_CASE("ROCm conformance: storage oracle identifies perturbed transfer map") 
 }
 
 TEST_CASE("ROCm conformance: storage oracle covers every leaf width and padded shape") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -415,7 +381,7 @@ TEST_CASE("ROCm conformance: storage oracle covers every leaf width and padded s
 
 
 TEST_CASE("ROCm conformance: asynchronous copies against the CPU reference") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -432,7 +398,7 @@ TEST_CASE("ROCm conformance: asynchronous copies against the CPU reference") {
 }
 
 TEST_CASE("ROCm conformance: copy validation fails before writes and sequences") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -448,7 +414,7 @@ TEST_CASE("ROCm conformance: copy validation fails before writes and sequences")
 }
 
 TEST_CASE("ROCm conformance: transfer failures keep metadata and ownership") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -464,7 +430,7 @@ TEST_CASE("ROCm conformance: transfer failures keep metadata and ownership") {
 }
 
 TEST_CASE("ROCm conformance: deferred queue lifetime and stability") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator candidate_allocator(gate);
     auto candidate = iom::make_rocm_device(0, candidate_allocator);
     iom_conformance::run_lifetime_conformance(
@@ -473,7 +439,7 @@ TEST_CASE("ROCm conformance: deferred queue lifetime and stability") {
 }
 
 TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the staged atomic word") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator candidate_allocator(gate);
     auto candidate = iom::make_rocm_device(0, candidate_allocator);
     constexpr std::uint64_t salt = 0x180001ull;
@@ -497,7 +463,7 @@ TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the stag
 }
 
 TEST_CASE("ROCm conformance: compute methods reject capability without submitting") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator candidate_allocator(gate);
     auto candidate = iom::make_rocm_device(0, candidate_allocator);
     iom_conformance::run_compute_capability_conformance(
@@ -506,7 +472,7 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
 }
 
 TEST_CASE("ROCm conformance: full shared suite") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     HipAllocator candidate_allocator(gate);
@@ -524,7 +490,7 @@ TEST_CASE("ROCm conformance: full shared suite") {
 }
 
 TEST_CASE("ROCm submission remains transactional across post-enqueue failures") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator candidate_allocator(gate);
     auto candidate = iom::make_rocm_device(0, candidate_allocator);
     const iom::TensorSpec spec{
@@ -566,7 +532,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
                     source->view(), destination->view()));
     CHECK_NE(launch_failure, 0);
     CHECK_EQ(iom_conformance::token_sequence(launch_failure), 3);
-    expect_repeated_runtime_failure(*queue, launch_failure);
+    iom_conformance::expect_repeated_runtime_failure(*queue, launch_failure);
     expect_bounded_wait_in_subprocess(
             iom::rocm_detail::SubmissionFault::third_plane_launch);
 
@@ -575,7 +541,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     const iom::oid record_failure =
             queue->copy(source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(record_failure), 4);
-    expect_repeated_runtime_failure(*queue, record_failure);
+    iom_conformance::expect_repeated_runtime_failure(*queue, record_failure);
     expect_bounded_wait_in_subprocess(
             iom::rocm_detail::SubmissionFault::event_record);
     iom::rocm_detail::inject_submission_fault_for_testing(
@@ -608,7 +574,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
         const iom::oid canary_failure = canary_queue->copy(
                 canary_source->view(), canary_destination->view());
         CHECK_EQ(iom_conformance::token_sequence(canary_failure), 1);
-        expect_repeated_runtime_failure(*canary_queue, canary_failure);
+        iom_conformance::expect_repeated_runtime_failure(*canary_queue, canary_failure);
 
         const void* source_address = canary_source->view().native_handle();
         const void* destination_address =
@@ -639,7 +605,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
 }
 
 TEST_CASE("ROCm queue destruction fences pending copies") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
     auto device = iom::make_rocm_device(0, allocator);
     const iom::TensorSpec spec{
@@ -676,7 +642,7 @@ TEST_CASE("ROCm conformance: inline and pooled metadata rank boundaries") {
     int device_count = 0;
     REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
     REQUIRE(device_count > 0);
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
     auto device = iom::make_rocm_device(0, allocator);
     HipStorageOracle oracle;

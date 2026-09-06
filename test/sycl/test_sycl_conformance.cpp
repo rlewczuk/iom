@@ -29,21 +29,9 @@
 namespace {
 
 
-class TrafficGate final : public iom_conformance::ConformanceObserver {
-public:
-    void setup_complete() override { armed_ = true; }
-    void case_complete() override { armed_ = false; }
-    ~TrafficGate() override { armed_ = false; }
-
-    [[nodiscard]] bool armed() const noexcept { return armed_; }
-
-private:
-    bool armed_ = false;
-};
-
 class HostAllocator final : public iom::Allocator {
 public:
-    explicit HostAllocator(const TrafficGate& gate) : gate_(gate) {}
+    explicit HostAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
 
     void* alloc(std::size_t size) override {
         CHECK_MESSAGE(
@@ -69,13 +57,13 @@ public:
     void reset() override {}
 
 private:
-    const TrafficGate& gate_;
+    const iom_conformance::TrafficGate& gate_;
     std::unordered_set<void*> live_;
 };
 
 class SyclAllocator final : public iom::Allocator {
 public:
-    explicit SyclAllocator(const TrafficGate& gate) : gate_(gate) {}
+    explicit SyclAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
 
     void bind_context(const sycl::context& context) {
         context_ = context;
@@ -128,7 +116,7 @@ public:
     std::size_t frees = 0;
 
 private:
-    const TrafficGate& gate_;
+    const iom_conformance::TrafficGate& gate_;
     std::optional<sycl::context> context_;
     sycl::device device_;
     std::unordered_set<void*> live_;
@@ -295,7 +283,7 @@ private:
 
 struct SyclDevices {
     ContextCallsRestore context_restore;
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HostAllocator reference_allocator{gate};
     SyclAllocator candidate_allocator{gate};
     SyclAllocator foreign_allocator{gate};
@@ -366,26 +354,6 @@ public:
 private:
     const SyclAllocator& allocator_;
 };
-
-void expect_repeated_runtime_failure(
-        iom::DeviceOps& queue, iom::oid token) {
-    std::string message;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        bool caught = false;
-        try {
-            queue.wait(token);
-        } catch (const std::runtime_error& error) {
-            caught = true;
-            if (message.empty()) {
-                message = error.what();
-            } else {
-                CHECK_EQ(std::string_view(error.what()), message);
-            }
-        }
-        CHECK(caught);
-    }
-    CHECK_FALSE(message.empty());
-}
 
 }  // namespace
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
@@ -494,7 +462,7 @@ TEST_CASE("SYCL submission remains transactional across post-enqueue failures") 
     const iom::oid token = queue->copy(
             source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(token), 1);
-    expect_repeated_runtime_failure(*queue, token);
+    iom_conformance::expect_repeated_runtime_failure(*queue, token);
 
     source.reset();
     destination.reset();

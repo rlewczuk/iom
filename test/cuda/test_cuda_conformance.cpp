@@ -26,21 +26,9 @@
 namespace {
 
 
-class TrafficGate final : public iom_conformance::ConformanceObserver {
-public:
-    void setup_complete() override { armed_ = true; }
-    void case_complete() override { armed_ = false; }
-    ~TrafficGate() override { armed_ = false; }
-
-    [[nodiscard]] bool armed() const noexcept { return armed_; }
-
-private:
-    bool armed_ = false;
-};
-
 class HostAllocator final : public iom::Allocator {
 public:
-    explicit HostAllocator(const TrafficGate& gate) : gate_(gate) {}
+    explicit HostAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
 
     void* alloc(std::size_t size) override {
         CHECK_MESSAGE(
@@ -68,7 +56,7 @@ public:
     void reset() override { ++traffic_; }
 
 private:
-    const TrafficGate& gate_;
+    const iom_conformance::TrafficGate& gate_;
     std::unordered_set<void*> live_;
     std::size_t traffic_ = 0;
 };
@@ -76,7 +64,7 @@ private:
 
 class CudaAllocator final : public iom::Allocator {
 public:
-    explicit CudaAllocator(const TrafficGate& gate) : gate_(gate) {}
+    explicit CudaAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
 
     void* alloc(std::size_t size) override {
         CHECK_MESSAGE(
@@ -105,7 +93,7 @@ public:
     void reset() override { ++traffic_; }
 
 private:
-    const TrafficGate& gate_;
+    const iom_conformance::TrafficGate& gate_;
     std::unordered_set<void*> live_;
     std::size_t traffic_ = 0;
 };
@@ -180,7 +168,7 @@ private:
 
 
 struct CudaDevices {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     HostAllocator reference_allocator{gate};
     CudaAllocator candidate_allocator{gate};
     CudaAllocator foreign_allocator{gate};
@@ -226,30 +214,10 @@ public:
 };
 
 
-void expect_repeated_runtime_failure(
-        iom::DeviceOps& queue, iom::oid token) {
-    std::string message;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        bool caught = false;
-        try {
-            queue.wait(token);
-        } catch (const std::runtime_error& error) {
-            caught = true;
-            if (message.empty()) {
-                message = error.what();
-            } else {
-                CHECK_EQ(std::string_view(error.what()), message);
-            }
-        }
-        CHECK(caught);
-    }
-    CHECK_FALSE(message.empty());
-}
-
 }  // namespace
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     CudaAllocator allocator(gate);
     const std::unique_ptr<iom::Device> candidate =
             iom::make_cuda_device(0, allocator);
@@ -412,14 +380,14 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
                     source->view(), destination->view()));
     CHECK_NE(launch_failure, 0);
     CHECK_EQ(iom_conformance::token_sequence(launch_failure), 3);
-    expect_repeated_runtime_failure(*queue, launch_failure);
+    iom_conformance::expect_repeated_runtime_failure(*queue, launch_failure);
 
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::event_record);
     const iom::oid record_failure =
             queue->copy(source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(record_failure), 4);
-    expect_repeated_runtime_failure(*queue, record_failure);
+    iom_conformance::expect_repeated_runtime_failure(*queue, record_failure);
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::none);
 
@@ -450,7 +418,7 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
         const iom::oid canary_failure = canary_queue->copy(
                 canary_source->view(), canary_destination->view());
         CHECK_EQ(iom_conformance::token_sequence(canary_failure), 1);
-        expect_repeated_runtime_failure(*canary_queue, canary_failure);
+        iom_conformance::expect_repeated_runtime_failure(*canary_queue, canary_failure);
 
         const void* source_address = canary_source->view().native_handle();
         const void* destination_address =
@@ -482,7 +450,7 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
 
 TEST_CASE("CUDA queue destruction fences pending copies") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     CudaAllocator allocator(gate);
     auto device = iom::make_cuda_device(0, allocator);
     const iom::TensorSpec spec{
@@ -517,7 +485,7 @@ TEST_CASE("CUDA queue destruction fences pending copies") {
 
 TEST_CASE("CUDA conformance: inline and pooled metadata rank boundaries") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     CudaAllocator allocator(gate);
     auto device = iom::make_cuda_device(0, allocator);
     CudaStorageOracle oracle;

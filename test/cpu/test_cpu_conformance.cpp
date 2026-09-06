@@ -17,26 +17,12 @@
 namespace {
 
 
-// Observes harness phase boundaries and exposes the armed window in which
-// tensor-storage allocators must stay silent.
-class TrafficGate final : public iom_conformance::ConformanceObserver {
-public:
-    void setup_complete() override { armed_ = true; }
-    void case_complete() override { armed_ = false; }
-    ~TrafficGate() override { armed_ = false; }
-
-    [[nodiscard]] bool armed() const noexcept { return armed_; }
-
-private:
-    bool armed_ = false;
-};
-
 // Recording allocator over 32-byte-aligned blocks. While the gate is armed —
 // inside transfers, transforms, and queue operations — every alloc or free is
 // a conformance failure: no case may allocate operands there.
 class GatedAllocator final : public iom::Allocator {
 public:
-    explicit GatedAllocator(const TrafficGate& gate) : gate_(gate) {}
+    explicit GatedAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
 
     void* alloc(std::size_t size) override {
         CHECK_MESSAGE(
@@ -72,7 +58,7 @@ public:
     }
 
 private:
-    const TrafficGate& gate_;
+    const iom_conformance::TrafficGate& gate_;
     std::unordered_set<void*> live_;
     std::size_t traffic_ = 0;
 };
@@ -80,7 +66,7 @@ private:
 // One independent CPU reference device, one candidate device, and one foreign
 // device instance of the same backend ordinal, each over its own allocator.
 struct CpuDevices {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     GatedAllocator reference_allocator{gate};
     GatedAllocator candidate_allocator{gate};
     GatedAllocator foreign_allocator{gate};
@@ -289,7 +275,7 @@ TEST_CASE("CPU conformance: full shared suite composes every shared case") {
 // bit-for-bit logical-byte mismatch; the independently generated encodings
 // make round-trip cancellation impossible.
 TEST_CASE("conformance harness detects perturbed candidate bytes") {
-    TrafficGate gate;
+    iom_conformance::TrafficGate gate;
     GatedAllocator reference_allocator(gate);
     GatedAllocator candidate_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);

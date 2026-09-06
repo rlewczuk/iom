@@ -182,6 +182,20 @@ public:
     virtual void case_complete() = 0;
 };
 
+// Observes harness phase boundaries and exposes the armed window in which
+// tensor-storage allocators must stay silent.
+class TrafficGate final : public ConformanceObserver {
+public:
+    void setup_complete() override { armed_ = true; }
+    void case_complete() override { armed_ = false; }
+    ~TrafficGate() override { armed_ = false; }
+
+    [[nodiscard]] bool armed() const noexcept { return armed_; }
+
+private:
+    bool armed_ = false;
+};
+
 struct ConformanceDevices {
     // CPU reference device every observable result is compared against.
     iom::Device& reference;
@@ -191,6 +205,28 @@ struct ConformanceDevices {
     // backend ordinal; its views must be rejected by candidate queues.
     iom::Device& foreign;
 };
+
+// Requires a deferred DeviceOps failure to rethrow the identical
+// runtime_error message on every repeat wait.
+inline void expect_repeated_runtime_failure(
+        iom::DeviceOps& queue, iom::oid token) {
+    std::string message;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool caught = false;
+        try {
+            queue.wait(token);
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            if (message.empty()) {
+                message = error.what();
+            } else {
+                CHECK_EQ(std::string_view(error.what()), message);
+            }
+        }
+        CHECK(caught);
+    }
+    CHECK_FALSE(message.empty());
+}
 
 // ---------------------------------------------------------------------------
 // Token decoding.
