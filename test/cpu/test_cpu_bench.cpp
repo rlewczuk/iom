@@ -166,21 +166,25 @@ TEST_CASE("CPU benchmark: blocked copy throughput vs memory floor") {
             "developer load");
 
     // Queued-latency calibration on 2026-09-06, reference host:
-    // AMD Ryzen AI 9 HX 370, Linux x86-64, g++ 15.2.0, Release -O2,
+    // AMD Ryzen AI 9 HX 370, Linux x86-64, g++ 15.2.0, Release `-O2`,
     // single-threaded, ordinary developer load.
     // N = 20; R = 1e-9 seconds
     // (steady_clock::period::num / steady_clock::period::den).
-    // D = -1.245e-7; Q = 2.655e-7; diff_max = 3.91e-7.
-    // M = max(2 * Q, 10 * R) = 5.31e-7 seconds.
-    // A_seconds = max(0, diff_max) + M + 2 * Q = 1.453e-6.
+    // D = 6.0e-8; Q = 0.0; diff_max = 6.0e-8 seconds.
+    // M = max(2 * Q, 10 * R) = 1.0e-8 seconds.
+    // A_seconds = max(0, diff_max) + M + 2 * Q = 7.0e-8 seconds.
     // G = 1.0e-8 seconds; raw diff_median_1..20 (seconds):
-    // {-9.9e-8, 1.6e-7, -4.1e-8, -9.72e-7, -4.4e-7,
-    //  -3.01e-7, 1.4e-7, -1.5e-7, 1.71e-7, 3.91e-7,
-    //  -9.41e-7, -3.91e-7, 1.51e-7, -3.41e-7, -9.21e-7,
-    //  -3.11e-7, 3.1e-7, 5.0e-8, -9.0e-8, -2.01e-7}.
-    // Injector = max(100e-6, 10 * kAllowanceSeconds) = 100e-6 seconds.
-    // Rounded: kAllowanceSeconds = ceil(A_seconds / G) * G = 1.46e-6.
-    constexpr double kAllowanceSeconds = 1.46e-6;
+    // {6.0e-8, 5.1e-8, 6.0e-8, 6.0e-8, 5.0e-8,
+    //  6.0e-8, 5.1e-8, 5.1e-8, 6.0e-8, 6.0e-8,
+    //  6.0e-8, 6.0e-8, 6.0e-8, 5.1e-8, 5.9e-8,
+    //  6.0e-8, 6.0e-8, 5.0e-8, 5.9e-8, 6.0e-8}.
+    // Injector = max(100, duration_cast<microseconds>(
+    //     10 * kAllowanceSeconds).count()) = 100 us.
+    // Rounded: kAllowanceSeconds = ceil(A_seconds / G) * G = 7.0e-8.
+    // This post-73 re-derivation supersedes order 67's constant because
+    // order 73 deleted the CPU StagedWorker path (CpuQueue::Task, execute,
+    // complete_task, worker_, and shutdown_and_drain).
+    constexpr double kAllowanceSeconds = 7.0e-8;
 
     // Post-CC-001 throughput calibration on 2026-09-06, reference host:
     // AMD Ryzen AI 9 HX 370, Linux x86-64, g++ 15.2.0, Release `-O2`,
