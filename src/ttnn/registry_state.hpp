@@ -7,7 +7,7 @@
 
 #include <ttnn/tensor/tensor.hpp>
 
-#include "iom/outstanding_work_registry.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 
 namespace iom::ttnn_test {
     void fail_next_quarantine_action_for_testing() noexcept;

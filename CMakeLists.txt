@@ -82,7 +82,6 @@ set(IOM_SOURCES
 
 set(IOM_HEADERS
         include/iom/iom.hpp
-        include/iom/outstanding_work_registry.hpp
         include/iom/gpu_algorithm.hpp
         include/iom/cpu/device.hpp
         include/iom/llama.hpp

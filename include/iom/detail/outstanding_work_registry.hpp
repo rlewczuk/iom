@@ -6,7 +6,6 @@
 #include <exception>
 #include <functional>
 #include <limits>
-#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -16,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "alloc.hpp"
+#include "iom/alloc.hpp"
 
 namespace iom::detail {
 
@@ -52,11 +51,8 @@ public:
     virtual void run() noexcept = 0;
     [[nodiscard]] virtual bool failed() const noexcept = 0;
     [[nodiscard]] virtual std::exception_ptr failure() const noexcept = 0;
-
-private:
-    friend class Quarantine;
-    std::unique_ptr<CleanupAction> next_;
 };
+
 
 class AllocatorCleanupAction final : public CleanupAction {
 public:
@@ -122,13 +118,17 @@ public:
     Quarantine(Quarantine&&) = delete;
     Quarantine& operator=(Quarantine&&) = delete;
 
-    void add(std::unique_ptr<CleanupAction> action) noexcept {
+    void add(std::unique_ptr<CleanupAction> action) {
         if (!action) {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        action->next_ = std::move(actions_);
-        actions_ = std::move(action);
+        try {
+            actions_.push_back(std::move(action));
+        } catch (...) {
+            (void)action.release();
+            throw;
+        }
     }
 
     template <typename Action, typename... Args>
@@ -138,32 +138,23 @@ public:
 
     void drain() noexcept {
         for (;;) {
-            std::unique_ptr<CleanupAction> action;
+            std::vector<std::unique_ptr<CleanupAction>> actions;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (!actions_) {
-                    return;
-                }
-                action = std::move(actions_);
-                actions_ = std::move(action->next_);
+                actions.swap(actions_);
             }
-            action->run();
+            if (actions.empty()) {
+                return;
+            }
+            for (auto it = actions.rbegin(); it != actions.rend(); ++it) {
+                (*it)->run();
+            }
         }
-    }
-
-    [[nodiscard]] std::size_t size() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::size_t count = 0;
-        for (const CleanupAction* action = actions_.get(); action != nullptr;
-             action = action->next_.get()) {
-            ++count;
-        }
-        return count;
     }
 
 private:
     mutable std::mutex mutex_;
-    std::unique_ptr<CleanupAction> actions_;
+    std::vector<std::unique_ptr<CleanupAction>> actions_;
 };
 
 class OutstandingWorkRegistry {
@@ -177,14 +168,7 @@ public:
         Fence fence;
     };
 
-    struct EntrySnapshot {
-        EntryId id = 0;
-        void* address = nullptr;
-        std::uint64_t sequence = 0;
-        QueueId queue_id = 0;
-        EntryState state = EntryState::Live;
-        Fence fence;
-    };
+    using EntrySnapshot = Entry;
 
     OutstandingWorkRegistry() = default;
     ~OutstandingWorkRegistry() = default;
@@ -232,22 +216,19 @@ public:
         }
         try {
             by_address_.emplace(address, id);
-            by_sequence_.emplace(sequence, id);
-            by_queue_.emplace(queue_id, id);
         } catch (...) {
-            erase_entry_locked(entry_it);
+            by_id_.erase(entry_it);
             throw;
         }
     }
 
-    [[nodiscard]] std::vector<EntrySnapshot> snapshot_for(
-            void* address) const {
+    [[nodiscard]] std::vector<Entry> snapshot_for(void* address) const {
         if (address == nullptr) {
             throw std::invalid_argument(
                     "outstanding-work snapshot address is null");
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<EntrySnapshot> result;
+        std::vector<Entry> result;
         const auto range = by_address_.equal_range(address);
         for (auto it = range.first; it != range.second; ++it) {
             const auto entry = by_id_.find(it->second);
@@ -255,10 +236,7 @@ public:
                 throw std::logic_error(
                         "outstanding-work address index is inconsistent");
             }
-            const Entry& value = entry->second;
-            result.push_back(
-                    EntrySnapshot{value.id, value.address, value.sequence,
-                                  value.queue_id, value.state, value.fence});
+            result.push_back(entry->second);
         }
         return result;
     }
@@ -279,33 +257,15 @@ public:
         return true;
     }
 
-    void invalidate_entries_for_sequence(
-            std::uint64_t sequence, QueueId queue_id) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = by_sequence_.lower_bound(sequence);
-        while (it != by_sequence_.end() && it->first == sequence) {
-            const EntryId id = it->second;
-            const auto entry = by_id_.find(id);
-            if (entry != by_id_.end()
-                    && entry->second.queue_id == queue_id) {
-                invalidate_entry_locked(entry->second);
-                it = by_sequence_.lower_bound(sequence);
-            } else {
-                ++it;
-            }
-        }
-    }
 
     void invalidate_entries_for_queue(QueueId queue_id) noexcept {
         if (queue_id == 0) {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto range = by_queue_.equal_range(queue_id);
-        for (auto it = range.first; it != range.second; ++it) {
-            const auto entry = by_id_.find(it->second);
-            if (entry != by_id_.end()) {
-                invalidate_entry_locked(entry->second);
+        for (auto& item : by_id_) {
+            if (item.second.queue_id == queue_id) {
+                invalidate_entry_locked(item.second);
             }
         }
     }
@@ -368,19 +328,8 @@ private:
     void invalidate_entry_locked(Entry& entry) noexcept {
         entry.state = EntryState::Invalidated;
         entry.fence = &failed_invalidated_fence;
-        erase_sequence_index_locked(entry.sequence, entry.id);
     }
 
-    void erase_sequence_index_locked(
-            std::uint64_t sequence, EntryId id) noexcept {
-        const auto range = by_sequence_.equal_range(sequence);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (it->second == id) {
-                by_sequence_.erase(it);
-                return;
-            }
-        }
-    }
 
     void validate_ids_locked(
             std::span<const EntryId> ids, void* expected_address) const {
@@ -408,7 +357,8 @@ private:
         }
     }
 
-    void erase_entry_locked(std::map<EntryId, Entry>::const_iterator entry) noexcept {
+    void erase_entry_locked(
+            std::map<EntryId, Entry>::const_iterator entry) noexcept {
         if (entry == by_id_.end()) {
             return;
         }
@@ -420,28 +370,12 @@ private:
                 break;
             }
         }
-        const auto sequence_range = by_sequence_.equal_range(value.sequence);
-        for (auto it = sequence_range.first; it != sequence_range.second; ++it) {
-            if (it->second == value.id) {
-                by_sequence_.erase(it);
-                break;
-            }
-        }
-        const auto queue_range = by_queue_.equal_range(value.queue_id);
-        for (auto it = queue_range.first; it != queue_range.second; ++it) {
-            if (it->second == value.id) {
-                by_queue_.erase(it);
-                break;
-            }
-        }
         by_id_.erase(entry);
     }
 
     mutable std::mutex mutex_;
     std::map<EntryId, Entry> by_id_;
     std::multimap<void*, EntryId> by_address_;
-    std::multimap<std::uint64_t, EntryId> by_sequence_;
-    std::multimap<QueueId, EntryId> by_queue_;
 };
 
 inline EntryId allocate_registry_id(EntryId& next_id) {

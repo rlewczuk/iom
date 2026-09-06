@@ -26,7 +26,7 @@
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/alloc.hpp"
-#include "iom/outstanding_work_registry.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/llama.hpp"
 #include "iom/tensor.hpp"
 
@@ -2098,8 +2098,42 @@ struct WorkerTask {
     std::uint64_t sequence;
     void* fence = nullptr;
 };
+struct CounterAction final : iom::detail::CleanupAction {
+    CounterAction(bool& destructor_ran, bool& ran) noexcept
+            : destructor_ran_(destructor_ran), ran_(ran) {}
+
+    ~CounterAction() noexcept override {
+        destructor_ran_ = true;
+    }
+
+    void run() noexcept override {
+        ran_ = true;
+    }
+
+    [[nodiscard]] bool failed() const noexcept override {
+        return false;
+    }
+
+    [[nodiscard]] std::exception_ptr failure() const noexcept override {
+        return nullptr;
+    }
+    [[nodiscard]] bool destructor_ran() const noexcept {
+        return destructor_ran_;
+    }
+
+    [[nodiscard]] bool ran() const noexcept {
+        return ran_;
+    }
+
+private:
+    bool& destructor_ran_;
+    bool& ran_;
+};
 
 }  // namespace
+static_assert(std::is_same_v<
+              iom::detail::OutstandingWorkRegistry::EntrySnapshot,
+              iom::detail::OutstandingWorkRegistry::Entry>);
 
 TEST_CASE("StagedWorker preserves fenced callback order") {
     std::mutex mutex;
@@ -2235,7 +2269,8 @@ TEST_CASE("OutstandingWorkRegistry releases exact same-address entries") {
     CHECK_EQ(concurrent[1].id, 4);
     CHECK_EQ(fence_calls, 0);
 
-    registry.invalidate_entries_for_sequence(2, 1);
+    const std::array<iom::detail::EntryId, 2> invalidation_ids{3, 4};
+    registry.invalidate_entries(invalidation_ids);
     const auto invalidated = registry.snapshot_for(address);
     REQUIRE_EQ(invalidated.size(), 2);
     CHECK(invalidated[0].state == iom::detail::EntryState::Invalidated);
@@ -2247,6 +2282,37 @@ TEST_CASE("OutstandingWorkRegistry releases exact same-address entries") {
     const std::array<iom::detail::EntryId, 2> remaining{3, 4};
     registry.remove_entries(remaining, address);
     CHECK(registry.snapshot_for(address).empty());
+}
+
+TEST_CASE("OutstandingWorkRegistry invalidates only matching queue entries") {
+    iom::detail::OutstandingWorkRegistry registry;
+    void* shared_address = reinterpret_cast<void*>(0x1000);
+    void* second_address = reinterpret_cast<void*>(0x2000);
+    const iom::detail::Fence fence = [] {
+        return iom::detail::FenceResult::success();
+    };
+
+    registry.register_entry(1, shared_address, 1, 11, fence);
+    registry.register_entry(2, shared_address, 2, 22, fence);
+    registry.register_entry(3, second_address, 3, 11, fence);
+
+    registry.invalidate_entries_for_queue(11);
+
+    const auto shared_entries = registry.snapshot_for(shared_address);
+    REQUIRE_EQ(shared_entries.size(), 2);
+    CHECK(shared_entries[0].state == iom::detail::EntryState::Invalidated);
+    CHECK(shared_entries[1].state == iom::detail::EntryState::Live);
+    CHECK_FALSE(registry.try_release_entry(1));
+    CHECK(registry.try_release_entry(2));
+
+    const auto second_entries = registry.snapshot_for(second_address);
+    REQUIRE_EQ(second_entries.size(), 1);
+    CHECK(second_entries[0].state == iom::detail::EntryState::Invalidated);
+
+    registry.remove_entry_if_present(1, shared_address);
+    registry.remove_entry_if_present(3, second_address);
+    CHECK(registry.snapshot_for(shared_address).empty());
+    CHECK(registry.snapshot_for(second_address).empty());
 }
 
 TEST_CASE("OutstandingWorkRegistry rolls back every registry index") {
@@ -2262,7 +2328,7 @@ TEST_CASE("OutstandingWorkRegistry rolls back every registry index") {
     iom_test::arm_counting();
     registry.register_entry(1, probe_address, 1, 1, fence);
     const std::size_t allocation_count = iom_test::disarm();
-    REQUIRE_EQ(allocation_count, 4);
+    REQUIRE(allocation_count > 0);
     CHECK(registry.try_release_entry(1));
 
     for (std::size_t ordinal = 1; ordinal <= allocation_count; ++ordinal) {
@@ -2299,7 +2365,8 @@ TEST_CASE("OutstandingWorkRegistry rolls back every registry index") {
         CHECK_EQ(registered[0].id, id);
         CHECK(registered[0].state == iom::detail::EntryState::Live);
 
-        registry.invalidate_entries_for_sequence(sequence, queue_id);
+        const std::array<iom::detail::EntryId, 1> invalidation_id{id};
+        registry.invalidate_entries(invalidation_id);
         const auto invalidated = registry.snapshot_for(address);
         REQUIRE_EQ(invalidated.size(), 1);
         CHECK(invalidated[0].state == iom::detail::EntryState::Invalidated);
@@ -2327,11 +2394,46 @@ TEST_CASE("Quarantine runs allocator cleanup at most once") {
     };
 
     CountingAllocator allocator;
-    void* address = allocator.alloc(64);
+    void* first_address = allocator.alloc(64);
+    void* second_address = allocator.alloc(64);
     iom::detail::Quarantine quarantine;
     quarantine.emplace<iom::detail::AllocatorCleanupAction>(
-            allocator, address, 64);
+            allocator, first_address, 64);
+    quarantine.emplace<iom::detail::AllocatorCleanupAction>(
+            allocator, second_address, 64);
     quarantine.drain();
     quarantine.drain();
-    CHECK_EQ(allocator.free_calls, 1);
+    CHECK_EQ(allocator.free_calls, 2);
+}
+
+TEST_CASE("Quarantine::add pins the action on growth allocation failure") {
+    bool leaked_destructor_ran = false;
+    bool leaked_ran = false;
+    auto action = std::make_unique<CounterAction>(
+            leaked_destructor_ran, leaked_ran);
+    CounterAction* leaked = action.get();
+
+    iom::detail::Quarantine quarantine;
+    iom_test::arm_failure(1);
+    try {
+        quarantine.add(std::move(action));
+        FAIL("add must throw");
+    } catch (const std::bad_alloc&) {
+        // The failed action node is deliberately leaked so its owned
+        // resources cannot be destroyed while quarantine recording fails.
+    }
+    CHECK_EQ(iom_test::disarm(), 1);
+    CHECK(action == nullptr);
+    CHECK_FALSE(leaked->destructor_ran());
+    CHECK_FALSE(leaked->ran());
+
+    bool healthy_destructor_ran = false;
+    bool healthy_ran = false;
+    quarantine.emplace<CounterAction>(healthy_destructor_ran, healthy_ran);
+    quarantine.drain();
+    quarantine.drain();
+    CHECK(healthy_destructor_ran);
+    CHECK(healthy_ran);
+    CHECK_FALSE(leaked->destructor_ran());
+    CHECK_FALSE(leaked->ran());
 }

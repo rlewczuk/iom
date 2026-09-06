@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "iom/outstanding_work_registry.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 
 namespace iom::cuda_detail {
 
