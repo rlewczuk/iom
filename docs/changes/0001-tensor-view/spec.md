@@ -421,7 +421,7 @@ public:
 }  // namespace iom
 ```
 
-`create_tensor` is an explicit caller action; compute and copy methods never allocate operands. It validates the specification and rejects unsupported types before allocating. `create_ops` returns one in-order asynchronous queue bound to the device. A caller may create multiple queues from one device and use tensors from that device on any of them. The `Device` and every caller-supplied allocator must outlive the tensors and queues that use them.
+`create_tensor` is an explicit caller action; compute and copy methods never allocate operands. It validates the specification and rejects unsupported types before allocating. `create_ops` returns one in-order asynchronous queue bound to the device. A caller may create multiple queues from one device and use tensors from that device on any of them. The Device must outlive every tensor and queue it created, and every caller-supplied allocator must outlive its Device.
 
 Calls on one `DeviceOps` queue are serialized by the caller; concurrent submission or waiting on the same queue is outside this contract. Different queues may be driven concurrently. A cross-queue dependency is established by waiting for the producer's `oid` on its originating queue before submitting the consumer.
 
@@ -446,10 +446,12 @@ The CPU, CUDA, ROCm, and SYCL device factories receive an `iom::Allocator` whose
 - a null return throws `std::bad_alloc` without calling `free`;
 - a non-null address that is not 32-byte aligned is freed once and rejected with `std::runtime_error`;
 - successful construction owns the returned allocation;
-- destruction calls `allocator.free(address)` exactly once;
+- destruction calls `allocator.free(address)` exactly once: at tensor destruction, or deferred to device destruction for storage quarantined because a queued operation referencing it failed or was invalidated;
 - failure after allocation frees the allocation before propagating the exception;
 - the injected allocator's `free` must not throw; `Allocator` lacks a `noexcept` declaration, but throwing from tensor destruction or construction cleanup is a caller contract violation;
 - host transfers, device copies, compute submission, and view transforms never call `alloc` or `free` on the configured tensor-storage allocator.
+
+Quarantined storage is released by the device destructor's quarantine drain, after all tensors and queues of that device are destroyed; this deferral is why the allocator must outlive the device.
 
 TTNN owns native materialized storage through its runtime and does not route that storage through `iom::Allocator`.
 
