@@ -2344,6 +2344,262 @@ TEST_CASE("OutstandingWorkRegistry rolls back every registry index") {
     }
 }
 
+TEST_CASE(
+        "release_or_quarantine releases storage only when every snapshot "
+        "fence succeeds") {
+    class CountingCleanup final : public iom::detail::CleanupAction {
+    public:
+        explicit CountingCleanup(int& run_count) noexcept
+                : run_count_(run_count) {}
+
+        void run() noexcept override {
+            ++run_count_;
+        }
+
+        [[nodiscard]] bool failed() const noexcept override {
+            return false;
+        }
+
+        [[nodiscard]] std::exception_ptr failure() const noexcept override {
+            return nullptr;
+        }
+
+    private:
+        int& run_count_;
+    };
+
+    const auto evaluate = [&](
+                                  iom::detail::OutstandingWorkRegistry& registry,
+                                  iom::detail::Quarantine& quarantine,
+                                  void* address, bool expect_quarantine) {
+        int make_calls = 0;
+        int release_calls = 0;
+        int cleanup_runs = 0;
+        iom::detail::release_or_quarantine(
+                registry, address,
+                [&] {
+                    ++make_calls;
+                    quarantine.emplace<CountingCleanup>(cleanup_runs);
+                },
+                [&] { ++release_calls; });
+
+        CHECK(registry.snapshot_for(address).empty());
+        if (expect_quarantine) {
+            CHECK_EQ(make_calls, 1);
+            CHECK_EQ(release_calls, 0);
+            CHECK_EQ(cleanup_runs, 0);
+            quarantine.drain();
+            CHECK_EQ(cleanup_runs, 1);
+            quarantine.drain();
+            CHECK_EQ(cleanup_runs, 1);
+        } else {
+            CHECK_EQ(make_calls, 0);
+            CHECK_EQ(release_calls, 1);
+            CHECK_EQ(cleanup_runs, 0);
+            quarantine.drain();
+            quarantine.drain();
+            CHECK_EQ(cleanup_runs, 0);
+        }
+    };
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        evaluate(
+                registry, quarantine, reinterpret_cast<void*>(0x3000), false);
+    }
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        void* address = reinterpret_cast<void*>(0x3100);
+        int fence_calls = 0;
+        const iom::detail::Fence fence = [&] {
+            ++fence_calls;
+            return iom::detail::FenceResult::success();
+        };
+        registry.register_entry(1, address, 1, 1, fence);
+        evaluate(registry, quarantine, address, false);
+        CHECK_EQ(fence_calls, 1);
+    }
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        void* address = reinterpret_cast<void*>(0x3200);
+        int fence_calls = 0;
+        const iom::detail::Fence fence = [&] {
+            ++fence_calls;
+            return iom::detail::FenceResult::success();
+        };
+        registry.register_entry(2, address, 1, 1, fence);
+        registry.register_entry(3, address, 2, 1, fence);
+        evaluate(registry, quarantine, address, false);
+        CHECK_EQ(fence_calls, 2);
+    }
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        void* address = reinterpret_cast<void*>(0x3300);
+        int fence_calls = 0;
+        const iom::detail::Fence fence = [&] {
+            ++fence_calls;
+            return iom::detail::FenceResult::success();
+        };
+        registry.register_entry(4, address, 1, 44, fence);
+        registry.invalidate_entries_for_queue(44);
+        const auto entries = registry.snapshot_for(address);
+        REQUIRE_EQ(entries.size(), 1);
+        CHECK(entries[0].state == iom::detail::EntryState::Invalidated);
+        evaluate(registry, quarantine, address, true);
+        CHECK_EQ(fence_calls, 0);
+    }
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        void* address = reinterpret_cast<void*>(0x3400);
+        int fence_calls = 0;
+        const iom::detail::Fence fence = [&] {
+            ++fence_calls;
+            return iom::detail::FenceResult::failed(
+                    std::make_exception_ptr(
+                            std::runtime_error("fence failed")));
+        };
+        registry.register_entry(5, address, 1, 1, fence);
+        evaluate(registry, quarantine, address, true);
+        CHECK_EQ(fence_calls, 1);
+    }
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        void* address = reinterpret_cast<void*>(0x3500);
+        int fence_calls = 0;
+        const iom::detail::Fence fence = [&]() -> iom::detail::FenceResult {
+            ++fence_calls;
+            throw std::runtime_error("fence threw");
+        };
+        registry.register_entry(6, address, 1, 1, fence);
+        evaluate(registry, quarantine, address, true);
+        CHECK_EQ(fence_calls, 1);
+    }
+
+    {
+        iom::detail::OutstandingWorkRegistry registry;
+        iom::detail::Quarantine quarantine;
+        void* address = reinterpret_cast<void*>(0x3600);
+        int live_fence_calls = 0;
+        const iom::detail::Fence live_fence = [&] {
+            ++live_fence_calls;
+            return iom::detail::FenceResult::success();
+        };
+        registry.register_entry(7, address, 1, 70, live_fence);
+        registry.register_entry(8, address, 2, 71, live_fence);
+        registry.invalidate_entries_for_queue(71);
+        const auto entries = registry.snapshot_for(address);
+        REQUIRE_EQ(entries.size(), 2);
+        CHECK(entries[0].state == iom::detail::EntryState::Live);
+        CHECK(entries[1].state == iom::detail::EntryState::Invalidated);
+        evaluate(registry, quarantine, address, true);
+        CHECK_EQ(live_fence_calls, 1);
+    }
+}
+
+TEST_CASE(
+        "register_registry_entries rolls back the source entry when the "
+        "destination registration throws") {
+    static int fence_calls = 0;
+    fence_calls = 0;
+    const iom::detail::Fence fence = [] {
+        ++fence_calls;
+        return iom::detail::FenceResult::success();
+    };
+
+    iom::detail::OutstandingWorkRegistry registry;
+    void* source_address = reinterpret_cast<void*>(0x3700);
+    void* destination_address = reinterpret_cast<void*>(0x3800);
+    iom::detail::EntryId next_entry_id = 5;
+    registry.register_entry(6, destination_address, 1, 1, fence);
+
+    CHECK_THROWS_AS(
+            iom::detail::register_registry_entries(
+                    registry, next_entry_id, 1, 1, source_address,
+                    destination_address, fence),
+            std::invalid_argument);
+    CHECK(registry.snapshot_for(source_address).empty());
+    CHECK_FALSE(registry.try_release_entry(5));
+    CHECK_EQ(fence_calls, 0);
+    const auto destination_entries = registry.snapshot_for(destination_address);
+    REQUIRE_EQ(destination_entries.size(), 1);
+    CHECK_EQ(destination_entries[0].id, 6);
+    CHECK(destination_entries[0].state == iom::detail::EntryState::Live);
+
+    registry.remove_entry_if_present(6, destination_address);
+    next_entry_id = 5;
+    const iom::detail::EntryRegistration registration =
+            iom::detail::register_registry_entries(
+                    registry, next_entry_id, 1, 1, source_address,
+                    destination_address, fence);
+    CHECK_EQ(registration.source, 5);
+    CHECK_EQ(registration.destination, 6);
+    CHECK_EQ(next_entry_id, 7);
+    CHECK_EQ(fence_calls, 0);
+    CHECK_EQ(registry.snapshot_for(source_address).size(), 1);
+    CHECK_EQ(registry.snapshot_for(destination_address).size(), 1);
+
+    registry.remove_entry_if_present(5, source_address);
+    registry.remove_entry_if_present(6, destination_address);
+    CHECK(registry.snapshot_for(source_address).empty());
+    CHECK(registry.snapshot_for(destination_address).empty());
+
+    next_entry_id = std::numeric_limits<iom::detail::EntryId>::max();
+    CHECK_THROWS_AS(
+            iom::detail::register_registry_entries(
+                    registry, next_entry_id, 1, 1, source_address,
+                    destination_address, fence),
+            std::overflow_error);
+    CHECK_EQ(
+            next_entry_id,
+            std::numeric_limits<iom::detail::EntryId>::max());
+    CHECK(registry.snapshot_for(source_address).empty());
+    CHECK(registry.snapshot_for(destination_address).empty());
+}
+
+TEST_CASE(
+        "registry release tolerates the destructor-versus-completion race") {
+    iom::detail::OutstandingWorkRegistry registry;
+    void* completion_address = reinterpret_cast<void*>(0x3900);
+    void* destructor_address = reinterpret_cast<void*>(0x3A00);
+    int fence_calls = 0;
+    const iom::detail::Fence fence = [&] {
+        ++fence_calls;
+        return iom::detail::FenceResult::success();
+    };
+
+    registry.register_entry(9, completion_address, 1, 1, fence);
+    const auto completion_snapshot = registry.snapshot_for(completion_address);
+    REQUIRE_EQ(completion_snapshot.size(), 1);
+    CHECK(registry.try_release_entry(9));
+    CHECK_NOTHROW(completion_snapshot[0].fence());
+    CHECK_EQ(fence_calls, 1);
+    CHECK_NOTHROW(
+            registry.remove_entry_if_present(9, completion_address));
+    CHECK_FALSE(registry.try_release_entry(9));
+    CHECK(registry.snapshot_for(completion_address).empty());
+
+    registry.register_entry(10, destructor_address, 2, 1, fence);
+    const auto destructor_snapshot = registry.snapshot_for(destructor_address);
+    REQUIRE_EQ(destructor_snapshot.size(), 1);
+    CHECK_NOTHROW(destructor_snapshot[0].fence());
+    CHECK_EQ(fence_calls, 2);
+    CHECK_NOTHROW(
+            registry.remove_entry_if_present(10, destructor_address));
+    CHECK_FALSE(registry.try_release_entry(10));
+    CHECK(registry.snapshot_for(destructor_address).empty());
+}
+
 TEST_CASE("Quarantine runs allocator cleanup at most once") {
     class CountingAllocator final : public iom::Allocator {
     public:

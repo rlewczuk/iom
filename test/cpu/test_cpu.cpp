@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <span>
+#include <new>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -82,6 +82,82 @@ public:
 
 private:
     std::unordered_map<void*, void*> live_;
+};
+
+class RecyclingAllocator final : public iom::Allocator {
+public:
+    using Event = RecordingAllocator::Event;
+
+    struct Slot {
+        void* address;
+        std::size_t bytes;
+    };
+
+    ~RecyclingAllocator() override {
+        release_free();
+        for (const auto& [address, bytes] : live_) {
+            (void)bytes;
+            ::operator delete(address, std::align_val_t(32));
+        }
+    }
+
+    std::vector<Event> events;
+
+    void* alloc(std::size_t size) override {
+        for (auto it = free_.begin(); it != free_.end(); ++it) {
+            if (it->bytes != size) {
+                continue;
+            }
+            void* address = it->address;
+            live_.emplace(address, size);
+            free_.erase(it);
+            events.push_back({Event::Kind::alloc, address, size});
+            return address;
+        }
+
+        void* address = ::operator new(size, std::align_val_t(32));
+        try {
+            live_.emplace(address, size);
+        } catch (...) {
+            ::operator delete(address, std::align_val_t(32));
+            throw;
+        }
+        events.push_back({Event::Kind::alloc, address, size});
+        return address;
+    }
+
+    void free(void* buffer) override {
+        const auto found = live_.find(buffer);
+        REQUIRE_MESSAGE(found != live_.end(),
+                        "allocator freed an address it never handed out");
+        const std::size_t bytes = found->second;
+        free_.push_back({buffer, bytes});
+        events.push_back({Event::Kind::free, buffer, bytes});
+        live_.erase(found);
+    }
+
+    void reset() override {
+        events.push_back({Event::Kind::reset, nullptr, 0});
+    }
+
+    void release_free() noexcept {
+        for (const Slot& slot : free_) {
+            ::operator delete(slot.address, std::align_val_t(32));
+        }
+        free_.clear();
+    }
+
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return free_.size();
+    }
+
+    [[nodiscard]] bool live_empty() const noexcept {
+        return live_.empty();
+    }
+
+private:
+    std::vector<Slot> free_;
+    std::unordered_map<void*, std::size_t> live_;
 };
 
 // ---------------------------------------------------------------------------
@@ -869,6 +945,217 @@ TEST_CASE("CPU rank-two views transfer through empty transforms") {
 // Asynchronous copies
 // ---------------------------------------------------------------------------
 
+
+TEST_CASE(
+        "CPU tensor destruction before wait fences queued work under address "
+        "recycling") {
+    enum class DestroyRole { source, destination, both };
+    const iom::TensorSpec spec =
+            make_spec({2, 3, 16, 16}, iom::DataType::U8);
+    const std::vector<std::byte> poison(
+            spec.logical_nbytes(), std::byte{0xC5});
+
+    for (const DestroyRole role :
+         {DestroyRole::source, DestroyRole::destination, DestroyRole::both}) {
+        RecyclingAllocator allocator;
+        auto device = iom::make_cpu_device(allocator);
+        auto source = device->create_tensor(spec);
+        auto destination = device->create_tensor(spec);
+        auto queue = device->create_ops();
+
+        const std::vector<std::byte> source_host =
+                encoded_host(source->view(), 101);
+        source->view().copy_from_host(source_host);
+        fill_storage(*destination, kSentinel);
+
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        const void* source_address = source->view().native_handle();
+        const void* destination_address =
+                destination->view().native_handle();
+        const std::size_t events_before_destroy = allocator.events.size();
+
+        if (role == DestroyRole::source || role == DestroyRole::both) {
+            source.reset();
+        }
+        if (role == DestroyRole::destination || role == DestroyRole::both) {
+            destination.reset();
+        }
+
+        const std::size_t destroyed_count =
+                role == DestroyRole::both ? 2 : 1;
+        CHECK_EQ(
+                allocator.events.size(),
+                events_before_destroy + destroyed_count);
+        const auto free_count_for = [&](const void* address) {
+            return std::count_if(
+                    allocator.events.begin(), allocator.events.end(),
+                    [address](const RecyclingAllocator::Event& event) {
+                        return event.kind
+                                        == RecyclingAllocator::Event::Kind::free
+                                && event.address == address;
+                    });
+        };
+        if (role == DestroyRole::source || role == DestroyRole::both) {
+            CHECK_EQ(free_count_for(source_address), 1);
+        }
+        if (role == DestroyRole::destination || role == DestroyRole::both) {
+            CHECK_EQ(free_count_for(destination_address), 1);
+        }
+
+        auto fresh_source = std::unique_ptr<iom::Tensor>{};
+        auto fresh_destination = std::unique_ptr<iom::Tensor>{};
+        if (role == DestroyRole::source) {
+            fresh_source = device->create_tensor(spec);
+            REQUIRE_EQ(
+                    fresh_source->view().native_handle(), source_address);
+            fill_storage(*fresh_source, std::byte{0xC5});
+        } else if (role == DestroyRole::destination) {
+            fresh_destination = device->create_tensor(spec);
+            REQUIRE_EQ(
+                    fresh_destination->view().native_handle(),
+                    destination_address);
+            fill_storage(*fresh_destination, std::byte{0xC5});
+        } else {
+            fresh_source = device->create_tensor(spec);
+            fresh_destination = device->create_tensor(spec);
+            REQUIRE_EQ(
+                    fresh_source->view().native_handle(), source_address);
+            REQUIRE_EQ(
+                    fresh_destination->view().native_handle(),
+                    destination_address);
+            CHECK_NE(
+                    fresh_source->view().native_handle(),
+                    fresh_destination->view().native_handle());
+            fill_storage(*fresh_source, std::byte{0xC5});
+            fill_storage(*fresh_destination, std::byte{0xC5});
+        }
+
+        const std::size_t events_before_wait = allocator.events.size();
+        queue->wait(token);
+        queue->wait(token);
+        CHECK_EQ(allocator.events.size(), events_before_wait);
+        if (role == DestroyRole::source) {
+            std::vector<std::byte> readback(source_host.size());
+            destination->view().copy_to_host(readback);
+            CHECK(readback == source_host);
+            std::vector<std::byte> fresh_readback(poison.size());
+            fresh_source->view().copy_to_host(fresh_readback);
+            CHECK(fresh_readback == poison);
+        } else if (role == DestroyRole::destination) {
+            std::vector<std::byte> readback(source_host.size());
+            source->view().copy_to_host(readback);
+            CHECK(readback == source_host);
+            std::vector<std::byte> fresh_readback(poison.size());
+            fresh_destination->view().copy_to_host(fresh_readback);
+            CHECK(fresh_readback == poison);
+        } else {
+            std::vector<std::byte> fresh_source_readback(poison.size());
+            std::vector<std::byte> fresh_destination_readback(poison.size());
+            fresh_source->view().copy_to_host(fresh_source_readback);
+            fresh_destination->view().copy_to_host(
+                    fresh_destination_readback);
+            CHECK(fresh_source_readback == poison);
+            CHECK(fresh_destination_readback == poison);
+        }
+
+        const std::size_t events_before_queue_reset = allocator.events.size();
+        queue.reset();
+        CHECK_EQ(allocator.events.size(), events_before_queue_reset);
+        if (role == DestroyRole::source || role == DestroyRole::both) {
+            CHECK_EQ(free_count_for(source_address), 1);
+        }
+        if (role == DestroyRole::destination || role == DestroyRole::both) {
+            CHECK_EQ(free_count_for(destination_address), 1);
+        }
+
+        fresh_source.reset();
+        fresh_destination.reset();
+        if (role == DestroyRole::source) {
+            CHECK_EQ(free_count_for(source_address), 2);
+        } else if (role == DestroyRole::destination) {
+            CHECK_EQ(free_count_for(destination_address), 2);
+        } else {
+            CHECK_EQ(free_count_for(source_address), 2);
+            CHECK_EQ(free_count_for(destination_address), 2);
+        }
+        source.reset();
+        destination.reset();
+
+        const std::size_t events_before_device_reset = allocator.events.size();
+        device.reset();
+        CHECK_EQ(allocator.events.size(), events_before_device_reset);
+        allocator.release_free();
+        CHECK_EQ(allocator.free_count(), 0);
+        CHECK(allocator.live_empty());
+    }
+}
+
+TEST_CASE(
+        "CPU queue destruction with unwaited tokens keeps frees exactly once") {
+    RecyclingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    const iom::TensorSpec spec =
+            make_spec({2, 3, 16, 16}, iom::DataType::U8);
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    const std::vector<std::byte> source_host =
+            encoded_host(source->view(), 202);
+    source->view().copy_from_host(source_host);
+    fill_storage(*destination, kSentinel);
+
+    auto queue = device->create_ops();
+    const iom::oid first = queue->copy(source->view(), destination->view());
+    const iom::oid second = queue->copy(destination->view(), source->view());
+    CHECK_EQ(token_sequence(first), 1);
+    CHECK_EQ(token_sequence(second), 2);
+    const void* source_address = source->view().native_handle();
+    const void* destination_address =
+            destination->view().native_handle();
+
+    queue.reset();
+    const std::size_t events_after_queue_reset = allocator.events.size();
+    source.reset();
+    destination.reset();
+    const auto free_count_for = [&](const void* address) {
+        return std::count_if(
+                allocator.events.begin(), allocator.events.end(),
+                [address](const RecyclingAllocator::Event& event) {
+                    return event.kind
+                                    == RecyclingAllocator::Event::Kind::free
+                            && event.address == address;
+                });
+    };
+    CHECK_EQ(free_count_for(source_address), 1);
+    CHECK_EQ(free_count_for(destination_address), 1);
+    CHECK_EQ(allocator.events.size(), events_after_queue_reset + 2);
+
+    auto next_queue = device->create_ops();
+    auto next_source = device->create_tensor(spec);
+    auto next_destination = device->create_tensor(spec);
+    REQUIRE_EQ(next_source->view().native_handle(), source_address);
+    REQUIRE_EQ(next_destination->view().native_handle(), destination_address);
+    next_source->view().copy_from_host(
+            encoded_host(next_source->view(), 303));
+    fill_storage(*next_destination, kSentinel);
+    const iom::oid next = next_queue->copy(
+            next_source->view(), next_destination->view());
+    next_queue->wait(next);
+    next_queue->wait(next);
+    std::vector<std::byte> readback(spec.logical_nbytes());
+    next_destination->view().copy_to_host(readback);
+    CHECK(readback == encoded_host(next_source->view(), 303));
+
+    next_source.reset();
+    next_destination.reset();
+    next_queue.reset();
+    const std::size_t events_before_device_reset = allocator.events.size();
+    device.reset();
+    CHECK_EQ(allocator.events.size(), events_before_device_reset);
+    allocator.release_free();
+    CHECK_EQ(allocator.free_count(), 0);
+    CHECK(allocator.live_empty());
+}
 TEST_CASE("CPU queue executes submissions in call order") {
     RecordingAllocator allocator;
     auto device = iom::make_cpu_device(allocator);
