@@ -304,6 +304,16 @@ if(CUDA_ENABLED OR ROCM_ENABLED OR TTNN_ENABLED OR SYCL_ENABLED)
             backend/test_backend_coexistence.cpp
     )
 
+    if(SYCL_ENABLED AND ROCM_ENABLED)
+        # A HIP object in the link graph otherwise makes CMake select
+        # clang-linker-wrapper, which cannot link DPC++ SYCL objects with
+        # oneAPI SDKs that do not ship libLLVMSYCL.so. Keep the final link
+        # on the DPC++ driver so it uses the installed libsycl runtime.
+        set_property(TARGET iom_backend_coexistence_tests
+            PROPERTY LINKER_LANGUAGE CXX
+        )
+    endif()
+
     set_source_files_properties(backend/test_backend_coexistence.cpp PROPERTIES
         COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
     )
