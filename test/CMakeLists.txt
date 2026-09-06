@@ -49,182 +49,145 @@ set_source_files_properties(cpu/test_cpu_bench.cpp PROPERTIES
 
 add_test(NAME iom_cpu_bench COMMAND iom_cpu_bench)
 
-if(ROCM_ENABLED)
-    add_executable(iom_rocm_smoke_tests
-            rocm/test_rocm_smoke.cpp
+function(add_iom_backend_tests name)
+    cmake_parse_arguments(PARSE_ARGV 1 arg
+        ""
+        "BACKEND_LIBRARY;CONFORMANCE_DOCTEST_CONFIG"
+        "SMOKE_MAIN_SOURCE;CONFORMANCE_MAIN_SOURCE;SMOKE_SOURCES;CONFORMANCE_SOURCES;COMPILE_DEFINITIONS;SMOKE_INCLUDE_DIRS;CONFORMANCE_INCLUDE_DIRS;COMPILE_OPTIONS;LINK_OPTIONS;RUNTIME_LIBRARIES")
+
+    if(NOT DEFINED arg_CONFORMANCE_DOCTEST_CONFIG)
+        set(arg_CONFORMANCE_DOCTEST_CONFIG DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+    endif()
+
+    add_executable(iom_${name}_smoke_tests
+        ${arg_SMOKE_SOURCES}
+    )
+    add_executable(iom_${name}_conformance_tests
+        ${arg_CONFORMANCE_SOURCES}
     )
 
-    set_source_files_properties(rocm/test_rocm_smoke.cpp PROPERTIES
+    set_source_files_properties(${arg_SMOKE_MAIN_SOURCE} PROPERTIES
         COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
     )
-
-    target_compile_definitions(iom_rocm_smoke_tests
-        PRIVATE
-            __HIP_PLATFORM_AMD__
-    )
-    target_include_directories(iom_rocm_smoke_tests
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/src/rocm
+    set_source_files_properties(${arg_CONFORMANCE_MAIN_SOURCE} PROPERTIES
+        COMPILE_DEFINITIONS ${arg_CONFORMANCE_DOCTEST_CONFIG}
     )
 
-    target_link_libraries(iom_rocm_smoke_tests
+    if(arg_COMPILE_DEFINITIONS)
+        target_compile_definitions(iom_${name}_smoke_tests
+            PRIVATE
+                ${arg_COMPILE_DEFINITIONS}
+        )
+        target_compile_definitions(iom_${name}_conformance_tests
+            PRIVATE
+                ${arg_COMPILE_DEFINITIONS}
+        )
+    endif()
+
+    if(arg_SMOKE_INCLUDE_DIRS)
+        target_include_directories(iom_${name}_smoke_tests
+            PRIVATE
+                ${arg_SMOKE_INCLUDE_DIRS}
+        )
+    endif()
+    if(arg_CONFORMANCE_INCLUDE_DIRS)
+        target_include_directories(iom_${name}_conformance_tests
+            PRIVATE
+                ${arg_CONFORMANCE_INCLUDE_DIRS}
+        )
+    endif()
+
+    if(arg_COMPILE_OPTIONS)
+        target_compile_options(iom_${name}_smoke_tests
+            PRIVATE
+                ${arg_COMPILE_OPTIONS}
+        )
+        target_compile_options(iom_${name}_conformance_tests
+            PRIVATE
+                ${arg_COMPILE_OPTIONS}
+        )
+    endif()
+    if(arg_LINK_OPTIONS)
+        target_link_options(iom_${name}_smoke_tests
+            PRIVATE
+                ${arg_LINK_OPTIONS}
+        )
+        target_link_options(iom_${name}_conformance_tests
+            PRIVATE
+                ${arg_LINK_OPTIONS}
+        )
+    endif()
+
+    target_link_libraries(iom_${name}_smoke_tests
         PRIVATE
             doctest::doctest
-            iom_rocm
-            hip::host
+            ${arg_BACKEND_LIBRARY}
     )
-
-    add_test(NAME iom_rocm_smoke_tests COMMAND iom_rocm_smoke_tests)
-    add_executable(iom_rocm_conformance_tests
-            rocm/test_rocm_conformance.cpp
-    )
-
-    set_source_files_properties(rocm/test_rocm_conformance.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT
-    )
-
-    target_compile_definitions(iom_rocm_conformance_tests
-        PRIVATE
-            __HIP_PLATFORM_AMD__
-    )
-
-    target_include_directories(iom_rocm_conformance_tests
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${PROJECT_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(iom_rocm_conformance_tests
+    target_link_libraries(iom_${name}_conformance_tests
         PRIVATE
             doctest::doctest
-            iom_rocm
+            ${arg_BACKEND_LIBRARY}
             libiom
-            hip::host
     )
 
-    add_test(NAME iom_rocm_conformance_tests
-             COMMAND iom_rocm_conformance_tests)
+    if(arg_RUNTIME_LIBRARIES)
+        target_link_libraries(iom_${name}_smoke_tests
+            PRIVATE
+                ${arg_RUNTIME_LIBRARIES}
+        )
+        target_link_libraries(iom_${name}_conformance_tests
+            PRIVATE
+                ${arg_RUNTIME_LIBRARIES}
+        )
+    endif()
+
+    add_test(NAME iom_${name}_smoke_tests COMMAND iom_${name}_smoke_tests)
+    add_test(NAME iom_${name}_conformance_tests COMMAND iom_${name}_conformance_tests)
+endfunction()
+
+if(ROCM_ENABLED)
+    add_iom_backend_tests(rocm
+        SMOKE_MAIN_SOURCE rocm/test_rocm_smoke.cpp
+        CONFORMANCE_MAIN_SOURCE rocm/test_rocm_conformance.cpp
+        SMOKE_SOURCES rocm/test_rocm_smoke.cpp
+        CONFORMANCE_SOURCES rocm/test_rocm_conformance.cpp
+        COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__
+        SMOKE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src/rocm
+        CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
+        BACKEND_LIBRARY iom_rocm
+        RUNTIME_LIBRARIES hip::host
+        CONFORMANCE_DOCTEST_CONFIG DOCTEST_CONFIG_IMPLEMENT
+    )
 endif()
 
 if(CUDA_ENABLED)
-    add_executable(iom_cuda_smoke_tests
-            cuda/test_cuda_smoke.cpp
+    add_iom_backend_tests(cuda
+        SMOKE_MAIN_SOURCE cuda/test_cuda_smoke.cpp
+        CONFORMANCE_MAIN_SOURCE cuda/test_cuda_conformance.cpp
+        SMOKE_SOURCES cuda/test_cuda_smoke.cpp
+        CONFORMANCE_SOURCES cuda/test_cuda_conformance.cpp
+        SMOKE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src/cuda
+        CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
+        BACKEND_LIBRARY iom_cuda
+        RUNTIME_LIBRARIES CUDA::cuda_driver
     )
-
-    set_source_files_properties(cuda/test_cuda_smoke.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-
-
-    target_include_directories(iom_cuda_smoke_tests
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/src/cuda
-    )
-    target_link_libraries(iom_cuda_smoke_tests
-        PRIVATE
-            doctest::doctest
-            iom_cuda
-            CUDA::cuda_driver
-    )
-
-    add_test(NAME iom_cuda_smoke_tests COMMAND iom_cuda_smoke_tests)
-    add_executable(iom_cuda_conformance_tests
-            cuda/test_cuda_conformance.cpp
-    )
-
-    set_source_files_properties(cuda/test_cuda_conformance.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-
-    target_include_directories(iom_cuda_conformance_tests
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${PROJECT_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(iom_cuda_conformance_tests
-        PRIVATE
-            doctest::doctest
-            iom_cuda
-            libiom
-            CUDA::cuda_driver
-    )
-
-    add_test(NAME iom_cuda_conformance_tests
-             COMMAND iom_cuda_conformance_tests)
 endif()
-
 
 if(SYCL_ENABLED)
-    add_executable(iom_sycl_smoke_tests
-            sycl/test_sycl_smoke.cpp
+    add_iom_backend_tests(sycl
+        SMOKE_MAIN_SOURCE sycl/test_sycl_smoke.cpp
+        CONFORMANCE_MAIN_SOURCE sycl/test_sycl_conformance.cpp
+        SMOKE_SOURCES sycl/test_sycl_smoke.cpp
+        CONFORMANCE_SOURCES sycl/test_sycl_conformance.cpp
+        SMOKE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src/sycl ${IOM_SYCL_INCLUDE_DIR}
+        CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/sycl ${IOM_SYCL_INCLUDE_DIR}
+        COMPILE_OPTIONS -fsycl
+        LINK_OPTIONS -fsycl
+        BACKEND_LIBRARY iom_sycl
+        RUNTIME_LIBRARIES
     )
-
-    set_source_files_properties(sycl/test_sycl_smoke.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-
-    target_include_directories(iom_sycl_smoke_tests
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/src/sycl
-            ${IOM_SYCL_INCLUDE_DIR}
-    )
-
-    target_compile_options(iom_sycl_smoke_tests
-        PRIVATE
-            -fsycl
-    )
-
-    target_link_options(iom_sycl_smoke_tests
-        PRIVATE
-            -fsycl
-    )
-
-    target_link_libraries(iom_sycl_smoke_tests
-        PRIVATE
-            doctest::doctest
-            iom_sycl
-    )
-
-    add_test(NAME iom_sycl_smoke_tests
-             COMMAND iom_sycl_smoke_tests)
-
-    add_executable(iom_sycl_conformance_tests
-            sycl/test_sycl_conformance.cpp
-    )
-
-    set_source_files_properties(sycl/test_sycl_conformance.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-
-    target_include_directories(iom_sycl_conformance_tests
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${PROJECT_SOURCE_DIR}/src
-            ${PROJECT_SOURCE_DIR}/src/sycl
-            ${IOM_SYCL_INCLUDE_DIR}
-    )
-
-    target_compile_options(iom_sycl_conformance_tests
-        PRIVATE
-            -fsycl
-    )
-
-    target_link_options(iom_sycl_conformance_tests
-        PRIVATE
-            -fsycl
-    )
-
-    target_link_libraries(iom_sycl_conformance_tests
-        PRIVATE
-            doctest::doctest
-            iom_sycl
-            libiom
-    )
-
-    add_test(NAME iom_sycl_conformance_tests
-             COMMAND iom_sycl_conformance_tests)
 endif()
+
 
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
@@ -248,48 +211,15 @@ target_link_libraries(iom_backend_conformance_cpu_tests
 add_test(NAME iom_backend_conformance_cpu_tests COMMAND iom_backend_conformance_cpu_tests)
 
 if(TTNN_ENABLED)
-    add_executable(iom_ttnn_smoke_tests
-            ttnn/test_ttnn_smoke.cpp
+    add_iom_backend_tests(ttnn
+        SMOKE_MAIN_SOURCE ttnn/test_ttnn_smoke.cpp
+        CONFORMANCE_MAIN_SOURCE ttnn/test_ttnn_conformance.cpp
+        SMOKE_SOURCES ttnn/test_ttnn_smoke.cpp
+        CONFORMANCE_SOURCES ttnn/test_ttnn_conformance.cpp
+        CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
+        BACKEND_LIBRARY iom_ttnn
+        RUNTIME_LIBRARIES TT::Metalium TTNN::TTNN
     )
-
-    set_source_files_properties(ttnn/test_ttnn_smoke.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-
-    target_link_libraries(iom_ttnn_smoke_tests
-        PRIVATE
-            doctest::doctest
-            iom_ttnn
-            TT::Metalium
-            TTNN::TTNN
-    )
-
-    add_test(NAME iom_ttnn_smoke_tests COMMAND iom_ttnn_smoke_tests)
-
-    add_executable(iom_ttnn_conformance_tests
-            ttnn/test_ttnn_conformance.cpp
-    )
-
-    set_source_files_properties(ttnn/test_ttnn_conformance.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-
-    target_include_directories(iom_ttnn_conformance_tests
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-
-    target_link_libraries(iom_ttnn_conformance_tests
-        PRIVATE
-            doctest::doctest
-            iom_ttnn
-            libiom
-            TT::Metalium
-            TTNN::TTNN
-    )
-
-    add_test(NAME iom_ttnn_conformance_tests
-             COMMAND iom_ttnn_conformance_tests)
 endif()
 
 # Combined coexistence executable (change 0001-tensor-view / 15): one

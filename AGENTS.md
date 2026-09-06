@@ -34,3 +34,10 @@ IOM is an inference-only C++20 engine for sparse, oversized language models. Com
 - CPU work may run locally. For accelerator build, test, or execution, follow the `remote-development` skill; do not duplicate its procedure here.
 - After each non-trivial change, run the backend conformance suite for all backends
 - Treat applicable change specifications as acceptance criteria.
+
+## SYCL Remote Verification
+
+- The configured SYCL host setup sources `/opt/intel/oneapi/setvars.sh`; it must be sourced with nounset disabled because `compiler/latest/env/vars.sh` reads `OCL_ICD_FILENAMES` before defining it.
+- For `remote-exec`, use a profile override without `REMOTE_SETUP`, then initialize the toolchain inside the command:
+  `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-setvars.log 2>&1; set -u;`
+- Preserve the runtime environment for `sycl-ls`, CMake, and CTest. `sycl-ls` should enumerate the Level Zero GPU devices before running `iom_sycl_smoke_tests`.
