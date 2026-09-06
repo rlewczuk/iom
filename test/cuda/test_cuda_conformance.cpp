@@ -355,7 +355,7 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     CudaDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate);
+            &devices.gate, "CUDA");
     CHECK_FALSE(devices.gate.armed());
 }
 

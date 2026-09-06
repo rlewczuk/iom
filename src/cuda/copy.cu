@@ -218,25 +218,8 @@ public:
                 });
     }
 
-    oid add(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("CUDA", "add");
-    }
-    oid mul(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("CUDA", "mul");
-    }
-    oid silu(const TensorView&, TensorView&) override {
-        throw unsupported("CUDA", "silu");
-    }
-    oid linear(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("CUDA", "linear");
-    }
-    oid rmsnorm(const TensorView&, TensorView&, const TensorView&, float,
-                size_t) override {
-        throw unsupported("CUDA", "rmsnorm");
-    }
-    oid sdpa(const TensorView&, const TensorView&, const TensorView&,
-             size_t, size_t, size_t, TensorView&) override {
-        throw unsupported("CUDA", "sdpa");
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "CUDA";
     }
 
 private:

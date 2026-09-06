@@ -568,32 +568,8 @@ public:
                 });
     }
 
-    oid add(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("SYCL", "add");
-    }
-
-    oid mul(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("SYCL", "mul");
-    }
-
-    oid silu(const TensorView&, TensorView&) override {
-        throw unsupported("SYCL", "silu");
-    }
-
-    oid linear(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("SYCL", "linear");
-    }
-
-    oid rmsnorm(
-            const TensorView&, TensorView&, const TensorView&, float,
-            size_t) override {
-        throw unsupported("SYCL", "rmsnorm");
-    }
-
-    oid sdpa(
-            const TensorView&, const TensorView&, const TensorView&, size_t,
-            size_t, size_t, TensorView&) override {
-        throw unsupported("SYCL", "sdpa");
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "SYCL";
     }
 
 private:

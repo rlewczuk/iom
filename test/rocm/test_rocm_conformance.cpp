@@ -501,7 +501,7 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
     HipAllocator candidate_allocator(gate);
     auto candidate = iom::make_rocm_device(0, candidate_allocator);
     iom_conformance::run_compute_capability_conformance(
-            *candidate, candidate->supported_data_types(), &gate);
+            *candidate, candidate->supported_data_types(), &gate, "ROCm");
     CHECK_FALSE(gate.armed());
 }
 

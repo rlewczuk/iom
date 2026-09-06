@@ -271,7 +271,7 @@ TEST_CASE("CPU conformance: compute methods reject capability without submitting
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate);
+            &devices.gate, "CPU");
     CHECK_FALSE(devices.gate.armed());
 }
 

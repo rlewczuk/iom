@@ -721,7 +721,7 @@ TEST_CASE("SYCL conformance: compute methods reject capability without submittin
     SyclDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate);
+            &devices.gate, "SYCL");
     CHECK_FALSE(devices.gate.armed());
 }
 

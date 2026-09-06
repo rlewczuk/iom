@@ -127,25 +127,8 @@ public:
         CHECK_EQ(record->destination_handle, destination.native_handle());
     }
 
-    iom::oid add(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("deferred fake does not implement add");
-    }
-    iom::oid mul(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("deferred fake does not implement mul");
-    }
-    iom::oid silu(const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("deferred fake does not implement silu");
-    }
-    iom::oid linear(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("deferred fake does not implement linear");
-    }
-    iom::oid rmsnorm(const iom::TensorView&, iom::TensorView&, const iom::TensorView&,
-                     float, size_t) override {
-        throw std::runtime_error("deferred fake does not implement rmsnorm");
-    }
-    iom::oid sdpa(const iom::TensorView&, const iom::TensorView&, const iom::TensorView&,
-                  size_t, size_t, size_t, iom::TensorView&) override {
-        throw std::runtime_error("deferred fake does not implement sdpa");
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "deferred";
     }
 
 private:
@@ -203,25 +186,8 @@ public:
     iom::oid copy(const iom::TensorView&, iom::TensorView&) override {
         return probe();
     }
-    iom::oid add(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("instrumented queue does not implement add");
-    }
-    iom::oid mul(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("instrumented queue does not implement mul");
-    }
-    iom::oid silu(const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("instrumented queue does not implement silu");
-    }
-    iom::oid linear(const iom::TensorView&, const iom::TensorView&, iom::TensorView&) override {
-        throw std::runtime_error("instrumented queue does not implement linear");
-    }
-    iom::oid rmsnorm(const iom::TensorView&, iom::TensorView&, const iom::TensorView&,
-                     float, size_t) override {
-        throw std::runtime_error("instrumented queue does not implement rmsnorm");
-    }
-    iom::oid sdpa(const iom::TensorView&, const iom::TensorView&, const iom::TensorView&,
-                  size_t, size_t, size_t, iom::TensorView&) override {
-        throw std::runtime_error("instrumented queue does not implement sdpa");
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "instrumented";
     }
 
 private:
@@ -446,7 +412,8 @@ inline void run_lifetime_conformance(
 inline void run_compute_capability_conformance(
         iom::Device& candidate,
         const std::span<const iom::DataType>,  // capability, not type-specific
-        ConformanceObserver* observer = nullptr) {
+        ConformanceObserver* observer = nullptr,
+        std::string_view backend_label = {}) {
     const iom::TensorSpec spec{iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     auto x = candidate.create_tensor(spec);
     auto y = candidate.create_tensor(spec);
@@ -463,20 +430,66 @@ inline void run_compute_capability_conformance(
     attn->view().copy_from_host(attn_pattern);
 
     auto queue = candidate.create_ops();
-    CHECK_THROWS_AS(queue->add(x->view(), x->view(), y->view()),
-                    std::runtime_error);
-    CHECK_THROWS_AS(queue->mul(x->view(), x->view(), y->view()),
-                    std::runtime_error);
-    CHECK_THROWS_AS(queue->silu(x->view(), y->view()), std::runtime_error);
-    CHECK_THROWS_AS(queue->linear(x->view(), w->view(), y->view()),
-                    std::runtime_error);
-    CHECK_THROWS_AS(
-            queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
-            std::runtime_error);
-    CHECK_THROWS_AS(
-            queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
-                        attn->view()),
-            std::runtime_error);
+    if (backend_label.empty()) {
+        CHECK_THROWS_AS(queue->add(x->view(), x->view(), y->view()),
+                        std::runtime_error);
+    } else {
+        const std::string expected =
+                std::string(backend_label) + " backend does not implement add";
+        CHECK_THROWS_WITH_AS(queue->add(x->view(), x->view(), y->view()),
+                             expected.c_str(), std::runtime_error);
+    }
+    if (backend_label.empty()) {
+        CHECK_THROWS_AS(queue->mul(x->view(), x->view(), y->view()),
+                        std::runtime_error);
+    } else {
+        const std::string expected =
+                std::string(backend_label) + " backend does not implement mul";
+        CHECK_THROWS_WITH_AS(queue->mul(x->view(), x->view(), y->view()),
+                             expected.c_str(), std::runtime_error);
+    }
+    if (backend_label.empty()) {
+        CHECK_THROWS_AS(queue->silu(x->view(), y->view()), std::runtime_error);
+    } else {
+        const std::string expected =
+                std::string(backend_label) + " backend does not implement silu";
+        CHECK_THROWS_WITH_AS(queue->silu(x->view(), y->view()),
+                             expected.c_str(), std::runtime_error);
+    }
+    if (backend_label.empty()) {
+        CHECK_THROWS_AS(queue->linear(x->view(), w->view(), y->view()),
+                        std::runtime_error);
+    } else {
+        const std::string expected =
+                std::string(backend_label) + " backend does not implement linear";
+        CHECK_THROWS_WITH_AS(
+                queue->linear(x->view(), w->view(), y->view()),
+                expected.c_str(), std::runtime_error);
+    }
+    if (backend_label.empty()) {
+        CHECK_THROWS_AS(
+                queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
+                std::runtime_error);
+    } else {
+        const std::string expected =
+                std::string(backend_label) + " backend does not implement rmsnorm";
+        CHECK_THROWS_WITH_AS(
+                queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
+                expected.c_str(), std::runtime_error);
+    }
+    if (backend_label.empty()) {
+        CHECK_THROWS_AS(
+                queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
+                            attn->view()),
+                std::runtime_error);
+    } else {
+        const std::string expected =
+                std::string(backend_label) + " backend does not implement sdpa";
+        CHECK_THROWS_WITH_AS(
+                queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
+                             attn->view()),
+                expected.c_str(), std::runtime_error);
+    }
 
     // Transformed operands compile against the view signatures and still
     // fail capability validation.

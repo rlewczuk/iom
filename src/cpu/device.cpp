@@ -766,30 +766,8 @@ namespace iom {
                     });
         }
 
-        oid add(const TensorView&, const TensorView&, TensorView&) override {
-            throw unsupported("CPU", "add");
-        }
-
-        oid mul(const TensorView&, const TensorView&, TensorView&) override {
-            throw unsupported("CPU", "mul");
-        }
-
-        oid silu(const TensorView&, TensorView&) override {
-            throw unsupported("CPU", "silu");
-        }
-
-        oid linear(const TensorView&, const TensorView&, TensorView&) override {
-            throw unsupported("CPU", "linear");
-        }
-
-        oid rmsnorm(const TensorView&, TensorView&, const TensorView&,
-                    float, size_t) override {
-            throw unsupported("CPU", "rmsnorm");
-        }
-
-        oid sdpa(const TensorView&, const TensorView&, const TensorView&,
-                 size_t, size_t, size_t, TensorView&) override {
-            throw unsupported("CPU", "sdpa");
+        [[nodiscard]] std::string_view backend_label() const noexcept override {
+            return "CPU";
         }
 
     private:

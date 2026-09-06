@@ -214,25 +214,8 @@ public:
                 });
     }
 
-    oid add(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("ROCm", "add");
-    }
-    oid mul(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("ROCm", "mul");
-    }
-    oid silu(const TensorView&, TensorView&) override {
-        throw unsupported("ROCm", "silu");
-    }
-    oid linear(const TensorView&, const TensorView&, TensorView&) override {
-        throw unsupported("ROCm", "linear");
-    }
-    oid rmsnorm(const TensorView&, TensorView&, const TensorView&, float,
-                size_t) override {
-        throw unsupported("ROCm", "rmsnorm");
-    }
-    oid sdpa(const TensorView&, const TensorView&, const TensorView&,
-             size_t, size_t, size_t, TensorView&) override {
-        throw unsupported("ROCm", "sdpa");
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "ROCm";
     }
 
 private:

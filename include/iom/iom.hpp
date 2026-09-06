@@ -208,6 +208,7 @@ namespace iom {
      * are repeatable. The live-id pool is the only global queue state: it
      * never selects a backend, device, or runtime context. Calls on one
      * queue are serialized by the caller.
+     * Compute operations default to throwing `unsupported(backend_label(), op)`; backends override only implemented operations.
      */
     class DeviceOps {
     public:
@@ -230,19 +231,29 @@ namespace iom {
         virtual oid copy(const TensorView& source, TensorView& destination) = 0;
 
         /** Addition: c = a + b **/
-        virtual oid add(const TensorView& a, const TensorView& b, TensorView& c) = 0;
+        virtual oid add(const TensorView& a, const TensorView& b, TensorView& c) {
+            throw unsupported(backend_label(), "add");
+        }
 
         /** Multiplication: c = a * b **/
-        virtual oid mul(const TensorView& a, const TensorView& b, TensorView& c) = 0;
+        virtual oid mul(const TensorView& a, const TensorView& b, TensorView& c) {
+            throw unsupported(backend_label(), "mul");
+        }
 
         /** SILU: y = silu(x) **/
-        virtual oid silu(const TensorView& x, TensorView& y) = 0;
+        virtual oid silu(const TensorView& x, TensorView& y) {
+            throw unsupported(backend_label(), "silu");
+        }
 
         /** Linear: y = x * w **/
-        virtual oid linear(const TensorView& x, const TensorView& w, TensorView& y) = 0;
+        virtual oid linear(const TensorView& x, const TensorView& w, TensorView& y) {
+            throw unsupported(backend_label(), "linear");
+        }
 
         /** RMSNorm: y = x * (1 / sqrt(mean(x^2, dim) + eps)) **/
-        virtual oid rmsnorm(const TensorView& x, TensorView& y, const TensorView& w, float eps, size_t dim) = 0;
+        virtual oid rmsnorm(const TensorView& x, TensorView& y, const TensorView& w, float eps, size_t dim) {
+            throw unsupported(backend_label(), "rmsnorm");
+        }
 
         /**
          * SDPA variant for GQA. We avoid repeating across k and v, kernel takes it into account automatically.
@@ -250,7 +261,9 @@ namespace iom {
          * Result is already rearranged so that it can be passed directly into linear projection o_proj.
          */
         virtual oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
-                         size_t n_heads, size_t n_kv_heads, size_t head_dim, TensorView& attn_out) = 0;
+                         size_t n_heads, size_t n_kv_heads, size_t head_dim, TensorView& attn_out) {
+            throw unsupported(backend_label(), "sdpa");
+        }
 
     protected:
         DeviceOps();
@@ -284,6 +297,7 @@ namespace iom {
                             destination.plane_strides().end());
         }
 
+        [[nodiscard]] virtual std::string_view backend_label() const noexcept = 0;
         [[nodiscard]] static std::runtime_error unsupported(
                 std::string_view backend, std::string_view operation) {
             std::string message(backend);

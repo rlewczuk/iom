@@ -503,7 +503,8 @@ TEST_CASE("TTNN conformance: compute methods reject capability without submittin
     require_hardware();
     TtnnDevices devices;
     iom_conformance::run_compute_capability_conformance(
-            *devices.candidate, iom::ttnn_supported_data_types());
+            *devices.candidate, iom::ttnn_supported_data_types(), nullptr,
+            "TTNN");
 }
 
 TEST_CASE("TTNN conformance: full shared suite") {

@@ -582,6 +582,9 @@ public:
 class FakeQueue final : public iom::DeviceOps {
 public:
     FakeQueue() = default;
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "fake";
+    }
 
     using iom::DeviceOps::complete;
     using iom::DeviceOps::seek_next_sequence;
@@ -705,48 +708,13 @@ public:
         });
     }
 
-    iom::oid add(
-            const iom::TensorView&, const iom::TensorView&, iom::TensorView&)
-            override {
-        throw unsupported("add");
-    }
-
-    iom::oid mul(
-            const iom::TensorView&, const iom::TensorView&, iom::TensorView&)
-            override {
-        throw unsupported("mul");
-    }
-
-    iom::oid silu(const iom::TensorView&, iom::TensorView&) override {
-        throw unsupported("silu");
-    }
-
-    iom::oid linear(
-            const iom::TensorView&, const iom::TensorView&, iom::TensorView&)
-            override {
-        throw unsupported("linear");
-    }
-
-    iom::oid rmsnorm(
-            const iom::TensorView&, iom::TensorView&, const iom::TensorView&,
-            float, size_t) override {
-        throw unsupported("rmsnorm");
-    }
-
-    iom::oid sdpa(
-            const iom::TensorView&, const iom::TensorView&, const iom::TensorView&,
-            size_t, size_t, size_t, iom::TensorView&) override {
-        throw unsupported("sdpa");
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "inline";
     }
 
     Mode mode;
     std::size_t inline_calls = 0;
 
-private:
-    static std::runtime_error unsupported(const char* operation) {
-        return std::runtime_error(
-                std::string("inline queue does not implement ") + operation);
-    }
 };
 
 constexpr std::uint64_t kTokenSequenceBits = 56;
