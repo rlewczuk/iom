@@ -359,6 +359,72 @@ private:
     friend class SyclQueue;
 };
 
+struct SyclFenceCapture {
+    std::shared_ptr<SyclFenceState> state;
+};
+
+static_assert(
+        sizeof(SyclFenceCapture) <= detail::kFenceStorageBytes);
+static_assert(
+        alignof(SyclFenceCapture) <= detail::kFenceStorageAlign);
+
+detail::FenceResult sycl_fence_invoke(
+        const detail::Fence& fence) noexcept {
+    const auto& capture =
+            *std::launder(reinterpret_cast<const SyclFenceCapture*>(
+                    fence.storage));
+    if (!capture.state) {
+        return detail::FenceResult::success();
+    }
+    return capture.state->result();
+}
+
+static_assert(noexcept(sycl_fence_invoke(
+        std::declval<const detail::Fence&>())));
+
+void sycl_fence_copy_construct(
+        detail::Fence* destination, const detail::Fence& source) noexcept {
+    ::new (destination->storage) SyclFenceCapture{
+            *std::launder(reinterpret_cast<const SyclFenceCapture*>(
+                    source.storage))};
+}
+
+static_assert(noexcept(sycl_fence_copy_construct(
+        std::declval<detail::Fence*>(),
+        std::declval<const detail::Fence&>())));
+
+void sycl_fence_move_construct(
+        detail::Fence* destination, detail::Fence* source) noexcept {
+    ::new (destination->storage) SyclFenceCapture{
+            std::move(*std::launder(reinterpret_cast<SyclFenceCapture*>(
+                    source->storage)))};
+    std::destroy_at(std::launder(reinterpret_cast<SyclFenceCapture*>(
+            source->storage)));
+}
+
+static_assert(noexcept(sycl_fence_move_construct(
+        std::declval<detail::Fence*>(),
+        std::declval<detail::Fence*>())));
+
+void sycl_fence_storage_destroy(detail::Fence* fence) noexcept {
+    std::destroy_at(std::launder(reinterpret_cast<SyclFenceCapture*>(
+            fence->storage)));
+}
+
+static_assert(noexcept(sycl_fence_storage_destroy(
+        std::declval<detail::Fence*>())));
+
+detail::Fence build_sycl_fence(
+        const std::shared_ptr<SyclFenceState>& state) noexcept {
+    detail::Fence fence;
+    ::new (fence.storage) SyclFenceCapture{state};
+    fence.invoke = &sycl_fence_invoke;
+    fence.copy_construct = &sycl_fence_copy_construct;
+    fence.move_construct = &sycl_fence_move_construct;
+    fence.destroy = &sycl_fence_storage_destroy;
+    return fence;
+}
+
 void launch_scatter_words(
         sycl::queue& queue, const void* source, void* destination,
         std::uint64_t destination_plane, std::uint64_t logical_base,
@@ -600,10 +666,7 @@ private:
                         SubmissionFault::fence_construction)) {
                 throw std::bad_alloc();
             }
-            detail::Fence fence =
-                    [state = task.state]() noexcept -> detail::FenceResult {
-                return state->result();
-            };
+            detail::Fence fence = build_sycl_fence(task.state);
             entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
                     const_cast<void*>(task.source->native_handle()),

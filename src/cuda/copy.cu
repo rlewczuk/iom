@@ -7,11 +7,12 @@
 #include <cstdint>
 #include <exception>
 #include <mutex>
-#include <array>
 #include <condition_variable>
 #include <limits>
 #include <type_traits>
 #include <memory>
+#include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -42,43 +43,6 @@ void synchronize_and_destroy_stream(cudaStream_t stream) noexcept {
 }
 
 
-detail::FenceResult fence_event(
-        CUcontext context, cudaEvent_t event,
-        std::exception_ptr retained_failure) noexcept {
-    if (event == nullptr && !retained_failure) {
-        return detail::FenceResult::success();
-    }
-    try {
-        const CUresult context_status = driver_calls.ctx_set_current(context);
-        if (context_status != CUDA_SUCCESS) {
-            throw cuda_error("cuCtxSetCurrent", context_status);
-        }
-        if (event != nullptr) {
-            const cudaError_t status = cudaEventSynchronize(event);
-            if (status != cudaSuccess) {
-                throw std::runtime_error(
-                        std::string("cudaEventSynchronize failed with ")
-                        + cudaGetErrorName(status) + ": "
-                        + cudaGetErrorString(status));
-            }
-        }
-        if (retained_failure) {
-            return detail::FenceResult::failed(std::move(retained_failure));
-        }
-        return detail::FenceResult::success();
-    } catch (...) {
-        return detail::FenceResult::failed(std::current_exception());
-    }
-}
-
-detail::Fence make_fence(
-        CUcontext context, cudaEvent_t event,
-        std::exception_ptr retained_failure = nullptr) {
-    return [context, event,
-            retained_failure = std::move(retained_failure)]() mutable noexcept {
-        return fence_event(context, event, retained_failure);
-    };
-}
 }  // namespace
 }  // namespace iom::cuda_detail
 
@@ -102,38 +66,182 @@ struct CudaFenceResource {
     std::size_t metadata_slot = 0;
     detail::MetadataSlotPool<gpu_policy>* pool = nullptr;
     CUcontext context = nullptr;
+    std::exception_ptr retained_failure;
+    std::atomic<std::size_t> refcount{1};
+    std::optional<detail::FenceResult> cached_result;
+    std::mutex cached_result_mu;
 };
 
-void destroy_cuda_resource_noexcept(CudaFenceResource* resource) noexcept {
-    if (resource == nullptr) {
-        return;
+struct CudaFenceLease {
+    CudaFenceResource* resource = nullptr;
+
+    CudaFenceLease() noexcept = default;
+
+    static CudaFenceLease acquire_lease(CudaFenceResource* resource) noexcept {
+        CudaFenceLease lease;
+        lease.resource = resource;
+        if (resource != nullptr) {
+            resource->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return lease;
     }
-    gpu_policy::destroy_event_noexcept(resource->event);
-    resource->pool->release(resource->metadata_slot);
-    delete resource;
+
+    CudaFenceLease(const CudaFenceLease& other) noexcept
+            : resource(other.resource) {
+        if (resource != nullptr) {
+            resource->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    CudaFenceLease(CudaFenceLease&& other) noexcept
+            : resource(other.resource) {
+        other.resource = nullptr;
+    }
+
+    CudaFenceLease& operator=(const CudaFenceLease&) = delete;
+    CudaFenceLease& operator=(CudaFenceLease&&) = delete;
+
+    ~CudaFenceLease() noexcept {
+        if (resource != nullptr
+                && resource->refcount.fetch_sub(
+                           1, std::memory_order_acq_rel)
+                        == 1) {
+            try {
+                gpu_policy::activate(resource->context);
+            } catch (...) {
+            }
+            gpu_policy::destroy_event_noexcept(resource->event);
+            delete resource;
+        }
+    }
+};
+
+static_assert(sizeof(CudaFenceLease) <= detail::kFenceStorageBytes);
+static_assert(alignof(CudaFenceLease) <= detail::kFenceStorageAlign);
+static_assert(noexcept(
+        CudaFenceLease(std::declval<const CudaFenceLease&>())));
+static_assert(noexcept(
+        CudaFenceLease(std::declval<CudaFenceLease&&>())));
+static_assert(noexcept(std::declval<CudaFenceLease&>().~CudaFenceLease()));
+static_assert(!std::is_copy_assignable_v<CudaFenceLease>);
+static_assert(!std::is_move_assignable_v<CudaFenceLease>);
+
+detail::FenceResult cuda_synchronized_fence_event(
+        CudaFenceResource& resource) noexcept {
+    std::lock_guard<std::mutex> lock(resource.cached_result_mu);
+    if (resource.cached_result.has_value()) {
+        return *resource.cached_result;
+    }
+    try {
+        gpu_policy::activate(resource.context);
+        gpu_policy::synchronize_event(resource.event);
+        if (resource.retained_failure) {
+            resource.cached_result.emplace(
+                    detail::FenceResult::failed(
+                            std::move(resource.retained_failure)));
+        } else {
+            resource.cached_result.emplace(detail::FenceResult::success());
+        }
+    } catch (...) {
+        resource.cached_result.emplace(
+                detail::FenceResult::failed(std::current_exception()));
+    }
+    return *resource.cached_result;
 }
 
+static_assert(noexcept(cuda_synchronized_fence_event(
+        std::declval<CudaFenceResource&>())));
+
 void cuda_fence_complete(void* opaque) {
-    auto* resource = static_cast<CudaFenceResource*>(opaque);
-    gpu_policy::activate(resource->context);
-    gpu_policy::synchronize_event(resource->event);
+    if (opaque == nullptr) {
+        return;
+    }
+    const detail::FenceResult result =
+            cuda_synchronized_fence_event(
+                    *static_cast<CudaFenceResource*>(opaque));
+    if (result.failure) {
+        std::rethrow_exception(result.failure);
+    }
 }
 
 void cuda_fence_destroy(void* opaque) noexcept {
-    auto* resource = static_cast<CudaFenceResource*>(opaque);
-    if (resource == nullptr) {
+    if (opaque == nullptr) {
         return;
     }
-    try {
-        gpu_policy::activate(resource->context);
-    } catch (...) {
+    auto* resource = static_cast<CudaFenceResource*>(opaque);
+    (void)cuda_synchronized_fence_event(*resource);
+    detail::MetadataSlotPool<gpu_policy>* pool = resource->pool;
+    resource->pool = nullptr;
+    if (pool != nullptr) {
+        pool->release(resource->metadata_slot);
     }
-    gpu_policy::synchronize_event_noexcept(resource->event);
-    destroy_cuda_resource_noexcept(resource);
+    if (resource->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        try {
+            gpu_policy::activate(resource->context);
+        } catch (...) {
+        }
+        gpu_policy::destroy_event_noexcept(resource->event);
+        delete resource;
+    }
+}
+
+void cuda_fence_copy_construct(
+        detail::Fence* destination, const detail::Fence& source) noexcept {
+    ::new (destination->storage) CudaFenceLease{
+            *std::launder(reinterpret_cast<const CudaFenceLease*>(
+                    source.storage))};
+}
+
+static_assert(noexcept(cuda_fence_copy_construct(
+        std::declval<detail::Fence*>(),
+        std::declval<const detail::Fence&>())));
+
+void cuda_fence_move_construct(
+        detail::Fence* destination, detail::Fence* source) noexcept {
+    ::new (destination->storage) CudaFenceLease{
+            std::move(*std::launder(reinterpret_cast<CudaFenceLease*>(
+                    source->storage)))};
+    std::destroy_at(std::launder(reinterpret_cast<CudaFenceLease*>(
+            source->storage)));
+}
+
+static_assert(noexcept(cuda_fence_move_construct(
+        std::declval<detail::Fence*>(),
+        std::declval<detail::Fence*>())));
+
+void cuda_fence_storage_destroy(detail::Fence* fence) noexcept {
+    std::destroy_at(std::launder(reinterpret_cast<CudaFenceLease*>(
+            fence->storage)));
+}
+
+static_assert(noexcept(cuda_fence_storage_destroy(
+        std::declval<detail::Fence*>())));
+
+detail::FenceResult cuda_fence_invoke(
+        const detail::Fence& fence) noexcept {
+    const auto& lease = *std::launder(reinterpret_cast<const CudaFenceLease*>(
+            fence.storage));
+    if (lease.resource == nullptr) {
+        return detail::FenceResult::success();
+    }
+    return cuda_synchronized_fence_event(*lease.resource);
+}
+
+static_assert(noexcept(cuda_fence_invoke(
+        std::declval<const detail::Fence&>())));
+
+detail::Fence build_cuda_fence(CudaFenceResource* resource) noexcept {
+    detail::Fence fence;
+    ::new (fence.storage) CudaFenceLease{
+            CudaFenceLease::acquire_lease(resource)};
+    fence.invoke = &cuda_fence_invoke;
+    fence.copy_construct = &cuda_fence_copy_construct;
+    fence.move_construct = &cuda_fence_move_construct;
+    fence.destroy = &cuda_fence_storage_destroy;
+    return fence;
 }
 
 }  // namespace
-
 namespace {
 
 class CudaQueue final : public DeviceOps {
@@ -245,9 +353,6 @@ private:
                     metadata_pool_.host_data(metadata_slot),
                     source, destination);
             gpu_policy::create_event(&event);
-            resource = std::make_unique<CudaFenceResource>(
-                    CudaFenceResource{
-                            event, metadata_slot, &metadata_pool_, context_});
             gpu_policy::copy_from_host(
                     stream_, metadata_pool_.device_data(metadata_slot),
                     metadata_pool_.host_data(metadata_slot), layout.bytes);
@@ -265,34 +370,47 @@ private:
             gpu_policy::after_grid_stride_launch();
             gpu_policy::record_event(event, stream_);
             event_recorded = true;
+            resource = std::make_unique<CudaFenceResource>();
+            resource->event = event;
+            resource->metadata_slot = metadata_slot;
+            resource->pool = &metadata_pool_;
+            resource->context = context_;
             task.event = event;
             task.fence = resource.release();
         } catch (...) {
             const std::exception_ptr failure = std::current_exception();
             if (kernel_enqueued) {
-                if (!event_recorded && resource) {
+                if (!event_recorded) {
                     gpu_policy::record_event_no_fault(event, stream_);
                     event_recorded = true;
                 }
-                if (event_recorded && resource) {
-                    task.event = event;
-                    task.fence = resource.release();
+                if (!resource) {
+                    try {
+                        resource = std::make_unique<CudaFenceResource>();
+                    } catch (...) {
+                        gpu_policy::synchronize_event_noexcept(event);
+                        gpu_policy::destroy_event_noexcept(event);
+                        metadata_pool_.release(metadata_slot);
+                        throw;
+                    }
+                    resource->event = event;
+                    resource->metadata_slot = metadata_slot;
+                    resource->pool = &metadata_pool_;
+                    resource->context = context_;
                 }
+                resource->retained_failure = failure;
+                task.event = event;
+                task.fence = resource.release();
                 retained_failure = failure;
             } else {
-                if (resource) {
-                    resource->event = event;
-                    destroy_cuda_resource_noexcept(resource.release());
-                } else {
-                    gpu_policy::destroy_event_noexcept(event);
-                    metadata_pool_.release(metadata_slot);
-                }
+                gpu_policy::destroy_event_noexcept(event);
+                metadata_pool_.release(metadata_slot);
                 throw;
             }
         }
 
-        const detail::Fence fence = make_fence(
-                context_, task.event, retained_failure);
+        const detail::Fence fence = build_cuda_fence(
+                static_cast<CudaFenceResource*>(task.fence));
         detail::EntryRegistration entries;
         try {
             entries = detail::register_copy_entries(

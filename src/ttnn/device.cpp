@@ -320,19 +320,40 @@ namespace iom {
             std::unique_ptr<std::vector<ttnn::Tensor>> planes_;
         };
 
-        detail::Fence make_fence(TtnnDevice& device) {
-            TtnnDevice* stable_device = &device;
-            return [stable_device]() noexcept {
-                try {
-                    std::lock_guard<std::mutex> lock(
-                            stable_device->api_mutex());
-                    stable_device->mesh().mesh_command_queue(0).finish();
-                    return detail::FenceResult::success();
-                } catch (...) {
-                    return detail::FenceResult::failed(
-                            std::current_exception());
-                }
-            };
+        struct TtnnFenceCapture {
+            TtnnDevice* device = nullptr;
+        };
+
+        static_assert(
+                sizeof(TtnnFenceCapture)
+                <= detail::kFenceStorageBytes);
+        static_assert(
+                alignof(TtnnFenceCapture)
+                <= detail::kFenceStorageAlign);
+        static_assert(std::is_trivially_copyable_v<TtnnFenceCapture>);
+        static_assert(std::is_trivially_destructible_v<TtnnFenceCapture>);
+
+        detail::FenceResult ttnn_fence_invoke(
+                const detail::Fence& fence) noexcept {
+            const auto& capture =
+                    *std::launder(reinterpret_cast<const TtnnFenceCapture*>(
+                            fence.storage));
+            try {
+                std::lock_guard<std::mutex> lock(
+                        capture.device->api_mutex());
+                capture.device->mesh().mesh_command_queue(0).finish();
+                return detail::FenceResult::success();
+            } catch (...) {
+                return detail::FenceResult::failed(
+                        std::current_exception());
+            }
+        }
+
+        detail::Fence build_ttnn_fence(TtnnDevice& device) noexcept {
+            detail::Fence fence;
+            ::new (fence.storage) TtnnFenceCapture{&device};
+            fence.invoke = &ttnn_fence_invoke;
+            return fence;
         }
 
         detail::FenceResult finish_native(TtnnDevice& device) noexcept {
@@ -349,8 +370,11 @@ namespace iom {
 class TtnnQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
-        TensorView source;
-        TensorView destination;
+        // StagedWorker::submit_copy executes the task before publication,
+        // while copy()'s view arguments are alive. Only execute dereferences
+        // these pointers; completion and fence paths never do.
+        const TensorView* source;
+        TensorView* destination;
         bool no_op;
         void* fence = nullptr;
         detail::EntryId source_entry_id = 0;
@@ -361,8 +385,8 @@ class TtnnQueue final : public DeviceOps {
              TensorView& destination_,
              bool no_op_)
             : sequence(sequence_),
-              source(source_),
-              destination(destination_),
+              source(&source_),
+              destination(&destination_),
               no_op(no_op_) {}
     };
 
@@ -420,22 +444,22 @@ private:
             std::lock_guard<std::mutex> api_lock(device_->api_mutex());
             const ttnn::Tensor* source_planes =
                     static_cast<const ttnn::Tensor*>(
-                            task.source.native_handle());
+                            task.source->native_handle());
             ttnn::Tensor* destination_planes =
                     static_cast<ttnn::Tensor*>(
-                            task.destination.native_handle());
+                            task.destination->native_handle());
             ttnn_detail::copy_planes(
-                    task.source, source_planes,
-                    task.destination, destination_planes);
+                    *task.source, source_planes,
+                    *task.destination, destination_planes);
         }
 
-        const detail::Fence fence = make_fence(*device_);
+        const detail::Fence fence = build_ttnn_fence(*device_);
         detail::EntryRegistration entries;
         try {
             entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
-                    task.source.native_handle(),
-                    task.destination.native_handle(), fence);
+                    const_cast<void*>(task.source->native_handle()),
+                    task.destination->native_handle(), fence);
             task.source_entry_id = entries.source;
             task.destination_entry_id = entries.destination;
             std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -450,12 +474,13 @@ private:
         } catch (...) {
             if (entries.source != 0) {
                 state_->registry.remove_entry_if_present(
-                        entries.source, task.source.native_handle());
+                        entries.source,
+                        const_cast<void*>(task.source->native_handle()));
             }
             if (entries.destination != 0) {
                 state_->registry.remove_entry_if_present(
                         entries.destination,
-                        task.destination.native_handle());
+                        task.destination->native_handle());
             }
             throw;
         }

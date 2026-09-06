@@ -679,50 +679,11 @@ namespace iom {
     };
 
     class CpuQueue final : public DeviceOps {
-        struct Task {
-            std::uint64_t sequence;
-            TensorView source;
-            TensorView destination;
-            bool no_op;
-            void* fence = nullptr;
-
-            Task(std::uint64_t sequence_,
-                 const TensorView& source_,
-                 TensorView& destination_,
-                 bool no_op_)
-                : sequence(sequence_),
-                  source(source_),
-                  destination(destination_),
-                  no_op(no_op_) {}
-        };
-
-
     public:
         explicit CpuQueue(CpuDevice& device)
-                : device_(&device),
-                  worker_(
-                          detail::StagedWorker<Task>::Callbacks{
-                                  [this](Task& task) {
-                                      execute(task);
-                                  },
-                                  [](void*) {},
-                                  [](void*) {},
-                                  [this](
-                                          std::uint64_t sequence,
-                                          std::exception_ptr failure) {
-                                      complete(
-                                              sequence, std::move(failure));
-                                  }},
-                          detail::StagedWorker<Task>::PublishPolicy::
-                                  CompleteOnThrow) {
-            worker_.start();
-        }
+                : device_(&device) {}
 
-        ~CpuQueue() override {
-            worker_.shutdown_and_drain();
-        }
-
-
+        ~CpuQueue() override = default;
 
         oid copy(const TensorView& source, TensorView& destination) override {
             std::lock_guard<std::mutex> submission_lock(
@@ -732,8 +693,10 @@ namespace iom {
             return submit(
                     [this, &source, &destination, no_op](
                             std::uint64_t sequence) {
-                        Task task(sequence, source, destination, no_op);
-                        worker_.submit_copy(std::move(task));
+                        if (!no_op) {
+                            copy_elements(source, destination);
+                        }
+                        complete(sequence, nullptr);
                     });
         }
 
@@ -742,11 +705,6 @@ namespace iom {
         }
 
     private:
-        void execute(Task& task) {
-            if (!task.no_op) {
-                copy_elements(task.source, task.destination);
-            }
-        }
 
         static void copy_elements(
                 const TensorView& source, TensorView& destination) {
@@ -814,7 +772,6 @@ namespace iom {
 
         CpuDevice* device_;
         std::mutex submission_order_mutex_;
-        detail::StagedWorker<Task> worker_;
     };
 
     std::unique_ptr<Tensor> CpuDevice::create_tensor(const TensorSpec& spec) {

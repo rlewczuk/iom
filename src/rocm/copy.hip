@@ -6,12 +6,12 @@
 #include <array>
 #include <cstdint>
 #include <exception>
-#include <array>
-#include <condition_variable>
 #include <limits>
 #include <type_traits>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -41,40 +41,6 @@ void synchronize_and_destroy_stream(hipStream_t stream) noexcept {
 }
 
 
-detail::FenceResult fence_event(
-        int device_ordinal, hipEvent_t event,
-        std::exception_ptr retained_failure) noexcept {
-    if (event == nullptr && !retained_failure) {
-        return detail::FenceResult::success();
-    }
-    try {
-        const hipError_t device_status = hipSetDevice(device_ordinal);
-        if (device_status != hipSuccess) {
-            throw hip_error("hipSetDevice", device_status);
-        }
-        if (event != nullptr) {
-            const hipError_t status = hipEventSynchronize(event);
-            if (status != hipSuccess) {
-                throw hip_error("hipEventSynchronize", status);
-            }
-        }
-        if (retained_failure) {
-            return detail::FenceResult::failed(std::move(retained_failure));
-        }
-        return detail::FenceResult::success();
-    } catch (...) {
-        return detail::FenceResult::failed(std::current_exception());
-    }
-}
-
-detail::Fence make_fence(
-        int device_ordinal, hipEvent_t event,
-        std::exception_ptr retained_failure = nullptr) {
-    return [device_ordinal, event,
-            retained_failure = std::move(retained_failure)]() mutable noexcept {
-        return fence_event(device_ordinal, event, retained_failure);
-    };
-}
 }  // namespace
 }  // namespace iom::rocm_detail
 
@@ -98,38 +64,182 @@ struct HipFenceResource {
     std::size_t metadata_slot = 0;
     detail::MetadataSlotPool<gpu_policy>* pool = nullptr;
     int context = 0;
+    std::exception_ptr retained_failure;
+    std::atomic<std::size_t> refcount{1};
+    std::optional<detail::FenceResult> cached_result;
+    std::mutex cached_result_mu;
 };
 
-void destroy_hip_resource_noexcept(HipFenceResource* resource) noexcept {
-    if (resource == nullptr) {
-        return;
+struct HipFenceLease {
+    HipFenceResource* resource = nullptr;
+
+    HipFenceLease() noexcept = default;
+
+    static HipFenceLease acquire_lease(HipFenceResource* resource) noexcept {
+        HipFenceLease lease;
+        lease.resource = resource;
+        if (resource != nullptr) {
+            resource->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return lease;
     }
-    gpu_policy::destroy_event_noexcept(resource->event);
-    resource->pool->release(resource->metadata_slot);
-    delete resource;
+
+    HipFenceLease(const HipFenceLease& other) noexcept
+            : resource(other.resource) {
+        if (resource != nullptr) {
+            resource->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    HipFenceLease(HipFenceLease&& other) noexcept
+            : resource(other.resource) {
+        other.resource = nullptr;
+    }
+
+    HipFenceLease& operator=(const HipFenceLease&) = delete;
+    HipFenceLease& operator=(HipFenceLease&&) = delete;
+
+    ~HipFenceLease() noexcept {
+        if (resource != nullptr
+                && resource->refcount.fetch_sub(
+                           1, std::memory_order_acq_rel)
+                        == 1) {
+            try {
+                gpu_policy::activate(resource->context);
+            } catch (...) {
+            }
+            gpu_policy::destroy_event_noexcept(resource->event);
+            delete resource;
+        }
+    }
+};
+
+static_assert(sizeof(HipFenceLease) <= detail::kFenceStorageBytes);
+static_assert(alignof(HipFenceLease) <= detail::kFenceStorageAlign);
+static_assert(noexcept(
+        HipFenceLease(std::declval<const HipFenceLease&>())));
+static_assert(noexcept(
+        HipFenceLease(std::declval<HipFenceLease&&>())));
+static_assert(noexcept(std::declval<HipFenceLease&>().~HipFenceLease()));
+static_assert(!std::is_copy_assignable_v<HipFenceLease>);
+static_assert(!std::is_move_assignable_v<HipFenceLease>);
+
+detail::FenceResult hip_synchronized_fence_event(
+        HipFenceResource& resource) noexcept {
+    std::lock_guard<std::mutex> lock(resource.cached_result_mu);
+    if (resource.cached_result.has_value()) {
+        return *resource.cached_result;
+    }
+    try {
+        gpu_policy::activate(resource.context);
+        gpu_policy::synchronize_event(resource.event);
+        if (resource.retained_failure) {
+            resource.cached_result.emplace(
+                    detail::FenceResult::failed(
+                            std::move(resource.retained_failure)));
+        } else {
+            resource.cached_result.emplace(detail::FenceResult::success());
+        }
+    } catch (...) {
+        resource.cached_result.emplace(
+                detail::FenceResult::failed(std::current_exception()));
+    }
+    return *resource.cached_result;
 }
 
+static_assert(noexcept(hip_synchronized_fence_event(
+        std::declval<HipFenceResource&>())));
+
 void hip_fence_complete(void* opaque) {
-    auto* resource = static_cast<HipFenceResource*>(opaque);
-    gpu_policy::activate(resource->context);
-    gpu_policy::synchronize_event(resource->event);
+    if (opaque == nullptr) {
+        return;
+    }
+    const detail::FenceResult result =
+            hip_synchronized_fence_event(
+                    *static_cast<HipFenceResource*>(opaque));
+    if (result.failure) {
+        std::rethrow_exception(result.failure);
+    }
 }
 
 void hip_fence_destroy(void* opaque) noexcept {
-    auto* resource = static_cast<HipFenceResource*>(opaque);
-    if (resource == nullptr) {
+    if (opaque == nullptr) {
         return;
     }
-    try {
-        gpu_policy::activate(resource->context);
-    } catch (...) {
+    auto* resource = static_cast<HipFenceResource*>(opaque);
+    (void)hip_synchronized_fence_event(*resource);
+    detail::MetadataSlotPool<gpu_policy>* pool = resource->pool;
+    resource->pool = nullptr;
+    if (pool != nullptr) {
+        pool->release(resource->metadata_slot);
     }
-    gpu_policy::synchronize_event_noexcept(resource->event);
-    destroy_hip_resource_noexcept(resource);
+    if (resource->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        try {
+            gpu_policy::activate(resource->context);
+        } catch (...) {
+        }
+        gpu_policy::destroy_event_noexcept(resource->event);
+        delete resource;
+    }
+}
+
+void hip_fence_copy_construct(
+        detail::Fence* destination, const detail::Fence& source) noexcept {
+    ::new (destination->storage) HipFenceLease{
+            *std::launder(reinterpret_cast<const HipFenceLease*>(
+                    source.storage))};
+}
+
+static_assert(noexcept(hip_fence_copy_construct(
+        std::declval<detail::Fence*>(),
+        std::declval<const detail::Fence&>())));
+
+void hip_fence_move_construct(
+        detail::Fence* destination, detail::Fence* source) noexcept {
+    ::new (destination->storage) HipFenceLease{
+            std::move(*std::launder(reinterpret_cast<HipFenceLease*>(
+                    source->storage)))};
+    std::destroy_at(std::launder(reinterpret_cast<HipFenceLease*>(
+            source->storage)));
+}
+
+static_assert(noexcept(hip_fence_move_construct(
+        std::declval<detail::Fence*>(),
+        std::declval<detail::Fence*>())));
+
+void hip_fence_storage_destroy(detail::Fence* fence) noexcept {
+    std::destroy_at(std::launder(reinterpret_cast<HipFenceLease*>(
+            fence->storage)));
+}
+
+static_assert(noexcept(hip_fence_storage_destroy(
+        std::declval<detail::Fence*>())));
+
+detail::FenceResult hip_fence_invoke(
+        const detail::Fence& fence) noexcept {
+    const auto& lease = *std::launder(reinterpret_cast<const HipFenceLease*>(
+            fence.storage));
+    if (lease.resource == nullptr) {
+        return detail::FenceResult::success();
+    }
+    return hip_synchronized_fence_event(*lease.resource);
+}
+
+static_assert(noexcept(hip_fence_invoke(
+        std::declval<const detail::Fence&>())));
+
+detail::Fence build_hip_fence(HipFenceResource* resource) noexcept {
+    detail::Fence fence;
+    ::new (fence.storage) HipFenceLease{
+            HipFenceLease::acquire_lease(resource)};
+    fence.invoke = &hip_fence_invoke;
+    fence.copy_construct = &hip_fence_copy_construct;
+    fence.move_construct = &hip_fence_move_construct;
+    fence.destroy = &hip_fence_storage_destroy;
+    return fence;
 }
 
 }  // namespace
-
 namespace {
 
 class RocmQueue final : public DeviceOps {
@@ -229,6 +339,7 @@ private:
         hipEvent_t event = nullptr;
         std::unique_ptr<HipFenceResource> resource;
         bool kernel_enqueued = false;
+        bool event_recorded = false;
         std::exception_ptr retained_failure;
         try {
             const detail::CopyMetadataLayout layout =
@@ -240,9 +351,6 @@ private:
                     metadata_pool_.host_data(metadata_slot),
                     source, destination);
             gpu_policy::create_event(&event);
-            resource = std::make_unique<HipFenceResource>(
-                    HipFenceResource{
-                            event, metadata_slot, &metadata_pool_, context_});
             gpu_policy::copy_from_host(
                     stream_, metadata_pool_.device_data(metadata_slot),
                     metadata_pool_.host_data(metadata_slot), layout.bytes);
@@ -259,31 +367,48 @@ private:
             gpu_policy::check_kernel(gpu_policy::copy_kernel_operation());
             gpu_policy::after_grid_stride_launch();
             gpu_policy::record_event(event, stream_);
+            event_recorded = true;
+            resource = std::make_unique<HipFenceResource>();
+            resource->event = event;
+            resource->metadata_slot = metadata_slot;
+            resource->pool = &metadata_pool_;
+            resource->context = context_;
             task.event = event;
             task.fence = resource.release();
         } catch (...) {
             const std::exception_ptr failure = std::current_exception();
             if (kernel_enqueued) {
-                if (resource) {
+                if (!event_recorded) {
                     gpu_policy::record_event_no_fault(event, stream_);
-                    task.event = event;
-                    task.fence = resource.release();
+                    event_recorded = true;
                 }
+                if (!resource) {
+                    try {
+                        resource = std::make_unique<HipFenceResource>();
+                    } catch (...) {
+                        gpu_policy::synchronize_event_noexcept(event);
+                        gpu_policy::destroy_event_noexcept(event);
+                        metadata_pool_.release(metadata_slot);
+                        throw;
+                    }
+                    resource->event = event;
+                    resource->metadata_slot = metadata_slot;
+                    resource->pool = &metadata_pool_;
+                    resource->context = context_;
+                }
+                resource->retained_failure = failure;
+                task.event = event;
+                task.fence = resource.release();
                 retained_failure = failure;
             } else {
-                if (resource) {
-                    resource->event = event;
-                    destroy_hip_resource_noexcept(resource.release());
-                } else {
-                    gpu_policy::destroy_event_noexcept(event);
-                    metadata_pool_.release(metadata_slot);
-                }
+                gpu_policy::destroy_event_noexcept(event);
+                metadata_pool_.release(metadata_slot);
                 throw;
             }
         }
 
-        const detail::Fence fence = make_fence(
-                context_, task.event, retained_failure);
+        const detail::Fence fence = build_hip_fence(
+                static_cast<HipFenceResource*>(task.fence));
         detail::EntryRegistration entries;
         try {
             entries = detail::register_copy_entries(

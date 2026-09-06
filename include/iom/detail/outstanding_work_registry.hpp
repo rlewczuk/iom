@@ -4,6 +4,7 @@
 #include <concepts>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -13,12 +14,16 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "iom/alloc.hpp"
 
 namespace iom::detail {
+
+inline constexpr std::size_t kFenceStorageBytes = 32;
+inline constexpr std::size_t kFenceStorageAlign = alignof(std::max_align_t);
 
 using EntryId = std::uint64_t;
 using QueueId = std::uint64_t;
@@ -38,7 +43,118 @@ struct FenceResult {
     }
 };
 
-using Fence = std::function<FenceResult()>;
+struct Fence {
+    alignas(kFenceStorageAlign) unsigned char storage[kFenceStorageBytes]{};
+    FenceResult (*invoke)(const Fence&) noexcept = nullptr;
+    void (*copy_construct)(Fence* dst, const Fence& src) noexcept = nullptr;
+    void (*move_construct)(Fence* dst, Fence* src) noexcept = nullptr;
+    void (*destroy)(Fence*) noexcept = nullptr;
+
+    Fence() noexcept = default;
+
+    ~Fence() noexcept {
+        if (destroy != nullptr) {
+            destroy(this);
+        }
+    }
+
+    Fence(const Fence& other) noexcept {
+        if (other.copy_construct != nullptr) {
+            other.copy_construct(this, other);
+        } else {
+            std::memcpy(storage, other.storage, kFenceStorageBytes);
+        }
+        invoke = other.invoke;
+        copy_construct = other.copy_construct;
+        move_construct = other.move_construct;
+        destroy = other.destroy;
+    }
+
+    Fence(Fence&& other) noexcept {
+        if (other.move_construct != nullptr) {
+            other.move_construct(this, &other);
+        } else {
+            std::memcpy(storage, other.storage, kFenceStorageBytes);
+        }
+        invoke = other.invoke;
+        copy_construct = other.copy_construct;
+        move_construct = other.move_construct;
+        destroy = other.destroy;
+        other.invoke = nullptr;
+        other.copy_construct = nullptr;
+        other.move_construct = nullptr;
+        other.destroy = nullptr;
+    }
+
+    Fence& operator=(const Fence& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        if (destroy != nullptr) {
+            destroy(this);
+        }
+        if (other.copy_construct != nullptr) {
+            other.copy_construct(this, other);
+        } else {
+            std::memcpy(storage, other.storage, kFenceStorageBytes);
+        }
+        invoke = other.invoke;
+        copy_construct = other.copy_construct;
+        move_construct = other.move_construct;
+        destroy = other.destroy;
+        return *this;
+    }
+
+    Fence& operator=(Fence&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        if (destroy != nullptr) {
+            destroy(this);
+        }
+        if (other.move_construct != nullptr) {
+            other.move_construct(this, &other);
+        } else {
+            std::memcpy(storage, other.storage, kFenceStorageBytes);
+        }
+        invoke = other.invoke;
+        copy_construct = other.copy_construct;
+        move_construct = other.move_construct;
+        destroy = other.destroy;
+        other.invoke = nullptr;
+        other.copy_construct = nullptr;
+        other.move_construct = nullptr;
+        other.destroy = nullptr;
+        return *this;
+    }
+
+    FenceResult operator()() const { return invoke(*this); }
+    explicit operator bool() const noexcept { return invoke != nullptr; }
+};
+
+static_assert(std::is_nothrow_default_constructible_v<Fence>);
+static_assert(std::is_nothrow_copy_constructible_v<Fence>);
+static_assert(std::is_nothrow_move_constructible_v<Fence>);
+static_assert(std::is_nothrow_destructible_v<Fence>);
+static_assert(std::is_nothrow_copy_assignable_v<Fence>);
+static_assert(std::is_nothrow_move_assignable_v<Fence>);
+
+inline FenceResult failed_invalidated_fence_invoke(
+        const Fence&) noexcept {
+    try {
+        return FenceResult::failed(std::make_exception_ptr(
+                std::runtime_error(
+                        "outstanding-work entry was invalidated")));
+    } catch (...) {
+        return FenceResult::failed(std::current_exception());
+    }
+}
+
+inline Fence make_invalidated_fence() noexcept {
+    Fence f;
+    f.invoke = &failed_invalidated_fence_invoke;
+    return f;
+}
 
 struct EntryRegistration {
     EntryId source = 0;
@@ -316,19 +432,9 @@ public:
     }
 private:
 
-    static FenceResult failed_invalidated_fence() noexcept {
-        try {
-            return FenceResult::failed(std::make_exception_ptr(
-                    std::runtime_error(
-                            "outstanding-work entry was invalidated")));
-        } catch (...) {
-            return FenceResult::failed(std::current_exception());
-        }
-    }
-
     void invalidate_entry_locked(Entry& entry) noexcept {
         entry.state = EntryState::Invalidated;
-        entry.fence = &failed_invalidated_fence;
+        entry.fence = make_invalidated_fence();
     }
 
 

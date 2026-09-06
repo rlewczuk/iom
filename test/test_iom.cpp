@@ -12,6 +12,7 @@
 #include <limits>
 #include <new>
 #include <memory>
+#include <optional>
 #include <numeric>
 #include <set>
 #include <span>
@@ -182,6 +183,190 @@ constexpr std::initializer_list<iom::DataType> kAllDataTypes = {
     iom::DataType::F16, iom::DataType::BF16,
     iom::DataType::F32, iom::DataType::F64,
 };
+
+enum class TestFenceMode { success, failed, throwing };
+
+struct TestFenceCapture {
+    int* calls;
+    TestFenceMode mode;
+};
+
+static_assert(
+        sizeof(TestFenceCapture)
+        <= iom::detail::kFenceStorageBytes);
+static_assert(
+        alignof(TestFenceCapture)
+        <= iom::detail::kFenceStorageAlign);
+
+iom::detail::FenceResult test_fence_invoke(
+        const iom::detail::Fence& fence) noexcept {
+    const auto& capture =
+            *std::launder(reinterpret_cast<const TestFenceCapture*>(
+                    fence.storage));
+    try {
+        if (capture.calls != nullptr) {
+            ++*capture.calls;
+        }
+        if (capture.mode == TestFenceMode::failed) {
+            throw std::runtime_error("fence failed");
+        }
+        if (capture.mode == TestFenceMode::throwing) {
+            throw std::runtime_error("fence threw");
+        }
+        return iom::detail::FenceResult::success();
+    } catch (...) {
+        return iom::detail::FenceResult::failed(
+                std::current_exception());
+    }
+}
+
+iom::detail::Fence make_test_fence(
+        int* calls,
+        TestFenceMode mode = TestFenceMode::success) noexcept {
+    iom::detail::Fence fence;
+    ::new (fence.storage) TestFenceCapture{calls, mode};
+    fence.invoke = &test_fence_invoke;
+    return fence;
+}
+
+struct FenceLeaseProbeResource {
+    std::atomic<std::size_t> refcount{1};
+    std::optional<iom::detail::FenceResult> cached_result;
+    std::mutex cached_result_mu;
+    std::atomic<std::size_t> synchronize_count{0};
+    std::atomic<std::size_t> destroy_count{0};
+};
+
+struct FenceLeaseProbe {
+    FenceLeaseProbeResource* resource = nullptr;
+
+    FenceLeaseProbe() noexcept = default;
+
+    static FenceLeaseProbe acquire_lease(
+            FenceLeaseProbeResource* resource) noexcept {
+        FenceLeaseProbe lease;
+        lease.resource = resource;
+        if (resource != nullptr) {
+            resource->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return lease;
+    }
+
+    FenceLeaseProbe(const FenceLeaseProbe& other) noexcept
+            : resource(other.resource) {
+        if (resource != nullptr) {
+            resource->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    FenceLeaseProbe(FenceLeaseProbe&& other) noexcept
+            : resource(other.resource) {
+        other.resource = nullptr;
+    }
+
+    FenceLeaseProbe& operator=(const FenceLeaseProbe&) = delete;
+    FenceLeaseProbe& operator=(FenceLeaseProbe&&) = delete;
+
+    ~FenceLeaseProbe() noexcept {
+        if (resource != nullptr
+                && resource->refcount.fetch_sub(
+                           1, std::memory_order_acq_rel)
+                        == 1) {
+            resource->destroy_count.fetch_add(
+                    1, std::memory_order_relaxed);
+        }
+    }
+};
+
+static_assert(sizeof(FenceLeaseProbe) <= iom::detail::kFenceStorageBytes);
+static_assert(
+        alignof(FenceLeaseProbe) <= iom::detail::kFenceStorageAlign);
+static_assert(!std::is_copy_assignable_v<FenceLeaseProbe>);
+static_assert(!std::is_move_assignable_v<FenceLeaseProbe>);
+
+iom::detail::FenceResult probe_fence_result(
+        FenceLeaseProbeResource& resource) noexcept {
+    std::lock_guard<std::mutex> lock(resource.cached_result_mu);
+    if (!resource.cached_result.has_value()) {
+        resource.synchronize_count.fetch_add(
+                1, std::memory_order_relaxed);
+        resource.cached_result.emplace(
+                iom::detail::FenceResult::success());
+    }
+    return *resource.cached_result;
+}
+
+void probe_fence_worker_release(
+        FenceLeaseProbeResource& resource) noexcept {
+    (void)probe_fence_result(resource);
+    if (resource.refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        resource.destroy_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+iom::detail::FenceResult probe_fence_invoke(
+        const iom::detail::Fence& fence) noexcept {
+    const auto& lease =
+            *std::launder(reinterpret_cast<const FenceLeaseProbe*>(
+                    fence.storage));
+    if (lease.resource == nullptr) {
+        return iom::detail::FenceResult::success();
+    }
+    return probe_fence_result(*lease.resource);
+}
+
+void probe_fence_copy_construct(
+        iom::detail::Fence* destination,
+        const iom::detail::Fence& source) noexcept {
+    ::new (destination->storage) FenceLeaseProbe{
+            *std::launder(reinterpret_cast<const FenceLeaseProbe*>(
+                    source.storage))};
+}
+
+void probe_fence_move_construct(
+        iom::detail::Fence* destination,
+        iom::detail::Fence* source) noexcept {
+    ::new (destination->storage) FenceLeaseProbe{
+            std::move(*std::launder(reinterpret_cast<FenceLeaseProbe*>(
+                    source->storage)))};
+    std::destroy_at(std::launder(reinterpret_cast<FenceLeaseProbe*>(
+            source->storage)));
+}
+
+void probe_fence_destroy(iom::detail::Fence* fence) noexcept {
+    std::destroy_at(std::launder(reinterpret_cast<FenceLeaseProbe*>(
+            fence->storage)));
+}
+
+iom::detail::Fence make_probe_fence(
+        FenceLeaseProbeResource& resource) noexcept {
+    iom::detail::Fence fence;
+    ::new (fence.storage) FenceLeaseProbe{
+            FenceLeaseProbe::acquire_lease(&resource)};
+    fence.invoke = &probe_fence_invoke;
+    fence.copy_construct = &probe_fence_copy_construct;
+    fence.move_construct = &probe_fence_move_construct;
+    fence.destroy = &probe_fence_destroy;
+    return fence;
+}
+
+static_assert(noexcept(probe_fence_result(
+        std::declval<FenceLeaseProbeResource&>())));
+static_assert(noexcept(probe_fence_worker_release(
+        std::declval<FenceLeaseProbeResource&>())));
+static_assert(noexcept(probe_fence_invoke(
+        std::declval<const iom::detail::Fence&>())));
+static_assert(noexcept(probe_fence_copy_construct(
+        std::declval<iom::detail::Fence*>(),
+        std::declval<const iom::detail::Fence&>())));
+static_assert(noexcept(probe_fence_move_construct(
+        std::declval<iom::detail::Fence*>(),
+        std::declval<iom::detail::Fence*>())));
+static_assert(noexcept(probe_fence_destroy(
+        std::declval<iom::detail::Fence*>())));
+
+static_assert(noexcept(test_fence_invoke(
+        std::declval<const iom::detail::Fence&>())));
 
 static_assert(iom::TensorSpec::TILE == 16);
 
@@ -2103,6 +2288,83 @@ static_assert(std::is_same_v<
               iom::detail::OutstandingWorkRegistry::EntrySnapshot,
               iom::detail::OutstandingWorkRegistry::Entry>);
 
+TEST_CASE("Inline Fence copies and moves captures without allocation") {
+    static_assert(
+            std::is_nothrow_default_constructible_v<iom::detail::Fence>);
+    static_assert(
+            std::is_nothrow_copy_constructible_v<iom::detail::Fence>);
+    static_assert(
+            std::is_nothrow_move_constructible_v<iom::detail::Fence>);
+    static_assert(
+            std::is_nothrow_copy_assignable_v<iom::detail::Fence>);
+    static_assert(
+            std::is_nothrow_move_assignable_v<iom::detail::Fence>);
+
+    int calls = 0;
+    iom::detail::Fence original = make_test_fence(&calls);
+    iom::detail::Fence copy(original);
+    iom::detail::Fence moved(std::move(copy));
+    iom::detail::Fence assigned;
+    assigned = original;
+    iom::detail::Fence move_assigned;
+    move_assigned = std::move(assigned);
+
+    CHECK(static_cast<bool>(original));
+    CHECK_FALSE(static_cast<bool>(copy));
+    CHECK(static_cast<bool>(moved));
+    CHECK(static_cast<bool>(move_assigned));
+    CHECK(original().succeeded);
+    CHECK(moved().succeeded);
+    CHECK(move_assigned().succeeded);
+    CHECK_EQ(calls, 3);
+}
+
+TEST_CASE(
+        "Inline fence snapshot copy remains invocable after worker drops "
+        "its Task refcount") {
+    FenceLeaseProbeResource resource;
+    iom::detail::Fence builder = make_probe_fence(resource);
+    CHECK_EQ(resource.refcount.load(), 2);
+
+    iom::detail::Fence source_entry(builder);
+    CHECK_EQ(resource.refcount.load(), 3);
+    iom::detail::Fence destination_entry(source_entry);
+    CHECK_EQ(resource.refcount.load(), 4);
+
+    builder = iom::detail::Fence{};
+    CHECK_EQ(resource.refcount.load(), 3);
+
+    probe_fence_worker_release(resource);
+    CHECK_EQ(resource.refcount.load(), 2);
+    CHECK_EQ(resource.synchronize_count.load(), 1);
+
+    source_entry = iom::detail::Fence{};
+    CHECK_EQ(resource.refcount.load(), 1);
+
+    iom::detail::Fence snapshot(destination_entry);
+    CHECK_EQ(resource.refcount.load(), 2);
+    destination_entry = iom::detail::Fence{};
+    CHECK_EQ(resource.refcount.load(), 1);
+
+    CHECK(snapshot().succeeded);
+    CHECK_EQ(resource.synchronize_count.load(), 1);
+
+    std::atomic<bool> first_succeeded{false};
+    std::atomic<bool> second_succeeded{false};
+    std::thread first([&] { first_succeeded.store(snapshot().succeeded); });
+    std::thread second(
+            [&] { second_succeeded.store(snapshot().succeeded); });
+    first.join();
+    second.join();
+    CHECK(first_succeeded.load());
+    CHECK(second_succeeded.load());
+    CHECK_EQ(resource.synchronize_count.load(), 1);
+
+    snapshot = iom::detail::Fence{};
+    CHECK_EQ(resource.refcount.load(), 0);
+    CHECK_EQ(resource.destroy_count.load(), 1);
+}
+
 TEST_CASE("StagedWorker preserves fenced callback order") {
     std::mutex mutex;
     std::condition_variable condition;
@@ -2215,10 +2477,7 @@ TEST_CASE("OutstandingWorkRegistry releases exact same-address entries") {
     iom::detail::OutstandingWorkRegistry registry;
     void* address = reinterpret_cast<void*>(0x1000);
     int fence_calls = 0;
-    const iom::detail::Fence fence = [&] {
-        ++fence_calls;
-        return iom::detail::FenceResult::success();
-    };
+    const iom::detail::Fence fence = make_test_fence(&fence_calls);
 
     registry.register_entry(1, address, 1, 1, fence);
     registry.register_entry(2, address, 1, 1, fence);
@@ -2256,9 +2515,7 @@ TEST_CASE("OutstandingWorkRegistry invalidates only matching queue entries") {
     iom::detail::OutstandingWorkRegistry registry;
     void* shared_address = reinterpret_cast<void*>(0x1000);
     void* second_address = reinterpret_cast<void*>(0x2000);
-    const iom::detail::Fence fence = [] {
-        return iom::detail::FenceResult::success();
-    };
+    const iom::detail::Fence fence = make_test_fence(nullptr);
 
     registry.register_entry(1, shared_address, 1, 11, fence);
     registry.register_entry(2, shared_address, 2, 22, fence);
@@ -2286,10 +2543,7 @@ TEST_CASE("OutstandingWorkRegistry invalidates only matching queue entries") {
 TEST_CASE("OutstandingWorkRegistry rolls back every registry index") {
     static int fence_calls = 0;
     fence_calls = 0;
-    const iom::detail::Fence fence = [] {
-        ++fence_calls;
-        return iom::detail::FenceResult::success();
-    };
+    const iom::detail::Fence fence = make_test_fence(&fence_calls);
 
     iom::detail::OutstandingWorkRegistry registry;
     const auto probe_address = reinterpret_cast<void*>(0x1000);
@@ -2414,10 +2668,7 @@ TEST_CASE(
         iom::detail::Quarantine quarantine;
         void* address = reinterpret_cast<void*>(0x3100);
         int fence_calls = 0;
-        const iom::detail::Fence fence = [&] {
-            ++fence_calls;
-            return iom::detail::FenceResult::success();
-        };
+        const iom::detail::Fence fence = make_test_fence(&fence_calls);
         registry.register_entry(1, address, 1, 1, fence);
         evaluate(registry, quarantine, address, false);
         CHECK_EQ(fence_calls, 1);
@@ -2428,10 +2679,7 @@ TEST_CASE(
         iom::detail::Quarantine quarantine;
         void* address = reinterpret_cast<void*>(0x3200);
         int fence_calls = 0;
-        const iom::detail::Fence fence = [&] {
-            ++fence_calls;
-            return iom::detail::FenceResult::success();
-        };
+        const iom::detail::Fence fence = make_test_fence(&fence_calls);
         registry.register_entry(2, address, 1, 1, fence);
         registry.register_entry(3, address, 2, 1, fence);
         evaluate(registry, quarantine, address, false);
@@ -2443,10 +2691,7 @@ TEST_CASE(
         iom::detail::Quarantine quarantine;
         void* address = reinterpret_cast<void*>(0x3300);
         int fence_calls = 0;
-        const iom::detail::Fence fence = [&] {
-            ++fence_calls;
-            return iom::detail::FenceResult::success();
-        };
+        const iom::detail::Fence fence = make_test_fence(&fence_calls);
         registry.register_entry(4, address, 1, 44, fence);
         registry.invalidate_entries_for_queue(44);
         const auto entries = registry.snapshot_for(address);
@@ -2461,12 +2706,8 @@ TEST_CASE(
         iom::detail::Quarantine quarantine;
         void* address = reinterpret_cast<void*>(0x3400);
         int fence_calls = 0;
-        const iom::detail::Fence fence = [&] {
-            ++fence_calls;
-            return iom::detail::FenceResult::failed(
-                    std::make_exception_ptr(
-                            std::runtime_error("fence failed")));
-        };
+        const iom::detail::Fence fence = make_test_fence(
+                &fence_calls, TestFenceMode::failed);
         registry.register_entry(5, address, 1, 1, fence);
         evaluate(registry, quarantine, address, true);
         CHECK_EQ(fence_calls, 1);
@@ -2477,10 +2718,8 @@ TEST_CASE(
         iom::detail::Quarantine quarantine;
         void* address = reinterpret_cast<void*>(0x3500);
         int fence_calls = 0;
-        const iom::detail::Fence fence = [&]() -> iom::detail::FenceResult {
-            ++fence_calls;
-            throw std::runtime_error("fence threw");
-        };
+        const iom::detail::Fence fence = make_test_fence(
+                &fence_calls, TestFenceMode::throwing);
         registry.register_entry(6, address, 1, 1, fence);
         evaluate(registry, quarantine, address, true);
         CHECK_EQ(fence_calls, 1);
@@ -2491,10 +2730,8 @@ TEST_CASE(
         iom::detail::Quarantine quarantine;
         void* address = reinterpret_cast<void*>(0x3600);
         int live_fence_calls = 0;
-        const iom::detail::Fence live_fence = [&] {
-            ++live_fence_calls;
-            return iom::detail::FenceResult::success();
-        };
+        const iom::detail::Fence live_fence =
+                make_test_fence(&live_fence_calls);
         registry.register_entry(7, address, 1, 70, live_fence);
         registry.register_entry(8, address, 2, 71, live_fence);
         registry.invalidate_entries_for_queue(71);
@@ -2512,10 +2749,7 @@ TEST_CASE(
         "destination registration throws") {
     static int fence_calls = 0;
     fence_calls = 0;
-    const iom::detail::Fence fence = [] {
-        ++fence_calls;
-        return iom::detail::FenceResult::success();
-    };
+    const iom::detail::Fence fence = make_test_fence(&fence_calls);
 
     iom::detail::OutstandingWorkRegistry registry;
     void* source_address = reinterpret_cast<void*>(0x3700);
@@ -2573,10 +2807,7 @@ TEST_CASE(
     void* completion_address = reinterpret_cast<void*>(0x3900);
     void* destructor_address = reinterpret_cast<void*>(0x3A00);
     int fence_calls = 0;
-    const iom::detail::Fence fence = [&] {
-        ++fence_calls;
-        return iom::detail::FenceResult::success();
-    };
+    const iom::detail::Fence fence = make_test_fence(&fence_calls);
 
     registry.register_entry(9, completion_address, 1, 1, fence);
     const auto completion_snapshot = registry.snapshot_for(completion_address);
