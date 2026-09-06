@@ -237,9 +237,10 @@ TEST_CASE("CPU conformance: storage oracle identifies perturbed transfer map") {
 
 TEST_CASE("CPU conformance: asynchronous copies against the CPU reference") {
     CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
     iom_conformance::run_async_copy_conformance(
             devices.conformance(), devices.candidate->supported_data_types(),
-            &devices.gate);
+            &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 

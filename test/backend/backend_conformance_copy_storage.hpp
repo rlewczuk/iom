@@ -175,6 +175,8 @@ inline const std::vector<std::vector<std::size_t>>& transfer_owner_shapes() {
         {2, 2, 2, 3, 17, 33},       // rank six: leading rank above three
         {16, 32},                   // rank-two, two tile columns
         {2, 3, 16, 48},              // leading rank two, three tile columns
+        {17, 16},                    // row-tail only
+        {1, 1},                      // minimal extent
     };
     return shapes;
 }
@@ -251,6 +253,51 @@ inline std::vector<CopyCase> copy_cases_for(const iom::TensorSpec& owner_spec) {
                  }});
     }
 
+    if (leading >= 1) {
+        std::optional<std::size_t> stepped_axis;
+        for (std::size_t axis = 0; axis < leading; ++axis) {
+            if (dims[axis] >= 4) {
+                stepped_axis = axis;
+                break;
+            }
+        }
+        if (stepped_axis.has_value()) {
+            const std::size_t axis = *stepped_axis;
+            const std::size_t count = dims[axis] / 2;
+            cases.push_back(
+                    {"contiguous source to stepped destination",
+                     [axis, count](const iom::TensorView& full) {
+                         return full.slice(axis, 0, count, 1);
+                     },
+                     [axis, count](const iom::TensorView& full) {
+                         return full.slice(axis, 1, count, 2);
+                     }});
+        }
+    }
+
+    if (leading >= 2) {
+        std::optional<std::size_t> swapped_axis;
+        for (std::size_t axis = 0; axis + 1 < leading; ++axis) {
+            if (dims[axis] == dims[axis + 1] && dims[axis] >= 2) {
+                swapped_axis = axis;
+                break;
+            }
+        }
+        if (swapped_axis.has_value()) {
+            const std::size_t axis = *swapped_axis;
+            std::vector<std::size_t> order(leading);
+            std::iota(order.begin(), order.end(), std::size_t{0});
+            std::swap(order[axis], order[axis + 1]);
+            cases.push_back(
+                    {"permuted source to contiguous destination",
+                     [order](const iom::TensorView& full) {
+                         return full.permute(
+                                 std::span<const std::size_t>{order});
+                     },
+                     [](const iom::TensorView& full) { return full; }});
+        }
+    }
+
     return cases;
 }
 
@@ -262,6 +309,8 @@ inline const std::vector<std::vector<std::size_t>>& copy_owner_shapes() {
         {2, 2, 2, 3, 17, 33},       // rank six
         {16, 32},                   // rank-two, two tile columns
         {2, 3, 16, 48},              // leading rank two, three tile columns
+        {17, 16},                   // row-tail only
+        {1, 1},                     // minimal extent
     };
     return shapes;
 }
