@@ -446,7 +446,7 @@ The CPU, CUDA, ROCm, and SYCL device factories receive an `iom::Allocator` whose
 - a null return throws `std::bad_alloc` without calling `free`;
 - a non-null address that is not 32-byte aligned is freed once and rejected with `std::runtime_error`;
 - successful construction owns the returned allocation;
-- destruction calls `allocator.free(address)` exactly once: at tensor destruction, or deferred to device destruction for storage quarantined because a queued operation referencing it failed or was invalidated;
+- destruction calls `allocator.free(address)` exactly once: at tensor destruction, or deferred to device destruction for storage quarantined because a queued operation referencing it failed or was invalidated; If constructing or recording the quarantine cleanup action itself fails inside a `noexcept` tensor destructor, the storage is deliberately leaked for the remainder of the process.
 - failure after allocation frees the allocation before propagating the exception;
 - the injected allocator's `free` must not throw; `Allocator` lacks a `noexcept` declaration, but throwing from tensor destruction or construction cleanup is a caller contract violation;
 - host transfers, device copies, compute submission, and view transforms never call `alloc` or `free` on the configured tensor-storage allocator.

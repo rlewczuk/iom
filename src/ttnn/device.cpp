@@ -31,6 +31,20 @@
 namespace iom {
 
     namespace {
+#ifdef IOM_ENABLE_TESTING
+        std::atomic<bool> g_fail_next_quarantine_action{false};
+        bool g_quarantine_action_fault_consumed = false;
+
+        void consume_quarantine_action_fault_locked() noexcept(false) {
+            if (g_fail_next_quarantine_action.exchange(
+                        false, std::memory_order_acquire)
+                    && !g_quarantine_action_fault_consumed) {
+                g_quarantine_action_fault_consumed = true;
+                throw std::bad_alloc();
+            }
+        }
+#endif
+
 
         // The one explicit TTNN supported-type table: every leaf type whose
         // host encoding TTNN tiled storage reproduces bit-for-bit. Signed
@@ -213,7 +227,10 @@ namespace iom {
         public:
             TtnnTensor(const TensorSpec& spec, TtnnDevice& device)
                     : Tensor(spec, device), device_(device),
-                      state_(&device.registry_state()) {
+                      state_(&device.registry_state()),
+                      planes_(
+                              std::make_unique<
+                                      std::vector<ttnn::Tensor>>()) {
                 const std::span<const std::size_t> dimensions =
                         spec.shape.dimensions();
                 const std::size_t plane_count = checked_plane_count(spec);
@@ -232,24 +249,25 @@ namespace iom {
                                         tt::tt_metal::Layout::TILE,
                                         tt::tt_metal::Tile()),
                                 tt::tt_metal::MemoryConfig{}));
-                planes_.reserve(plane_count);
+                planes_->reserve(plane_count);
                 for (std::size_t plane = 0; plane < plane_count; ++plane) {
-                    planes_.push_back(ttnn::create_device_tensor(
+                    planes_->push_back(ttnn::create_device_tensor(
                             plane_spec, &device_.mesh()));
                 }
             }
 
             ~TtnnTensor() noexcept override {
-                const void* original_address = planes_.data();
+                const void* original_address = planes_->data();
                 const auto quarantine_native = [this]() noexcept {
-                    auto retained = std::unique_ptr<
-                            std::vector<ttnn::Tensor>>(
-                            new (std::nothrow) std::vector<ttnn::Tensor>);
+                    std::unique_ptr<std::vector<ttnn::Tensor>> retained(
+                            planes_.release());
                     if (!retained) {
-                        std::terminate();
+                        return;
                     }
-                    retained->swap(planes_);
                     try {
+#ifdef IOM_ENABLE_TESTING
+                        consume_quarantine_action_fault_locked();
+#endif
                         auto action = std::unique_ptr<
                                 ttnn_detail::TtnnNativeCleanupAction>(
                                 new ttnn_detail::TtnnNativeCleanupAction(
@@ -262,11 +280,9 @@ namespace iom {
                                                     .finish();
                                         }));
                         state_->quarantine.add(std::move(action));
-                        (void)retained.release();
                     } catch (...) {
-                        // Preserve native ownership if action allocation
-                        // fails; the intentionally leaked vector cannot be
-                        // returned to the runtime before device teardown.
+                        // Keep native storage unreachable if quarantine action
+                        // construction or recording fails.
                         (void)retained.release();
                     }
                 };
@@ -305,7 +321,7 @@ namespace iom {
                                 const_cast<void*>(original_address));
                     }
                     std::lock_guard<std::mutex> lock(device_.api_mutex());
-                    planes_.clear();
+                    planes_->clear();
                     return;
                 }
 
@@ -319,7 +335,7 @@ namespace iom {
 
         private:
             [[nodiscard]] void* storage_handle() noexcept override {
-                return planes_.data();
+                return planes_->data();
             }
 
             void region_from_host(
@@ -327,7 +343,7 @@ namespace iom {
                     std::span<const std::byte> source) override {
                 std::lock_guard<std::mutex> lock(device_.api_mutex());
                 ttnn_detail::region_from_host(
-                        device_.mesh(), destination, planes_.data(), source);
+                        device_.mesh(), destination, planes_->data(), source);
             }
 
             void region_to_host(
@@ -335,12 +351,12 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 std::lock_guard<std::mutex> lock(device_.api_mutex());
                 ttnn_detail::region_to_host(
-                        device_.mesh(), source, planes_.data(), destination);
+                        device_.mesh(), source, planes_->data(), destination);
             }
 
             TtnnDevice& device_;
             ttnn_detail::TtnnRegistryState* state_;
-            std::vector<ttnn::Tensor> planes_;
+            std::unique_ptr<std::vector<ttnn::Tensor>> planes_;
         };
 
         detail::Fence make_fence(TtnnDevice& device) {
@@ -588,6 +604,19 @@ private:
 
 
     }  // namespace
+
+#ifdef IOM_ENABLE_TESTING
+    namespace ttnn_test {
+        void fail_next_quarantine_action_for_testing() noexcept {
+            g_fail_next_quarantine_action.store(
+                    true, std::memory_order_release);
+        }
+
+        bool quarantine_action_fault_consumed_for_testing() noexcept {
+            return g_quarantine_action_fault_consumed;
+        }
+    }  // namespace ttnn_test
+#endif
 
     std::span<const DataType> ttnn_supported_data_types() noexcept {
         return {kSupportedKeys.data(), kSupportedKeys.size()};

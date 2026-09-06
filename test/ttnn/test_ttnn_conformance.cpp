@@ -22,6 +22,7 @@
 #include "backend/backend_conformance_other.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/ttnn/device.hpp"
+#include "../../src/ttnn/registry_state.hpp"
 
 namespace {
 
@@ -513,6 +514,40 @@ TEST_CASE("TTNN conformance: full shared suite") {
     TtnnStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices.conformance(), supported.subspan(0, 1), nullptr, &oracle);
+}
+
+TEST_CASE("TTNN quarantine action allocation failure leaks native storage") {
+    require_hardware();
+    const iom::TensorSpec spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::BF16};
+    auto device = iom::make_ttnn_device(0);
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    auto queue = device->create_ops();
+    REQUIRE_NOTHROW(queue->copy(source->view(), destination->view()));
+
+    {
+        iom::ttnn_test::fail_next_quarantine_action_for_testing();
+        queue.reset();
+        CHECK_NOTHROW(destination.reset());
+        CHECK(
+                iom::ttnn_test::quarantine_action_fault_consumed_for_testing());
+    }
+
+    {
+        const bool consumed =
+                iom::ttnn_test::quarantine_action_fault_consumed_for_testing();
+        CHECK_NOTHROW(source.reset());
+        CHECK_EQ(
+                iom::ttnn_test::quarantine_action_fault_consumed_for_testing(),
+                consumed);
+    }
+
+    {
+        // The healthy follow-up is the sole recorded quarantine action; its
+        // device-teardown drain must complete without throwing.
+        CHECK_NOTHROW(device.reset());
+    }
 }
 
 namespace {

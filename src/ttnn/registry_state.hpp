@@ -9,6 +9,10 @@
 
 #include "iom/outstanding_work_registry.hpp"
 
+namespace iom::ttnn_test {
+    void fail_next_quarantine_action_for_testing() noexcept;
+    bool quarantine_action_fault_consumed_for_testing() noexcept;
+}
 namespace iom::ttnn_detail {
 
 struct TtnnRegistryState {
