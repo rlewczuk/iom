@@ -234,8 +234,10 @@ if(SYCL_ENABLED)
     add_library(iom_sycl STATIC
         src/sycl/device.cpp
         src/sycl/copy.cpp
+        src/sycl/staging_pool.cpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
+        src/sycl/staging_pool.hpp
         src/sycl/registry_state.hpp
         include/iom/sycl/device.hpp
     )
@@ -270,6 +272,9 @@ include(CTest)
 if(BUILD_TESTING)
     if(CUDA_ENABLED)
         target_compile_definitions(iom_cuda PUBLIC IOM_ENABLE_TESTING)
+    endif()
+    if(SYCL_ENABLED)
+        target_compile_definitions(iom_sycl PRIVATE IOM_ENABLE_TESTING)
     endif()
     if(ROCM_ENABLED)
         target_compile_definitions(iom_rocm PUBLIC IOM_ENABLE_TESTING)

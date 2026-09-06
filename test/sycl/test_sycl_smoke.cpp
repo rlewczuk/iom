@@ -6,12 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <stdexcept>
 
 #include "iom/alloc.hpp"
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/sycl/device.hpp"
+#include "staging_pool.hpp"
 #include "iom/tensor.hpp"
 #include "runtime.hpp"
 
@@ -77,6 +79,15 @@ std::size_t eligible_device_count_from_runtime() {
             }));
 }
 
+sycl::device first_accelerator_device() {
+    for (const sycl::device& device : sycl::device::get_devices()) {
+        if (device.is_gpu() || device.is_accelerator()) {
+            return device;
+        }
+    }
+    throw std::runtime_error("SYCL accelerator device is unavailable");
+}
+
 }  // namespace
 
 TEST_CASE("SYCL factory enumerates real accelerator devices") {
@@ -136,4 +147,50 @@ TEST_CASE("SYCL factory rejects the first unavailable ordinal") {
     CHECK(allocator.allocations == 0);
     CHECK(probe.created == 0);
     CHECK(probe.destroyed == 0);
+}
+
+TEST_CASE("SYCL staging pool preserves accounting across allocation failures") {
+    const sycl::device device = first_accelerator_device();
+    const sycl::context context(device);
+    iom::sycl_detail::StagingSlotPool pool(context, device);
+
+    CHECK_THROWS_AS(
+            pool.acquire(
+                    iom::sycl_detail::StagingSlotPool::kMaxStagingBytes + 1),
+            std::invalid_argument);
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    pool.fail_next_allocation_for_testing();
+    CHECK_THROWS_AS(pool.acquire(4096), std::bad_alloc);
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    {
+        auto lease = pool.acquire(4096);
+        REQUIRE(lease.staging() != nullptr);
+        REQUIRE(lease.host_mirror() != nullptr);
+        CHECK_EQ(pool.allocation_count_for_testing(), 1);
+        CHECK_EQ(pool.idle_count_for_testing(), 0);
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+
+    {
+        auto lease = pool.acquire(8192);
+        CHECK(lease.capacity() >= 8192);
+        CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    }
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+
+    {
+        auto lease = pool.acquire(4096);
+        lease.poison();
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
+
+    pool.destroy();
+    CHECK_EQ(pool.allocation_count_for_testing(), 0);
+    CHECK_EQ(pool.idle_count_for_testing(), 0);
 }

@@ -23,6 +23,7 @@
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
 #include "copy.hpp"
+#include "staging_pool.hpp"
 #include "runtime.hpp"
 
 namespace {
@@ -489,7 +490,7 @@ TEST_CASE("SYCL submission remains transactional across post-enqueue failures") 
     auto queue = devices.device->create_ops();
 
     iom::sycl_detail::inject_submission_fault_for_testing(
-            iom::sycl_detail::SubmissionFault::second_submit);
+            iom::sycl_detail::SubmissionFault::post_launch);
     const iom::oid token = queue->copy(
             source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(token), 1);
@@ -533,7 +534,7 @@ TEST_CASE("SYCL queue destruction fences pending copies") {
         CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
         CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
         iom::sycl_detail::inject_submission_fault_for_testing(
-                iom::sycl_detail::SubmissionFault::second_submit);
+                iom::sycl_detail::SubmissionFault::post_launch);
         CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
         iom::sycl_detail::inject_submission_fault_for_testing(
                 iom::sycl_detail::SubmissionFault::none);
@@ -566,6 +567,56 @@ TEST_CASE("SYCL identical-window copy is a no-op") {
     const iom::oid token = queue->copy(tensor->view(), tensor->view());
     CHECK_NOTHROW(queue->wait(token));
     CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), 0);
+}
+
+TEST_CASE("SYCL host transfers reuse pooled staging") {
+    SyclDevices devices;
+    const iom::TensorSpec odd_spec{
+            iom::TensorShape{{1, 17}}, iom::DataType::U4};
+    auto odd_tensor = devices.candidate->create_tensor(odd_spec);
+    sycl::queue transfer_queue(
+            devices.candidate_allocator.context(),
+            devices.candidate_allocator.device(),
+            sycl::property_list{sycl::property::queue::in_order{}});
+    iom::sycl_detail::StagingSlotPool pool(
+            devices.candidate_allocator.context(),
+            devices.candidate_allocator.device());
+
+    std::vector<std::byte> odd_source(odd_spec.logical_nbytes());
+    for (std::size_t index = 0; index < odd_source.size(); ++index) {
+        odd_source[index] = static_cast<std::byte>(index * 13 + 7);
+    }
+    odd_source.back() &= std::byte{0x0f};
+    std::vector<std::byte> odd_result(odd_source.size());
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        iom::sycl_detail::region_from_host(
+                pool, transfer_queue, odd_tensor->view(),
+                odd_tensor->view().native_handle(), odd_source);
+        iom::sycl_detail::region_to_host(
+                pool, transfer_queue, odd_tensor->view(),
+                odd_tensor->view().native_handle(), odd_result);
+        CHECK(odd_result == odd_source);
+    }
+    CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
+
+    const iom::TensorSpec aligned_spec{
+            iom::TensorShape{{1, 16}}, iom::DataType::U8};
+    auto aligned_tensor = devices.candidate->create_tensor(aligned_spec);
+    std::vector<std::byte> aligned_source(aligned_spec.logical_nbytes());
+    for (std::size_t index = 0; index < aligned_source.size(); ++index) {
+        aligned_source[index] = static_cast<std::byte>(0xa0 + index);
+    }
+    std::vector<std::byte> aligned_result(aligned_source.size());
+    iom::sycl_detail::region_from_host(
+            pool, transfer_queue, aligned_tensor->view(),
+            aligned_tensor->view().native_handle(), aligned_source);
+    iom::sycl_detail::region_to_host(
+            pool, transfer_queue, aligned_tensor->view(),
+            aligned_tensor->view().native_handle(), aligned_result);
+    CHECK(aligned_result == aligned_source);
+    CHECK_EQ(pool.allocation_count_for_testing(), 1);
+    CHECK_EQ(pool.idle_count_for_testing(), 1);
 }
 
 TEST_CASE("SyclFenceState::result() idempotency and snapshot-after-clear") {

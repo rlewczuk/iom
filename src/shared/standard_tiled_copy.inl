@@ -19,6 +19,10 @@
 #ifndef IOM_LAUNCH_KERNEL
 #error "IOM_LAUNCH_KERNEL must be defined before including standard_tiled_copy.inl"
 #endif
+#ifndef IOM_GPU_GLOBAL_STRIDE
+#define IOM_GPU_GLOBAL_STRIDE \
+    (static_cast<std::uint64_t>(blockDim.x) * gridDim.x)
+#endif
 
 namespace iom::detail {
 namespace {
@@ -283,8 +287,7 @@ IOM_GPU_GLOBAL void scatter_plane_kernel(
         std::uint64_t destination_plane, std::uint64_t logical_base,
         std::uint64_t word_count, std::uint64_t rows,
         std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t stride =
-            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+    const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
     for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < word_count;
          word += stride) {
         copy_logical_to_tiled_word(
@@ -298,8 +301,7 @@ IOM_GPU_GLOBAL void gather_plane_kernel(
         std::uint64_t source_plane, std::uint64_t logical_base,
         std::uint64_t first_word, std::uint64_t word_count,
         std::uint64_t rows, std::uint64_t columns, unsigned int bits) {
-    const std::uint64_t stride =
-            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+    const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
     for (std::uint64_t index = IOM_GPU_GLOBAL_INDEX; index < word_count;
          index += stride) {
         copy_tiled_to_logical_word(
@@ -466,8 +468,7 @@ IOM_GPU_GLOBAL void grid_stride_copy_kernel(
             source_strides + metadata->leading_rank;
     const std::uint64_t* leading_dimensions =
             destination_strides + metadata->leading_rank;
-    const std::uint64_t stride =
-            static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+    const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
 
     for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < total_words;
          word += stride) {

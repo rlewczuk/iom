@@ -8,6 +8,7 @@
 
 #include "iom/iom.hpp"
 #include "registry_state.hpp"
+#include "staging_pool.hpp"
 
 namespace iom::sycl_detail {
 
@@ -17,7 +18,7 @@ enum class SubmissionFault {
     fence_construction,
     outcome_insertion,
     first_submit,
-    second_submit,
+    post_launch,
 };
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
@@ -26,12 +27,12 @@ void reset_fence_wait_count_for_testing() noexcept;
 [[nodiscard]] std::size_t fence_wait_count_for_testing() noexcept;
 
 void region_from_host(
-        const sycl::context& context, const sycl::device& device,
+        StagingSlotPool& staging_pool, sycl::queue& transfer_queue,
         const TensorView& destination, void* storage,
         std::span<const std::byte> source);
 
 void region_to_host(
-        const sycl::context& context, const sycl::device& device,
+        StagingSlotPool& staging_pool, sycl::queue& transfer_queue,
         const TensorView& source, const void* storage,
         std::span<std::byte> destination);
 

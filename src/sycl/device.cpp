@@ -68,6 +68,11 @@ namespace iom {
                        Allocator& allocator)
                     : device_(std::move(device)),
                       context_(device_),
+                      staging_pool_(*context_, device_),
+                      transfer_queue_(
+                              std::in_place, *context_, device_,
+                              sycl::property_list{
+                                      sycl::property::queue::in_order{}}),
                       registry_state_(),
                       ordinal_(ordinal),
                       allocator_(allocator) {
@@ -83,6 +88,12 @@ namespace iom {
             SyclDevice& operator=(const SyclDevice&) = delete;
             ~SyclDevice() override {
                 registry_state_.quarantine.drain();
+                staging_pool_.destroy();
+                try {
+                    transfer_queue_->wait_and_throw();
+                } catch (...) {
+                }
+                transfer_queue_.reset();
                 context_.reset();
                 if (sycl_detail::context_calls.context_destroyed != nullptr) {
                     sycl_detail::context_calls.context_destroyed();
@@ -116,6 +127,14 @@ namespace iom {
             [[nodiscard]] const sycl::device& native_device() const noexcept {
                 return device_;
             }
+            [[nodiscard]] sycl_detail::StagingSlotPool&
+                    staging_pool() noexcept {
+                return staging_pool_;
+            }
+
+            [[nodiscard]] sycl::queue& transfer_queue() noexcept {
+                return *transfer_queue_;
+            }
 
             [[nodiscard]] sycl_detail::SyclRegistryState&
                     registry_state() noexcept {
@@ -125,6 +144,8 @@ namespace iom {
         private:
             sycl::device device_;
             std::optional<sycl::context> context_;
+            sycl_detail::StagingSlotPool staging_pool_;
+            std::optional<sycl::queue> transfer_queue_;
             sycl_detail::SyclRegistryState registry_state_;
             std::uint32_t ordinal_;
             Allocator& allocator_;
@@ -235,7 +256,7 @@ namespace iom {
                     const TensorView& destination,
                     std::span<const std::byte> source) override {
                 sycl_detail::region_from_host(
-                        device_.context(), device_.native_device(),
+                        device_.staging_pool(), device_.transfer_queue(),
                         destination, address_, source);
             }
 
@@ -243,8 +264,8 @@ namespace iom {
                     const TensorView& source,
                     std::span<std::byte> destination) const override {
                 sycl_detail::region_to_host(
-                        device_.context(), device_.native_device(), source,
-                        address_, destination);
+                        device_.staging_pool(), device_.transfer_queue(),
+                        source, address_, destination);
             }
 
             SyclDevice& device_;
