@@ -1,4 +1,4 @@
-**Status:** blocked
+**Status:** done
 
 ## Summary
 
@@ -7,12 +7,10 @@ Implemented SYCL queue lifetime hardening across `src/sycl/registry_state.hpp`, 
 ## Verification
 
 - `cmake -S . -B build/sycl -DBUILD_TESTING=ON -DSYCL_ENABLED=ON -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF` via remote-development `sycl` profile — configured successfully with IntelLLVM 2026.1.
-- `cmake --build build/sycl --target iom_sycl_conformance_tests iom_sycl_smoke_tests -j` via remote-development — both targets built successfully.
-- Focused SYCL destruction, pre-enqueue, post-enqueue, queue-teardown, no-op, and `SyclFenceState::result()` runs under exclusive device access — all passed.
+- `cmake --build build/sycl --target iom_sycl_conformance_tests iom_sycl_smoke_tests iom_tests -j` via remote-development — all targets built successfully.
+- Dedicated pre-enqueue fault run under exclusive device access — 1 test passed, 26 assertions passed.
+- Valgrind Memcheck runs for destruction-before-wait, post-enqueue transactional failure, queue teardown, and `SyclFenceState::result()` — each test passed and reported `ERROR SUMMARY: 0 errors from 0 contexts`.
 - `ctest --test-dir build/sycl --output-on-failure -R "^iom_sycl_(conformance|smoke)_tests$"` via remote-development — 2/2 tests passed.
 - `ctest --test-dir build/sycl --output-on-failure -R "^iom_tests$"` via remote-development — 1/1 test passed.
 - SYCL source audit and `git diff --check` — passed.
-
-## Errors
-
-- Integration checkout is currently dirty (`test/CMakeLists.txt`), so `spec-run-task` cannot merge the latest integration branch or rerun the required diagnostics yet; the implementation remains committed on the retained feature branch.
+- Remote SYCL mirror cleaned after verification.
