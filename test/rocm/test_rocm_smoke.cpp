@@ -16,8 +16,7 @@
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/rocm/device.hpp"
-#include "staging_pool.hpp"
-#include "transfer_pool.hpp"
+#include "copy.hpp"
 #include "iom/tensor.hpp"
 
 namespace {

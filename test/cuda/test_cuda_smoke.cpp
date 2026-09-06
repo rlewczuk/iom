@@ -24,8 +24,6 @@
 #include "iom/tensor.hpp"
 #include "copy.hpp"
 #include "driver.hpp"
-#include "transfer_pool.hpp"
-#include "staging_pool.hpp"
 
 namespace cuda_test {
 bool fail_next_allocation = false;

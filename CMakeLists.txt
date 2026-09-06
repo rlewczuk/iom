@@ -151,11 +151,11 @@ if(CUDA_ENABLED)
         src/cuda/copy.hpp
         src/cuda/driver.cpp
         src/cuda/driver.hpp
-        src/cuda/transfer_pool.hpp
         src/cuda/registry_state.hpp
-        src/cuda/staging_pool.cpp
-        src/cuda/staging_pool.hpp
+        src/shared/metadata_slot_pool.hpp
+        src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
+        src/shared/transfer_pool.hpp
         include/iom/cuda/device.hpp
     )
 
@@ -196,11 +196,11 @@ if(ROCM_ENABLED)
         src/rocm/device.cpp
         src/rocm/copy.hip
         src/rocm/copy.hpp
-        src/rocm/staging_pool.cpp
-        src/rocm/staging_pool.hpp
-        src/rocm/transfer_pool.hpp
-        src/shared/standard_tiled_copy.hpp
         src/rocm/registry_state.hpp
+        src/shared/metadata_slot_pool.hpp
+        src/shared/staging_pool.hpp
+        src/shared/standard_tiled_copy.hpp
+        src/shared/transfer_pool.hpp
         include/iom/rocm/device.hpp
     )
 
@@ -269,10 +269,10 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
     if(CUDA_ENABLED)
-        target_compile_definitions(iom_cuda PRIVATE IOM_ENABLE_TESTING)
+        target_compile_definitions(iom_cuda PUBLIC IOM_ENABLE_TESTING)
     endif()
     if(ROCM_ENABLED)
-        target_compile_definitions(iom_rocm PRIVATE IOM_ENABLE_TESTING)
+        target_compile_definitions(iom_rocm PUBLIC IOM_ENABLE_TESTING)
     endif()
     if(TTNN_ENABLED)
         target_compile_definitions(iom_ttnn PRIVATE IOM_ENABLE_TESTING)
