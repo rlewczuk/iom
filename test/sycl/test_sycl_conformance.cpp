@@ -687,9 +687,10 @@ TEST_CASE("SYCL conformance: storage oracle covers every leaf width and padded s
 
 TEST_CASE("SYCL conformance: asynchronous copies against the CPU reference") {
     SyclDevices devices;
+    SyclStorageOracle oracle(devices.candidate_allocator);
     iom_conformance::run_async_copy_conformance(
             devices.conformance(), devices.candidate->supported_data_types(),
-            &devices.gate);
+            &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -727,9 +728,10 @@ TEST_CASE("SYCL conformance: compute methods reject capability without submittin
 
 TEST_CASE("SYCL conformance: full shared suite") {
     SyclDevices devices;
+    SyclStorageOracle oracle(devices.candidate_allocator);
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate);
+            &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
