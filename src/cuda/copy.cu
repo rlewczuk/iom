@@ -86,6 +86,11 @@ struct gpu_policy {
             (void)cudaEventDestroy(event);
         }
     }
+    static void synchronize_event_noexcept(event_type event) noexcept {
+        if (event != nullptr) {
+            (void)cudaEventSynchronize(event);
+        }
+    }
     static void synchronize_event(event_type event) {
         check_cuda_kernel("cudaEventSynchronize", cudaEventSynchronize(event));
     }
@@ -628,6 +633,7 @@ void cuda_fence_destroy(void* opaque) noexcept {
         gpu_policy::activate(resource->context);
     } catch (...) {
     }
+    gpu_policy::synchronize_event_noexcept(resource->event);
     destroy_cuda_resource_noexcept(resource);
 }
 
