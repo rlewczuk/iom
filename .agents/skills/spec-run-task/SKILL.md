@@ -1,12 +1,12 @@
 ---
 name: spec-run-task
-description: Implement one change task or its unfinished subtasks from docs/changes in isolated, reusable Git worktrees, then commit, verify, and merge the completed work. Use only through /spec-run-task <change-name>[/subpath] or when explicitly requested.
+description: Implement one change task or its unfinished subtasks from docs/changes in isolated, reusable Git worktrees on readable task-derived branches, then commit, verify, and merge the completed work. Use only through /spec-run-task <change-name>[/subpath] or when explicitly requested.
 hide: true
 ---
 
 # Spec Run Task
 
-Implement the requested specification completely. Every executable task gets its own deterministic feature branch and worktree under `.work/`; no project file may be changed in the integration checkout. A target with descendant task specifications is an orchestration target: run its unfinished leaf subtasks instead of implementing the target's own `spec.md`.
+Implement the requested specification completely. Every executable task gets its own deterministic, task-named feature branch and registered worktree under `.work/`. The integration checkout is never an implementation or verification workspace: no project file may be changed, built, tested, formatted, or run there on the task's behalf. A target with descendant task specifications is an orchestration target: run its unfinished leaf subtasks instead of implementing the target's own `spec.md`.
 
 The command supplies one path relative to `docs/changes/`:
 
@@ -16,11 +16,23 @@ The command supplies one path relative to `docs/changes/`:
 
 For target `<target>`, the requested specification is exactly `docs/changes/<target>/spec.md` and its optional annotation is `docs/changes/<target>/task.md`.
 
+## Mandatory worktree execution boundary
+
+Treat the integration checkout as a read-only control plane, not as the task's working directory. Use it only for read-only discovery and orchestration, repository validation, status/ref/worktree inspection, worktree provisioning, and the final verified fast-forward merge.
+
+Before any project-file edit, annotation edit, LSP mutation, build, test, formatter, or runtime command:
+
+1. Provision or reuse the executable task's exact `.work/<task-path>` worktree.
+2. Verify inside that worktree that its checked-out branch is the expected task-derived feature branch and that its common Git directory belongs to this repository.
+3. Bind all subsequent task implementation and verification paths and command working directories to that worktree. Prefix every Read, Edit, Write, and LSP path used for task files with `.work/<task-path>/` (or its exact absolute path), and set every task-related Bash `cwd` to the worktree.
+
+Never edit in the integration checkout with the intent to copy or commit the change later. Never rely on the shell's current directory or on an unprefixed relative path for task work after provisioning. If a task tool path or command `cwd` would resolve to the integration checkout, stop before the action and retarget it to the assigned worktree.
+
 ## Non-negotiable invariants
 
 - Capture the project repository's current branch as the **integration branch** before provisioning any worktree. New feature branches start at that branch's then-current tip.
 - Require a named integration branch and a clean integration checkout. Do not stash, reset, clean, switch, commit, or otherwise disturb pre-existing user changes to make it clean.
-- Do not edit any project file in the integration checkout. All implementation and annotation edits happen in the executable task's assigned worktree.
+- Do not edit, build, test, format, or run task code in the integration checkout. All implementation, annotation, code-intelligence, build, test, and runtime actions happen in the executable task's assigned worktree.
 - Use one feature branch and one registered Git worktree per executable task. Reuse the deterministic branch and exact worktree when they already exist; never discard unfinished contents.
 - The exact worktree for task path `<task-path>` is `<repo-root>/.work/<task-path>`. For example, `0001-foo/02-bar` uses `.work/0001-foo/02-bar`.
 - Keep `.work/` ignored. Never stage files through the integration checkout merely because a worktree lives below it.
@@ -118,15 +130,19 @@ Topologically schedule unfinished leaves in waves. Tasks in one wave have all bl
 
 ## Provision a task worktree
 
-Provision every task before its agent changes any project file. Derive a deterministic, Git-safe feature branch from the exact task path:
+Provision every task before its agent changes any project file or runs any task command. Derive a deterministic, readable, Git-safe feature branch from the exact task path:
 
 ```text
-digest = lowercase SHA-256 of the UTF-8 task path, with no trailing newline
-feature branch = spec-run-task/<64-hex-digest>
+components = the exact slash-separated task-path components
+require every component to match [A-Za-z0-9]+(?:-[A-Za-z0-9]+)*
+branch suffix = components joined with --
+feature branch = run-task/<branch-suffix>
 worktree = <repo-root>/.work/<task-path>
 ```
 
-A full digest avoids branch-ref hierarchy collisions between a task and its nested subtasks. Compute it with a quoted input and verify the result before using it as a ref. Validate the final ref with `git check-ref-format --branch`.
+For example, task path `task-name/subtask-name` uses `run-task/task-name--subtask-name`; `0001-tensor-view/02-core-metadata-layout` uses `run-task/0001-tensor-view--02-core-metadata-layout`.
+
+Joining components with `--` is collision-free because a valid component contains only single hyphen separators. Preserve each component exactly, including case and numeric prefixes. Do not silently slugify or hash an invalid name: report the exact invalid component and stop before creating a ref or worktree. Validate the final ref with `git check-ref-format --branch`.
 
 Provision or reuse conservatively:
 
@@ -149,8 +165,8 @@ For a reused clean feature branch, have its owning agent merge the latest integr
 
 When the requested target has no descendant task specs, the main agent is the task owner:
 
-1. Provision or reuse the target worktree and feature branch.
-2. Perform every Read, Edit, Write, LSP, build, and runtime action against the worktree. File tools must use paths rooted at `.work/<target>/`; Bash commands must set that worktree as `cwd`. Do not modify like-named files in the integration checkout.
+1. Before any implementation action, provision or reuse the target worktree and feature branch, then verify both from inside that worktree.
+2. Treat the assigned worktree as the sole project root for the task. Perform every Read, Edit, Write, LSP, build, test, and runtime action there. File tools must use paths rooted at `.work/<target>/`; Bash commands must set that worktree as `cwd`. An unprefixed project path or integration-checkout `cwd` is an error: stop and retarget rather than modifying the integration checkout.
 3. Read the complete `spec.md`, repository guidance, referenced implementation and tests, and applicable skills. Resume coherent prior work when reusing a worktree.
 4. Reproduce a bug before editing when the spec requires a reproduction and it remains reachable.
 5. Implement the complete specified behavior and acceptance criteria. Run the focused verification in the spec and the repository-required conformance coverage.
@@ -164,7 +180,7 @@ If the leaf annotation already says `done`, make no project change and report it
 
 ## Execute a container through subagents
 
-Subtasks must be implemented by general-purpose subagents, not by the orchestrating main agent. Do not use automatic isolated-agent worktrees: provision the required `.work/<task-path>` worktrees explicitly, then assign each child its exact existing worktree and feature branch.
+Subtasks must be implemented by general-purpose subagents, not by the orchestrating main agent. Do not use automatic isolated-agent worktrees: the orchestrator must provision and verify each required `.work/<task-path>` worktree explicitly before spawning, then assign each child its exact existing worktree and task-derived feature branch. The child works only in that worktree; the integration checkout remains a read-only control plane.
 
 ### Prepare a wave
 
@@ -185,7 +201,7 @@ Use this assignment shape:
 - Exclusive ownership: this task's implementation, tests, and annotation only
 
 # Change
-- Use the assigned worktree only. Prefix every file-tool path with the worktree path and set every Bash cwd to it. Never edit the integration checkout.
+- **WORKTREE ONLY:** use the assigned worktree as the sole project root. Prefix every Read, Edit, Write, and LSP path with the exact worktree path and set every Bash `cwd` to it. Before the first implementation action, verify the current branch from inside that worktree. Never edit, build, test, format, or run task code in the integration checkout, even temporarily.
 - Read the complete spec, repository guidance, relevant source/tests, and applicable skills.
 - Preserve and resume coherent existing work when the worktree was reused.
 - If needed, merge the integration branch into the feature branch before implementation and resolve any conflict here.
@@ -245,7 +261,7 @@ Before completing the command, establish all of the following from observed stat
 
 - every non-finished leaf whose blockers became satisfied was attempted;
 - no container `spec.md` was implemented while it had descendant specs;
-- each attempted task used its exact `.work/<task-path>` worktree and deterministic feature branch;
+- each attempted task used its exact `.work/<task-path>` worktree and deterministic `run-task/<task-name>[--<subtask-name>...]` feature branch;
 - each integrated task has `Status: done`, grounded verification evidence, and committed implementation and annotation changes;
 - every integrated feature commit is reachable from the recorded integration branch;
 - no failed, blocked, partial, dirty, or unverified feature branch was merged;
