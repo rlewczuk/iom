@@ -270,14 +270,14 @@ void synchronous_transfer(
     }
     const std::size_t staging_nbytes =
             (logical_nbytes + (kWordBytes - 1)) / kWordBytes * kWordBytes;
-    void* staging = sycl::malloc_shared(staging_nbytes, device, context);
+    void* staging = sycl::malloc_host(staging_nbytes, context);
     if (staging == nullptr) {
         throw std::bad_alloc();
     }
 
     try {
         if (from_host) {
-            queue.memcpy(staging, source.data(), logical_nbytes);
+            std::memcpy(staging, source.data(), logical_nbytes);
             launch_view_transfer(
                     queue, view, staging, const_cast<void*>(storage), true);
             queue.wait_and_throw();
@@ -286,8 +286,7 @@ void synchronous_transfer(
             launch_view_transfer(
                     queue, view, storage, staging, false);
             queue.wait_and_throw();
-            queue.memcpy(destination.data(), staging, logical_nbytes)
-                    .wait_and_throw();
+            std::memcpy(destination.data(), staging, logical_nbytes);
         }
     } catch (...) {
         try {
