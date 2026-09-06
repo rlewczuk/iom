@@ -237,6 +237,7 @@ if(SYCL_ENABLED)
         src/sycl/copy.cpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
+        src/sycl/registry_state.hpp
         include/iom/sycl/device.hpp
     )
 

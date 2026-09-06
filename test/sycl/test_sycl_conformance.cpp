@@ -10,6 +10,9 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -19,6 +22,7 @@
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
+#include "copy.hpp"
 #include "runtime.hpp"
 
 namespace {
@@ -129,6 +133,106 @@ private:
     std::unordered_set<void*> live_;
 };
 
+class ReusingSyclAllocator final : public iom::Allocator {
+public:
+    ~ReusingSyclAllocator() override {
+        if (!context_.has_value()) {
+            return;
+        }
+        for (const Slot& slot : free_) {
+            try {
+                sycl::free(slot.pointer, *context_);
+            } catch (...) {
+            }
+        }
+        for (const auto& [pointer, size] : live_) {
+            (void)size;
+            try {
+                sycl::free(pointer, *context_);
+            } catch (...) {
+            }
+        }
+    }
+
+    void bind_context(const sycl::context& context) {
+        context_ = context;
+        const std::vector<sycl::device> devices = context.get_devices();
+        REQUIRE(!devices.empty());
+        device_ = devices.front();
+    }
+
+    void* alloc(std::size_t size) override {
+        REQUIRE(context_.has_value());
+        for (auto it = free_.begin(); it != free_.end(); ++it) {
+            if (it->size != size) {
+                continue;
+            }
+            void* pointer = it->pointer;
+            live_.emplace(pointer, size);
+            free_.erase(it);
+            ++allocations;
+            return pointer;
+        }
+
+        void* pointer = sycl::malloc_shared(size, device_, *context_);
+        if (pointer == nullptr) {
+            throw std::bad_alloc();
+        }
+        try {
+            live_.emplace(pointer, size);
+        } catch (...) {
+            sycl::free(pointer, *context_);
+            throw;
+        }
+        ++allocations;
+        return pointer;
+    }
+
+    void free(void* buffer) override {
+        const auto found = live_.find(buffer);
+        REQUIRE_MESSAGE(
+                found != live_.end(),
+                "SYCL reuse allocator received an unknown address");
+        free_.push_back({buffer, found->second});
+        live_.erase(found);
+        ++frees;
+    }
+
+    void reset() override {}
+
+    void release_free() noexcept {
+        if (!context_.has_value()) {
+            return;
+        }
+        for (const Slot& slot : free_) {
+            try {
+                sycl::free(slot.pointer, *context_);
+            } catch (...) {
+            }
+        }
+        free_.clear();
+    }
+
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return free_.size();
+    }
+
+    std::size_t allocations = 0;
+    std::size_t frees = 0;
+
+private:
+    struct Slot {
+        void* pointer;
+        std::size_t size;
+    };
+
+    std::optional<sycl::context> context_;
+    sycl::device device_;
+    std::vector<Slot> free_;
+    std::unordered_map<void*, std::size_t> live_;
+};
+
+
 class HostPointerAllocator final : public iom::Allocator {
 public:
     void* alloc(std::size_t size) override {
@@ -154,17 +258,24 @@ private:
 };
 
 SyclAllocator* active_context_allocator = nullptr;
+ReusingSyclAllocator* active_reusing_allocator = nullptr;
 
 void capture_context(const sycl::context& context) {
     REQUIRE(active_context_allocator != nullptr);
     active_context_allocator->bind_context(context);
 }
 
+void capture_reusing_context(const sycl::context& context) {
+    REQUIRE(active_reusing_allocator != nullptr);
+    active_reusing_allocator->bind_context(context);
+}
+
 class ContextCallsRestore final {
 public:
     ContextCallsRestore()
             : saved_(iom::sycl_detail::context_calls),
-              saved_allocator_(active_context_allocator) {}
+              saved_allocator_(active_context_allocator),
+              saved_reusing_allocator_(active_reusing_allocator) {}
 
     ContextCallsRestore(const ContextCallsRestore&) = delete;
     ContextCallsRestore& operator=(const ContextCallsRestore&) = delete;
@@ -172,11 +283,13 @@ public:
     ~ContextCallsRestore() {
         iom::sycl_detail::context_calls = saved_;
         active_context_allocator = saved_allocator_;
+        active_reusing_allocator = saved_reusing_allocator_;
     }
 
 private:
     iom::sycl_detail::ContextCalls saved_;
     SyclAllocator* saved_allocator_;
+    ReusingSyclAllocator* saved_reusing_allocator_;
 };
 
 struct SyclDevices {
@@ -202,6 +315,20 @@ struct SyclDevices {
 
     [[nodiscard]] iom_conformance::ConformanceDevices conformance() const {
         return {*reference, *candidate, *foreign};
+    }
+};
+
+struct ReusingSyclDevice {
+    ContextCallsRestore context_restore;
+    ReusingSyclAllocator allocator;
+    std::unique_ptr<iom::Device> device;
+
+    ReusingSyclDevice() {
+        iom::sycl_detail::context_calls.context_ready =
+                &capture_reusing_context;
+        active_reusing_allocator = &allocator;
+        device = iom::make_sycl_device(0, allocator);
+        active_reusing_allocator = nullptr;
     }
 };
 
@@ -239,6 +366,26 @@ private:
     const SyclAllocator& allocator_;
 };
 
+void expect_repeated_runtime_failure(
+        iom::DeviceOps& queue, iom::oid token) {
+    std::string message;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool caught = false;
+        try {
+            queue.wait(token);
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            if (message.empty()) {
+                message = error.what();
+            } else {
+                CHECK_EQ(std::string_view(error.what()), message);
+            }
+        }
+        CHECK(caught);
+    }
+    CHECK_FALSE(message.empty());
+}
+
 }  // namespace
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
     SyclDevices devices;
@@ -263,6 +410,181 @@ TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") 
     for (std::size_t i = 0; i < supported.size(); ++i) {
         CHECK_EQ(supported[i], expected[i]);
     }
+}
+
+TEST_CASE("SYCL tensor destruction fences queued work") {
+    REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
+    ReusingSyclDevice devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = devices.device->create_tensor(spec);
+    auto destination = devices.device->create_tensor(spec);
+    const std::vector<std::byte> pattern(
+            spec.logical_nbytes(), static_cast<std::byte>(0x3c));
+    const std::vector<std::byte> zero(
+            spec.logical_nbytes(), static_cast<std::byte>(0));
+    source->view().copy_from_host(pattern);
+    destination->view().copy_from_host(zero);
+
+    auto queue = devices.device->create_ops();
+    const iom::oid token = queue->copy(
+            source->view(), destination->view());
+    source.reset();
+    auto fresh_source = devices.device->create_tensor(spec);
+    fresh_source->view().copy_from_host(
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), static_cast<std::byte>(0xa5)));
+
+    CHECK_NOTHROW(queue->wait(token));
+    std::vector<std::byte> observed(spec.logical_nbytes());
+    destination->view().copy_to_host(observed);
+    CHECK(observed == pattern);
+
+    fresh_source.reset();
+    destination.reset();
+    queue.reset();
+    CHECK_EQ(devices.allocator.frees, 3);
+    CHECK_EQ(devices.allocator.allocations, 3);
+    devices.device.reset();
+    devices.allocator.release_free();
+    CHECK_EQ(devices.allocator.free_count(), 0);
+}
+
+TEST_CASE("SYCL pre-enqueue failures preserve submission sequences") {
+    SyclDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    const iom::sycl_detail::SubmissionFault faults[] = {
+            iom::sycl_detail::SubmissionFault::state_allocation,
+            iom::sycl_detail::SubmissionFault::fence_construction,
+            iom::sycl_detail::SubmissionFault::outcome_insertion,
+            iom::sycl_detail::SubmissionFault::first_submit,
+    };
+
+    for (const auto fault : faults) {
+        auto queue = devices.candidate->create_ops();
+        iom::sycl_detail::inject_submission_fault_for_testing(fault);
+        CHECK_THROWS(queue->copy(source->view(), destination->view()));
+        iom::sycl_detail::inject_submission_fault_for_testing(
+                iom::sycl_detail::SubmissionFault::none);
+        const iom::oid token = queue->copy(
+                source->view(), destination->view());
+        CHECK_EQ(iom_conformance::token_sequence(token), 1);
+        CHECK_NOTHROW(queue->wait(token));
+    }
+}
+
+TEST_CASE("SYCL submission remains transactional across post-enqueue failures") {
+    REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
+    ReusingSyclDevice devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = devices.device->create_tensor(spec);
+    auto destination = devices.device->create_tensor(spec);
+    const void* source_address = source->view().native_handle();
+    const void* destination_address =
+            destination->view().native_handle();
+    auto queue = devices.device->create_ops();
+
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::second_submit);
+    const iom::oid token = queue->copy(
+            source->view(), destination->view());
+    CHECK_EQ(iom_conformance::token_sequence(token), 1);
+    expect_repeated_runtime_failure(*queue, token);
+
+    source.reset();
+    destination.reset();
+    auto fresh_source = devices.device->create_tensor(spec);
+    auto fresh_destination = devices.device->create_tensor(spec);
+    CHECK_NE(fresh_source->view().native_handle(), source_address);
+    CHECK_NE(
+            fresh_destination->view().native_handle(), destination_address);
+    CHECK_NE(
+            fresh_source->view().native_handle(),
+            fresh_destination->view().native_handle());
+
+    fresh_source.reset();
+    fresh_destination.reset();
+    queue.reset();
+    CHECK_EQ(devices.allocator.frees, 2);
+    CHECK_EQ(devices.allocator.allocations, 4);
+    devices.device.reset();
+    CHECK_EQ(devices.allocator.frees, 4);
+    devices.allocator.release_free();
+    CHECK_EQ(devices.allocator.free_count(), 0);
+}
+
+TEST_CASE("SYCL queue destruction fences pending copies") {
+    REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
+    ReusingSyclDevice devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = devices.device->create_tensor(spec);
+    auto destination = devices.device->create_tensor(spec);
+    const void* source_address = source->view().native_handle();
+    const void* destination_address =
+            destination->view().native_handle();
+
+    {
+        auto queue = devices.device->create_ops();
+        CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        iom::sycl_detail::inject_submission_fault_for_testing(
+                iom::sycl_detail::SubmissionFault::second_submit);
+        CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        iom::sycl_detail::inject_submission_fault_for_testing(
+                iom::sycl_detail::SubmissionFault::none);
+    }
+
+    source.reset();
+    destination.reset();
+    CHECK_EQ(devices.allocator.frees, 0);
+    auto fresh_source = devices.device->create_tensor(spec);
+    auto fresh_destination = devices.device->create_tensor(spec);
+    CHECK_NE(fresh_source->view().native_handle(), source_address);
+    CHECK_NE(
+            fresh_destination->view().native_handle(), destination_address);
+    fresh_source.reset();
+    fresh_destination.reset();
+    CHECK_EQ(devices.allocator.frees, 2);
+    devices.device.reset();
+    CHECK_EQ(devices.allocator.frees, 4);
+    devices.allocator.release_free();
+    CHECK_EQ(devices.allocator.free_count(), 0);
+}
+
+TEST_CASE("SYCL identical-window copy is a no-op") {
+    SyclDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::U8};
+    auto tensor = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+    iom::sycl_detail::reset_fence_wait_count_for_testing();
+    const iom::oid token = queue->copy(tensor->view(), tensor->view());
+    CHECK_NOTHROW(queue->wait(token));
+    CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), 0);
+}
+
+TEST_CASE("SyclFenceState::result() idempotency and snapshot-after-clear") {
+    SyclDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+    iom::sycl_detail::reset_fence_wait_count_for_testing();
+    const iom::oid token = queue->copy(
+            source->view(), destination->view());
+
+    source.reset();
+    CHECK_NOTHROW(queue->wait(token));
+    destination.reset();
+    CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), 1);
+    CHECK_NOTHROW(queue->wait(token));
+    CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), 1);
 }
 
 

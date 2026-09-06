@@ -68,6 +68,7 @@ namespace iom {
                        Allocator& allocator)
                     : device_(std::move(device)),
                       context_(device_),
+                      registry_state_(),
                       ordinal_(ordinal),
                       allocator_(allocator) {
                 if (sycl_detail::context_calls.context_created != nullptr) {
@@ -80,8 +81,8 @@ namespace iom {
 
             SyclDevice(const SyclDevice&) = delete;
             SyclDevice& operator=(const SyclDevice&) = delete;
-
             ~SyclDevice() override {
+                registry_state_.quarantine.drain();
                 context_.reset();
                 if (sycl_detail::context_calls.context_destroyed != nullptr) {
                     sycl_detail::context_calls.context_destroyed();
@@ -103,9 +104,9 @@ namespace iom {
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;
-
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
-                return sycl_detail::make_queue(*this, *context_, device_);
+                return sycl_detail::make_queue(
+                        *this, *context_, device_, registry_state_);
             }
 
             [[nodiscard]] const sycl::context& context() const noexcept {
@@ -116,9 +117,15 @@ namespace iom {
                 return device_;
             }
 
+            [[nodiscard]] sycl_detail::SyclRegistryState&
+                    registry_state() noexcept {
+                return registry_state_;
+            }
+
         private:
             sycl::device device_;
             std::optional<sycl::context> context_;
+            sycl_detail::SyclRegistryState registry_state_;
             std::uint32_t ordinal_;
             Allocator& allocator_;
 
@@ -126,10 +133,13 @@ namespace iom {
         };
         class SyclTensor final : public Tensor {
         public:
-            SyclTensor(const TensorSpec& spec, SyclDevice& device,
-                       Allocator& allocator)
+            SyclTensor(
+                    const TensorSpec& spec, SyclDevice& device,
+                    sycl_detail::SyclRegistryState& state,
+                    Allocator& allocator)
                     : Tensor(spec, device),
                       device_(device),
+                      state_(&state),
                       allocator_(allocator) {
                 address_ = iom::detail::allocate_aligned_storage(
                         allocator_,
@@ -151,8 +161,69 @@ namespace iom {
                 }
             }
 
-            ~SyclTensor() override {
-                iom::detail::release_aligned_storage(allocator_, address_);
+            ~SyclTensor() noexcept override {
+                if (address_ == nullptr) {
+                    return;
+                }
+
+                const void* original_address = address_;
+                const std::size_t bytes =
+                        view().spec().tiled_storage_nbytes();
+                const auto quarantine_storage = [this, bytes]() noexcept {
+                    try {
+                        state_->quarantine
+                                .emplace<detail::AllocatorCleanupAction>(
+                                        allocator_, address_, bytes);
+                    } catch (...) {
+                        // Leaking is safer than returning failed storage to
+                        // the allocator when quarantine allocation fails.
+                    }
+                    address_ = nullptr;
+                };
+
+                std::vector<
+                        detail::OutstandingWorkRegistry::EntrySnapshot>
+                        snapshots;
+                try {
+                    snapshots = state_->registry.snapshot_for(address_);
+                } catch (...) {
+                    quarantine_storage();
+                    return;
+                }
+
+                bool safe_to_release = true;
+                for (const auto& snapshot : snapshots) {
+                    if (snapshot.state == detail::EntryState::Invalidated
+                            || !snapshot.fence) {
+                        safe_to_release = false;
+                        continue;
+                    }
+                    try {
+                        const detail::FenceResult result = snapshot.fence();
+                        safe_to_release = safe_to_release
+                                && result.succeeded && !result.failure;
+                    } catch (...) {
+                        safe_to_release = false;
+                    }
+                }
+
+                if (safe_to_release) {
+                    for (const auto& snapshot : snapshots) {
+                        state_->registry.remove_entry_if_present(
+                                snapshot.id,
+                                const_cast<void*>(original_address));
+                    }
+                    iom::detail::release_aligned_storage(
+                            allocator_, address_);
+                    return;
+                }
+
+                quarantine_storage();
+                for (const auto& snapshot : snapshots) {
+                    state_->registry.remove_entry_if_present(
+                            snapshot.id,
+                            const_cast<void*>(original_address));
+                }
             }
 
         private:
@@ -177,13 +248,15 @@ namespace iom {
             }
 
             SyclDevice& device_;
+            sycl_detail::SyclRegistryState* state_;
             Allocator& allocator_;
             void* address_ = nullptr;
         };
 
         std::unique_ptr<Tensor> SyclDevice::create_tensor(
                 const TensorSpec& spec) {
-            return std::make_unique<SyclTensor>(spec, *this, allocator_);
+            return std::make_unique<SyclTensor>(
+                    spec, *this, registry_state_, allocator_);
         }
 
     }  // namespace

@@ -3,25 +3,85 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
-#include <condition_variable>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <exception>
-#include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace iom::sycl_detail {
 namespace {
+
+std::atomic<SubmissionFault> g_submission_fault{
+        SubmissionFault::none};
+std::atomic<std::size_t> g_fence_wait_count{0};
+
+[[nodiscard]] bool consume_submission_fault(
+        SubmissionFault point) noexcept {
+    SubmissionFault expected = point;
+    return g_submission_fault.compare_exchange_strong(
+            expected, SubmissionFault::none, std::memory_order_acq_rel);
+}
+
+class SyclFenceState final {
+public:
+    static_assert(
+            std::is_nothrow_move_constructible_v<sycl::event>
+            && std::is_nothrow_move_assignable_v<sycl::event>);
+
+    void set_event(sycl::event incoming) noexcept {
+        event_ = std::move(incoming);
+    }
+
+    void set_failure(std::exception_ptr incoming) noexcept {
+        retained_failure_ = std::move(incoming);
+    }
+
+    [[nodiscard]] detail::FenceResult result() noexcept {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cached_.has_value()) {
+            return *cached_;
+        }
+
+        detail::FenceResult result = detail::FenceResult::success();
+        if (event_.has_value()) {
+            ++g_fence_wait_count;
+            try {
+                event_->wait_and_throw();
+            } catch (...) {
+                result = detail::FenceResult::failed(
+                        std::current_exception());
+            }
+        }
+        if (!result.failure && retained_failure_) {
+            result = detail::FenceResult::failed(retained_failure_);
+        }
+        cached_ = result;
+        return result;
+    }
+
+    void clear_event() noexcept {
+        std::lock_guard<std::mutex> lock(mu_);
+        event_.reset();
+    }
+
+private:
+    std::mutex mu_;
+    std::optional<sycl::event> event_;
+    std::exception_ptr retained_failure_;
+    std::optional<detail::FenceResult> cached_;
+};
 
 constexpr std::size_t kTile = TensorSpec::TILE;
 constexpr std::size_t kTileSlots = kTile * kTile;
@@ -245,31 +305,76 @@ void synchronous_transfer(
 }
 
 class SyclQueue final : public DeviceOps {
+    struct Task {
+        std::uint64_t sequence;
+        const TensorView* source;
+        TensorView* destination;
+        std::vector<PlanePair> pairs;
+        bool no_op;
+        std::shared_ptr<SyclFenceState> state;
+        void* fence = state.get();
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+    };
+
+    struct SequenceOutcome {
+        detail::EntryId source_entry_id = 0;
+        detail::EntryId destination_entry_id = 0;
+        std::shared_ptr<SyclFenceState> state;
+    };
+
 public:
     SyclQueue(
             const Device& device, const sycl::context& context,
-            const sycl::device& native_device)
+            const sycl::device& native_device, SyclRegistryState& state)
             : device_(&device),
+              state_(&state),
+              registry_queue_id_(allocate_queue_id(*state_)),
               queue_(
                       context, native_device,
                       sycl::property_list{
                               sycl::property::queue::in_order{}}),
-              worker_([this] { run(); }) {}
+              worker_(
+                      detail::StagedWorker<Task>::Callbacks{
+                              [this](Task& task) {
+                                  execute(task);
+                              },
+                              [](void* fence) noexcept {
+                                  if (fence != nullptr) {
+                                      (void)static_cast<SyclFenceState*>(
+                                                     fence)
+                                              ->result();
+                                  }
+                              },
+                              [](void* fence) noexcept {
+                                  if (fence == nullptr) {
+                                      return;
+                                  }
+                                  auto* state =
+                                          static_cast<SyclFenceState*>(fence);
+                                  (void)state->result();
+                                  state->clear_event();
+                              },
+                              [this](
+                                      std::uint64_t sequence,
+                                      std::exception_ptr failure) {
+                                  complete_task(
+                                          sequence, std::move(failure));
+                              }},
+                      detail::StagedWorker<Task>::PublishPolicy::Splice) {
+        worker_.start();
+    }
 
     ~SyclQueue() override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            shutdown_ = true;
-        }
-        completion_.notify_all();
-        if (worker_.joinable()) {
-            worker_.join();
-        }
+        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        worker_.shutdown_and_drain();
     }
 
     oid copy(
             const TensorView& source,
             TensorView& destination) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
         validate_copy(*device_, source, destination);
         const bool no_op = identical_window(source, destination);
         std::vector<PlanePair> pairs;
@@ -283,72 +388,18 @@ public:
         const std::size_t columns = dimensions[dimensions.size() - 1];
         const unsigned int bits = static_cast<unsigned int>(
                 detail::leaf_bits(source.spec().data_type));
-        const void* source_handle = source.native_handle();
-        void* destination_handle = destination.native_handle();
 
-        const oid token = submit(
-                [this, no_op, pairs = std::move(pairs), source_handle,
-                 destination_handle, rows, columns, bits](
+        return submit(
+                [this, &source, &destination, no_op,
+                 pairs = std::move(pairs), rows, columns, bits](
                         std::uint64_t sequence) mutable {
-                    if (no_op) {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        staged_.push_back(Task{sequence, std::nullopt});
-                        return;
-                    }
-
-                    std::optional<sycl::event> last_event;
-                    try {
-                        for (const PlanePair pair : pairs) {
-                            last_event = queue_.submit([=](sycl::handler& handler) {
-                                handler.parallel_for(
-                                        sycl::range<1>(rows * columns),
-                                        [=](sycl::id<1> index) {
-                                            const std::uint64_t local = index[0];
-                                            const std::uint64_t row = local / columns;
-                                            const std::uint64_t column = local % columns;
-                                            const std::uint64_t source_bit =
-                                                    device_plane_slot(
-                                                            pair.source, row,
-                                                            column, rows,
-                                                            columns)
-                                                    * bits;
-                                            const std::uint64_t destination_bit =
-                                                    device_plane_slot(
-                                                            pair.destination,
-                                                            row, column, rows,
-                                                            columns)
-                                                    * bits;
-                                            device_write_bits(
-                                                    static_cast<unsigned char*>(
-                                                            destination_handle),
-                                                    destination_bit, bits,
-                                                    device_read_bits(
-                                                            static_cast<const unsigned char*>(
-                                                                    source_handle),
-                                                            source_bit, bits));
-                                        });
-                            });
-                        }
-                    } catch (...) {
-                        const std::exception_ptr failure =
-                                std::current_exception();
-                        if (!last_event.has_value()) {
-                            throw;
-                        }
-                        {
-                            std::lock_guard<std::mutex> lock(mutex_);
-                            staged_.push_back(
-                                    Task{sequence, std::move(last_event)});
-                        }
-                        commit_failure(sequence, failure);
-                        return;
-                    }
-
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    staged_.push_back(Task{sequence, std::move(last_event)});
+                    worker_.submit_copy(Task{
+                            sequence, &source, &destination, std::move(pairs),
+                            no_op});
+                    (void)rows;
+                    (void)columns;
+                    (void)bits;
                 });
-        publish_staged();
-        return token;
     }
 
     oid add(const TensorView&, const TensorView&, TensorView&) override {
@@ -380,60 +431,206 @@ public:
     }
 
 private:
-    struct Task {
-        std::uint64_t sequence;
-        std::optional<sycl::event> event;
-    };
+    void execute(Task& task) {
+        if (task.no_op) {
+            task.state = nullptr;
+            task.fence = nullptr;
+            return;
+        }
 
+        if (consume_submission_fault(SubmissionFault::state_allocation)) {
+            throw std::bad_alloc();
+        }
+        task.state = std::make_shared<SyclFenceState>();
+        task.fence = task.state.get();
 
-    void publish_staged() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        tasks_.insert(
-                tasks_.end(),
-                std::make_move_iterator(staged_.begin()),
-                std::make_move_iterator(staged_.end()));
-        staged_.clear();
-        completion_.notify_one();
-    }
-
-    void run() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        for (;;) {
-            completion_.wait(lock, [this] {
-                return shutdown_ || !tasks_.empty();
-            });
-            if (shutdown_) {
-                return;
+        detail::EntryRegistration entries;
+        bool outcome_inserted = false;
+        try {
+            if (consume_submission_fault(
+                        SubmissionFault::fence_construction)) {
+                throw std::bad_alloc();
             }
-            Task task = std::move(tasks_.front());
-            tasks_.pop_front();
-            lock.unlock();
+            detail::Fence fence =
+                    [state = task.state]() noexcept -> detail::FenceResult {
+                return state->result();
+            };
+            entries = register_copy_entries(
+                    *state_, registry_queue_id_, task.sequence,
+                    const_cast<void*>(task.source->native_handle()),
+                    task.destination->native_handle(), fence);
+            task.source_entry_id = entries.source;
+            task.destination_entry_id = entries.destination;
 
-            std::exception_ptr failure;
-            try {
-                if (task.event.has_value()) {
-                    task.event->wait_and_throw();
+            if (consume_submission_fault(
+                        SubmissionFault::outcome_insertion)) {
+                throw std::bad_alloc();
+            }
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto [it, inserted] = outcomes_.emplace(
+                    task.sequence,
+                    SequenceOutcome{
+                            entries.source, entries.destination, task.state});
+            if (!inserted) {
+                throw std::logic_error(
+                        "duplicate SYCL outstanding-work sequence");
+            }
+            (void)it;
+            outcome_inserted = true;
+        } catch (...) {
+            if (outcome_inserted) {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                outcomes_.erase(task.sequence);
+            }
+            if (entries.source != 0) {
+                const std::array<detail::EntryId, 2> ids{
+                        entries.source, entries.destination};
+                state_->registry.remove_entries(ids);
+            }
+            task.source_entry_id = 0;
+            task.destination_entry_id = 0;
+            task.fence = nullptr;
+            task.state.reset();
+            throw;
+        }
+
+        bool submitted_any = false;
+        try {
+            const void* source_handle = task.source->native_handle();
+            void* destination_handle = task.destination->native_handle();
+            const std::size_t rows =
+                    task.source->spec().shape.dimensions()[
+                            task.source->spec().shape.rank() - 2];
+            const std::size_t columns =
+                    task.source->spec().shape.dimensions()[
+                            task.source->spec().shape.rank() - 1];
+            const unsigned int bits = static_cast<unsigned int>(
+                    detail::leaf_bits(task.source->spec().data_type));
+
+            for (std::size_t index = 0; index < task.pairs.size(); ++index) {
+                if (index == 0
+                        && consume_submission_fault(
+                                SubmissionFault::first_submit)) {
+                    throw std::runtime_error(
+                            "injected SYCL first-submit failure");
                 }
-            } catch (...) {
-                failure = std::current_exception();
+                if (index == 1
+                        && consume_submission_fault(
+                                SubmissionFault::second_submit)) {
+                    throw std::runtime_error(
+                            "injected SYCL second-submit failure");
+                }
+                const PlanePair pair = task.pairs[index];
+                sycl::event event = queue_.submit(
+                        [=](sycl::handler& handler) {
+                            handler.parallel_for(
+                                    sycl::range<1>(rows * columns),
+                                    [=](sycl::id<1> item) {
+                                        const std::uint64_t local = item[0];
+                                        const std::uint64_t row =
+                                                local / columns;
+                                        const std::uint64_t column =
+                                                local % columns;
+                                        const std::uint64_t source_bit =
+                                                device_plane_slot(
+                                                        pair.source, row,
+                                                        column, rows, columns)
+                                                * bits;
+                                        const std::uint64_t destination_bit =
+                                                device_plane_slot(
+                                                        pair.destination, row,
+                                                        column, rows, columns)
+                                                * bits;
+                                        device_write_bits(
+                                                static_cast<unsigned char*>(
+                                                        destination_handle),
+                                                destination_bit, bits,
+                                                device_read_bits(
+                                                        static_cast<const unsigned char*>(
+                                                                source_handle),
+                                                        source_bit, bits));
+                                    });
+                        });
+                task.state->set_event(std::move(event));
+                submitted_any = true;
             }
-            complete(task.sequence, failure);
-
-            lock.lock();
+        } catch (...) {
+            const std::exception_ptr failure = std::current_exception();
+            if (!submitted_any) {
+                {
+                    std::lock_guard<std::mutex> lock(outcome_mutex_);
+                    outcomes_.erase(task.sequence);
+                }
+                const std::array<detail::EntryId, 2> ids{
+                        task.source_entry_id, task.destination_entry_id};
+                state_->registry.remove_entries(ids);
+                task.source_entry_id = 0;
+                task.destination_entry_id = 0;
+                task.fence = nullptr;
+                task.state.reset();
+                throw;
+            }
+            task.state->set_failure(failure);
         }
     }
 
+    void complete_task(
+            std::uint64_t sequence, std::exception_ptr callback_failure) {
+        SequenceOutcome outcome;
+        bool has_outcome = false;
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(sequence);
+            if (it != outcomes_.end()) {
+                outcome = std::move(it->second);
+                outcomes_.erase(it);
+                has_outcome = true;
+            }
+        }
+
+        std::exception_ptr combined_failure = std::move(callback_failure);
+        if (has_outcome) {
+            const detail::FenceResult result = outcome.state->result();
+            if (!combined_failure) {
+                combined_failure = result.failure;
+            }
+            const std::array<detail::EntryId, 2> ids{
+                    outcome.source_entry_id,
+                    outcome.destination_entry_id};
+            if (combined_failure || !result.succeeded) {
+                state_->registry.invalidate_entries(ids);
+            } else {
+                (void)state_->registry.try_release_entry(ids[0]);
+                (void)state_->registry.try_release_entry(ids[1]);
+            }
+        }
+        complete(sequence, std::move(combined_failure));
+    }
+
     const Device* device_;
+    SyclRegistryState* state_;
+    detail::QueueId registry_queue_id_;
     sycl::queue queue_;
-    std::mutex mutex_;
-    std::condition_variable completion_;
-    std::deque<Task> staged_;
-    std::deque<Task> tasks_;
-    bool shutdown_ = false;
-    std::thread worker_;
+    std::mutex submission_order_mutex_;
+    std::mutex outcome_mutex_;
+    std::map<std::uint64_t, SequenceOutcome> outcomes_;
+    detail::StagedWorker<Task> worker_;
 };
 
 }  // namespace
+
+void inject_submission_fault_for_testing(
+        SubmissionFault fault) noexcept {
+    g_submission_fault.store(fault, std::memory_order_release);
+}
+
+void reset_fence_wait_count_for_testing() noexcept {
+    g_fence_wait_count.store(0, std::memory_order_release);
+}
+
+std::size_t fence_wait_count_for_testing() noexcept {
+    return g_fence_wait_count.load(std::memory_order_acquire);
+}
 
 void region_from_host(
         const sycl::context& context, const sycl::device& device,
@@ -453,8 +650,9 @@ void region_to_host(
 
 std::unique_ptr<DeviceOps> make_queue(
         const Device& device, const sycl::context& context,
-        const sycl::device& native_device) {
-    return std::make_unique<SyclQueue>(device, context, native_device);
+        const sycl::device& native_device, SyclRegistryState& registry_state) {
+    return std::make_unique<SyclQueue>(
+            device, context, native_device, registry_state);
 }
 
 }  // namespace iom::sycl_detail
