@@ -50,105 +50,6 @@ std::atomic<std::size_t> g_fence_wait_count{0};
             expected, SubmissionFault::none, std::memory_order_acq_rel);
 }
 
-struct SyclCopyMetadataHeader {
-    std::uint64_t source_plane_offset;
-    std::uint64_t destination_plane_offset;
-    std::uint64_t rows;
-    std::uint64_t columns;
-    std::uint64_t plane_count;
-    std::uint32_t bits;
-    std::uint32_t leading_rank;
-};
-static_assert(std::is_trivially_copyable_v<SyclCopyMetadataHeader>);
-
-[[nodiscard]] std::size_t checked_metadata_mul(
-        std::size_t left, std::size_t right, const char* message) {
-    if (right != 0
-            && left > std::numeric_limits<std::size_t>::max() / right) {
-        throw std::overflow_error(message);
-    }
-    return left * right;
-}
-
-[[nodiscard]] std::size_t checked_metadata_add(
-        std::size_t left, std::size_t right, const char* message) {
-    if (left > std::numeric_limits<std::size_t>::max() - right) {
-        throw std::overflow_error(message);
-    }
-    return left + right;
-}
-
-[[nodiscard]] std::uint64_t metadata_u64(
-        std::size_t value, const char* message) {
-    if (value > std::numeric_limits<std::uint64_t>::max()) {
-        throw std::overflow_error(message);
-    }
-    return static_cast<std::uint64_t>(value);
-}
-
-[[nodiscard]] std::size_t padded_dimension(std::size_t value) {
-    const std::size_t tiles =
-            value / TensorSpec::TILE + (value % TensorSpec::TILE != 0);
-    return checked_metadata_mul(
-            tiles, TensorSpec::TILE, "metadata size overflows");
-}
-
-struct SyclMetadataLayout {
-    std::size_t bytes;
-    std::size_t total_words;
-};
-
-[[nodiscard]] SyclMetadataLayout metadata_layout(
-        const TensorView& source, const TensorView& destination) {
-    const std::span<const std::size_t> dimensions =
-            source.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    if (leading_rank > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("metadata leading rank overflows");
-    }
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    std::size_t plane_count = 1;
-    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
-        plane_count = checked_metadata_mul(
-                plane_count, dimensions[axis], "metadata plane count overflows");
-    }
-    const std::size_t padded_elements = checked_metadata_mul(
-            padded_dimension(rows), padded_dimension(columns),
-            "metadata element count overflows");
-    const std::size_t plane_bits = checked_metadata_mul(
-            padded_elements, detail::leaf_bits(source.spec().data_type),
-            "metadata plane bits overflows");
-    const std::size_t words_per_plane = checked_metadata_add(
-            plane_bits, 31, "metadata word count overflows")
-            / 32;
-    const std::size_t total_words = checked_metadata_mul(
-            plane_count, words_per_plane, "metadata total words overflows");
-    const std::size_t array_count = checked_metadata_mul(
-            leading_rank, 3, "metadata array count overflows");
-    const std::size_t array_bytes = checked_metadata_mul(
-            array_count, sizeof(std::uint64_t),
-            "metadata array bytes overflows");
-    const std::size_t bytes = checked_metadata_add(
-            sizeof(SyclCopyMetadataHeader), array_bytes,
-            "metadata allocation size overflows");
-    (void)metadata_u64(rows, "metadata rows overflows");
-    (void)metadata_u64(columns, "metadata columns overflows");
-    (void)metadata_u64(plane_count, "metadata plane count overflows");
-    (void)metadata_u64(total_words, "metadata total words overflows");
-    for (const std::size_t stride : source.plane_strides()) {
-        (void)metadata_u64(stride, "metadata source stride overflows");
-    }
-    for (const std::size_t stride : destination.plane_strides()) {
-        (void)metadata_u64(stride, "metadata destination stride overflows");
-    }
-    (void)metadata_u64(
-            source.plane_offset(), "metadata source offset overflows");
-    (void)metadata_u64(
-            destination.plane_offset(), "metadata destination offset overflows");
-    return {bytes, total_words};
-}
-
 class SyclMetadataSlotPool final {
 public:
     static constexpr std::size_t kMetadataSlotCount = 16;
@@ -521,44 +422,6 @@ void launch_view_transfer(
     }
 }
 
-void write_sycl_metadata(
-        std::byte* storage, const TensorView& source,
-        const TensorView& destination) {
-    const std::span<const std::size_t> dimensions =
-            source.spec().shape.dimensions();
-    const std::size_t leading_rank = dimensions.size() - 2;
-    std::size_t plane_count = 1;
-    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
-        plane_count = checked_metadata_mul(
-                plane_count, dimensions[axis], "metadata plane count overflows");
-    }
-    const std::size_t rows = dimensions[leading_rank];
-    const std::size_t columns = dimensions[leading_rank + 1];
-    auto* header = reinterpret_cast<SyclCopyMetadataHeader*>(storage);
-    header->source_plane_offset = metadata_u64(
-            source.plane_offset(), "metadata source offset overflows");
-    header->destination_plane_offset = metadata_u64(
-            destination.plane_offset(), "metadata destination offset overflows");
-    header->rows = metadata_u64(rows, "metadata rows overflows");
-    header->columns = metadata_u64(columns, "metadata columns overflows");
-    header->plane_count = metadata_u64(
-            plane_count, "metadata plane count overflows");
-    header->bits = static_cast<std::uint32_t>(
-            detail::leaf_bits(source.spec().data_type));
-    header->leading_rank = static_cast<std::uint32_t>(leading_rank);
-    auto* values = reinterpret_cast<std::uint64_t*>(header + 1);
-    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
-        values[axis] = metadata_u64(
-                source.plane_strides()[axis],
-                "metadata source stride overflows");
-        values[leading_rank + axis] = metadata_u64(
-                destination.plane_strides()[axis],
-                "metadata destination stride overflows");
-        values[2 * leading_rank + axis] = metadata_u64(
-                dimensions[axis], "metadata leading dimension overflows");
-    }
-}
-
 class SyclQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
@@ -718,10 +581,11 @@ private:
 
             const std::size_t metadata_slot = metadata_pool_.acquire();
             task.state->set_metadata_slot(metadata_pool_, metadata_slot);
-            const SyclMetadataLayout layout =
-                    metadata_layout(*task.source, *task.destination);
+            const detail::CopyMetadataLayout layout =
+                    detail::copy_metadata_layout(
+                            *task.source, *task.destination);
             metadata_pool_.ensure_slot_capacity(metadata_slot, layout.bytes);
-            write_sycl_metadata(
+            detail::write_copy_metadata(
                     metadata_pool_.host_data(metadata_slot),
                     *task.source, *task.destination);
             queue_.memcpy(
@@ -734,54 +598,16 @@ private:
             auto* destination_handle = static_cast<unsigned char*>(
                     task.destination->native_handle());
             const auto* metadata = static_cast<
-                    const SyclCopyMetadataHeader*>(
+                    const detail::CopyMetadataHeader*>(
                     metadata_pool_.device_data(metadata_slot));
             sycl::event event = queue_.parallel_for(
                     sycl::range<1>(layout.total_words),
                     [=](sycl::id<1> item) {
-                        const std::uint64_t padded_rows =
-                                (metadata->rows / TensorSpec::TILE
-                                 + (metadata->rows % TensorSpec::TILE != 0))
-                                * TensorSpec::TILE;
-                        const std::uint64_t padded_columns =
-                                (metadata->columns / TensorSpec::TILE
-                                 + (metadata->columns % TensorSpec::TILE != 0))
-                                * TensorSpec::TILE;
-                        const std::uint64_t words_per_plane =
-                                padded_rows * padded_columns
-                                * metadata->bits / 32;
-                        const std::uint64_t word = item[0];
-                        const std::uint64_t logical_plane =
-                                word / words_per_plane;
-                        const std::uint64_t word_in_plane =
-                                word % words_per_plane;
-                        const std::uint64_t* source_strides =
+                        detail::copy_one_tiled_word(
+                                source_handle, destination_handle, *metadata,
                                 reinterpret_cast<const std::uint64_t*>(
-                                        metadata + 1);
-                        const std::uint64_t* destination_strides =
-                                source_strides + metadata->leading_rank;
-                        const std::uint64_t* leading_dimensions =
-                                destination_strides + metadata->leading_rank;
-                        std::uint64_t source_plane =
-                                metadata->source_plane_offset;
-                        std::uint64_t destination_plane =
-                                metadata->destination_plane_offset;
-                        std::uint64_t rest = logical_plane;
-                        for (std::uint32_t axis = metadata->leading_rank;
-                             axis-- > 0;) {
-                            const std::uint64_t coordinate =
-                                    rest % leading_dimensions[axis];
-                            rest /= leading_dimensions[axis];
-                            source_plane +=
-                                    coordinate * source_strides[axis];
-                            destination_plane +=
-                                    coordinate * destination_strides[axis];
-                        }
-                        detail::copy_tiled_to_tiled_word(
-                                source_handle, destination_handle,
-                                source_plane, destination_plane,
-                                word_in_plane, metadata->rows,
-                                metadata->columns, metadata->bits);
+                                        metadata + 1),
+                                item[0]);
                     });
             if (launch_calls.kernel_launched != nullptr) {
                 launch_calls.kernel_launched();

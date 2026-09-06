@@ -463,6 +463,45 @@ void write_copy_metadata(
 }
 
 
+IOM_GPU_DEVICE void copy_one_tiled_word(
+        const unsigned char* source, unsigned char* destination,
+        const CopyMetadataHeader& metadata,
+        const std::uint64_t* values, std::uint64_t word) {
+    const std::uint64_t padded_rows =
+            (metadata.rows / TensorSpec::TILE
+             + (metadata.rows % TensorSpec::TILE != 0))
+            * TensorSpec::TILE;
+    const std::uint64_t padded_columns =
+            (metadata.columns / TensorSpec::TILE
+             + (metadata.columns % TensorSpec::TILE != 0))
+            * TensorSpec::TILE;
+    const std::uint64_t padded_elements = padded_rows * padded_columns;
+    const std::uint64_t plane_bits = padded_elements * metadata.bits;
+    const std::uint64_t words_per_plane = (plane_bits + 31) / 32;
+    const std::uint64_t logical_plane = word / words_per_plane;
+    const std::uint64_t word_in_plane = word % words_per_plane;
+    const std::uint64_t* source_strides = values;
+    const std::uint64_t* destination_strides =
+            source_strides + metadata.leading_rank;
+    const std::uint64_t* leading_dimensions =
+            destination_strides + metadata.leading_rank;
+    std::uint64_t source_plane = metadata.source_plane_offset;
+    std::uint64_t destination_plane =
+            metadata.destination_plane_offset;
+    std::uint64_t rest = logical_plane;
+    for (std::uint32_t axis = metadata.leading_rank; axis-- > 0;) {
+        const std::uint64_t coordinate =
+                rest % leading_dimensions[axis];
+        rest /= leading_dimensions[axis];
+        source_plane += coordinate * source_strides[axis];
+        destination_plane += coordinate * destination_strides[axis];
+    }
+    copy_tiled_to_tiled_word(
+            source, destination, source_plane, destination_plane,
+            word_in_plane, metadata.rows, metadata.columns,
+            metadata.bits);
+}
+
 IOM_GPU_DEVICE void grid_stride_copy_body(
         const unsigned char* source, unsigned char* destination,
         const CopyMetadataHeader& metadata,
@@ -480,33 +519,11 @@ IOM_GPU_DEVICE void grid_stride_copy_body(
     const std::uint64_t words_per_plane = (plane_bits + 31) / 32;
     const std::uint64_t total_words =
             metadata.plane_count * words_per_plane;
-    const std::uint64_t* source_strides = values;
-    const std::uint64_t* destination_strides =
-            source_strides + metadata.leading_rank;
-    const std::uint64_t* leading_dimensions =
-            destination_strides + metadata.leading_rank;
     const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
 
     for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < total_words;
          word += stride) {
-        const std::uint64_t logical_plane =
-                word / words_per_plane;
-        const std::uint64_t word_in_plane = word % words_per_plane;
-        std::uint64_t source_plane = metadata.source_plane_offset;
-        std::uint64_t destination_plane =
-                metadata.destination_plane_offset;
-        std::uint64_t rest = logical_plane;
-        for (std::uint32_t axis = metadata.leading_rank; axis-- > 0;) {
-            const std::uint64_t coordinate =
-                    rest % leading_dimensions[axis];
-            rest /= leading_dimensions[axis];
-            source_plane += coordinate * source_strides[axis];
-            destination_plane += coordinate * destination_strides[axis];
-        }
-        copy_tiled_to_tiled_word(
-                source, destination, source_plane, destination_plane,
-                word_in_plane, metadata.rows, metadata.columns,
-                metadata.bits);
+        copy_one_tiled_word(source, destination, metadata, values, word);
     }
 }
 
