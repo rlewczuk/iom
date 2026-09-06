@@ -66,8 +66,7 @@ namespace iom {
             CudaDevice(std::uint32_t ordinal, CUdevice device, CUcontext context,
                        Allocator& allocator)
                     : ordinal_(ordinal), device_(device), context_(context),
-                      transfer_pool_{}, staging_pool_(context),
-                      allocator_(allocator) {}
+                      transfer_pool_{}, allocator_(allocator) {}
 
             CudaDevice(const CudaDevice&) = delete;
             CudaDevice& operator=(const CudaDevice&) = delete;

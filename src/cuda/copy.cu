@@ -218,6 +218,10 @@ public:
 
 private:
     void execute(Task& task) {
+        const TensorView& source = *task.source;
+        TensorView& destination = *task.destination;
+        task.source = nullptr;
+        task.destination = nullptr;
         if (task.no_op) {
             task.event = nullptr;
             task.fence = nullptr;
@@ -234,12 +238,12 @@ private:
         try {
             const detail::CopyMetadataLayout layout =
                     detail::copy_metadata_layout(
-                            *task.source, *task.destination);
+                            source, destination);
             metadata_pool_.ensure_slot_capacity(
                     metadata_slot, layout.bytes, stream_);
             detail::write_copy_metadata(
                     metadata_pool_.host_data(metadata_slot),
-                    *task.source, *task.destination);
+                    source, destination);
             gpu_policy::create_event(&event);
             resource = std::make_unique<CudaFenceResource>(
                     CudaFenceResource{
@@ -250,9 +254,9 @@ private:
             detail::launch_grid_stride_copy<gpu_policy>(
                     stream_,
                     static_cast<const unsigned char*>(
-                            task.source->native_handle()),
+                            source.native_handle()),
                     static_cast<unsigned char*>(
-                            task.destination->native_handle()),
+                            destination.native_handle()),
                     static_cast<const detail::CopyMetadataHeader*>(
                             metadata_pool_.device_data(metadata_slot)),
                     layout.total_words);
@@ -293,8 +297,8 @@ private:
         try {
             entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
-                    const_cast<void*>(task.source->native_handle()),
-                    task.destination->native_handle(), fence);
+                    const_cast<void*>(source.native_handle()),
+                    destination.native_handle(), fence);
             task.source_entry_id = entries.source;
             task.destination_entry_id = entries.destination;
             std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -302,7 +306,7 @@ private:
                     task.sequence,
                     detail::SequenceOutcome{
                             entries.source, entries.destination,
-                            retained_failure == nullptr, retained_failure});
+                            retained_failure});
             if (!inserted) {
                 throw std::logic_error(
                         "duplicate CUDA outstanding-work sequence");
@@ -311,12 +315,12 @@ private:
             if (entries.source != 0) {
                 state_->registry.remove_entry_if_present(
                         entries.source,
-                        const_cast<void*>(task.source->native_handle()));
+                        const_cast<void*>(source.native_handle()));
             }
             if (entries.destination != 0) {
                 state_->registry.remove_entry_if_present(
                         entries.destination,
-                        task.destination->native_handle());
+                        destination.native_handle());
             }
             if (task.fence != nullptr) {
                 cuda_fence_destroy(task.fence);
@@ -347,9 +351,10 @@ private:
             }
         }
         if (has_outcome) {
-            outcome.fence_succeeded = !failure && !outcome.retained_failure;
+            const bool fence_succeeded = !failure && !outcome.retained_failure;
             (void)detail::release_or_invalidate_entries(
-                    state_->registry, outcome, static_cast<bool>(failure));
+                    state_->registry, outcome, static_cast<bool>(failure),
+                    fence_succeeded);
         }
         complete(sequence, std::move(failure));
     }

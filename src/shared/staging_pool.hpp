@@ -55,8 +55,7 @@ public:
         friend class StagingSlotPool;
     };
 
-    explicit StagingSlotPool(typename Policy::context_type context)
-            : context_(context) {
+    StagingSlotPool() {
         slots_.reserve(kMaxSlotCount);
         free_.reserve(kMaxSlotCount);
         vacant_.reserve(kMaxSlotCount);
@@ -250,7 +249,6 @@ private:
         available_.notify_all();
     }
 
-    typename Policy::context_type context_;
     std::vector<Slot> slots_;
     std::vector<std::size_t> free_;
     std::vector<std::size_t> vacant_;

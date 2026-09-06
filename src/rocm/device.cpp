@@ -58,9 +58,7 @@ namespace iom {
         public:
             RocmDevice(std::uint32_t ordinal, Allocator& allocator)
                     : ordinal_(ordinal),
-                      transfer_pool_{},
-                      staging_pool_(static_cast<int>(ordinal)),
-                      allocator_(allocator) {}
+                      transfer_pool_{}, allocator_(allocator) {}
 
             RocmDevice(const RocmDevice&) = delete;
             RocmDevice& operator=(const RocmDevice&) = delete;

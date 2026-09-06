@@ -442,8 +442,7 @@ private:
             const auto [it, inserted] = outcomes_.emplace(
                     task.sequence,
                     detail::SequenceOutcome{
-                            entries.source, entries.destination, true,
-                            nullptr});
+                            entries.source, entries.destination, nullptr});
             if (!inserted) {
                 throw std::logic_error(
                         "duplicate TTNN outstanding-work sequence");
@@ -479,12 +478,12 @@ private:
             const detail::FenceResult fence_result =
                     failure ? detail::FenceResult::failed(failure)
                             : finish_native(*device_);
-            outcome.fence_succeeded =
+            const bool fence_succeeded =
                     fence_result.succeeded && !fence_result.failure;
             const bool released =
                     detail::release_or_invalidate_entries(
                             state_->registry, outcome,
-                            static_cast<bool>(failure));
+                            static_cast<bool>(failure), fence_succeeded);
             if (!released && !failure) {
                 failure = fence_result.failure;
             }

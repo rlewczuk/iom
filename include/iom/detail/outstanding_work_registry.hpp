@@ -424,16 +424,15 @@ inline void release_or_quarantine(
 struct SequenceOutcome {
     EntryId source_entry_id = 0;
     EntryId destination_entry_id = 0;
-    bool fence_succeeded = false;
     std::exception_ptr retained_failure;
 };
 
 [[nodiscard]] inline bool release_or_invalidate_entries(
         OutstandingWorkRegistry& registry, const SequenceOutcome& outcome,
-        bool failure) noexcept {
+        bool failure, bool fence_succeeded) noexcept {
     const std::array<EntryId, 2> entries{
             outcome.source_entry_id, outcome.destination_entry_id};
-    if (failure || !outcome.fence_succeeded) {
+    if (failure || !fence_succeeded) {
         registry.invalidate_entries(entries);
         return false;
     }

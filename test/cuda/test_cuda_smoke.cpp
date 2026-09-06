@@ -515,7 +515,7 @@ TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
     std::vector<std::byte> input(spec.logical_nbytes());
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    iom::cuda_detail::StagingSlotPool staging_pool(context);
+    iom::cuda_detail::StagingSlotPool staging_pool;
     iom::cuda_detail::TransferStreamPool pool;
 
     iom::cuda_detail::inject_submission_fault_for_testing(
@@ -556,9 +556,7 @@ TEST_CASE("CUDA staging pool preserves accounting across allocation failures") {
     require_cuda_hardware();
     UnusedAllocator allocator;
     auto device = iom::make_cuda_device(0, allocator);
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    iom::cuda_detail::StagingSlotPool pool(context);
+    iom::cuda_detail::StagingSlotPool pool;
 
     CHECK_THROWS_AS(
             pool.acquire(iom::cuda_detail::StagingSlotPool::kMaxStagingBytes + 1),

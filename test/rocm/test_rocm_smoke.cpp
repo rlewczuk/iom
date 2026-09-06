@@ -102,7 +102,7 @@ TEST_CASE("ROCm staging pool preserves accounting across allocation failures") {
 
     UnusedAllocator allocator;
     auto device = iom::make_rocm_device(0, allocator);
-    iom::rocm_detail::StagingSlotPool pool(0);
+    iom::rocm_detail::StagingSlotPool pool;
 
     CHECK_THROWS_AS(
             (void)pool.acquire(

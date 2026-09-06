@@ -766,11 +766,11 @@ private:
             combined_failure =
                     fence_result.failure ? fence_result.failure
                                           : callback_failure;
-            outcome.common.fence_succeeded =
+            const bool fence_succeeded =
                     fence_result.succeeded && !fence_result.failure;
             (void)detail::release_or_invalidate_entries(
                     state_->registry, outcome.common,
-                    static_cast<bool>(callback_failure));
+                    static_cast<bool>(callback_failure), fence_succeeded);
         } else {
             combined_failure = callback_failure;
         }
