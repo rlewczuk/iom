@@ -1,8 +1,9 @@
 #pragma once
 
 // Backend-neutral physical-storage oracle for the conformance harness.
-// The encoder deliberately depends only on the public tensor metadata and the
-// checked standard-layout helper; backend drivers provide the native access.
+// The expected physical bytes come from a test-only canonical tile-slot
+// encoder that shares no arithmetic with production mapping; backend drivers
+// provide the native access.
 
 #include "backend/backend_conformance_common.hpp"
 
@@ -65,9 +66,96 @@ inline void write_storage_bits(
             reinterpret_cast<unsigned char*>(base), bit_offset, nbits, value);
 }
 
+// ---------------------------------------------------------------------------
+// Independent canonical 16x16 tile-slot encoder. This test-only model
+// re-derives the documented standard layout from first principles — row-major
+// owner-plane numbering, ceil(rows/16) x ceil(columns/16) tile coordinates,
+// 16x16 in-tile coordinates, and bit-slot placement — and deliberately
+// shares no code with iom::detail::standard_layout_slot/standard_plane_slot,
+// the accelerator kernels, or any other production mapper. A production or
+// coordinated helper/kernel tile-map regression therefore fails physical
+// conformance instead of being mirrored by the expected-value generator.
+// ---------------------------------------------------------------------------
+
+constexpr std::size_t kCanonicalTile = 16;
+constexpr std::size_t kCanonicalTileSlots = kCanonicalTile * kCanonicalTile;
+
+// ceil(extent / kCanonicalTile) for the tiled final axes.
+inline std::size_t canonical_tile_count(std::size_t extent) {
+    return extent / kCanonicalTile
+           + (extent % kCanonicalTile != 0 ? 1 : 0);
+}
+
+inline std::size_t canonical_padded_extent(std::size_t extent) {
+    return canonical_tile_count(extent) * kCanonicalTile;
+}
+
+// Owner slot of one (plane, row, column) element of the canonical layout:
+// planes are numbered row-major across the leading axes, each plane holds
+// ceil(rows/16) x ceil(columns/16) whole tiles, and each tile holds its
+// 16x16 elements row-major.
+inline std::size_t canonical_plane_slot(
+        const iom::TensorSpec& spec, std::size_t plane,
+        std::size_t row, std::size_t column) {
+    const std::span<const std::size_t> dimensions = spec.shape.dimensions();
+    const std::size_t leading_rank = dimensions.size() - 2;
+    const std::size_t rows = dimensions[leading_rank];
+    const std::size_t columns = dimensions[leading_rank + 1];
+
+    const std::size_t tile_rows = canonical_tile_count(rows);
+    const std::size_t tile_columns = canonical_tile_count(columns);
+    const std::size_t tiles_per_plane = tile_rows * tile_columns;
+    const std::size_t tile_index =
+            plane * tiles_per_plane
+            + (row / kCanonicalTile) * tile_columns
+            + column / kCanonicalTile;
+    return tile_index * kCanonicalTileSlots
+           + (row % kCanonicalTile) * kCanonicalTile
+           + (column % kCanonicalTile);
+}
+
+// Owner slot of one dense owner coordinate: the leading axes fold into a
+// row-major plane number, the final two coordinates stay inside the plane.
+inline std::size_t canonical_layout_slot(
+        const iom::TensorSpec& spec,
+        std::span<const std::size_t> coordinates) {
+    const std::span<const std::size_t> dimensions = spec.shape.dimensions();
+    if (coordinates.size() != dimensions.size()) {
+        throw std::invalid_argument("coordinate count must equal tensor rank");
+    }
+    for (std::size_t axis = 0; axis < dimensions.size(); ++axis) {
+        if (coordinates[axis] >= dimensions[axis]) {
+            throw std::out_of_range("coordinate exceeds tensor dimension");
+        }
+    }
+    const std::size_t leading_rank = dimensions.size() - 2;
+    std::size_t plane = 0;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        plane = plane * dimensions[axis] + coordinates[axis];
+    }
+    return canonical_plane_slot(
+            spec, plane, coordinates[leading_rank],
+            coordinates[leading_rank + 1]);
+}
+
+// Element slots of the padded allocation: leading axes unchanged, the final
+// two axes rounded up to whole 16x16 tiles.
+inline std::size_t canonical_padded_element_count(
+        const iom::TensorSpec& spec) {
+    const std::span<const std::size_t> dimensions = spec.shape.dimensions();
+    std::size_t count = 1;
+    for (std::size_t axis = 0; axis < dimensions.size(); ++axis) {
+        const std::size_t extent = dimensions[axis];
+        count *= axis + 2 >= dimensions.size()
+                         ? canonical_padded_extent(extent)
+                         : extent;
+    }
+    return count;
+}
+
 // Owner storage slot for the linear-th element of a transformed view. This
 // maps only leading planes; final row and column coordinates stay unchanged.
-// Tile arithmetic remains exclusively in iom::detail::standard_layout_slot.
+// The tile arithmetic is the independent canonical encoder above.
 inline std::size_t standard_layout_view_slot(
         const iom::TensorView& view, const iom::TensorSpec& owner,
         std::size_t linear) {
@@ -98,23 +186,28 @@ inline std::size_t standard_layout_view_slot(
     }
     coordinates[owner_leading_rank] = row;
     coordinates[owner_leading_rank + 1] = column;
-    return iom::detail::standard_layout_slot(
+    return canonical_layout_slot(
             owner, std::span<const std::size_t>{coordinates});
 }
 // Encode the standard 16x16 tiled allocation for the deterministic logical
 // pattern at salt zero. Padded coordinates are visited in row-major order;
 // padding remains zero and every in-bounds coordinate obtains its slot from
-// the checked core helper rather than duplicating tile math in the test.
+// the independent canonical encoder above.
 inline std::vector<std::byte> encode_standard_tiled_storage(
         const iom::TensorSpec& spec) {
     spec.validate();
-    const std::size_t bits = iom::detail::leaf_bits(spec.data_type);
+    const std::size_t bits = bits_of(spec.data_type);
     const std::span<const std::size_t> dimensions = spec.shape.dimensions();
-    const iom::TensorShape padded_shape = spec.standard_padded_shape();
-    const std::span<const std::size_t> padded = padded_shape.dimensions();
     const std::size_t count = spec.shape.element_count();
-    const std::size_t padded_count = padded_shape.element_count();
-    std::vector<std::byte> storage(spec.tiled_storage_nbytes(), std::byte{0});
+    const std::size_t padded_count = canonical_padded_element_count(spec);
+    std::vector<std::byte> storage(
+            (padded_count * bits + 7) / 8, std::byte{0});
+
+    std::vector<std::size_t> padded(dimensions.begin(), dimensions.end());
+    padded[padded.size() - 2] =
+            canonical_padded_extent(padded[padded.size() - 2]);
+    padded[padded.size() - 1] =
+            canonical_padded_extent(padded[padded.size() - 1]);
 
     std::vector<std::size_t> coordinates(dimensions.size());
     for (std::size_t padded_linear = 0; padded_linear < padded_count;
@@ -137,7 +230,7 @@ inline std::vector<std::byte> encode_standard_tiled_storage(
         if (logical_linear >= count) {
             throw std::logic_error("standard storage encoder logical index overflow");
         }
-        const std::size_t slot = iom::detail::standard_layout_slot(
+        const std::size_t slot = canonical_layout_slot(
                 spec, std::span<const std::size_t>{coordinates});
         write_storage_bits(
                 storage.data(), slot * bits, bits,
@@ -152,7 +245,7 @@ inline std::vector<std::byte> decode_standard_tiled_view(
     if (storage.size() != owner.tiled_storage_nbytes()) {
         throw std::invalid_argument("standard storage decode has the wrong size");
     }
-    const std::size_t bits = iom::detail::leaf_bits(view.spec().data_type);
+    const std::size_t bits = bits_of(view.spec().data_type);
     const std::size_t count = view.spec().shape.element_count();
     std::vector<std::byte> logical(view.spec().logical_nbytes(), std::byte{0});
     for (std::size_t linear = 0; linear < count; ++linear) {
@@ -171,7 +264,7 @@ inline void apply_standard_tiled_view(
             || storage.size() != owner.tiled_storage_nbytes()) {
         throw std::invalid_argument("standard storage view update has the wrong size");
     }
-    const std::size_t bits = iom::detail::leaf_bits(view.spec().data_type);
+    const std::size_t bits = bits_of(view.spec().data_type);
     const std::size_t count = view.spec().shape.element_count();
     for (std::size_t linear = 0; linear < count; ++linear) {
         const std::size_t slot = standard_layout_view_slot(view, owner, linear);
@@ -238,9 +331,8 @@ public:
 private:
     [[nodiscard]] std::vector<std::byte> permute(
             std::span<const std::byte> storage) const {
-        const std::size_t bits = iom::detail::leaf_bits(owner_spec().data_type);
-        const std::size_t slots =
-                owner_spec().standard_padded_shape().element_count();
+        const std::size_t bits = bits_of(owner_spec().data_type);
+        const std::size_t slots = canonical_padded_element_count(owner_spec());
         if (storage.size() != owner_spec().tiled_storage_nbytes()) {
             throw std::invalid_argument(
                     "permuting storage oracle received the wrong size");

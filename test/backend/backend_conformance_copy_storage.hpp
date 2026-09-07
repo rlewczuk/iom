@@ -171,6 +171,7 @@ inline const std::vector<std::vector<std::size_t>>& transfer_owner_shapes() {
         {1, 17},                    // vector representation, row padding
         {17, 33},                   // both final dimensions padded
         {4, 3, 17, 33},             // leading rank two
+        {2, 3, 17, 33},             // leading rank two, six planes
         {2, 3, 4, 17, 33},          // leading rank three
         {2, 2, 2, 3, 17, 33},       // rank six: leading rank above three
         {16, 32},                   // rank-two, two tile columns

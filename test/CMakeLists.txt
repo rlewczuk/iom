@@ -25,6 +25,11 @@ set_source_files_properties(cpu/test_cpu.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 )
 
+target_include_directories(iom_cpu_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 target_link_libraries(iom_cpu_tests
     PRIVATE
         doctest::doctest

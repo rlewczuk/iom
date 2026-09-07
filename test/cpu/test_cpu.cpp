@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "backend/backend_conformance_oracle.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/device.hpp"
@@ -341,45 +342,11 @@ constexpr std::initializer_list<iom::DataType> kAllDataTypes = {
     iom::DataType::F32, iom::DataType::F64,
 };
 
-// Owner element slot of the view's linear-th logical element, computed with
-// the checked core layout helper: the view's offset and strides yield the
-// owner plane, which is inverted into dense owner coordinates. Independent
-// of the backend's traversal code.
-std::size_t view_slot_at(
-        const iom::TensorView& view, const iom::TensorSpec& owner_spec,
-        std::size_t linear) {
-    const std::span<const std::size_t> dims =
-            view.spec().shape.dimensions();
-    const std::size_t leading_rank = dims.size() - 2;
-    const std::size_t rows = dims[leading_rank];
-    const std::size_t columns = dims[leading_rank + 1];
-    const std::span<const std::size_t> strides = view.plane_strides();
-    const std::span<const std::size_t> owner_dims =
-            owner_spec.shape.dimensions();
-    const std::size_t owner_leading_rank = owner_dims.size() - 2;
-
-    std::size_t rest = linear;
-    const std::size_t column = rest % columns;
-    rest /= columns;
-    const std::size_t row = rest % rows;
-    rest /= rows;
-    std::size_t plane = view.plane_offset();
-    for (std::size_t k = leading_rank; k-- > 0;) {
-        plane += (rest % dims[k]) * strides[k];
-        rest /= dims[k];
-    }
-    std::vector<std::size_t> coordinates(owner_dims.size());
-    for (std::size_t k = owner_leading_rank; k-- > 0;) {
-        coordinates[k] = plane % owner_dims[k];
-        plane /= owner_dims[k];
-    }
-    coordinates[owner_leading_rank] = row;
-    coordinates[owner_leading_rank + 1] = column;
-    return iom::detail::standard_layout_slot(owner_spec, coordinates);
-}
-
 // Full-storage oracle for one owner specification. Starts at the sentinel
 // the tests write into the real allocation, then tracks logical writes.
+// Physical slots come from the shared independent canonical encoder in
+// backend_conformance_oracle.hpp (iom_conformance::standard_layout_view_slot)
+// so the expected bytes never share tile arithmetic with production mapping.
 class StorageModel {
 public:
     StorageModel(const iom::TensorSpec& owner_spec, std::byte fill)
@@ -395,7 +362,9 @@ public:
         const std::size_t bits = test_bits(spec_.data_type);
         const std::size_t count = view.spec().shape.element_count();
         for (std::size_t linear = 0; linear < count; ++linear) {
-            const std::size_t slot = view_slot_at(view, spec_, linear);
+            const std::size_t slot =
+                    iom_conformance::standard_layout_view_slot(
+                            view, spec_, linear);
             write_test_bits(
                     reinterpret_cast<unsigned char*>(bytes_.data()),
                     slot * bits, bits,
@@ -416,9 +385,11 @@ public:
                 destination_view.spec().shape.element_count();
         for (std::size_t linear = 0; linear < count; ++linear) {
             const std::size_t source_slot =
-                    view_slot_at(source_view, source_spec, linear);
+                    iom_conformance::standard_layout_view_slot(
+                            source_view, source_spec, linear);
             const std::size_t destination_slot =
-                    view_slot_at(destination_view, spec_, linear);
+                    iom_conformance::standard_layout_view_slot(
+                            destination_view, spec_, linear);
             write_test_bits(
                     reinterpret_cast<unsigned char*>(bytes_.data()),
                     destination_slot * bits, bits,
