@@ -74,7 +74,6 @@ option(TTNN_ENABLED "Build with TTNN support" OFF)
 set(IOM_SOURCES
         src/iom.cpp
         src/cpu/device.cpp
-        src/llama.cpp
         src/mmap.cpp
         src/safetensors.cpp
         src/alloc.cpp
@@ -84,7 +83,6 @@ set(IOM_HEADERS
         include/iom/iom.hpp
         include/iom/gpu_algorithm.hpp
         include/iom/cpu/device.hpp
-        include/iom/llama.hpp
         include/iom/mmap.hpp
         include/iom/safetensors.hpp
         include/iom/alloc.hpp
