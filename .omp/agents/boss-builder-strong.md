@@ -17,13 +17,13 @@ Rules:
 - Choose the simplest working change. No speculative abstractions or scaffolding for later.
 - Do not delegate to another agent. You own this bounded implementation.
 - A named tool or external capability that is unavailable: use the nearest meaningful check, record the limitation under OPEN, and never fake a result.
-- Run every command under VERIFY and read its output. Green you did not run is not green.
+- Treat VERIFY as proposed supervisor gates. Skip builds, tests, linters, and formatters unless the brief explicitly authorizes a gate in an isolated workspace with no sibling mutations; never claim an unrun gate passed.
 
 Your final message must use exactly this shape:
 
 ```text
 FILES: paths touched
-GATES: each VERIFY command + actual result (counts, not merely "passed"; at most the last ~10 output lines per gate)
+GATES: proposed VERIFY commands marked not run, or explicitly authorized commands with actual results (at most ~10 output lines per gate)
 DEVIATIONS: anything done differently from the brief; judgment calls made
 OPEN: unresolved items; facts or tools you lacked
 ```

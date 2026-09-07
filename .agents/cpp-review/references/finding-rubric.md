@@ -28,6 +28,22 @@ Each specialist returns zero or more candidate packets. Packets may be structure
 
 A packet is an internal review handoff, not a report section. Include enough repository evidence and decisions for synthesis to produce a self-contained task without re-running a broad review.
 
+## Compact evidence handoff
+
+This section extends the packet above; it does not replace or relax any existing field. Keep evidence bounded and source-grounded:
+
+- **Reviewed state and scope provenance:** identify the exact working-tree/commit state, selected-commit baseline and target when applicable, specification identity, and affected backend/workload scope.
+- **Decisive excerpts:** provide the smallest useful `path:line`/symbol excerpts that establish the mechanism or contract. Do not paste whole files, whole diffs, or raw logs.
+- **Source facts:** state what the code, test, benchmark, profile, or authoritative specification directly shows.
+- **Inference and decision:** state the conclusion drawn from those facts, its verification class, and any assumptions; never present inference as a source fact.
+- **Callers, guards, counterparts, and negative evidence:** name relevant call paths, capability/path-selection guards, backend/reference counterparts, existing tests or protections, and inspected evidence that argues against the candidate.
+- **Search coverage:** state searches/areas inspected, sampled versus exhaustive coverage, and explicit uninspected areas.
+- **Baseline-v-target provenance:** for selected-commit findings, identify the parent/target symbols, ranges, and behavior or evidence that changed; pre-existing observations are not findings.
+- **Actual validation and gaps:** record gates actually run by the root, their exact results, unavailable tools, and remaining verification gaps. Proposed worker commands are not validation.
+- **Falsifier and remediation seed:** make the disproof condition exact and keep the remediation structurally complete, including ownership boundaries, affected symbols, acceptance conditions, and non-goals.
+
+Shared facts MAY be stored once in a compact evidence ledger and referenced by stable internal identifier in candidate packets. A packet must include its candidate-specific delta. When an advisor is consulted, the root MUST supply the advisor the needed packet content—including decisive excerpts, facts, inference, coverage, negative evidence, validation, and gaps—not merely a URI, path, or artifact reference. The advisor is not permitted to open references. Missing or uninspected evidence must be labeled as such and must never increase confidence or be silently treated as support.
+
 ## Area ID prefixes
 
 - Contract & correctness: `CC-###`
@@ -70,6 +86,8 @@ Confidence is independent of severity:
 - `70–89`: strong evidence; minor unresolved assumptions.
 - `50–69`: plausible with important assumptions; usually hypothesis.
 - `<50`: normally reject unless impact is exceptional and falsification is cheap and important.
+
+Confidence reflects supplied evidence and coverage, not missing work, advisor agreement, or the number of prose assertions.
 
 ## Root-cause and simplification rules
 

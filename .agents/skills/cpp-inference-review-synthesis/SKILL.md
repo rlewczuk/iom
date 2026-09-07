@@ -6,30 +6,54 @@ argument-hint: "[candidate packets] [review scope] [spec docs/changes/... option
 
 # Review Synthesis & Direct Task Materialization
 
-Turn reviewed candidate packets into the smallest trustworthy set of implementation-ready remediation tasks. This is the shared final pass for both the full orchestrator and every independently invoked specialist.
-
-Do not create `review.md`. Do not defer task generation to another skill.
-
-Read:
+Read `skill://boss` **first**, before reading any repository file, reference, or other skill. The visible/root session MUST run as `@slow`; role configuration or a model override selects that role, and this skill cannot switch an already-running model. Then read:
 
 - `.agents/cpp-review/references/finding-rubric.md`
 - `.agents/cpp-review/references/review-process.md`
 - `.agents/cpp-review/templates/remediation-task.md`
+
+The shared review process is canonical. This skill is the mandatory final pass for both the full orchestrator and every independently invoked specialist. It owns complete synthesis without spawning a nested supervisor, creating `review.md`, or deferring task generation to another skill.
+
+## Synthesis routing
+
+The root `@slow` session owns packet intake, scope/coverage accountability, candidate acceptance, root-cause reconciliation, the complete assignment table, task materialization, generated-set validation, and the completion response. Synthesis is not a second broad repository review.
+
+Use separate, bounded lanes:
+
+- `boss-reviewer @task` performs independent adversarial evidence checks on candidates. It receives packet content and decisive excerpts/known ranges, may make narrow exact reads when needed, and never delegates, scans a review frontier, writes tasks, or runs gates.
+- `boss-advisor @advisor` is tool-free and packet-only. Use it only for a genuinely hard semantic, lifetime, numerical, disputed-evidence, or key/high-risk acceptance/remediation decision. Supply compact packet **CONTENT**; it must never open a URI/path or access source, filesystem, web, shell, or other tools. If effective plan-mode tools would broaden its tools beyond this contract, do not dispatch it; report the routing limit.
+- `boss-errand @smol` performs existence, path/symbol, destination, collision, and equivalent-task checks against exact known paths. It does not perform routine semantic review or broad scans.
+- `boss-builder-fast @smol` mechanically drafts accepted task files after the root freezes the table. Use `boss-builder @task` only when the root explicitly chooses it for a bounded drafting need. Builders have no design authority and do not allocate numbers concurrently.
+
+Run independent evidence/path checks in one batch when possible. A hard-decision advisor is conditional, not a routine call for every candidate. If an advisor returns `NEED EVIDENCE`, the root sends one exact question to `boss-errand @smol`, appends only that evidence delta to the packet, and may return the self-contained delta to the same advisor. The advisor's agreement never turns an unverified claim into verified evidence.
+
+Workers never run compiler, build, test, sanitizer, profiler, benchmark, or other gates. They may identify a focused command and expected observation. The root runs actual validation after candidate collection and records the command, environment, and result. Accelerator checks follow `remote-development` rules and execute on the selected remote Linux host over SSH; local inspection is not represented as a remote accelerator result.
+
+When called from the full orchestrator, synthesis receives all five area packets from one concurrent batch. When called from a standalone specialist, the specialist's running `@slow` root supplies its complete area packets and resolved scope. In neither mode may synthesis invoke another orchestrator, specialist review, or synthesis pass. In standalone mode, unavailable lanes do not authorize widening the assigned area into an unbounded whole-repository `@slow` review; report the area-only routing and coverage limit. If a required lane is unavailable, request explicit permission before a materially costlier fallback; do not silently substitute an expensive frontier review or claim missing checks ran.
 
 ## Inputs
 
 Require:
 
 - one resolved review scope and reviewed-state identity;
-- review coverage and validation performed;
+- review coverage and validation performed (distinguish root-run results from proposed worker commands);
+- the shared reconnaissance/specification map and its search coverage/gaps when available;
 - optional destination beneath `docs/changes/`;
 - zero or more candidate packets using the common rubric.
 
-When called independently, do not invent candidates from vague prose. Ask for missing candidate fields only when they cannot be recovered from the supplied scope and repository evidence.
+The packet contract extends `.agents/cpp-review/references/finding-rubric.md`; it does not replace any rubric field. Every packet must preserve reviewed state/scope, exact path:line/symbol and decisive minimal excerpts, source facts separated from inference, relevant callers/guards/counterparts/negative evidence, search coverage and uninspected areas, baseline-v-target provenance for commit findings, actual validation and gaps, a falsifier, and a full remediation seed. Reference internal artifacts for workers when useful, but place compact packet CONTENT in any advisor request; an advisor must never need to open a URI/path. Bound output, split work rather than dump repository/raw logs, and never truncate away evidence or coverage.
+
+When called independently, do not invent candidates from vague prose. Ask for missing candidate fields only when they cannot be recovered from the supplied scope and repository evidence. A standalone finalizer owns the complete finalization of the supplied area, not an unassigned repository frontier.
+
+## 0. Freeze inputs and establish evidence coverage
+
+Before dispatching checks, `[ROOT @slow]` confirms one scope, reviewed-state identity, baseline/target provenance where applicable, affected backends, specification requirements, and area coverage. It records sampled versus exhaustive search, uninspected areas, actual validation, and gaps. It may read exact known file:line ranges when cheaper than another dispatch, but must not broad-scan the repository. A cheap path worker receives exact known paths for existence/collision/equivalence checks; it is not asked to rediscover the review.
+
+The root supplies each evidence checker with packet content and the smallest useful excerpts. Candidate packets are internal handoffs, not report sections. No task file is written until the root completes the assignment table in Section 6.
 
 ## 1. Adversarial gate
 
-For every candidate, ask:
+For every candidate, `[EVIDENCE boss-reviewer @task]` and then `[ROOT @slow]` ask:
 
 1. Is it inside the requested scope?
 2. In selected-commit mode, was it introduced or materially exposed/worsened by the target commit?
@@ -44,7 +68,7 @@ For every candidate, ask:
 11. Does the proposed remediation reuse the repository's established mechanism instead of creating a second pattern?
 12. What evidence would falsify the claim?
 
-Reject candidates that fail this gate. Missing evidence does not become certainty.
+The evidence worker reports disagreements, missing facts, negative evidence, and exact questions; it does not make final acceptance decisions. Use the packet-only advisor only when a hard decision remains. Reject candidates that fail this gate. Missing evidence does not become certainty.
 
 ## 2. Complexity and overengineering gate
 
@@ -71,7 +95,7 @@ A verified structural problem may be low severity even without a current runtime
 
 ## 3. Deduplicate and reconcile
 
-Merge candidates when one cause explains multiple symptoms or review areas. Preserve:
+`[ROOT @slow]` merges candidates when one cause explains multiple symptoms or review areas. Preserve:
 
 - the strongest location and evidence;
 - every affected invariant/backend;
@@ -88,7 +112,7 @@ Assign final IDs using the root cause's primary area:
 - `NT-###` — numerical correctness/testing
 - `PF-###` — performance
 
-Preserve specialist IDs when unique. Renumber collisions deterministically by area and source order.
+Preserve specialist IDs when unique. Renumber collisions deterministically by area and source order. A finding ID alone is never proof that two tasks are equivalent.
 
 ## 4. Severity, confidence, and verification
 
@@ -107,17 +131,19 @@ Severity:
 
 Confidence is an independent integer from 0 to 100.
 
+The root preserves the distinction between actual root-run validation and proposed verification. For hypotheses, the task outcome is measurement/falsification and the suspected effect is not stated as fact.
+
 ## 5. Choose task destination, order, and collision behavior
 
 ### Specification-linked output
 
-Resolve a supplied destination with:
+For a supplied destination, `[ROOT @slow]` resolves it with:
 
 ```bash
 python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
 ```
 
-Inspect direct child directories whose names start with digits followed by `-`.
+The root verifies the destination remains beneath `docs/changes/`. `[PATH boss-errand @smol]` then inspects direct child directories whose names start with digits followed by `-`, checks current paths/symbols, and searches existing `spec.md` files for equivalent tasks. It returns existence, collision, and equivalence evidence only; it does not decide acceptance.
 
 - First new order is one greater than the largest existing numeric prefix; start at `01` if none exist.
 - Never fill an earlier gap.
@@ -136,6 +162,16 @@ Without a specification directory, do not invent one. Return each task using the
 
 ## 6. Assign priority and blockers
 
+`[ROOT @slow]` builds the full assignment table before writing any file. The table contains:
+
+- final ID and title;
+- source area and candidate order;
+- final directory/order;
+- priority with reason;
+- blocker list;
+- duplicate/collision decision;
+- exact root-cause boundary.
+
 Use the task contract, not blind severity conversion:
 
 - **P0** — prerequisite, public-contract, correctness, memory-safety, lifetime, or backend-availability work that gates broad progress;
@@ -146,19 +182,11 @@ Critical/high correctness and stability findings normally map to P0. A medium fi
 
 A blocker exists only when a task requires an interface, invariant, or mechanism from another task. Thematic similarity is not a dependency. Blockers must name existing task directories or earlier newly assigned directories; no forward edges or cycles.
 
-Build the full assignment table before writing any file:
-
-- final ID and title;
-- source area and candidate order;
-- final directory/order;
-- priority with reason;
-- blocker list;
-- duplicate/collision decision;
-- exact root-cause boundary.
+After the table is frozen, the root gives the drafting worker exact destinations, table values, candidate packet content, template, and any evidence deltas. The worker has no design authority and writes no task not present in the table. There is no concurrent order allocation.
 
 ## 7. Write one self-contained task per accepted root cause
 
-Use `.agents/cpp-review/templates/remediation-task.md`. Each task must stand alone; an implementer must not need review prose, parent conversation, or sibling tasks to learn its contract.
+`[DRAFT boss-builder-fast @smol]` (or the explicitly selected `boss-builder @task`) uses `.agents/cpp-review/templates/remediation-task.md`. Each task must stand alone; an implementer must not need review prose, parent conversation, or sibling tasks to learn its contract.
 
 Required content:
 
@@ -176,11 +204,11 @@ Translate the candidate's remediation seed directly. Recheck paths/symbols that 
 
 For structural tasks, name concrete deletions/consolidations and the single mechanism that remains. For hypotheses, make measurement/falsification the task outcome and do not state the suspected effect as fact.
 
-Do not modify implementation, tests, parent specs, existing task specs, or unrelated files.
+Do not modify implementation, tests, parent specs, existing task specs, or unrelated files. If a destination is supplied, write only newly assigned task directories and `spec.md` files; never write `review.md`, indexes, manifests, or TODO files.
 
 ## 8. Validate the generated set
 
-After writing, read every new `spec.md` and check:
+After writing, `[ROOT @slow]` reads every new `spec.md` and checks:
 
 - every accepted non-duplicate root cause has exactly one task;
 - no rejected candidate, residual observation, or validation note became a task;
@@ -194,7 +222,7 @@ After writing, read every new `spec.md` and check:
 - tasks do not duplicate mechanisms or leave design choices unresolved;
 - simplification tasks reduce net concept count rather than move code around.
 
-Then run one command over the exact new files:
+Then the root runs one command over the exact new files:
 
 ```bash
 python3 .agents/cpp-review/scripts/validate_review_tasks.py \
@@ -203,16 +231,17 @@ python3 .agents/cpp-review/scripts/validate_review_tasks.py \
   --task-file '<next-task>/spec.md'
 ```
 
-Repeat `--task-file` for every generated task. If validation fails, correct the task and rerun. This is document validation, not an implementation build.
+Repeat `--task-file` for every generated task. If validation fails, the root corrects the task (or sends a precise mechanical delta to the drafting worker) and reruns. This is document validation, not an implementation build. If no specification directory exists, the root validates the inline template fields and assignment metadata directly and writes no files.
 
 ## Completion response
 
 Report only:
 
-- reviewed scope and material validation;
+- reviewed scope and material validation actually performed by the root;
 - ordered generated tasks with ID, priority, path, and blockers;
 - equivalent existing tasks that prevented duplicates;
 - any material unresolved hypothesis or destination collision;
+- routing/coverage limits and any explicitly requested but unavailable costlier fallback;
 - `No material findings; no remediation tasks generated.` when applicable.
 
-The task specifications are the primary deliverable.
+The task specifications are the primary deliverable. Never claim that a worker-run gate, advisor source check, or unavailable lane occurred.

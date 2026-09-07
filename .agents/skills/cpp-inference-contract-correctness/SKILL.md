@@ -8,14 +8,28 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [o
 
 Review **what the system promises and whether the implementation preserves it**. Ignore style unless it obscures a semantic defect or creates duplicated sources of truth.
 
-Read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, and `.agents/cpp-review/checklists/common.md`.
+Before any repository work, read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, and `.agents/cpp-review/checklists/common.md`.
 
 ## Invocation modes
 
-- **Orchestrated:** use the supplied resolved scope/specification map; return only `CC-###` candidate packets to the orchestrator. Do not write task files.
-- **Standalone:** resolve scope and optional `docs/changes/...` destination using the shared process, perform this area only, then invoke `cpp-inference-review-synthesis`. The final deliverable is direct remediation subtasks, not a review report.
+- **Orchestrated:** use the supplied resolved scope/specification map; return only `CC-###` candidate packets to the orchestrator. This is candidate-only `boss-reviewer` execution at `@task`: do not resolve a new frontier, delegate recursively, invoke synthesis, write task files, or run validation gates.
+- **Standalone:** run as the root `@slow` orchestration for this area. Resolve scope and the optional `docs/changes/...` destination using the shared process, own the complete area review and acceptance, then invoke `cpp-inference-review-synthesis`. The final deliverable is direct remediation subtasks, not a review report. The skill cannot switch an already-running model; require the intended role configuration before invocation.
 
 In selected-commit mode, inspect necessary surrounding code and backend counterparts but accept only defects introduced or materially exposed/worsened by the target commit.
+
+## Boss routing for this area
+
+Follow the canonical review process rather than restating it. The standalone invocation is owned by the running `@slow` root, which resolves scope, accepts candidates, freezes the assignment table, and invokes synthesis; the orchestrated invocation is a candidate-only `boss-reviewer` leaf at `@task`. Neither mode may claim an already-running model was switched, and the leaf may not delegate, recurse, write tasks, or broaden discovery.
+
+- Project agent `scout` at `@smol` handles broad specification inventory, changed-interface/callsite/counterpart search, capability/dispatch tracing, and test/error-path discovery. Use `boss-errand` at `@smol` only for atomic factual followups. Return exact `path:line`/symbol evidence, source facts versus inference, negative evidence, search coverage, and uninspected areas.
+- `boss-reviewer` may inspect the bounded assigned source ranges and callpaths directly, alongside the scout evidence, to perform semantic reasoning and independent falsification; it returns candidate packets only.
+- For a genuinely hard or disputed semantic, capability/fallback, compatibility, or operator/tensor decision, the root may send compact packet **content** to `boss-advisor` at `@advisor`. The advisor is tool-free, packet-only, never delegates, and may answer `NEED EVIDENCE` with one exact question; agreement never verifies a claim.
+- The root reads only cheap exact-known ranges when cheaper than another dispatch, not broad scans or whole-diff ingestion. Batch independent work and make no gratuitous calls.
+- Workers skip builds, tests, benchmarks, formatters, and other validation; they propose exact gates. The root executes gates and mandatory synthesis. If delegation is unavailable, disclose routing/coverage limits and request permission before any materially costlier fallback.
+
+### Cheap evidence assignments
+
+Ask the `@smol` scout to enumerate authoritative requirements, exact interfaces/callers, operator/tensor representation and ownership assumptions, capability predicates, dispatch/fallback/error paths, compatibility counterparts, and supported/unsupported tests. Ask the `@task` reviewer to inspect only the assigned bounded ranges/callpaths and packet, checking observable semantics, validation-before-mutation, shape/rank/dtype/layout/aliasing and overflow boundaries, and canonical contract ownership. Escalate to the advisor only for a hard semantic interpretation, disputed guard/counterpart, or high-risk acceptance/remediation choice after evidence is complete; otherwise the root decides.
 
 ## Establish the contract map
 

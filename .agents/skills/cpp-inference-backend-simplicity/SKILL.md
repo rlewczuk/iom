@@ -10,14 +10,28 @@ Optimize **concept count, responsibility count, and sources of truth**, not line
 
 Do not simplify away correctness, debuggability, real backend differences, asynchronous lifetime, or measured performance.
 
-Read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/backend-architecture.md`, `.agents/cpp-review/references/finding-rubric.md`, and `.agents/cpp-review/checklists/common.md`.
+Before any repository work, read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/backend-architecture.md`, `.agents/cpp-review/references/finding-rubric.md`, and `.agents/cpp-review/checklists/common.md`.
 
 ## Invocation modes
 
-- **Orchestrated:** use the supplied resolved scope and return only `AR-###` candidate packets. Do not write tasks before cross-area synthesis.
-- **Standalone:** resolve scope and optional task destination, run this area completely, then invoke `cpp-inference-review-synthesis` to cross-check and directly materialize tasks.
+- **Orchestrated:** use the supplied resolved scope and return only `AR-###` candidate packets. This is candidate-only `boss-reviewer` execution at `@task`: do not resolve a new frontier, delegate recursively, invoke synthesis, write task files, or run validation gates.
+- **Standalone:** run as the root `@slow` orchestration for this area. Resolve scope and the optional task destination using the shared process, own the complete area review and acceptance, then invoke `cpp-inference-review-synthesis` to cross-check and directly materialize tasks. The skill cannot switch an already-running model; require the intended role configuration before invocation.
 
 A request such as “find redundant code,” “remove overengineering,” or “simplify backend architecture” is a valid standalone invocation. In selected-commit mode, only accept complexity introduced or materially worsened/exposed by that commit.
+
+## Boss routing for this area
+
+Follow the canonical review process rather than restating it. The standalone invocation is owned by the running `@slow` root, which resolves scope, accepts candidates, freezes the assignment table, and invokes synthesis; the orchestrated invocation is a candidate-only `boss-reviewer` leaf at `@task`. Neither mode may claim an already-running model was switched, and the leaf may not delegate, recurse, write tasks, or broaden discovery.
+
+- Project agent `scout` at `@smol` handles broad concept/state inventory, repeated-decision search, caller/counterpart collection, wrapper/factory/registry tracing, dynamic-entry-point checks, and dead-machinery discovery. Use `boss-errand` at `@smol` only for atomic factual followups. Return exact `path:line`/symbol evidence, source facts versus inference, negative evidence, search coverage, and uninspected areas.
+- `boss-reviewer` may inspect the bounded assigned source ranges and callpaths directly, alongside the scout evidence, to perform simplification reasoning and independent falsification; it returns candidate packets only.
+- For a genuinely hard or disputed responsibility boundary, backend-semantic distinction, source-of-truth choice, or deletion/consolidation risk, the root may send compact packet **content** to `boss-advisor` at `@advisor`. The advisor is tool-free, packet-only, never delegates, and may answer `NEED EVIDENCE` with one exact question; agreement never verifies a claim.
+- The root reads only cheap exact-known ranges when cheaper than another dispatch, not broad scans or whole-diff ingestion. Batch independent work and make no gratuitous calls.
+- Workers skip builds, tests, benchmarks, formatters, and other validation; they propose exact gates. The root executes gates and mandatory synthesis. If delegation is unavailable, disclose routing/coverage limits and request permission before any materially costlier fallback.
+
+### Cheap evidence assignments
+
+Ask the `@smol` scout to inventory owners, states/transitions, representations/conversions, capability and policy sources, dispatch/fallback branches, validation/error paths, caches/registries/factories/adapters/wrappers, common/backend implementations, dynamic entry points, and backend counterparts; search repeated support, placement, allocation, conversion, error, registration, and version decisions and report canonical versus duplicated sources. Ask the `@task` reviewer to inspect only the assigned bounded ranges/callpaths and packet, identifying objective redundancy, invalid state combinations, backend leakage, special-case accumulation, weightless layers, dead machinery, or accidental work while preserving semantics, diagnostics, async lifetime, and performance. Escalate to the advisor only for a hard ownership boundary, disputed real backend distinction, or high-risk deletion/consolidation choice after evidence is complete; otherwise the root decides.
 
 ## Architectural rule
 

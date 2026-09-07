@@ -8,14 +8,28 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [b
 
 Treat asynchronous accelerator execution as a first-class correctness model. C++ lexical scope does not prove device work completed.
 
-Read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/cpp-gpu-stability.md`, `.agents/cpp-review/checklists/common.md`, and every affected backend checklist.
+Before any repository work, read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/cpp-gpu-stability.md`, `.agents/cpp-review/checklists/common.md`, and every affected backend checklist.
 
 ## Invocation modes
 
-- **Orchestrated:** use the supplied resolved scope and return only `ST-###` candidate packets. Do not write tasks before cross-area synthesis.
-- **Standalone:** resolve scope and optional task destination, perform this stability pass, then invoke `cpp-inference-review-synthesis` to adversarially verify and directly materialize tasks.
+- **Orchestrated:** use the supplied resolved scope and return only `ST-###` candidate packets. This is candidate-only `boss-reviewer` execution at `@task`: do not resolve a new frontier, delegate recursively, invoke synthesis, write task files, or run validation gates.
+- **Standalone:** run as the root `@slow` orchestration for this area. Resolve scope and the optional task destination using the shared process, own the complete stability pass and acceptance, then invoke `cpp-inference-review-synthesis` to adversarially verify and directly materialize tasks. The skill cannot switch an already-running model; require the intended role configuration before invocation.
 
 In selected-commit mode, accept only root causes introduced or materially exposed/worsened by the target.
+
+## Boss routing for this area
+
+Follow the canonical review process rather than restating it. The standalone invocation is owned by the running `@slow` root, which resolves scope, accepts candidates, freezes the assignment table, and invokes synthesis; the orchestrated invocation is a candidate-only `boss-reviewer` leaf at `@task`. Neither mode may claim an already-running model was switched, and the leaf may not delegate, recurse, write tasks, or broaden discovery.
+
+- Project agent `scout` at `@smol` handles broad ownership/lifetime inventory, enqueue/callback timeline collection, stream/event/fence dependency tracing, cache/device-state search, cleanup/error-path discovery, and size-arithmetic search. Use `boss-errand` at `@smol` only for atomic factual followups. Return exact `path:line`/symbol evidence, source facts versus inference, negative evidence, search coverage, and uninspected areas.
+- `boss-reviewer` may inspect the bounded assigned source ranges and callpaths directly, alongside the scout evidence, to perform asynchronous reasoning and independent falsification; it returns candidate packets only.
+- For a genuinely hard or disputed ownership/lifetime, synchronization/visibility, concurrency/device-context, deferred-error, or cleanup decision, the root may send compact packet **content** to `boss-advisor` at `@advisor`. The advisor is tool-free, packet-only, never delegates, and may answer `NEED EVIDENCE` with one exact question; agreement never verifies a claim.
+- The root reads only cheap exact-known ranges when cheaper than another dispatch, not broad scans or whole-diff ingestion. Batch independent work and make no gratuitous calls.
+- Workers skip builds, tests, benchmarks, formatters, and other validation; they propose exact gates. The root executes gates and mandatory synthesis. If delegation is unavailable, disclose routing/coverage limits and request permission before any materially costlier fallback.
+
+### Cheap evidence assignments
+
+Ask the `@smol` scout to map each relevant allocation, buffer, queue/stream, event/fence, module/kernel, graph, descriptor, mapped region, cache entry, and context/device handle to owner, borrower, acquisition, release, asynchronous uses, completion, error cleanup, and device identity; collect producer/dependency/consumer paths, callback captures, mutable cache/registry keys, and arithmetic-width sites with exact locations. Ask the `@task` reviewer to inspect only the assigned bounded ranges/callpaths and packet, reconstructing asynchronous timelines, reuse/destruction and visibility, concurrent-device state, deferred errors, and missing versus excess ordering. Escalate to the advisor only for a hard lifetime/synchronization interpretation, disputed device/context guard, or high-risk acceptance/remediation choice after evidence is complete; otherwise the root decides.
 
 ## Review order
 

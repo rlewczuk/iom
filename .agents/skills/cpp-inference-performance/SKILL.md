@@ -8,24 +8,45 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [w
 
 Performance is a correctness-like requirement for inference engines, but claims require workload relevance and evidence.
 
-Read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/performance.md`, and applicable backend checklists.
+Read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/performance.md`, and applicable backend checklists. Follow the common routing, evidence-packet, synthesis, and verification contract in `review-process.md`.
 
-## Invocation modes
+## Boss routing contract
 
-- **Orchestrated:** use the supplied resolved scope and return only `PF-###` candidate packets. Do not write task files before cross-area synthesis.
-- **Standalone:** resolve scope and optional destination, perform this performance pass, then invoke `cpp-inference-review-synthesis` for adversarial verification and direct task output.
+The canonical routing, evidence, scope, synthesis, and verification contract is `.agents/cpp-review/references/review-process.md`; this skill adds only performance-specific routing and evidence jobs. The visible/root session must be configured as `@slow` because a skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
 
-In selected-commit mode, accept only regressions introduced or materially exposed/worsened by the target.
+One `@slow` root schedules one shared `scout (project read-only) @smol`, atomic `boss-errand @smol` follow-ups, and bounded read-only `boss-reviewer @task` analysis/falsification. Area leaves do not delegate, invoke orchestration or synthesis, write tasks, or run gates. Dispatch independent work in one batch, use exact known ranges when cheaper than another dispatch, and do not make gratuitous calls.
 
-## Evidence classes
+### Invocation modes
+
+- **Orchestrated:** use the supplied scope/map as a `boss-reviewer @task` leaf and return only `PF-###` candidate packets. Request factual follow-ups through the root; do not delegate, synthesize, or materialize tasks.
+- **Standalone:** the `@slow` invocation owns the complete area, resolves scope, performs this pass, and always invokes `cpp-inference-review-synthesis` for adversarial verification and direct task output.
+
+Workers may propose exact benchmark, profiler, trace, or runtime commands/scenarios, but only the root runs gates after collection and records actual results and gaps. If a lane is unavailable, report routing/coverage limits and request permission before a materially costlier fallback; never silently replace cheap profiles or run an unbounded frontier review.
+
+## Performance evidence classes
 
 Classify every candidate:
 
-1. **Measured regression** — controlled benchmark/profile data shows material degradation.
+1. **Measured regression** — controlled benchmark/profile data shows material degradation on a representative workload.
 2. **Mechanically clear critical-path regression** — code proves an unconditional relevant synchronization, transfer, fallback, allocation, recompilation, or work increase.
 3. **Hypothesis** — plausible mechanism without enough evidence; the task must be the exact measurement/falsification experiment and must not state the suspected effect as fact.
 
-Reject claims such as “virtual calls are slow” or “this loop may be expensive” without material workload evidence.
+Reject claims such as “virtual calls are slow” or “this loop may be expensive” without material workload evidence. Do not turn an uninspected path, missing profile, or model agreement into verification or confidence.
+
+## Concrete evidence jobs
+
+### Cheap `@smol` jobs
+
+- Inventory the selected path's model-load/compile, prompt/prefill, token/decode, batch-throughput, and multi-device phases; map host/device transfers, synchronization, fallback, allocation, launch, capture, and cache boundaries to exact symbols.
+- For one suspected hotspot, trace callers, guards, backend counterparts, stream/queue and device transitions, allocator/cache invalidation, and relevant negative evidence; identify whether the mechanism is unconditional and critical-path.
+- Locate representative benchmark/profiler harnesses and report workload shapes, warmups, samples/variance, hardware/software/power identity, instrumentation comparability, metrics, and thresholds; propose commands only.
+- For a selected commit, compare baseline and target provenance at the smallest decisive ranges and classify introduced versus pre-existing work; do not ingest an entire diff when focused ranges suffice.
+
+### Advisor hard-decision triggers
+
+Use `boss-advisor @advisor` only for a genuinely hard decision: whether evidence establishes a material regression versus a hypothesis; whether a synchronization, transfer, fallback, allocation, cache, or launch mechanism is actually on a relevant critical path; disputed workload/baseline/threshold interpretation; ownership between performance, stability, and architecture; or a high/critical remediation choice such as deleting versus retaining a cache/scheduler/fusion layer.
+
+The advisor is tool-free and reasons only over a compact packet containing the needed source facts, exact minimal excerpts, measurements or proposed falsifier, negative evidence, coverage, validation, and alternatives. It must never open a URI/path, search files, run commands, delegate, or supply missing repository facts. If facts are missing, it returns `NEED EVIDENCE` with one exact question; the root sends a cheap source-reading worker and returns only the evidence delta. Advisor agreement does not verify a claim and the supervisor remains accountable.
 
 ## Review system behavior before kernels
 
@@ -54,7 +75,7 @@ Only after proving a kernel is material, inspect bandwidth/coalescing, arithmeti
 
 ## Benchmark discipline
 
-Use representative shapes/workloads, warmups, repeated samples, variance, controlled hardware/software/power state, recorded backend/device identity, comparable profiler instrumentation, and explicit latency/throughput/memory thresholds.
+Use representative shapes/workloads, warmups, repeated samples, variance, controlled hardware/software/power state, recorded backend/device identity, comparable profiler instrumentation, and explicit latency/throughput/memory thresholds. Workers propose the exact command and evidence requirements; the root runs gates after collection and records actual results and gaps.
 
 A semantically correct fallback can be a severe performance defect when it adds critical-path transfers, device changes, conversions, or prevents fusion/partitioning.
 
@@ -78,6 +99,6 @@ If a lifetime/order defect belongs to stability, keep one stability root cause a
 
 ## Candidate acceptance
 
-Use IDs `PF-###` and the full packet. Include workload/critical path, baseline and target evidence when measured, exact mechanism, expected metric, current symbols, remediation, and falsifier.
+Use IDs `PF-###` and the full packet in `finding-rubric.md`. Include workload/critical path, baseline and target evidence when measured, exact mechanism, expected metric, current symbols, remediation, and falsifier. Preserve the measured/mechanically-clear/hypothesis distinction in `Verification`, `Confidence`, `Evidence`, and `Verification method`.
 
 When standalone, always finish through `cpp-inference-review-synthesis`. If no candidate survives, return `No material findings; no remediation tasks generated.` with coverage and verification limits.
