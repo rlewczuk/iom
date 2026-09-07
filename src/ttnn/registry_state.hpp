@@ -12,6 +12,27 @@
 namespace iom::ttnn_test {
     void fail_next_quarantine_action_for_testing() noexcept;
     bool quarantine_action_fault_consumed_for_testing() noexcept;
+
+    // Fails the next ttnn_detail::copy_planes call just before the chosen
+    // plane index is enqueued; planes below it have already reached the
+    // mesh. A fault at index zero fails before any plane is submitted.
+    void fail_next_copy_planes_submission_for_testing(
+            std::size_t plane_index) noexcept;
+    bool copy_planes_submission_fault_consumed_for_testing() noexcept;
+
+    // Fails the next copy's registration phase with std::bad_alloc before
+    // any native plane is submitted: either the entry registration itself
+    // or the outcome insertion after both entries were registered.
+    void fail_next_copy_registration_for_testing() noexcept;
+    bool copy_registration_fault_consumed_for_testing() noexcept;
+    void fail_next_copy_outcome_insertion_for_testing() noexcept;
+    bool copy_outcome_insertion_fault_consumed_for_testing() noexcept;
+
+    // Fails the next `count` mesh-finish attempts made while draining a
+    // copy operation (the synchronous drain in the failed submission and
+    // the completion retry). Every other mesh finish is unaffected.
+    void fail_next_copy_finishes_for_testing(std::size_t count) noexcept;
+    bool copy_finish_fault_pending_for_testing() noexcept;
 }
 namespace iom::ttnn_detail {
 

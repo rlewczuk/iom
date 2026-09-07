@@ -594,3 +594,215 @@ TEST_CASE("TTNN copy survives derived-view temporaries") {
     iom_conformance::require_logical_bytes(
             actual_view, expected, "temporary-view copy");
 }
+
+namespace {
+// Runs one healthy multi-plane copy through a fresh queue on the device,
+// asserting neither the wait nor the readback observes anything left over
+// from a previously failed operation.
+void require_healthy_copy_after_failure(
+        iom::Device& device, const iom::TensorSpec& spec,
+        std::uint64_t salt, std::string_view context) {
+    auto fresh_source = device.create_tensor(spec);
+    auto fresh_destination = device.create_tensor(spec);
+    auto fresh_queue = device.create_ops();
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(spec, salt);
+    fresh_source->view().copy_from_host(pattern);
+    const iom::oid token =
+            fresh_queue->copy(fresh_source->view(), fresh_destination->view());
+    REQUIRE_NOTHROW(fresh_queue->wait(token));
+    iom_conformance::require_logical_bytes(
+            fresh_destination->view(), pattern, context);
+}
+}  // namespace
+
+TEST_CASE("TTNN failed plane submissions drain before rethrow") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
+    const std::size_t plane_count = 6;
+    for (const std::size_t fail_plane :
+         {std::size_t{0}, std::size_t{1}, plane_count - 1}) {
+        CAPTURE(fail_plane);
+        auto source = devices.candidate->create_tensor(spec);
+        auto destination = devices.candidate->create_tensor(spec);
+        source->view().copy_from_host(
+                iom_conformance::encode_logical(spec, 21));
+
+        auto queue = devices.candidate->create_ops();
+        iom::ttnn_test::fail_next_copy_planes_submission_for_testing(
+                fail_plane);
+        REQUIRE_THROWS_AS(
+                queue->copy(source->view(), destination->view()),
+                std::runtime_error);
+        CHECK(iom::ttnn_test::
+                      copy_planes_submission_fault_consumed_for_testing());
+
+        // The owners can be destroyed and reused immediately: the thrown
+        // call drained every submitted plane (or submitted none) before
+        // ownership was removed, and the same queue stays healthy.
+        source.reset();
+        destination.reset();
+        source = devices.candidate->create_tensor(spec);
+        destination = devices.candidate->create_tensor(spec);
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(spec, 22);
+        source->view().copy_from_host(pattern);
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        REQUIRE_NOTHROW(queue->wait(token));
+        iom_conformance::require_logical_bytes(
+                destination->view(), pattern,
+                "copy after partial-plane failure");
+    }
+}
+
+TEST_CASE("TTNN registration and outcome insertion failures roll back ownership") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
+
+    {
+        // The registration phase fails before any entry or native plane
+        // exists; the sequence reservation rolls back and the queue serves
+        // the next copy normally.
+        auto source = devices.candidate->create_tensor(spec);
+        auto destination = devices.candidate->create_tensor(spec);
+        auto queue = devices.candidate->create_ops();
+        iom::ttnn_test::fail_next_copy_registration_for_testing();
+        REQUIRE_THROWS_AS(
+                queue->copy(source->view(), destination->view()),
+                std::bad_alloc);
+        CHECK(iom::ttnn_test::
+                      copy_registration_fault_consumed_for_testing());
+
+        source.reset();
+        destination.reset();
+        require_healthy_copy_after_failure(
+                *devices.candidate, spec, 23,
+                "copy after registration failure");
+    }
+
+    {
+        // The outcome insertion fails after both entries were registered:
+        // the transaction must roll the entries back before rethrowing, and
+        // a repeated failure reuses the rolled-back sequence each time.
+        auto source = devices.candidate->create_tensor(spec);
+        auto destination = devices.candidate->create_tensor(spec);
+        auto queue = devices.candidate->create_ops();
+        for (int failure = 0; failure < 2; ++failure) {
+            iom::ttnn_test::fail_next_copy_outcome_insertion_for_testing();
+            REQUIRE_THROWS_AS(
+                    queue->copy(source->view(), destination->view()),
+                    std::bad_alloc);
+            CHECK(iom::ttnn_test::
+                          copy_outcome_insertion_fault_consumed_for_testing());
+        }
+
+        source.reset();
+        destination.reset();
+        require_healthy_copy_after_failure(
+                *devices.candidate, spec, 24,
+                "copy after outcome-insertion failure");
+    }
+}
+
+TEST_CASE("TTNN un-drainable failed submission reports a repeatable failed token") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    source->view().copy_from_host(
+            iom_conformance::encode_logical(spec, 31));
+
+    auto queue = devices.candidate->create_ops();
+    // The submission fails after one plane and the synchronous drain fails,
+    // so the operation is published with the retained submission failure
+    // instead of throwing: the caller receives a waitable token whose
+    // repeated waits report the failure.
+    iom::ttnn_test::fail_next_copy_planes_submission_for_testing(1);
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(2);
+    const iom::oid token = queue->copy(source->view(), destination->view());
+
+    std::string first_message;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool caught = false;
+        try {
+            queue->wait(token);
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            const std::string message = error.what();
+            CHECK(message.find("copy-plane submission failure")
+                  != std::string::npos);
+            if (first_message.empty()) {
+                first_message = message;
+            } else {
+                CHECK_EQ(std::string_view(message), first_message);
+            }
+        }
+        CHECK(caught);
+    }
+    CHECK_FALSE(iom::ttnn_test::copy_finish_fault_pending_for_testing());
+    CHECK(iom::ttnn_test::
+                  copy_planes_submission_fault_consumed_for_testing());
+
+    // The retained completion left the entries invalidated; destroying and
+    // reusing the owners never frees planes ahead of the pending mesh work,
+    // and the device stays fully usable.
+    queue.reset();
+    source.reset();
+    destination.reset();
+    require_healthy_copy_after_failure(
+            *devices.candidate, spec, 32,
+            "copy after retained-failure drain");
+}
+
+TEST_CASE("TTNN native finish failure reports a repeatable failed token") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    source->view().copy_from_host(
+            iom_conformance::encode_logical(spec, 41));
+
+    auto queue = devices.candidate->create_ops();
+    // The submission itself completes; the worker's one native finish for
+    // the operation fails, so the completion reports the finish failure.
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(1);
+    const iom::oid token = queue->copy(source->view(), destination->view());
+
+    std::string first_message;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool caught = false;
+        try {
+            queue->wait(token);
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            const std::string message = error.what();
+            CHECK(message.find("copy finish failure")
+                  != std::string::npos);
+            if (first_message.empty()) {
+                first_message = message;
+            } else {
+                CHECK_EQ(std::string_view(message), first_message);
+            }
+        }
+        CHECK(caught);
+    }
+    CHECK_FALSE(iom::ttnn_test::copy_finish_fault_pending_for_testing());
+
+    // Queue destruction and owner reuse after repeated failed waits drain
+    // without leaks or double release; the next operation is healthy.
+    queue.reset();
+    source.reset();
+    destination.reset();
+    require_healthy_copy_after_failure(
+            *devices.candidate, spec, 42,
+            "copy after native finish failure");
+}

@@ -39,8 +39,13 @@ namespace iom::ttnn_detail {
     // each view's plane offset and strides onto the owner planes. Values only;
     // no host staging and no encoding conversion. Returns after submission;
     // the caller synchronizes the mesh command queue once per operation.
+    // Sets any_submitted when at least one plane reached the mesh, so the
+    // caller can distinguish a failure before the first submission (nothing
+    // pending on the device) from a failure after one or more submissions
+    // (mesh work that must be drained before ownership can be removed).
     void copy_planes(
             const TensorView& source, const ttnn::Tensor* source_planes,
-            const TensorView& destination, ttnn::Tensor* destination_planes);
+            const TensorView& destination, ttnn::Tensor* destination_planes,
+            bool& any_submitted);
 
 }  // namespace iom::ttnn_detail

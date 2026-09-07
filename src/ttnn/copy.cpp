@@ -1,4 +1,5 @@
 #include "copy.hpp"
+#include "registry_state.hpp"
 
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
@@ -9,6 +10,7 @@
 #include <ttnn/tensor/tensor_ops.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -17,6 +19,36 @@
 #include <optional>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+
+#ifdef IOM_ENABLE_TESTING
+    // Test seam for submission-failure injection: the next copy_planes
+    // call throws just before the chosen plane index is submitted, so
+    // planes below it have already reached the mesh. A fault at index
+    // zero fails before any submission. The fault fires exactly once at
+    // the armed index; copy_planes runs under the device API mutex, so
+    // arming and consumption never race with another plane loop.
+    std::atomic<bool> g_copy_planes_fault_armed{false};
+    std::atomic<std::size_t> g_copy_planes_fault_at{0};
+    std::atomic<bool> g_copy_planes_fault_consumed{false};
+
+    void fail_copy_planes_submission_at(std::size_t index) noexcept(false) {
+        if (g_copy_planes_fault_armed.load(std::memory_order_acquire)
+                && index
+                        == g_copy_planes_fault_at.load(
+                                std::memory_order_acquire)) {
+            g_copy_planes_fault_armed.store(
+                    false, std::memory_order_release);
+            g_copy_planes_fault_consumed.store(
+                    true, std::memory_order_release);
+            throw std::runtime_error(
+                    "injected TTNN copy-plane submission failure");
+        }
+    }
+#endif
+
+}  // namespace
 
 namespace iom::ttnn_detail {
 
@@ -283,13 +315,37 @@ namespace iom::ttnn_detail {
 
     void copy_planes(
             const TensorView& source, const ttnn::Tensor* source_planes,
-            const TensorView& destination, ttnn::Tensor* destination_planes) {
+            const TensorView& destination, ttnn::Tensor* destination_planes,
+            bool& any_submitted) {
+        any_submitted = false;
         const std::size_t count = view_plane_count(source);
         for (std::size_t index = 0; index < count; ++index) {
+#ifdef IOM_ENABLE_TESTING
+            fail_copy_planes_submission_at(index);
+#endif
             ttnn::copy(
                     source_planes[owner_plane_at(source, index)],
                     destination_planes[owner_plane_at(destination, index)]);
+            any_submitted = true;
         }
     }
 
 }  // namespace iom::ttnn_detail
+
+#ifdef IOM_ENABLE_TESTING
+namespace iom::ttnn_test {
+
+    void fail_next_copy_planes_submission_for_testing(
+            std::size_t plane_index) noexcept {
+        g_copy_planes_fault_at.store(plane_index, std::memory_order_release);
+        g_copy_planes_fault_consumed.store(
+                false, std::memory_order_release);
+        g_copy_planes_fault_armed.store(true, std::memory_order_release);
+    }
+
+    bool copy_planes_submission_fault_consumed_for_testing() noexcept {
+        return g_copy_planes_fault_consumed.load(std::memory_order_acquire);
+    }
+
+}  // namespace iom::ttnn_test
+#endif

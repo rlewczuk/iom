@@ -43,6 +43,57 @@ namespace iom {
                 throw std::bad_alloc();
             }
         }
+
+        // Test seams for copy ownership transaction failure injection. Each
+        // arming is consumed by exactly one operation; the atomic state keeps
+        // arming and consumption race-free across the submit and worker
+        // threads. The copy-plane seam itself lives with copy_planes in
+        // copy.cpp; registration, outcome-insertion, and finish-failure seams
+        // are consumed here where the transaction runs.
+        std::atomic<bool> g_fail_next_copy_registration{false};
+        std::atomic<bool> g_fail_next_copy_outcome_insertion{false};
+        std::atomic<bool> g_copy_registration_fault_consumed{false};
+        std::atomic<bool> g_copy_outcome_insertion_fault_consumed{false};
+
+        // Remaining mesh-finish attempts that must fail. Count semantics let
+        // a test fail both drain attempts of one failed submission (the
+        // synchronous drain in execute and the completion retry) while every
+        // later finish, including quarantine drains, succeeds.
+        std::atomic<std::size_t> g_fail_copy_mesh_finishes{0};
+
+        void consume_copy_registration_fault() noexcept(false) {
+            if (g_fail_next_copy_registration.exchange(
+                        false, std::memory_order_acquire)) {
+                g_copy_registration_fault_consumed.store(
+                        true, std::memory_order_release);
+                throw std::bad_alloc();
+            }
+        }
+
+        void consume_copy_outcome_insertion_fault() noexcept(false) {
+            if (g_fail_next_copy_outcome_insertion.exchange(
+                        false, std::memory_order_acquire)) {
+                g_copy_outcome_insertion_fault_consumed.store(
+                        true, std::memory_order_release);
+                throw std::bad_alloc();
+            }
+        }
+
+        bool consume_copy_finish_fault() noexcept {
+            std::size_t remaining = g_fail_copy_mesh_finishes.load(
+                    std::memory_order_acquire);
+            for (;;) {
+                if (remaining == 0) {
+                    return false;
+                }
+                if (g_fail_copy_mesh_finishes.compare_exchange_weak(
+                            remaining, remaining - 1,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                    return true;
+                }
+            }
+        }
 #endif
 
 
@@ -356,10 +407,27 @@ namespace iom {
             return fence;
         }
 
+        // Finishes the mesh command queue. The caller must already hold the
+        // device API mutex: the synchronous drain of a failed submission
+        // runs under execute's api lock, and complete_task's retry reaches
+        // the same drain through finish_native's own lock. Every copy-drain
+        // path routes through here so an armed finish-failure seam faults
+        // exactly those attempts; host transfers, fence invokes, and
+        // quarantine drains keep their own finish calls unaffected.
+        void finish_locked(TtnnDevice& device) {
+#ifdef IOM_ENABLE_TESTING
+            if (consume_copy_finish_fault()) {
+                throw std::runtime_error(
+                        "injected TTNN copy finish failure");
+            }
+#endif
+            device.mesh().mesh_command_queue(0).finish();
+        }
+
         detail::FenceResult finish_native(TtnnDevice& device) noexcept {
             try {
                 std::lock_guard<std::mutex> lock(device.api_mutex());
-                device.mesh().mesh_command_queue(0).finish();
+                finish_locked(device);
                 return detail::FenceResult::success();
             } catch (...) {
                 return detail::FenceResult::failed(
@@ -416,6 +484,10 @@ public:
 
     ~TtnnQueue() override {
         state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        // The drain completes every published task, including retained-failure
+        // sequences left by an un-drainable failed submission: complete_task
+        // retries the native finish and delivers the retained failure to the
+        // wait tokens, under the device API mutex.
         worker_.shutdown_and_drain();
     }
 
@@ -440,36 +512,38 @@ public:
 
 private:
     void execute(Task& task) {
-        if (!task.no_op) {
-            std::lock_guard<std::mutex> api_lock(device_->api_mutex());
-            const ttnn::Tensor* source_planes =
-                    static_cast<const ttnn::Tensor*>(
-                            task.source->native_handle());
-            ttnn::Tensor* destination_planes =
-                    static_cast<ttnn::Tensor*>(
-                            task.destination->native_handle());
-            ttnn_detail::copy_planes(
-                    *task.source, source_planes,
-                    *task.destination, destination_planes);
-        }
-
+        // The transaction registers source and destination ownership before
+        // any native plane reaches the mesh, so every submitted command is
+        // associated with a completion record from the instant it is
+        // enqueued. A failure during registration or outcome insertion
+        // happens before any submission: roll back the partial entries and
+        // rethrow, with nothing pending on the device.
         const detail::Fence fence = build_ttnn_fence(*device_);
         detail::EntryRegistration entries;
         try {
+#ifdef IOM_ENABLE_TESTING
+            consume_copy_registration_fault();
+#endif
             entries = detail::register_copy_entries(
                     *state_, registry_queue_id_, task.sequence,
                     const_cast<void*>(task.source->native_handle()),
                     task.destination->native_handle(), fence);
             task.source_entry_id = entries.source;
             task.destination_entry_id = entries.destination;
-            std::lock_guard<std::mutex> lock(outcome_mutex_);
-            const auto [it, inserted] = outcomes_.emplace(
-                    task.sequence,
-                    detail::SequenceOutcome{
-                            entries.source, entries.destination, nullptr});
-            if (!inserted) {
-                throw std::logic_error(
-                        "duplicate TTNN outstanding-work sequence");
+            {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+#ifdef IOM_ENABLE_TESTING
+                consume_copy_outcome_insertion_fault();
+#endif
+                const auto [it, inserted] = outcomes_.emplace(
+                        task.sequence,
+                        detail::SequenceOutcome{
+                                entries.source, entries.destination,
+                                nullptr});
+                if (!inserted) {
+                    throw std::logic_error(
+                            "duplicate TTNN outstanding-work sequence");
+                }
             }
         } catch (...) {
             if (entries.source != 0) {
@@ -484,6 +558,86 @@ private:
             }
             throw;
         }
+
+        if (task.no_op) {
+            // An identical-window copy submits no native work; the
+            // registered entries above already own the empty operation and
+            // complete_task's single mesh finish closes it out.
+            return;
+        }
+
+        std::lock_guard<std::mutex> api_lock(device_->api_mutex());
+        bool any_submitted = false;
+        std::exception_ptr submission_failure;
+        try {
+            const ttnn::Tensor* source_planes =
+                    static_cast<const ttnn::Tensor*>(
+                            task.source->native_handle());
+            ttnn::Tensor* destination_planes =
+                    static_cast<ttnn::Tensor*>(
+                            task.destination->native_handle());
+            ttnn_detail::copy_planes(
+                    *task.source, source_planes,
+                    *task.destination, destination_planes,
+                    any_submitted);
+        } catch (...) {
+            submission_failure = std::current_exception();
+        }
+        if (!submission_failure) {
+            // Success path: every plane is submitted and owned; the worker's
+            // complete_task performs exactly one mesh finish per operation.
+            return;
+        }
+
+        if (!any_submitted) {
+            // The failure struck before the first plane reached the mesh:
+            // nothing is pending, so ownership rolls back and the exception
+            // propagates synchronously with no device work outstanding.
+            state_->registry.remove_entry_if_present(
+                    entries.source,
+                    const_cast<void*>(task.source->native_handle()));
+            state_->registry.remove_entry_if_present(
+                    entries.destination,
+                    task.destination->native_handle());
+            {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                outcomes_.erase(task.sequence);
+            }
+            std::rethrow_exception(submission_failure);
+        }
+
+        // One or more planes reached the mesh. Drain them synchronously
+        // under the API mutex before ownership is removed, so a thrown call
+        // has established the terminal result of every submitted command
+        // before the owners can be destroyed or reused.
+        try {
+            finish_locked(*device_);
+        } catch (...) {
+            // The mesh cannot be drained. Retain the failed fenced sequence:
+            // the task is published normally, so the caller receives a
+            // waitable token whose waits report the retained submission
+            // failure, and the registered entries keep protecting the planes
+            // until complete_task's finish retry (or the quarantine drain
+            // when the owners are destroyed) establishes the terminal result.
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(task.sequence);
+            if (it != outcomes_.end()) {
+                it->second.retained_failure =
+                        std::move(submission_failure);
+            }
+            return;
+        }
+        state_->registry.remove_entry_if_present(
+                entries.source,
+                const_cast<void*>(task.source->native_handle()));
+        state_->registry.remove_entry_if_present(
+                entries.destination,
+                task.destination->native_handle());
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            outcomes_.erase(task.sequence);
+        }
+        std::rethrow_exception(submission_failure);
     }
 
     void complete_task(
@@ -500,21 +654,33 @@ private:
             }
         }
         if (has_outcome) {
+            // A retained failure means a plane submission (or the synchronous
+            // drain after it) already failed for this operation. The finish
+            // still runs: it either establishes the terminal result of every
+            // submitted native command, or it proves the queue cannot be
+            // drained, in which case the entries stay invalidated and the
+            // quarantine protects the planes until a device-teardown finish
+            // succeeds. The caller observes the retained failure either way.
             const detail::FenceResult fence_result =
-                    failure ? detail::FenceResult::failed(failure)
-                            : finish_native(*device_);
+                    finish_native(*device_);
             const bool fence_succeeded =
                     fence_result.succeeded && !fence_result.failure;
+            const std::exception_ptr operation_failure =
+                    failure ? failure : outcome.retained_failure;
             const bool released =
                     detail::release_or_invalidate_entries(
                             state_->registry, outcome,
-                            static_cast<bool>(failure), fence_succeeded);
-            if (!released && !failure) {
-                failure = fence_result.failure;
-            }
+                            static_cast<bool>(operation_failure),
+                            fence_succeeded);
             if (released) {
                 last_finished_seq_.store(
                         sequence, std::memory_order_release);
+            }
+            // The worker-supplied failure wins, then the retained submission
+            // failure, then the native finish failure.
+            if (!failure) {
+                failure = operation_failure ? operation_failure
+                                            : fence_result.failure;
             }
         }
         complete(sequence, std::move(failure));
@@ -563,6 +729,37 @@ private:
 
         bool quarantine_action_fault_consumed_for_testing() noexcept {
             return g_quarantine_action_fault_consumed;
+        }
+
+        void fail_next_copy_registration_for_testing() noexcept {
+            g_fail_next_copy_registration.store(
+                    true, std::memory_order_release);
+        }
+
+        bool copy_registration_fault_consumed_for_testing() noexcept {
+            return g_copy_registration_fault_consumed.load(
+                    std::memory_order_acquire);
+        }
+
+        void fail_next_copy_outcome_insertion_for_testing() noexcept {
+            g_fail_next_copy_outcome_insertion.store(
+                    true, std::memory_order_release);
+        }
+
+        bool copy_outcome_insertion_fault_consumed_for_testing() noexcept {
+            return g_copy_outcome_insertion_fault_consumed.load(
+                    std::memory_order_acquire);
+        }
+
+        void fail_next_copy_finishes_for_testing(
+                std::size_t count) noexcept {
+            g_fail_copy_mesh_finishes.store(count, std::memory_order_release);
+        }
+
+        bool copy_finish_fault_pending_for_testing() noexcept {
+            return g_fail_copy_mesh_finishes.load(
+                           std::memory_order_acquire)
+                   != 0;
         }
     }  // namespace ttnn_test
 #endif
