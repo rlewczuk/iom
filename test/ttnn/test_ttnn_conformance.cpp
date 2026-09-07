@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <tt-metalium/bfloat16.hpp>
+#include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_buffer.hpp>
 #include <tt-metalium/tile.hpp>
 #include <ttnn/tensor/tensor.hpp>
@@ -65,29 +66,6 @@ struct TtnnDevices {
 // throws, so enabled conformance targets fail instead of skipping.
 void require_hardware() {}
 
-tt::tt_metal::DataType native_dtype(iom::DataType type) {
-    switch (type) {
-        case iom::DataType::BOOL:
-        case iom::DataType::U8:
-        case iom::DataType::I8:
-            return tt::tt_metal::DataType::UINT8;
-        case iom::DataType::U16:
-        case iom::DataType::I16:
-            return tt::tt_metal::DataType::UINT16;
-        case iom::DataType::U32:
-            return tt::tt_metal::DataType::UINT32;
-        case iom::DataType::I32:
-            return tt::tt_metal::DataType::INT32;
-        case iom::DataType::BF16:
-            return tt::tt_metal::DataType::BFLOAT16;
-        case iom::DataType::F32:
-            return tt::tt_metal::DataType::FLOAT32;
-        default:
-            throw std::invalid_argument(
-                    "unsupported TTNN oracle data type");
-    }
-}
-
 template <typename T>
 tt::tt_metal::HostBuffer make_host_buffer(
         std::vector<std::byte>& bytes) {
@@ -139,24 +117,130 @@ std::size_t owner_plane_count(const iom::TensorSpec& spec) {
     }
     return count;
 }
-template <typename T>
-void observe_plane_values(
+// Nonzero sentinel pre-seeded into the observer's independent byte
+// representation. Any native cell the readback fails to observe — a padded
+// slot in particular — stays nonzero and diverges from the zero-filled
+// expected model instead of cancelling against it.
+constexpr std::byte kObserverStorageSentinel{0xA5};
+
+// One native TTNN TILE plane's padded geometry. The TTNN runtime pads every
+// plane to 32x32-tile multiples and stores the complete allocation in
+// physical tile-major order: tiles row-major over the padded grid, every
+// 32x32 tile as four row-major 16x16 faces. This is the same tile geometry
+// the TTNN transfer implementation assumes for its host staging.
+struct TtnnPlaneLayout {
+    std::size_t padded_rows = 0;
+    std::size_t padded_columns = 0;
+    std::size_t tile_columns = 0;
+
+    explicit TtnnPlaneLayout(const ttnn::Tensor& plane) {
+        padded_rows =
+                static_cast<std::size_t>(plane.padded_shape()[-2]);
+        padded_columns =
+                static_cast<std::size_t>(plane.padded_shape()[-1]);
+        tile_columns = padded_columns / 32;
+    }
+
+    // Physical tile-major element index of the padded coordinate (row,
+    // column) inside this plane's native readback.
+    [[nodiscard]] std::size_t element_index(
+            std::size_t row, std::size_t column) const {
+        const std::size_t tile_index =
+                (row / 32) * tile_columns + column / 32;
+        const std::size_t face_index =
+                ((row % 32) / 16) * 2 + ((column % 32) / 16);
+        return tile_index * 1024 + face_index * 256
+                + (row % 16) * 16 + (column % 16);
+    }
+};
+
+// Builds one native plane's padded row-major host image from the encoded
+// standard model: logical elements at their row-major padded positions and
+// zero padding, optionally planting nonzero sentinels at padded coordinates.
+// Uses only the standard slot arithmetic, independent of the production TTNN
+// copy helper, so the seed path and the padding-mutation probe share one
+// geometry.
+std::vector<std::byte> padded_plane_image(
         const ttnn::Tensor& plane, const iom::TensorSpec& owner,
-        std::size_t plane_index, std::vector<std::byte>& storage) {
+        std::size_t plane_index, std::span<const std::byte> encoded,
+        std::span<const std::pair<std::size_t, std::size_t>> planted = {}) {
     const std::span<const std::size_t> dimensions = owner.shape.dimensions();
     const std::size_t rows = dimensions[dimensions.size() - 2];
     const std::size_t columns = dimensions[dimensions.size() - 1];
-    const std::vector<T> values = plane.to_vector<T>();
-    REQUIRE(values.size() >= rows * columns);
-    const auto* bytes = reinterpret_cast<const std::byte*>(values.data());
-    const std::size_t element_bytes = sizeof(T);
+    const std::size_t padded_rows =
+            static_cast<std::size_t>(plane.padded_shape()[-2]);
+    const std::size_t padded_columns =
+            static_cast<std::size_t>(plane.padded_shape()[-1]);
+    const std::size_t bits = iom::detail::leaf_bits(owner.data_type);
+    REQUIRE_EQ(bits % 8, std::size_t{0});
+    const std::size_t element_bytes = bits / 8;
+    std::vector<std::byte> padded(
+            padded_rows * padded_columns * element_bytes, std::byte{0});
     for (std::size_t row = 0; row < rows; ++row) {
         for (std::size_t column = 0; column < columns; ++column) {
             const std::size_t slot = iom::detail::standard_plane_slot(
                     owner, plane_index, row, column);
             std::memcpy(
+                    padded.data()
+                            + (row * padded_columns + column) * element_bytes,
+                    encoded.data() + slot * element_bytes, element_bytes);
+        }
+    }
+    for (const auto& [row, column] : planted) {
+        const bool planted_inside_logical =
+                row < rows && column < columns;
+        REQUIRE_FALSE(planted_inside_logical);
+        REQUIRE(row < padded_rows);
+        REQUIRE(column < padded_columns);
+        std::byte* cell =
+                padded.data() + (row * padded_columns + column) * element_bytes;
+        std::fill(cell, cell + element_bytes, kObserverStorageSentinel);
+    }
+    return padded;
+}
+
+// Writes one padded row-major host image into a native plane through TTNN's
+// own layout conversion, the same independent native path the oracle seed
+// uses.
+void write_padded_plane_image(
+        ttnn::Tensor& plane, std::vector<std::byte>& padded) {
+    ttnn::Tensor host_row_major(
+            make_host_buffer(plane.dtype(), padded),
+            plane.logical_shape(), plane.padded_shape(), plane.dtype(),
+            tt::tt_metal::Layout::ROW_MAJOR);
+    const ttnn::Tensor host_tiled = tt::tt_metal::to_layout(
+            host_row_major, tt::tt_metal::Layout::TILE);
+    ttnn::copy_to_device(host_tiled, plane);
+}
+
+// Observes one native plane's complete padded TILE readback into standard
+// slot order, mapping every standard padded coordinate — padded rows and
+// columns included — by its standard slot. The readback is raw physical
+// tile-major bytes; coordinates are mapped through the native tile geometry,
+// never by assuming the native and standard layouts agree, so native padding
+// writes and physical tile-slot permutations surface instead of being
+// normalized away.
+void observe_plane_storage(
+        std::span<const std::byte> readback,
+        const ttnn::Tensor& plane, const iom::TensorSpec& owner,
+        std::size_t plane_index, std::size_t element_bytes,
+        std::vector<std::byte>& storage) {
+    const TtnnPlaneLayout native(plane);
+    REQUIRE_EQ(
+            readback.size(),
+            native.padded_rows * native.padded_columns * element_bytes);
+    const iom::TensorShape padded_shape = owner.standard_padded_shape();
+    const std::span<const std::size_t> padded = padded_shape.dimensions();
+    const std::size_t padded_rows = padded[padded.size() - 2];
+    const std::size_t padded_columns = padded[padded.size() - 1];
+    for (std::size_t row = 0; row < padded_rows; ++row) {
+        for (std::size_t column = 0; column < padded_columns; ++column) {
+            const std::size_t slot = iom::detail::standard_plane_slot(
+                    owner, plane_index, row, column);
+            const std::size_t position = native.element_index(row, column);
+            std::memcpy(
                     storage.data() + slot * element_bytes,
-                    bytes + (row * columns + column) * element_bytes,
+                    readback.data() + position * element_bytes,
                     element_bytes);
         }
     }
@@ -175,9 +259,6 @@ public:
         const std::size_t rows = dimensions[dimensions.size() - 2];
         const std::size_t columns = dimensions[dimensions.size() - 1];
         const std::size_t planes_count = owner_plane_count(owner);
-        const std::size_t bits = iom::detail::leaf_bits(owner.data_type);
-        REQUIRE_EQ(bits % 8, std::size_t{0});
-        const std::size_t element_bytes = bits / 8;
         auto* planes = static_cast<ttnn::Tensor*>(view.native_handle());
 
         // Exercise the view-coordinate plane map independently of the
@@ -191,40 +272,21 @@ public:
         for (std::size_t plane_index = 0; plane_index < planes_count;
              ++plane_index) {
             ttnn::Tensor& plane = planes[plane_index];
-            const std::size_t padded_rows =
-                    static_cast<std::size_t>(plane.padded_shape()[-2]);
-            const std::size_t padded_columns =
-                    static_cast<std::size_t>(plane.padded_shape()[-1]);
-            std::vector<std::byte> padded(
-                    padded_rows * padded_columns * element_bytes,
-                    std::byte{0});
-            for (std::size_t row = 0; row < rows; ++row) {
-                for (std::size_t column = 0; column < columns; ++column) {
-                    const std::size_t slot = iom::detail::standard_plane_slot(
-                            owner, plane_index, row, column);
-                    std::memcpy(
-                            padded.data()
-                                    + (row * padded_columns + column)
-                                            * element_bytes,
-                            encoded.data() + slot * element_bytes,
-                            element_bytes);
-                }
-            }
-            ttnn::Tensor host_row_major(
-                    make_host_buffer(plane.dtype(), padded),
-                    plane.logical_shape(), plane.padded_shape(), plane.dtype(),
-                    tt::tt_metal::Layout::ROW_MAJOR);
-            const ttnn::Tensor host_tiled = tt::tt_metal::to_layout(
-                    host_row_major, tt::tt_metal::Layout::TILE);
-            ttnn::copy_to_device(host_tiled, plane);
+            std::vector<std::byte> padded =
+                    padded_plane_image(plane, owner, plane_index, encoded);
+            write_padded_plane_image(plane, padded);
         }
     }
 
     [[nodiscard]] std::vector<std::byte> observe(
             const iom::TensorView& view) const override {
         const iom::TensorSpec& owner = owner_spec();
+        // The independent byte representation is pre-seeded with a nonzero
+        // sentinel: padded rows, padded columns, and untouched owner planes
+        // are reported from the native readback, so a cell the observer fails
+        // to fill cannot cancel against zero-initialized expected padding.
         std::vector<std::byte> storage(
-                owner.tiled_storage_nbytes(), std::byte{0});
+                owner.tiled_storage_nbytes(), kObserverStorageSentinel);
         const std::span<const std::size_t> dimensions =
                 owner.shape.dimensions();
         const std::size_t rows = dimensions[dimensions.size() - 2];
@@ -237,44 +299,43 @@ public:
         }
         const auto* planes =
                 static_cast<const ttnn::Tensor*>(view.native_handle());
-        switch (native_dtype(owner.data_type)) {
-            case tt::tt_metal::DataType::BFLOAT16:
-                for (std::size_t i = 0; i < planes_count; ++i) {
-                    observe_plane_values<bfloat16>(
-                            planes[i], owner, i, storage);
-                }
-                break;
-            case tt::tt_metal::DataType::FLOAT32:
-                for (std::size_t i = 0; i < planes_count; ++i) {
-                    observe_plane_values<float>(planes[i], owner, i, storage);
-                }
-                break;
-            case tt::tt_metal::DataType::UINT32:
-                for (std::size_t i = 0; i < planes_count; ++i) {
-                    observe_plane_values<std::uint32_t>(
-                            planes[i], owner, i, storage);
-                }
-                break;
-            case tt::tt_metal::DataType::INT32:
-                for (std::size_t i = 0; i < planes_count; ++i) {
-                    observe_plane_values<std::int32_t>(
-                            planes[i], owner, i, storage);
-                }
-                break;
-            case tt::tt_metal::DataType::UINT16:
-                for (std::size_t i = 0; i < planes_count; ++i) {
-                    observe_plane_values<std::uint16_t>(
-                            planes[i], owner, i, storage);
-                }
-                break;
-            case tt::tt_metal::DataType::UINT8:
-                for (std::size_t i = 0; i < planes_count; ++i) {
-                    observe_plane_values<std::uint8_t>(
-                            planes[i], owner, i, storage);
-                }
-                break;
-            default:
-                throw std::logic_error("unsupported TTNN oracle dtype");
+        const std::size_t bits = iom::detail::leaf_bits(owner.data_type);
+        REQUIRE_EQ(bits % 8, std::size_t{0});
+        const std::size_t element_bytes = bits / 8;
+
+        // Raw physical readback of every owner plane. copy_to_host returns
+        // the complete native padded allocation in tile-major order — the
+        // same staging layout the production download assembly consumes —
+        // including padded rows, padded columns, and untouched planes.
+        auto* device = planes[0].device();
+        REQUIRE(device != nullptr);
+        auto& queue = device->mesh_command_queue(0);
+        std::vector<std::size_t> plane_bytes(planes_count);
+        std::size_t staging_bytes = 0;
+        for (std::size_t i = 0; i < planes_count; ++i) {
+            const TtnnPlaneLayout native(planes[i]);
+            plane_bytes[i] =
+                    native.padded_rows * native.padded_columns * element_bytes;
+            staging_bytes += plane_bytes[i];
+        }
+        std::unique_ptr<std::byte[]> staging =
+                std::make_unique_for_overwrite<std::byte[]>(staging_bytes);
+        std::size_t offset = 0;
+        for (std::size_t i = 0; i < planes_count; ++i) {
+            ttnn::copy_to_host(
+                    queue, planes[i], staging.get() + offset, std::nullopt,
+                    /*blocking=*/false);
+            offset += plane_bytes[i];
+        }
+        queue.finish();
+
+        offset = 0;
+        for (std::size_t i = 0; i < planes_count; ++i) {
+            observe_plane_storage(
+                    std::span<const std::byte>(
+                            staging.get() + offset, plane_bytes[i]),
+                    planes[i], owner, i, element_bytes, storage);
+            offset += plane_bytes[i];
         }
         return storage;
     }
@@ -467,6 +528,72 @@ TEST_CASE("TTNN conformance: storage oracle covers every leaf width and padded s
     TtnnStorageOracle oracle;
     REQUIRE(iom_conformance::run_storage_oracle_conformance(
             devices.conformance(), iom::ttnn_supported_data_types(), oracle));
+}
+
+// Decisive padded-storage probe: the full-storage oracle observes the
+// complete native padded allocation, so a nonzero native padding write fails
+// it while the logical host projection stays byte-identical, and a logical
+// host write re-establishes the documented zero policy.
+TEST_CASE("TTNN conformance: full-storage oracle exposes native padding mutations") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{17, 33}}, iom::DataType::U8};
+    auto tensor = devices.candidate->create_tensor(spec);
+    TtnnStorageOracle oracle;
+    oracle.set_owner_spec(spec);
+    iom::TensorView& view = tensor->view();
+    auto* planes = static_cast<ttnn::Tensor*>(view.native_handle());
+    const std::vector<std::byte> initial =
+            iom_conformance::encode_standard_tiled_storage(spec);
+
+    // Plant a nonzero sentinel in the first padded row's leading cell through
+    // the independent padded native write path, preserving every logical
+    // value from the encoded model.
+    const std::size_t planted_row = spec.shape.dimension(0);
+    const std::size_t planted_column = 0;
+    const std::pair<std::size_t, std::size_t> planted_cells[] = {
+            {planted_row, planted_column}};
+    std::vector<std::byte> mutated = padded_plane_image(
+            planes[0], spec, 0, initial,
+            std::span<const std::pair<std::size_t, std::size_t>>{
+                    planted_cells});
+    write_padded_plane_image(planes[0], mutated);
+
+    // A padded-cell mutation fails full-storage observation at exactly the
+    // planted standard slot; the logical projection is unchanged.
+    const std::vector<std::byte> observed = oracle.observe(view);
+    CHECK_FALSE(iom_conformance::require_storage_oracle_bytes(
+            observed, initial, "planted padding mutation", false));
+    std::size_t first_mismatch = observed.size();
+    std::size_t mismatch_count = 0;
+    for (std::size_t i = 0; i < observed.size(); ++i) {
+        if (observed[i] != initial[i]) {
+            if (mismatch_count == 0) {
+                first_mismatch = i;
+            }
+            ++mismatch_count;
+        }
+    }
+    const std::size_t planted_slot = iom::detail::standard_plane_slot(
+            spec, 0, planted_row, planted_column);
+    CHECK_EQ(mismatch_count, 1);
+    CHECK_EQ(first_mismatch, planted_slot);
+    iom_conformance::require_logical_bytes(
+            view, iom_conformance::decode_standard_tiled_view(view, spec, initial),
+            "logical projection after native padding mutation");
+
+    // A logical host write goes through the production upload, which
+    // zero-fills native padding: full-storage observation now matches the
+    // expected untouched/zero policy exactly.
+    const std::vector<std::byte> pattern = iom_conformance::encode_logical(spec, 0x2A);
+    view.copy_from_host(pattern);
+    std::vector<std::byte> expected = initial;
+    iom_conformance::apply_standard_tiled_view(view, spec, pattern, expected);
+    REQUIRE(iom_conformance::require_storage_oracle_bytes(
+            oracle.observe(view), expected,
+            "logical write re-establishes zero padding", true));
+    iom_conformance::require_logical_bytes(view, pattern, "logical write content");
 }
 
 TEST_CASE("TTNN conformance: asynchronous copies against the CPU reference") {
