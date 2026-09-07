@@ -100,6 +100,21 @@ namespace iom {
                 unsigned char* destination, const unsigned char* source,
                 std::size_t elements) {
             assert(elements <= TensorSpec::TILE);
+            const std::size_t bytes = elements * kElementBytes;
+            const std::uintptr_t destination_begin =
+                    reinterpret_cast<std::uintptr_t>(destination);
+            const std::uintptr_t source_begin =
+                    reinterpret_cast<std::uintptr_t>(source);
+            // A row run is one contiguous byte range. Disjoint source and
+            // destination ranges copy with one bulk memory move, equivalent
+            // to the per-element loop below and avoiding up to 16 tiny
+            // memcpy calls per run. Overlapping or self ranges keep the
+            // per-element path so no alias behavior changes.
+            if (destination_begin + bytes <= source_begin
+                    || source_begin + bytes <= destination_begin) {
+                std::memcpy(destination, source, bytes);
+                return;
+            }
             for (std::size_t index = 0; index < elements; ++index) {
                 if (destination + index * kElementBytes
                         != source + index * kElementBytes) {
