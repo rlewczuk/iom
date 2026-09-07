@@ -61,6 +61,12 @@ namespace iom {
         // later finish, including quarantine drains, succeeds.
         std::atomic<std::size_t> g_fail_copy_mesh_finishes{0};
 
+        // Mesh-finish attempts routed through finish_locked for the
+        // copy-drain paths, counted under IOM_ENABLE_TESTING.
+        // Batch-completion tests assert one native finish per ready batch
+        // through this counter.
+        std::atomic<std::uint64_t> g_copy_mesh_finish_count{0};
+
         void consume_copy_registration_fault() noexcept(false) {
             if (g_fail_next_copy_registration.exchange(
                         false, std::memory_order_acquire)) {
@@ -416,6 +422,7 @@ namespace iom {
         // quarantine drains keep their own finish calls unaffected.
         void finish_locked(TtnnDevice& device) {
 #ifdef IOM_ENABLE_TESTING
+            g_copy_mesh_finish_count.fetch_add(1, std::memory_order_relaxed);
             if (consume_copy_finish_fault()) {
                 throw std::runtime_error(
                         "injected TTNN copy finish failure");
@@ -562,7 +569,8 @@ private:
         if (task.no_op) {
             // An identical-window copy submits no native work; the
             // registered entries above already own the empty operation and
-            // complete_task's single mesh finish closes it out.
+            // complete_task's batch finish closes it out.
+            executed_seq_.store(task.sequence, std::memory_order_release);
             return;
         }
 
@@ -585,7 +593,9 @@ private:
         }
         if (!submission_failure) {
             // Success path: every plane is submitted and owned; the worker's
-            // complete_task performs exactly one mesh finish per operation.
+            // complete_task performs one mesh finish per ready batch of
+            // contiguous executed tasks.
+            executed_seq_.store(task.sequence, std::memory_order_release);
             return;
         }
 
@@ -625,6 +635,7 @@ private:
                 it->second.retained_failure =
                         std::move(submission_failure);
             }
+            executed_seq_.store(task.sequence, std::memory_order_release);
             return;
         }
         state_->registry.remove_entry_if_present(
@@ -642,31 +653,62 @@ private:
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
-        detail::SequenceOutcome outcome;
+        // Collect the ready contiguous batch starting at `sequence`: the
+        // task's own outcome plus every following sequence whose outcome
+        // exists and whose execution has finished. Registration precedes
+        // native submission, so a registered outcome alone is not enough;
+        // executed_seq_ marks the highest sequence whose planes have
+        // reached the mesh, which keeps the single finish below from
+        // racing a not-yet-enqueued task.
+        std::vector<std::pair<std::uint64_t, detail::SequenceOutcome>> batch;
         bool has_outcome = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
-            const auto it = outcomes_.find(sequence);
-            if (it != outcomes_.end()) {
-                outcome = std::move(it->second);
-                outcomes_.erase(it);
+            const auto first = outcomes_.find(sequence);
+            if (first != outcomes_.end()) {
+                batch.emplace_back(
+                        sequence, std::move(first->second));
+                outcomes_.erase(first);
                 has_outcome = true;
+
+                const std::uint64_t executed =
+                        executed_seq_.load(std::memory_order_acquire);
+                std::uint64_t next = sequence + 1;
+                for (auto it = outcomes_.upper_bound(sequence);
+                     it != outcomes_.end() && it->first == next
+                             && next <= executed;
+                     it = outcomes_.erase(it), ++next) {
+                    batch.emplace_back(next, std::move(it->second));
+                }
             }
         }
-        if (has_outcome) {
-            // A retained failure means a plane submission (or the synchronous
-            // drain after it) already failed for this operation. The finish
-            // still runs: it either establishes the terminal result of every
-            // submitted native command, or it proves the queue cannot be
-            // drained, in which case the entries stay invalidated and the
-            // quarantine protects the planes until a device-teardown finish
-            // succeeds. The caller observes the retained failure either way.
-            const detail::FenceResult fence_result =
-                    finish_native(*device_);
-            const bool fence_succeeded =
-                    fence_result.succeeded && !fence_result.failure;
+        if (!has_outcome) {
+            complete(sequence, std::move(failure));
+            return;
+        }
+
+        // One native finish establishes the terminal result of every
+        // command the batch enqueued, exactly as the pre-batch code did
+        // per task. A retained failure means a plane submission (or the
+        // synchronous drain after it) already failed for that operation;
+        // the finish still runs: it either establishes the terminal result
+        // of every submitted native command, or it proves the queue cannot
+        // be drained, in which case the entries of every affected batch
+        // member stay invalidated and the quarantine protects the planes
+        // until a device-teardown finish succeeds. The caller observes the
+        // retained failure either way.
+        const detail::FenceResult fence_result = finish_native(*device_);
+        const bool fence_succeeded =
+                fence_result.succeeded && !fence_result.failure;
+        for (std::size_t index = 0; index < batch.size(); ++index) {
+            const std::uint64_t seq = batch[index].first;
+            const detail::SequenceOutcome& outcome = batch[index].second;
+            // The worker-supplied failure belongs only to the head task;
+            // later members carry at most their retained submission
+            // failure.
             const std::exception_ptr operation_failure =
-                    failure ? failure : outcome.retained_failure;
+                    index == 0 && failure ? failure
+                                          : outcome.retained_failure;
             const bool released =
                     detail::release_or_invalidate_entries(
                             state_->registry, outcome,
@@ -674,16 +716,21 @@ private:
                             fence_succeeded);
             if (released) {
                 last_finished_seq_.store(
-                        sequence, std::memory_order_release);
+                        seq, std::memory_order_release);
             }
-            // The worker-supplied failure wins, then the retained submission
-            // failure, then the native finish failure.
-            if (!failure) {
-                failure = operation_failure ? operation_failure
-                                            : fence_result.failure;
+            // The worker-supplied failure wins, then the retained
+            // submission failure, then the native finish failure, in
+            // submission order within the batch.
+            std::exception_ptr completion_failure;
+            if (index == 0 && failure) {
+                completion_failure = failure;
+            } else if (operation_failure) {
+                completion_failure = operation_failure;
+            } else {
+                completion_failure = fence_result.failure;
             }
+            complete(seq, std::move(completion_failure));
         }
-        complete(sequence, std::move(failure));
     }
 
     TtnnDevice* device_;
@@ -695,6 +742,13 @@ private:
     detail::StagedWorker<Task> worker_;
     std::mutex fence_mutex_;
     std::atomic<std::uint64_t> last_finished_seq_{0};
+    // Highest sequence whose task finished executing with its outcome still
+    // registered (every native plane enqueued, or a determined no-op).
+    // Registration precedes native submission, so an outcome alone is not
+    // proof its work reached the mesh; complete_task's batch collection
+    // reads this marker, under outcome_mutex_, to stop the batch before
+    // any not-yet-executed sequence.
+    std::atomic<std::uint64_t> executed_seq_{0};
     void fence_through_sequence(
             std::uint64_t sequence) noexcept override;
 };
@@ -760,6 +814,14 @@ private:
             return g_fail_copy_mesh_finishes.load(
                            std::memory_order_acquire)
                    != 0;
+        }
+
+        void reset_copy_finish_count_for_testing() noexcept {
+            g_copy_mesh_finish_count.store(0, std::memory_order_release);
+        }
+
+        std::uint64_t copy_finish_count_for_testing() noexcept {
+            return g_copy_mesh_finish_count.load(std::memory_order_acquire);
         }
     }  // namespace ttnn_test
 #endif

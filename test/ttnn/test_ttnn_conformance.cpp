@@ -933,3 +933,156 @@ TEST_CASE("TTNN native finish failure reports a repeatable failed token") {
             *devices.candidate, spec, 42,
             "copy after native finish failure");
 }
+
+TEST_CASE("TTNN no-wait bursts share one native finish per ready batch") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{4, 2, 16, 16}}, iom::DataType::BF16};
+
+    // Serial submission with a wait after every copy: each completion is
+    // its own one-task batch, so exactly one native mesh finish occurs per
+    // copy regardless of the worker's timing. This pins the not-batched
+    // path to one finish per task.
+    {
+        auto source = devices.candidate->create_tensor(spec);
+        auto destination = devices.candidate->create_tensor(spec);
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(spec, 51);
+        source->view().copy_from_host(pattern);
+        auto queue = devices.candidate->create_ops();
+        iom::ttnn_test::reset_copy_finish_count_for_testing();
+        constexpr std::size_t kSerialCopies = 4;
+        for (std::size_t i = 0; i < kSerialCopies; ++i) {
+            const iom::oid token =
+                    queue->copy(source->view(), destination->view());
+            REQUIRE_NOTHROW(queue->wait(token));
+        }
+        CHECK_EQ(
+                iom::ttnn_test::copy_finish_count_for_testing(),
+                kSerialCopies);
+        iom_conformance::require_logical_bytes(
+                destination->view(), pattern, "serial copy content");
+        queue.reset();
+    }
+
+    // A no-wait burst: the worker's single native finish covers every task
+    // that was already executed when the batch was collected, so the whole
+    // ready batch completes under one finish and no token is finished more
+    // than once. The finish count is at most one per task, every token
+    // settles in submission order with correct content, and waits stay
+    // repeatable after the batched completion.
+    {
+        auto source = devices.candidate->create_tensor(spec);
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(spec, 52);
+        source->view().copy_from_host(pattern);
+        std::vector<std::unique_ptr<iom::Tensor>> destinations;
+        for (std::size_t i = 0; i < 8; ++i) {
+            destinations.push_back(
+                    devices.candidate->create_tensor(spec));
+        }
+        auto queue = devices.candidate->create_ops();
+        iom::ttnn_test::reset_copy_finish_count_for_testing();
+        std::vector<iom::oid> tokens;
+        for (const auto& destination : destinations) {
+            tokens.push_back(
+                    queue->copy(source->view(), destination->view()));
+        }
+        for (const iom::oid token : tokens) {
+            REQUIRE_NOTHROW(queue->wait(token));
+        }
+        const std::uint64_t finishes =
+                iom::ttnn_test::copy_finish_count_for_testing();
+        CHECK_GT(finishes, 0);
+        CHECK_LE(finishes, tokens.size());
+        for (const auto& destination : destinations) {
+            iom_conformance::require_logical_bytes(
+                    destination->view(), pattern, "burst copy content");
+        }
+        REQUIRE_NOTHROW(queue->wait(tokens.front()));
+        queue.reset();
+    }
+}
+
+TEST_CASE("TTNN one failed batch finish fails every token of that batch") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
+    auto source = devices.candidate->create_tensor(spec);
+    std::vector<std::unique_ptr<iom::Tensor>> destinations;
+    for (std::size_t i = 0; i < 4; ++i) {
+        destinations.push_back(devices.candidate->create_tensor(spec));
+    }
+    auto queue = devices.candidate->create_ops();
+
+    // Arm exactly one native-finish failure for the burst. The first batch
+    // the worker collects always contains the first token, so it consumes
+    // the seam: every token of that batch fails as a unit, every later
+    // batch succeeds, and the failed tokens form a prefix of the
+    // submission order.
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(1);
+    std::vector<iom::oid> tokens;
+    for (const auto& destination : destinations) {
+        tokens.push_back(queue->copy(source->view(), destination->view()));
+    }
+
+    iom::oid first_failed_token = 0;
+    bool failures_ended = false;
+    bool saw_failure = false;
+    for (const iom::oid token : tokens) {
+        bool failed = false;
+        try {
+            queue->wait(token);
+        } catch (const std::runtime_error& error) {
+            failed = true;
+            CHECK(std::string_view(error.what())
+                          .find("copy finish failure")
+                  != std::string_view::npos);
+        }
+        if (failed) {
+            CHECK_FALSE(failures_ended);
+            saw_failure = true;
+            if (first_failed_token == 0) {
+                first_failed_token = token;
+            }
+        } else {
+            failures_ended = true;
+        }
+    }
+    CHECK(saw_failure);
+    REQUIRE_NE(first_failed_token, 0);
+    CHECK_FALSE(iom::ttnn_test::copy_finish_fault_pending_for_testing());
+
+    // The failed token's wait stays repeatable with the identical message.
+    std::string first_message;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool caught = false;
+        try {
+            queue->wait(first_failed_token);
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            CHECK(std::string_view(error.what())
+                          .find("copy finish failure")
+                  != std::string_view::npos);
+            const std::string message = error.what();
+            if (first_message.empty()) {
+                first_message = message;
+            } else {
+                CHECK_EQ(std::string_view(message), first_message);
+            }
+        }
+        CHECK(caught);
+    }
+
+    // The batch failure kept the ownership guarantees: destroying and
+    // reusing the owners never frees planes ahead of the pending mesh
+    // work, and the same device stays fully usable.
+    queue.reset();
+    source.reset();
+    destinations.clear();
+    require_healthy_copy_after_failure(
+            *devices.candidate, spec, 61,
+            "copy after failed batch finish");
+}

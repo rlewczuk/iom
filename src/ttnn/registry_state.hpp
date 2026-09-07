@@ -33,6 +33,12 @@ namespace iom::ttnn_test {
     // the completion retry). Every other mesh finish is unaffected.
     void fail_next_copy_finishes_for_testing(std::size_t count) noexcept;
     bool copy_finish_fault_pending_for_testing() noexcept;
+
+    // Counts mesh-finish attempts routed through the copy-drain path (the
+    // same attempts the failure seam above can fault). Batch-completion
+    // tests assert one native finish per ready batch through this counter.
+    void reset_copy_finish_count_for_testing() noexcept;
+    std::uint64_t copy_finish_count_for_testing() noexcept;
 }
 namespace iom::ttnn_detail {
 
