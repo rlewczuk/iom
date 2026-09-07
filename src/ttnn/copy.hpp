@@ -16,24 +16,28 @@ namespace tt::tt_metal::distributed {
 
 namespace iom::ttnn_detail {
 
+    class TtnnHostStaging;
+
     // Every function below requires the caller to hold the owning device's
     // API mutex; TTNN runtime calls are serialized through it.
 
     // Uploads the view's logical region from the row-major host encoding.
     // planes is the owner tensor's native handle: one TTNN-native tiled
-    // tensor per logical owner plane. Synchronous at return.
+    // tensor per logical owner plane. staging is the device's retained
+    // host-transfer staging facility; per-plane buffers are held until the
+    // region's queue finish. Synchronous at return.
     void region_from_host(
             tt::tt_metal::distributed::MeshDevice& device,
-            const TensorView& destination, ttnn::Tensor* planes,
-            std::span<const std::byte> source);
+            TtnnHostStaging& staging, const TensorView& destination,
+            ttnn::Tensor* planes, std::span<const std::byte> source);
 
     // Downloads the view's logical region into the row-major host encoding.
     // destination is pre-zeroed so unused tail bits read as zero. No padding
     // reaches the host buffer. Synchronous at return.
     void region_to_host(
             tt::tt_metal::distributed::MeshDevice& device,
-            const TensorView& source, const ttnn::Tensor* planes,
-            std::span<std::byte> destination);
+            TtnnHostStaging& staging, const TensorView& source,
+            const ttnn::Tensor* planes, std::span<std::byte> destination);
 
     // Copies logical values plane by plane in view-coordinate order, mapping
     // each view's plane offset and strides onto the owner planes. Values only;

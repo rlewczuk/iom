@@ -39,6 +39,26 @@ namespace iom::ttnn_test {
     // tests assert one native finish per ready batch through this counter.
     void reset_copy_finish_count_for_testing() noexcept;
     std::uint64_t copy_finish_count_for_testing() noexcept;
+    // Fails the next host-transfer (region_from_host or region_to_host)
+    // plane submission just before the chosen plane index reaches the mesh;
+    // planes below it have already been submitted. A fault at index zero
+    // fails before any submission. The fault fires exactly once at the
+    // armed index.
+    void fail_next_host_transfer_submission_for_testing(
+            std::size_t plane_index) noexcept;
+    bool host_transfer_submission_fault_consumed_for_testing() noexcept;
+
+    // Fails the next retained host-staging allocation (an upload or
+    // download slot creation or growth) with std::bad_alloc, leaving the
+    // slot untouched; the armed fault is consumed only when an allocation
+    // is actually attempted.
+    void fail_next_host_transfer_staging_allocation_for_testing() noexcept;
+    bool host_transfer_staging_allocation_fault_consumed_for_testing() noexcept;
+
+    // Number of fresh retained host-staging allocations made so far (slot
+    // creations and growths, including replacements after a discarded
+    // slot).
+    std::size_t host_transfer_staging_allocation_count_for_testing() noexcept;
 }
 namespace iom::ttnn_detail {
 

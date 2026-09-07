@@ -123,6 +123,7 @@ if(TTNN_ENABLED)
         src/ttnn/copy.cpp
         src/ttnn/copy.hpp
         src/ttnn/registry_state.hpp
+        src/ttnn/staging.hpp
         include/iom/ttnn/device.hpp
     )
 

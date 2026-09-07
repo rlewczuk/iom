@@ -619,6 +619,160 @@ TEST_CASE("TTNN conformance: transfer failures keep metadata and ownership") {
             devices.conformance(), iom::ttnn_supported_data_types());
 }
 
+// The retained host-transfer staging facility allocates one byte slot per
+// native upload dtype per plane plus one byte buffer per download. A
+// six-plane region therefore warms exactly seven retained buffers; every
+// later same-or-smaller transfer reuses them, and a larger shape grows
+// every retained buffer once and then reuses it.
+TEST_CASE("TTNN host transfers reuse retained staging after warm-up") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 17, 33}}, iom::DataType::BF16};
+    auto tensor = devices.candidate->create_tensor(spec);
+
+    // Warm-up: the first upload allocates the six BF16 plane slots and the
+    // first download the byte staging buffer exactly once.
+    const std::vector<std::byte> seed =
+            iom_conformance::encode_logical(spec, 0x51);
+    tensor->view().copy_from_host(seed);
+    iom_conformance::require_logical_bytes(
+            tensor->view(), seed, "warm-up readback");
+    const std::size_t warmup_allocations =
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing();
+
+    // Repeated same-or-smaller transfers allocate no fresh host staging.
+    for (std::uint64_t salt = 0x60; salt < 0x64; ++salt) {
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(spec, salt);
+        tensor->view().copy_from_host(pattern);
+        iom_conformance::require_logical_bytes(
+                tensor->view(), pattern, "reused staging round trip");
+        CHECK_EQ(
+                iom::ttnn_test::
+                        host_transfer_staging_allocation_count_for_testing(),
+                warmup_allocations);
+    }
+
+    // A larger padded shape grows every retained buffer once (six upload
+    // slots plus the download buffer), then reuses it.
+    const iom::TensorSpec larger{
+            iom::TensorShape{{2, 3, 65, 33}}, iom::DataType::BF16};
+    auto big = devices.candidate->create_tensor(larger);
+    const std::vector<std::byte> large_seed =
+            iom_conformance::encode_logical(larger, 0x71);
+    big->view().copy_from_host(large_seed);
+    iom_conformance::require_logical_bytes(
+            big->view(), large_seed, "grown readback");
+    CHECK_EQ(
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing(),
+            warmup_allocations + 7);
+    for (std::uint64_t salt = 0x72; salt < 0x75; ++salt) {
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(larger, salt);
+        big->view().copy_from_host(pattern);
+        iom_conformance::require_logical_bytes(
+                big->view(), pattern, "grown staging round trip");
+        CHECK_EQ(
+                iom::ttnn_test::
+                        host_transfer_staging_allocation_count_for_testing(),
+                warmup_allocations + 7);
+    }
+}
+
+// A failed host transfer discards the staging it held, never reuses it, and
+// leaves the facility able to serve the next transfer from fresh, clean
+// storage; the download failure additionally preserves the drain ordering.
+TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 17, 33}}, iom::DataType::U8};
+    auto tensor = devices.candidate->create_tensor(spec);
+
+    // Warm the facility so the faults below hit submitted staging, not an
+    // allocation.
+    const std::vector<std::byte> seed =
+            iom_conformance::encode_logical(spec, 0x81);
+    tensor->view().copy_from_host(seed);
+    iom_conformance::require_logical_bytes(
+            tensor->view(), seed, "warm-up");
+
+    // An upload submission fault at plane 1: plane 0 reached the mesh, the
+    // faulted plane's staged bytes are partial, and every outstanding lease
+    // of the failed region is discarded. The next upload re-allocates the
+    // six slots from scratch and serves clean bytes identical to the model.
+    iom::ttnn_test::fail_next_host_transfer_submission_for_testing(1);
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(spec, 0x82);
+    REQUIRE_THROWS_AS(
+            tensor->view().copy_from_host(pattern), std::runtime_error);
+    CHECK(iom::ttnn_test::
+                  host_transfer_submission_fault_consumed_for_testing());
+    const std::size_t after_upload_failure =
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing();
+
+    const std::vector<std::byte> pattern_2 =
+            iom_conformance::encode_logical(spec, 0x83);
+    tensor->view().copy_from_host(pattern_2);
+    iom_conformance::require_logical_bytes(
+            tensor->view(), pattern_2, "clean upload after failure");
+    CHECK_EQ(
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing(),
+            after_upload_failure + 6);
+
+    // A download submission fault at plane 1: plane 0 was enqueued, the
+    // failure drain finishes it, and the byte staging buffer is discarded
+    // instead of being reused; the next download allocates fresh storage
+    // and returns the exact logical bytes.
+    iom::ttnn_test::fail_next_host_transfer_submission_for_testing(1);
+    std::vector<std::byte> readback(
+            spec.logical_nbytes(), iom_conformance::kReadbackSentinel);
+    REQUIRE_THROWS_AS(
+            tensor->view().copy_to_host(readback), std::runtime_error);
+    CHECK(iom::ttnn_test::
+                  host_transfer_submission_fault_consumed_for_testing());
+    const std::size_t after_download_failure =
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing();
+    iom_conformance::require_logical_bytes(
+            tensor->view(), pattern_2, "clean download after failure");
+    CHECK_EQ(
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing(),
+            after_download_failure + 1);
+
+    // A staging-allocation failure leaves the retained slot untouched and
+    // the facility able to serve the next (larger) transfer.
+    const iom::TensorSpec larger{
+            iom::TensorShape{{2, 3, 65, 33}}, iom::DataType::U8};
+    auto big = devices.candidate->create_tensor(larger);
+    const std::vector<std::byte> large_seed =
+            iom_conformance::encode_logical(larger, 0x84);
+    iom::ttnn_test::
+            fail_next_host_transfer_staging_allocation_for_testing();
+    REQUIRE_THROWS_AS(
+            big->view().copy_from_host(large_seed), std::bad_alloc);
+    CHECK(
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_fault_consumed_for_testing());
+    const std::size_t after_allocation_failure =
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing();
+
+    big->view().copy_from_host(large_seed);
+    iom_conformance::require_logical_bytes(
+            big->view(), large_seed, "clean growth after allocation failure");
+    CHECK_EQ(
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing(),
+            after_allocation_failure + 7);
+}
+
 TEST_CASE("TTNN conformance: deferred queue lifetime and stability") {
     require_hardware();
     TtnnDevices devices;

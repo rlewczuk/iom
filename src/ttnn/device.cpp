@@ -26,6 +26,7 @@
 
 #include "copy.hpp"
 #include "registry_state.hpp"
+#include "staging.hpp"
 #include "iom/iom.hpp"
 
 namespace iom {
@@ -264,6 +265,11 @@ namespace iom {
                 return api_mutex_;
             }
 
+            [[nodiscard]] ttnn_detail::TtnnHostStaging& host_staging()
+                    noexcept {
+                return host_staging_;
+            }
+
             [[nodiscard]] detail::RegistryState&
                     registry_state() noexcept {
                 return registry_state_;
@@ -271,6 +277,10 @@ namespace iom {
 
         private:
             std::uint32_t ordinal_;
+            // Declared before the native device so it is destroyed after
+            // the mesh teardown: retired staging may still be referenced by
+            // an undrainable asynchronous reader until the mesh is gone.
+            ttnn_detail::TtnnHostStaging host_staging_;
             std::shared_ptr<ttnn::MeshDevice> native_device_;
             std::mutex api_mutex_;
             detail::RegistryState registry_state_;
@@ -361,7 +371,8 @@ namespace iom {
                     std::span<const std::byte> source) override {
                 std::lock_guard<std::mutex> lock(device_.api_mutex());
                 ttnn_detail::region_from_host(
-                        device_.mesh(), destination, planes_->data(), source);
+                        device_.mesh(), device_.host_staging(), destination,
+                        planes_->data(), source);
             }
 
             void region_to_host(
@@ -369,7 +380,8 @@ namespace iom {
                     std::span<std::byte> destination) const override {
                 std::lock_guard<std::mutex> lock(device_.api_mutex());
                 ttnn_detail::region_to_host(
-                        device_.mesh(), source, planes_->data(), destination);
+                        device_.mesh(), device_.host_staging(), source,
+                        planes_->data(), destination);
             }
 
             TtnnDevice& device_;

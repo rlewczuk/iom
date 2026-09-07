@@ -1,11 +1,14 @@
 #include "copy.hpp"
 #include "registry_state.hpp"
+#include "staging.hpp"
 
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/experimental/tensor/tensor_apis.hpp>
 #include <tt-metalium/host_buffer.hpp>
+#include <tt-metalium/memory_pin.hpp>
 #include <tt-metalium/tile.hpp>
+#include <tt_stl/span.hpp>
 #include <ttnn/operations/data_movement/copy/copy.hpp>
 #include <ttnn/tensor/tensor_ops.hpp>
 
@@ -44,6 +47,30 @@ namespace {
                     true, std::memory_order_release);
             throw std::runtime_error(
                     "injected TTNN copy-plane submission failure");
+        }
+    }
+
+    // Test seam for host-transfer submission-failure injection: the next
+    // plane submission of a region_from_host or region_to_host call throws
+    // just before the chosen plane index reaches the mesh. Planes below it
+    // have already been submitted (and, for downloads, enqueued). The fault
+    // fires exactly once at the armed index; host transfers run under the
+    // device API mutex, so arming and consumption never race.
+    std::atomic<bool> g_host_transfer_fault_armed{false};
+    std::atomic<std::size_t> g_host_transfer_fault_at{0};
+    std::atomic<bool> g_host_transfer_fault_consumed{false};
+
+    void fail_host_transfer_submission_at(std::size_t index) noexcept(false) {
+        if (g_host_transfer_fault_armed.load(std::memory_order_acquire)
+                && index
+                        == g_host_transfer_fault_at.load(
+                                std::memory_order_acquire)) {
+            g_host_transfer_fault_armed.store(
+                    false, std::memory_order_release);
+            g_host_transfer_fault_consumed.store(
+                    true, std::memory_order_release);
+            throw std::runtime_error(
+                    "injected TTNN host-transfer submission failure");
         }
     }
 #endif
@@ -95,56 +122,110 @@ namespace iom::ttnn_detail {
             return bits / 8;
         }
 
-        // TTNN's host layout conversion views the buffer through the dtype's
-        // C++ element type, so the raw bytes must arrive in a correctly
-        // typed vector. This is a reinterpretation, never a conversion.
-        template <typename T>
-        tt::tt_metal::HostBuffer typed_buffer(std::vector<std::byte>& bytes) {
-            std::vector<T> typed(bytes.size() / sizeof(T));
-            std::memcpy(typed.data(), bytes.data(), bytes.size());
-            return tt::tt_metal::HostBuffer(std::move(typed));
+        // Maps a supported native dtype to its retained upload staging slot
+        // list in TtnnHostStaging, mirroring the upload_typed dispatch below.
+        std::size_t upload_slot_index(tt::tt_metal::DataType type) {
+            switch (type) {
+                case tt::tt_metal::DataType::BFLOAT16: return 0;
+                case tt::tt_metal::DataType::FLOAT32: return 1;
+                case tt::tt_metal::DataType::UINT32: return 2;
+                case tt::tt_metal::DataType::INT32: return 3;
+                case tt::tt_metal::DataType::UINT16: return 4;
+                case tt::tt_metal::DataType::UINT8: return 5;
+                default:
+                    throw std::logic_error(
+                            "TTNN native dtype has no upload staging slot");
+            }
+        }
+
+        // Physical tile-major element index of the padded coordinate (row,
+        // column): tiles row-major over the padded grid, every 32x32 tile as
+        // four row-major 16x16 faces.
+        std::size_t padded_cell_index(
+                std::size_t row, std::size_t column,
+                std::size_t num_tile_cols) {
+            const std::size_t tile_index =
+                    (row / 32) * num_tile_cols + (column / 32);
+            const std::size_t face_index =
+                    ((row % 32) / 16) * 2 + ((column % 32) / 16);
+            return tile_index * 1024 + face_index * 256
+                    + (row % 16) * 16 + (column % 16);
         }
 
         // Uploads one plane's logical row-major bytes into the plane's
-        // TTNN-native tiled tensor, zero-filling native padding.
+        // TTNN-native tiled tensor, zero-filling native padding. The buffer
+        // is the caller-held retained staging slot: only the padding cells
+        // the logical fill will not write are zero-initialized, and the
+        // borrowed typed host tensor always reads the slot in place.
         void upload_plane(
-                ttnn::Tensor& plane, const std::byte* source,
-                std::size_t rows, std::size_t columns,
-                std::size_t element_size) {
+                ttnn::Tensor& plane,
+                TtnnHostStaging::UploadLease& lease,
+                const std::byte* source, std::size_t rows,
+                std::size_t columns, std::size_t element_size,
+                std::size_t plane_index) {
             const std::size_t padded_rows =
                     static_cast<std::size_t>(plane.padded_shape()[-2]);
             const std::size_t padded_columns =
                     static_cast<std::size_t>(plane.padded_shape()[-1]);
             const std::size_t num_tile_cols = padded_columns / 32;
             const std::size_t padded_elements = padded_rows * padded_columns;
+            std::byte* buffer = lease.data();
+
+            // Initialize only the required padding: the padded cells the
+            // logical fill below will not write. All logical cells are
+            // overwritten element-for-element, so padding is the retained
+            // buffer's only obligation to zero.
+            for (std::size_t row = rows; row < padded_rows; ++row) {
+                for (std::size_t column = 0; column < padded_columns;
+                     ++column) {
+                    std::memset(
+                            buffer
+                                    + padded_cell_index(
+                                              row, column, num_tile_cols)
+                                            * element_size,
+                            0, element_size);
+                }
+            }
+            for (std::size_t row = 0; row < rows; ++row) {
+                for (std::size_t column = columns; column < padded_columns;
+                     ++column) {
+                    std::memset(
+                            buffer
+                                    + padded_cell_index(
+                                              row, column, num_tile_cols)
+                                            * element_size,
+                            0, element_size);
+                }
+            }
+
+            for (std::size_t row = 0; row < rows; ++row) {
+                std::size_t col = 0;
+                while (col < columns) {
+                    const std::size_t seg_columns = std::min<std::size_t>(
+                            16 - (col % 16), columns - col);
+                    const std::size_t first_element_index =
+                            padded_cell_index(row, col, num_tile_cols);
+                    std::memcpy(
+                            buffer + first_element_index * element_size,
+                            source + (row * columns + col) * element_size,
+                            seg_columns * element_size);
+                    col += seg_columns;
+                }
+            }
 
             auto upload_typed = [&]<typename T>() {
-                std::vector<T> typed(padded_elements, T{0});
-                for (std::size_t row = 0; row < rows; ++row) {
-                    std::size_t col = 0;
-                    while (col < columns) {
-                        const std::size_t seg_columns = std::min<std::size_t>(
-                                16 - (col % 16), columns - col);
-                        const std::size_t tile_index =
-                                (row / 32) * num_tile_cols + (col / 32);
-                        const std::size_t face_index =
-                                ((row % 32) / 16) * 2 + ((col % 32) / 16);
-                        const std::size_t first_element_index =
-                                tile_index * 1024 + face_index * 256
-                                + (row % 16) * 16 + (col % 16);
-                        std::memcpy(
-                                reinterpret_cast<std::byte*>(typed.data())
-                                        + first_element_index * element_size,
-                                source + (row * columns + col) * element_size,
-                                seg_columns * element_size);
-                        col += seg_columns;
-                    }
-                }
-                tt::tt_metal::HostBuffer host_buffer(std::move(typed));
+                tt::tt_metal::HostBuffer host_buffer(
+                        ttsl::Span<T>(
+                                reinterpret_cast<T*>(buffer),
+                                padded_elements),
+                        tt::tt_metal::MemoryPin(lease.keepalive()));
                 ttnn::Tensor host_tiled(
                         std::move(host_buffer), plane.logical_shape(),
                         plane.padded_shape(), plane.dtype(),
                         tt::tt_metal::Layout::TILE);
+#ifdef IOM_ENABLE_TESTING
+                fail_host_transfer_submission_at(plane_index);
+#endif
                 ttnn::copy_to_device(host_tiled, plane);
             };
 
@@ -177,7 +258,11 @@ namespace iom::ttnn_detail {
         // staging window without waiting for the device read to complete.
         void submit_download_plane(
                 tt::tt_metal::distributed::MeshCommandQueue& queue,
-                const ttnn::Tensor& plane, std::byte* staging) {
+                const ttnn::Tensor& plane, std::byte* staging,
+                std::size_t plane_index) {
+#ifdef IOM_ENABLE_TESTING
+            fail_host_transfer_submission_at(plane_index);
+#endif
             ttnn::copy_to_host(
                     queue, plane, staging, std::nullopt, /*blocking=*/false);
         }
@@ -193,13 +278,8 @@ namespace iom::ttnn_detail {
                 while (col < columns) {
                     const std::size_t seg_columns = std::min<std::size_t>(
                             16 - (col % 16), columns - col);
-                    const std::size_t tile_index =
-                            (row / 32) * num_tile_cols + (col / 32);
-                    const std::size_t face_index =
-                            ((row % 32) / 16) * 2 + ((col % 32) / 16);
                     const std::size_t first_element_index =
-                            tile_index * 1024 + face_index * 256
-                            + (row % 16) * 16 + (col % 16);
+                            padded_cell_index(row, col, num_tile_cols);
                     std::memcpy(
                             destination + (row * columns + col) * element_size,
                             staging + first_element_index * element_size,
@@ -223,27 +303,51 @@ namespace iom::ttnn_detail {
 
     void region_from_host(
             tt::tt_metal::distributed::MeshDevice& device,
-            const TensorView& destination, ttnn::Tensor* planes,
-            std::span<const std::byte> source) {
+            TtnnHostStaging& staging, const TensorView& destination,
+            ttnn::Tensor* planes, std::span<const std::byte> source) {
         const std::size_t rows = view_rows(destination);
         const std::size_t columns = view_columns(destination);
         const std::size_t element_size =
                 element_bytes(destination.spec().data_type);
         const std::size_t plane_bytes = rows * columns * element_size;
         const std::size_t count = view_plane_count(destination);
+
+        // Retained per-plane staging is acquired before the first plane
+        // reaches the mesh and returned only after the region finish below:
+        // every leased buffer stays owned until the queue consumed it. On
+        // failure the outstanding leases unwind and poison their slots, so
+        // a failed transfer never reuses partially written staging.
+        std::vector<TtnnHostStaging::UploadLease> leases;
+        leases.reserve(count);
+        if (count != 0) {
+            const ttnn::Tensor& first_plane =
+                    planes[owner_plane_at(destination, 0)];
+            const std::size_t padded_rows = static_cast<std::size_t>(
+                    first_plane.padded_shape()[-2]);
+            const std::size_t padded_columns = static_cast<std::size_t>(
+                    first_plane.padded_shape()[-1]);
+            const std::size_t slot = upload_slot_index(first_plane.dtype());
+            for (std::size_t index = 0; index < count; ++index) {
+                leases.emplace_back(staging.acquire_upload(
+                        slot, padded_rows * padded_columns * element_size));
+            }
+        }
         for (std::size_t index = 0; index < count; ++index) {
             upload_plane(
-                    planes[owner_plane_at(destination, index)],
+                    planes[owner_plane_at(destination, index)], leases[index],
                     source.data() + index * plane_bytes, rows, columns,
-                    element_size);
+                    element_size, index);
         }
         device.mesh_command_queue(0).finish();
+        for (TtnnHostStaging::UploadLease& lease : leases) {
+            lease.release();
+        }
     }
 
     void region_to_host(
             tt::tt_metal::distributed::MeshDevice& device,
-            const TensorView& source, const ttnn::Tensor* planes,
-            std::span<std::byte> destination) {
+            TtnnHostStaging& staging, const TensorView& source,
+            const ttnn::Tensor* planes, std::span<std::byte> destination) {
         const std::size_t rows = view_rows(source);
         const std::size_t columns = view_columns(source);
         const std::size_t element_size =
@@ -279,35 +383,49 @@ namespace iom::ttnn_detail {
             throw std::overflow_error(
                     "TTNN download staging byte count overflows");
         }
+        // The retained byte staging buffer covers every padded plane of the
+        // region and is returned only after the single finish below.
         const std::size_t total_bytes = count * padded_plane_bytes;
-        std::unique_ptr<std::byte[]> staging =
-                std::make_unique_for_overwrite<std::byte[]>(total_bytes);
+        TtnnHostStaging::DownloadLease lease =
+                staging.acquire_download(total_bytes);
         auto& queue = device.mesh_command_queue(0);
         std::exception_ptr original_failure;
         try {
             for (std::size_t index = 0; index < count; ++index) {
                 submit_download_plane(
                         queue, planes[owner_plane_at(source, index)],
-                        staging.get() + index * padded_plane_bytes);
+                        lease.data() + index * padded_plane_bytes, index);
             }
             queue.finish();
 
             const std::size_t num_tile_cols = padded_columns / 32;
             for (std::size_t index = 0; index < count; ++index) {
                 assemble_download_plane(
-                        staging.get() + index * padded_plane_bytes,
+                        lease.data() + index * padded_plane_bytes,
                         destination.data() + index * plane_bytes, rows,
                         columns, element_size, num_tile_cols);
             }
+            lease.release();
         } catch (...) {
             if (!original_failure) {
                 original_failure = std::current_exception();
             }
+            bool drained = false;
             try {
                 queue.finish();
+                drained = true;
             } catch (...) {
-                std::byte* leaked = staging.release();
-                (void)leaked;
+            }
+            if (drained) {
+                // Every submitted plane reached the host staging; the
+                // faulted plane may hold partial bytes, so discard the
+                // storage instead of handing it out again.
+                lease.discard();
+            } else {
+                // The mesh cannot be drained: an asynchronous reader may
+                // still touch the staging, so it is retired — never reused
+                // and freed only when the device is torn down.
+                lease.retire();
             }
             std::rethrow_exception(original_failure);
         }
@@ -345,6 +463,36 @@ namespace iom::ttnn_test {
 
     bool copy_planes_submission_fault_consumed_for_testing() noexcept {
         return g_copy_planes_fault_consumed.load(std::memory_order_acquire);
+    }
+
+    void fail_next_host_transfer_submission_for_testing(
+            std::size_t plane_index) noexcept {
+        g_host_transfer_fault_at.store(plane_index, std::memory_order_release);
+        g_host_transfer_fault_consumed.store(
+                false, std::memory_order_release);
+        g_host_transfer_fault_armed.store(true, std::memory_order_release);
+    }
+
+    bool host_transfer_submission_fault_consumed_for_testing() noexcept {
+        return g_host_transfer_fault_consumed.load(
+                std::memory_order_acquire);
+    }
+
+    void fail_next_host_transfer_staging_allocation_for_testing() noexcept {
+        iom::ttnn_detail::g_fail_next_host_staging_allocation.store(
+                true, std::memory_order_release);
+        iom::ttnn_detail::g_host_staging_allocation_fault_consumed.store(
+                false, std::memory_order_release);
+    }
+
+    bool host_transfer_staging_allocation_fault_consumed_for_testing() noexcept {
+        return iom::ttnn_detail::g_host_staging_allocation_fault_consumed.load(
+                std::memory_order_acquire);
+    }
+
+    std::size_t host_transfer_staging_allocation_count_for_testing() noexcept {
+        return iom::ttnn_detail::g_host_staging_allocations.load(
+                std::memory_order_acquire);
     }
 
 }  // namespace iom::ttnn_test
