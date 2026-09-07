@@ -1087,6 +1087,42 @@ TEST_CASE("TTNN native finish failure reports a repeatable failed token") {
             "copy after native finish failure");
 }
 
+TEST_CASE("TTNN identical-window copies complete without native finish") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::BF16};
+    auto source = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+
+    iom::ttnn_test::reset_copy_finish_count_for_testing();
+    const iom::oid token = queue->copy(source->view(), source->view());
+    REQUIRE_NOTHROW(queue->wait(token));
+    REQUIRE_NOTHROW(queue->wait(token));
+    CHECK_EQ(iom::ttnn_test::copy_finish_count_for_testing(), 0);
+}
+
+TEST_CASE("TTNN mixed no-op and native batches finish native work once") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::BF16};
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+
+    iom::ttnn_test::reset_copy_finish_count_for_testing();
+    const iom::oid no_op = queue->copy(source->view(), source->view());
+    const iom::oid native =
+            queue->copy(source->view(), destination->view());
+    REQUIRE_NOTHROW(queue->wait(no_op));
+    REQUIRE_NOTHROW(queue->wait(native));
+    CHECK_EQ(iom::ttnn_test::copy_finish_count_for_testing(), 1);
+    REQUIRE_NOTHROW(queue->wait(no_op));
+    REQUIRE_NOTHROW(queue->wait(native));
+    CHECK_EQ(iom::ttnn_test::copy_finish_count_for_testing(), 1);
+}
+
 TEST_CASE("TTNN no-wait bursts share one native finish per ready batch") {
     require_hardware();
     TtnnDevices devices;

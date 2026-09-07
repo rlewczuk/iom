@@ -579,9 +579,9 @@ private:
         }
 
         if (task.no_op) {
-            // An identical-window copy submits no native work; the
-            // registered entries above already own the empty operation and
-            // complete_task's batch finish closes it out.
+            // An identical-window copy submits no native work. Its
+            // registered entries are released by complete_task without a
+            // device-wide finish.
             executed_seq_.store(task.sequence, std::memory_order_release);
             return;
         }
@@ -604,12 +604,16 @@ private:
             submission_failure = std::current_exception();
         }
         if (!submission_failure) {
-            // Success path: every plane is submitted and owned; the worker's
-            // complete_task performs one mesh finish per ready batch of
-            // contiguous executed tasks.
+            {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                outcomes_.at(task.sequence).native_work_submitted = true;
+            }
+            // Every plane is submitted and owned; complete_task performs one
+            // mesh finish per ready batch of contiguous executed tasks.
             executed_seq_.store(task.sequence, std::memory_order_release);
             return;
         }
+
 
         if (!any_submitted) {
             // The failure struck before the first plane reached the mesh:
@@ -627,6 +631,11 @@ private:
             }
             std::rethrow_exception(submission_failure);
         }
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            outcomes_.at(task.sequence).native_work_submitted = true;
+        }
+
 
         // One or more planes reached the mesh. Drain them synchronously
         // under the API mutex before ownership is removed, so a thrown call
@@ -699,17 +708,18 @@ private:
             return;
         }
 
-        // One native finish establishes the terminal result of every
-        // command the batch enqueued, exactly as the pre-batch code did
-        // per task. A retained failure means a plane submission (or the
-        // synchronous drain after it) already failed for that operation;
-        // the finish still runs: it either establishes the terminal result
-        // of every submitted native command, or it proves the queue cannot
-        // be drained, in which case the entries of every affected batch
-        // member stay invalidated and the quarantine protects the planes
-        // until a device-teardown finish succeeds. The caller observes the
-        // retained failure either way.
-        const detail::FenceResult fence_result = finish_native(*device_);
+        bool has_native_work = false;
+        for (const auto& member : batch) {
+            has_native_work =
+                    has_native_work
+                    || member.second.native_work_submitted;
+        }
+        // A no-op-only batch has no mesh work to drain. Native work in any
+        // member requires one finish for the whole contiguous batch.
+        const detail::FenceResult fence_result =
+                has_native_work
+                        ? finish_native(*device_)
+                        : detail::FenceResult::success();
         const bool fence_succeeded =
                 fence_result.succeeded && !fence_result.failure;
         for (std::size_t index = 0; index < batch.size(); ++index) {

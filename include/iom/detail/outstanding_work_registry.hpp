@@ -580,6 +580,7 @@ struct SequenceOutcome {
     EntryId source_entry_id = 0;
     EntryId destination_entry_id = 0;
     std::exception_ptr retained_failure;
+    bool native_work_submitted = false;
 };
 
 [[nodiscard]] inline bool release_or_invalidate_entries(
