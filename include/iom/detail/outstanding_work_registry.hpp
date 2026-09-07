@@ -202,6 +202,7 @@ public:
     virtual ~CleanupAction() noexcept = default;
 
     virtual void run() noexcept = 0;
+    [[nodiscard]] virtual bool completed() const noexcept { return true; }
     [[nodiscard]] virtual bool failed() const noexcept = 0;
     [[nodiscard]] virtual std::exception_ptr failure() const noexcept = 0;
 };
@@ -234,6 +235,10 @@ public:
         }
         address_ = nullptr;
     }
+ 
+    [[nodiscard]] bool completed() const noexcept override {
+        return attempted_;
+    }
 
     [[nodiscard]] bool failed() const noexcept override {
         return static_cast<bool>(failure_);
@@ -264,7 +269,13 @@ private:
 class Quarantine {
 public:
     Quarantine() = default;
-    ~Quarantine() noexcept { drain(); }
+    ~Quarantine() noexcept {
+        drain();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& action : actions_) {
+            (void)action.release();
+        }
+    }
 
     Quarantine(const Quarantine&) = delete;
     Quarantine& operator=(const Quarantine&) = delete;
@@ -290,19 +301,21 @@ public:
     }
 
     void drain() noexcept {
-        for (;;) {
-            std::vector<std::unique_ptr<CleanupAction>> actions;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                actions.swap(actions_);
-            }
-            if (actions.empty()) {
-                return;
-            }
-            for (auto it = actions.rbegin(); it != actions.rend(); ++it) {
-                (*it)->run();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t index = actions_.size(); index != 0; --index) {
+            actions_[index - 1]->run();
+        }
+
+        std::size_t retained = 0;
+        for (std::size_t index = 0; index < actions_.size(); ++index) {
+            if (!actions_[index]->completed()) {
+                if (retained != index) {
+                    actions_[retained] = std::move(actions_[index]);
+                }
+                ++retained;
             }
         }
+        actions_.resize(retained);
     }
 
 private:

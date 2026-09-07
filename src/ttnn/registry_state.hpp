@@ -70,18 +70,24 @@ public:
             : planes_(std::move(planes)), finish_(std::move(finish)) {}
 
     void run() noexcept override {
-        if (attempted_) {
+        if (completed_) {
             return;
         }
-        attempted_ = true;
         try {
             if (finish_) {
                 finish_();
             }
+            planes_.clear();
+            completed_ = true;
         } catch (...) {
-            failure_ = std::current_exception();
+            if (failure_ == nullptr) {
+                failure_ = std::current_exception();
+            }
         }
-        planes_.clear();
+    }
+
+    [[nodiscard]] bool completed() const noexcept override {
+        return completed_;
     }
 
     [[nodiscard]] bool failed() const noexcept override {
@@ -96,7 +102,7 @@ private:
     std::vector<ttnn::Tensor> planes_;
     std::function<void()> finish_;
     std::exception_ptr failure_;
-    bool attempted_ = false;
+    bool completed_ = false;
 };
 
 }  // namespace iom::ttnn_detail
