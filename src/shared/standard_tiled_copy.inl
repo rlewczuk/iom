@@ -686,6 +686,7 @@ void synchronous_transfer_impl(
                 Policy::after_copy_plane_launch(2);
             }
             Policy::synchronize_stream(stream);
+            stream_scope.mark_synchronized();
             if (!from_host) {
                 Policy::copy_to_host(
                         stream, destination.data(), staging,

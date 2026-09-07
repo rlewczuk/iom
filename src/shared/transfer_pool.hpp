@@ -13,10 +13,14 @@ struct TransferStreamPool final {
     class Scope final {
     public:
         Scope(TransferStreamPool& pool, typename Policy::stream_type stream)
-                : pool_(&pool), stream_(stream), poisoned_(false) {}
+                : pool_(&pool), stream_(stream), poisoned_(false),
+                  synchronized_(false) {}
         ~Scope() noexcept {
-            const bool synchronized =
-                    Policy::synchronize_stream_noexcept(stream_);
+            // Synchronize unless the owner already performed one successful
+            // explicit synchronization, so a stream never reaches reuse or
+            // destruction with pending work.
+            const bool synchronized = synchronized_
+                    || Policy::synchronize_stream_noexcept(stream_);
             const bool drop_stream = poisoned_ || !synchronized;
             if (drop_stream) {
                 std::lock_guard<std::mutex> lock(pool_->mutex_);
@@ -40,11 +44,15 @@ struct TransferStreamPool final {
             return stream_;
         }
         void poison() noexcept { poisoned_ = true; }
+        // Records that the stream was already explicitly synchronized
+        // successfully, so the destructor must not wait on it again.
+        void mark_synchronized() noexcept { synchronized_ = true; }
 
     private:
         TransferStreamPool* pool_;
         typename Policy::stream_type stream_;
         bool poisoned_;
+        bool synchronized_;
     };
 
     [[nodiscard]] Scope acquire() {
