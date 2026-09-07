@@ -189,7 +189,9 @@ namespace iom {
 
         std::unique_ptr<Tensor> RocmDevice::create_tensor(
                 const TensorSpec& spec) {
-            activate();
+            // The base Tensor ctor validates the spec before any device
+            // interaction; allocation-time activation is owned by the
+            // RocmTensor ctor's pre_allocate callback.
             return std::make_unique<RocmTensor>(spec, *this, allocator_);
         }
 

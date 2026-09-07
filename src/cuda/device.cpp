@@ -211,7 +211,9 @@ namespace iom {
 
     std::unique_ptr<Tensor> CudaDevice::create_tensor(
             const TensorSpec& spec) {
-        activate();
+        // The base Tensor ctor validates the spec before any device
+        // interaction; allocation-time activation is owned by the
+        // CudaTensor ctor's pre_allocate callback.
         return std::make_unique<CudaTensor>(spec, *this, allocator_);
     }
 

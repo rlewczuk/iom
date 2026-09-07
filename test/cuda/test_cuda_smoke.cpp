@@ -791,3 +791,76 @@ TEST_CASE("CUDA event ring fences are pending until own completion") {
     CHECK_FALSE(resettled->invoke_result().succeeded);
     resettled.reset();
 }
+
+TEST_CASE("CUDA create_tensor validates the spec before any context activation") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+
+    int device_count = 0;
+    REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
+    REQUIRE(device_count > 0);
+
+    DriverCallsRestore restore;
+    DriverCallProbe probe;
+    active_probe = &probe;
+    auto calls = iom::cuda_detail::driver_calls;
+    calls.primary_ctx_retain = &counting_primary_ctx_retain;
+    calls.ctx_set_current = &pass_through_ctx_set_current;
+    calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
+    iom::cuda_detail::driver_calls = calls;
+
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    REQUIRE(device != nullptr);
+    const std::size_t activation_count = probe.ctx_set_current_count;
+
+    // Rank and dimension violations are rejected by TensorShape before
+    // create_tensor is reached, with no driver interaction and no
+    // allocator allocation.
+    try {
+        (void)iom::TensorSpec{
+                iom::TensorShape{{16}}, iom::DataType::F32};
+        FAIL("TensorSpec accepted a rank-one shape");
+    } catch (const std::invalid_argument&) {
+    }
+    try {
+        (void)iom::TensorSpec{
+                iom::TensorShape{{16, 0}}, iom::DataType::F32};
+        FAIL("TensorSpec accepted a zero dimension");
+    } catch (const std::invalid_argument&) {
+    }
+    CHECK(probe.ctx_set_current_count == activation_count);
+    CHECK(allocator.allocations == 0);
+
+    // Grouped quantization is rejected by the base Tensor ctor's spec
+    // validation with the same error the ctor produces today, while the
+    // driver-call probe records zero context-set calls and the allocator
+    // never runs.
+    const iom::TensorSpec invalid_spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32,
+            iom::QuantizationFormat::INT8_SYMMETRIC};
+    try {
+        (void)device->create_tensor(invalid_spec);
+        FAIL("create_tensor accepted a grouped-quantization spec");
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string_view(error.what()).starts_with(
+                "grouped quantization formats are not supported"));
+    } catch (...) {
+        FAIL("create_tensor threw an unexpected exception type");
+    }
+    CHECK(probe.ctx_set_current_count == activation_count);
+    CHECK(allocator.allocations == 0);
+
+    // A valid spec activates the runtime exactly once, at allocation time,
+    // through the CudaTensor ctor's pre_allocate callback; the allocator's
+    // nullptr return then surfaces as bad_alloc before any storage exists.
+    const iom::TensorSpec valid_spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    CHECK_THROWS_AS(
+            (void)device->create_tensor(valid_spec), std::bad_alloc);
+    CHECK(probe.ctx_set_current_count == activation_count + 1);
+    CHECK(allocator.allocations == 1);
+    CHECK(allocator.frees == 0);
+}

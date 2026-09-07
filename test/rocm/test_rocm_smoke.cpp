@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <new>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -382,4 +383,41 @@ TEST_CASE("ROCm event ring fences are pending until own completion") {
     CHECK_EQ(state->slot_index(*resettled), first_index);
     CHECK_FALSE(resettled->invoke_result().succeeded);
     resettled.reset();
+}
+
+TEST_CASE("ROCm rejected create_tensor leaves the current device unchanged") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+
+    UnusedAllocator allocator;
+    auto device = iom::make_rocm_device(0, allocator);
+    REQUIRE(device != nullptr);
+
+    // Move the calling thread onto another device so a stray hipSetDevice
+    // inside create_tensor (the pre-fix entry-point activation) would be
+    // observable as a mutation of the thread's current device.
+    const int other_device = device_count > 1 ? 1 : 0;
+    REQUIRE(hipSetDevice(other_device) == hipSuccess);
+    int current_before = -1;
+    REQUIRE(hipGetDevice(&current_before) == hipSuccess);
+    CHECK(current_before == other_device);
+
+    const iom::TensorSpec invalid_spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32,
+            iom::QuantizationFormat::INT8_SYMMETRIC};
+    try {
+        (void)device->create_tensor(invalid_spec);
+        FAIL("create_tensor accepted a grouped-quantization spec");
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string_view(error.what()).starts_with(
+                "grouped quantization formats are not supported"));
+    } catch (...) {
+        FAIL("create_tensor threw an unexpected exception type");
+    }
+
+    int current_after = -1;
+    REQUIRE(hipGetDevice(&current_after) == hipSuccess);
+    CHECK(current_after == current_before);
+    CHECK(allocator.allocations == 0);
 }
