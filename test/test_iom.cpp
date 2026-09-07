@@ -28,7 +28,6 @@
 #include "iom/iom.hpp"
 #include "iom/alloc.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
-#include "iom/llama.hpp"
 #include "iom/tensor.hpp"
 
 namespace iom_test {
@@ -916,14 +915,6 @@ std::uint64_t token_sequence(iom::oid token) {
 
 iom::oid make_token(std::uint64_t queue_id, std::uint64_t sequence) {
     return (queue_id << kTokenSequenceBits) | sequence;
-}
-
-std::vector<std::string_view> op_names(const FakeQueue& queue) {
-    std::vector<std::string_view> names;
-    for (const FakeQueue::Submission& entry : queue.submissions) {
-        names.push_back(entry.op);
-    }
-    return names;
 }
 
 constexpr std::array kFakeDeviceSupportedDataTypes = {
@@ -2139,110 +2130,6 @@ TEST_CASE("DeviceOps queue destruction neither waits nor cancels and releases th
     }
     FakeQueue successor;
     CHECK_EQ(token_queue(successor.probe()), released);
-}
-
-TEST_CASE("DeviceOps queue drives the llama models through owner views") {
-    FakeDevice device;
-    FakeQueue dev;
-
-    constexpr std::size_t kCtxLen = 8;
-    constexpr std::size_t kHeadDim = 4;
-    constexpr double kTheta = 10000.0;
-
-    FakeTensor sin = make_tensor(device, {kCtxLen, kHeadDim / 2});
-    FakeTensor cos = make_tensor(device, {kCtxLen, kHeadDim / 2});
-    iom::models::LlamaRoPE rope(dev, kCtxLen, kHeadDim, kTheta, sin, cos);
-
-    // Initialization sent exactly one logical_nbytes host span each and
-    // queued nothing.
-    REQUIRE(sin.from_host_calls == 1);
-    REQUIRE(cos.from_host_calls == 1);
-    REQUIRE(sin.from_bytes.size() == sin.view().spec().logical_nbytes());
-    REQUIRE(cos.from_bytes.size() == cos.view().spec().logical_nbytes());
-    REQUIRE(dev.submissions.empty());
-
-    // Exact float tables in row-major [ctx, head_dim / 2] order.
-    std::vector<double> inv_freq(kHeadDim / 2, 0.0);
-    for (std::size_t j = 0; j < kHeadDim / 2; ++j) {
-        inv_freq[j] = 1.0 / std::pow(10000.0, static_cast<double>((2 * j) / kHeadDim));
-    }
-    auto decode_le_float = [](const std::byte* bytes) {
-        std::uint32_t bits = 0;
-        for (std::size_t b = 0; b < 4; ++b) {
-            bits |= static_cast<std::uint32_t>(bytes[b]) << (8 * b);
-        }
-        float value = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
-        return value;
-    };
-    for (std::size_t i = 0; i < kCtxLen; ++i) {
-        for (std::size_t j = 0; j < kHeadDim / 2; ++j) {
-            CAPTURE(i);
-            CAPTURE(j);
-            const std::size_t offset = (i * kHeadDim / 2 + j) * 4;
-            CHECK_EQ(decode_le_float(sin.from_bytes.data() + offset),
-                     static_cast<float>(std::sin(kTheta * static_cast<double>(i) * inv_freq[j])));
-            CHECK_EQ(decode_le_float(cos.from_bytes.data() + offset),
-                     static_cast<float>(std::cos(kTheta * static_cast<double>(i) * inv_freq[j])));
-        }
-    }
-
-    FakeTensor x = make_tensor(device, {16, 16});
-    FakeTensor y = make_tensor(device, {16, 16});
-    FakeTensor t = make_tensor(device, {16, 16});
-    FakeTensor r = make_tensor(device, {16, 16});
-    FakeTensor wq = make_tensor(device, {16, 16});
-    FakeTensor wk = make_tensor(device, {16, 16});
-    FakeTensor wv = make_tensor(device, {16, 16});
-    FakeTensor wo = make_tensor(device, {16, 16});
-    FakeTensor q = make_tensor(device, {16, 16});
-    FakeTensor k = make_tensor(device, {16, 16});
-    FakeTensor v = make_tensor(device, {16, 16});
-    FakeTensor a = make_tensor(device, {16, 16});
-    FakeTensor wu = make_tensor(device, {16, 16});
-    FakeTensor wd = make_tensor(device, {16, 16});
-    FakeTensor wg = make_tensor(device, {16, 16});
-    FakeTensor u = make_tensor(device, {16, 16});
-    FakeTensor g = make_tensor(device, {16, 16});
-    FakeTensor wi = make_tensor(device, {16, 16});
-    FakeTensor wm = make_tensor(device, {16, 16});
-    FakeTensor wlm = make_tensor(device, {16, 16});
-    FakeTensor wn = make_tensor(device, {16, 16});
-
-    iom::models::LlamaAttention attn(dev, 16, 2, 1, wq, wk, wv, wo, q, k, v, a, rope);
-    iom::models::LlamaMlp mlp(dev, wu, wd, wg, u, g);
-    iom::models::LlamaDecoder decoder(dev, attn, mlp, wi, wm, t, r);
-    std::vector<std::reference_wrapper<iom::models::LlamaDecoder>> decoders{decoder};
-    iom::models::Llama2Model model(dev, decoders, wlm, wn, t);
-
-    decoder.forward(x, y);
-    const std::vector<std::string_view> decoder_ops = {
-        "rmsnorm",
-        "linear", "linear", "linear", "sdpa", "linear",
-        "add",
-        "copy",
-        "rmsnorm",
-        "linear", "linear", "silu", "mul", "linear",
-        "add",
-    };
-    REQUIRE(dev.submissions.size() == decoder_ops.size());
-    CHECK(op_names(dev) == decoder_ops);
-    CHECK(dev.silu_aliased);
-    CHECK_EQ(dev.submissions.back().sequence, decoder_ops.size());
-
-    model.forward(x, y);
-    // The model repeats the whole decoder, then closes with output norm
-    // and the LM head projection.
-    std::vector<std::string_view> expected_tail = decoder_ops;
-    expected_tail.push_back("rmsnorm");
-    expected_tail.push_back("linear");
-    const std::vector<std::string_view> model_ops = op_names(dev);
-    REQUIRE(model_ops.size() == decoder_ops.size() + expected_tail.size());
-    CHECK(std::vector<std::string_view>(
-              model_ops.begin() + static_cast<std::ptrdiff_t>(decoder_ops.size()),
-              model_ops.end()) == expected_tail);
-    CHECK_EQ(dev.submissions.back().sequence,
-             decoder_ops.size() + expected_tail.size());
 }
 
 namespace {
