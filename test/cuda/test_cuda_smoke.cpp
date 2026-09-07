@@ -654,17 +654,18 @@ TEST_CASE("CUDA event ring reuses events and enforces bounded capacity") {
             context, metadata_pool);
 
     for (int i = 0; i < 32; ++i) {
-        auto& slot = state->acquire();
-        state->release(slot);
+        auto record = state->acquire();
     }
     CHECK_EQ(state->created_event_count_for_testing(), 1);
     CHECK_EQ(state->in_use_count_for_testing(), 0);
 
-    std::vector<iom::cuda_detail::EventRingState::Slot*> held;
+    std::vector<
+            std::shared_ptr<iom::cuda_detail::EventRingState::Submission>>
+            held;
     held.reserve(iom::cuda_detail::EventRingState::kEventRingCount);
     for (std::size_t i = 0;
          i < iom::cuda_detail::EventRingState::kEventRingCount; ++i) {
-        held.push_back(&state->acquire());
+        held.push_back(state->acquire());
     }
     CHECK_EQ(state->created_event_count_for_testing(), 16);
     CHECK_EQ(state->in_use_count_for_testing(), 16);
@@ -673,19 +674,18 @@ TEST_CASE("CUDA event ring reuses events and enforces bounded capacity") {
     std::atomic<bool> waiter_acquired = false;
     std::thread waiter([&] {
         waiter_started.store(true, std::memory_order_release);
-        auto& slot = state->acquire();
+        auto record = state->acquire();
         waiter_acquired.store(true, std::memory_order_release);
-        state->release(slot);
     });
     while (!waiter_started.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
     CHECK_EQ(state->in_use_count_for_testing(), 16);
-    state->release(*held.front());
+    held.front().reset();
     waiter.join();
     CHECK(waiter_acquired.load(std::memory_order_acquire));
-    for (auto* slot : held) {
-        state->release(*slot);
+    for (auto& record : held) {
+        record.reset();
     }
 }
 
@@ -709,7 +709,7 @@ TEST_CASE("CUDA event ring consumes create faults before allocating") {
             iom::cuda_detail::SubmissionFault::none);
 }
 
-TEST_CASE("CUDA event ring releases metadata when state is destroyed") {
+TEST_CASE("CUDA event ring releases attached metadata when retired") {
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
@@ -719,7 +719,7 @@ TEST_CASE("CUDA event ring releases metadata when state is destroyed") {
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
             context, metadata_pool);
-    auto& event_slot = state->acquire();
+    auto submission = state->acquire();
     std::vector<std::size_t> metadata_slots;
     metadata_slots.reserve(
             iom::detail::MetadataSlotPool<
@@ -730,9 +730,13 @@ TEST_CASE("CUDA event ring releases metadata when state is destroyed") {
          ++i) {
         metadata_slots.push_back(metadata_pool.acquire());
     }
-    event_slot.attached_metadata_slot = metadata_slots.front();
-    auto lease = std::move(state);
-    lease.reset();
+    submission->attach_metadata_slot(metadata_slots.front());
+    // Retiring the submission releases the attached metadata; the pooled
+    // event stays reserved until the last record reference is dropped.
+    state->on_worker_destroy(*submission);
+    CHECK_EQ(state->in_use_count_for_testing(), 1);
+    submission.reset();
+    CHECK_EQ(state->in_use_count_for_testing(), 0);
     for (std::size_t i = 1; i < metadata_slots.size(); ++i) {
         metadata_pool.release(metadata_slots[i]);
     }
@@ -747,7 +751,7 @@ TEST_CASE("CUDA event ring releases metadata when state is destroyed") {
     }
 }
 
-TEST_CASE("CUDA event ring preserves cached results across reuse") {
+TEST_CASE("CUDA event ring fences are pending until own completion") {
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
@@ -757,14 +761,33 @@ TEST_CASE("CUDA event ring preserves cached results across reuse") {
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
             context, metadata_pool);
-    auto& first = state->acquire();
-    const std::size_t index = state->slot_index(first);
-    state->on_worker_complete(first);
-    state->on_worker_destroy(first);
-    const iom::detail::FenceResult recorded = state->invoke_result(index);
+    auto first = state->acquire();
+    const std::size_t first_index = state->slot_index(*first);
+
+    // A pending submission never reports the cached default success: an
+    // in-use slot must not claim success before its event is synchronized.
+    CHECK_FALSE(first->invoke_result().succeeded);
+    state->on_worker_complete(*first);
+    state->on_worker_destroy(*first);
+    const iom::detail::FenceResult recorded = first->invoke_result();
     CHECK(recorded.succeeded);
-    auto& reused = state->acquire();
-    CHECK_EQ(state->slot_index(reused), index);
-    CHECK(state->invoke_result(index).succeeded);
-    state->release(reused);
+
+    // A fence reference (as held by registry entries and destructor
+    // snapshots) keeps the pooled event reserved, so a later submission
+    // cannot reuse the slot and cannot alter the earlier fence's result.
+    auto earlier_fence = first;
+    first.reset();
+    CHECK_EQ(state->in_use_count_for_testing(), 1);
+    auto reused = state->acquire();
+    CHECK_NE(state->slot_index(*reused), first_index);
+    CHECK_FALSE(reused->invoke_result().succeeded);
+    CHECK(earlier_fence->invoke_result().succeeded);
+
+    // Once the earlier fence reference is gone the slot is reusable; a
+    // later submission may land on it and still starts pending.
+    earlier_fence.reset();
+    auto resettled = state->acquire();
+    CHECK_EQ(state->slot_index(*resettled), first_index);
+    CHECK_FALSE(resettled->invoke_result().succeeded);
+    resettled.reset();
 }

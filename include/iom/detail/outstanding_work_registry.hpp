@@ -37,6 +37,12 @@ struct FenceResult {
         return {true, nullptr};
     }
 
+    // A submission that has not reached a terminal state yet. Never a
+    // success: callers that observe it must hold the storage back.
+    [[nodiscard]] static FenceResult pending() noexcept {
+        return {false, nullptr};
+    }
+
     [[nodiscard]] static FenceResult failed(
             std::exception_ptr error) noexcept {
         return {false, std::move(error)};

@@ -291,7 +291,6 @@ TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") 
     }
 }
 
-
 TEST_CASE("ROCm conformance: storage and host transfers for every leaf type") {
     // Keep the CPU allocator large enough for the largest shared case.
     iom_conformance::TrafficGate gate;
@@ -636,6 +635,154 @@ TEST_CASE("ROCm queue destruction fences pending copies") {
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::none);
     CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm pre-wait source destruction keeps storage until completion") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+    // Large enough that the queued copy kernel is still executing when the
+    // host destroys the source; the assertions below hold under every
+    // worker/interleaving outcome: the copy completes from storage that was
+    // either quarantined or released only after its event fired, so waiting
+    // the token always yields correct destination bytes and the allocator
+    // never sees a double free. The deterministic quarantine/no-reuse
+    // contract is pinned by the ring smoke tests and by the
+    // queue-teardown case below.
+    const iom::TensorSpec spec{
+            iom::TensorShape{{8192, 4096}}, iom::DataType::F32};
+    const std::vector<std::byte> expected =
+            iom_conformance::encode_standard_tiled_storage(spec);
+    const std::vector<std::byte> empty(
+            spec.tiled_storage_nbytes(), std::byte{0});
+
+    ReusingHipAllocator allocator;
+    auto device = iom::make_rocm_device(0, allocator);
+    HipStorageOracle oracle;
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    oracle.set_owner_spec(spec);
+    oracle.seed(source->view(), expected);
+    oracle.set_owner_spec(spec);
+    oracle.seed(destination->view(), empty);
+
+    auto queue = device->create_ops();
+    const iom::oid token = queue->copy(source->view(), destination->view());
+
+    // Destroy the source before any explicit wait. The registry fence never
+    // reports success while the recorded event is pending, so the source
+    // block is either quarantined or released only after the copy finished
+    // reading it; in both cases the fresh allocation is safe and the copy
+    // still produces the expected bytes.
+    source.reset();
+    auto fresh = device->create_tensor(spec);
+
+    CHECK_NOTHROW(queue->wait(token));
+    oracle.set_owner_spec(spec);
+    CHECK_EQ(oracle.observe(destination->view()), expected);
+
+    fresh.reset();
+    queue.reset();
+    destination.reset();
+    allocator.release_free();
+    CHECK_EQ(allocator.free_count(), 0);
+    device.reset();
+}
+
+TEST_CASE("ROCm shared-operand copies release storage after both complete") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{8192, 4096}}, iom::DataType::F32};
+    const std::vector<std::byte> expected =
+            iom_conformance::encode_standard_tiled_storage(spec);
+    const std::vector<std::byte> empty(
+            spec.tiled_storage_nbytes(), std::byte{0});
+
+    ReusingHipAllocator allocator;
+    auto device = iom::make_rocm_device(0, allocator);
+    HipStorageOracle oracle;
+    auto source = device->create_tensor(spec);
+    auto first_destination = device->create_tensor(spec);
+    auto second_destination = device->create_tensor(spec);
+    oracle.set_owner_spec(spec);
+    oracle.seed(source->view(), expected);
+    oracle.set_owner_spec(spec);
+    oracle.seed(first_destination->view(), empty);
+    oracle.set_owner_spec(spec);
+    oracle.seed(second_destination->view(), empty);
+
+    auto queue = device->create_ops();
+    // Two back-to-back copies share the source; each owns its completion
+    // record, so destroying the shared operand before any wait can never
+    // recycle it while either recorded event is pending.
+    const iom::oid first =
+            queue->copy(source->view(), first_destination->view());
+    const iom::oid second =
+            queue->copy(source->view(), second_destination->view());
+
+    source.reset();
+    auto fresh = device->create_tensor(spec);
+
+    CHECK_NOTHROW(queue->wait(first));
+    CHECK_NOTHROW(queue->wait(second));
+    oracle.set_owner_spec(spec);
+    CHECK_EQ(oracle.observe(first_destination->view()), expected);
+    oracle.set_owner_spec(spec);
+    CHECK_EQ(oracle.observe(second_destination->view()), expected);
+
+    fresh.reset();
+    queue.reset();
+    first_destination.reset();
+    second_destination.reset();
+    allocator.release_free();
+    CHECK_EQ(allocator.free_count(), 0);
+    device.reset();
+}
+
+TEST_CASE("ROCm operands destroyed after queue teardown remain quarantined") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+    // Queue destruction invalidates every outstanding registry entry up
+    // front, so the operand fences provably report failure when the operands
+    // are destroyed afterwards: the reusing allocator cannot recycle either
+    // block until device teardown, deterministically, with no timing
+    // dependence on the worker or the GPU.
+    const iom::TensorSpec spec{
+            iom::TensorShape{{4096, 2048}}, iom::DataType::F32};
+
+    ReusingHipAllocator allocator;
+    auto device = iom::make_rocm_device(0, allocator);
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    {
+        auto queue = device->create_ops();
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        (void)token;  // never waited; torn down with the queue
+    }
+    const void* source_address = source->view().native_handle();
+    const void* destination_address =
+            destination->view().native_handle();
+
+    source.reset();
+    destination.reset();
+    auto fresh_source = device->create_tensor(spec);
+    auto fresh_destination = device->create_tensor(spec);
+    CHECK_NE(fresh_source->view().native_handle(), source_address);
+    CHECK_NE(fresh_source->view().native_handle(), destination_address);
+    CHECK_NE(fresh_destination->view().native_handle(), source_address);
+    CHECK_NE(fresh_destination->view().native_handle(), destination_address);
+    CHECK_EQ(allocator.free_count(), 0);
+
+    fresh_source.reset();
+    fresh_destination.reset();
+    allocator.release_free();
+    CHECK_EQ(allocator.free_count(), 0);
+    device.reset();
+    CHECK_EQ(allocator.free_count(), 2);
 }
 
 TEST_CASE("ROCm conformance: inline and pooled metadata rank boundaries") {

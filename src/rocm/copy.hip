@@ -62,21 +62,26 @@ detail::FenceResult hip_fence_invoke(
     const auto& capture =
             *std::launder(reinterpret_cast<const EventLeaseWithFailure*>(
                     fence.storage));
-    if (capture.state == nullptr) {
+    if (capture.submission == nullptr) {
         return detail::FenceResult::success();
     }
-    return capture.state->invoke_result(capture.slot_index);
+    detail::FenceResult result = capture.submission->invoke_result();
+    if (result.succeeded && result.failure == nullptr
+            && capture.retained_failure) {
+        result = detail::FenceResult::failed(capture.retained_failure);
+    }
+    return result;
 }
 
 static_assert(noexcept(hip_fence_invoke(
         std::declval<const detail::Fence&>())));
 
 detail::Fence build_hip_fence(
-        const std::shared_ptr<EventRingState>& state,
-        std::size_t slot_index, std::exception_ptr retained_failure) noexcept {
+        std::shared_ptr<EventRingState::Submission> submission,
+        std::exception_ptr retained_failure) noexcept {
     detail::Fence fence;
     ::new (fence.storage) EventLeaseWithFailure{
-            state, slot_index, std::move(retained_failure)};
+            std::move(submission), std::move(retained_failure)};
     fence.invoke = &hip_fence_invoke;
     fence.copy_construct =
             &detail::FenceCaptureOps<EventLeaseWithFailure>::copy_construct;
@@ -94,9 +99,11 @@ class RocmQueue final : public DeviceOps {
         std::uint64_t sequence;
         const TensorView* source;
         TensorView* destination;
-        hipEvent_t event = nullptr;
         bool no_op;
-        EventRingState::Slot* fence = nullptr;
+        // Owns the completion record while the task is queued; keeps the
+        // record alive for the worker callbacks referenced by fence.
+        std::shared_ptr<EventRingState::Submission> submission;
+        void* fence = nullptr;
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
     };
@@ -121,12 +128,14 @@ public:
                               },
                               [state = state_](void* fence) {
                                   state->on_worker_complete(
-                                          *static_cast<EventRingState::Slot*>(
+                                          *static_cast<
+                                                  EventRingState::Submission*>(
                                                   fence));
                               },
                               [state = state_](void* fence) {
                                   state->on_worker_destroy(
-                                          *static_cast<EventRingState::Slot*>(
+                                          *static_cast<
+                                                  EventRingState::Submission*>(
                                                   fence));
                               },
                               [this](
@@ -168,8 +177,7 @@ public:
                 [this, &source, &destination, no_op](
                         std::uint64_t sequence) {
                     worker_.submit_copy(
-                            Task{sequence, &source, &destination, nullptr,
-                                 no_op});
+                            Task{sequence, &source, &destination, no_op});
                 });
     }
 
@@ -184,7 +192,7 @@ private:
         task.source = nullptr;
         task.destination = nullptr;
         if (task.no_op) {
-            task.event = nullptr;
+            task.submission.reset();
             task.fence = nullptr;
             return;
         }
@@ -192,8 +200,7 @@ private:
         gpu_policy::activate(context_);
         const detail::CopyMetadataLayout layout =
                 detail::copy_metadata_layout(source, destination);
-        EventRingState::Slot* slot = nullptr;
-        std::size_t slot_index = 0;
+        std::shared_ptr<EventRingState::Submission> submission;
         std::size_t metadata_slot = EventRingState::kNoAttachedSlot;
         bool metadata_acquired = false;
         bool kernel_enqueued = false;
@@ -201,13 +208,10 @@ private:
         std::exception_ptr retained_failure;
         detail::InlineCopyMetadata inline_metadata{};
         try {
-            slot = &state_->acquire();
-            slot_index = state_->slot_index(*slot);
+            submission = state_->acquire();
             if (layout.bytes <= sizeof(detail::InlineCopyMetadata)) {
                 detail::write_copy_metadata(
                         inline_metadata, source, destination);
-                slot->attached_metadata_slot =
-                        EventRingState::kNoAttachedSlot;
                 detail::launch_grid_stride_copy<gpu_policy>(
                         stream_,
                         static_cast<const unsigned char*>(
@@ -223,7 +227,7 @@ private:
                 detail::write_copy_metadata(
                         metadata_pool_.host_data(metadata_slot),
                         source, destination);
-                slot->attached_metadata_slot = metadata_slot;
+                submission->attach_metadata_slot(metadata_slot);
                 gpu_policy::copy_from_host(
                         stream_, metadata_pool_.device_data(metadata_slot),
                         metadata_pool_.host_data(metadata_slot), layout.bytes);
@@ -240,35 +244,37 @@ private:
             kernel_enqueued = true;
             gpu_policy::check_kernel(gpu_policy::copy_kernel_operation());
             gpu_policy::after_grid_stride_launch();
-            gpu_policy::record_event(slot->event, stream_);
+            gpu_policy::record_event(
+                    state_->event_of(*submission), stream_);
             event_recorded = true;
-            task.event = slot->event;
-            task.fence = slot;
+            task.submission = submission;
+            task.fence = submission.get();
         } catch (...) {
             const std::exception_ptr failure = std::current_exception();
-            if (slot == nullptr) {
+            if (submission == nullptr) {
                 throw;
             }
             if (kernel_enqueued) {
                 if (!event_recorded) {
-                    gpu_policy::record_event_no_fault(slot->event, stream_);
+                    gpu_policy::record_event_no_fault(
+                            state_->event_of(*submission), stream_);
                     event_recorded = true;
                 }
-                task.event = slot->event;
-                task.fence = slot;
+                task.submission = submission;
+                task.fence = submission.get();
                 retained_failure = failure;
             } else {
                 if (metadata_acquired) {
                     metadata_pool_.release(metadata_slot);
                 }
-                state_->release(*slot);
+                submission.reset();
                 throw;
             }
         }
 
         const std::exception_ptr outcome_failure = retained_failure;
         const detail::Fence fence = build_hip_fence(
-                state_, slot_index, std::move(retained_failure));
+                submission, std::move(retained_failure));
         detail::EntryRegistration entries;
         try {
             entries = detail::register_copy_entries(
@@ -299,14 +305,11 @@ private:
                         destination.native_handle());
             }
             if (task.fence != nullptr) {
-                state_->on_worker_destroy(*task.fence);
+                state_->on_worker_destroy(
+                        *static_cast<EventRingState::Submission*>(
+                                task.fence));
+                task.submission.reset();
                 task.fence = nullptr;
-                task.event = nullptr;
-            } else {
-                if (metadata_acquired) {
-                    metadata_pool_.release(metadata_slot);
-                }
-                state_->release(*slot);
             }
             throw;
         }

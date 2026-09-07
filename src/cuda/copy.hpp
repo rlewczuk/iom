@@ -223,8 +223,7 @@ struct gpu_policy {
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
 struct EventLeaseWithFailure {
-    std::shared_ptr<EventRingState> state;
-    std::size_t slot_index = 0;
+    std::shared_ptr<EventRingState::Submission> submission;
     std::exception_ptr retained_failure;
 };
 static_assert(sizeof(EventLeaseWithFailure) <= iom::detail::kFenceStorageBytes);

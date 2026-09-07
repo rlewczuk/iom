@@ -15,7 +15,8 @@
 namespace iom::detail {
 
 template <typename Policy>
-class EventRingState final {
+class EventRingState final
+        : public std::enable_shared_from_this<EventRingState<Policy>> {
 public:
     using context_type = typename Policy::context_type;
     using event_type = typename Policy::event_type;
@@ -24,11 +25,55 @@ public:
     static constexpr std::size_t kNoAttachedSlot =
             std::numeric_limits<std::size_t>::max();
 
+    // One pooled event. Owned by the ring for its whole lifetime and reused
+    // for later submissions once every record referencing it is gone.
     struct Slot {
         event_type event = nullptr;
         bool in_use = false;
-        std::size_t attached_metadata_slot = kNoAttachedSlot;
-        FenceResult cached_result = FenceResult::success();
+    };
+
+    // One submission's completion record. The registry fence captures a
+    // shared_ptr to this record, so the record — and its pooled event — stays
+    // reserved until every registry entry (and destructor snapshot) that
+    // references it has disappeared. Re-acquiring the pool entry for a later
+    // submission therefore cannot change the result observed by an earlier
+    // fence. The result starts pending (non-success) and only becomes
+    // success after the worker has synchronized this submission's event.
+    class Submission final {
+    public:
+        ~Submission() noexcept {
+            ring_->return_pool_entry(pool_index_);
+        }
+
+        // Returns the result recorded by this submission's worker, or a
+        // pending (non-success) result until on_worker_complete has
+        // synchronized the event. Never touches the event.
+        [[nodiscard]] FenceResult invoke_result() const noexcept {
+            std::lock_guard<std::mutex> lock(ring_->mutex_);
+            return result_;
+        }
+
+        void attach_metadata_slot(std::size_t slot) noexcept {
+            metadata_slot_ = slot;
+        }
+
+        // Public so std::make_shared can allocate the record in a single
+        // allocation: access to a nested class's private constructor is not
+        // granted inside <memory>'s make_shared instantiation. Only
+        // EventRingState::acquire constructs it, with a valid pool index
+        // and while holding the ring's own shared reference.
+        Submission(
+                std::shared_ptr<EventRingState> ring,
+                std::size_t pool_index) noexcept
+                : ring_(std::move(ring)), pool_index_(pool_index) {}
+
+    private:
+        friend class EventRingState;
+
+        std::shared_ptr<EventRingState> ring_;
+        std::size_t pool_index_ = kNoAttachedSlot;
+        FenceResult result_ = FenceResult::pending();
+        std::size_t metadata_slot_ = kNoAttachedSlot;
     };
 
     EventRingState(
@@ -36,15 +81,12 @@ public:
             : context_(context), metadata_pool_(&metadata_pool) {}
 
     ~EventRingState() noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (std::size_t index = 0; index < created_count_; ++index) {
-            Slot& slot = slots_[index];
-            if (slot.in_use) {
-                if (slot.attached_metadata_slot != kNoAttachedSlot) {
-                    metadata_pool_->release(slot.attached_metadata_slot);
-                    slot.attached_metadata_slot = kNoAttachedSlot;
-                }
-                slot.in_use = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // No submission record can outlive the ring (every record holds
+            // a shared reference), so no pool entry is reserved here.
+            for (std::size_t index = 0; index < created_count_; ++index) {
+                slots_[index].in_use = false;
             }
         }
         try {
@@ -64,7 +106,7 @@ public:
     EventRingState(EventRingState&&) = delete;
     EventRingState& operator=(EventRingState&&) = delete;
 
-    [[nodiscard]] Slot& acquire() {
+    [[nodiscard]] std::shared_ptr<Submission> acquire() {
         Policy::check_acquire_event_fault();
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
@@ -72,8 +114,8 @@ public:
                 Slot& slot = slots_[index];
                 if (!slot.in_use) {
                     slot.in_use = true;
-                    slot.attached_metadata_slot = kNoAttachedSlot;
-                    return slot;
+                    return std::make_shared<Submission>(
+                            this->shared_from_this(), index);
                 }
             }
             if (created_count_ < kEventRingCount) {
@@ -81,8 +123,8 @@ public:
                 Policy::create_event(&slot.event);
                 ++created_count_;
                 slot.in_use = true;
-                slot.attached_metadata_slot = kNoAttachedSlot;
-                return slot;
+                return std::make_shared<Submission>(
+                        this->shared_from_this(), created_count_ - 1);
             }
             completion_.wait(lock, [this] {
                 for (std::size_t index = 0; index < created_count_; ++index) {
@@ -95,51 +137,52 @@ public:
         }
     }
 
-    void release(Slot& slot) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        release_locked(slot);
-    }
-
-    void on_worker_complete(Slot& slot) {
+    void on_worker_complete(Submission& submission) {
         std::unique_lock<std::mutex> lock(mutex_);
         FenceResult result;
         try {
             Policy::activate(context_);
-            Policy::synchronize_event(slot.event);
+            Policy::synchronize_event(
+                    slots_[submission.pool_index_].event);
             result = FenceResult::success();
         } catch (...) {
             result = FenceResult::failed(std::current_exception());
         }
-        slot.cached_result = result;
+        submission.result_ = result;
         lock.unlock();
         if (result.failure) {
             std::rethrow_exception(result.failure);
         }
     }
 
-    void on_worker_destroy(Slot& slot) noexcept {
+    // Releases the recorded event's resources (metadata) for reuse. The
+    // pooled event itself is only returned to the pool once the submission
+    // record is destroyed (its last fence reference gone), so an earlier
+    // fence can never read a later submission's state.
+    void on_worker_destroy(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         try {
             Policy::activate(context_);
         } catch (...) {
         }
-        Policy::synchronize_event_noexcept(slot.event);
-        if (slot.attached_metadata_slot != kNoAttachedSlot) {
-            metadata_pool_->release(slot.attached_metadata_slot);
+        Policy::synchronize_event_noexcept(
+                slots_[submission.pool_index_].event);
+        if (submission.metadata_slot_ != kNoAttachedSlot) {
+            metadata_pool_->release(submission.metadata_slot_);
+            submission.metadata_slot_ = kNoAttachedSlot;
         }
-        release_locked(slot);
     }
 
-    // Returns the result recorded by the worker without touching the event.
-    [[nodiscard]] FenceResult invoke_result(
-            std::size_t slot_index) const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return slots_[slot_index].cached_result;
+    // The pooled event recorded for this submission. The event does not
+    // change while the record lives.
+    [[nodiscard]] event_type event_of(
+            const Submission& submission) const noexcept {
+        return slots_[submission.pool_index_].event;
     }
 
-
-    [[nodiscard]] std::size_t slot_index(const Slot& slot) const noexcept {
-        return static_cast<std::size_t>(&slot - slots_.data());
+    [[nodiscard]] std::size_t slot_index(
+            const Submission& submission) const noexcept {
+        return submission.pool_index_;
     }
 
 #ifdef IOM_ENABLE_TESTING
@@ -160,13 +203,12 @@ public:
 #endif
 
 private:
-    void release_locked(Slot& slot) noexcept {
-        if (!slot.in_use) {
-            return;
+    void return_pool_entry(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < created_count_ && slots_[index].in_use) {
+            slots_[index].in_use = false;
+            completion_.notify_one();
         }
-        slot.in_use = false;
-        slot.attached_metadata_slot = kNoAttachedSlot;
-        completion_.notify_one();
     }
 
     context_type context_;
