@@ -10,24 +10,33 @@
 namespace iom {
 
     namespace {
-
         bool is_power_of_two(std::size_t value) {
             return value != 0 && (value & (value - 1)) == 0;
+        }
+
+        std::uintptr_t checked_raw_begin(void* buffer, std::size_t size, std::size_t alignment) {
+            if (buffer == nullptr && size != 0) {
+                throw std::invalid_argument("buffer is null");
+            }
+            if (!is_power_of_two(alignment)) {
+                throw std::invalid_argument("alignment must be a non-zero power of two");
+            }
+            return reinterpret_cast<std::uintptr_t>(buffer);
+        }
+
+        std::uintptr_t checked_raw_end(std::uintptr_t raw_begin, std::size_t size) {
+            if (size > std::numeric_limits<std::uintptr_t>::max() - raw_begin) {
+                throw std::overflow_error("allocator buffer range overflows address space");
+            }
+            return raw_begin + size;
         }
 
     }  // namespace
 
     SingleBufferAllocatorBase::SingleBufferAllocatorBase(void* buffer, std::size_t size, std::size_t alignment)
-            : raw_begin_(reinterpret_cast<std::uintptr_t>(buffer)),
-              raw_end_(raw_begin_ + size),
+            : raw_begin_(checked_raw_begin(buffer, size, alignment)),
+              raw_end_(checked_raw_end(raw_begin_, size)),
               align_(alignment) {
-        if (buffer == nullptr && size != 0) {
-            throw std::invalid_argument("buffer is null");
-        }
-        if (!is_power_of_two(align_)) {
-            throw std::invalid_argument("alignment must be a non-zero power of two");
-        }
-
         begin_ = align_up_addr(raw_begin_);
         if (begin_ > raw_end_) {
             begin_ = raw_end_;
@@ -50,7 +59,6 @@ namespace iom {
         return reinterpret_cast<std::uintptr_t>(ptr);
     }
 
-
     std::size_t SingleBufferAllocatorBase::offset_of(void* ptr) const {
         const auto address = addr_from_ptr(ptr);
         if (address < begin_ || address > raw_end_) {
@@ -61,8 +69,12 @@ namespace iom {
 
     std::uintptr_t SingleBufferAllocatorBase::align_up_addr(std::uintptr_t address) const {
         const auto mask = static_cast<std::uintptr_t>(align_ - 1);
+        if (address > std::numeric_limits<std::uintptr_t>::max() - mask) {
+            throw std::overflow_error("allocator address alignment overflows address space");
+        }
         return (address + mask) & ~mask;
     }
+
 
     LinearAllocator::LinearAllocator(void* buffer, std::size_t size, std::size_t alignment)
             : SingleBufferAllocatorBase(buffer, size, alignment),
@@ -231,10 +243,6 @@ namespace iom {
             : SingleBufferAllocatorBase(buffer, size, alignment),
               payload_size_(payload_size),
               stride_(align_up_payload(payload_size, alignment)) {
-        if (payload_size_ == 0) {
-            throw std::invalid_argument("payload size must be non-zero");
-        }
-
         block_count_ = capacity() / stride_;
         free_indices_.reserve(block_count_);
         in_use_.resize(block_count_, false);
@@ -322,7 +330,16 @@ namespace iom {
     }
 
     std::size_t FixedSizeAllocator::align_up_payload(std::size_t size, std::size_t alignment) {
+        if (size == 0) {
+            throw std::invalid_argument("payload size must be non-zero");
+        }
+        if (!is_power_of_two(alignment)) {
+            throw std::invalid_argument("alignment must be a non-zero power of two");
+        }
         const auto mask = alignment - 1;
+        if (size > std::numeric_limits<std::size_t>::max() - mask) {
+            throw std::overflow_error("payload alignment overflows size range");
+        }
         return (size + mask) & ~mask;
     }
 

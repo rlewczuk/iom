@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <type_traits>
@@ -96,6 +97,14 @@ TEST_CASE("LinearAllocator rejects invalid construction arguments") {
     CHECK_THROWS_AS(iom::LinearAllocator(nullptr, buffer.size()), std::invalid_argument);
     CHECK_THROWS_AS(iom::LinearAllocator(buffer.data(), buffer.size(), 0), std::invalid_argument);
     CHECK_THROWS_AS(iom::LinearAllocator(buffer.data(), buffer.size(), 3), std::invalid_argument);
+}
+
+TEST_CASE("SingleBufferAllocator rejects overflowing address ranges and alignment") {
+    const auto near_limit = reinterpret_cast<void*>(
+            std::numeric_limits<std::uintptr_t>::max() - static_cast<std::uintptr_t>(7));
+
+    CHECK_THROWS_AS(iom::LinearAllocator(near_limit, 8, 8), std::overflow_error);
+    CHECK_THROWS_AS(iom::LinearAllocator(near_limit, 0, 32), std::overflow_error);
 }
 
 TEST_CASE("ListAllocator is non-copyable and non-movable") {
@@ -327,4 +336,13 @@ TEST_CASE("FixedSizeAllocator rejects invalid construction arguments") {
     CHECK_THROWS_AS(iom::FixedSizeAllocator(buffer.data(), buffer.size(), 0), std::invalid_argument);
     CHECK_THROWS_AS(iom::FixedSizeAllocator(buffer.data(), buffer.size(), 0, 8), std::invalid_argument);
     CHECK_THROWS_AS(iom::FixedSizeAllocator(buffer.data(), buffer.size(), 3, 8), std::invalid_argument);
+}
+
+TEST_CASE("FixedSizeAllocator rejects overflowing payload stride") {
+    std::array<std::byte, 32> buffer{};
+
+    CHECK_THROWS_AS(
+            iom::FixedSizeAllocator(buffer.data(), buffer.size(), 32, std::numeric_limits<std::size_t>::max()),
+            std::overflow_error);
+    CHECK_THROWS_AS(iom::FixedSizeAllocator(buffer.data(), buffer.size(), 32, 0), std::invalid_argument);
 }
