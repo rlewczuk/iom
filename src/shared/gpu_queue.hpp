@@ -222,7 +222,7 @@ private:
                 metadata_slot = metadata_pool_.acquire();
                 metadata_acquired = true;
                 metadata_pool_.ensure_slot_capacity(
-                        metadata_slot, layout.bytes, stream_);
+                        metadata_slot, layout.bytes);
                 detail::write_copy_metadata(
                         metadata_pool_.host_data(metadata_slot),
                         source, destination);

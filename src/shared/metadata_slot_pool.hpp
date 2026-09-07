@@ -59,9 +59,10 @@ public:
         }
     }
 
+    // acquire() only returns a slot after its owning fence has retired, so
+    // replacing its storage does not require draining unrelated stream work.
     void ensure_slot_capacity(
-            std::size_t index, std::size_t required_bytes,
-            typename Policy::stream_type stream) {
+            std::size_t index, std::size_t required_bytes) {
         Slot& slot = slots_.at(index);
         if (slot.capacity >= required_bytes) {
             return;
@@ -74,7 +75,6 @@ public:
             }
             capacity *= 2;
         }
-        Policy::synchronize_stream(stream);
         std::unique_ptr<std::byte[]> replacement(
                 new std::byte[capacity]);
         void* replacement_device = Policy::allocate(capacity);

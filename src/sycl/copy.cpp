@@ -115,7 +115,6 @@ public:
             capacity *= 2;
         }
 
-        queue_.wait_and_throw();
         void* replacement_device =
                 sycl::malloc_device(capacity, queue_.get_device(), context_);
         if (replacement_device == nullptr) {
