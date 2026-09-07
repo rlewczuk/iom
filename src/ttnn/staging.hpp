@@ -13,12 +13,10 @@
 // Ownership and ordering: every method is called only while the owning
 // device's API mutex is held (region_from_host/region_to_host in copy.cpp
 // run under it). A lease hands out one retained slot; the transfer returns
-// it strictly after the region's queue finish consumed the data. A lease
-// destroyed without an explicit release means the transfer failed: upload
-// slots are discarded, a download whose drain finished is discarded, and a
 // download whose drain could not be finished is retired (never reused,
 // freed only with the device), so an asynchronous reader can never touch
-// reused memory. Poisoned storage is never handed out again.
+// reused memory. Poisoned upload storage remains in its slot until a
+// successful covering finish proves that it is safe to reclaim.
 
 #include <atomic>
 #include <array>
@@ -50,13 +48,10 @@ namespace iom::ttnn_detail {
         class UploadLease final {
         public:
             ~UploadLease() noexcept {
-                // A lease destroyed without an explicit release means the
-                // transfer failed: discard the slot so no poisoned bytes
-                // are ever reused.
-                if (pool_ != nullptr) {
-                    pool_->release_upload(
-                            list_index_, position_, /*poisoned=*/true);
-                }
+                // A lease destroyed without an explicit disposition means
+                // that submission may have reached the mesh. Retire the
+                // slot rather than freeing bytes that may still be read.
+                retire();
             }
 
             UploadLease(const UploadLease&) = delete;
@@ -78,12 +73,24 @@ namespace iom::ttnn_detail {
                 return keepalive_;
             }
 
-            // Returns the retained slot to the facility. Called only after
-            // the region's queue finish has consumed the staged data.
+            // Returns the retained slot to the facility after completion has
+            // been proven by the region's queue finish.
             void release() noexcept {
                 if (pool_ != nullptr) {
                     pool_->release_upload(
-                            list_index_, position_, /*poisoned=*/false);
+                            list_index_, position_,
+                            UploadDisposition::Complete);
+                    pool_ = nullptr;
+                }
+            }
+
+            // Retains the bytes in place when completion is unknown. This is
+            // allocation-free and safe in failure/destructor paths.
+            void retire() noexcept {
+                if (pool_ != nullptr) {
+                    pool_->release_upload(
+                            list_index_, position_,
+                            UploadDisposition::Retire);
                     pool_ = nullptr;
                 }
             }
@@ -159,14 +166,12 @@ namespace iom::ttnn_detail {
             DownloadLease(
                     TtnnHostStaging& pool, std::byte* data) noexcept
                     : pool_(&pool), data_(data) {}
-
             TtnnHostStaging* pool_ = nullptr;
             std::byte* data_ = nullptr;
         };
 
         // Hands out one retained byte slot from the dtype's slot list,
-        // growing the list and the storage only when no retained buffer
-        // fits, and zero-initializing only the newly claimed tail.
+        // growing the list and storage only when no retained buffer fits.
         [[nodiscard]] UploadLease acquire_upload(
                 std::size_t list_index, std::size_t required_bytes) {
             std::vector<UploadSlot>& slots =
@@ -174,16 +179,13 @@ namespace iom::ttnn_detail {
             UploadSlot* free_slot = nullptr;
             std::size_t position = 0;
             for (std::size_t i = 0; i < slots.size(); ++i) {
-                if (!slots[i].in_use) {
+                if (!slots[i].in_use && !slots[i].retired) {
                     free_slot = &slots[i];
                     position = i;
                     break;
                 }
             }
             if (free_slot == nullptr) {
-                // The list grows by one retained slot for this plane; slot
-                // positions (not pointers) identify leases, so the
-                // reallocation below never invalidates an outstanding lease.
                 slots.push_back(UploadSlot{});
                 free_slot = &slots.back();
                 position = slots.size() - 1;
@@ -210,11 +212,23 @@ namespace iom::ttnn_detail {
             return DownloadLease{
                     *this, download_slot_.data.data()};
         }
+        // Reclaims retired upload slots after a successful finish covering
+        // the queue's prior work. This only changes state and never allocates.
+        void reclaim_retired_uploads() noexcept {
+            for (auto& slots : upload_slots_) {
+                for (UploadSlot& slot : slots) {
+                    if (slot.retired && !slot.in_use) {
+                        slot.retired = false;
+                    }
+                }
+            }
+        }
 
     private:
         struct UploadSlot {
             std::vector<std::byte> data;
             bool in_use = false;
+            bool retired = false;
         };
 
         struct DownloadSlot {
@@ -223,6 +237,7 @@ namespace iom::ttnn_detail {
         };
 
         enum class DownloadDisposition { Keep, Discard, Retire };
+        enum class UploadDisposition { Complete, Retire };
 
         // Grows the retained buffer when no retained allocation fits; the
         // claimed region beyond the current size is zero-initialized. Each
@@ -251,14 +266,15 @@ namespace iom::ttnn_detail {
 
         void release_upload(
                 std::size_t list_index, std::size_t position,
-                bool poisoned) noexcept {
+                UploadDisposition disposition) noexcept {
             std::vector<UploadSlot>& slots = upload_slots_[list_index];
             if (position >= slots.size() || !slots[position].in_use) {
                 return;
             }
-            slots[position].in_use = false;
-            if (poisoned) {
-                std::vector<std::byte>().swap(slots[position].data);
+            UploadSlot& slot = slots[position];
+            slot.in_use = false;
+            if (disposition == UploadDisposition::Retire) {
+                slot.retired = true;
             }
         }
 

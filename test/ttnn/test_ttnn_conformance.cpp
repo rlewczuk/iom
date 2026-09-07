@@ -701,9 +701,8 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
             tensor->view(), seed, "warm-up");
 
     // An upload submission fault at plane 1: plane 0 reached the mesh, the
-    // faulted plane's staged bytes are partial, and every outstanding lease
-    // of the failed region is discarded. The next upload re-allocates the
-    // six slots from scratch and serves clean bytes identical to the model.
+    // bounded recovery finish succeeds, and all leases become reusable only
+    // after that completion proof. The original fault still propagates.
     iom::ttnn_test::fail_next_host_transfer_submission_for_testing(1);
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(spec, 0x82);
@@ -723,7 +722,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
     CHECK_EQ(
             iom::ttnn_test::
                     host_transfer_staging_allocation_count_for_testing(),
-            after_upload_failure + 6);
+            after_upload_failure);
 
     // A download submission fault at plane 1: plane 0 was enqueued, the
     // failure drain finishes it, and the byte staging buffer is discarded

@@ -312,11 +312,9 @@ namespace iom::ttnn_detail {
         const std::size_t plane_bytes = rows * columns * element_size;
         const std::size_t count = view_plane_count(destination);
 
-        // Retained per-plane staging is acquired before the first plane
-        // reaches the mesh and returned only after the region finish below:
-        // every leased buffer stays owned until the queue consumed it. On
-        // failure the outstanding leases unwind and poison their slots, so
-        // a failed transfer never reuses partially written staging.
+        // Each lease remains owned until the queue proves completion. A
+        // submission exception is conservatively treated as possibly in
+        // flight, even when the vendor call throws before returning.
         std::vector<TtnnHostStaging::UploadLease> leases;
         leases.reserve(count);
         if (count != 0) {
@@ -332,15 +330,45 @@ namespace iom::ttnn_detail {
                         slot, padded_rows * padded_columns * element_size));
             }
         }
-        for (std::size_t index = 0; index < count; ++index) {
-            upload_plane(
-                    planes[owner_plane_at(destination, index)], leases[index],
-                    source.data() + index * plane_bytes, rows, columns,
-                    element_size, index);
-        }
-        device.mesh_command_queue(0).finish();
-        for (TtnnHostStaging::UploadLease& lease : leases) {
-            lease.release();
+
+        std::size_t submitted = 0;
+        bool submissions_complete = false;
+        try {
+            for (std::size_t index = 0; index < count; ++index) {
+                ++submitted;
+                upload_plane(
+                        planes[owner_plane_at(destination, index)],
+                        leases[index], source.data() + index * plane_bytes,
+                        rows, columns, element_size, index);
+            }
+            submissions_complete = true;
+            device.mesh_command_queue(0).finish();
+            for (TtnnHostStaging::UploadLease& lease : leases) {
+                lease.release();
+            }
+            staging.reclaim_retired_uploads();
+        } catch (...) {
+            const std::exception_ptr original_failure =
+                    std::current_exception();
+            bool drained = false;
+            if (submitted != 0 && !submissions_complete) {
+                try {
+                    device.mesh_command_queue(0).finish();
+                    drained = true;
+                } catch (...) {
+                }
+            }
+            for (TtnnHostStaging::UploadLease& lease : leases) {
+                if (drained) {
+                    lease.release();
+                } else {
+                    lease.retire();
+                }
+            }
+            if (drained) {
+                staging.reclaim_retired_uploads();
+            }
+            std::rethrow_exception(original_failure);
         }
     }
 
