@@ -1,5 +1,10 @@
 #pragma once
 
+// A pooled event is only a completion proof after the current submission
+// records it successfully. A stream drain is an equivalent proof for the
+// exceptional path where both event-record attempts fail.
+#include <stdexcept>
+
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -74,12 +79,14 @@ public:
         std::size_t pool_index_ = kNoAttachedSlot;
         FenceResult result_ = FenceResult::pending();
         std::size_t metadata_slot_ = kNoAttachedSlot;
-        // True once this submission's on_worker_complete successfully
-        // synchronized its pooled event. Fresh records start false; because
-        // acquire() constructs a new record for every reuse of a pool entry,
-        // the marker is implicitly reset on slot acquire. It stays false for
-        // queue-drain and failed/partially-observed paths, which must still
-        // perform the noexcept cleanup wait on on_worker_destroy.
+        // Event record status is explicit: vendor synchronization on a fresh
+        // event is not a completion proof.
+        bool event_recorded_ = false;
+        // A successful queue drain is the completion proof when recording
+        // failed twice.
+        bool stream_drained_ = false;
+        // True once on_worker_complete has observed completion. Other paths
+        // still receive noexcept cleanup synchronization on destruction.
         bool synchronized_on_complete_ = false;
     };
 
@@ -137,21 +144,38 @@ public:
                 for (std::size_t index = 0; index < created_count_; ++index) {
                     if (!slots_[index].in_use) {
                         return true;
+
                     }
                 }
                 return false;
             });
         }
     }
+    void mark_event_recorded(Submission& submission) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        submission.event_recorded_ = true;
+    }
+
+    void mark_stream_drained(Submission& submission) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        submission.stream_drained_ = true;
+    }
 
     void on_worker_complete(Submission& submission) {
         std::unique_lock<std::mutex> lock(mutex_);
         FenceResult result;
         try {
-            Policy::activate(context_);
-            Policy::synchronize_event(
-                    slots_[submission.pool_index_].event);
-            result = FenceResult::success();
+            if (submission.stream_drained_) {
+                result = FenceResult::success();
+            } else if (submission.event_recorded_) {
+                Policy::activate(context_);
+                Policy::synchronize_event(
+                        slots_[submission.pool_index_].event);
+                result = FenceResult::success();
+            } else {
+                throw std::runtime_error(
+                        "GPU completion event was never recorded");
+            }
             submission.synchronized_on_complete_ = true;
         } catch (...) {
             result = FenceResult::failed(std::current_exception());

@@ -360,6 +360,7 @@ TEST_CASE("ROCm event ring fences are pending until own completion") {
     // A pending submission never reports the cached default success: an
     // in-use slot must not claim success before its event is synchronized.
     CHECK_FALSE(first->invoke_result().succeeded);
+    state->mark_event_recorded(*first);
     state->on_worker_complete(*first);
     state->on_worker_destroy(*first);
     const iom::detail::FenceResult recorded = first->invoke_result();

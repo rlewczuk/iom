@@ -118,9 +118,13 @@ struct gpu_policy {
         check_cuda_kernel("cudaEventRecord", status);
     }
 
-    static void record_event_no_fault(
+    [[nodiscard]] static bool record_event_no_fault(
             event_type event, stream_type stream) noexcept {
-        (void)cudaEventRecord(event, stream);
+        cudaError_t status = cudaEventRecord(event, stream);
+        if (consume_submission_fault(SubmissionFault::event_record)) {
+            status = cudaErrorInvalidValue;
+        }
+        return status == cudaSuccess;
     }
 
     [[nodiscard]] static void* allocate(std::size_t bytes) {

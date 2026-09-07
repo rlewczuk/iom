@@ -246,6 +246,7 @@ private:
             Policy::record_event(
                     state_->event_of(*submission), stream_);
             event_recorded = true;
+            state_->mark_event_recorded(*submission);
             task.submission = submission;
             task.fence = submission.get();
         } catch (...) {
@@ -255,9 +256,13 @@ private:
             }
             if (kernel_enqueued) {
                 if (!event_recorded) {
-                    Policy::record_event_no_fault(
+                    event_recorded = Policy::record_event_no_fault(
                             state_->event_of(*submission), stream_);
-                    event_recorded = true;
+                    if (event_recorded) {
+                        state_->mark_event_recorded(*submission);
+                    } else if (Policy::synchronize_stream_noexcept(stream_)) {
+                        state_->mark_stream_drained(*submission);
+                    }
                 }
                 task.submission = submission;
                 task.fence = submission.get();

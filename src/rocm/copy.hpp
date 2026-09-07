@@ -108,9 +108,13 @@ struct gpu_policy {
         check_hip("hipEventRecord", status);
     }
 
-    static void record_event_no_fault(
+    [[nodiscard]] static bool record_event_no_fault(
             event_type event, stream_type stream) noexcept {
-        (void)hipEventRecord(event, stream);
+        hipError_t status = hipEventRecord(event, stream);
+        if (consume_submission_fault(SubmissionFault::event_record)) {
+            status = hipErrorInvalidValue;
+        }
+        return status == hipSuccess;
     }
 
     [[nodiscard]] static void* allocate(std::size_t bytes) {
