@@ -2,7 +2,6 @@
 
 #include <hip/hip_runtime_api.h>
 
-#include <array>
 #include <limits>
 #include <memory>
 #include <new>
@@ -11,26 +10,11 @@
 
 #include "copy.hpp"
 #include "iom/detail/aligned_storage.hpp"
+#include "../shared/standard_tiled_copy.hpp"
 
 namespace iom {
 
     namespace {
-
-        constexpr std::array kRocmSupportedDataTypes = {
-                iom::DataType::BOOL,
-                iom::DataType::I2, iom::DataType::U2,
-                iom::DataType::I4, iom::DataType::U4,
-                iom::DataType::I8, iom::DataType::U8,
-                iom::DataType::I16, iom::DataType::U16,
-                iom::DataType::I32, iom::DataType::U32,
-                iom::DataType::I64, iom::DataType::U64,
-                iom::DataType::F4_E2M1,
-                iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-                iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
-                iom::DataType::F8_E8M0,
-                iom::DataType::F16, iom::DataType::BF16,
-                iom::DataType::F32, iom::DataType::F64,
-        };
 
         [[nodiscard]] std::runtime_error hip_error(
                 const char* operation, hipError_t status) {
@@ -81,8 +65,7 @@ namespace iom {
             }
             [[nodiscard]] std::span<const iom::DataType>
                     supported_data_types() const noexcept override {
-                return {kRocmSupportedDataTypes.data(),
-                        kRocmSupportedDataTypes.size()};
+                return detail::standard_supported_data_types();
             }
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
