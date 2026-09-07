@@ -849,6 +849,7 @@ public:
         throw_before_complete,
         complete_then_throw,
         commit_failure_then_complete,
+        commit_failure_then_throw,
     };
 
     explicit InlineQueue(Mode mode = Mode::complete)
@@ -889,6 +890,12 @@ public:
                                 std::runtime_error("post-link boom")));
                 complete(sequence);
                 break;
+            case Mode::commit_failure_then_throw:
+                commit_failure(
+                        sequence,
+                        std::make_exception_ptr(
+                                std::runtime_error("post-link boom")));
+                throw std::runtime_error("post-commit boom");
             }
         });
     }
@@ -1931,6 +1938,33 @@ TEST_CASE("DeviceOps submit rolls back a synchronous queue_work failure") {
     const iom::oid next = queue.copy(a.view(), b.view());
     CHECK_EQ(token_sequence(next), 1);
     CHECK_NOTHROW(queue.wait(next));
+}
+
+TEST_CASE("submit rollback reclaims a pending failure committed before a synchronous throw") {
+    FakeDevice device;
+    InlineQueue queue(InlineQueue::Mode::commit_failure_then_throw);
+    FakeTensor a = make_tensor(device, {4, 8});
+    FakeTensor b = make_tensor(device, {4, 8});
+
+    bool matched = false;
+    try {
+        queue.copy(a.view(), b.view());
+    } catch (const std::runtime_error& error) {
+        matched = std::string_view(error.what()) == "post-commit boom";
+    }
+    CHECK(matched);
+
+    // The reclaimed sequence is reissued without its stale failure: the
+    // second copy reuses sequence 1, completes it, and wait() never
+    // rethrows the aborted submission's retained failure, across repeated
+    // calls. A surviving pending_failures_ entry would instead be taken
+    // over by complete(1) and rethrown by every wait().
+    queue.mode = InlineQueue::Mode::complete;
+    const iom::oid next = queue.copy(a.view(), b.view());
+    CHECK_EQ(token_sequence(next), 1);
+    for (int i = 0; i < 3; ++i) {
+        CHECK_NOTHROW(queue.wait(next));
+    }
 }
 
 TEST_CASE("submit suppresses rollback when queue_work completes inline and then throws") {

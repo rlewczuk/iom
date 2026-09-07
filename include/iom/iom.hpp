@@ -317,7 +317,11 @@ namespace iom {
          * shape can reuse the sequence. Under concurrent submit calls, a
          * later reservation leaves a monotonic gap. An inline-completing
          * backend may call complete(sequence) from queue_work; if it then
-         * throws, the completed sequence is never rolled back.
+         * throws, the completed sequence is never rolled back. A backend
+         * that records a failure via commit_failure(sequence, failure) and
+         * then throws loses that retained failure when the reservation is
+         * reclaimed; the failure persists only while a later reservation
+         * leaves a gap.
          */
         template <typename QueueWork>
         oid submit(QueueWork queue_work) {
@@ -335,6 +339,7 @@ namespace iom {
             } catch (...) {
                 std::lock_guard<std::mutex> lock(completion_mutex_);
                 if (next_sequence_ == sequence + 1 && completed_ < sequence) {
+                    pending_failures_.erase(sequence);
                     next_sequence_ = sequence;
                 }
                 throw;
