@@ -71,12 +71,12 @@ namespace iom {
             SyclDevice(const SyclDevice&) = delete;
             SyclDevice& operator=(const SyclDevice&) = delete;
             ~SyclDevice() override {
-                registry_state_.quarantine.drain();
-                staging_pool_.destroy();
                 try {
                     transfer_queue_->wait_and_throw();
                 } catch (...) {
                 }
+                registry_state_.quarantine.drain();
+                staging_pool_.destroy();
                 transfer_queue_.reset();
                 context_.reset();
                 if (sycl_detail::context_calls.context_destroyed != nullptr) {

@@ -684,8 +684,14 @@ void region_from_host(
                 storage, true);
         transfer_queue.wait_and_throw();
     } catch (...) {
+        const std::exception_ptr enqueue_failure =
+                std::current_exception();
+        try {
+            transfer_queue.wait_and_throw();
+        } catch (...) {
+        }
         lease.poison();
-        throw;
+        std::rethrow_exception(enqueue_failure);
     }
 }
 
@@ -718,8 +724,14 @@ void region_to_host(
         std::memcpy(
                 destination.data(), lease.host_mirror(), logical_nbytes);
     } catch (...) {
+        const std::exception_ptr enqueue_failure =
+                std::current_exception();
+        try {
+            transfer_queue.wait_and_throw();
+        } catch (...) {
+        }
         lease.poison();
-        throw;
+        std::rethrow_exception(enqueue_failure);
     }
 }
 
