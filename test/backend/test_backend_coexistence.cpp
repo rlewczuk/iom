@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -9,6 +11,8 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "backend/backend_conformance_common.hpp"
@@ -75,14 +79,28 @@ const iom::TensorSpec& coexistence_spec() {
 class HostAllocator final : public iom::Allocator {
 public:
     void* alloc(std::size_t size) override {
+        ++allocations_;
         return ::operator new(size, std::align_val_t(32));
     }
 
     void free(void* buffer) override {
+        ++frees_;
         ::operator delete(buffer, std::align_val_t(32));
     }
 
     void reset() override {}
+
+    [[nodiscard]] std::size_t allocation_count() const noexcept {
+        return allocations_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return frees_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::size_t> allocations_{0};
+    std::atomic<std::size_t> frees_{0};
 };
 
 #ifdef IOM_COEXIST_SYCL
@@ -101,19 +119,31 @@ public:
         if (pointer == nullptr) {
             throw std::bad_alloc();
         }
+        ++allocations_;
         return pointer;
     }
 
     void free(void* buffer) override {
         REQUIRE(context_.has_value());
+        ++frees_;
         sycl::free(buffer, *context_);
     }
 
     void reset() override {}
 
+    [[nodiscard]] std::size_t allocation_count() const noexcept {
+        return allocations_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return frees_.load(std::memory_order_relaxed);
+    }
+
 private:
     std::optional<sycl::context> context_;
     sycl::device device_;
+    std::atomic<std::size_t> allocations_{0};
+    std::atomic<std::size_t> frees_{0};
 };
 
 SyclUsmAllocator* active_sycl_allocator = nullptr;
@@ -168,15 +198,29 @@ public:
     void* alloc(std::size_t size) override {
         CUdeviceptr device_pointer = 0;
         REQUIRE(cuMemAlloc(&device_pointer, size) == CUDA_SUCCESS);
+        ++allocations_;
         return reinterpret_cast<void*>(device_pointer);
     }
 
     void free(void* buffer) override {
         REQUIRE(cuMemFree(reinterpret_cast<CUdeviceptr>(buffer))
                 == CUDA_SUCCESS);
+        ++frees_;
     }
 
     void reset() override {}
+
+    [[nodiscard]] std::size_t allocation_count() const noexcept {
+        return allocations_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return frees_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::size_t> allocations_{0};
+    std::atomic<std::size_t> frees_{0};
 };
 
 // Hardware is required, never skipped: an enabled backend fails the test
@@ -196,14 +240,28 @@ public:
     void* alloc(std::size_t size) override {
         void* block = nullptr;
         REQUIRE(hipMalloc(&block, size) == kHipSuccess);
+        ++allocations_;
         return block;
     }
 
     void free(void* buffer) override {
         REQUIRE(hipFree(buffer) == kHipSuccess);
+        ++frees_;
     }
 
     void reset() override {}
+
+    [[nodiscard]] std::size_t allocation_count() const noexcept {
+        return allocations_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t free_count() const noexcept {
+        return frees_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::size_t> allocations_{0};
+    std::atomic<std::size_t> frees_{0};
 };
 
 [[nodiscard]] int hip_runtime_device_count() {
@@ -630,4 +688,193 @@ TEST_CASE("Backend coexistence: queue ids release, reuse, and stay unique") {
     // A stale sequence the recreated queue never submitted stays
     // caller-invalid even though it carries the recycled id.
     CHECK_THROWS_AS(recreated->wait(repeat_token), std::invalid_argument);
+}
+
+// Barrier-based concurrent queue creation and submission on one device.
+// Independent threads race the per-device registry queue-id counter while
+// creating queues and the per-device source/destination entry-id counter
+// while submitting multi-plane copies; every queue must end up with a
+// distinct registry identity, every operation with one unique entry pair,
+// and destroying one queue must invalidate only that queue's own entries.
+// The counting allocator makes the invalidation observable: a surviving
+// queue's outstanding entry stays live, so its destination storage is
+// released (freed) at tensor destruction -- never quarantined by another
+// queue's teardown -- and every allocated tensor storage is freed exactly
+// once. TTNN owns native storage and has no caller allocator, so its call
+// site passes a scalar placeholder (`int`, never dereferenced); for
+// non-class placeholders the allocator-count code is discarded at compile
+// time and the scenario runs without the free-count assertions.
+template <typename CountingAllocator>
+void run_concurrent_queue_scenario(
+        const char* name, iom::Device& device,
+        CountingAllocator* counting_allocator) {
+    CAPTURE(name);
+    constexpr int kQueues = 6;
+    constexpr int kCopiesPerQueue = 12;
+    const iom::TensorSpec spec = coexistence_spec();
+    const std::vector<std::byte> expected =
+            iom_conformance::encode_logical(spec, 13);
+
+    [[maybe_unused]] std::size_t allocations_before = 0;
+    [[maybe_unused]] std::size_t frees_before = 0;
+    if constexpr (std::is_class_v<CountingAllocator>) {
+        if (counting_allocator != nullptr) {
+            allocations_before = counting_allocator->allocation_count();
+            frees_before = counting_allocator->free_count();
+        }
+    } else {
+        static_cast<void>(counting_allocator);
+    }
+
+    {
+        auto source = device.create_tensor(spec);
+        source->view().copy_from_host(expected);
+        std::vector<std::unique_ptr<iom::Tensor>> destination;
+        destination.reserve(kQueues);
+        for (int queue = 0; queue < kQueues; ++queue) {
+            destination.push_back(device.create_tensor(spec));
+        }
+
+        std::vector<std::unique_ptr<iom::DeviceOps>> queue(kQueues);
+        std::vector<std::vector<iom::oid>> tokens(kQueues);
+        std::atomic<bool> failed = false;
+        std::barrier gate(kQueues + 1);
+        std::vector<std::thread> threads;
+        threads.reserve(kQueues);
+        for (int worker = 0; worker < kQueues; ++worker) {
+            threads.emplace_back([&, worker] {
+                try {
+                    // Queue creation races the per-device registry
+                    // queue-id counter across these threads.
+                    gate.arrive_and_wait();
+                    queue[worker] = device.create_ops();
+                    // Copy submission races the per-device entry-id
+                    // counter across the queues' worker paths.
+                    gate.arrive_and_wait();
+                    for (int copy_index = 0;
+                         copy_index < kCopiesPerQueue; ++copy_index) {
+                        tokens[worker].push_back(queue[worker]->copy(
+                                source->view(),
+                                destination[worker]->view()));
+                    }
+                    gate.arrive_and_wait();
+                    for (const iom::oid token : tokens[worker]) {
+                        queue[worker]->wait(token);
+                    }
+                } catch (...) {
+                    failed.store(true, std::memory_order_release);
+                }
+            });
+        }
+        gate.arrive_and_wait();
+        gate.arrive_and_wait();
+        gate.arrive_and_wait();
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        CHECK_FALSE(failed.load(std::memory_order_acquire));
+
+        // Every operation completed; every destination matches the CPU
+        // reference, proving each copy ran with its own unique entry pair.
+        for (int worker = 0; worker < kQueues; ++worker) {
+            iom_conformance::require_logical_bytes(
+                    destination[worker]->view(), expected, name);
+        }
+
+        // Destroying one queue must invalidate only its own entries. A
+        // surviving queue holds an outstanding copy; its entry must stay
+        // live so its destination storage is released at destruction,
+        // not quarantined by the destroyed queue's teardown.
+        std::vector<std::unique_ptr<iom::Tensor>> late_destination(
+                kQueues - 1);
+        for (int survivor = 1; survivor < kQueues; ++survivor) {
+            late_destination[survivor - 1] = device.create_tensor(spec);
+        }
+        std::vector<iom::oid> late_tokens(kQueues - 1);
+        for (int survivor = 1; survivor < kQueues; ++survivor) {
+            late_tokens[survivor - 1] = queue[survivor]->copy(
+                    source->view(),
+                    late_destination[survivor - 1]->view());
+        }
+        queue[0].reset();
+        for (int survivor = 1; survivor < kQueues; ++survivor) {
+            queue[survivor]->wait(late_tokens[survivor - 1]);
+            if constexpr (std::is_class_v<CountingAllocator>) {
+                if (counting_allocator != nullptr) {
+                    const std::size_t frees_before_survivor =
+                            counting_allocator->free_count();
+                    late_destination[survivor - 1].reset();
+                    CHECK_EQ(
+                            counting_allocator->free_count(),
+                            frees_before_survivor + 1);
+                } else {
+                    late_destination[survivor - 1].reset();
+                }
+            } else {
+                late_destination[survivor - 1].reset();
+            }
+        }
+
+        // Surviving queues keep submitting and completing after the other
+        // queue's teardown.
+        for (int survivor = 1; survivor < kQueues; ++survivor) {
+            const iom::oid token = queue[survivor]->copy(
+                    source->view(), destination[survivor]->view());
+            queue[survivor]->wait(token);
+            iom_conformance::require_logical_bytes(
+                    destination[survivor]->view(), expected, name);
+        }
+    }
+
+    // All 12 tensor storages were freed exactly once at their destruction:
+    // none was left quarantined by a cross-queue invalidation and none was
+    // released twice.
+    if constexpr (std::is_class_v<CountingAllocator>) {
+        if (counting_allocator != nullptr) {
+            CHECK_EQ(
+                    counting_allocator->allocation_count(),
+                    allocations_before + 12);
+            CHECK_EQ(counting_allocator->free_count(), frees_before + 12);
+        }
+    }
+}
+
+// The registry stores per-device queue and entry ids; concurrent queue
+// creation and submission on one device must stay serialized so every queue
+// receives a distinct registry identity and every copy a unique entry pair.
+TEST_CASE(
+        "Backend coexistence: concurrent queue creation and submission "
+        "on one device") {
+    {
+        HostAllocator allocator;
+        auto device = iom::make_cpu_device(allocator);
+        run_concurrent_queue_scenario("cpu", *device, &allocator);
+    }
+#ifdef IOM_COEXIST_CUDA
+    {
+        CudaMemoryAllocator allocator;
+        auto device = iom::make_cuda_device(0, allocator);
+        run_concurrent_queue_scenario("cuda", *device, &allocator);
+    }
+#endif
+#ifdef IOM_COEXIST_ROCM
+    {
+        HipMemoryAllocator allocator;
+        auto device = iom::make_rocm_device(0, allocator);
+        run_concurrent_queue_scenario("rocm", *device, &allocator);
+    }
+#endif
+#ifdef IOM_COEXIST_SYCL
+    {
+        SyclUsmAllocator allocator;
+        auto device = make_sycl_device_with_allocator(0, allocator);
+        run_concurrent_queue_scenario("sycl", *device, &allocator);
+    }
+#endif
+#ifdef IOM_COEXIST_TTNN
+    {
+        auto device = iom::make_ttnn_device(0);
+        run_concurrent_queue_scenario<int>("ttnn", *device, nullptr);
+    }
+#endif
 }

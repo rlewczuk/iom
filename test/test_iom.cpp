@@ -1,8 +1,9 @@
 #include <doctest/doctest.h>
 #include <algorithm>
 #include <array>
-#include <condition_variable>
 #include <atomic>
+#include <barrier>
+#include <condition_variable>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -2686,6 +2687,94 @@ TEST_CASE(
             std::numeric_limits<iom::detail::EntryId>::max());
     CHECK(registry.snapshot_for(source_address).empty());
     CHECK(registry.snapshot_for(destination_address).empty());
+}
+
+TEST_CASE(
+        "RegistryState allocates unique queue ids and entry-id pairs "
+        "under concurrent threads") {
+    iom::detail::RegistryState state;
+    constexpr int kThreads = 8;
+    constexpr int kRegistrationsPerThread = 64;
+    constexpr std::size_t kRegistrations =
+            static_cast<std::size_t>(kThreads)
+            * kRegistrationsPerThread;
+
+    std::atomic<std::size_t> next_address{0};
+    std::atomic<bool> failed{false};
+    std::array<iom::detail::QueueId, kThreads> queue_ids{};
+    std::vector<iom::detail::EntryId> source_ids(kRegistrations, 0);
+    std::vector<iom::detail::EntryId> destination_ids(
+            kRegistrations, 0);
+
+    const auto run_one = [&](int thread) {
+        queue_ids[thread] = iom::detail::allocate_queue_id(state);
+        for (int iteration = 0;
+             iteration < kRegistrationsPerThread; ++iteration) {
+            const std::size_t slot =
+                    static_cast<std::size_t>(thread)
+                    * kRegistrationsPerThread + iteration;
+            const std::size_t base =
+                    next_address.fetch_add(2, std::memory_order_relaxed);
+            void* source_address =
+                    reinterpret_cast<void*>(0x4000 + 2 * base);
+            void* destination_address =
+                    reinterpret_cast<void*>(0x4000 + 2 * base + 1);
+            const iom::detail::EntryRegistration registration =
+                    iom::detail::register_copy_entries(
+                            state, queue_ids[thread],
+                            static_cast<std::uint64_t>(iteration + 1),
+                            source_address, destination_address,
+                            make_test_fence(nullptr));
+            source_ids[slot] = registration.source;
+            destination_ids[slot] = registration.destination;
+        }
+    };
+
+    std::barrier gate(kThreads + 1);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int thread = 0; thread < kThreads; ++thread) {
+        threads.emplace_back([&, thread] {
+            try {
+                gate.arrive_and_wait();
+                run_one(thread);
+            } catch (...) {
+                failed.store(true, std::memory_order_release);
+            }
+        });
+    }
+    gate.arrive_and_wait();
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    CHECK_FALSE(failed.load(std::memory_order_acquire));
+
+    // Queue ids on one RegistryState are unique and never skipped: the
+    // counter assigns exactly 1..kThreads across the racing callers.
+    std::set<iom::detail::QueueId> unique_queue_ids(
+            queue_ids.begin(), queue_ids.end());
+    CHECK_EQ(unique_queue_ids.size(), kThreads);
+    CHECK_EQ(*unique_queue_ids.begin(), 1u);
+    CHECK_EQ(*unique_queue_ids.rbegin(),
+             static_cast<iom::detail::QueueId>(kThreads));
+
+    // Every reserved source/destination pair is one atomic reservation:
+    // the 2*kRegistrations entry ids are exactly 1..2*kRegistrations, each
+    // pair contiguous (destination == source + 1), with no duplicate or
+    // skipped id observed under the barrier-synchronized submissions.
+    std::set<iom::detail::EntryId> all_ids(
+            source_ids.begin(), source_ids.end());
+    for (const iom::detail::EntryId id : destination_ids) {
+        all_ids.insert(id);
+    }
+    CHECK_EQ(all_ids.size(), 2 * kRegistrations);
+    CHECK_EQ(*all_ids.begin(), 1u);
+    CHECK_EQ(*all_ids.rbegin(),
+             static_cast<iom::detail::EntryId>(2 * kRegistrations));
+    for (std::size_t slot = 0; slot < kRegistrations; ++slot) {
+        CHECK_NE(source_ids[slot], 0u);
+        CHECK_EQ(destination_ids[slot], source_ids[slot] + 1);
+    }
 }
 
 TEST_CASE(

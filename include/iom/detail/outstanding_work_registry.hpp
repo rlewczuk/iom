@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <span>
 #include <stdexcept>
@@ -587,6 +588,13 @@ struct RegistryState {
     Quarantine quarantine;
     EntryId next_entry_id = 1;
     QueueId next_queue_id = 1;
+    // Serializes mutable ID allocation for this device registry. The
+    // registry map mutex guards only map operations; this separate lock
+    // guards the shared ID counters so concurrent queue creation and copy
+    // submission reserve unique queue ids and unique source/destination
+    // entry-id pairs. It is held across the whole pair reservation, keeping
+    // one source/destination pair a single reservation.
+    mutable std::mutex allocation_mutex;
 };
 
 
@@ -644,12 +652,14 @@ inline EntryRegistration register_registry_entries(
 
 
 inline QueueId allocate_queue_id(RegistryState& state) {
+    std::lock_guard<std::mutex> lock(state.allocation_mutex);
     return allocate_registry_queue_id(state.next_queue_id);
 }
 
 inline EntryRegistration register_copy_entries(
         RegistryState& state, QueueId queue_id, std::uint64_t sequence,
         void* source, void* destination, const Fence& fence) {
+    std::lock_guard<std::mutex> lock(state.allocation_mutex);
     return register_registry_entries(
             state.registry, state.next_entry_id, queue_id, sequence, source,
             destination, fence);
