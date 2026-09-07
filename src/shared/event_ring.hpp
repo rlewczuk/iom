@@ -74,6 +74,13 @@ public:
         std::size_t pool_index_ = kNoAttachedSlot;
         FenceResult result_ = FenceResult::pending();
         std::size_t metadata_slot_ = kNoAttachedSlot;
+        // True once this submission's on_worker_complete successfully
+        // synchronized its pooled event. Fresh records start false; because
+        // acquire() constructs a new record for every reuse of a pool entry,
+        // the marker is implicitly reset on slot acquire. It stays false for
+        // queue-drain and failed/partially-observed paths, which must still
+        // perform the noexcept cleanup wait on on_worker_destroy.
+        bool synchronized_on_complete_ = false;
     };
 
     EventRingState(
@@ -145,6 +152,7 @@ public:
             Policy::synchronize_event(
                     slots_[submission.pool_index_].event);
             result = FenceResult::success();
+            submission.synchronized_on_complete_ = true;
         } catch (...) {
             result = FenceResult::failed(std::current_exception());
         }
@@ -158,15 +166,21 @@ public:
     // Releases the recorded event's resources (metadata) for reuse. The
     // pooled event itself is only returned to the pool once the submission
     // record is destroyed (its last fence reference gone), so an earlier
-    // fence can never read a later submission's state.
+    // fence can never read a later submission's state. Normal completion is
+    // waited exactly once: on_worker_destroy skips the second synchronization
+    // when the worker's on_worker_complete already waited and observed this
+    // event successfully. Queue-drain and failed/partially-observed paths
+    // (marker unset) retain the required cleanup wait.
     void on_worker_destroy(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        try {
-            Policy::activate(context_);
-        } catch (...) {
+        if (!submission.synchronized_on_complete_) {
+            try {
+                Policy::activate(context_);
+            } catch (...) {
+            }
+            Policy::synchronize_event_noexcept(
+                    slots_[submission.pool_index_].event);
         }
-        Policy::synchronize_event_noexcept(
-                slots_[submission.pool_index_].event);
         if (submission.metadata_slot_ != kNoAttachedSlot) {
             metadata_pool_->release(submission.metadata_slot_);
             submission.metadata_slot_ = kNoAttachedSlot;
