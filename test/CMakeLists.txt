@@ -52,6 +52,14 @@ set_source_files_properties(cpu/test_cpu_bench.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 )
 
+# CPU bandwidth/latency benchmark. Registered as a generic CTest test, the
+# executable reports workload, compiler/OS, detected hardware, and sample
+# distributions without failing on the one-host absolute floors. Threshold
+# enforcement is a deliberate controlled-run contract: the binary asserts the
+# calibrated floors/allowance only when the environment variable
+# IOM_CPU_BENCH_ENFORCE_FLOORS=1 is set AND the detected runner matches the
+# calibrated reference host (AMD Ryzen AI 9 HX 370, Linux x86-64). See
+# docs/changes/01-review/17-PF-006-decouple-cpu-bench-from-ctest-thresholds.
 add_test(NAME iom_cpu_bench COMMAND iom_cpu_bench)
 
 function(add_iom_backend_tests name)
