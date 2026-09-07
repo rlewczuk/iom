@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "../../src/ttnn/staging.hpp"
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -343,6 +344,31 @@ public:
 
 
 }  // namespace
+
+TEST_CASE("TTNN download retirement preserves slot ownership") {
+    using DownloadLease = iom::ttnn_detail::TtnnHostStaging::DownloadLease;
+    static_assert(noexcept(std::declval<DownloadLease&>().retire()));
+    static_assert(noexcept(std::declval<DownloadLease&>().~DownloadLease()));
+
+    iom::ttnn_detail::TtnnHostStaging staging;
+    auto lease = staging.acquire_download(8);
+    std::byte* const retained = lease.data();
+    const std::size_t allocations =
+            iom::ttnn_test::host_transfer_staging_allocation_count_for_testing();
+    lease.retire();
+
+    CHECK(staging.download_retired());
+    CHECK_EQ(
+            iom::ttnn_test::host_transfer_staging_allocation_count_for_testing(),
+            allocations);
+    CHECK_THROWS_AS(
+            staging.acquire_download(8), std::logic_error);
+
+    staging.reclaim_download();
+    auto reclaimed = staging.acquire_download(8);
+    CHECK_EQ(reclaimed.data(), retained);
+    reclaimed.release();
+}
 
 // The supported-type table is explicit, nonempty, includes BF16, and is the
 // single source for both creation validation and conformance

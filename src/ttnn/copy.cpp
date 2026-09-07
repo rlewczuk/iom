@@ -411,12 +411,18 @@ namespace iom::ttnn_detail {
             throw std::overflow_error(
                     "TTNN download staging byte count overflows");
         }
+        // A retired slot still protects bytes referenced by an earlier
+        // transfer. Prove completion before reclaiming it for new work.
+        auto& queue = device.mesh_command_queue(0);
+        if (staging.download_retired()) {
+            queue.finish();
+            staging.reclaim_download();
+        }
         // The retained byte staging buffer covers every padded plane of the
         // region and is returned only after the single finish below.
         const std::size_t total_bytes = count * padded_plane_bytes;
         TtnnHostStaging::DownloadLease lease =
                 staging.acquire_download(total_bytes);
-        auto& queue = device.mesh_command_queue(0);
         std::exception_ptr original_failure;
         try {
             for (std::size_t index = 0; index < count; ++index) {

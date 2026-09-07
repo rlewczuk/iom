@@ -203,6 +203,10 @@ namespace iom::ttnn_detail {
         // no retained allocation fits.
         [[nodiscard]] DownloadLease acquire_download(
                 std::size_t required_bytes) {
+            if (download_slot_.retired) {
+                throw std::logic_error(
+                        "TTNN download staging slot is retired");
+            }
             if (download_slot_.in_use) {
                 throw std::logic_error(
                         "TTNN download staging slot already leased");
@@ -212,6 +216,17 @@ namespace iom::ttnn_detail {
             return DownloadLease{
                     *this, download_slot_.data.data()};
         }
+
+        [[nodiscard]] bool download_retired() const noexcept {
+            return download_slot_.retired;
+        }
+
+        // Reclaims the download slot only after a successful finish covering
+        // all work that could still reference its retained bytes.
+        void reclaim_download() noexcept {
+            download_slot_.retired = false;
+        }
+
         // Reclaims retired upload slots after a successful finish covering
         // the queue's prior work. This only changes state and never allocates.
         void reclaim_retired_uploads() noexcept {
@@ -234,6 +249,7 @@ namespace iom::ttnn_detail {
         struct DownloadSlot {
             std::vector<std::byte> data;
             bool in_use = false;
+            bool retired = false;
         };
 
         enum class DownloadDisposition { Keep, Discard, Retire };
@@ -291,8 +307,7 @@ namespace iom::ttnn_detail {
                     std::vector<std::byte>().swap(slot.data);
                     break;
                 case DownloadDisposition::Retire:
-                    retired_.push_back(std::move(slot.data));
-                    slot.data.clear();
+                    slot.retired = true;
                     break;
             }
         }
@@ -300,10 +315,10 @@ namespace iom::ttnn_detail {
         std::array<std::vector<UploadSlot>, kUploadSlotListCount>
                 upload_slots_;
         DownloadSlot download_slot_;
-        std::vector<std::vector<std::byte>> retired_;
 
         friend class UploadLease;
         friend class DownloadLease;
+
     };
 
 }  // namespace iom::ttnn_detail
