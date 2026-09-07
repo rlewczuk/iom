@@ -220,14 +220,12 @@ struct gpu_policy {
             noexcept {
         return "CUDA copy kernel launch";
     }
+
+    [[nodiscard]] static constexpr const char* backend_label() noexcept {
+        return "CUDA";
+    }
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
-struct EventLeaseWithFailure {
-    std::shared_ptr<EventRingState::Submission> submission;
-    std::exception_ptr retained_failure;
-};
-static_assert(sizeof(EventLeaseWithFailure) <= iom::detail::kFenceStorageBytes);
-static_assert(alignof(EventLeaseWithFailure) <= iom::detail::kFenceStorageAlign);
 
 using StagingSlotPool = iom::detail::StagingSlotPool<gpu_policy>;
 using TransferStreamPool = iom::detail::TransferStreamPool<gpu_policy>;
