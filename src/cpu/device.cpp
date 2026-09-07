@@ -16,9 +16,7 @@
 #include <vector>
 
 #include "iom/iom.hpp"
-#include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/detail/aligned_storage.hpp"
-#include "registry_state.hpp"
 
 namespace iom {
 
@@ -436,10 +434,6 @@ namespace iom {
         explicit CpuDevice(Allocator& allocator)
                 : allocator_(allocator) {}
 
-        ~CpuDevice() override {
-            registry_state_.quarantine.drain();
-        }
-
         [[nodiscard]] BackendKind backend_kind() const noexcept override {
             return BackendKind::CPU;
         }
@@ -457,12 +451,7 @@ namespace iom {
                 const TensorSpec& spec) override;
         [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override;
 
-        [[nodiscard]] cpu_detail::CpuRegistryState& registry_state() noexcept {
-            return registry_state_;
-        }
-
     private:
-        cpu_detail::CpuRegistryState registry_state_;
         Allocator& allocator_;
     };
 
@@ -475,8 +464,7 @@ namespace iom {
     public:
         CpuTensor(const TensorSpec& spec, CpuDevice& device,
                   Allocator& allocator)
-                : Tensor(spec, device), device_(device),
-                  allocator_(allocator) {
+                : Tensor(spec, device), allocator_(allocator) {
             address_ = iom::detail::allocate_aligned_storage(
                     allocator_,
                     view().spec().tiled_storage_nbytes(),
@@ -485,28 +473,10 @@ namespace iom {
         }
 
         ~CpuTensor() noexcept override {
-            if (address_ == nullptr) {
-                return;
-            }
-
-            const std::size_t bytes = view().spec().tiled_storage_nbytes();
-            const auto quarantine_storage = [this, bytes]() noexcept {
-                try {
-                    device_.registry_state().quarantine
-                            .emplace<detail::AllocatorCleanupAction>(
-                                    allocator_, address_, bytes);
-                } catch (...) {
-                    // Leaking is safer than returning failed storage to the
-                    // allocator when quarantine allocation itself fails.
-                }
-                address_ = nullptr;
-            };
-            const auto release_storage = [this]() noexcept {
-                iom::detail::release_aligned_storage(allocator_, address_);
-            };
-            iom::detail::release_or_quarantine(
-                    device_.registry_state().registry, address_,
-                    quarantine_storage, release_storage);
+            // CPU copies complete inline before CpuQueue::copy returns, so no
+            // deferred outstanding-work registry protection exists: release
+            // the allocator block exactly once, directly to the allocator.
+            iom::detail::release_aligned_storage(allocator_, address_);
         }
 
     private:
@@ -688,7 +658,6 @@ namespace iom {
                         }
                     });
         }
-        CpuDevice& device_;
         Allocator& allocator_;
         void* address_ = nullptr;
     };

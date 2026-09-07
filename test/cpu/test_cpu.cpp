@@ -917,9 +917,13 @@ TEST_CASE("CPU rank-two views transfer through empty transforms") {
 // ---------------------------------------------------------------------------
 
 
+// CPU copies complete inline before CpuQueue::copy returns: destroying a
+// tensor before waiting its token frees storage immediately (no deferred
+// outstanding-work protection exists), the fresh tensor recycles the same
+// address, and later waits remain idempotent.
 TEST_CASE(
-        "CPU tensor destruction before wait fences queued work under address "
-        "recycling") {
+        "CPU tensor destruction before wait frees inline and recycles "
+        "addresses") {
     enum class DestroyRole { source, destination, both };
     const iom::TensorSpec spec =
             make_spec({2, 3, 16, 16}, iom::DataType::U8);
@@ -1062,6 +1066,10 @@ TEST_CASE(
     }
 }
 
+// CPU copies complete inline before CpuQueue::copy returns, so no fence or
+// quarantine defers storage release: destroying tensors after queue
+// destruction frees each block exactly once, and fresh tensors recycle the
+// addresses.
 TEST_CASE(
         "CPU queue destruction with unwaited tokens keeps frees exactly once") {
     RecyclingAllocator allocator;
