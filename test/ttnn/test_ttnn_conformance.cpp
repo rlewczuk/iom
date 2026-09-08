@@ -220,8 +220,8 @@ void write_padded_plane_image(
 // tile-major bytes; coordinates are mapped through the native tile geometry,
 // never by assuming the native and standard layouts agree, so native padding
 // writes and physical tile-slot permutations surface instead of being
-// normalized away.
-void observe_plane_storage(
+// normalized away. Returns whether every native-only cell is zero.
+bool observe_plane_storage(
         std::span<const std::byte> readback,
         const ttnn::Tensor& plane, const iom::TensorSpec& owner,
         std::size_t plane_index, std::size_t element_bytes,
@@ -234,17 +234,31 @@ void observe_plane_storage(
     const std::span<const std::size_t> padded = padded_shape.dimensions();
     const std::size_t padded_rows = padded[padded.size() - 2];
     const std::size_t padded_columns = padded[padded.size() - 1];
-    for (std::size_t row = 0; row < padded_rows; ++row) {
-        for (std::size_t column = 0; column < padded_columns; ++column) {
-            const std::size_t slot = iom::detail::standard_plane_slot(
-                    owner, plane_index, row, column);
+    bool native_padding_zero = true;
+    for (std::size_t row = 0; row < native.padded_rows; ++row) {
+        for (std::size_t column = 0; column < native.padded_columns;
+             ++column) {
             const std::size_t position = native.element_index(row, column);
-            std::memcpy(
-                    storage.data() + slot * element_bytes,
-                    readback.data() + position * element_bytes,
-                    element_bytes);
+            const std::byte* cell =
+                    readback.data() + position * element_bytes;
+            if (row >= padded_rows || column >= padded_columns) {
+                native_padding_zero = native_padding_zero
+                        && std::all_of(
+                                cell, cell + element_bytes,
+                                [](std::byte value) {
+                                    return value == std::byte{0};
+                                });
+            }
+            if (row < padded_rows && column < padded_columns) {
+                const std::size_t slot = iom::detail::standard_plane_slot(
+                        owner, plane_index, row, column);
+                std::memcpy(
+                        storage.data() + slot * element_bytes, cell,
+                        element_bytes);
+            }
         }
     }
+    return native_padding_zero;
 }
 
 class TtnnStorageOracle final
@@ -330,16 +344,26 @@ public:
         }
         queue.finish();
 
+        native_padding_zero_ = true;
         offset = 0;
         for (std::size_t i = 0; i < planes_count; ++i) {
-            observe_plane_storage(
-                    std::span<const std::byte>(
-                            staging.get() + offset, plane_bytes[i]),
-                    planes[i], owner, i, element_bytes, storage);
+            native_padding_zero_ =
+                    observe_plane_storage(
+                            std::span<const std::byte>(
+                                    staging.get() + offset, plane_bytes[i]),
+                            planes[i], owner, i, element_bytes, storage)
+                    && native_padding_zero_;
             offset += plane_bytes[i];
         }
         return storage;
     }
+
+    [[nodiscard]] bool native_padding_zero() const {
+        return native_padding_zero_;
+    }
+
+private:
+    mutable bool native_padding_zero_ = true;
 };
 
 
@@ -547,7 +571,6 @@ TEST_CASE("TTNN conformance: storage oracle identifies perturbed transfer map") 
             devices.conformance(), one_type, perturbed, nullptr, false,
             false));
 }
-
 TEST_CASE("TTNN conformance: storage oracle covers every leaf width and padded shape") {
     require_hardware();
     TtnnDevices devices;
@@ -555,71 +578,77 @@ TEST_CASE("TTNN conformance: storage oracle covers every leaf width and padded s
     REQUIRE(iom_conformance::run_storage_oracle_conformance(
             devices.conformance(), iom::ttnn_supported_data_types(), oracle));
 }
-
 // Decisive padded-storage probe: the full-storage oracle observes the
-// complete native padded allocation, so a nonzero native padding write fails
-// it while the logical host projection stays byte-identical, and a logical
-// host write re-establishes the documented zero policy.
+// complete native padded allocation, so nonzero native-only writes fail it
+// while the logical host projection stays byte-identical, and a logical host
+// write re-establishes the documented zero policy.
 TEST_CASE("TTNN conformance: full-storage oracle exposes native padding mutations") {
     require_hardware();
     TtnnDevices devices;
-    const iom::TensorSpec spec{
-            iom::TensorShape{{17, 33}}, iom::DataType::U8};
-    auto tensor = devices.candidate->create_tensor(spec);
     TtnnStorageOracle oracle;
-    oracle.set_owner_spec(spec);
-    iom::TensorView& view = tensor->view();
-    auto* planes = static_cast<ttnn::Tensor*>(view.native_handle());
-    const std::vector<std::byte> initial =
-            iom_conformance::encode_standard_tiled_storage(spec);
+    const std::vector<std::pair<iom::TensorSpec, std::pair<std::size_t, std::size_t>>>
+            cases = {
+                    {iom::TensorSpec{
+                             iom::TensorShape{{17, 33}}, iom::DataType::U8},
+                     {0, 48}},
+                    {iom::TensorSpec{
+                             iom::TensorShape{{33, 17}}, iom::DataType::U8},
+                     {48, 0}}};
 
-    // Plant a nonzero sentinel in the first padded row's leading cell through
-    // the independent padded native write path, preserving every logical
-    // value from the encoded model.
-    const std::size_t planted_row = spec.shape.dimension(0);
-    const std::size_t planted_column = 0;
-    const std::pair<std::size_t, std::size_t> planted_cells[] = {
-            {planted_row, planted_column}};
-    std::vector<std::byte> mutated = padded_plane_image(
-            planes[0], spec, 0, initial,
-            std::span<const std::pair<std::size_t, std::size_t>>{
-                    planted_cells});
-    write_padded_plane_image(planes[0], mutated);
+    for (const auto& [spec, planted_cell] : cases) {
+        CAPTURE(spec.shape.dimension(0));
+        CAPTURE(spec.shape.dimension(1));
+        CAPTURE(planted_cell.first);
+        CAPTURE(planted_cell.second);
+        auto tensor = devices.candidate->create_tensor(spec);
+        oracle.set_owner_spec(spec);
+        iom::TensorView& view = tensor->view();
+        auto* planes = static_cast<ttnn::Tensor*>(view.native_handle());
+        const TtnnPlaneLayout native(planes[0]);
+        const iom::TensorShape standard_shape =
+                spec.standard_padded_shape();
+        const std::span<const std::size_t> standard =
+                standard_shape.dimensions();
+        CHECK_EQ(native.padded_rows, planted_cell.first == 48 ? 64 : 32);
+        CHECK_EQ(native.padded_columns, planted_cell.second == 48 ? 64 : 32);
+        CHECK_EQ(standard[standard.size() - 2],
+                 planted_cell.first == 48 ? 48 : 32);
+        CHECK_EQ(standard[standard.size() - 1],
+                 planted_cell.second == 48 ? 48 : 32);
+        const std::vector<std::byte> initial =
+                iom_conformance::encode_standard_tiled_storage(spec);
 
-    // A padded-cell mutation fails full-storage observation at exactly the
-    // planted standard slot; the logical projection is unchanged.
-    const std::vector<std::byte> observed = oracle.observe(view);
-    CHECK_FALSE(iom_conformance::require_storage_oracle_bytes(
-            observed, initial, "planted padding mutation", false));
-    std::size_t first_mismatch = observed.size();
-    std::size_t mismatch_count = 0;
-    for (std::size_t i = 0; i < observed.size(); ++i) {
-        if (observed[i] != initial[i]) {
-            if (mismatch_count == 0) {
-                first_mismatch = i;
-            }
-            ++mismatch_count;
-        }
+        const std::pair<std::size_t, std::size_t> planted_cells[] = {
+                planted_cell};
+        std::vector<std::byte> mutated = padded_plane_image(
+                planes[0], spec, 0, initial,
+                std::span<const std::pair<std::size_t, std::size_t>>{
+                        planted_cells});
+        write_padded_plane_image(planes[0], mutated);
+
+        const std::vector<std::byte> observed = oracle.observe(view);
+        CHECK_FALSE(oracle.native_padding_zero());
+        REQUIRE(iom_conformance::require_storage_oracle_bytes(
+                observed, initial, "native-only padding mutation", true));
+        iom_conformance::require_logical_bytes(
+                view,
+                iom_conformance::decode_standard_tiled_view(
+                        view, spec, initial),
+                "logical projection after native-only padding mutation");
+
+        const std::vector<std::byte> pattern =
+                iom_conformance::encode_logical(spec, 0x2A);
+        view.copy_from_host(pattern);
+        std::vector<std::byte> expected = initial;
+        iom_conformance::apply_standard_tiled_view(view, spec, pattern, expected);
+        const std::vector<std::byte> restored = oracle.observe(view);
+        REQUIRE(oracle.native_padding_zero());
+        REQUIRE(iom_conformance::require_storage_oracle_bytes(
+                restored, expected,
+                "logical write re-establishes native zero padding", true));
+        iom_conformance::require_logical_bytes(
+                view, pattern, "logical write content");
     }
-    const std::size_t planted_slot = iom::detail::standard_plane_slot(
-            spec, 0, planted_row, planted_column);
-    CHECK_EQ(mismatch_count, 1);
-    CHECK_EQ(first_mismatch, planted_slot);
-    iom_conformance::require_logical_bytes(
-            view, iom_conformance::decode_standard_tiled_view(view, spec, initial),
-            "logical projection after native padding mutation");
-
-    // A logical host write goes through the production upload, which
-    // zero-fills native padding: full-storage observation now matches the
-    // expected untouched/zero policy exactly.
-    const std::vector<std::byte> pattern = iom_conformance::encode_logical(spec, 0x2A);
-    view.copy_from_host(pattern);
-    std::vector<std::byte> expected = initial;
-    iom_conformance::apply_standard_tiled_view(view, spec, pattern, expected);
-    REQUIRE(iom_conformance::require_storage_oracle_bytes(
-            oracle.observe(view), expected,
-            "logical write re-establishes zero padding", true));
-    iom_conformance::require_logical_bytes(view, pattern, "logical write content");
 }
 
 TEST_CASE("TTNN conformance: asynchronous copies against the CPU reference") {
