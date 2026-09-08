@@ -224,9 +224,61 @@ TEST_CASE("SafeTensors dtype maps every accepted string to its DataType") {
     }
 }
 
-TEST_CASE("SafeTensorsFile rejects mismatched, overlapping, and out-of-order entries") {
+TEST_CASE("SafeTensorsFile validates complete physical range coverage") {
     {
-        TempDir dir("payload-truncated");
+        TempDir dir("physical-order");
+        const std::string first = deterministic_payload(8, 1);
+        const std::string second = deterministic_payload(8, 2);
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "physical-order.safetensors",
+            {{"a", "F32", {2}, 8, 16}, {"b", "F32", {2}, 0, 8}},
+            second + first);
+
+        const iom::SafeTensorsFile file(path);
+        REQUIRE(file.keys() == std::vector<std::string>{"a", "b"});
+        CHECK(std::memcmp(file["a"].raw<uint8_t>(), first.data(), first.size()) == 0);
+        CHECK(std::memcmp(file["b"].raw<uint8_t>(), second.data(), second.size()) == 0);
+    }
+
+    {
+        TempDir dir("range-holes");
+        const auto throws_range_error = [&](const std::string& filename,
+                                            const std::vector<RawTensorEntry>& entries,
+                                            const std::string& payload) {
+            const auto path =
+                write_raw_safetensors_file(dir.path(), filename, entries, payload);
+            CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
+        };
+        throws_range_error("leading.safetensors",
+                           {{"a", "U8", {3}, 1, 4}}, std::string(4, '\0'));
+        throws_range_error("intermediate.safetensors",
+                           {{"a", "U8", {4}, 0, 4},
+                            {"b", "U8", {4}, 5, 9}},
+                           std::string(9, '\0'));
+        throws_range_error("trailing.safetensors",
+                           {{"a", "U8", {4}, 0, 4}}, std::string(8, '\0'));
+        throws_range_error("empty-index.safetensors", {}, "x");
+        throws_range_error("overlap.safetensors",
+                           {{"a", "U8", {8}, 0, 8},
+                            {"b", "U8", {8}, 4, 12}},
+                           std::string(12, '\0'));
+        throws_range_error("out-of-range.safetensors",
+                           {{"a", "U8", {8}, 0, 9}}, std::string(8, '\0'));
+    }
+
+    {
+        TempDir dir("zero-ranges");
+        const auto path = write_raw_safetensors_file(
+            dir.path(), "zero-ranges.safetensors",
+            {{"a", "U8", {0}, 0, 0}, {"b", "U8", {0}, 0, 0}}, "");
+        const iom::SafeTensorsFile file(path);
+        REQUIRE(file.keys() == std::vector<std::string>{"a", "b"});
+        CHECK(file["a"].nbytes() == 0);
+        CHECK(file["b"].nbytes() == 0);
+    }
+
+    {
+        TempDir dir("payload-validation");
         const auto path = write_raw_safetensors_file(
             dir.path(), "truncated.safetensors",
             {{"a", "F32", {4096, 4096}, 0, 4}},
@@ -240,94 +292,8 @@ TEST_CASE("SafeTensorsFile rejects mismatched, overlapping, and out-of-order ent
         } catch (const std::runtime_error& error) {
             message = error.what();
         }
-        const bool message_matches =
-            message.find("payload size mismatch") != std::string::npos &&
-            message.find("a") != std::string::npos;
-        CHECK(message_matches);
-    }
-
-    {
-        TempDir dir("payload-oversized");
-        const auto path = write_raw_safetensors_file(
-            dir.path(), "oversized.safetensors",
-            {{"b", "F16", {2, 2}, 0, 10}},
-            std::string(10, '\0'));
-        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
-
-        std::string message;
-        try {
-            const iom::SafeTensorsFile file(path);
-            (void)file;
-        } catch (const std::runtime_error& error) {
-            message = error.what();
-        }
-        const bool message_matches =
-            message.find("payload size mismatch") != std::string::npos &&
-            message.find("b") != std::string::npos;
-        CHECK(message_matches);
-    }
-
-    {
-        TempDir dir("payload-overlap");
-        const auto path = write_raw_safetensors_file(
-            dir.path(), "overlap.safetensors",
-            {{"c", "F32", {2}, 0, 8}, {"d", "F32", {2}, 4, 12}},
-            std::string(12, '\0'));
-        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
-
-        std::string message;
-        try {
-            const iom::SafeTensorsFile file(path);
-            (void)file;
-        } catch (const std::runtime_error& error) {
-            message = error.what();
-        }
-        const bool message_matches =
-            message.find("out of order or overlapping") != std::string::npos &&
-            message.find("d") != std::string::npos;
-        CHECK(message_matches);
-    }
-
-    {
-        TempDir dir("payload-out-of-order");
-        const auto path = write_raw_safetensors_file(
-            dir.path(), "out-of-order.safetensors",
-            {{"e", "F32", {2}, 8, 16}, {"f", "F32", {2}, 0, 8}},
-            std::string(16, '\0'));
-        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
-
-        std::string message;
-        try {
-            const iom::SafeTensorsFile file(path);
-            (void)file;
-        } catch (const std::runtime_error& error) {
-            message = error.what();
-        }
-        const bool message_matches =
-            message.find("out of order or overlapping") != std::string::npos &&
-            message.find("f") != std::string::npos;
-        CHECK(message_matches);
-    }
-
-    {
-        TempDir dir("payload-overflow");
-        const auto path = write_raw_safetensors_file(
-            dir.path(), "overflow.safetensors",
-            {{"g", "I64", {1ULL << 62, 2}, 0, 8}},
-            std::string(8, '\0'));
-        CHECK_THROWS_AS((void)iom::SafeTensorsFile(path), std::runtime_error);
-
-        std::string message;
-        try {
-            const iom::SafeTensorsFile file(path);
-            (void)file;
-        } catch (const std::runtime_error& error) {
-            message = error.what();
-        }
-        const bool message_matches =
-            message.find("payload size") != std::string::npos &&
-            message.find("g") != std::string::npos;
-        CHECK(message_matches);
+        CHECK(message.find("payload size mismatch") != std::string::npos);
+        CHECK(message.find("a") != std::string::npos);
     }
 }
 

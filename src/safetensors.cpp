@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 
 #include <nlohmann/json.hpp>
 
@@ -132,8 +134,14 @@ SafeTensorsFile::SafeTensorsFile(const std::string& filename)
         throw std::runtime_error("invalid safetensors header: " + filename);
     }
 
-    std::size_t prev_end = 0;
-    bool first_entry = true;
+    struct TensorRecord {
+        std::string name;
+        DataType dtype;
+        std::vector<size_t> shape;
+        size_t begin;
+        size_t end;
+    };
+    std::vector<TensorRecord> records;
     for (const auto& [name, tensor] : header.items()) {
         if (name == "__metadata__") {
             continue;
@@ -147,7 +155,8 @@ SafeTensorsFile::SafeTensorsFile(const std::string& filename)
         const auto offsets_it = tensor.find("data_offsets");
         if (dtype_it == tensor.end() || !dtype_it->is_string() ||
             shape_it == tensor.end() || !shape_it->is_array() ||
-            offsets_it == tensor.end() || !offsets_it->is_array() || offsets_it->size() != 2) {
+            offsets_it == tensor.end() || !offsets_it->is_array() ||
+            offsets_it->size() != 2) {
             throw std::runtime_error("invalid safetensors tensor fields: " + name);
         }
 
@@ -172,15 +181,40 @@ SafeTensorsFile::SafeTensorsFile(const std::string& filename)
                 " (expected " + std::to_string(expected_nbytes) +
                 " bytes, got " + std::to_string(end - begin) + " bytes)");
         }
-        if (!first_entry && begin < prev_end) {
-            throw std::runtime_error(
-                "safetensors tensor range out of order or overlapping: " + name);
-        }
+        records.push_back(
+            {name, dtype, std::move(shape), begin, end});
+    }
 
-        base_.insert(name, SafeTensorView(dtype, std::move(shape),
-                                           data_begin + begin, end - begin));
-        prev_end = end;
-        first_entry = false;
+    std::vector<size_t> physical_order(records.size());
+    std::iota(physical_order.begin(), physical_order.end(), 0);
+    std::sort(physical_order.begin(), physical_order.end(),
+              [&records](size_t lhs, size_t rhs) {
+                  return std::tie(records[lhs].begin, records[lhs].end) <
+                         std::tie(records[rhs].begin, records[rhs].end);
+              });
+    size_t cursor = 0;
+    for (const size_t index : physical_order) {
+        const TensorRecord& record = records[index];
+        if (record.begin != cursor) {
+            if (record.begin < cursor) {
+                throw std::runtime_error(
+                    "safetensors tensor range out of order or overlapping: " +
+                    record.name);
+            }
+            throw std::runtime_error(
+                "safetensors tensor ranges do not cover data: " + record.name);
+        }
+        cursor = record.end;
+    }
+    if (cursor != data_size) {
+        throw std::runtime_error("safetensors tensor ranges do not cover data");
+    }
+
+    for (TensorRecord& record : records) {
+        base_.insert(record.name,
+                     SafeTensorView(record.dtype, std::move(record.shape),
+                                    data_begin + record.begin,
+                                    record.end - record.begin));
     }
 }
 
