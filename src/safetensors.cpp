@@ -14,6 +14,7 @@
 namespace iom {
 namespace {
 
+constexpr uint64_t kMaxHeaderSize = 100'000'000;
 uint64_t read_le_u64(const uint8_t* data) {
     uint64_t value = 0;
     for (size_t i = 0; i < 8; ++i) {
@@ -114,7 +115,8 @@ size_t SafeTensorView::nbytes() const {
 SafeTensorsFile::SafeTensorsFile(const std::string& filename)
     : file_(filename, 8) {
     const uint64_t header_len_u64 = read_le_u64(file_.data());
-    if (header_len_u64 > std::numeric_limits<size_t>::max()) {
+    if (header_len_u64 > kMaxHeaderSize ||
+        header_len_u64 > std::numeric_limits<size_t>::max()) {
         throw std::runtime_error("safetensors header is too large: " + filename);
     }
 

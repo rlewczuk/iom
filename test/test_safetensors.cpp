@@ -163,6 +163,67 @@ std::string write_raw_safetensors_file(
     return path.string();
 }
 
+std::string write_sparse_header_file(const std::filesystem::path& dir,
+                                     const std::string& filename,
+                                     std::uint64_t header_len) {
+    const auto path = dir / filename;
+    std::string length_bytes(8, '\0');
+    for (std::size_t i = 0; i < length_bytes.size(); ++i) {
+        length_bytes[i] =
+            static_cast<char>((header_len >> (8 * i)) & 0xFF);
+    }
+
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error(
+                "cannot write test safetensors file: " + path.string());
+        }
+        out.write(length_bytes.data(),
+                  static_cast<std::streamsize>(length_bytes.size()));
+        if (!out) {
+            throw std::runtime_error(
+                "cannot write test safetensors file: " + path.string());
+        }
+    }
+    std::filesystem::resize_file(
+        path, static_cast<std::uintmax_t>(8) + header_len);
+    return path.string();
+}
+
+TEST_CASE("SafeTensorsFile rejects a header beyond the format cap before parsing") {
+    TempDir dir("header-cap");
+    const auto path = write_sparse_header_file(
+        dir.path(), "oversized-header.safetensors", 100'000'001);
+
+    std::string message;
+    try {
+        const iom::SafeTensorsFile file(path);
+        (void)file;
+    } catch (const std::runtime_error& error) {
+        message = error.what();
+    }
+
+    REQUIRE_FALSE(message.empty());
+    CHECK(message.find("safetensors header is too large") != std::string::npos);
+    CHECK(message.find(path) != std::string::npos);
+}
+
+TEST_CASE("SafeTensorsFile still parses an ordinary valid header") {
+    TempDir dir("ordinary-header");
+    const auto path = write_safetensors_file(
+        dir.path(), "ordinary.safetensors", {{"weight", "F32", {1}, "ABCD"}});
+
+    const iom::SafeTensorsFile file(path);
+    REQUIRE(file.size() == 1);
+    const iom::SafeTensorView tensor = file["weight"];
+    CHECK(tensor.dtype() == iom::DataType::F32);
+    CHECK(tensor.shape() == std::vector<std::size_t>{1});
+    REQUIRE(tensor.nbytes() == 4);
+    REQUIRE(tensor.raw<std::uint8_t>() != nullptr);
+    CHECK(std::memcmp(tensor.raw<std::uint8_t>(), "ABCD", 4) == 0);
+}
+
 TEST_CASE("SafeTensors dtype maps every accepted string to its DataType") {
     const std::pair<std::string, iom::DataType> cases[] = {
         {"BOOL", iom::DataType::BOOL},
