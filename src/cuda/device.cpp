@@ -7,6 +7,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "copy.hpp"
 #include "driver.hpp"
@@ -22,6 +23,50 @@ namespace iom {
                     "CUDA device ordinal " + std::to_string(ordinal)
                     + " is unavailable; device count is "
                     + std::to_string(device_count));
+        }
+
+        void validate_native_storage(
+                void* address, CUcontext context, std::uint32_t ordinal) {
+            CUmemorytype memory_type{};
+            int is_managed = 0;
+            CUcontext pointer_context = nullptr;
+            int pointer_ordinal = -1;
+            CUdeviceptr device_pointer = 0;
+            const CUdeviceptr pointer =
+                    reinterpret_cast<CUdeviceptr>(address);
+            check_cuda(
+                    "cuPointerGetAttribute(memory type)",
+                    cuPointerGetAttribute(
+                            &memory_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                            pointer));
+            check_cuda(
+                    "cuPointerGetAttribute(managed status)",
+                    cuPointerGetAttribute(
+                            &is_managed, CU_POINTER_ATTRIBUTE_IS_MANAGED,
+                            pointer));
+            check_cuda(
+                    "cuPointerGetAttribute(context)",
+                    cuPointerGetAttribute(
+                            &pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT,
+                            pointer));
+            check_cuda(
+                    "cuPointerGetAttribute(device ordinal)",
+                    cuPointerGetAttribute(
+                            &pointer_ordinal,
+                            CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer));
+            check_cuda(
+                    "cuPointerGetAttribute(device pointer)",
+                    cuPointerGetAttribute(
+                            &device_pointer,
+                            CU_POINTER_ATTRIBUTE_DEVICE_POINTER, pointer));
+            if (memory_type != CU_MEMORYTYPE_DEVICE || is_managed != 0
+                    || pointer_context != context
+                    || pointer_ordinal != static_cast<int>(ordinal)
+                    || device_pointer != pointer) {
+                throw std::runtime_error(
+                        "CUDA tensor storage is incompatible with the owning "
+                        "device context");
+            }
         }
 
         class PrimaryCtxGuard final {
@@ -100,6 +145,9 @@ namespace iom {
             [[nodiscard]] CUcontext context() const noexcept {
                 return context_;
             }
+            [[nodiscard]] std::uint32_t ordinal() const noexcept {
+                return ordinal_;
+            }
 
             [[nodiscard]] detail::RegistryState&
                     registry_state() noexcept {
@@ -128,6 +176,16 @@ namespace iom {
                         view().spec().tiled_storage_nbytes(),
                         [this] { device_.activate(); },
                         "CUDA tensor storage is not 32-byte aligned");
+                try {
+                    validate_native_storage(
+                            address_, device_.context(), device_.ordinal());
+                } catch (...) {
+                    void* rejected = std::exchange(address_, nullptr);
+                    iom::detail::release_aligned_storage(
+                            allocator_, rejected,
+                            [this] { device_.activate(); });
+                    throw;
+                }
             }
 
             ~CudaTensor() noexcept override {

@@ -7,6 +7,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "copy.hpp"
 #include "iom/detail/aligned_storage.hpp"
@@ -36,6 +37,21 @@ namespace iom {
                     "ROCm device ordinal " + std::to_string(ordinal)
                     + " is unavailable; device count is "
                     + std::to_string(device_count));
+        }
+
+        void validate_native_storage(void* address, int ordinal) {
+            hipPointerAttribute_t attributes{};
+            check_hip(
+                    "hipPointerGetAttributes",
+                    hipPointerGetAttributes(&attributes, address));
+            if (attributes.type != hipMemoryTypeDevice
+                    || attributes.isManaged != 0
+                    || attributes.device != ordinal
+                    || attributes.devicePointer != address) {
+                throw std::runtime_error(
+                        "ROCm tensor storage is incompatible with the owning "
+                        "device");
+            }
         }
 
         class RocmDevice final : public Device {
@@ -70,6 +86,9 @@ namespace iom {
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;
+            [[nodiscard]] std::uint32_t ordinal() const noexcept {
+                return ordinal_;
+            }
 
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 activate();
@@ -108,6 +127,16 @@ namespace iom {
                         view().spec().tiled_storage_nbytes(),
                         [this] { device_.activate(); },
                         "ROCm tensor storage is not 32-byte aligned");
+                try {
+                    validate_native_storage(
+                            address_, static_cast<int>(device_.ordinal()));
+                } catch (...) {
+                    void* rejected = std::exchange(address_, nullptr);
+                    iom::detail::release_aligned_storage(
+                            allocator_, rejected,
+                            [this] { device_.activate(); });
+                    throw;
+                }
             }
 
             ~RocmTensor() noexcept override {
