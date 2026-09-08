@@ -36,9 +36,29 @@ The numeric prefix is part of the task directory name and records dependency ord
 - Do not create tasks for work that is already complete and conforms to the specification.
 - Do not implement the change. The deliverables are the task mini-specifications and the concise ordered list in the completion response.
 
+## Boss orchestration contract
+
+This seven-step workflow is one Boss process. Before starting it, the root MUST read `skill://boss`, then apply this skill's explicit override: substantive repository fact-gathering uses the read-only `spec-tasks-facts` profile at `@task`, rather than Boss's default cheap exploration lane. The root MUST already resolve to `@slow`; it MUST inspect effective `modelRoles`, `task.agentModelOverrides`, `task.agentAdvisor`, and each dispatched profile's tool restrictions before dispatch. Report missing or conflicting setup and stop; never switch models, inherit an expensive parent, or silently fall back.
+
+The `@slow` root owns intake, complete requirement accounting, decomposition, priorities, the dependency DAG, architectural and ambiguity decisions, the frozen complete assignment table, verification, and final output:
+
+- `[FACTS spec-tasks-facts @task]` performs scoped, parallel, read-only factual discovery using exactly the profile's `read`, `grep`, `glob`, `lsp`, and `ast_grep` tools (`advisor: false`, `spawns: []`). It has no design authority, writing, delegation, or gates.
+- `[DRAFT boss-builder-fast @smol]` writes frozen mini-specs and performs simple mechanical edits only after the root fixes destinations, order, blockers, requirements, and acceptance criteria. It has no design or numbering authority.
+- `[PATH boss-errand @smol]` may perform mechanical metadata, path, existence, and collision checks against exact known paths; it MUST NOT perform substantive source discovery or design work.
+- `[ADVISOR boss-advisor @advisor]` handles only genuinely key architectural decisions from supplied facts. It is tool-free and packet-only: it cannot search, fetch artifacts, edit, delegate, or run gates.
+
+Fact packets MUST provide exact `file:line` and symbol evidence, decisive minimal excerpts, a `done`/`partial`/`missing`/`discrepant` mapping, relevant conventions and focused test commands, inspected and uninspected areas, gaps, and separate `SOURCE FACTS` from `INFERENCE`. Batch truly independent discovery and disjoint writers, collect each phase before consuming its output, and do not split output tasks merely for parallelism. No worker delegates recursively; workers skip gates, tests, linters, builds, and formatters.
+
+Every brief is self-contained: it states exact scope and files, established facts and decisions, required output, non-goals, acceptance criteria, and any blockers. Advisor `CONTENT` must inline the requirements and non-goals, decisive excerpts and facts, constraints, alternatives with trade-offs, and one exact question; a path or URI alone is invalid. If the advisor returns `NEED EVIDENCE`, route the exact factual question back to `spec-tasks-facts`, append only the evidence delta, and keep the final decision at the root.
+
+This contract preserves the existing generation contract: precedence and path guards, minimal scope, omission of completed work, the task template, collision protection, self-contained mini-specs, ambiguity handling, and the concise completion response remain authoritative.
+
 ## Workflow
 
+The seven stages below are Boss-owned; role dispatch supplements the stage and does not create a second workflow.
+
 ### 1. Read and normalize the requested change
+The `@slow` root completes intake and precedence resolution before any delegation, including all requirements, non-goals, assumptions, and unresolved decisions.
 
 Read `spec.md`, then `spec-fixme.md` if present. Extract:
 
@@ -52,6 +72,7 @@ Read `spec.md`, then `spec-fixme.md` if present. Extract:
 Build one coherent requirement set using the precedence rules above. A fixme correction replaces the conflicting parent requirement; do not preserve both alternatives. Do not propagate brainstorming, rejected alternatives, or editorial commentary as implementation work.
 
 ### 2. Ground the work in the repository
+The root dispatches the exact `spec-tasks-facts` (`@task`) profile for scoped parallel repository facts, then reconciles its evidence rather than delegating requirement or design authority.
 
 Explore only the project areas needed to decompose and anchor the change. Read referenced files and enough surrounding implementation, call sites, tests, configuration, schemas, and project design documentation to establish:
 
@@ -67,6 +88,8 @@ Classify each source requirement as **done**, **partial**, **missing**, or **dis
 Repository exploration is for reducing implementer search, not for proposing adjacent improvements. Ignore unrelated defects unless one directly blocks the specified behavior; if it does, include only the smallest necessary correction.
 
 ### 3. Decide whether and how to decompose
+
+The root owns the decomposition judgment and any architectural decision. Consult `boss-advisor` only with self-contained packet `CONTENT`; never ask it to investigate the repository.
 
 A task must be:
 
@@ -86,6 +109,8 @@ If no implementation work remains, create no task directories and report that th
 
 ### 4. Build and prioritize the task graph
 
+The root owns priorities, the dependency DAG, and numbering. `boss-errand` may check exact destination metadata, paths, and collisions mechanically; it does not discover substantive source facts.
+
 For every candidate task, identify only genuine blocking edges. A blocker is work whose output is required before the task can be implemented or verified; conceptual similarity is not a dependency.
 
 Assign a priority:
@@ -101,6 +126,8 @@ Number the sorted tasks from `01`. Use short lowercase kebab-case slugs that des
 Before writing, check every destination. Never silently overwrite an unrelated file or user-authored task specification. If a destination already contains a task for the same source and outcome, revise it carefully; otherwise choose a distinct precise slug and report the collision.
 
 ### 5. Write one self-contained mini-spec per task
+
+Only after the root freezes destinations, order, blockers, requirements, and acceptance does `boss-builder-fast` (`@smol`) mechanically write the mini-specs. The writer cannot redesign tasks or allocate numbers.
 
 Each mini-spec is an implementation contract for a smaller, cheaper model. It must be understandable without reading the parent specification, fixme file, conversation, or sibling task specs. Repeat the few shared decisions needed by the task instead of saying “follow the parent spec” or “same as the previous task.” References to blockers provide sequencing, not missing requirements.
 
@@ -165,11 +192,15 @@ Mini-spec writing rules:
 
 ### 6. Resolve only blocking ambiguity
 
+The root resolves material ambiguity. For a key architectural choice it may use packet-only `boss-advisor`; a `NEED EVIDENCE` response routes one exact question to `spec-tasks-facts`, after which the root decides.
+
 Use repository evidence and established project conventions for factual and low-risk implementation details. If a source ambiguity materially changes behavior, task boundaries, or dependency order and cannot be resolved from the repository, ask one focused question at a time with a recommended minimal answer. Wait for the answer before writing affected mini-specs.
 
 Do not ask the user to approve an otherwise clear breakdown. Do not manufacture choices, expand the product design, or turn decomposition into a design interview.
 
 ### 7. Final consistency pass
+
+The root collects all phase results before consuming them, performs the final consistency pass, and verifies the focused generated artifacts without building or inspecting untouched implementation.
 
 Before completing:
 
