@@ -2,16 +2,12 @@
 
 #include <cassert>
 #include <array>
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
-#include <exception>
 #include <mutex>
 #include <cstring>
 #include <new>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -358,59 +354,6 @@ namespace iom {
                     destination.plane_offset());
         }
 
-        // Calls op(owner_plane, row, column, linear_index) for every
-        // logical element of the view in row-major coordinate order. The
-        // view's plane offset and strides carry the leading coordinates.
-        template <typename Op>
-        void for_each_coordinate(const TensorView& view, Op&& op) {
-            const TensorSpec& spec = view.spec();
-            const std::span<const std::size_t> dimensions =
-                    spec.shape.dimensions();
-            const std::size_t leading_rank = dimensions.size() - 2;
-            const std::size_t rows = dimensions[leading_rank];
-            const std::size_t columns = dimensions[leading_rank + 1];
-            const std::size_t count = spec.shape.element_count();
-            const std::span<const std::size_t> strides =
-                    view.plane_strides();
-
-            for (std::size_t linear = 0; linear < count; ++linear) {
-                std::size_t rest = linear;
-                const std::size_t column = rest % columns;
-                rest /= columns;
-                const std::size_t row = rest % rows;
-                rest /= rows;
-
-                // View transforms keep every addressed owner plane in
-                // bounds, so this accumulation cannot overflow.
-                std::size_t plane = view.plane_offset();
-                for (std::size_t k = leading_rank; k-- > 0;) {
-                    plane += (rest % dimensions[k]) * strides[k];
-                    rest /= dimensions[k];
-                }
-                op(plane, row, column, linear);
-            }
-        }
-
-        // Owner plane of the view's linear_index-th logical element; the
-        // row-major inverse of for_each_coordinate's plane accumulation.
-        std::size_t plane_at(const TensorView& view, std::size_t linear) {
-            const TensorSpec& spec = view.spec();
-            const std::span<const std::size_t> dimensions =
-                    spec.shape.dimensions();
-            const std::size_t leading_rank = dimensions.size() - 2;
-            const std::size_t rows = dimensions[leading_rank];
-            const std::size_t columns = dimensions[leading_rank + 1];
-            const std::span<const std::size_t> strides =
-                    view.plane_strides();
-
-            std::size_t rest = linear / (rows * columns);
-            std::size_t plane = view.plane_offset();
-            for (std::size_t k = leading_rank; k-- > 0;) {
-                plane += (rest % dimensions[k]) * strides[k];
-                rest /= dimensions[k];
-            }
-            return plane;
-        }
 
     }  // namespace
 
