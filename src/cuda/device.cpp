@@ -184,6 +184,8 @@ namespace iom {
                             cudaMemset(
                                     address_, 0,
                                     view().spec().tiled_storage_nbytes()));
+                    cuda_detail::check_cuda_kernel(
+                            "cudaDeviceSynchronize", cudaDeviceSynchronize());
                 } catch (...) {
                     void* rejected = std::exchange(address_, nullptr);
                     iom::detail::release_aligned_storage(
