@@ -268,31 +268,40 @@ Before considering a backend complete, confirm all of the following:
 
 1. `DeviceOps` is non-copyable/non-movable and represents one in-order queue.
    The caller serializes calls on a queue. The backend may synchronize or use
-   asynchronous runtime work internally, but observable completion order is
-   submission order.
-2. Every successful submission uses the common `submit` path and returns
-   `oid = (queue_id << 56) | sequence`. The process-unique queue ID is in
-   `[1,255]`; the sequence begins at one and is monotonic through successful
-   reservations. Sequence exhaustion MUST throw `std::overflow_error` before
-   backend work begins.
-3. `wait(token)` blocks until that token's operation completes. Later waits on
-   a successful token MUST succeed. Later waits on a failed token MUST rethrow
-   the retained failure every time, with the same observable runtime-error
-   message. Zero, a zero sequence, a live foreign queue ID, and an unsubmitted
-   sequence MUST throw `std::invalid_argument`.
-4. Completing sequence *n* makes every earlier submitted sequence observable as
-   complete. A post-enqueue failure remains tied to its token. A pre-enqueue
-   failure throws synchronously and, when no later reservation exists, does not
-   consume the sequence number.
-5. The common base releases a queue ID at destruction; it does not define an
+   asynchronous runtime work internally, but observable completion and
+   visibility order is submission order.
+2. Every successful submission uses the common facade and returns a positive
+   `oid = static_cast<oid>((std::uint64_t{q} << 55) | sequence)`. Queue ID `q`
+   is process-unique in the complete range `[1,255]`, represented in bits
+   `55..62`; `sequence` is exactly 55 bits, begins at one, and is in
+   `[1,2^55-1]`. Sequence zero is never submitted.
+3. OID facades are common `noexcept` entry points. They validate, map errors,
+   encode tokens, and register lifetimes before backend effects or acceptance;
+   protected backend hooks cannot bypass those obligations. Synchronous
+   failures return exactly `InvalidArgument=-1`, `Unsupported=-2`,
+   `Overflow=-3`, `ResourceExhausted=-4`, `DeviceError=-5`, or
+   `InternalError=-6`. Invalid input, unavailable operation/specification,
+   checked arithmetic or sequence exhaustion, bounded-resource failure,
+   pre-acceptance runtime failure, and otherwise unclassified failure map to
+   those values respectively. No synchronous exception crosses an OID facade.
+4. Sequence exhaustion returns `Overflow` before backend work, effects, or
+   token acceptance. Every accepted submission returns one positive token.
+   Failures after acceptance remain attached to that token and `wait` rethrows
+   them repeatably; successful completion and visibility are repeatable.
+5. `wait(token)` blocks for accepted work and immediately throws
+   `std::invalid_argument` for a negative value, zero, a foreign queue token,
+   a future value, a skipped/reserved-but-never-submitted value, or any other
+   unsubmitted value. A skipped value remains invalid after later completion.
+   Completing sequence *n* makes earlier submitted work observable as complete.
+6. The common base releases a queue ID at destruction; it does not define an
    implicit wait or cancellation of outstanding work. A concrete backend MUST
-   nevertheless perform the runtime cleanup necessary to prevent use-after-free
-   of its stream/events/storage. Callers must not use a token or queue after
-   its queue owner is destroyed.
-6. Backend queues MUST retain enough state to complete and fail submitted work
+   nevertheless perform runtime cleanup preventing use-after-free of streams,
+   events, storage, and lifetime registrations. Callers must not use a token
+   or queue after its owner is destroyed.
+7. Backend queues MUST retain enough state to complete and fail submitted work
    correctly even if their worker observes a runtime error after launch. A
-   completion proof can be a runtime event, a successful stream drain, or an
-   equivalent native fence. If no proof is available, the affected storage and
+   completion proof can be a runtime event, successful stream drain, or
+   equivalent native fence. If no proof is available, affected storage and
    metadata MUST be quarantined/retired rather than reused.
 
 ### 6. Copy contract
@@ -302,37 +311,28 @@ Before considering a backend complete, confirm all of the following:
    causing writes: both views must belong to the queue's exact `Device`, and
    their specs must compare equal (shape, leaf type, quantization).
 2. Shape/type/quantization mismatch and reference/foreign-device views MUST
-   throw `std::invalid_argument`. A rejected copy MUST not write the
-   destination and MUST not consume a token; the next valid copy receives the
-   next unused sequence.
+   return the negative `InvalidArgument` OID result. A rejected copy MUST not
+   write the destination and MUST not consume a token; the next valid copy
+   receives the next unused sequence.
 3. A valid copy maps every logical element from the source view to the matching
    logical element of the destination view. It MUST honor both independent
    plane offsets and strides; source and destination may be full, offset,
    stepped, selected, permuted, or nested views.
 4. Same-queue copies execute in call order without an intervening host wait.
    Waiting on the last token must make all earlier queued writes visible.
-5. If source and destination have the identical native handle, plane offset,
-   and plane-stride window, the copy is a valid waitable no-op. It still
-   receives a token and consumes one sequence but does not need a native data
-   movement.
-6. A backend MUST protect native allocations participating in asynchronous
-   copy until the operation's completion/failure is resolved. On success it
-   releases normal tracking; on failure it invalidates/quarantines tracking so
-   storage cannot be reused prematurely.
-
 ### 7. Compute capability contract
 
-1. `copy` is the only operation every current backend is required to implement.
-   `add`, `mul`, `silu`, `linear`, `rmsnorm`, and `sdpa` are opt-in capability
-   hooks. A backend MUST NOT claim to implement one until it supplies its real
-   semantic, validation, asynchronous, and numerical contract.
-2. For an unimplemented compute method, retain the `DeviceOps` default or
-   throw the exact equivalent `std::runtime_error`:
-   `"<backend> backend does not implement <operation>"`.
-3. An unsupported compute request MUST fail before it submits work, consumes a
-   sequence, or modifies any output. This applies equally to transformed
-   operands and outputs.
-4. A future implementation of a compute hook MUST preserve caller-provided
+1. `copy` is the only operation every current backend is required to
+   implement. The compute hooks `add`, `mul`, `silu`, `linear`, `rmsnorm`, and
+   `sdpa` remain opt-in; current hooks other than the later ADD implementation
+   report `Unsupported`. A backend MUST NOT claim a capability until it
+   supplies its real semantic, validation, asynchronous, and numerical
+   contract.
+2. An unsupported compute request MUST return the common negative
+   `Unsupported` OID result before submission, sequence consumption, effects,
+   or output mutation. The same rule applies to transformed operands and
+   outputs. It is not a synchronous exception crossing the OID facade.
+3. A future implementation of a compute hook MUST preserve caller-provided
    operand/output storage, exact device identity, queue ordering, wait-token
    behavior, and the no-hidden-allocation rule. It requires behavioral tests
    before it becomes a reported capability.

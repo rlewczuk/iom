@@ -225,20 +225,44 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `gpu_algorithm::compute_staging_size(logical_nbytes)` | Returns the logical transfer payload rounded to a 4-byte GPU word, rejecting rounding overflow. |
 
 `DeviceOps::copy` is pure device-to-device work on compatible views. The
-compute functions require caller-created output views: `add` computes
-`c = a + b`, `mul` computes `c = a * b`, `silu` applies SiLU, `linear`
-computes `x * w`, `rmsnorm` applies weighted RMS normalization, and `sdpa`
-implements GQA scaled dot-product attention with an implicit causal mask and
-an output arranged for the output projection. Backends override only the
-operations they implement; the base implementation throws a runtime error that
-names the backend and operation.
+remaining compute entry points are public OID facades, but current hooks other
+than the later ADD implementation remain `Unsupported`; this document does
+not define ADD arithmetic or any future numeric capability.
 
-Every successful submission returns an `oid` token. The base queue leases a
-process-unique 8-bit queue identifier and combines it with a monotonic 56-bit
-per-queue sequence. `wait(token)` rejects zero, foreign live queue IDs, and
-unsubmitted sequences; completion is repeatable, and an asynchronous failure
-is retained and rethrown by every later wait for that token. Calls on one queue
-are serialized by the caller.
+### OID compatibility contract
+
+`iom::oid` is signed `std::int64_t`. Negative values are terminal synchronous
+results, with exactly these stable values: `OidError::InvalidArgument = -1`,
+`Unsupported = -2`, `Overflow = -3`, `ResourceExhausted = -4`,
+`DeviceError = -5`, and `InternalError = -6`. Positive values are accepted
+asynchronous tokens; zero is invalid and is neither an error nor a token.
+`to_oid(OidError) noexcept` returns the enum's negative underlying value,
+`oid_is_error(oid) noexcept` classifies values by `value < 0`, and
+`oid_is_token(oid) noexcept` classifies values by `value > 0`.
+
+Every successful submission encodes queue ID `q` for the complete range
+`1..255` in bits `55..62` and sequence `1..2^55-1` in the low 55 bits:
+`static_cast<oid>((std::uint64_t{q} << 55) | sequence)`. Sequence zero is
+never submitted. Exhaustion returns synchronous `Overflow` before effects or
+acceptance, while invalid input, unavailable operations or specifications,
+checked arithmetic, bounded-resource allocation, pre-acceptance runtime
+failure, and otherwise unclassified failures map respectively to
+`InvalidArgument`, `Unsupported`, `Overflow`, `ResourceExhausted`,
+`DeviceError`, and `InternalError`. No synchronous exception crosses an OID
+facade.
+
+These facades validate, map, encode, and register lifetimes before backend
+effects or token acceptance. Protected backend hooks cannot bypass that
+common protocol. Accepted work is ordered and visible in submission order;
+successful waits are repeatable, and post-acceptance failures are retained and
+re-thrown by every later wait. Callers serialize calls on one queue.
+
+`wait(token)` immediately throws `std::invalid_argument` for negative, zero,
+foreign, future, skipped/reserved-but-never-submitted, or otherwise
+unsubmitted values. A skipped value remains invalid after later completion.
+Callers must consume negative results rather than expect synchronous exceptions,
+and must wait only on accepted positive tokens; existing wait handling for
+invalid tokens and retained asynchronous failures remains required.
 
 ## Backend execution machinery
 

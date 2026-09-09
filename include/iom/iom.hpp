@@ -202,8 +202,19 @@ namespace iom {
 
     /**
      * One in-order asynchronous operation queue over caller-created tensor
-     * views. Public operations are non-virtual exception-free facades; backend
-     * implementations override only the protected hooks below.
+     * views. Every OID-returning operation below is a common noexcept facade:
+     * it validates, maps failures, encodes tokens, and registers lifetimes
+     * before backend effects or token acceptance. Backend implementations
+     * override only the protected hooks; those hooks are not alternate public
+     * entry points and cannot bypass that protocol.
+     *
+     * An oid is signed int64_t. Negative values are terminal OidError results
+     * (-1 InvalidArgument, -2 Unsupported, -3 Overflow, -4
+     * ResourceExhausted, -5 DeviceError, -6 InternalError); positive values
+     * are accepted tokens and zero is invalid. Callers must consume negative
+     * results and wait only on accepted positive tokens. The breaking cutover
+     * moves synchronous OID failures out of exceptions; wait still throws for
+     * invalid tokens and retained post-acceptance failures.
      */
     class DeviceOps {
     public:
@@ -214,8 +225,21 @@ namespace iom {
 
         virtual ~DeviceOps();
 
+        /**
+         * Observe accepted work in queue order. A negative, zero, foreign,
+         * future, skipped/reserved-but-never-submitted, or otherwise
+         * unsubmitted value throws std::invalid_argument immediately; a
+         * skipped value remains invalid after later completion. Accepted
+         * tokens are repeat-waitable, and retained asynchronous failures are
+         * rethrown by every wait.
+         */
         void wait(oid token);
 
+        /**
+         * Common noexcept OID facades. Successful tokens encode queue ID q in
+         * bits 55..62 for every q in [1, 255], with sequence 1..2^55-1 in
+         * the low 55 bits. Synchronous failures return OidError values.
+         */
         oid copy(const TensorView& source, TensorView& destination) noexcept;
         oid add(const TensorView& a, const TensorView& b,
                 TensorView& c) noexcept;
@@ -231,6 +255,11 @@ namespace iom {
                  TensorView& attn_out) noexcept;
 
     protected:
+        /*
+         * Backend hooks are implementation extension points only. Public
+         * facades retain common validation, error mapping, token encoding,
+         * queue ordering, and lifetime registration.
+         */
         DeviceOps();
         explicit DeviceOps(const Device& device);
 
