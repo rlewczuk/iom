@@ -25,6 +25,7 @@ enum class SubmissionFault {
     event_create,
     third_plane_launch,
     event_record,
+    stream_synchronize,
 };
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
@@ -73,9 +74,11 @@ struct gpu_policy {
         check_cuda_kernel(
                 "cudaStreamSynchronize", cudaStreamSynchronize(stream));
     }
-
     [[nodiscard]] static bool synchronize_stream_noexcept(
             stream_type stream) noexcept {
+        if (consume_submission_fault(SubmissionFault::stream_synchronize)) {
+            return false;
+        }
         return stream == nullptr
                 || cudaStreamSynchronize(stream) == cudaSuccess;
     }

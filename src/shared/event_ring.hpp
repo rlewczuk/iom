@@ -1,13 +1,15 @@
 #pragma once
 
 // A pooled event is only a completion proof after the current submission
-// records it successfully. A stream drain is an equivalent proof for the
-// exceptional path where both event-record attempts fail.
+// records it successfully. A covering stream drain is an equivalent proof
+// for the exceptional path where both event-record attempts fail.
+
 #include <stdexcept>
 
 #include <array>
 #include <condition_variable>
 #include <cstddef>
+#include <vector>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -18,6 +20,11 @@
 #include "metadata_slot_pool.hpp"
 
 namespace iom::detail {
+enum class CompletionDisposition {
+    Pending,
+    Complete,
+    RetireUnknown,
+};
 
 template <typename Policy>
 class EventRingState final
@@ -79,15 +86,11 @@ public:
         std::size_t pool_index_ = kNoAttachedSlot;
         FenceResult result_ = FenceResult::pending();
         std::size_t metadata_slot_ = kNoAttachedSlot;
-        // Event record status is explicit: vendor synchronization on a fresh
-        // event is not a completion proof.
         bool event_recorded_ = false;
-        // A successful queue drain is the completion proof when recording
-        // failed twice.
         bool stream_drained_ = false;
-        // True once on_worker_complete has observed completion. Other paths
-        // still receive noexcept cleanup synchronization on destruction.
         bool synchronized_on_complete_ = false;
+        CompletionDisposition disposition_ =
+                CompletionDisposition::Pending;
     };
 
     EventRingState(
@@ -177,8 +180,10 @@ public:
                         "GPU completion event was never recorded");
             }
             submission.synchronized_on_complete_ = true;
+            submission.disposition_ = CompletionDisposition::Complete;
         } catch (...) {
             result = FenceResult::failed(std::current_exception());
+            submission.disposition_ = CompletionDisposition::RetireUnknown;
         }
         submission.result_ = result;
         lock.unlock();
@@ -187,28 +192,42 @@ public:
         }
     }
 
-    // Releases the recorded event's resources (metadata) for reuse. The
-    // pooled event itself is only returned to the pool once the submission
-    // record is destroyed (its last fence reference gone), so an earlier
-    // fence can never read a later submission's state. Normal completion is
-    // waited exactly once: on_worker_destroy skips the second synchronization
-    // when the worker's on_worker_complete already waited and observed this
-    // event successfully. Queue-drain and failed/partially-observed paths
-    // (marker unset) retain the required cleanup wait.
     void on_worker_destroy(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!submission.synchronized_on_complete_) {
+        if (!submission.synchronized_on_complete_
+                && submission.event_recorded_) {
             try {
                 Policy::activate(context_);
+                Policy::synchronize_event(
+                        slots_[submission.pool_index_].event);
+                submission.disposition_ = CompletionDisposition::Complete;
             } catch (...) {
+                submission.disposition_ = CompletionDisposition::RetireUnknown;
             }
-            Policy::synchronize_event_noexcept(
-                    slots_[submission.pool_index_].event);
         }
         if (submission.metadata_slot_ != kNoAttachedSlot) {
-            metadata_pool_->release(submission.metadata_slot_);
+            if (submission.disposition_
+                    == CompletionDisposition::RetireUnknown) {
+                metadata_pool_->protect(submission.metadata_slot_);
+                retired_metadata_.push_back(submission.metadata_slot_);
+            } else {
+                metadata_pool_->release_after_proof(
+                        submission.metadata_slot_);
+            }
             submission.metadata_slot_ = kNoAttachedSlot;
         }
+    }
+
+    // A queue drain covers every retired submission on its stream.
+    void on_queue_drain(bool successful) noexcept {
+        if (!successful) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const std::size_t slot : retired_metadata_) {
+            metadata_pool_->release_after_proof(slot);
+        }
+        retired_metadata_.clear();
     }
 
     // The pooled event recorded for this submission. The event does not
@@ -251,6 +270,7 @@ private:
 
     context_type context_;
     MetadataSlotPool<Policy>* metadata_pool_;
+    std::vector<std::size_t> retired_metadata_;
     std::array<Slot, kEventRingCount> slots_;
     std::size_t created_count_ = 0;
     mutable std::mutex mutex_;

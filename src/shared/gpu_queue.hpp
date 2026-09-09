@@ -206,9 +206,11 @@ public:
         registry_state_->registry.invalidate_entries_for_queue(
                 registry_queue_id_);
         worker_.shutdown_and_drain();
+        bool drained = false;
         try {
             Policy::activate(context_);
-            (void)Policy::synchronize_stream_noexcept(stream_);
+            drained = Policy::synchronize_stream_noexcept(stream_);
+            state_->on_queue_drain(drained);
             Policy::destroy_queue_stream_noexcept(stream_);
         } catch (...) {
         }

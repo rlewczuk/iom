@@ -386,6 +386,46 @@ TEST_CASE("ROCm event ring fences are pending until own completion") {
     resettled.reset();
 }
 
+TEST_CASE("ROCm double-fault retirement protects metadata until covering drain") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+    UnusedAllocator allocator;
+    auto device = iom::make_rocm_device(0, allocator);
+    iom::detail::MetadataSlotPool<iom::rocm_detail::gpu_policy> metadata_pool(
+            0);
+    auto state = std::make_shared<iom::rocm_detail::EventRingState>(
+            0, metadata_pool);
+    auto submission = state->acquire();
+    const auto first = metadata_pool.acquire();
+    submission->attach_metadata_slot(first);
+    CHECK_THROWS_AS(state->on_worker_complete(*submission), std::runtime_error);
+    state->on_worker_destroy(*submission);
+    std::vector<std::size_t> held;
+    for (std::size_t i = 1;
+         i < iom::detail::MetadataSlotPool<
+                     iom::rocm_detail::gpu_policy>::kMetadataSlotCount;
+         ++i) {
+        held.push_back(metadata_pool.acquire());
+    }
+    std::atomic<bool> acquired = false;
+    std::thread waiter([&] {
+        const auto slot = metadata_pool.acquire();
+        acquired.store(true, std::memory_order_release);
+        metadata_pool.release(slot);
+    });
+    std::this_thread::yield();
+    CHECK_FALSE(acquired.load(std::memory_order_acquire));
+    state->on_queue_drain(false);
+    CHECK_FALSE(acquired.load(std::memory_order_acquire));
+    state->on_queue_drain(true);
+    waiter.join();
+    CHECK(acquired.load(std::memory_order_acquire));
+    for (const auto slot : held) {
+        metadata_pool.release(slot);
+    }
+}
+
 TEST_CASE("ROCm rejected create_tensor leaves the current device unchanged") {
     int device_count = 0;
     REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);

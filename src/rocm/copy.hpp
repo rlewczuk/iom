@@ -22,6 +22,7 @@ enum class SubmissionFault {
     event_create,
     third_plane_launch,
     event_record,
+    stream_synchronize,
 };
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
@@ -189,9 +190,11 @@ struct gpu_policy {
     static void synchronize_stream(stream_type stream) {
         check_hip("hipStreamSynchronize", hipStreamSynchronize(stream));
     }
-
     [[nodiscard]] static bool synchronize_stream_noexcept(
             stream_type stream) noexcept {
+        if (consume_submission_fault(SubmissionFault::stream_synchronize)) {
+            return false;
+        }
         return stream == nullptr
                 || hipStreamSynchronize(stream) == hipSuccess;
     }

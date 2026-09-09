@@ -19,11 +19,27 @@ namespace iom::cuda_detail {
 namespace {
 
 std::atomic<SubmissionFault> g_submission_fault{SubmissionFault::none};
+std::atomic<int> g_event_record_failures{0};
+std::atomic<int> g_stream_sync_failures{0};
 
 }  // namespace
 
 bool consume_submission_fault(
         SubmissionFault point) noexcept {
+    if (point == SubmissionFault::event_record
+            || point == SubmissionFault::stream_synchronize) {
+        auto& failures = point == SubmissionFault::event_record
+                ? g_event_record_failures : g_stream_sync_failures;
+        int remaining = failures.load(std::memory_order_acquire);
+        while (remaining > 0
+                && !failures.compare_exchange_weak(
+                        remaining, remaining - 1,
+                        std::memory_order_acq_rel)) {
+        }
+        if (remaining > 0) {
+            return true;
+        }
+    }
     SubmissionFault expected = point;
     return g_submission_fault.compare_exchange_strong(
             expected, SubmissionFault::none, std::memory_order_acq_rel);
@@ -36,10 +52,9 @@ bool consume_submission_fault(
 #define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
-
 #include "../shared/standard_tiled_copy.inl"
 #include "../shared/standard_tiled_add.inl"
-#undef IOM_LAUNCH_KERNEL
+
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_GLOBAL
 #undef IOM_GPU_DEVICE
@@ -47,9 +62,14 @@ bool consume_submission_fault(
 #include "../shared/gpu_queue.hpp"
 
 namespace iom::cuda_detail {
-
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
+    g_event_record_failures.store(
+            fault == SubmissionFault::event_record ? 2 : 0,
+            std::memory_order_release);
+    g_stream_sync_failures.store(
+            fault == SubmissionFault::event_record ? 1 : 0,
+            std::memory_order_release);
     g_submission_fault.store(fault, std::memory_order_release);
 }
 

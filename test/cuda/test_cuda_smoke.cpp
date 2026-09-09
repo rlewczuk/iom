@@ -793,6 +793,46 @@ TEST_CASE("CUDA event ring fences are pending until own completion") {
     resettled.reset();
 }
 
+TEST_CASE("CUDA double-fault retirement protects metadata until covering drain") {
+    require_cuda_hardware();
+    CUcontext context = nullptr;
+    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
+            context);
+    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
+            context, metadata_pool);
+    auto submission = state->acquire();
+    const auto first = metadata_pool.acquire();
+    submission->attach_metadata_slot(first);
+    CHECK_THROWS_AS(state->on_worker_complete(*submission), std::runtime_error);
+    state->on_worker_destroy(*submission);
+    std::vector<std::size_t> held;
+    for (std::size_t i = 1;
+         i < iom::detail::MetadataSlotPool<
+                     iom::cuda_detail::gpu_policy>::kMetadataSlotCount;
+         ++i) {
+        held.push_back(metadata_pool.acquire());
+    }
+    std::atomic<bool> acquired = false;
+    std::thread waiter([&] {
+        const auto slot = metadata_pool.acquire();
+        acquired.store(true, std::memory_order_release);
+        metadata_pool.release(slot);
+    });
+    std::this_thread::yield();
+    CHECK_FALSE(acquired.load(std::memory_order_acquire));
+    state->on_queue_drain(false);
+    CHECK_FALSE(acquired.load(std::memory_order_acquire));
+    state->on_queue_drain(true);
+    waiter.join();
+    CHECK(acquired.load(std::memory_order_acquire));
+    for (const auto slot : held) {
+        metadata_pool.release(slot);
+    }
+}
+
 TEST_CASE("CUDA create_tensor validates the spec before any context activation") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
 

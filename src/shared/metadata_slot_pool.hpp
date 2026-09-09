@@ -24,13 +24,37 @@ public:
         } catch (...) {
         }
         for (Slot& slot : slots_) {
-            Policy::free_noexcept(slot.device);
+            // A protected slot may still be referenced by work whose
+            // completion could not be proven. Do not speculatively free it
+            // during pool teardown; retain both device and host storage.
+            if (!slot.protected_) {
+                Policy::free_noexcept(slot.device);
+            } else {
+                (void)slot.host.release();
+            }
             slot.device = nullptr;
         }
     }
 
     MetadataSlotPool(const MetadataSlotPool&) = delete;
     MetadataSlotPool& operator=(const MetadataSlotPool&) = delete;
+
+    void protect(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < slots_.size()) {
+            slots_[index].protected_ = true;
+            slots_[index].in_use = true;
+        }
+    }
+
+    void release_after_proof(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < slots_.size() && slots_[index].in_use) {
+            slots_[index].protected_ = false;
+            slots_[index].in_use = false;
+            completion_.notify_one();
+        }
+    }
 
     [[nodiscard]] std::size_t acquire() {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -52,11 +76,7 @@ public:
     }
 
     void release(std::size_t index) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < slots_.size() && slots_[index].in_use) {
-            slots_[index].in_use = false;
-            completion_.notify_one();
-        }
+        release_after_proof(index);
     }
 
     // acquire() only returns a slot after its owning fence has retired, so
@@ -99,6 +119,7 @@ private:
         void* device = nullptr;
         std::size_t capacity = 0;
         bool in_use = false;
+        bool protected_ = false;
     };
 
     typename Policy::context_type context_;
@@ -108,3 +129,4 @@ private:
 };
 
 }  // namespace iom::detail
+
