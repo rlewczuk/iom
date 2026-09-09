@@ -408,8 +408,8 @@ public:
             const Device& device, const sycl::context& context,
             const sycl::device& native_device,
             detail::RegistryState& state)
-            : device_(&device),
-              state_(&state),
+            : DeviceOps(device),
+              device_(&device),
               registry_queue_id_(detail::allocate_queue_id(*state_)),
               queue_(
                       context, native_device,
@@ -453,12 +453,11 @@ public:
         worker_.shutdown_and_drain();
     }
 
-    oid copy(
+    oid copy_impl(
             const TensorView& source,
             TensorView& destination) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
-        validate_copy(*device_, source, destination);
         const bool no_op = identical_window(source, destination);
         return submit(
                 [this, &source, &destination, no_op](

@@ -592,14 +592,13 @@ namespace iom {
     class CpuQueue final : public DeviceOps {
     public:
         explicit CpuQueue(CpuDevice& device)
-                : device_(&device) {}
+                : DeviceOps(device), device_(&device) {}
 
         ~CpuQueue() override = default;
 
-        oid copy(const TensorView& source, TensorView& destination) override {
+        oid copy_impl(const TensorView& source, TensorView& destination) override {
             std::lock_guard<std::mutex> submission_lock(
                     submission_order_mutex_);
-            validate_copy(*device_, source, destination);
             const bool no_op = identical_window(source, destination);
             return submit(
                     [this, &source, &destination, no_op](

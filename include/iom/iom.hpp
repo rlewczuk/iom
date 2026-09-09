@@ -1,6 +1,6 @@
 #pragma once
 
-#include <algorithm>
+#include <initializer_list>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -202,17 +202,9 @@ namespace iom {
 
     /**
      * One in-order asynchronous operation queue over caller-created tensor
-     * views. The common base leases one process-unique queue id in [1, 255]
-     * at construction and releases it at destruction, allocates a monotonic
-     * 55-bit submission sequence for every successfully queued operation,
-     * validates wait tokens, and records completions so waits are repeatable.
-     * The live-id pool is the only global queue state: it never selects a
-     * backend, device, or runtime context. Calls on one queue are serialized
-     * by the caller.
-     * Compute operations default to throwing `unsupported(backend_label(), op)`;
-     * backends override only implemented operations.
+     * views. Public operations are non-virtual exception-free facades; backend
+     * implementations override only the protected hooks below.
      */
-
     class DeviceOps {
     public:
         DeviceOps(const DeviceOps&) = delete;
@@ -222,110 +214,61 @@ namespace iom {
 
         virtual ~DeviceOps();
 
-        /**
-         * Blocks until the token's operation completes, then keeps
-         * succeeding on every later call; a retained asynchronous failure
-         * is rethrown on every later call. Token zero, a zero sequence, a
-         * live foreign queue id, and a sequence this queue never submitted
-         * throw std::invalid_argument.
-         */
         void wait(oid token);
 
-        virtual oid copy(const TensorView& source, TensorView& destination) = 0;
-
-        /** Addition: c = a + b **/
-        virtual oid add(const TensorView& a, const TensorView& b, TensorView& c) {
-            throw unsupported(backend_label(), "add");
-        }
-
-        /** Multiplication: c = a * b **/
-        virtual oid mul(const TensorView& a, const TensorView& b, TensorView& c) {
-            throw unsupported(backend_label(), "mul");
-        }
-
-        /** SILU: y = silu(x) **/
-        virtual oid silu(const TensorView& x, TensorView& y) {
-            throw unsupported(backend_label(), "silu");
-        }
-
-        /** Linear: y = x * w **/
-        virtual oid linear(const TensorView& x, const TensorView& w, TensorView& y) {
-            throw unsupported(backend_label(), "linear");
-        }
-
-        /** RMSNorm: y = x * (1 / sqrt(mean(x^2, dim) + eps)) **/
-        virtual oid rmsnorm(const TensorView& x, TensorView& y, const TensorView& w, float eps, size_t dim) {
-            throw unsupported(backend_label(), "rmsnorm");
-        }
-
-        /**
-         * SDPA variant for GQA. We avoid repeating across k and v, kernel takes it into account automatically.
-         * It always uses implicit casual mask.
-         * Result is already rearranged so that it can be passed directly into linear projection o_proj.
-         */
-        virtual oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
-                         size_t n_heads, size_t n_kv_heads, size_t head_dim, TensorView& attn_out) {
-            throw unsupported(backend_label(), "sdpa");
-        }
+        oid copy(const TensorView& source, TensorView& destination) noexcept;
+        oid add(const TensorView& a, const TensorView& b,
+                TensorView& c) noexcept;
+        oid mul(const TensorView& a, const TensorView& b,
+                TensorView& c) noexcept;
+        oid silu(const TensorView& x, TensorView& y) noexcept;
+        oid linear(const TensorView& x, const TensorView& w,
+                   TensorView& y) noexcept;
+        oid rmsnorm(const TensorView& x, TensorView& y, const TensorView& w,
+                    float eps, size_t dim) noexcept;
+        oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
+                 size_t n_heads, size_t n_kv_heads, size_t head_dim,
+                 TensorView& attn_out) noexcept;
 
     protected:
         DeviceOps();
+        explicit DeviceOps(const Device& device);
+
+        virtual oid copy_impl(
+                const TensorView& source, TensorView& destination);
+        virtual oid add_impl(const TensorView& a, const TensorView& b,
+                             TensorView& c);
+        virtual oid mul_impl(const TensorView& a, const TensorView& b,
+                             TensorView& c);
+        virtual oid silu_impl(const TensorView& x, TensorView& y);
+        virtual oid linear_impl(const TensorView& x, const TensorView& w,
+                                TensorView& y);
+        virtual oid rmsnorm_impl(const TensorView& x, TensorView& y,
+                                 const TensorView& w, float eps, size_t dim);
+        virtual oid sdpa_impl(const TensorView& q, const TensorView& k,
+                              const TensorView& v, size_t n_heads,
+                              size_t n_kv_heads, size_t head_dim,
+                              TensorView& attn_out);
+
+        [[nodiscard]] const Device& queue_device() const;
         virtual void fence_through_sequence(
                 std::uint64_t sequence) noexcept;
         void record_post_completion_failure(
                 std::uint64_t sequence, std::exception_ptr failure);
         static void validate_copy(
                 const Device& device, const TensorView& source,
-                const TensorView& destination) {
-            if (&source.device() != &device
-                    || &destination.device() != &device) {
-                throw std::invalid_argument(
-                        "copy views must belong to the queue's own device");
-            }
-            if (!(source.spec() == destination.spec())) {
-                throw std::invalid_argument(
-                        "copy views must have identical shape, leaf type, "
-                        "and quantization");
-            }
-        }
+                const TensorView& destination);
+        static void validate_views(const Device& device,
+                                   std::initializer_list<const TensorView*> views);
 
         [[nodiscard]] static bool identical_window(
-                const TensorView& source, const TensorView& destination) {
-            return source.native_handle() == destination.native_handle()
-                    && source.plane_offset() == destination.plane_offset()
-                    && std::equal(
-                            source.plane_strides().begin(),
-                            source.plane_strides().end(),
-                            destination.plane_strides().begin(),
-                            destination.plane_strides().end());
+                const TensorView& source, const TensorView& destination);
+        [[nodiscard]] virtual std::string_view backend_label() const noexcept {
+            return "unknown";
         }
-
-        [[nodiscard]] virtual std::string_view backend_label() const noexcept = 0;
         [[nodiscard]] static std::runtime_error unsupported(
-                std::string_view backend, std::string_view operation) {
-            std::string message(backend);
-            message += " backend does not implement ";
-            message += operation;
-            return std::runtime_error(std::move(message));
-        }
+                std::string_view backend, std::string_view operation);
 
-        /**
-         * Reserves this queue's next submission sequence before invoking
-         * (queue_id << 55) | sequence. Allocating a sequence past 2^55 - 1
-         * throws std::overflow_error before queue_work runs. If queue_work
-         * throws synchronously, submit reclaims the reservation only when no
-         * later submission has reserved a sequence and the failing sequence
-         * has not already completed, so the single-threaded backend call
-         * shape can reuse the sequence. Under concurrent submit calls, a
-         * later reservation leaves a monotonic gap. An inline-completing
-         * backend may call complete(sequence) from queue_work; if it then
-         * throws, the completed sequence is never rolled back. A backend
-         * that records a failure via commit_failure(sequence, failure) and
-         * then throws loses that retained failure when the reservation is
-         * reclaimed; the failure persists only while a later reservation
-         * leaves a gap.
-
-         */
         template <typename QueueWork>
         oid submit(QueueWork queue_work) {
             std::uint64_t sequence = 0;
@@ -349,38 +292,28 @@ namespace iom {
             }
             return encode_token(sequence);
         }
-        /**
-         * Reports one completion and retains any failure for repeatable wait.
-         */
-        void complete(
-                std::uint64_t sequence,
-                std::exception_ptr failure = nullptr);
-
-        /**
-         * Retains a failure for any reserved-but-not-completed sequence.
-         */
-        void commit_failure(
-                std::uint64_t sequence, std::exception_ptr failure);
-
-        /**
-         * Test seam: moves the next allocated sequence forward without
-         * submitting work, letting deterministic fakes begin near the
-         * 55-bit limit. Never moves backward and never allocates.
-         */
+        void complete(std::uint64_t sequence,
+                      std::exception_ptr failure = nullptr);
+        void commit_failure(std::uint64_t sequence,
+                            std::exception_ptr failure);
         void seek_next_sequence(std::uint64_t next_sequence);
 
     private:
+        [[nodiscard]] oid invoke(oid result) noexcept;
+        [[nodiscard]] oid invoke_failure(std::exception_ptr failure) noexcept;
+        [[nodiscard]] static oid map_failure(
+                std::exception_ptr failure) noexcept;
         [[nodiscard]] static std::uint8_t lease_queue_id();
         static void release_queue_id(std::uint8_t queue_id) noexcept;
         [[nodiscard]] oid encode_token(std::uint64_t sequence) const noexcept;
 
-        static constexpr std::uint64_t kSequenceBits = 55;
-        static constexpr std::uint64_t kSequenceMask = (std::uint64_t{1} << kSequenceBits) - 1;
-        static constexpr std::uint64_t kMaxSequence = kSequenceMask;
-        // Sequence ranges skipped by seek_next_sequence are never submitted.
-        std::map<std::uint64_t, std::uint64_t> skipped_sequences_;
-
+        const Device* device_ = nullptr;
         std::uint8_t queue_id_;
+        static constexpr std::uint64_t kSequenceBits = 55;
+        static constexpr std::uint64_t kSequenceMask =
+                (std::uint64_t{1} << kSequenceBits) - 1;
+        static constexpr std::uint64_t kMaxSequence = kSequenceMask;
+        std::map<std::uint64_t, std::uint64_t> skipped_sequences_;
         std::uint64_t next_sequence_ = 1;
         std::uint64_t completed_ = 0;
         std::mutex completion_mutex_;

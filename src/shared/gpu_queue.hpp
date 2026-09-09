@@ -131,8 +131,8 @@ public:
     GpuQueue(
             const Device& device, typename Policy::context_type context,
             detail::RegistryState& registry_state)
-            : device_(&device),
-              registry_state_(&registry_state),
+            : DeviceOps(device),
+              device_(&device),
               registry_queue_id_(
                       detail::allocate_queue_id(*registry_state_)),
               context_(context),
@@ -166,11 +166,10 @@ public:
         state_.reset();
     }
 
-    iom::oid copy(
+    iom::oid copy_impl(
             const TensorView& source, TensorView& destination) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
-        validate_copy(*device_, source, destination);
         const bool no_op = identical_window(source, destination);
         return submit(
                 [this, &source, &destination, no_op](

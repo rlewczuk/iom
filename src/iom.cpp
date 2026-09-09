@@ -485,9 +485,205 @@ namespace iom {
 
     }  // namespace
 
+    void DeviceOps::validate_copy(
+            const Device& device, const TensorView& source,
+            const TensorView& destination) {
+        validate_views(device, {&source, &destination});
+        if (!(source.spec() == destination.spec())) {
+            throw std::invalid_argument(
+                    "copy views must have identical shape, leaf type, "
+                    "and quantization");
+        }
+    }
+
+    bool DeviceOps::identical_window(
+            const TensorView& source, const TensorView& destination) {
+        return source.native_handle() == destination.native_handle()
+                && source.plane_offset() == destination.plane_offset()
+                && std::equal(
+                        source.plane_strides().begin(),
+                        source.plane_strides().end(),
+                        destination.plane_strides().begin(),
+                        destination.plane_strides().end());
+    }
+
+    std::runtime_error DeviceOps::unsupported(
+            std::string_view backend, std::string_view operation) {
+        std::string message(backend);
+        message += " backend does not implement ";
+        message += operation;
+        return std::runtime_error(std::move(message));
+    }
     DeviceOps::DeviceOps()
             : queue_id_(lease_queue_id()) {}
 
+    DeviceOps::DeviceOps(const Device& device)
+            : device_(&device), queue_id_(lease_queue_id()) {}
+
+    namespace {
+        struct UnsupportedOperation final : std::runtime_error {
+            UnsupportedOperation()
+                    : std::runtime_error("operation is unsupported") {}
+        };
+    }
+
+    const Device& DeviceOps::queue_device() const {
+        if (device_ == nullptr) {
+            throw std::logic_error("operation queue has no device");
+        }
+        return *device_;
+    }
+
+    void DeviceOps::validate_views(
+            const Device& device,
+            std::initializer_list<const TensorView*> views) {
+        for (const TensorView* view : views) {
+            if (view == nullptr || &view->device() != &device) {
+                throw std::invalid_argument(
+                        "operation views must belong to the queue's device");
+            }
+        }
+    }
+
+    oid DeviceOps::copy_impl(
+            const TensorView&, TensorView&) {
+        throw UnsupportedOperation();
+    }
+    oid DeviceOps::add_impl(
+            const TensorView&, const TensorView&, TensorView&) {
+        throw UnsupportedOperation();
+    }
+    oid DeviceOps::mul_impl(
+            const TensorView&, const TensorView&, TensorView&) {
+        throw UnsupportedOperation();
+    }
+    oid DeviceOps::silu_impl(const TensorView&, TensorView&) {
+        throw UnsupportedOperation();
+    }
+    oid DeviceOps::linear_impl(
+            const TensorView&, const TensorView&, TensorView&) {
+        throw UnsupportedOperation();
+    }
+    oid DeviceOps::rmsnorm_impl(
+            const TensorView&, TensorView&, const TensorView&, float, size_t) {
+        throw UnsupportedOperation();
+    }
+    oid DeviceOps::sdpa_impl(
+            const TensorView&, const TensorView&, const TensorView&,
+            size_t, size_t, size_t, TensorView&) {
+        throw UnsupportedOperation();
+    }
+
+    oid DeviceOps::map_failure(std::exception_ptr failure) noexcept {
+        try {
+            if (failure != nullptr) {
+                std::rethrow_exception(failure);
+            }
+        } catch (const UnsupportedOperation&) {
+            return to_oid(OidError::Unsupported);
+        } catch (const std::bad_alloc&) {
+            return to_oid(OidError::ResourceExhausted);
+        } catch (const std::overflow_error&) {
+            return to_oid(OidError::Overflow);
+        } catch (const std::invalid_argument&) {
+            return to_oid(OidError::InvalidArgument);
+        } catch (const std::exception&) {
+            return to_oid(OidError::DeviceError);
+        } catch (...) {
+            return to_oid(OidError::InternalError);
+        }
+        return to_oid(OidError::InternalError);
+    }
+
+    oid DeviceOps::invoke_failure(std::exception_ptr failure) noexcept {
+        return map_failure(std::move(failure));
+    }
+
+    oid DeviceOps::invoke(oid result) noexcept {
+        return result;
+    }
+
+    oid DeviceOps::copy(
+            const TensorView& source, TensorView& destination) noexcept {
+        try {
+            validate_copy(queue_device(), source, destination);
+            return invoke(copy_impl(source, destination));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::add(
+            const TensorView& a, const TensorView& b, TensorView& c) noexcept {
+        try {
+            validate_views(queue_device(), {&a, &b, &c});
+            return invoke(add_impl(a, b, c));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::mul(
+            const TensorView& a, const TensorView& b, TensorView& c) noexcept {
+        try {
+            validate_views(queue_device(), {&a, &b, &c});
+            return invoke(mul_impl(a, b, c));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::silu(
+            const TensorView& x, TensorView& y) noexcept {
+        try {
+            validate_views(queue_device(), {&x, &y});
+            return invoke(silu_impl(x, y));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::linear(
+            const TensorView& x, const TensorView& w,
+            TensorView& y) noexcept {
+        try {
+            validate_views(queue_device(), {&x, &w, &y});
+            return invoke(linear_impl(x, w, y));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::rmsnorm(
+            const TensorView& x, TensorView& y, const TensorView& w,
+            float eps, size_t dim) noexcept {
+        try {
+            validate_views(queue_device(), {&x, &y, &w});
+            if (!(eps >= 0.0F) || dim == 0) {
+                throw std::invalid_argument("invalid rmsnorm parameters");
+            }
+            return invoke(rmsnorm_impl(x, y, w, eps, dim));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::sdpa(
+            const TensorView& q, const TensorView& k, const TensorView& v,
+            size_t n_heads, size_t n_kv_heads, size_t head_dim,
+            TensorView& attn_out) noexcept {
+        try {
+            validate_views(queue_device(), {&q, &k, &v, &attn_out});
+            if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0
+                    || n_heads % n_kv_heads != 0) {
+                throw std::invalid_argument("invalid sdpa parameters");
+            }
+            return invoke(sdpa_impl(
+                    q, k, v, n_heads, n_kv_heads, head_dim, attn_out));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
     DeviceOps::~DeviceOps() {
         release_queue_id(queue_id_);
     }
