@@ -20,6 +20,7 @@
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "iom/alloc.hpp"
+#include "backend/backend_conformance_add.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
 #include "copy.hpp"
@@ -696,7 +697,7 @@ TEST_CASE("SYCL conformance: compute methods reject capability without submittin
     SyclDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "SYCL");
+            &devices.gate, "SYCL", true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -706,6 +707,12 @@ TEST_CASE("SYCL conformance: full shared suite") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle);
+            &devices.gate, &oracle, true);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("SYCL conformance: ADD requests use native queue and owner registry") {
+    SyclDevices devices;
+    iom_conformance::run_add_request_conformance(devices.conformance());
     CHECK_FALSE(devices.gate.armed());
 }

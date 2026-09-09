@@ -235,6 +235,7 @@ if(SYCL_ENABLED)
     add_library(iom_sycl STATIC
         src/sycl/device.cpp
         src/sycl/copy.cpp
+        src/sycl/add.cpp
         src/sycl/staging_pool.cpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
@@ -247,6 +248,7 @@ if(SYCL_ENABLED)
             ${PROJECT_SOURCE_DIR}/include
         PRIVATE
             ${PROJECT_SOURCE_DIR}/src/sycl
+            ${PROJECT_SOURCE_DIR}/src/shared
             ${IOM_SYCL_INCLUDE_DIR}
     )
 

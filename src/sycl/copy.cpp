@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <condition_variable>
 #include <cstring>
@@ -20,7 +20,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "iom/gpu_algorithm.hpp"
+#include "scalar_add.hpp"
 #include "runtime.hpp"
 
 #define IOM_GPU_DEVICE
@@ -389,17 +389,20 @@ void launch_view_transfer(
 class SyclQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
-        const TensorView* source;
-        TensorView* destination;
-        bool no_op;
+        const TensorView* source = nullptr;
+        TensorView* destination = nullptr;
+        bool no_op = false;
         std::shared_ptr<SyclFenceState> state;
         void* fence = state.get();
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
+        std::optional<AddRequest> add_request;
+        detail::AddEntryRegistration add_entries;
     };
     struct SyclSequenceOutcome {
         detail::SequenceOutcome common;
         std::shared_ptr<SyclFenceState> state;
+        std::optional<detail::AddEntryRegistration> add_entries;
     };
 
 
@@ -450,8 +453,14 @@ public:
     }
 
     ~SyclQueue() override {
-        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        // Drain queued device work before destroying task captures and
+        // their owner registrations.
+        try {
+            queue_.wait_and_throw();
+        } catch (...) {
+        }
         worker_.shutdown_and_drain();
+        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
     }
 
     oid copy_impl(
@@ -468,12 +477,301 @@ public:
                 });
     }
 
+    oid add_impl(const AddRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        if (consume_submission_fault(SubmissionFault::state_allocation)) {
+            throw std::bad_alloc();
+        }
+        auto state = std::make_shared<SyclFenceState>();
+        detail::Fence fence = build_sycl_fence(state);
+        return submit_add(
+                request, *state_, registry_queue_id_, fence,
+                [this, state](std::uint64_t sequence,
+                              const AddRequest& captured,
+                              detail::AddEntryRegistration entries) {
+                    Task task;
+                    task.sequence = sequence;
+                    task.state = state;
+                    task.fence = state.get();
+                    task.add_request.emplace(captured);
+                    task.add_entries = entries;
+                    worker_.submit_copy(std::move(task));
+                });
+    }
+
     [[nodiscard]] std::string_view backend_label() const noexcept override {
         return "SYCL";
     }
 
 private:
+    // Device-USM-safe ADD staging extent: whole plane blocks up to the
+    // view's highest addressed plane, so untouched planes and tile padding
+    // round-trip unchanged. validate_add bounded this walk with checked
+    // arithmetic and equal plane geometry, so the recompute cannot
+    // overflow for an accepted request.
+    static std::size_t add_view_staging_bytes(
+            const AddRequest& captured, const AddViewSnapshot& view) {
+        const std::span<const std::size_t> dims =
+                view.spec.shape.dimensions();
+        const std::size_t leading_rank = dims.size() - 2;
+        std::size_t max_plane = view.plane_offset;
+        for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+            max_plane += (dims[axis] - 1) * view.plane_strides[axis];
+        }
+        const TensorShape padded_shape =
+                view.spec.standard_padded_shape();
+        const auto padded_dimensions = padded_shape.dimensions();
+        const std::size_t padded_plane_elements =
+                padded_dimensions[leading_rank]
+                * padded_dimensions[leading_rank + 1];
+        const std::size_t plane_bits =
+                padded_plane_elements
+                * detail::leaf_bits(captured.out.spec.data_type);
+        const std::size_t plane_bytes =
+                plane_bits / 8 + (plane_bits % 8 != 0);
+        return (max_plane + 1) * plane_bytes;
+    }
+
+    // Exact shared scalar loop over host staging buffers.
+    static void add_elements(
+            const AddRequest& captured, const unsigned char* lhs_storage,
+            const unsigned char* rhs_storage, unsigned char* out_storage) {
+        const auto dims = captured.result_shape.dimensions();
+        const std::size_t rank = dims.size();
+        const std::size_t bits = detail::leaf_bits(
+                captured.out.spec.data_type);
+        auto load = [bits](const void* ptr, std::size_t bit) {
+            std::uint64_t value = 0;
+            const auto* bytes =
+                    static_cast<const unsigned char*>(ptr);
+            for (std::size_t i = 0; i < bits; ++i)
+                value |= ((bytes[(bit + i) / 8] >>
+                           ((bit + i) % 8)) & 1u) << i;
+            return value;
+        };
+        auto store = [bits](void* ptr, std::size_t bit,
+                            std::uint64_t value) {
+            auto* bytes = static_cast<unsigned char*>(ptr);
+            for (std::size_t i = 0; i < bits; ++i) {
+                const unsigned char mask =
+                        static_cast<unsigned char>(
+                                1u << ((bit + i) % 8));
+                if ((value >> i) & 1u)
+                    bytes[(bit + i) / 8] |= mask;
+                else
+                    bytes[(bit + i) / 8] &= ~mask;
+            }
+        };
+        std::array<std::size_t, 8> coord{};
+        const std::size_t count =
+                captured.result_shape.element_count();
+        for (std::size_t linear = 0; linear < count; ++linear) {
+            std::size_t rest = linear;
+            for (std::size_t axis = rank; axis-- > 0;) {
+                coord[axis] = rest % dims[axis];
+                rest /= dims[axis];
+            }
+            auto plane = [&](const AddViewSnapshot& view) {
+                std::size_t result = view.plane_offset;
+                for (std::size_t axis = 0; axis < rank - 2;
+                     ++axis) {
+                    if (view.logical_plane_strides[axis] != 0)
+                        result += coord[axis] *
+                                  view.logical_plane_strides[axis];
+                }
+                return result;
+            };
+            const std::size_t row = coord[rank - 2];
+            const std::size_t col = coord[rank - 1];
+            const auto slot = [&](const AddViewSnapshot& view,
+                                  std::size_t p,
+                                  std::size_t r,
+                                  std::size_t c) {
+                return detail::standard_plane_slot(
+                        view.spec, p,
+                        view.broadcast_rows ? 0 : r,
+                        view.broadcast_columns ? 0 : c);
+            };
+            const auto a = load(
+                    lhs_storage,
+                    slot(captured.lhs, plane(captured.lhs), row, col) * bits);
+            const auto b = load(
+                    rhs_storage,
+                    slot(captured.rhs, plane(captured.rhs), row, col) * bits);
+            const auto destination_slot = slot(
+                    captured.out, plane(captured.out), row, col);
+            store(out_storage,
+                  destination_slot * bits,
+                  detail::scalar_add(
+                          captured.out.spec.data_type, a, b));
+        }
+    }
+
+    static void free_add_staging(
+            void* staging, const sycl::context& context) noexcept {
+        if (staging == nullptr) {
+            return;
+        }
+        try {
+            sycl::free(staging, context);
+        } catch (...) {
+        }
+    }
+
     void execute(Task& task) {
+        if (task.add_request.has_value()) {
+            if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
+                throw std::bad_alloc();
+            }
+            {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                const auto [it, inserted] = outcomes_.emplace(
+                        task.sequence,
+                        SyclSequenceOutcome{
+                                detail::SequenceOutcome{},
+                                task.state, task.add_entries});
+                if (!inserted) {
+                    throw std::logic_error("duplicate SYCL outstanding-work sequence");
+                }
+            }
+            const AddRequest& captured = *task.add_request;
+            const std::size_t lhs_bytes =
+                    add_view_staging_bytes(captured, captured.lhs);
+            const std::size_t rhs_bytes =
+                    add_view_staging_bytes(captured, captured.rhs);
+            const std::size_t out_bytes =
+                    add_view_staging_bytes(captured, captured.out);
+            const sycl::context context = queue_.get_context();
+            void* lhs_stage = nullptr;
+            void* rhs_stage = nullptr;
+            void* out_stage = nullptr;
+            void* lhs_device = nullptr;
+            void* rhs_device = nullptr;
+            void* out_device = nullptr;
+            bool submitted = false;
+            bool staged_enqueued = false;
+            try {
+                if (consume_submission_fault(SubmissionFault::first_submit)) {
+                    throw std::runtime_error("injected SYCL first-submit failure");
+                }
+                // Tensor storage is device USM and this runtime rejects
+                // direct queue memcpy operations involving caller handles.
+                // The existing copy kernels can access those handles, so
+                // each extent first crosses through a temporary device-USM
+                // buffer. Only the temporary buffers participate in memcpy;
+                // the host scalar loop still uses the exact shared
+                // long-double implementation, preserving cross-backend
+                // bit-exactness. All transfers stay ordered on this
+                // in-order queue. Tradeoff: the element loop executes on
+                // the host between queue drains instead of a device kernel.
+                lhs_stage = sycl::malloc_host(lhs_bytes, context);
+                rhs_stage = sycl::malloc_host(rhs_bytes, context);
+                out_stage = sycl::malloc_host(out_bytes, context);
+                lhs_device = sycl::malloc_device(
+                        lhs_bytes, queue_.get_device(), context);
+                rhs_device = sycl::malloc_device(
+                        rhs_bytes, queue_.get_device(), context);
+                out_device = sycl::malloc_device(
+                        out_bytes, queue_.get_device(), context);
+                if (lhs_stage == nullptr || rhs_stage == nullptr
+                        || out_stage == nullptr || lhs_device == nullptr
+                        || rhs_device == nullptr || out_device == nullptr) {
+                    throw std::bad_alloc();
+                }
+                const auto* lhs_source =
+                        static_cast<const unsigned char*>(
+                                captured.lhs.native_handle);
+                auto* lhs_target =
+                        static_cast<unsigned char*>(lhs_device);
+                queue_.parallel_for(
+                        sycl::range<1>(lhs_bytes),
+                        [=](sycl::id<1> item) {
+                            lhs_target[item[0]] = lhs_source[item[0]];
+                        });
+                staged_enqueued = true;
+                submitted = true;
+                const auto* rhs_source =
+                        static_cast<const unsigned char*>(
+                                captured.rhs.native_handle);
+                auto* rhs_target =
+                        static_cast<unsigned char*>(rhs_device);
+                queue_.parallel_for(
+                        sycl::range<1>(rhs_bytes),
+                        [=](sycl::id<1> item) {
+                            rhs_target[item[0]] = rhs_source[item[0]];
+                        });
+                const auto* out_source =
+                        static_cast<const unsigned char*>(
+                                captured.out.native_handle);
+                auto* out_target =
+                        static_cast<unsigned char*>(out_device);
+                queue_.parallel_for(
+                        sycl::range<1>(out_bytes),
+                        [=](sycl::id<1> item) {
+                            out_target[item[0]] = out_source[item[0]];
+                        });
+                queue_.memcpy(lhs_stage, lhs_device, lhs_bytes);
+                queue_.memcpy(rhs_stage, rhs_device, rhs_bytes);
+                queue_.memcpy(out_stage, out_device, out_bytes);
+                queue_.wait_and_throw();
+                add_elements(
+                        captured,
+                        static_cast<const unsigned char*>(lhs_stage),
+                        static_cast<const unsigned char*>(rhs_stage),
+                        static_cast<unsigned char*>(out_stage));
+                queue_.memcpy(out_device, out_stage, out_bytes);
+                const auto* out_device_source =
+                        static_cast<const unsigned char*>(out_device);
+                auto* out_destination =
+                        static_cast<unsigned char*>(
+                                captured.out.native_handle);
+                queue_.parallel_for(
+                        sycl::range<1>(out_bytes),
+                        [=](sycl::id<1> item) {
+                            out_destination[item[0]] =
+                                    out_device_source[item[0]];
+                        });
+                if (consume_submission_fault(SubmissionFault::post_launch)) {
+                    throw std::runtime_error("injected SYCL post-launch failure");
+                }
+                queue_.wait_and_throw();
+            } catch (...) {
+                if (staged_enqueued) {
+                    try {
+                        queue_.wait_and_throw();
+                    } catch (...) {
+                    }
+                }
+                free_add_staging(lhs_stage, context);
+                free_add_staging(rhs_stage, context);
+                free_add_staging(out_stage, context);
+                free_add_staging(lhs_device, context);
+                free_add_staging(rhs_device, context);
+                free_add_staging(out_device, context);
+                if (!submitted) {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        outcomes_.erase(task.sequence);
+                    }
+                    // Entry rollback belongs to submit_add: it registered
+                    // the ADD entries, and a second remove here replaced
+                    // the original failure with invalid_argument.
+                    task.state.reset();
+                    task.fence = nullptr;
+                    throw;
+                }
+                task.state->set_failure(std::current_exception());
+                return;
+            }
+            free_add_staging(lhs_stage, context);
+            free_add_staging(rhs_stage, context);
+            free_add_staging(out_stage, context);
+            free_add_staging(lhs_device, context);
+            free_add_staging(rhs_device, context);
+            free_add_staging(out_device, context);
+            return;
+        }
         if (task.no_op) {
             task.state = nullptr;
             task.fence = nullptr;
@@ -631,9 +929,16 @@ private:
                                           : callback_failure;
             const bool fence_succeeded =
                     fence_result.succeeded && !fence_result.failure;
-            (void)detail::release_or_invalidate_entries(
-                    state_->registry, outcome.common,
-                    static_cast<bool>(callback_failure), fence_succeeded);
+            if (outcome.add_entries.has_value()) {
+                (void)detail::release_or_invalidate_add_entries(
+                        state_->registry, *outcome.add_entries,
+                        static_cast<bool>(callback_failure),
+                        fence_succeeded);
+            } else {
+                (void)detail::release_or_invalidate_entries(
+                        state_->registry, outcome.common,
+                        static_cast<bool>(callback_failure), fence_succeeded);
+            }
         } else {
             combined_failure = callback_failure;
         }
