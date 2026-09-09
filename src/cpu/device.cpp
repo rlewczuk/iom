@@ -402,6 +402,14 @@ namespace iom {
                     view().spec().tiled_storage_nbytes(),
                     [] {},
                     "CPU tensor storage is not 32-byte aligned");
+            try {
+                std::fill_n(
+                        static_cast<std::byte*>(address_),
+                        view().spec().tiled_storage_nbytes(), std::byte{0});
+            } catch (...) {
+                iom::detail::release_aligned_storage(allocator_, address_);
+                throw;
+            }
         }
 
         ~CpuTensor() noexcept override {

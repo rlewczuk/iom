@@ -179,6 +179,11 @@ namespace iom {
                 try {
                     validate_native_storage(
                             address_, device_.context(), device_.ordinal());
+                    cuda_detail::check_cuda_kernel(
+                            "cudaMemset",
+                            cudaMemset(
+                                    address_, 0,
+                                    view().spec().tiled_storage_nbytes()));
                 } catch (...) {
                     void* rejected = std::exchange(address_, nullptr);
                     iom::detail::release_aligned_storage(

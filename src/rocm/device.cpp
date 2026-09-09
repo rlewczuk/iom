@@ -130,6 +130,12 @@ namespace iom {
                 try {
                     validate_native_storage(
                             address_, static_cast<int>(device_.ordinal()));
+                    check_hip(
+                            "hipMemset",
+                            hipMemset(
+                                    address_, 0,
+                                    view().spec().tiled_storage_nbytes()));
+                    check_hip("hipDeviceSynchronize", hipDeviceSynchronize());
                 } catch (...) {
                     void* rejected = std::exchange(address_, nullptr);
                     iom::detail::release_aligned_storage(

@@ -153,11 +153,19 @@ namespace iom {
 
                 try {
                     if (sycl::get_pointer_type(address_, device_.context())
-                            == sycl::usm::alloc::unknown) {
+                            == sycl::usm::alloc::unknown
+                            || sycl::get_pointer_device(
+                                       address_, device_.context())
+                                    != device_.native_device()) {
                         throw std::runtime_error(
                                 "SYCL tensor storage is incompatible with "
-                                "the owned context");
+                                "the owning context");
                     }
+                    auto& queue = device_.transfer_queue();
+                    queue.memset(
+                            address_, 0,
+                            view().spec().tiled_storage_nbytes());
+                    queue.wait_and_throw();
                 } catch (...) {
                     void* rejected = std::exchange(address_, nullptr);
                     iom::detail::release_aligned_storage(allocator_, rejected);
