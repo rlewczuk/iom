@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "backend/backend_conformance_common.hpp"
+#include "backend/backend_conformance_add.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/device.hpp"
@@ -877,3 +878,198 @@ TEST_CASE(
     }
 #endif
 }
+namespace {
+
+std::vector<std::byte> coexistence_uniform(
+        const iom::TensorSpec& spec, std::uint64_t value) {
+    std::vector<std::byte> bytes(spec.logical_nbytes(), std::byte{0});
+    const std::size_t bits = iom_conformance::bits_of(spec.data_type);
+    auto* base = reinterpret_cast<unsigned char*>(bytes.data());
+    for (std::size_t i = 0; i < spec.shape.element_count(); ++i) {
+        iom_conformance::write_bits(base, i * bits, bits, value);
+    }
+    return bytes;
+}
+
+void run_interleaved_add(
+        const std::vector<BackendParticipant*>& participants,
+        iom::DataType type, std::uint64_t lhs_value,
+        std::uint64_t rhs_value) {
+    const iom::TensorSpec spec{iom::TensorShape{{2, 17, 33}}, type};
+    const std::vector<std::byte> lhs_bytes =
+            coexistence_uniform(spec, lhs_value);
+    const std::vector<std::byte> rhs_bytes =
+            coexistence_uniform(spec, rhs_value);
+    const std::uint64_t sum = iom_conformance::add_oracle::add(
+            type, lhs_value, rhs_value);
+    const std::vector<std::byte> expected =
+            coexistence_uniform(spec, sum);
+    const std::uint64_t alias_sum =
+            iom_conformance::add_oracle::add(type, sum, sum);
+    const std::vector<std::byte> alias_expected =
+            coexistence_uniform(spec, alias_sum);
+
+    struct Work {
+        std::unique_ptr<iom::Tensor> lhs, rhs, staged, out, copied;
+        const iom::Tensor* lhs_owner = nullptr;
+        const iom::Tensor* rhs_owner = nullptr;
+        const iom::Tensor* out_owner = nullptr;
+        void* lhs_handle = nullptr;
+        void* rhs_handle = nullptr;
+        void* out_handle = nullptr;
+        std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+        std::vector<iom::oid> tokens;
+    };
+    std::vector<Work> work;
+    work.reserve(participants.size());
+    for (BackendParticipant* participant : participants) {
+        Work item;
+        item.lhs = participant->device->create_tensor(spec);
+        item.rhs = participant->device->create_tensor(spec);
+        item.staged = participant->device->create_tensor(spec);
+        item.out = participant->device->create_tensor(spec);
+        item.copied = participant->device->create_tensor(spec);
+        item.lhs->view().copy_from_host(lhs_bytes);
+        item.rhs->view().copy_from_host(rhs_bytes);
+        const std::vector<std::byte> sentinel(
+                spec.logical_nbytes(), iom_conformance::kReadbackSentinel);
+        item.staged->view().copy_from_host(sentinel);
+        item.out->view().copy_from_host(sentinel);
+        item.copied->view().copy_from_host(sentinel);
+        item.queues.push_back(participant->device->create_ops());
+        item.queues.push_back(participant->device->create_ops());
+        work.push_back(std::move(item));
+    }
+
+    HostAllocator foreign_allocator;
+    auto foreign_device = iom::make_cpu_device(foreign_allocator);
+    auto foreign_tensor = foreign_device->create_tensor(spec);
+    foreign_tensor->view().copy_from_host(lhs_bytes);
+    for (std::size_t i = 0; i < work.size(); ++i) {
+        CAPTURE(participants[i]->name);
+        const std::vector<std::byte> before =
+                iom_conformance::read_logical(work[i].out->view());
+        CHECK_EQ(work[i].queues[0]->add(
+                         foreign_tensor->view(), work[i].rhs->view(),
+                         work[i].out->view()),
+                 iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(iom_conformance::read_logical(work[i].out->view()), before);
+    }
+
+    std::set<iom::oid> tokens;
+    std::set<std::uint8_t> queue_ids;
+    for (std::size_t round = 0; round < 2; ++round) {
+        for (std::size_t i = 0; i < work.size(); ++i) {
+            Work& item = work[i];
+            item.lhs_owner = item.lhs->view().owner_identity();
+            item.rhs_owner = item.rhs->view().owner_identity();
+            item.out_owner = item.out->view().owner_identity();
+            item.lhs_handle = item.lhs->view().native_handle();
+            item.rhs_handle = item.rhs->view().native_handle();
+            item.out_handle = item.out->view().native_handle();
+            const iom::oid staged_copy =
+                    item.queues[0]->copy(item.lhs->view(), item.staged->view());
+            const iom::oid ordered_add = item.queues[0]->add(
+                    item.staged->view(), item.rhs->view(), item.out->view());
+            const iom::oid add_then_copy = item.queues[1]->add(
+                    item.lhs->view(), item.rhs->view(), item.copied->view());
+            const iom::oid readback_copy = item.queues[1]->copy(
+                    item.copied->view(), item.out->view());
+            for (const iom::oid token :
+                 {staged_copy, ordered_add, add_then_copy, readback_copy}) {
+                REQUIRE(iom::oid_is_token(token));
+                CHECK(tokens.insert(token).second);
+                queue_ids.insert(iom_conformance::token_queue(token));
+                item.tokens.push_back(token);
+            }
+        }
+    }
+    CHECK_EQ(queue_ids.size(), participants.size() * 2);
+
+    for (std::size_t i = work.size(); i-- > 0;) {
+        Work& item = work[i];
+        // Wait the tail first to exercise out-of-order waits; queue ordering
+        // still makes all preceding work visible before that token completes.
+        item.queues[1]->wait(item.tokens[7]);
+        item.queues[0]->wait(item.tokens[5]);
+        item.queues[0]->wait(item.tokens[1]);
+        item.queues[0]->wait(item.tokens[1]);
+        item.queues[1]->wait(item.tokens[3]);
+        item.queues[0]->wait(item.tokens[0]);
+        item.queues[0]->wait(item.tokens[4]);
+        item.queues[1]->wait(item.tokens[2]);
+        item.queues[1]->wait(item.tokens[6]);
+        iom_conformance::require_logical_bytes(
+                item.out->view(), expected, participants[i]->name);
+        CHECK(item.lhs_owner == item.lhs->view().owner_identity());
+        CHECK(item.rhs_owner == item.rhs->view().owner_identity());
+        CHECK(item.out_owner == item.out->view().owner_identity());
+        CHECK(item.lhs_handle == item.lhs->view().native_handle());
+        CHECK(item.rhs_handle == item.rhs->view().native_handle());
+        CHECK(item.out_handle == item.out->view().native_handle());
+
+        const iom::oid derived = [&] {
+            auto lhs_view = item.lhs->view().slice(0, 0, 2);
+            auto rhs_view = item.rhs->view().slice(0, 0, 2);
+            auto out_view = item.out->view().slice(0, 0, 2);
+            return item.queues[0]->add(lhs_view, rhs_view, out_view);
+        }();
+        REQUIRE(iom::oid_is_token(derived));
+        item.queues[0]->wait(derived);
+        iom_conformance::require_logical_bytes(
+                item.out->view(), expected, participants[i]->name);
+
+        const iom::oid alias =
+                item.queues[1]->add(item.out->view(), item.out->view(),
+                                    item.out->view());
+        REQUIRE(iom::oid_is_token(alias));
+        item.queues[1]->wait(alias);
+        iom_conformance::require_logical_bytes(
+                item.out->view(), alias_expected, participants[i]->name);
+    }
+
+    auto fault_lhs = participants.front()->device->create_tensor(spec);
+    auto fault_rhs = participants.front()->device->create_tensor(spec);
+    auto fault_out = participants.front()->device->create_tensor(spec);
+    iom_conformance::CommonAddQueue fault_queue(*participants.front()->device);
+    fault_queue.fail_next_after_acceptance();
+    const iom::oid failed =
+            fault_queue.add(fault_lhs->view(), fault_rhs->view(),
+                            fault_out->view());
+    REQUIRE(iom::oid_is_token(failed));
+    fault_queue.finish(iom_conformance::token_sequence(failed));
+    iom_conformance::expect_repeated_runtime_failure(fault_queue, failed);
+}
+
+TEST_CASE("Backend coexistence: ADD interleaves across enabled backends") {
+    HostAllocator cpu_allocator;
+    BackendParticipant cpu_participant = make_cpu_participant(cpu_allocator);
+    std::vector<BackendParticipant*> participants{&cpu_participant};
+#ifdef IOM_COEXIST_CUDA
+    CudaMemoryAllocator cuda_allocator;
+    BackendParticipant cuda_participant = make_cuda_participant(cuda_allocator);
+    participants.push_back(&cuda_participant);
+#endif
+#ifdef IOM_COEXIST_ROCM
+    HipMemoryAllocator rocm_allocator;
+    BackendParticipant rocm_participant = make_rocm_participant(rocm_allocator);
+    participants.push_back(&rocm_participant);
+#endif
+#ifdef IOM_COEXIST_SYCL
+    SyclUsmAllocator sycl_allocator;
+    BackendParticipant sycl_participant = make_sycl_participant(sycl_allocator);
+    participants.push_back(&sycl_participant);
+#endif
+#ifdef IOM_COEXIST_TTNN
+    BackendParticipant ttnn_participant = make_ttnn_participant();
+    participants.push_back(&ttnn_participant);
+#endif
+    run_interleaved_add(
+            participants, iom::DataType::I32, std::uint64_t{7},
+            std::uint64_t{5});
+    run_interleaved_add(
+            participants, iom::DataType::F32, std::uint64_t{0x3fc00000},
+            std::uint64_t{0x40100000});
+}
+
+}  // namespace
