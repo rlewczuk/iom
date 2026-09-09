@@ -30,7 +30,6 @@
 namespace iom::detail {
 namespace {
 
-constexpr unsigned kAddMaxRank = 16;
 constexpr std::uint64_t kAddTile = TensorSpec::TILE;
 constexpr std::uint64_t kAddTileSlots = kAddTile * kAddTile;
 
@@ -44,10 +43,10 @@ struct AddMetadata {
     std::uint64_t out_offset;
     std::uint64_t lhs_offset;
     std::uint64_t rhs_offset;
-    std::uint64_t dims[kAddMaxRank];
-    std::uint64_t lhs_strides[kAddMaxRank];
-    std::uint64_t rhs_strides[kAddMaxRank];
-    std::uint64_t out_strides[kAddMaxRank];
+    const std::uint64_t* dims;
+    const std::uint64_t* lhs_strides;
+    const std::uint64_t* rhs_strides;
+    const std::uint64_t* out_strides;
     std::uint64_t lhs_rows;
     std::uint64_t lhs_columns;
     std::uint64_t rhs_rows;
@@ -57,6 +56,7 @@ struct AddMetadata {
     std::uint32_t rhs_brow;
     std::uint32_t rhs_bcol;
 };
+
 
 [[nodiscard]] std::size_t add_checked_mul(
         std::size_t left, std::size_t right, const char* message) {
@@ -72,6 +72,17 @@ struct AddMetadata {
         throw std::overflow_error(message);
     }
     return left + right;
+}
+[[nodiscard]] std::size_t add_metadata_storage_bytes(
+        std::size_t rank) {
+    const std::size_t arrays = add_checked_mul(
+            add_checked_mul(
+                    rank, sizeof(std::uint64_t),
+                    "ADD metadata rank storage overflows"),
+            4, "ADD metadata rank storage overflows");
+    return add_checked_add(
+            sizeof(AddMetadata), arrays,
+            "ADD metadata storage size overflows");
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +409,8 @@ void launch_grid_stride_add(
         const unsigned char* rhs, unsigned char* out,
         const AddMetadata& metadata) {
     const std::uint64_t launch_words =
-            metadata.total_words + 255;
+            add_checked_add(metadata.total_words, 255,
+                    "ADD launch word count overflows");
     const unsigned int blocks = static_cast<unsigned int>(
             launch_words / 256 < 65535 ? launch_words / 256 : 65535);
     IOM_LAUNCH_KERNEL(
@@ -409,12 +421,14 @@ void launch_grid_stride_add(
 template <typename Request>
 [[nodiscard]] AddMetadata make_add_metadata(const Request& request) {
     const auto dimensions = request.result_shape.dimensions();
-    if (dimensions.size() > kAddMaxRank) {
-        throw std::invalid_argument(
-                "ADD rank exceeds implementation limit");
-    }
     if (dimensions.size() < 2) {
         throw std::invalid_argument("ADD rank below tiled matrix rank");
+    }
+    if (dimensions.size()
+            > static_cast<std::size_t>(
+                      std::numeric_limits<std::uint32_t>::max())) {
+        throw std::overflow_error(
+                "ADD metadata rank representation overflows");
     }
     const std::size_t rank = dimensions.size();
     AddMetadata metadata{};
@@ -438,30 +452,28 @@ template <typename Request>
     metadata.lhs_bcol = request.lhs.broadcast_columns ? 1u : 0u;
     metadata.rhs_brow = request.rhs.broadcast_rows ? 1u : 0u;
     metadata.rhs_bcol = request.rhs.broadcast_columns ? 1u : 0u;
-    for (std::size_t axis = 0; axis < rank; ++axis) {
-        metadata.dims[axis] = dimensions[axis];
-    }
-    for (std::size_t axis = 0; axis + 2 < rank; ++axis) {
-        metadata.lhs_strides[axis] = request.lhs.logical_plane_strides[axis];
-        metadata.rhs_strides[axis] = request.rhs.logical_plane_strides[axis];
-        metadata.out_strides[axis] = request.out.logical_plane_strides[axis];
-    }
     std::size_t plane_count = 1;
     for (std::size_t axis = 0; axis + 2 < rank; ++axis) {
         plane_count = add_checked_mul(
                 plane_count, static_cast<std::size_t>(dimensions[axis]),
                 "ADD metadata plane count overflows");
     }
-    const std::size_t padded_rows =
-            (static_cast<std::size_t>(metadata.rows)
-             + static_cast<std::size_t>(kAddTile) - 1)
-            / static_cast<std::size_t>(kAddTile)
-            * static_cast<std::size_t>(kAddTile);
-    const std::size_t padded_columns =
-            (static_cast<std::size_t>(metadata.columns)
-             + static_cast<std::size_t>(kAddTile) - 1)
-            / static_cast<std::size_t>(kAddTile)
-            * static_cast<std::size_t>(kAddTile);
+    const std::size_t padded_rows = add_checked_mul(
+            (add_checked_add(
+                    static_cast<std::size_t>(metadata.rows),
+                    static_cast<std::size_t>(kAddTile) - 1,
+                    "ADD metadata row padding overflows")
+             / static_cast<std::size_t>(kAddTile)),
+            static_cast<std::size_t>(kAddTile),
+            "ADD metadata padded rows overflow");
+    const std::size_t padded_columns = add_checked_mul(
+            (add_checked_add(
+                    static_cast<std::size_t>(metadata.columns),
+                    static_cast<std::size_t>(kAddTile) - 1,
+                    "ADD metadata column padding overflows")
+             / static_cast<std::size_t>(kAddTile)),
+            static_cast<std::size_t>(kAddTile),
+            "ADD metadata padded columns overflow");
     const std::size_t words_per_plane = add_checked_add(
             add_checked_mul(
                     add_checked_mul(
@@ -475,6 +487,45 @@ template <typename Request>
             plane_count, words_per_plane,
             "ADD metadata total words overflows");
     return metadata;
+}
+
+template <typename Request>
+void write_add_metadata(
+        void* host_storage, const void* device_storage,
+        const Request& request) {
+    const auto dimensions = request.result_shape.dimensions();
+    const std::size_t rank = dimensions.size();
+    AddMetadata metadata = make_add_metadata(request);
+    auto* host_bytes = static_cast<std::byte*>(host_storage);
+    const auto* device_bytes =
+            static_cast<const std::byte*>(device_storage);
+    const std::size_t arrays_offset = sizeof(AddMetadata);
+    auto* host_dims = reinterpret_cast<std::uint64_t*>(
+            host_bytes + arrays_offset);
+    auto* host_lhs_strides = host_dims + rank;
+    auto* host_rhs_strides = host_lhs_strides + rank;
+    auto* host_out_strides = host_rhs_strides + rank;
+    for (std::size_t axis = 0; axis < rank; ++axis) {
+        host_dims[axis] = dimensions[axis];
+        host_lhs_strides[axis] = 0;
+        host_rhs_strides[axis] = 0;
+        host_out_strides[axis] = 0;
+    }
+    for (std::size_t axis = 0; axis + 2 < rank; ++axis) {
+        host_lhs_strides[axis] =
+                request.lhs.logical_plane_strides[axis];
+        host_rhs_strides[axis] =
+                request.rhs.logical_plane_strides[axis];
+        host_out_strides[axis] =
+                request.out.logical_plane_strides[axis];
+    }
+    const auto* device_dims = reinterpret_cast<const std::uint64_t*>(
+            device_bytes + arrays_offset);
+    metadata.dims = device_dims;
+    metadata.lhs_strides = device_dims + rank;
+    metadata.rhs_strides = device_dims + rank * 2;
+    metadata.out_strides = device_dims + rank * 3;
+    *reinterpret_cast<AddMetadata*>(host_storage) = metadata;
 }
 
 }  // namespace

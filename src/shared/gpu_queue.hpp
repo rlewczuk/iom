@@ -36,6 +36,45 @@ namespace iom::detail {
 template <typename Policy>
 class GpuQueue final : public DeviceOps {
     using EventRing = iom::detail::EventRingState<Policy>;
+    struct MetadataLease {
+        MetadataSlotPool<Policy>* pool = nullptr;
+        std::size_t slot = EventRing::kNoAttachedSlot;
+
+        ~MetadataLease() {
+            if (pool != nullptr) {
+                pool->release(slot);
+            }
+        }
+
+        MetadataLease() = default;
+        MetadataLease(
+                MetadataSlotPool<Policy>* pool_value,
+                std::size_t slot_value)
+                : pool(pool_value), slot(slot_value) {}
+        MetadataLease(const MetadataLease&) = delete;
+        MetadataLease& operator=(const MetadataLease&) = delete;
+        MetadataLease(MetadataLease&& other) noexcept
+                : pool(std::exchange(other.pool, nullptr)),
+                  slot(std::exchange(
+                          other.slot, EventRing::kNoAttachedSlot)) {}
+        MetadataLease& operator=(MetadataLease&& other) noexcept {
+            if (this != &other) {
+                if (pool != nullptr) {
+                    pool->release(slot);
+                }
+                pool = std::exchange(other.pool, nullptr);
+                slot = std::exchange(
+                        other.slot, EventRing::kNoAttachedSlot);
+            }
+            return *this;
+        }
+
+        void handoff() noexcept {
+            pool = nullptr;
+            slot = EventRing::kNoAttachedSlot;
+        }
+    };
+
 
     struct Task {
         std::uint64_t sequence;
@@ -49,6 +88,7 @@ class GpuQueue final : public DeviceOps {
         void* fence = nullptr;
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
+        MetadataLease metadata_lease;
     };
 
     // One submission's completion lease paired with a post-launch retained
@@ -190,20 +230,41 @@ public:
     }
 
     oid add_impl(const AddRequest& request) override {
-        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        // Validate rank-dependent arithmetic and reserve the complete
+        // metadata representation before accepting the request. The slot is
+        // retained by the completion submission once the worker receives it.
+        const std::size_t metadata_bytes =
+                detail::add_metadata_storage_bytes(
+                        request.result_shape.dimensions().size());
+        (void)detail::make_add_metadata(request);
         Policy::activate(context_);
-        auto submission = state_->acquire();
-        const detail::Fence fence = build_fence(submission, nullptr);
-        return submit_add(
-                request, *registry_state_, registry_queue_id_, fence,
-                [this, submission = std::move(submission)](
-                        std::uint64_t sequence, const AddRequest& captured,
-                        detail::AddEntryRegistration entries) mutable {
-                    worker_.submit_copy(Task{
-                            sequence, nullptr, nullptr, false, true,
-                            std::optional<AddRequest>(captured), entries,
-                            std::move(submission)});
-                });
+        const std::size_t metadata_slot = metadata_pool_.acquire();
+        try {
+            metadata_pool_.ensure_slot_capacity(
+                    metadata_slot, metadata_bytes);
+            auto submission = state_->acquire();
+            const detail::Fence fence = build_fence(submission, nullptr);
+            return submit_add(
+                    request, *registry_state_, registry_queue_id_, fence,
+                    [this, submission = std::move(submission),
+                     metadata_slot](
+                            std::uint64_t sequence,
+                            const AddRequest& captured,
+                            detail::AddEntryRegistration entries) mutable {
+                        Task task;
+                        task.sequence = sequence;
+                        task.is_add = true;
+                        task.add_request.emplace(captured);
+                        task.add_entries = entries;
+                        task.submission = std::move(submission);
+                        task.metadata_lease = MetadataLease{
+                                &metadata_pool_, metadata_slot};
+                        worker_.submit_copy(std::move(task));
+                    });
+        } catch (...) {
+            metadata_pool_.release(metadata_slot);
+            throw;
+        }
     }
 
 private:
@@ -225,8 +286,27 @@ private:
             }
             std::exception_ptr failure;
             try {
+                const std::size_t metadata_bytes =
+                        detail::add_metadata_storage_bytes(
+                                task.add_request->result_shape
+                                        .dimensions()
+                                        .size());
+                const std::size_t metadata_slot =
+                        task.metadata_lease.slot;
+                task.submission->attach_metadata_slot(metadata_slot);
+                task.metadata_lease.handoff();
+                detail::write_add_metadata(
+                        metadata_pool_.host_data(metadata_slot),
+                        metadata_pool_.device_data(metadata_slot),
+                        *task.add_request);
+                Policy::copy_from_host(
+                        stream_,
+                        metadata_pool_.device_data(metadata_slot),
+                        metadata_pool_.host_data(metadata_slot),
+                        metadata_bytes);
                 const detail::AddMetadata metadata =
-                        detail::make_add_metadata(*task.add_request);
+                        *reinterpret_cast<const detail::AddMetadata*>(
+                                metadata_pool_.host_data(metadata_slot));
                 detail::launch_grid_stride_add<Policy>(
                         stream_,
                         static_cast<const unsigned char*>(

@@ -242,6 +242,8 @@ TEST_CASE("CPU conformance: common ADD validation and lifetime policy") {
     CpuDevices devices;
     iom_conformance::run_add_request_conformance(
             devices.conformance(), &devices.gate);
+    iom_conformance::run_add_rank_boundary_conformance(
+            *devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }
 

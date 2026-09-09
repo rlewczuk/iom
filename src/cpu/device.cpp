@@ -660,7 +660,7 @@ namespace iom {
         static std::size_t source_plane(
                 const DeviceOps::AddViewSnapshot& source,
                 std::span<const std::size_t> result_dimensions,
-                const std::array<std::size_t, 8>& coordinates) {
+                std::span<const std::size_t> coordinates) {
             const auto dimensions = source.spec.shape.dimensions();
             const std::size_t leading = result_dimensions.size() - 2;
             const std::size_t source_leading = dimensions.size() - 2;
@@ -677,9 +677,6 @@ namespace iom {
 
         static void add_elements(const DeviceOps::AddRequest& request) {
             const auto result_dimensions = request.result_shape.dimensions();
-            if (result_dimensions.size() > 8) {
-                throw std::invalid_argument("CPU ADD rank exceeds implementation limit");
-            }
             const std::size_t rank = result_dimensions.size();
             const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
             auto* out_base = static_cast<unsigned char*>(
@@ -688,7 +685,7 @@ namespace iom {
                     request.lhs.native_handle);
             const auto* rhs_base = static_cast<const unsigned char*>(
                     request.rhs.native_handle);
-            std::array<std::size_t, 8> coordinates{};
+            std::vector<std::size_t> coordinates(rank);
             const std::size_t count = request.result_shape.element_count();
             for (std::size_t linear = 0; linear < count; ++linear) {
                 std::size_t remainder = linear;
@@ -729,6 +726,7 @@ namespace iom {
                                 lhs_value, rhs_value));
             }
         }
+
 
         oid add_impl(const AddRequest& request) override {
             std::lock_guard<std::mutex> submission_lock(

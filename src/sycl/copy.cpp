@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "scalar_add.hpp"
 #include "runtime.hpp"
@@ -563,7 +564,7 @@ private:
                     bytes[(bit + i) / 8] &= ~mask;
             }
         };
-        std::array<std::size_t, 8> coord{};
+        std::vector<std::size_t> coord(rank);
         const std::size_t count =
                 captured.result_shape.element_count();
         for (std::size_t linear = 0; linear < count; ++linear) {

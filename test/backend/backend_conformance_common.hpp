@@ -482,4 +482,47 @@ inline void run_add_request_conformance(
         observer->case_complete();
     }
 }
+inline void run_add_rank_boundary_conformance(iom::Device& candidate) {
+    const iom::TensorSpec input_spec{
+            iom::TensorShape{{17, 33}}, iom::DataType::U8};
+    const std::vector<std::byte> lhs_bytes =
+            encode_logical(input_spec, 0x13579BDF2468ACE0ull);
+    const std::vector<std::byte> rhs_bytes =
+            encode_logical(input_spec, 0x0ECA8642FDB97531ull);
+    auto rhs = candidate.create_tensor(input_spec);
+    rhs->view().copy_from_host(rhs_bytes);
+    auto queue = candidate.create_ops();
+    for (const std::size_t rank : {8u, 9u, 16u, 17u}) {
+        std::vector<std::size_t> dimensions(rank, 1);
+        dimensions[rank - 2] = 17;
+        dimensions[rank - 1] = 33;
+        const iom::TensorSpec lhs_spec{
+                iom::TensorShape{dimensions}, iom::DataType::U8};
+        const iom::TensorSpec output_spec{
+                iom::TensorShape{dimensions}, iom::DataType::U8};
+        auto lhs = candidate.create_tensor(lhs_spec);
+        auto output = candidate.create_tensor(output_spec);
+        lhs->view().copy_from_host(lhs_bytes);
+        output->view().copy_from_host(
+                std::vector<std::byte>(
+                        output_spec.logical_nbytes(), std::byte{0}));
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), output->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_NOTHROW(queue->wait(token));
+        const std::vector<std::byte> actual =
+                read_logical(output->view());
+        REQUIRE_EQ(actual.size(), lhs_bytes.size());
+        std::vector<std::byte> expected(actual.size());
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            expected[index] = std::byte{
+                    static_cast<unsigned char>(
+                            static_cast<unsigned>(lhs_bytes[index])
+                            + static_cast<unsigned>(rhs_bytes[index]))};
+        }
+        CHECK_EQ(actual, expected);
+    }
+}
+
 }  // namespace iom_conformance

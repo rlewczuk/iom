@@ -714,5 +714,7 @@ TEST_CASE("SYCL conformance: full shared suite") {
 TEST_CASE("SYCL conformance: ADD requests use native queue and owner registry") {
     SyclDevices devices;
     iom_conformance::run_add_request_conformance(devices.conformance());
+    iom_conformance::run_add_rank_boundary_conformance(
+            *devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }

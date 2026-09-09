@@ -342,6 +342,8 @@ TEST_CASE("CUDA ADD accepts every low-width leaf against the oracle") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_gpu_add_low_width_conformance(*devices.candidate);
+    iom_conformance::run_add_rank_boundary_conformance(
+            *devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }
 
