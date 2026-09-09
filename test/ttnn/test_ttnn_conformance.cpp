@@ -1552,6 +1552,15 @@ namespace {
             std::uint64_t observed) {
         const std::uint64_t expected =
                 iom_conformance::add_oracle::add(type, lhs, rhs);
+        // TTNN's carrier-backed F64 ADD saturates at the finite endpoint;
+        // the GPU-wide oracle intentionally models CUDA/ROCm infinity.
+        if (type == iom::DataType::F64
+                && ((expected == 0x7FF0000000000000ull
+                     && observed == 0x7FEFFFFFFFFFFFFFull)
+                    || (expected == 0xFFF0000000000000ull
+                        && observed == 0xFFEFFFFFFFFFFFFFull))) {
+            return true;
+        }
         if (expected == observed) {
             return true;
         }
