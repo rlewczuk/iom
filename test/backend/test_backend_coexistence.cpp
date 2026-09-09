@@ -454,6 +454,7 @@ TEST_CASE("Backend coexistence: enabled backends interleave in one process") {
                     const iom::oid token = participant->queues[index]->copy(
                             participant->source->view(),
                             participant->destinations[index]->view());
+                    REQUIRE(iom::oid_is_token(token));
                     queue_ids.insert(iom_conformance::token_queue(token));
                     participant->submitted[index].push_back(token);
                 }
@@ -526,14 +527,8 @@ TEST_CASE("Backend coexistence: queues reject views from another device") {
         auto foreign_destination = foreign.create_tensor(coexistence_spec());
         auto queue = device.create_ops();
 
-        CHECK_THROWS_AS(
-                (void)queue->copy(
-                        foreign_source->view(), destination->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                (void)queue->copy(
-                        source->view(), foreign_destination->view()),
-                std::invalid_argument);
+        CHECK_EQ(queue->copy(foreign_source->view(), destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(source->view(), foreign_destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
 
         // Validation happens before queue submission, so these rejected
         // pairs cannot alter device storage or queue completion state. The
@@ -662,28 +657,32 @@ TEST_CASE("Backend coexistence: queue ids release, reuse, and stay unique") {
             first->copy(source->view(), destination->view());
     const iom::oid second_token =
             second->copy(source->view(), destination->view());
+    REQUIRE(iom::oid_is_token(first_token));
+    REQUIRE(iom::oid_is_token(repeat_token));
+    REQUIRE(iom::oid_is_token(second_token));
     const std::uint8_t first_id = iom_conformance::token_queue(first_token);
     const std::uint8_t second_id = iom_conformance::token_queue(second_token);
     CHECK_EQ(iom_conformance::token_queue(repeat_token), first_id);
     CHECK_NE(first_id, second_id);
-    first->wait(first_token);
-    first->wait(repeat_token);
-    second->wait(second_token);
+    CHECK_NOTHROW(first->wait(first_token));
+    CHECK_NOTHROW(first->wait(repeat_token));
+    CHECK_NOTHROW(second->wait(second_token));
 
     first.reset();
     auto recreated = device->create_ops();
     const iom::oid recreated_token =
             recreated->copy(source->view(), destination->view());
     // The released id returns to the pool and is leased again.
+    REQUIRE(iom::oid_is_token(recreated_token));
     CHECK_EQ(iom_conformance::token_queue(recreated_token), first_id);
     CHECK_NE(iom_conformance::token_queue(recreated_token), second_id);
-    recreated->wait(recreated_token);
-    second->wait(second_token);
+    CHECK_NOTHROW(recreated->wait(recreated_token));
+    CHECK_NOTHROW(second->wait(second_token));
 
     // No generation check: the stale token collides with the recreated
     // queue's own sequence-1 submission and is silently accepted. The
     // collision is the caller's mistake, not a detected error.
-    recreated->wait(first_token);
+    CHECK_NOTHROW(recreated->wait(first_token));
 
     // A stale sequence the recreated queue never submitted stays
     // caller-invalid even though it carries the recycled id.

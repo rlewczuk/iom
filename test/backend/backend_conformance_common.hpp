@@ -236,14 +236,25 @@ constexpr std::uint64_t kTokenSequenceBits = 55;
 constexpr std::uint64_t kTokenSequenceMask =
         (std::uint64_t{1} << kTokenSequenceBits) - 1;
 
-inline std::uint8_t token_queue(iom::oid token) {
+constexpr std::uint8_t token_queue(iom::oid token) {
     return static_cast<std::uint8_t>(
             static_cast<std::uint64_t>(token) >> kTokenSequenceBits);
 }
 
-inline std::uint64_t token_sequence(iom::oid token) {
+constexpr std::uint64_t token_sequence(iom::oid token) {
     return static_cast<std::uint64_t>(token) & kTokenSequenceMask;
 }
+
+// The public token layout: 55 sequence bits, queue ids in bits 55..62,
+// so every id through 255 stays representable and no 56-bit decode exists.
+static_assert(kTokenSequenceBits == 55);
+static_assert(kTokenSequenceMask == (std::uint64_t{1} << 55) - 1);
+static_assert(token_queue(0) == 0);
+static_assert(token_sequence(0) == 0);
+static_assert(token_queue((std::uint64_t{255} << 55) | 1) == 255);
+static_assert(token_sequence((std::uint64_t{255} << 55) | 1) == 1);
+static_assert(token_sequence(std::uint64_t{1} << 54)
+              == (std::uint64_t{1} << 54));
 
 // A span over a temporary initializer-list array; valid for the full
 // expression that consumes it.

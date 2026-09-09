@@ -20,6 +20,7 @@
 #include <exception>
 #include <initializer_list>
 #include <memory>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -41,11 +42,18 @@ namespace iom_conformance {
 
 class DeferredCopyQueue final : public iom::DeviceOps {
 public:
+    DeferredCopyQueue() = default;
+    explicit DeferredCopyQueue(const iom::Device& device)
+            : iom::DeviceOps(device) {}
     using iom::DeviceOps::copy;
     using iom::DeviceOps::complete;
+    using iom::DeviceOps::seek_next_sequence;
     enum class CopyFailure {
         none,
         pre_enqueue,
+        pre_enqueue_bad_alloc,
+        pre_enqueue_overflow,
+        pre_enqueue_nonstandard,
         post_enqueue,
     };
 
@@ -68,14 +76,21 @@ public:
         return records_;
     }
 
+    // Owned seam for tests to reset the journal between submissions.
+    void clear_records() noexcept {
+        records_.clear();
+    }
+
     // Submission that also records the owner addresses, mirroring what a
     // real queue observes about its operands.
     iom::oid copy(
             const iom::Tensor& source_owner, const iom::TensorView& source,
             iom::Tensor& destination_owner, iom::TensorView& destination) {
         const iom::oid token = iom::DeviceOps::copy(source, destination);
-        records_.back().source_owner = &source_owner;
-        records_.back().destination_owner = &destination_owner;
+        if (iom::oid_is_token(token)) {
+            records_.back().source_owner = &source_owner;
+            records_.back().destination_owner = &destination_owner;
+        }
         return token;
     }
 
@@ -85,8 +100,19 @@ protected:
             iom::TensorView& destination) override {
         const CopyFailure failure =
                 std::exchange(next_copy_failure_, CopyFailure::none);
-        if (failure == CopyFailure::pre_enqueue) {
-            throw std::invalid_argument("deferred pre-enqueue failure");
+        switch (failure) {
+            case CopyFailure::pre_enqueue:
+                throw std::invalid_argument("deferred pre-enqueue failure");
+            case CopyFailure::pre_enqueue_bad_alloc:
+                throw std::bad_alloc();
+            case CopyFailure::pre_enqueue_overflow:
+                throw std::overflow_error(
+                        "deferred pre-enqueue overflow");
+            case CopyFailure::pre_enqueue_nonstandard:
+                throw 42;  // unclassifiable -> InternalError
+            case CopyFailure::none:
+            case CopyFailure::post_enqueue:
+                break;
         }
         return submit([&, failure](std::uint64_t sequence) {
             records_.push_back(
@@ -163,9 +189,11 @@ public:
         std::uint64_t sequence;
     };
 
-    explicit InstrumentedQueue(
+    InstrumentedQueue() = default;
+    InstrumentedQueue(
+            const iom::Device& device,
             std::shared_ptr<std::vector<Event>> journal)
-            : journal_(std::move(journal)) {}
+            : iom::DeviceOps(device), journal_(std::move(journal)) {}
 
     ~InstrumentedQueue() override {
         journal_->push_back({Event::Kind::destroy_begin, 0});
@@ -217,7 +245,7 @@ inline void run_lifetime_conformance(
 
     // Stable addresses across a deferred window.
     {
-        DeferredCopyQueue queue;
+        DeferredCopyQueue queue{candidate};
         auto source = candidate.create_tensor(spec);
         auto interior = candidate.create_tensor(spec);
         auto destination = candidate.create_tensor(spec);
@@ -286,7 +314,7 @@ inline void run_lifetime_conformance(
     // A post-enqueue failure retains the token while a pre-enqueue failure
     // leaves the sequence counter untouched.
     {
-        DeferredCopyQueue queue;
+        DeferredCopyQueue queue{candidate};
         auto source = candidate.create_tensor(spec);
         auto destination = candidate.create_tensor(spec);
 
@@ -330,10 +358,48 @@ inline void run_lifetime_conformance(
         CHECK_EQ(failure_message, "deferred post-enqueue failure");
     }
 
+    // Every synchronous error category the fake seam can produce maps to
+    // its exact signed OID error and consumes no sequence.
+    {
+        DeferredCopyQueue queue{candidate};
+        auto source = candidate.create_tensor(spec);
+        auto destination = candidate.create_tensor(spec);
+        const struct {
+            DeferredCopyQueue::CopyFailure failure;
+            iom::OidError expected;
+        } categories[] = {
+                {DeferredCopyQueue::CopyFailure::pre_enqueue,
+                 iom::OidError::InvalidArgument},
+                {DeferredCopyQueue::CopyFailure::pre_enqueue_bad_alloc,
+                 iom::OidError::ResourceExhausted},
+                {DeferredCopyQueue::CopyFailure::pre_enqueue_overflow,
+                 iom::OidError::Overflow},
+                {DeferredCopyQueue::CopyFailure::pre_enqueue_nonstandard,
+                 iom::OidError::InternalError},
+        };
+        std::uint64_t expected_sequence = 1;
+        for (const auto& category : categories) {
+            CAPTURE(static_cast<int>(category.expected));
+            queue.inject_copy_failure(category.failure);
+            CHECK_EQ(
+                    queue.copy(source->view(), destination->view()),
+                    iom::to_oid(category.expected));
+            // The rejected call consumed no sequence and queued nothing.
+            CHECK(queue.records().empty());
+            const iom::oid token =
+                    queue.copy(source->view(), destination->view());
+            CHECK_EQ(token_sequence(token), expected_sequence);
+            queue.complete(expected_sequence);
+            CHECK_NOTHROW(queue.wait(token));
+            ++expected_sequence;
+            queue.clear_records();
+        }
+    }
+
     // In-order completion: completing a later sequence implies every earlier
     // sequence.
     {
-        DeferredCopyQueue queue;
+        DeferredCopyQueue queue{candidate};
         const iom::oid first = queue.probe();
         const iom::oid second = queue.probe();
         queue.complete(2);
@@ -341,17 +407,72 @@ inline void run_lifetime_conformance(
         CHECK_NOTHROW(queue.wait(second));
     }
 
-    // Tokens of other queues and zero are rejected.
+    // Invalid waits are rejected immediately, on the owning queue and on
+    // any other queue, without side effects. Skipping a sequence never
+    // makes the skipped value waitable, even after later sequences
+    // completed in order.
     {
-        DeferredCopyQueue queue;
-        DeferredCopyQueue other;
+        DeferredCopyQueue queue{candidate};
+        DeferredCopyQueue other{candidate};
         const iom::oid own = queue.probe();
-        const iom::oid foreign_token = other.probe();
-        CHECK_THROWS_AS(queue.wait(0), std::invalid_argument);
-        CHECK_THROWS_AS(queue.wait(foreign_token), std::invalid_argument);
-        CHECK_THROWS_AS(other.wait(own), std::invalid_argument);
-        queue.complete(1);
+        const iom::oid other_token = other.probe();
+
+        for (DeferredCopyQueue* target : {&queue, &other}) {
+            const iom::oid target_token =
+                    target == &queue ? own : other_token;
+            const iom::oid foreign_token =
+                    target == &queue ? other_token : own;
+            const iom::oid future_token =
+                    (static_cast<iom::oid>(token_queue(target_token))
+                     << kTokenSequenceBits)
+                    | (token_sequence(target_token) + 1);
+            CHECK_THROWS_AS(target->wait(-1), std::invalid_argument);
+            CHECK_THROWS_AS(target->wait(0), std::invalid_argument);
+            CHECK_THROWS_AS(target->wait(foreign_token),
+                            std::invalid_argument);
+            CHECK_THROWS_AS(target->wait(future_token),
+                            std::invalid_argument);
+            // An otherwise unsubmitted sequence with the target queue id.
+            CHECK_THROWS_AS(
+                    target->wait(
+                            (static_cast<iom::oid>(token_queue(target_token))
+                             << kTokenSequenceBits)
+                                    | 4),
+                    std::invalid_argument);
+            CHECK_EQ(target->records().size(), std::size_t{1});
+            // Complete the target's accepted token before the next loop
+            // iteration, so no invalid wait can block on an accepted value.
+            target->complete(1);
+            CHECK_NOTHROW(target->wait(target_token));
+        }
+
+        // Rejected submissions consumed no sequence; the owning queue's
+        // next accepted submission is sequence two.
+        CHECK_EQ(token_sequence(queue.probe()), 2);
+        queue.complete(2);
         CHECK_NOTHROW(queue.wait(own));
+
+
+        // Reserve a gap, submit and complete a later sequence, then prove
+        // the skipped and unsubmitted values stay immediately invalid.
+        queue.seek_next_sequence(4);
+        const iom::oid later = queue.probe();
+        CHECK_EQ(token_sequence(later), 4);
+        CHECK_EQ(queue.records().size(), std::size_t{3});
+        queue.complete(4);
+        CHECK_NOTHROW(queue.wait(later));
+        CHECK_THROWS_AS(
+                queue.wait(
+                        (static_cast<iom::oid>(token_queue(later))
+                         << kTokenSequenceBits)
+                                | 3),
+                std::invalid_argument);
+        CHECK_THROWS_AS(
+                queue.wait(
+                        (static_cast<iom::oid>(token_queue(later))
+                         << kTokenSequenceBits)
+                                | 5),
+                std::invalid_argument);
     }
 
     // Queue destruction neither synchronizes on an outstanding sequence nor
@@ -364,7 +485,7 @@ inline void run_lifetime_conformance(
             std::uint8_t released_id = 0;
             const auto began = std::chrono::steady_clock::now();
             {
-                InstrumentedQueue pending(journal);
+                InstrumentedQueue pending(candidate, journal);
                 const iom::oid outstanding = pending.probe();
                 released_id = token_queue(outstanding);
                 CHECK_EQ(token_sequence(outstanding), 1);
@@ -399,7 +520,7 @@ inline void run_lifetime_conformance(
             CHECK(saw_destroy_begin);
             CHECK(saw_destroy_end);
 
-            InstrumentedQueue successor(journal);
+            InstrumentedQueue successor(candidate, journal);
             CHECK_EQ(token_queue(successor.probe()), released_id);
             successor.finish(1);
             CHECK_NOTHROW(successor.wait(
@@ -431,6 +552,7 @@ inline void run_compute_capability_conformance(
     const std::vector<std::byte> y_pattern = encode_logical(spec, 41);
     const std::vector<std::byte> attn_pattern = encode_logical(spec, 42);
     y->view().copy_from_host(y_pattern);
+    attn->view().copy_from_host(attn_pattern);
     auto queue = candidate.create_ops();
     (void)backend_label;
     const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);

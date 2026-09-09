@@ -505,11 +505,11 @@ TEST_CASE("SYCL queue destruction fences pending copies") {
 
     {
         auto queue = devices.device->create_ops();
-        CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
-        CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
+        CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
         iom::sycl_detail::inject_submission_fault_for_testing(
                 iom::sycl_detail::SubmissionFault::post_launch);
-        CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+        CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
         iom::sycl_detail::inject_submission_fault_for_testing(
                 iom::sycl_detail::SubmissionFault::none);
     }

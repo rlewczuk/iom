@@ -860,7 +860,7 @@ TEST_CASE("TTNN quarantine action allocation failure leaks native storage") {
     auto source = device->create_tensor(spec);
     auto destination = device->create_tensor(spec);
     auto queue = device->create_ops();
-    REQUIRE_NOTHROW(queue->copy(source->view(), destination->view()));
+    REQUIRE(iom::oid_is_token(queue->copy(source->view(), destination->view())));
 
     {
         iom::ttnn_test::fail_next_quarantine_action_for_testing();

@@ -506,9 +506,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     source->view().copy_from_host(logical_pattern);
     destination->view().copy_from_host(logical_pattern);
 
-    CHECK_THROWS_AS(
-            queue->copy(source->view(), invalid_destination->view()),
-            std::invalid_argument);
+    CHECK_EQ(queue->copy(source->view(), invalid_destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
 
     const iom::oid first = queue->copy(source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(first), 1);
@@ -516,9 +514,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
 
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::event_create);
-    CHECK_THROWS_AS(
-            queue->copy(source->view(), destination->view()),
-            std::runtime_error);
+    CHECK_EQ(queue->copy(source->view(), destination->view()), iom::to_oid(iom::OidError::DeviceError));
     const iom::oid second = queue->copy(source->view(), destination->view());
     CHECK_EQ(iom_conformance::token_sequence(second), 2);
     CHECK_NOTHROW(queue->wait(second));
@@ -526,9 +522,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::third_plane_launch);
     iom::oid launch_failure = 0;
-    CHECK_NOTHROW(
-            launch_failure = queue->copy(
-                    source->view(), destination->view()));
+    launch_failure = queue->copy(source->view(), destination->view());
+    CHECK(iom::oid_is_token(launch_failure));
     CHECK_NE(launch_failure, 0);
     CHECK_EQ(iom_conformance::token_sequence(launch_failure), 3);
     iom_conformance::expect_repeated_runtime_failure(*queue, launch_failure);
@@ -619,16 +614,16 @@ TEST_CASE("ROCm queue destruction fences pending copies") {
     {
         auto queue = device->create_ops();
         for (int i = 0; i < 32; ++i) {
-            CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+            CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
         }
         iom::rocm_detail::inject_submission_fault_for_testing(
                 iom::rocm_detail::SubmissionFault::third_plane_launch);
         iom::oid failure = 0;
-        CHECK_NOTHROW(
-                failure = queue->copy(source->view(), destination->view()));
+        failure = queue->copy(source->view(), destination->view());
+        CHECK(iom::oid_is_token(failure));
         CHECK_NE(failure, 0);
         for (int i = 0; i < 32; ++i) {
-            CHECK_NOTHROW(queue->copy(source->view(), destination->view()));
+            CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
         }
         queue.reset();
     }

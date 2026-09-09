@@ -718,30 +718,14 @@ inline void run_copy_error_conformance(
         source->view().copy_from_host(source_pattern);
         destination->view().copy_from_host(destination_pattern);
 
-        CHECK_THROWS_AS(
-                queue->copy(other_shape->view(), destination->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(destination->view(), other_shape->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(other_type_tensor->view(), destination->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(destination->view(), other_type_tensor->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(reference_view_tensor->view(), destination->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(destination->view(), reference_view_tensor->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(foreign_tensor->view(), destination->view()),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                queue->copy(destination->view(), foreign_tensor->view()),
-                std::invalid_argument);
+        CHECK_EQ(queue->copy(other_shape->view(), destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(destination->view(), other_shape->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(other_type_tensor->view(), destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(destination->view(), other_type_tensor->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(reference_view_tensor->view(), destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(destination->view(), reference_view_tensor->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(foreign_tensor->view(), destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(queue->copy(destination->view(), foreign_tensor->view()), iom::to_oid(iom::OidError::InvalidArgument));
 
         // No rejected submission wrote or consumed a sequence.
         require_logical_bytes(
