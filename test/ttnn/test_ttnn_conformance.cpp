@@ -10,6 +10,8 @@
 #include <cstring>
 #include <cstdint>
 #include <exception>
+#include <iomanip>
+
 #include <limits>
 #include <memory>
 #include <new>
@@ -1424,6 +1426,127 @@ namespace {
                 iom::TensorShape{{1, columns, columns}}, type};
     }
 
+    enum class AddFloatClass {
+        finite,
+        zero,
+        infinity,
+        nan,
+    };
+
+    struct AddLeafComparison {
+        bool matches = false;
+        AddFloatClass comparison_class = AddFloatClass::finite;
+    };
+
+    struct AddFloatFormat {
+        unsigned bits;
+        unsigned exponent_bits;
+        unsigned fraction_bits;
+    };
+
+    AddFloatFormat add_float_format(iom::DataType type) {
+        switch (type) {
+            case iom::DataType::F16: return {16, 5, 10};
+            case iom::DataType::BF16: return {16, 8, 7};
+            case iom::DataType::F32: return {32, 8, 23};
+            case iom::DataType::F64: return {64, 11, 52};
+            default: throw std::invalid_argument("not a supported floating ADD type");
+        }
+    }
+
+    const char* add_type_name(iom::DataType type) {
+        switch (type) {
+            case iom::DataType::F16: return "F16";
+            case iom::DataType::BF16: return "BF16";
+            case iom::DataType::F32: return "F32";
+            case iom::DataType::F64: return "F64";
+            default: return "non-floating";
+        }
+    }
+    bool add_supported_float_leaf(iom::DataType type) {
+        return type == iom::DataType::F16
+                || type == iom::DataType::BF16
+                || type == iom::DataType::F32
+                || type == iom::DataType::F64;
+    }
+
+    const char* add_float_class_name(AddFloatClass value) {
+        switch (value) {
+            case AddFloatClass::finite: return "finite";
+            case AddFloatClass::zero: return "zero";
+            case AddFloatClass::infinity: return "infinity";
+            case AddFloatClass::nan: return "NaN";
+        }
+        return "unknown";
+    }
+
+    AddFloatClass classify_add_float(
+            std::uint64_t raw, AddFloatFormat format) {
+        const std::uint64_t fraction_mask =
+                (std::uint64_t{1} << format.fraction_bits) - 1;
+        const std::uint64_t exponent_mask =
+                (std::uint64_t{1} << format.exponent_bits) - 1;
+        const std::uint64_t exponent =
+                (raw >> format.fraction_bits) & exponent_mask;
+        const std::uint64_t fraction = raw & fraction_mask;
+        if (exponent == exponent_mask) {
+            return fraction == 0 ? AddFloatClass::infinity
+                                 : AddFloatClass::nan;
+        }
+        return exponent == 0 && fraction == 0 ? AddFloatClass::zero
+                                               : AddFloatClass::finite;
+    }
+
+    AddLeafComparison compare_add_leaf_encoding(
+            iom::DataType type, std::uint64_t expected, std::uint64_t observed) {
+        const AddFloatFormat format = add_float_format(type);
+        const std::uint64_t sign_bit = std::uint64_t{1} << (format.bits - 1);
+        const AddFloatClass expected_class =
+                classify_add_float(expected, format);
+        const AddFloatClass observed_class =
+                classify_add_float(observed, format);
+        if (expected_class != observed_class) {
+            return {false, observed_class};
+        }
+        if (expected_class == AddFloatClass::nan) {
+            return {true, expected_class};
+        }
+        if (expected_class == AddFloatClass::infinity
+            || expected_class == AddFloatClass::zero) {
+            return {expected == observed, expected_class};
+        }
+        const auto ordered = [sign_bit](std::uint64_t bits) {
+            return (bits & sign_bit) != 0 ? ~bits : bits | sign_bit;
+        };
+        const std::uint64_t expected_order = ordered(expected);
+        const std::uint64_t observed_order = ordered(observed);
+        const std::uint64_t distance =
+                expected_order > observed_order
+                ? expected_order - observed_order
+                : observed_order - expected_order;
+        return {distance <= 1, expected_class};
+    }
+
+    bool add_integer_leaf(iom::DataType type) {
+        switch (type) {
+            case iom::DataType::I2:
+            case iom::DataType::U2:
+            case iom::DataType::I4:
+            case iom::DataType::U4:
+            case iom::DataType::I8:
+            case iom::DataType::U8:
+            case iom::DataType::I16:
+            case iom::DataType::U16:
+            case iom::DataType::I32:
+            case iom::DataType::U32:
+            case iom::DataType::I64:
+            case iom::DataType::U64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     void require_add_leaf_matches_oracle(
             iom::Device& device, iom::DataType type,
             std::span<const std::uint64_t> lhs_values,
@@ -1460,29 +1583,37 @@ namespace {
                             type, lhs_values[i], rhs_values[i]);
             const std::uint64_t observed =
                     get_add_logical_value(spec, out_bytes, i);
-            if (expected != observed) {
-                // Floating results are permitted one ULP of envelope; every
-                // integer leaf must match the oracle exactly.
-                const bool integer_leaf =
-                        type == iom::DataType::I2
-                        || type == iom::DataType::U2
-                        || type == iom::DataType::I4
-                        || type == iom::DataType::U4
-                        || type == iom::DataType::I8
-                        || type == iom::DataType::U8
-                        || type == iom::DataType::I16
-                        || type == iom::DataType::U16
-                        || type == iom::DataType::I32
-                        || type == iom::DataType::U32
-                        || type == iom::DataType::I64
-                        || type == iom::DataType::U64;
-                if (integer_leaf) {
-                    REQUIRE_EQ(observed, expected);
-                } else {
-                    MESSAGE("floating leaf within envelope");
-                    CHECK(true);
-                }
+            if (expected == observed) {
+                continue;
             }
+            if (add_integer_leaf(type)) {
+                REQUIRE_MESSAGE(
+                        false,
+                        "ADD " << add_type_name(type) << " element " << i
+                               << " integer expected bits 0x" << std::hex
+                               << expected << " observed bits 0x" << observed);
+                continue;
+            }
+            if (!add_supported_float_leaf(type)) {
+                REQUIRE_MESSAGE(
+                        false,
+                        "ADD unsupported floating type at element " << i
+                               << " expected bits 0x" << std::hex << expected
+                               << " observed bits 0x" << observed);
+                continue;
+            }
+            const AddLeafComparison comparison =
+                    compare_add_leaf_encoding(type, expected, observed);
+            const AddFloatClass expected_class =
+                    classify_add_float(expected, add_float_format(type));
+            REQUIRE_MESSAGE(
+                    comparison.matches,
+                    "ADD " << add_type_name(type) << " element " << i
+                           << " expected bits 0x" << std::hex << expected
+                           << " observed bits 0x" << observed
+                           << " comparison class "
+                           << add_float_class_name(expected_class) << " vs "
+                           << add_float_class_name(comparison.comparison_class));
         }
     }
 
@@ -1533,6 +1664,43 @@ namespace {
             default:
                 return {0, 1, 2, 3};
         }
+    }
+}
+
+TEST_CASE("TTNN ADD floating comparison envelope rejects deterministic mutations") {
+    const iom::DataType types[] = {
+            iom::DataType::F16, iom::DataType::BF16,
+            iom::DataType::F32, iom::DataType::F64};
+    for (const iom::DataType type : types) {
+        const AddFloatFormat format = add_float_format(type);
+        const std::uint64_t exponent_mask =
+                (std::uint64_t{1} << format.exponent_bits) - 1;
+        const std::uint64_t sign_bit = std::uint64_t{1} << (format.bits - 1);
+        const std::uint64_t one =
+                std::uint64_t{1} << format.fraction_bits;
+        const std::uint64_t infinity = exponent_mask << format.fraction_bits;
+        const auto check = [type](std::uint64_t expected,
+                                   std::uint64_t observed, bool wanted,
+                                   const char* scenario) {
+            const AddLeafComparison result =
+                    compare_add_leaf_encoding(type, expected, observed);
+            CHECK_MESSAGE(
+                    result.matches == wanted,
+                    add_type_name(type) << " " << scenario
+                                        << " expected bits " << expected
+                                        << " observed bits " << observed);
+        };
+
+        check(one, one, true, "exact finite");
+        check(one, one + 1, true, "positive one-ULP finite");
+        check(one, one + 2, false, "positive two-ULP finite");
+        check(sign_bit | one, (sign_bit | one) - 1, true,
+              "negative one-ULP finite");
+        check(one, infinity, false, "finite versus infinity");
+        check(one, infinity | 1, false, "finite versus NaN");
+        check(infinity | 1, infinity | 2, true, "NaN payload");
+        check(infinity, infinity | sign_bit, false, "infinity sign");
+        check(0, sign_bit, false, "signed zero");
     }
 }
 
