@@ -4,11 +4,10 @@
 // included by public headers: TTNN types stay inside the iom_ttnn target.
 
 #include <cstddef>
-#include <span>
-
+#include <vector>
 #include <ttnn/tensor/tensor.hpp>
 
-#include "iom/tensor.hpp"
+#include "iom/iom.hpp"
 
 namespace tt::tt_metal::distributed {
     class MeshDevice;
@@ -51,5 +50,22 @@ namespace iom::ttnn_detail {
             const TensorView& source, const ttnn::Tensor* source_planes,
             const TensorView& destination, ttnn::Tensor* destination_planes,
             bool& any_submitted);
+    struct AddSnapshot {
+        TensorSpec spec;
+        void* native_handle;
+        std::size_t plane_offset;
+        std::vector<std::size_t> logical_plane_strides;
+    };
+    struct AddRequest {
+        AddSnapshot lhs;
+        AddSnapshot rhs;
+        AddSnapshot out;
+        TensorShape result_shape;
+    };
+    void add_planes(
+            tt::tt_metal::distributed::MeshDevice& device,
+            TtnnHostStaging& staging, const AddRequest& request,
+            ttnn::Tensor* lhs_planes, ttnn::Tensor* rhs_planes,
+            ttnn::Tensor* out_planes, bool& any_submitted);
 
 }  // namespace iom::ttnn_detail

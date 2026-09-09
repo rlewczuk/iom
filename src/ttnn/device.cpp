@@ -507,13 +507,20 @@ namespace iom {
 class TtnnQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
-        // StagedWorker::submit_copy executes the task before publication,
-        // while copy()'s view arguments are alive. Only execute dereferences
-        // these pointers; completion and fence paths never do.
-        const TensorView* source;
-        TensorView* destination;
-        bool no_op;
+        const TensorView* source = nullptr;
+        TensorView* destination = nullptr;
+        bool no_op = false;
+        bool is_add = false;
+        ttnn_detail::AddRequest add_request{
+                {TensorSpec{TensorShape{{1, 1}}, DataType::I32},
+                 nullptr, 0, {}},
+                {TensorSpec{TensorShape{{1, 1}}, DataType::I32},
+                 nullptr, 0, {}},
+                {TensorSpec{TensorShape{{1, 1}}, DataType::I32},
+                 nullptr, 0, {}},
+                TensorShape{{1, 1}}};
         void* fence = nullptr;
+        detail::AddEntryRegistration add_entries{};
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
 
@@ -521,10 +528,17 @@ class TtnnQueue final : public DeviceOps {
              const TensorView& source_,
              TensorView& destination_,
              bool no_op_)
-            : sequence(sequence_),
-              source(&source_),
-              destination(&destination_),
+            : sequence(sequence_), source(&source_), destination(&destination_),
               no_op(no_op_) {}
+        Task(std::uint64_t sequence_, const ttnn_detail::AddRequest& request,
+             detail::AddEntryRegistration entries)
+            : sequence(sequence_), is_add(true), add_request(request),
+              add_entries(entries) {}
+    };
+    struct AddOutcome {
+        detail::AddEntryRegistration entries;
+        bool native_work_submitted = false;
+        std::exception_ptr retained_failure;
     };
 
 
@@ -574,13 +588,81 @@ public:
                     worker_.submit_copy(std::move(task));
                 });
     }
-
+    oid add_impl(const AddRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        detail::Fence fence = build_ttnn_fence(*device_);
+        return submit_add(
+                request, *state_, registry_queue_id_, fence,
+                [this](std::uint64_t sequence, const AddRequest& captured,
+                       detail::AddEntryRegistration entries) {
+                    ttnn_detail::AddRequest internal{
+                            {captured.lhs.spec, captured.lhs.native_handle,
+                             captured.lhs.plane_offset,
+                             captured.lhs.logical_plane_strides},
+                            {captured.rhs.spec, captured.rhs.native_handle,
+                             captured.rhs.plane_offset,
+                             captured.rhs.logical_plane_strides},
+                            {captured.out.spec, captured.out.native_handle,
+                             captured.out.plane_offset,
+                             captured.out.logical_plane_strides},
+                            captured.result_shape};
+                    worker_.submit_copy(
+                            Task(sequence, internal, entries));
+                });
+    }
     [[nodiscard]] std::string_view backend_label() const noexcept override {
         return "TTNN";
     }
 
 private:
     void execute(Task& task) {
+        if (task.is_add) {
+            // A failure after this point may have left mesh work in
+            // flight; a failure before add_planes is pre-submission and
+            // finishes no native work.
+            bool submitted = false;
+            try {
+                {
+                    std::lock_guard<std::mutex> lock(outcome_mutex_);
+                    const auto [it, inserted] = add_outcomes_.emplace(
+                            task.sequence, AddOutcome{task.add_entries});
+                    if (!inserted) {
+                        throw std::logic_error("duplicate TTNN ADD sequence");
+                    }
+                }
+                std::lock_guard<std::mutex> api_lock(device_->api_mutex());
+                auto* lhs = static_cast<ttnn::Tensor*>(
+                        task.add_request.lhs.native_handle);
+                auto* rhs = static_cast<ttnn::Tensor*>(
+                        task.add_request.rhs.native_handle);
+                auto* out = static_cast<ttnn::Tensor*>(
+                        task.add_request.out.native_handle);
+                ttnn_detail::add_planes(
+                        device_->mesh(), device_->host_staging(),
+                        task.add_request, lhs, rhs, out, submitted);
+                {
+                    std::lock_guard<std::mutex> lock(outcome_mutex_);
+                    add_outcomes_.at(task.sequence).native_work_submitted =
+                            submitted;
+                }
+                executed_seq_.store(task.sequence, std::memory_order_release);
+                return;
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                auto it = add_outcomes_.find(task.sequence);
+                if (it != add_outcomes_.end()) {
+                    it->second.retained_failure = std::current_exception();
+                    it->second.native_work_submitted = submitted;
+                }
+                executed_seq_.store(task.sequence, std::memory_order_release);
+                return;
+            }
+        }
+        execute_copy(task);
+    }
+
+    void execute_copy(Task& task) {
         // The transaction registers source and destination ownership before
         // any native plane reaches the mesh, so every submitted command is
         // associated with a completion record from the instant it is
@@ -724,11 +806,34 @@ private:
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
-        // Collect the ready contiguous batch starting at `sequence`: the
-        // task's own outcome plus every following sequence whose outcome
-        // exists and whose execution has finished. Registration precedes
-        // native submission, so a registered outcome alone is not enough;
-        // executed_seq_ marks the highest sequence whose planes have
+        AddOutcome add_outcome;
+        bool is_add = false;
+        {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = add_outcomes_.find(sequence);
+            if (it != add_outcomes_.end()) {
+                add_outcome = std::move(it->second);
+                add_outcomes_.erase(it);
+                is_add = true;
+            }
+        }
+        if (is_add) {
+            detail::FenceResult fence_result = detail::FenceResult::success();
+            if (add_outcome.native_work_submitted) {
+                fence_result = finish_native(*device_);
+            }
+            const std::exception_ptr operation_failure =
+                    failure ? failure : add_outcome.retained_failure;
+            const bool released = detail::release_or_invalidate_add_entries(
+                    state_->registry, add_outcome.entries,
+                    static_cast<bool>(operation_failure),
+                    fence_result.succeeded && !fence_result.failure);
+            (void)released;
+            complete(sequence, operation_failure
+                    ? operation_failure : fence_result.failure);
+            return;
+        }
+        // Copy completion follows.
         // reached the mesh, which keeps the single finish below from
         // racing a not-yet-enqueued task.
         std::vector<std::pair<std::uint64_t, detail::SequenceOutcome>> batch;
@@ -806,6 +911,7 @@ private:
     }
 
     TtnnDevice* device_;
+    std::map<std::uint64_t, AddOutcome> add_outcomes_;
     detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
     std::mutex submission_order_mutex_;
@@ -824,26 +930,22 @@ private:
     void fence_through_sequence(
             std::uint64_t sequence) noexcept override;
 };
-        void TtnnQueue::fence_through_sequence(
-                std::uint64_t sequence) noexcept {
-            std::lock_guard<std::mutex> fence_lock(fence_mutex_);
-            const std::uint64_t now =
-                    last_finished_seq_.load(std::memory_order_acquire);
-            if (sequence <= now) {
-                return;
-            }
-            const detail::FenceResult result =
-                    finish_native(*device_);
-            if (result.succeeded && !result.failure) {
-                last_finished_seq_.store(
-                        sequence, std::memory_order_release);
-            } else {
-                record_post_completion_failure(
-                        sequence, result.failure);
-            }
-        }
 
-
+void TtnnQueue::fence_through_sequence(
+        std::uint64_t sequence) noexcept {
+    std::lock_guard<std::mutex> fence_lock(fence_mutex_);
+    const std::uint64_t now =
+            last_finished_seq_.load(std::memory_order_acquire);
+    if (sequence <= now) {
+        return;
+    }
+    const detail::FenceResult result = finish_native(*device_);
+    if (result.succeeded && !result.failure) {
+        last_finished_seq_.store(sequence, std::memory_order_release);
+    } else {
+        record_post_completion_failure(sequence, result.failure);
+    }
+}
     }  // namespace
 
 #ifdef IOM_ENABLE_TESTING

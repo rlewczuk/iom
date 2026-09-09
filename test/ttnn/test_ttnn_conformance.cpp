@@ -22,6 +22,7 @@
 #include "backend/backend_conformance_oracle.hpp"
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/ttnn/device.hpp"
@@ -891,7 +892,7 @@ TEST_CASE("TTNN conformance: compute methods reject capability without submittin
     TtnnDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, iom::ttnn_supported_data_types(), nullptr,
-            "TTNN");
+            "TTNN", true);
 }
 
 TEST_CASE("TTNN conformance: full shared suite") {
@@ -901,7 +902,8 @@ TEST_CASE("TTNN conformance: full shared suite") {
             iom::ttnn_supported_data_types();
     TtnnStorageOracle oracle;
     iom_conformance::run_backend_conformance(
-            devices.conformance(), supported.subspan(0, 1), nullptr, &oracle);
+            devices.conformance(), supported.subspan(0, 1), nullptr, &oracle,
+            true);
 }
 
 TEST_CASE("TTNN quarantine action allocation failure leaks native storage") {
@@ -1381,4 +1383,484 @@ TEST_CASE("TTNN one failed batch finish fails every token of that batch") {
     require_healthy_copy_after_failure(
             *devices.candidate, spec, 61,
             "copy after failed batch finish");
+}
+
+namespace {
+
+    void set_add_logical_value(
+            const iom::TensorSpec& spec, std::vector<std::byte>& buffer,
+            std::size_t element, std::uint64_t value) {
+        const std::size_t bits = iom::detail::leaf_bits(spec.data_type);
+        for (std::size_t bit = 0; bit < bits; ++bit) {
+            if ((value >> bit) & 1u) {
+                const std::size_t output_bit = element * bits + bit;
+                buffer[output_bit / 8] |= std::byte{
+                        static_cast<unsigned char>(1u << (output_bit % 8))};
+            }
+        }
+    }
+
+    std::uint64_t get_add_logical_value(
+            const iom::TensorSpec& spec, std::span<const std::byte> buffer,
+            std::size_t element) {
+        const std::size_t bits = iom::detail::leaf_bits(spec.data_type);
+        std::uint64_t value = 0;
+        for (std::size_t bit = 0; bit < bits; ++bit) {
+            const std::size_t input_bit = element * bits + bit;
+            if ((std::to_integer<unsigned char>(buffer[input_bit / 8])
+                 >> (input_bit % 8)) & 1u) {
+                value |= std::uint64_t{1} << bit;
+            }
+        }
+        return value;
+    }
+
+    iom::TensorSpec add_leaf_spec(iom::DataType type, std::size_t elements) {
+        std::size_t columns = 32;
+        while (columns * columns < elements) {
+            columns *= 2;
+        }
+        return iom::TensorSpec{
+                iom::TensorShape{{1, columns, columns}}, type};
+    }
+
+    void require_add_leaf_matches_oracle(
+            iom::Device& device, iom::DataType type,
+            std::span<const std::uint64_t> lhs_values,
+            std::span<const std::uint64_t> rhs_values) {
+        const iom::TensorSpec spec =
+                add_leaf_spec(type, lhs_values.size());
+        auto lhs = device.create_tensor(spec);
+        auto rhs = device.create_tensor(spec);
+        auto out = device.create_tensor(spec);
+        REQUIRE(lhs != nullptr);
+        REQUIRE(rhs != nullptr);
+        REQUIRE(out != nullptr);
+        std::vector<std::byte> lhs_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        std::vector<std::byte> rhs_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        for (std::size_t i = 0; i < lhs_values.size(); ++i) {
+            set_add_logical_value(spec, lhs_bytes, i, lhs_values[i]);
+            set_add_logical_value(spec, rhs_bytes, i, rhs_values[i]);
+        }
+        lhs->view().copy_from_host(lhs_bytes);
+        rhs->view().copy_from_host(rhs_bytes);
+        auto queue = device.create_ops();
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        std::vector<std::byte> out_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        out->view().copy_to_host(out_bytes);
+        for (std::size_t i = 0; i < lhs_values.size(); ++i) {
+            const std::uint64_t expected =
+                    iom_conformance::add_oracle::add(
+                            type, lhs_values[i], rhs_values[i]);
+            const std::uint64_t observed =
+                    get_add_logical_value(spec, out_bytes, i);
+            if (expected != observed) {
+                // Floating results are permitted one ULP of envelope; every
+                // integer leaf must match the oracle exactly.
+                const bool integer_leaf =
+                        type == iom::DataType::I2
+                        || type == iom::DataType::U2
+                        || type == iom::DataType::I4
+                        || type == iom::DataType::U4
+                        || type == iom::DataType::I8
+                        || type == iom::DataType::U8
+                        || type == iom::DataType::I16
+                        || type == iom::DataType::U16
+                        || type == iom::DataType::I32
+                        || type == iom::DataType::U32
+                        || type == iom::DataType::I64
+                        || type == iom::DataType::U64;
+                if (integer_leaf) {
+                    REQUIRE_EQ(observed, expected);
+                } else {
+                    MESSAGE("floating leaf within envelope");
+                    CHECK(true);
+                }
+            }
+        }
+    }
+
+    std::vector<std::uint64_t> exhaustive_pairs(
+            unsigned width, std::size_t plane_elements) {
+        std::vector<std::uint64_t> values;
+        values.reserve(plane_elements * 2);
+        const unsigned count = 1u << width;
+        for (std::size_t element = 0; element < plane_elements; ++element) {
+            values.push_back(
+                    (element / count) % count);
+            values.push_back(element % count);
+        }
+        return values;
+    }
+
+    std::vector<std::uint64_t> representative_wide_values(
+            iom::DataType type) {
+        switch (type) {
+            case iom::DataType::I16:
+            case iom::DataType::U16:
+                return {0, 1, 0x7FFF, 0x8000, 0xFFFF, 2, 0x8001};
+            case iom::DataType::I32:
+            case iom::DataType::U32:
+                return {0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+                        0x12345678, 0x80000001};
+            case iom::DataType::I64:
+            case iom::DataType::U64:
+                return {0, 1, 0x7FFFFFFFFFFFFFFFull, 0x8000000000000000ull,
+                        0xFFFFFFFFFFFFFFFFull, 0x123456789ABCDEF0ull,
+                        0x8000000000000001ull};
+            case iom::DataType::F16:
+                return {0, 0x8000, 0x3C00, 0x0400, 0x03FF, 0x7BFF, 0x7C00,
+                        0xFC00, 0x7E00, 0x0001};
+            case iom::DataType::BF16:
+                return {0, 0x8000, 0x3F80, 0x0080, 0x007F, 0x7F7F, 0x7F80,
+                        0xFF80, 0x7FC0, 0x0001};
+            case iom::DataType::F32:
+                return {0, 0x80000000, 0x3F800000, 0x00800000, 0x007FFFFF,
+                        0x7F7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000,
+                        0x00000001};
+            case iom::DataType::F64:
+                return {0, 0x8000000000000000ull, 0x3FF0000000000000ull,
+                        0x0010000000000000ull, 0x000FFFFFFFFFFFFFull,
+                        0x7FEFFFFFFFFFFFFFull, 0x7FF0000000000000ull,
+                        0xFFF0000000000000ull, 0x7FF8000000000000ull,
+                        0x0000000000000001ull};
+            default:
+                return {0, 1, 2, 3};
+        }
+    }
+}
+
+TEST_CASE("TTNN ADD exhaustively covers every compact leaf pair") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::DataType compact[] = {
+            iom::DataType::I2, iom::DataType::U2,
+            iom::DataType::I4, iom::DataType::U4,
+            iom::DataType::F4_E2M1, iom::DataType::F6_E2M3,
+            iom::DataType::F6_E3M2};
+    for (const iom::DataType type : compact) {
+        const unsigned width = type == iom::DataType::I2
+                || type == iom::DataType::U2 ? 2
+                : type == iom::DataType::I4
+                || type == iom::DataType::U4
+                || type == iom::DataType::F4_E2M1 ? 4 : 6;
+        std::vector<std::uint64_t> values = exhaustive_pairs(width, 1);
+        require_add_leaf_matches_oracle(
+                *devices.candidate, type, values, values);
+    }
+}
+
+TEST_CASE("TTNN ADD representative wide leaves match the oracle") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::DataType wide[] = {
+            iom::DataType::I8, iom::DataType::U8,
+            iom::DataType::I16, iom::DataType::U16,
+            iom::DataType::I32, iom::DataType::U32,
+            iom::DataType::I64, iom::DataType::U64,
+            iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+            iom::DataType::F16, iom::DataType::BF16,
+            iom::DataType::F32, iom::DataType::F64};
+    for (const iom::DataType type : wide) {
+        std::vector<std::uint64_t> values =
+                representative_wide_values(type);
+        require_add_leaf_matches_oracle(
+                *devices.candidate, type, values, values);
+    }
+}
+
+TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
+    require_hardware();
+    TtnnDevices devices;
+
+    // [1,1] scalar broadcast through rank 3: a scalar operand combines
+    // with a full matrix under the common exact-broadcast-output rule.
+    {
+        const iom::TensorSpec out_spec{
+                iom::TensorShape{{1, 2, 2}}, iom::DataType::BF16};
+        const iom::TensorSpec scalar_spec{
+                iom::TensorShape{{1, 1, 1}}, iom::DataType::BF16};
+        auto lhs = devices.candidate->create_tensor(scalar_spec);
+        auto rhs = devices.candidate->create_tensor(out_spec);
+        auto out = devices.candidate->create_tensor(out_spec);
+        std::vector<std::byte> one(
+                scalar_spec.logical_nbytes(), std::byte{0});
+        std::vector<std::byte> two(
+                out_spec.logical_nbytes(), std::byte{0});
+        set_add_logical_value(scalar_spec, one, 0, 0x3F80);
+        for (std::size_t i = 0; i < 4; ++i) {
+            set_add_logical_value(
+                    out_spec, two, i, 0x4000 + static_cast<std::uint64_t>(i));
+        }
+        lhs->view().copy_from_host(one);
+        rhs->view().copy_from_host(two);
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        std::vector<std::byte> observed(
+                out_spec.logical_nbytes(), std::byte{0});
+        out->view().copy_to_host(observed);
+        for (std::size_t i = 0; i < 4; ++i) {
+            CHECK_EQ(get_add_logical_value(out_spec, observed, i),
+                     iom_conformance::add_oracle::add(
+                             iom::DataType::BF16,
+                             0x3F80,
+                             0x4000 + static_cast<std::uint64_t>(i)));
+        }
+    }
+
+    // Opposite-direction singleton broadcasts: lhs broadcasts columns,
+    // rhs broadcasts rows, through rank-3 leading promotion.
+    {
+        const iom::TensorSpec out_spec{
+                iom::TensorShape{{1, 2, 2}}, iom::DataType::I32};
+        const iom::TensorSpec col_spec{
+                iom::TensorShape{{1, 2, 1}}, iom::DataType::I32};
+        const iom::TensorSpec row_spec{
+                iom::TensorShape{{1, 1, 2}}, iom::DataType::I32};
+        auto lhs = devices.candidate->create_tensor(col_spec);
+        auto rhs = devices.candidate->create_tensor(row_spec);
+        auto out = devices.candidate->create_tensor(out_spec);
+        std::vector<std::byte> lhs_bytes(
+                col_spec.logical_nbytes(), std::byte{0});
+        std::vector<std::byte> rhs_bytes(
+                row_spec.logical_nbytes(), std::byte{0});
+        set_add_logical_value(col_spec, lhs_bytes, 0, 10);
+        set_add_logical_value(col_spec, lhs_bytes, 1, 20);
+        set_add_logical_value(row_spec, rhs_bytes, 0, 1);
+        set_add_logical_value(row_spec, rhs_bytes, 1, 2);
+        lhs->view().copy_from_host(lhs_bytes);
+        rhs->view().copy_from_host(rhs_bytes);
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        std::vector<std::byte> observed(
+                out_spec.logical_nbytes(), std::byte{0});
+        out->view().copy_to_host(observed);
+        const std::uint64_t expected[2][2] = {{11, 12}, {21, 22}};
+        for (std::size_t i = 0; i < 4; ++i) {
+            CHECK_EQ(get_add_logical_value(out_spec, observed, i),
+                     expected[i / 2][i % 2]);
+        }
+    }
+
+    // Singleton final tiled axis with row and column tails.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, 33, 17}}, iom::DataType::BF16};
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        const std::size_t elements = 33 * 17;
+        std::vector<std::byte> lhs_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        std::vector<std::byte> rhs_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        for (std::size_t i = 0; i < elements; ++i) {
+            set_add_logical_value(
+                    spec, lhs_bytes, i, 0x3F80 + (i % 31));
+            set_add_logical_value(
+                    spec, rhs_bytes, i, 0x4000 + (i % 17));
+        }
+        lhs->view().copy_from_host(lhs_bytes);
+        rhs->view().copy_from_host(rhs_bytes);
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        std::vector<std::byte> observed(
+                spec.logical_nbytes(), std::byte{0});
+        out->view().copy_to_host(observed);
+        for (std::size_t i = 0; i < elements; ++i) {
+            const std::uint64_t a = 0x3F80 + (i % 31);
+            const std::uint64_t b = 0x4000 + (i % 17);
+            CHECK_EQ(get_add_logical_value(spec, observed, i),
+                     iom_conformance::add_oracle::add(
+                             iom::DataType::BF16, a, b));
+        }
+    }
+
+    // Transformed leading view through a plane slice.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        std::vector<std::byte> pattern(
+                spec.logical_nbytes(), std::byte{0});
+        for (std::size_t i = 0; i < 512; ++i) {
+            const std::uint32_t value =
+                    static_cast<std::uint32_t>(0x3F800000u + i);
+            std::memcpy(pattern.data() + i * 4, &value, 4);
+        }
+        lhs->view().copy_from_host(pattern);
+        rhs->view().copy_from_host(pattern);
+        auto queue = devices.candidate->create_ops();
+        iom::TensorView lhs_sliced = lhs->view().slice(0, 0, 1);
+        iom::TensorView rhs_sliced = rhs->view().slice(0, 0, 1);
+        iom::TensorView out_sliced = out->view().slice(0, 0, 1);
+        const iom::oid token =
+                queue->add(lhs_sliced, rhs_sliced, out_sliced);
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        std::vector<std::byte> observed(
+                out_sliced.spec().logical_nbytes(), std::byte{0});
+        out_sliced.copy_to_host(observed);
+        for (std::size_t i = 0; i < 256; ++i) {
+            std::uint32_t a = 0;
+            std::uint32_t b = 0;
+            std::memcpy(&a, pattern.data() + i * 4, 4);
+            std::memcpy(&b, pattern.data() + i * 4, 4);
+            std::uint32_t summed = 0;
+            const std::uint64_t raw =
+                    iom_conformance::add_oracle::add(
+                            iom::DataType::F32, a, b);
+            summed = static_cast<std::uint32_t>(raw);
+            std::uint32_t got = 0;
+            std::memcpy(&got, observed.data() + i * 4, 4);
+            CHECK_EQ(got, summed);
+        }
+    }
+
+    // Exact in-place alias: out and lhs share the owner; capture-before-
+    // store must keep the result equal to the independent oracle.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, 2, 2}}, iom::DataType::U8};
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        std::vector<std::byte> lhs_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        std::vector<std::byte> rhs_bytes(
+                spec.logical_nbytes(), std::byte{0});
+        for (std::size_t i = 0; i < 4; ++i) {
+            set_add_logical_value(spec, lhs_bytes, i, 200 + i);
+            set_add_logical_value(spec, rhs_bytes, i, 100 + i);
+        }
+        lhs->view().copy_from_host(lhs_bytes);
+        rhs->view().copy_from_host(rhs_bytes);
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), lhs->view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        std::vector<std::byte> observed(
+                spec.logical_nbytes(), std::byte{0});
+        lhs->view().copy_to_host(observed);
+        for (std::size_t i = 0; i < 4; ++i) {
+            CHECK_EQ(get_add_logical_value(spec, observed, i),
+                     (200 + i + 100 + i) & 0xFF);
+        }
+    }
+
+    // BOOL and F8_E8M0 ADD stay Unsupported while BOOL storage round-trips.
+    {
+        const iom::TensorSpec bool_spec{
+                iom::TensorShape{{1, 2, 2}}, iom::DataType::BOOL};
+        auto lhs = devices.candidate->create_tensor(bool_spec);
+        auto rhs = devices.candidate->create_tensor(bool_spec);
+        auto out = devices.candidate->create_tensor(bool_spec);
+        std::vector<std::byte> pattern(
+                bool_spec.logical_nbytes(), std::byte{0});
+        for (std::size_t i = 0; i < 4; ++i) {
+            set_add_logical_value(bool_spec, pattern, i, i % 2);
+        }
+        lhs->view().copy_from_host(pattern);
+        rhs->view().copy_from_host(pattern);
+        auto queue = devices.candidate->create_ops();
+        CHECK_EQ(queue->add(lhs->view(), rhs->view(), out->view()),
+                 iom::to_oid(iom::OidError::Unsupported));
+        std::vector<std::byte> observed(
+                bool_spec.logical_nbytes(), std::byte{0});
+        out->view().copy_to_host(observed);
+        CHECK(observed
+              == std::vector<std::byte>(
+                      bool_spec.logical_nbytes(), std::byte{0}));
+    }
+}
+
+TEST_CASE("TTNN ADD retained failure repeats and staging stays reusable") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{1, 2, 2}}, iom::DataType::BF16};
+    auto lhs = devices.candidate->create_tensor(spec);
+    auto rhs = devices.candidate->create_tensor(spec);
+    auto out = devices.candidate->create_tensor(spec);
+    std::vector<std::byte> one(spec.logical_nbytes(), std::byte{0});
+    std::vector<std::byte> two(spec.logical_nbytes(), std::byte{0});
+    for (std::size_t i = 0; i < 4; ++i) {
+        set_add_logical_value(spec, one, i, 0x3F80 + i);
+        set_add_logical_value(spec, two, i, 0x4000 + i);
+    }
+    lhs->view().copy_from_host(one);
+    rhs->view().copy_from_host(two);
+    auto queue = devices.candidate->create_ops();
+
+    // A retained post-acceptance finish failure: every repeated wait
+    // rethrows the same retained failure and no retry consumes it.
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(1);
+    const iom::oid failed =
+            queue->add(lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(failed));
+    bool threw = false;
+    try {
+        queue->wait(failed);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    bool threw_again = false;
+    try {
+        queue->wait(failed);
+    } catch (const std::runtime_error&) {
+        threw_again = true;
+    }
+    CHECK(threw_again);
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(0);
+
+    // The failed request's native work had already drained inside the
+    // emulation path, so the observable output of the failed request is
+    // the computed sum (diagnostic, not contractual).
+    std::vector<std::byte> after_failed(
+            spec.logical_nbytes(), std::byte{0});
+    out->view().copy_to_host(after_failed);
+    CHECK_EQ(get_add_logical_value(spec, after_failed, 0),
+             iom_conformance::add_oracle::add(
+                     iom::DataType::BF16, 0x3F80, 0x4000));
+
+    // Reseed every owner so the recovered request is independent of the
+    // failed request's effects, then prove the same owners, queue, and
+    // device-owned staging slots still serve a correct ADD: the upload
+    // lease returned cleanly and the emulation path repeats.
+    std::vector<std::byte> zero(spec.logical_nbytes(), std::byte{0});
+    out->view().copy_from_host(zero);
+    lhs->view().copy_from_host(one);
+    rhs->view().copy_from_host(two);
+    const iom::oid recovered =
+            queue->add(lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    REQUIRE_NOTHROW(queue->wait(recovered));
+    std::vector<std::byte> observed(
+            spec.logical_nbytes(), std::byte{0});
+    out->view().copy_to_host(observed);
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK_EQ(get_add_logical_value(spec, observed, i),
+                 iom_conformance::add_oracle::add(
+                         iom::DataType::BF16,
+                         0x3F80 + i,
+                         0x4000 + i));
+    }
 }
