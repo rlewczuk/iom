@@ -968,9 +968,9 @@ TEST_CASE("TTNN failed plane submissions drain before rethrow") {
         auto queue = devices.candidate->create_ops();
         iom::ttnn_test::fail_next_copy_planes_submission_for_testing(
                 fail_plane);
-        REQUIRE_THROWS_AS(
+        CHECK_EQ(
                 queue->copy(source->view(), destination->view()),
-                std::runtime_error);
+                iom::to_oid(iom::OidError::DeviceError));
         CHECK(iom::ttnn_test::
                       copy_planes_submission_fault_consumed_for_testing());
 
@@ -1007,9 +1007,9 @@ TEST_CASE("TTNN registration and outcome insertion failures roll back ownership"
         auto destination = devices.candidate->create_tensor(spec);
         auto queue = devices.candidate->create_ops();
         iom::ttnn_test::fail_next_copy_registration_for_testing();
-        REQUIRE_THROWS_AS(
+        CHECK_EQ(
                 queue->copy(source->view(), destination->view()),
-                std::bad_alloc);
+                iom::to_oid(iom::OidError::ResourceExhausted));
         CHECK(iom::ttnn_test::
                       copy_registration_fault_consumed_for_testing());
 
@@ -1029,9 +1029,9 @@ TEST_CASE("TTNN registration and outcome insertion failures roll back ownership"
         auto queue = devices.candidate->create_ops();
         for (int failure = 0; failure < 2; ++failure) {
             iom::ttnn_test::fail_next_copy_outcome_insertion_for_testing();
-            REQUIRE_THROWS_AS(
+            CHECK_EQ(
                     queue->copy(source->view(), destination->view()),
-                    std::bad_alloc);
+                    iom::to_oid(iom::OidError::ResourceExhausted));
             CHECK(iom::ttnn_test::
                           copy_outcome_insertion_fault_consumed_for_testing());
         }
