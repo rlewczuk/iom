@@ -42,7 +42,9 @@ inline long double value(std::uint64_t r, Spec s) noexcept {
 inline std::uint64_t round_encode(long double x, Spec s) noexcept {
     const auto em = (std::uint64_t{1} << s.e) - 1, fm = (std::uint64_t{1} << s.f) - 1;
     const auto sg = std::signbit(x) ? std::uint64_t{1} : 0; x = std::fabs(x);
-    if (std::isnan(x)) return (sg << (s.e + s.f)) | (em << s.f) | fm;
+    if (std::isnan(x))
+        return (sg << (s.e + s.f)) | (em << s.f) |
+               (s.finite ? fm : std::uint64_t{1} << (s.f - 1));
     if (std::isinf(x)) return (sg << (s.e + s.f)) | (s.inf ? em << s.f : ((em - 1) << s.f) | fm);
     if (x == 0) return sg << (s.e + s.f);
     int e = 0; std::frexp(x, &e); --e;
