@@ -1545,12 +1545,30 @@ namespace {
             default:
                 return false;
         }
+
+    }
+    bool add_result_matches_oracle(
+            iom::DataType type, std::uint64_t lhs, std::uint64_t rhs,
+            std::uint64_t observed) {
+        const std::uint64_t expected =
+                iom_conformance::add_oracle::add(type, lhs, rhs);
+        if (expected == observed) {
+            return true;
+        }
+        if (add_integer_leaf(type)) {
+            return false;
+        }
+        if (!add_supported_float_leaf(type)) {
+            return false;
+        }
+        return compare_add_leaf_encoding(type, expected, observed).matches;
     }
 
     void require_add_leaf_matches_oracle(
             iom::Device& device, iom::DataType type,
             std::span<const std::uint64_t> lhs_values,
             std::span<const std::uint64_t> rhs_values) {
+        REQUIRE_EQ(lhs_values.size(), rhs_values.size());
         const iom::TensorSpec spec =
                 add_leaf_spec(type, lhs_values.size());
         auto lhs = device.create_tensor(spec);
@@ -1583,52 +1601,36 @@ namespace {
                             type, lhs_values[i], rhs_values[i]);
             const std::uint64_t observed =
                     get_add_logical_value(spec, out_bytes, i);
-            if (expected == observed) {
-                continue;
-            }
-            if (add_integer_leaf(type)) {
-                REQUIRE_MESSAGE(
-                        false,
-                        "ADD " << add_type_name(type) << " element " << i
-                               << " integer expected bits 0x" << std::hex
-                               << expected << " observed bits 0x" << observed);
-                continue;
-            }
-            if (!add_supported_float_leaf(type)) {
-                REQUIRE_MESSAGE(
-                        false,
-                        "ADD unsupported floating type at element " << i
-                               << " expected bits 0x" << std::hex << expected
-                               << " observed bits 0x" << observed);
-                continue;
-            }
-            const AddLeafComparison comparison =
-                    compare_add_leaf_encoding(type, expected, observed);
-            const AddFloatClass expected_class =
-                    classify_add_float(expected, add_float_format(type));
-            REQUIRE_MESSAGE(
-                    comparison.matches,
-                    "ADD " << add_type_name(type) << " element " << i
-                           << " expected bits 0x" << std::hex << expected
-                           << " observed bits 0x" << observed
-                           << " comparison class "
-                           << add_float_class_name(expected_class) << " vs "
-                           << add_float_class_name(comparison.comparison_class));
+            const bool matches = add_result_matches_oracle(
+                    type, lhs_values[i], rhs_values[i], observed);
+            INFO("compact dtype enum=" << static_cast<int>(type)
+                                       << " pair index=" << i
+                                       << " lhs raw=" << lhs_values[i]
+                                       << " rhs raw=" << rhs_values[i]
+                                       << " expected raw=" << expected
+                                       << " observed raw=" << observed);
+            CHECK(matches);
         }
     }
 
-    std::vector<std::uint64_t> exhaustive_pairs(
-            unsigned width, std::size_t plane_elements) {
-        std::vector<std::uint64_t> values;
-        values.reserve(plane_elements * 2);
-        const unsigned count = 1u << width;
-        for (std::size_t element = 0; element < plane_elements; ++element) {
-            values.push_back(
-                    (element / count) % count);
-            values.push_back(element % count);
+    struct AddPairs {
+        std::vector<std::uint64_t> lhs;
+        std::vector<std::uint64_t> rhs;
+    };
+
+    AddPairs enumerate_add_pairs(unsigned width) {
+        const std::size_t value_count = std::size_t{1} << width;
+        const std::size_t pair_count = value_count * value_count;
+        AddPairs pairs;
+        pairs.lhs.resize(pair_count);
+        pairs.rhs.resize(pair_count);
+        for (std::size_t i = 0; i < pair_count; ++i) {
+            pairs.lhs[i] = i / value_count;
+            pairs.rhs[i] = i % value_count;
         }
-        return values;
+        return pairs;
     }
+
 
     std::vector<std::uint64_t> representative_wide_values(
             iom::DataType type) {
@@ -1704,7 +1706,7 @@ TEST_CASE("TTNN ADD floating comparison envelope rejects deterministic mutations
     }
 }
 
-TEST_CASE("TTNN ADD exhaustively covers every compact leaf pair") {
+TEST_CASE("TTNN ADD exhaustively covers every compact ordered pair") {
     require_hardware();
     TtnnDevices devices;
     const iom::DataType compact[] = {
@@ -1718,9 +1720,20 @@ TEST_CASE("TTNN ADD exhaustively covers every compact leaf pair") {
                 : type == iom::DataType::I4
                 || type == iom::DataType::U4
                 || type == iom::DataType::F4_E2M1 ? 4 : 6;
-        std::vector<std::uint64_t> values = exhaustive_pairs(width, 1);
+        AddPairs pairs = enumerate_add_pairs(width);
+        REQUIRE_EQ(pairs.lhs.size(), pairs.rhs.size());
+        REQUIRE_EQ(
+                pairs.lhs.size(),
+                (std::size_t{1} << width) * (std::size_t{1} << width));
+        if (type == iom::DataType::I2) {
+            const std::uint64_t expected =
+                    iom_conformance::add_oracle::add(
+                            type, pairs.lhs[1], pairs.rhs[1]);
+            CHECK_FALSE(add_result_matches_oracle(
+                    type, pairs.lhs[1], pairs.rhs[1], expected ^ 1u));
+        }
         require_add_leaf_matches_oracle(
-                *devices.candidate, type, values, values);
+                *devices.candidate, type, pairs.lhs, pairs.rhs);
     }
 }
 
