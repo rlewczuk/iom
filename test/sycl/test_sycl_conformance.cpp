@@ -699,3 +699,9 @@ TEST_CASE("SYCL conformance: ADD requests use native queue and owner registry") 
             *devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }
+
+TEST_CASE("SYCL conformance: ADD values through the real queue") {
+    SyclDevices devices;
+    iom_conformance::run_add_value_conformance(*devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
+}

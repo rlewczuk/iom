@@ -11,6 +11,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_add.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 
@@ -225,6 +226,12 @@ TEST_CASE("CPU conformance: common ADD validation and lifetime policy") {
             devices.conformance(), &devices.gate);
     iom_conformance::run_add_rank_boundary_conformance(
             *devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU conformance: ADD values through the real queue") {
+    CpuDevices devices;
+    iom_conformance::run_add_value_conformance(*devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }
 
