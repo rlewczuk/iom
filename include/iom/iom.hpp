@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <initializer_list>
 #include <condition_variable>
 #include <cstdint>
@@ -14,6 +15,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <span>
+
+#include "detail/outstanding_work_registry.hpp"
+
 
 #include "oid.hpp"
 
@@ -241,8 +246,8 @@ namespace iom {
          * the low 55 bits. Synchronous failures return OidError values.
          */
         oid copy(const TensorView& source, TensorView& destination) noexcept;
-        oid add(const TensorView& a, const TensorView& b,
-                TensorView& c) noexcept;
+        oid add(const TensorView& lhs, const TensorView& rhs,
+                TensorView& out) noexcept;
         oid mul(const TensorView& a, const TensorView& b,
                 TensorView& c) noexcept;
         oid silu(const TensorView& x, TensorView& y) noexcept;
@@ -260,13 +265,37 @@ namespace iom {
          * facades retain common validation, error mapping, token encoding,
          * queue ordering, and lifetime registration.
          */
+        /**
+         * Immutable backend-neutral ADD metadata. logical_plane_strides is
+         * aligned to the result's leading axes; zero is an internal broadcast
+         * marker and is never exposed as TensorView stride metadata.
+         */
+        struct AddViewSnapshot {
+            TensorSpec spec;
+            const Device* device_identity;
+            const Tensor* owner_identity;
+            void* native_handle;
+            std::size_t plane_offset;
+            std::vector<std::size_t> plane_strides;
+            std::vector<std::size_t> logical_plane_strides;
+            bool broadcast_rows;
+            bool broadcast_columns;
+            bool broadcasts;
+        };
+
+        struct AddRequest {
+            AddViewSnapshot lhs;
+            AddViewSnapshot rhs;
+            AddViewSnapshot out;
+            TensorShape result_shape;
+        };
+
         DeviceOps();
         explicit DeviceOps(const Device& device);
 
         virtual oid copy_impl(
                 const TensorView& source, TensorView& destination);
-        virtual oid add_impl(const TensorView& a, const TensorView& b,
-                             TensorView& c);
+        virtual oid add_impl(const AddRequest& request);
         virtual oid mul_impl(const TensorView& a, const TensorView& b,
                              TensorView& c);
         virtual oid silu_impl(const TensorView& x, TensorView& y);
@@ -284,6 +313,12 @@ namespace iom {
                 std::uint64_t sequence) noexcept;
         void record_post_completion_failure(
                 std::uint64_t sequence, std::exception_ptr failure);
+        [[nodiscard]] static AddRequest validate_add(
+                const Device& device, const TensorView& lhs,
+                const TensorView& rhs, const TensorView& out);
+        [[nodiscard]] static AddViewSnapshot snapshot_add_view(
+                const TensorView& view,
+                std::span<const std::size_t> result_dimensions);
         static void validate_copy(
                 const Device& device, const TensorView& source,
                 const TensorView& destination);
@@ -321,6 +356,42 @@ namespace iom {
             }
             return encode_token(sequence);
         }
+        /**
+         * Backend ADD queues use this after their pre-acceptance resources
+         * and fence are ready. It reserves the common sequence, registers
+         * each distinct owner before queue_work may submit backend work, and
+         * rolls registrations back if queue_work rejects the submission.
+         * queue_work must retain the returned registration in its queued
+         * outcome and release or invalidate it at terminal completion.
+         */
+        template <typename QueueWork>
+        oid submit_add(
+                const AddRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            return submit([&](std::uint64_t sequence) {
+                const std::array<detail::AddOwnerRegistration, 3> owners{{
+                        {request.lhs.owner_identity,
+                         request.lhs.native_handle},
+                        {request.rhs.owner_identity,
+                         request.rhs.native_handle},
+                        {request.out.owner_identity,
+                         request.out.native_handle},
+                }};
+                detail::AddEntryRegistration entries =
+                        detail::register_add_entries(
+                                state, queue_id, sequence, owners, fence);
+                try {
+                    queue_work(sequence, request, entries);
+                } catch (...) {
+                    state.registry.remove_entries(
+                            std::span<const detail::EntryId>(
+                                    entries.entries.data(), entries.count));
+                    throw;
+                }
+            });
+        }
+
         void complete(std::uint64_t sequence,
                       std::exception_ptr failure = nullptr);
         void commit_failure(std::uint64_t sequence,

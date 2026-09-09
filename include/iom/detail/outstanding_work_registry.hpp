@@ -576,6 +576,7 @@ inline void release_or_quarantine(
     }
 }
 
+
 struct SequenceOutcome {
     EntryId source_entry_id = 0;
     EntryId destination_entry_id = 0;
@@ -604,10 +605,9 @@ struct RegistryState {
     QueueId next_queue_id = 1;
     // Serializes mutable ID allocation for this device registry. The
     // registry map mutex guards only map operations; this separate lock
-    // guards the shared ID counters so concurrent queue creation and copy
-    // submission reserve unique queue ids and unique source/destination
-    // entry-id pairs. It is held across the whole pair reservation, keeping
-    // one source/destination pair a single reservation.
+    // guards the shared ID counters so concurrent queue creation and
+    // submission reserve unique queue IDs and operation entry sets. It is
+    // held across each complete copy pair or deduplicated ADD owner set.
     mutable std::mutex allocation_mutex;
 };
 
@@ -677,6 +677,69 @@ inline EntryRegistration register_copy_entries(
     return register_registry_entries(
             state.registry, state.next_entry_id, queue_id, sequence, source,
             destination, fence);
+}
+
+struct AddEntryRegistration {
+    std::array<EntryId, 3> entries{};
+    std::size_t count = 0;
+};
+struct AddOwnerRegistration {
+    const void* identity = nullptr;
+    void* address = nullptr;
+};
+
+
+[[nodiscard]] inline AddEntryRegistration register_add_entries(
+        RegistryState& state, QueueId queue_id, std::uint64_t sequence,
+        std::span<const AddOwnerRegistration> owners, const Fence& fence) {
+    std::lock_guard<std::mutex> lock(state.allocation_mutex);
+    AddEntryRegistration result;
+    try {
+        for (std::size_t index = 0; index < owners.size(); ++index) {
+            const AddOwnerRegistration owner = owners[index];
+            if (owner.identity == nullptr || owner.address == nullptr) {
+                throw std::invalid_argument("ADD owner identity or address is null");
+            }
+            bool duplicate = false;
+            for (std::size_t prior = 0; prior < index; ++prior) {
+                if (owners[prior].identity == owner.identity) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            if (result.count == result.entries.size()) {
+                throw std::invalid_argument("too many ADD owners");
+            }
+            const EntryId id = allocate_registry_id(state.next_entry_id);
+            state.registry.register_entry(
+                    id, owner.address, sequence, queue_id, Fence(fence));
+            result.entries[result.count++] = id;
+        }
+    } catch (...) {
+        if (result.count != 0) {
+            state.registry.remove_entries(
+                    std::span<const EntryId>(result.entries.data(), result.count));
+        }
+        throw;
+    }
+    return result;
+}
+
+[[nodiscard]] inline bool release_or_invalidate_add_entries(
+        OutstandingWorkRegistry& registry, const AddEntryRegistration& outcome,
+        bool failure, bool fence_succeeded) noexcept {
+    const std::span<const EntryId> ids(outcome.entries.data(), outcome.count);
+    if (failure || !fence_succeeded) {
+        registry.invalidate_entries(ids);
+        return false;
+    }
+    for (const EntryId id : ids) {
+        (void)registry.try_release_entry(id);
+    }
+    return true;
 }
 
 }  // namespace iom::detail

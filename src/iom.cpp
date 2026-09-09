@@ -2,6 +2,7 @@
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
 
+#include <algorithm>
 #include <bitset>
 #include <condition_variable>
 #include <cstddef>
@@ -255,6 +256,9 @@ namespace iom {
               plane_offset_(plane_offset),
               plane_strides_(std::move(plane_strides)) {}
 
+    const Tensor* TensorView::owner_identity() const noexcept {
+        return owner_;
+    }
     const TensorSpec& TensorView::spec() const noexcept {
         return spec_;
     }
@@ -482,8 +486,306 @@ namespace iom {
         // runtime context.
         std::mutex g_queue_ids_mutex;
         std::bitset<255> g_live_queue_ids;
+        struct UnsupportedOperation final : std::runtime_error {
+            UnsupportedOperation()
+                    : std::runtime_error("operation is unsupported") {}
+        };
+        bool recognized_quantization(QuantizationFormat value) noexcept {
+            switch (value) {
+                case QuantizationFormat::NONE:
+                case QuantizationFormat::INT8_SYMMETRIC:
+                case QuantizationFormat::INT8_ASYMMETRIC:
+                case QuantizationFormat::INT4_SYMMETRIC:
+                case QuantizationFormat::INT4_ASYMMETRIC:
+                case QuantizationFormat::OCP_MXFP4:
+                case QuantizationFormat::OCP_MXFP8_E4M3:
+                case QuantizationFormat::OCP_MXFP8_E5M2:
+                case QuantizationFormat::NVIDIA_NVFP4:
+                case QuantizationFormat::GGML_Q4_0:
+                case QuantizationFormat::GGML_Q4_1:
+                case QuantizationFormat::GGML_Q5_0:
+                case QuantizationFormat::GGML_Q5_1:
+                case QuantizationFormat::GGML_Q8_0:
+                case QuantizationFormat::GGML_Q2_K:
+                case QuantizationFormat::GGML_Q3_K:
+                case QuantizationFormat::GGML_Q4_K:
+                case QuantizationFormat::GGML_Q5_K:
+                case QuantizationFormat::GGML_Q6_K:
+                case QuantizationFormat::TT_BFP2:
+                case QuantizationFormat::TT_BFP2A:
+                case QuantizationFormat::TT_BFP4:
+                case QuantizationFormat::TT_BFP4A:
+                case QuantizationFormat::TT_BFP8:
+                case QuantizationFormat::TT_BFP8A:
+                    return true;
+            }
+            return false;
+        }
 
+        bool add_numeric_leaf(DataType value) noexcept {
+            switch (value) {
+                case DataType::I2: case DataType::U2:
+                case DataType::I4: case DataType::U4:
+                case DataType::I8: case DataType::U8:
+                case DataType::I16: case DataType::U16:
+                case DataType::I32: case DataType::U32:
+                case DataType::I64: case DataType::U64:
+                case DataType::F4_E2M1: case DataType::F6_E2M3:
+                case DataType::F6_E3M2: case DataType::F8_E4M3FN:
+                case DataType::F8_E5M2: case DataType::F16:
+                case DataType::BF16: case DataType::F32:
+                case DataType::F64:
+                    return true;
+                case DataType::BOOL: case DataType::F8_E8M0:
+                    return false;
+            }
+            return false;
+        }
+
+        void validate_add_spec(const TensorSpec& spec) {
+            (void)detail::leaf_bits(spec.data_type);
+            if (!recognized_quantization(spec.quantization)) {
+                throw std::invalid_argument("unknown quantization format");
+            }
+            if (spec.shape.rank() < 2) {
+                throw std::invalid_argument("ADD requires rank at least two");
+            }
+            for (const std::size_t dimension : spec.shape.dimensions()) {
+                if (dimension == 0) {
+                    throw std::invalid_argument(
+                            "ADD dimensions must be nonzero");
+                }
+            }
+        }
+
+        std::size_t checked_plane_count(const TensorShape& shape) {
+            std::size_t planes = 1;
+            const std::span<const std::size_t> dimensions =
+                    shape.dimensions();
+            for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
+                planes = checked_mul(
+                        planes, dimensions[i],
+                        "ADD plane count overflows");
+            }
+            return planes;
+        }
+
+        void validate_add_view(
+                const Device& device, const TensorView& view) {
+            const Tensor* owner = view.owner_identity();
+            if (owner == nullptr) {
+                throw std::invalid_argument("ADD view has no owner");
+            }
+            if (&view.device() != &device
+                    || &owner->view().device() != &device
+                    || owner->view().owner_identity() != owner) {
+                throw std::invalid_argument(
+                        "ADD view owner belongs to another device");
+            }
+            const void* handle = view.native_handle();
+            if (handle == nullptr
+                    || handle != owner->view().native_handle()) {
+                throw std::invalid_argument(
+                        "ADD view has no stable owner handle");
+            }
+
+            const TensorSpec& spec = view.spec();
+            const TensorSpec& owner_spec = owner->view().spec();
+            const std::span<const std::size_t> dimensions =
+                    spec.shape.dimensions();
+            const std::span<const std::size_t> owner_dimensions =
+                    owner_spec.shape.dimensions();
+            if (spec.data_type != owner_spec.data_type
+                    || spec.quantization != owner_spec.quantization
+                    || dimensions[dimensions.size() - 2]
+                            != owner_dimensions[owner_dimensions.size() - 2]
+                    || dimensions.back() != owner_dimensions.back()) {
+                throw std::invalid_argument(
+                        "ADD view specification does not match its owner");
+            }
+
+            const std::size_t leading = dimensions.size() - 2;
+            const std::span<const std::size_t> strides =
+                    view.plane_strides();
+            if (strides.size() != leading) {
+                throw std::invalid_argument("invalid ADD plane stride count");
+            }
+            std::size_t max_plane = view.plane_offset();
+            for (std::size_t i = 0; i < leading; ++i) {
+                if (strides[i] == 0) {
+                    throw std::invalid_argument(
+                            "ADD does not permit zero strides");
+                }
+                max_plane = checked_add(
+                        max_plane,
+                        checked_mul(
+                                dimensions[i] - 1, strides[i],
+                                "ADD plane address overflows"),
+                        "ADD plane address overflows");
+            }
+            if (max_plane >= checked_plane_count(owner_spec.shape)) {
+                throw std::invalid_argument(
+                        "ADD view addresses outside its owner");
+            }
+
+            const std::size_t last_slot = detail::standard_plane_slot(
+                    spec, max_plane, dimensions[leading] - 1,
+                    dimensions[leading + 1] - 1);
+            const std::size_t addressed_bits = checked_mul(
+                    checked_add(last_slot, 1, "ADD slot count overflows"),
+                    detail::leaf_bits(spec.data_type),
+                    "ADD view size overflows");
+            const std::size_t addressed_bytes =
+                    bits_to_bytes(addressed_bits, "ADD view byte size overflows");
+            const std::size_t owner_bits = checked_mul(
+                    owner_spec.standard_padded_shape().element_count(),
+                    detail::leaf_bits(owner_spec.data_type),
+                    "ADD owner storage size overflows");
+            if (addressed_bytes
+                    > bits_to_bytes(
+                            owner_bits, "ADD owner storage size overflows")) {
+                throw std::invalid_argument(
+                        "ADD view exceeds its owner storage");
+            }
+            const std::size_t logical_bits = checked_mul(
+                    spec.shape.element_count(),
+                    detail::leaf_bits(spec.data_type),
+                    "ADD logical size overflows");
+            (void)bits_to_bytes(logical_bits, "ADD logical size overflows");
+        }
     }  // namespace
+
+
+    DeviceOps::AddViewSnapshot DeviceOps::snapshot_add_view(
+                const TensorView& view,
+                std::span<const std::size_t> result_dimensions) {
+            const std::span<const std::size_t> dimensions =
+                    view.spec().shape.dimensions();
+            const std::size_t rank_offset =
+                    result_dimensions.size() - dimensions.size();
+            const std::size_t result_leading =
+                    result_dimensions.size() - 2;
+            std::vector<std::size_t> logical_plane_strides(
+                    result_leading, 0);
+            bool broadcasts = dimensions.size() != result_dimensions.size();
+            for (std::size_t axis = 0; axis < result_leading; ++axis) {
+                if (axis < rank_offset) {
+                    broadcasts = broadcasts || result_dimensions[axis] != 1;
+                    continue;
+                }
+                const std::size_t source_axis = axis - rank_offset;
+                if (dimensions[source_axis] == 1
+                        && result_dimensions[axis] != 1) {
+                    broadcasts = true;
+                    continue;
+                }
+                logical_plane_strides[axis] =
+                        view.plane_strides()[source_axis];
+            }
+            const bool broadcast_rows =
+                    dimensions[dimensions.size() - 2] == 1
+                    && result_dimensions[result_dimensions.size() - 2] != 1;
+            const bool broadcast_columns =
+                    dimensions.back() == 1
+                    && result_dimensions.back() != 1;
+            broadcasts =
+                    broadcasts || broadcast_rows || broadcast_columns;
+            return DeviceOps::AddViewSnapshot{
+                    view.spec(),
+                    &view.device(),
+                    view.owner_identity(),
+                    const_cast<void*>(view.native_handle()),
+                    view.plane_offset(),
+                    {view.plane_strides().begin(),
+                     view.plane_strides().end()},
+                    std::move(logical_plane_strides),
+                    broadcast_rows,
+                    broadcast_columns,
+                    broadcasts};
+        }
+
+    DeviceOps::AddRequest DeviceOps::validate_add(
+            const Device& device, const TensorView& lhs,
+            const TensorView& rhs, const TensorView& out) {
+        validate_add_spec(lhs.spec());
+        validate_add_spec(rhs.spec());
+        validate_add_spec(out.spec());
+
+        if (lhs.spec().data_type != rhs.spec().data_type
+                || lhs.spec().data_type != out.spec().data_type
+                || lhs.spec().quantization != rhs.spec().quantization
+                || lhs.spec().quantization != out.spec().quantization) {
+            throw std::invalid_argument("ADD specifications do not match");
+        }
+
+        validate_add_view(device, lhs);
+        validate_add_view(device, rhs);
+        validate_add_view(device, out);
+
+        const auto lhs_dims = lhs.spec().shape.dimensions();
+        const auto rhs_dims = rhs.spec().shape.dimensions();
+        const std::size_t rank = std::max(lhs_dims.size(), rhs_dims.size());
+        std::vector<std::size_t> result(rank, 1);
+        for (std::size_t i = 0; i < rank; ++i) {
+            const std::size_t lhs_axis =
+                    i < rank - lhs_dims.size() ? 1
+                    : lhs_dims[i - (rank - lhs_dims.size())];
+            const std::size_t rhs_axis =
+                    i < rank - rhs_dims.size() ? 1
+                    : rhs_dims[i - (rank - rhs_dims.size())];
+            if (lhs_axis != rhs_axis && lhs_axis != 1 && rhs_axis != 1) {
+                throw std::invalid_argument(
+                        "ADD shapes are not broadcast compatible");
+            }
+            result[i] = std::max(lhs_axis, rhs_axis);
+        }
+        const auto same_shape = [&result](const TensorShape& shape) {
+            return shape.dimensions().size() == result.size()
+                    && std::equal(
+                            shape.dimensions().begin(),
+                            shape.dimensions().end(), result.begin());
+        };
+        if (!same_shape(out.spec().shape)) {
+            throw std::invalid_argument("ADD output shape is incorrect");
+        }
+
+        AddViewSnapshot lhs_snapshot = snapshot_add_view(lhs, result);
+        AddViewSnapshot rhs_snapshot = snapshot_add_view(rhs, result);
+        AddViewSnapshot out_snapshot = snapshot_add_view(out, result);
+        const auto exact_alias = [](const AddViewSnapshot& input,
+                                    const AddViewSnapshot& output) {
+            return !input.broadcasts
+                    && input.owner_identity == output.owner_identity
+                    && input.spec == output.spec
+                    && input.plane_offset == output.plane_offset
+                    && input.plane_strides == output.plane_strides
+                    && input.logical_plane_strides
+                            == output.logical_plane_strides
+                    && input.broadcast_rows == output.broadcast_rows
+                    && input.broadcast_columns == output.broadcast_columns;
+        };
+        if ((lhs_snapshot.owner_identity == out_snapshot.owner_identity
+                    && !exact_alias(lhs_snapshot, out_snapshot))
+                || (rhs_snapshot.owner_identity == out_snapshot.owner_identity
+                    && !exact_alias(rhs_snapshot, out_snapshot))) {
+            throw std::invalid_argument("ADD input/output alias is forbidden");
+        }
+
+        if (lhs.spec().quantization != QuantizationFormat::NONE
+                || lhs.spec().data_type == DataType::BOOL
+                || lhs.spec().data_type == DataType::F8_E8M0
+                || !add_numeric_leaf(lhs.spec().data_type)) {
+            throw UnsupportedOperation();
+        }
+        return AddRequest{
+                std::move(lhs_snapshot),
+                std::move(rhs_snapshot),
+                std::move(out_snapshot),
+                TensorShape{std::move(result)}};
+    }
+
+
+
 
     void DeviceOps::validate_copy(
             const Device& device, const TensorView& source,
@@ -520,12 +822,6 @@ namespace iom {
     DeviceOps::DeviceOps(const Device& device)
             : device_(&device), queue_id_(lease_queue_id()) {}
 
-    namespace {
-        struct UnsupportedOperation final : std::runtime_error {
-            UnsupportedOperation()
-                    : std::runtime_error("operation is unsupported") {}
-        };
-    }
 
     const Device& DeviceOps::queue_device() const {
         if (device_ == nullptr) {
@@ -549,8 +845,7 @@ namespace iom {
             const TensorView&, TensorView&) {
         throw UnsupportedOperation();
     }
-    oid DeviceOps::add_impl(
-            const TensorView&, const TensorView&, TensorView&) {
+    oid DeviceOps::add_impl(const AddRequest&) {
         throw UnsupportedOperation();
     }
     oid DeviceOps::mul_impl(
@@ -614,10 +909,11 @@ namespace iom {
     }
 
     oid DeviceOps::add(
-            const TensorView& a, const TensorView& b, TensorView& c) noexcept {
+            const TensorView& lhs, const TensorView& rhs,
+            TensorView& out) noexcept {
         try {
-            validate_views(queue_device(), {&a, &b, &c});
-            return invoke(add_impl(a, b, c));
+            AddRequest request = validate_add(queue_device(), lhs, rhs, out);
+            return invoke(add_impl(request));
         } catch (...) {
             return invoke_failure(std::current_exception());
         }

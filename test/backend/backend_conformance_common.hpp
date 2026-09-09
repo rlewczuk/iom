@@ -3,15 +3,16 @@
 // Backend-neutral conformance harness: shared definitions (change 0001-tensor-view / 06).
 //
 // Provides the independent host-encoding model, logical-byte observation
-// helpers, case parameters (observer, devices), token decoding, span helper,
-// and compile-time checks of every compute method's view signature. None of
-// these depend on storage, copy, lifetime, or capability scenarios; the other
-// parts of the harness build on top of them. The harness never switches on
+// helpers, case parameters (observer, devices), token decoding, compile-time
+// signature checks, and the backend-neutral ADD validation/lifetime fake. The
+// remaining storage, copy, and capability scenarios build on these definitions.
+// The harness never switches on
 // BackendKind, never constructs a device, and includes no accelerator header,
 // so a backend-specific test can include it unchanged.
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -311,4 +312,174 @@ static_assert(!std::is_invocable_v<
               decltype(&iom::DeviceOps::copy), iom::DeviceOps*,
               const iom::Tensor&, iom::Tensor&>);
 
+
+// ---------------------------------------------------------------------------
+// Backend-neutral ADD policy fake. It consumes only the protected immutable
+// request and the common registry seam; no arithmetic or backend runtime is
+// involved.
+// ---------------------------------------------------------------------------
+
+class CommonAddQueue final : public iom::DeviceOps {
+public:
+    struct Record {
+        std::uint64_t sequence;
+        std::vector<std::size_t> result_shape;
+        iom::detail::AddEntryRegistration entries;
+        bool retained_failure;
+    };
+
+    explicit CommonAddQueue(const iom::Device& device)
+            : iom::DeviceOps(device) {}
+
+    void fail_next_after_acceptance() noexcept {
+        fail_next_ = true;
+    }
+
+    [[nodiscard]] const std::vector<Record>& records() const noexcept {
+        return records_;
+    }
+
+    [[nodiscard]] std::size_t registered_at(void* address) const {
+        return state_.registry.snapshot_for(address).size();
+    }
+
+    void finish(std::uint64_t sequence) {
+        for (const Record& record : records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_add_entries(
+                    state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown common ADD sequence");
+    }
+
+protected:
+    iom::oid add_impl(const AddRequest& request) override {
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        const bool retained_failure = std::exchange(fail_next_, false);
+        return submit_add(
+                request, state_, registry_queue_id_, fence,
+                [this, retained_failure](
+                        std::uint64_t sequence, const AddRequest& snapshot,
+                        iom::detail::AddEntryRegistration entries) {
+                    records_.push_back(
+                            {sequence,
+                             {snapshot.result_shape.dimensions().begin(),
+                              snapshot.result_shape.dimensions().end()},
+                             entries,
+                             retained_failure});
+                    if (retained_failure) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "common ADD retained failure")));
+                    }
+                });
+    }
+
+private:
+    iom::detail::RegistryState state_;
+    iom::detail::QueueId registry_queue_id_ =
+            iom::detail::allocate_queue_id(state_);
+    std::vector<Record> records_;
+    bool fail_next_ = false;
+};
+
+inline void run_add_request_conformance(
+        const ConformanceDevices& devices,
+        ConformanceObserver* observer = nullptr) {
+    const iom::TensorSpec matrix{
+            iom::TensorShape{{2, 17, 33}}, iom::DataType::F32};
+    const iom::TensorSpec scalar{
+            iom::TensorShape{{1, 1}}, iom::DataType::F32};
+    const iom::TensorSpec broadcast_result{
+            iom::TensorShape{{2, 4, 3, 5, 17, 33}}, iom::DataType::F32};
+    const iom::TensorSpec broadcast_lhs{
+            iom::TensorShape{{2, 1, 3, 1, 17, 1}}, iom::DataType::F32};
+    const iom::TensorSpec broadcast_rhs{
+            iom::TensorShape{{1, 4, 1, 5, 1, 33}}, iom::DataType::F32};
+
+    auto lhs = devices.candidate.create_tensor(matrix);
+    auto rhs = devices.candidate.create_tensor(matrix);
+    auto out = devices.candidate.create_tensor(matrix);
+    auto foreign = devices.foreign.create_tensor(matrix);
+    auto scalar_lhs = devices.candidate.create_tensor(scalar);
+    auto scalar_rhs = devices.candidate.create_tensor(scalar);
+    auto scalar_out = devices.candidate.create_tensor(scalar);
+    auto broad_lhs = devices.candidate.create_tensor(broadcast_lhs);
+    auto broad_rhs = devices.candidate.create_tensor(broadcast_rhs);
+    auto broad_out = devices.candidate.create_tensor(broadcast_result);
+    if (observer != nullptr) {
+        observer->setup_complete();
+    }
+
+    CommonAddQueue queue(devices.candidate);
+    const iom::oid first =
+            queue.add(lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(first));
+    CHECK_EQ(token_sequence(first), 1);
+    REQUIRE_EQ(queue.records().back().entries.count, 3);
+    CHECK_EQ(queue.registered_at(lhs->view().native_handle()), 1);
+    queue.finish(1);
+    CHECK_NOTHROW(queue.wait(first));
+    CHECK_NOTHROW(queue.wait(first));
+    CHECK_EQ(queue.registered_at(lhs->view().native_handle()), 0);
+
+    const iom::oid scalar_token =
+            queue.add(scalar_lhs->view(), scalar_rhs->view(),
+                      scalar_out->view());
+    REQUIRE(iom::oid_is_token(scalar_token));
+    CHECK_EQ(queue.records().back().result_shape,
+             std::vector<std::size_t>({1, 1}));
+    queue.finish(token_sequence(scalar_token));
+
+    const iom::oid broadcast_token =
+            queue.add(broad_lhs->view(), broad_rhs->view(),
+                      broad_out->view());
+    REQUIRE(iom::oid_is_token(broadcast_token));
+    CHECK_EQ(
+            queue.records().back().result_shape,
+            std::vector<std::size_t>({2, 4, 3, 5, 17, 33}));
+    queue.finish(token_sequence(broadcast_token));
+
+    const iom::oid promoted =
+            queue.add(scalar_lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(promoted));
+    CHECK_EQ(queue.records().back().result_shape,
+             std::vector<std::size_t>({2, 17, 33}));
+    queue.finish(token_sequence(promoted));
+
+    const std::size_t accepted = queue.records().size();
+    CHECK_EQ(
+            queue.add(foreign->view(), rhs->view(), out->view()),
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
+            queue.add(lhs->view(), rhs->view(), scalar_out->view()),
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(queue.records().size(), accepted);
+
+    const iom::oid aliased =
+            queue.add(out->view(), out->view(), out->view());
+    REQUIRE(iom::oid_is_token(aliased));
+    REQUIRE_EQ(queue.records().back().entries.count, 1);
+    queue.finish(token_sequence(aliased));
+
+    queue.fail_next_after_acceptance();
+    const iom::oid failed =
+            queue.add(lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(failed));
+    queue.finish(token_sequence(failed));
+    expect_repeated_runtime_failure(queue, failed);
+
+    if (observer != nullptr) {
+        observer->case_complete();
+    }
+}
 }  // namespace iom_conformance

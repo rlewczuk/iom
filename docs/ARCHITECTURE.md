@@ -194,6 +194,19 @@ identical is a valid no-op. Device identity, capability, shape, dtype,
 quantization, buffer extent, and overflow are checked before the backend begins
 work.
 
+ADD validation produces an immutable backend-neutral snapshot of all three
+views, including owner and device identities, handles, exact specifications,
+offsets and strides, and the result-aligned logical broadcast mapping. Backend
+queues consume that snapshot through the protected ADD hook. Once their
+pre-acceptance resources and fence are ready, later CPU, GPU, SYCL, and TTNN
+ADD implementations must use the protected `submit_add` seam with their
+device-owned `RegistryState`; it reserves the sequence, registers each distinct
+owner before the backend submission callback, and rolls registration back if
+that callback
+rejects the work. The queued outcome owns the copied snapshot and registration
+until it releases or invalidates the entries at terminal completion. No backend
+may retain the caller's `TensorView` objects.
+
 ## Public API guide
 
 The library is intentionally small. The following are the user-facing entry

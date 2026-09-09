@@ -238,6 +238,13 @@ TEST_CASE("CPU conformance: copy validation fails before writes and sequences") 
     CHECK_FALSE(devices.gate.armed());
 }
 
+TEST_CASE("CPU conformance: common ADD validation and lifetime policy") {
+    CpuDevices devices;
+    iom_conformance::run_add_request_conformance(
+            devices.conformance(), &devices.gate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("CPU conformance: transfer failures keep metadata and ownership") {
     CpuDevices devices;
     iom_conformance::run_transfer_error_conformance(

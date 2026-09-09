@@ -152,6 +152,7 @@ namespace iom {
         TensorView& operator=(TensorView&&) = delete;
 
         [[nodiscard]] const TensorSpec& spec() const noexcept;
+        [[nodiscard]] const Tensor* owner_identity() const noexcept;
         [[nodiscard]] const Device& device() const noexcept;
         [[nodiscard]] BackendKind backend_kind() const noexcept;
         [[nodiscard]] std::uint32_t backend_device() const noexcept;

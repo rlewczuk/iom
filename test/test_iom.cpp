@@ -724,7 +724,7 @@ public:
             : iom::Tensor(std::move(spec), device) {}
 
     [[nodiscard]] void* storage_handle() noexcept override {
-        return &storage_;
+        return handle_;
     }
 
     void region_from_host(
@@ -749,6 +749,12 @@ public:
     }
 
     int storage_ = 0;
+    void use_storage_handle(void* handle) noexcept {
+        handle_ = handle;
+    }
+
+    void* handle_ = &storage_;
+
 
     std::size_t from_host_calls = 0;
     std::size_t from_view_offset = 0;
@@ -766,9 +772,44 @@ public:
 // common DeviceOps machinery. No threads, backends, or real work involved.
 class FakeQueue final : public iom::DeviceOps {
 public:
+    enum class AddFailure {
+        none,
+        bad_alloc,
+        runtime,
+        internal,
+        post_acceptance,
+    };
+
+    struct Submission {
+        std::uint64_t sequence;
+        const char* op;
+    };
+
+    struct AddViewRecord {
+        iom::TensorSpec spec;
+        const iom::Device* device;
+        const iom::Tensor* owner;
+        void* handle;
+        std::size_t plane_offset;
+        std::vector<std::size_t> plane_strides;
+        std::vector<std::size_t> logical_plane_strides;
+        bool broadcast_rows;
+        bool broadcast_columns;
+        bool broadcasts;
+    };
+
+    struct AddRecord {
+        std::uint64_t sequence;
+        std::array<AddViewRecord, 3> views;
+        std::vector<std::size_t> result_shape;
+        iom::detail::AddEntryRegistration entries;
+        bool retained_failure;
+    };
+
     FakeQueue() = default;
     explicit FakeQueue(const iom::Device& device)
             : iom::DeviceOps(device) {}
+
     [[nodiscard]] std::string_view backend_label() const noexcept override {
         return "fake";
     }
@@ -776,14 +817,34 @@ public:
     using iom::DeviceOps::complete;
     using iom::DeviceOps::seek_next_sequence;
 
-    struct Submission {
-        std::uint64_t sequence;
-        const char* op;
-    };
+    void inject_add_failure(AddFailure failure) noexcept {
+        next_add_failure_ = failure;
+    }
+
+    [[nodiscard]] const std::vector<AddRecord>& add_records() const noexcept {
+        return add_records_;
+    }
+
+    [[nodiscard]] std::size_t registered_at(void* address) const {
+        return registry_state_.registry.snapshot_for(address).size();
+    }
+
+    void finish_add(std::uint64_t sequence) {
+        for (const AddRecord& record : add_records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_add_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake ADD sequence");
+    }
 
     // Successfully queued operations in submission order.
     std::vector<Submission> submissions;
-
     bool silu_aliased = false;
 
     // A view-less submission used to observe queue identity and sequence
@@ -805,11 +866,62 @@ protected:
         });
     }
 
-    iom::oid add_impl(const iom::TensorView&, const iom::TensorView&,
-                      iom::TensorView&) override {
-        return submit([&](std::uint64_t sequence) {
-            submissions.push_back({sequence, "add"});
-        });
+    iom::oid add_impl(const AddRequest& request) override {
+        const AddFailure failure =
+                std::exchange(next_add_failure_, AddFailure::none);
+        switch (failure) {
+            case AddFailure::bad_alloc:
+                throw std::bad_alloc();
+            case AddFailure::runtime:
+                throw std::runtime_error("fake ADD runtime failure");
+            case AddFailure::internal:
+                throw 42;
+            case AddFailure::none:
+            case AddFailure::post_acceptance:
+                break;
+        }
+
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_add(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence, const AddRequest& snapshot,
+                        iom::detail::AddEntryRegistration entries) {
+                    const auto record_view =
+                            [](const AddViewSnapshot& view) {
+                                return AddViewRecord{
+                                        view.spec,
+                                        view.device_identity,
+                                        view.owner_identity,
+                                        view.native_handle,
+                                        view.plane_offset,
+                                        view.plane_strides,
+                                        view.logical_plane_strides,
+                                        view.broadcast_rows,
+                                        view.broadcast_columns,
+                                        view.broadcasts};
+                            };
+                    AddRecord record{
+                            sequence,
+                            {record_view(snapshot.lhs),
+                             record_view(snapshot.rhs),
+                             record_view(snapshot.out)},
+                            {snapshot.result_shape.dimensions().begin(),
+                             snapshot.result_shape.dimensions().end()},
+                            entries,
+                            failure == AddFailure::post_acceptance};
+                    add_records_.push_back(std::move(record));
+                    submissions.push_back({sequence, "add"});
+                    if (failure == AddFailure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake ADD retained failure")));
+                    }
+                });
     }
 
     iom::oid mul_impl(const iom::TensorView&, const iom::TensorView&,
@@ -847,6 +959,13 @@ protected:
             submissions.push_back({sequence, "sdpa"});
         });
     }
+
+private:
+    iom::detail::RegistryState registry_state_;
+    iom::detail::QueueId registry_queue_id_ =
+            iom::detail::allocate_queue_id(registry_state_);
+    std::vector<AddRecord> add_records_;
+    AddFailure next_add_failure_ = AddFailure::none;
 };
 
 class InlineQueue final : public iom::DeviceOps {
@@ -1788,6 +1907,360 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
 
     REQUIRE(queue.submissions.size() == 8);
     CHECK_EQ(queue.submissions.back().sequence, 8);
+}
+
+TEST_CASE("ADD accepts every numeric NONE leaf through immutable fake snapshots") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    std::uint64_t expected_sequence = 1;
+
+    for (const iom::DataType type : kFakeDeviceSupportedDataTypes) {
+        if (type == iom::DataType::BOOL
+                || type == iom::DataType::F8_E8M0) {
+            continue;
+        }
+        CAPTURE(static_cast<int>(type));
+        FakeTensor lhs = make_tensor(device, {2, 3, 17, 33}, type);
+        FakeTensor rhs = make_tensor(device, {2, 3, 17, 33}, type);
+        FakeTensor out = make_tensor(device, {2, 3, 17, 33}, type);
+        lhs.storage_ = 11;
+        rhs.storage_ = 12;
+        out.storage_ = 13;
+        const void* const lhs_handle = lhs.view().native_handle();
+        const void* const rhs_handle = rhs.view().native_handle();
+        void* const out_handle = out.view().native_handle();
+
+        const iom::oid token =
+                queue.add(lhs.view(), rhs.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(token_sequence(token), expected_sequence);
+        REQUIRE_EQ(queue.add_records().size(), expected_sequence);
+        const FakeQueue::AddRecord& record = queue.add_records().back();
+        CHECK_EQ(record.sequence, expected_sequence);
+        CHECK(record.views[0].spec == lhs.view().spec());
+        CHECK(record.views[1].spec == rhs.view().spec());
+        CHECK(record.views[2].spec == out.view().spec());
+        CHECK_EQ(record.views[0].handle, lhs_handle);
+        CHECK_EQ(record.views[1].handle, rhs_handle);
+        CHECK_EQ(record.views[2].handle, out_handle);
+        CHECK_EQ(record.entries.count, 3);
+        CHECK_EQ(lhs.storage_, 11);
+        CHECK_EQ(rhs.storage_, 12);
+        CHECK_EQ(out.storage_, 13);
+
+        queue.finish_add(expected_sequence);
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_EQ(queue.registered_at(const_cast<void*>(lhs_handle)), 0);
+        CHECK_EQ(queue.registered_at(const_cast<void*>(rhs_handle)), 0);
+        CHECK_EQ(queue.registered_at(out_handle), 0);
+        ++expected_sequence;
+    }
+    CHECK_EQ(expected_sequence, 22);
+}
+
+TEST_CASE("ADD validation preserves error precedence and rejection effects") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+
+    {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        const auto unknown = static_cast<iom::DataType>(127);
+        const_cast<iom::TensorSpec&>(lhs.view().spec()).data_type = unknown;
+        const_cast<iom::TensorSpec&>(rhs.view().spec()).data_type = unknown;
+        const_cast<iom::TensorSpec&>(out.view().spec()).data_type = unknown;
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        const auto unknown = static_cast<iom::QuantizationFormat>(127);
+        const_cast<iom::TensorSpec&>(lhs.view().spec()).quantization = unknown;
+        const_cast<iom::TensorSpec&>(rhs.view().spec()).quantization = unknown;
+        const_cast<iom::TensorSpec&>(out.view().spec()).quantization = unknown;
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        for (iom::TensorView* view :
+             {&lhs.view(), &rhs.view(), &out.view()}) {
+            const_cast<std::size_t*>(view->spec().shape.dimensions().data())[0] =
+                    0;
+        }
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        lhs.use_storage_handle(nullptr);
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(
+                device, {2, 16, 16}, iom::DataType::BOOL);
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        const_cast<iom::TensorSpec&>(lhs.view().spec()).quantization =
+                iom::QuantizationFormat::OCP_MXFP4;
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    for (const iom::DataType excluded :
+         {iom::DataType::BOOL, iom::DataType::F8_E8M0}) {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16}, excluded);
+        FakeTensor rhs = make_tensor(device, {2, 16, 16}, excluded);
+        FakeTensor out = make_tensor(device, {2, 16, 16}, excluded);
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), unsupported);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        for (iom::TensorView* view :
+             {&lhs.view(), &rhs.view(), &out.view()}) {
+            const_cast<iom::TensorSpec&>(view->spec()).quantization =
+                    iom::QuantizationFormat::GGML_Q4_0;
+        }
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), unsupported);
+    }
+    {
+        FakeTensor lhs = make_tensor(foreign, {2, 16, 16});
+        FakeTensor rhs = make_tensor(device, {2, 16, 16});
+        FakeTensor out = make_tensor(device, {2, 16, 16});
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {2, 17, 33});
+        FakeTensor rhs = make_tensor(device, {3, 17, 33});
+        FakeTensor out = make_tensor(device, {3, 17, 33});
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {1, 17, 33});
+        FakeTensor rhs = make_tensor(device, {3, 17, 33});
+        FakeTensor out = make_tensor(device, {1, 17, 33});
+        CHECK_EQ(queue.add(lhs.view(), rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor owner = make_tensor(device, {3, 17, 33});
+        FakeTensor rhs = make_tensor(device, {3, 17, 33});
+        FakeTensor out = make_tensor(device, {3, 17, 33});
+        iom::TensorView malformed = owner.view();
+        const_cast<std::size_t*>(malformed.plane_strides().data())[0] = 0;
+        CHECK_EQ(queue.add(malformed, rhs.view(), out.view()), invalid);
+
+        iom::TensorView out_of_range = owner.view();
+        const_cast<std::size_t*>(out_of_range.plane_strides().data())[0] = 2;
+        CHECK_EQ(queue.add(out_of_range, rhs.view(), out.view()), invalid);
+    }
+    {
+        FakeTensor lhs = make_tensor(device, {3, 17, 33});
+        FakeTensor rhs = make_tensor(device, {3, 17, 33});
+        FakeTensor out = make_tensor(device, {3, 17, 33});
+        iom::TensorView overflowed = lhs.view();
+        const_cast<std::size_t*>(overflowed.plane_strides().data())[0] =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_EQ(
+                queue.add(overflowed, rhs.view(), out.view()),
+                iom::to_oid(iom::OidError::Overflow));
+    }
+    {
+        FakeTensor owner = make_tensor(device, {2, 2, 17, 33});
+        FakeTensor rhs = make_tensor(device, {2, 17, 33});
+        iom::TensorView lhs = owner.view().select(0, 0);
+        iom::TensorView out = owner.view().select(0, 1);
+        CHECK_EQ(queue.add(lhs, rhs.view(), out), invalid);
+    }
+    {
+        FakeTensor owner = make_tensor(device, {3, 17, 33});
+        FakeTensor rhs = make_tensor(device, {3, 17, 33});
+        iom::TensorView lhs = owner.view().slice(0, 0, 1);
+        CHECK_EQ(queue.add(lhs, rhs.view(), owner.view()), invalid);
+    }
+
+    CHECK(queue.add_records().empty());
+    CHECK(queue.submissions.empty());
+    const iom::oid first = queue.probe();
+    CHECK_EQ(token_sequence(first), 1);
+}
+
+TEST_CASE("ADD snapshots broadcast and transformed mappings before temporaries die") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    FakeTensor lhs = make_tensor(device, {2, 1, 3, 1, 17, 1});
+    FakeTensor rhs = make_tensor(device, {1, 4, 1, 5, 1, 33});
+    FakeTensor out = make_tensor(device, {2, 4, 3, 5, 17, 33});
+
+    const iom::oid broadcast =
+            queue.add(lhs.view(), rhs.view(), out.view());
+    REQUIRE(iom::oid_is_token(broadcast));
+    const FakeQueue::AddRecord& broadcast_record = queue.add_records().back();
+    CHECK_EQ(
+            broadcast_record.result_shape,
+            std::vector<std::size_t>({2, 4, 3, 5, 17, 33}));
+    CHECK_EQ(
+            broadcast_record.views[0].logical_plane_strides,
+            std::vector<std::size_t>({3, 0, 1, 0}));
+    CHECK_EQ(
+            broadcast_record.views[1].logical_plane_strides,
+            std::vector<std::size_t>({0, 5, 0, 1}));
+    CHECK(broadcast_record.views[0].broadcast_columns);
+    CHECK(broadcast_record.views[1].broadcast_rows);
+    CHECK_FALSE(broadcast_record.views[2].broadcasts);
+    queue.finish_add(token_sequence(broadcast));
+
+    FakeTensor transformed_lhs =
+            make_tensor(device, {4, 3, 17, 33});
+    FakeTensor transformed_rhs =
+            make_tensor(device, {4, 3, 17, 33});
+    FakeTensor transformed_out =
+            make_tensor(device, {3, 2, 17, 33});
+    iom::TensorView out_view = transformed_out.view();
+    const iom::oid transformed = queue.add(
+            transformed_lhs.view().slice(0, 1, 2).permute(span_of({1, 0})),
+            transformed_rhs.view().slice(0, 0, 2).permute(span_of({1, 0})),
+            out_view);
+    REQUIRE(iom::oid_is_token(transformed));
+    const FakeQueue::AddRecord& transformed_record =
+            queue.add_records().back();
+    CHECK_EQ(transformed_record.views[0].plane_offset, 3);
+    CHECK_EQ(
+            transformed_record.views[0].plane_strides,
+            std::vector<std::size_t>({1, 3}));
+    CHECK_EQ(transformed_record.views[1].plane_offset, 0);
+    CHECK_EQ(
+            transformed_record.views[1].plane_strides,
+            std::vector<std::size_t>({1, 3}));
+    CHECK_EQ(transformed_record.views[0].owner, &transformed_lhs);
+    CHECK_EQ(
+            transformed_record.views[0].handle,
+            transformed_lhs.view().native_handle());
+    queue.finish_add(token_sequence(transformed));
+    CHECK_NOTHROW(queue.wait(transformed));
+}
+
+TEST_CASE("ADD lifetime registration deduplicates owners and retains failures") {
+    FakeDevice device;
+    {
+        FakeQueue queue(device);
+        FakeTensor value = make_tensor(device, {2, 17, 33});
+        const iom::oid token =
+                queue.add(value.view(), value.view(), value.view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_EQ(queue.add_records().back().entries.count, 1);
+        CHECK_EQ(queue.registered_at(value.view().native_handle()), 1);
+        queue.finish_add(token_sequence(token));
+        CHECK_EQ(queue.registered_at(value.view().native_handle()), 0);
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_NOTHROW(queue.wait(token));
+    }
+    {
+        FakeQueue queue(device);
+        FakeTensor lhs = make_tensor(device, {2, 17, 33});
+        FakeTensor rhs = make_tensor(device, {2, 17, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        const iom::oid lhs_alias =
+                queue.add(out.view(), rhs.view(), out.view());
+        REQUIRE(iom::oid_is_token(lhs_alias));
+        REQUIRE_EQ(queue.add_records().back().entries.count, 2);
+        queue.finish_add(token_sequence(lhs_alias));
+        const iom::oid rhs_alias =
+                queue.add(lhs.view(), out.view(), out.view());
+        REQUIRE(iom::oid_is_token(rhs_alias));
+        REQUIRE_EQ(queue.add_records().back().entries.count, 2);
+        queue.finish_add(token_sequence(rhs_alias));
+    }
+    {
+        FakeQueue queue(device);
+        FakeTensor lhs = make_tensor(device, {2, 17, 33});
+        FakeTensor rhs = make_tensor(device, {2, 17, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        rhs.use_storage_handle(lhs.view().native_handle());
+        out.use_storage_handle(lhs.view().native_handle());
+        const iom::oid token =
+                queue.add(lhs.view(), rhs.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_EQ(queue.add_records().back().entries.count, 3);
+        CHECK_EQ(queue.registered_at(lhs.view().native_handle()), 3);
+        queue.finish_add(token_sequence(token));
+        CHECK_EQ(queue.registered_at(lhs.view().native_handle()), 0);
+    }
+    {
+        FakeQueue queue(device);
+        FakeTensor lhs = make_tensor(device, {2, 17, 33});
+        FakeTensor rhs = make_tensor(device, {2, 17, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        queue.inject_add_failure(FakeQueue::AddFailure::post_acceptance);
+        const iom::oid token =
+                queue.add(lhs.view(), rhs.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        queue.finish_add(token_sequence(token));
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            CHECK_THROWS_WITH_AS(
+                    queue.wait(token), "fake ADD retained failure",
+                    std::runtime_error);
+        }
+        CHECK_EQ(queue.registered_at(lhs.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(rhs.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
+    }
+}
+
+TEST_CASE("ADD maps pre-acceptance failures without consuming a sequence") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    FakeTensor lhs = make_tensor(device, {2, 17, 33});
+    FakeTensor rhs = make_tensor(device, {2, 17, 33});
+    FakeTensor out = make_tensor(device, {2, 17, 33});
+    out.storage_ = 71;
+
+    const struct {
+        FakeQueue::AddFailure failure;
+        iom::OidError expected;
+    } failures[] = {
+            {FakeQueue::AddFailure::bad_alloc,
+             iom::OidError::ResourceExhausted},
+            {FakeQueue::AddFailure::runtime, iom::OidError::DeviceError},
+            {FakeQueue::AddFailure::internal, iom::OidError::InternalError},
+    };
+    for (const auto& failure : failures) {
+        queue.inject_add_failure(failure.failure);
+        CHECK_EQ(
+                queue.add(lhs.view(), rhs.view(), out.view()),
+                iom::to_oid(failure.expected));
+        CHECK(queue.add_records().empty());
+        CHECK(queue.submissions.empty());
+        CHECK_EQ(out.storage_, 71);
+        CHECK_EQ(queue.registered_at(lhs.view().native_handle()), 0);
+        CHECK_EQ(queue.registered_at(rhs.view().native_handle()), 0);
+        CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+    }
+    const iom::oid first = queue.add(lhs.view(), rhs.view(), out.view());
+    REQUIRE(iom::oid_is_token(first));
+    CHECK_EQ(token_sequence(first), 1);
+    queue.finish_add(1);
+
+    FakeQueue exhausted(device);
+    exhausted.seek_next_sequence(kMaxSequence + 1);
+    CHECK_EQ(
+            exhausted.add(lhs.view(), rhs.view(), out.view()),
+            iom::to_oid(iom::OidError::Overflow));
+    CHECK(exhausted.add_records().empty());
+    CHECK(exhausted.submissions.empty());
 }
 
 TEST_CASE("DeviceOps queue ids lease exclusively across threads and are reused after release") {
