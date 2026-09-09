@@ -538,7 +538,8 @@ inline void run_compute_capability_conformance(
         iom::Device& candidate,
         const std::span<const iom::DataType>,  // capability, not type-specific
         ConformanceObserver* observer = nullptr,
-        std::string_view backend_label = {}) {
+        std::string_view backend_label = {},
+        bool add_supported = false) {
     const iom::TensorSpec spec{iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     auto x = candidate.create_tensor(spec);
     auto y = candidate.create_tensor(spec);
@@ -556,7 +557,14 @@ inline void run_compute_capability_conformance(
     auto queue = candidate.create_ops();
     (void)backend_label;
     const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
-    CHECK_EQ(queue->add(x->view(), x->view(), y->view()), unsupported);
+    const iom::oid add_token =
+            queue->add(x->view(), x->view(), y->view());
+    if (add_supported) {
+        REQUIRE(iom::oid_is_token(add_token));
+        CHECK_NOTHROW(queue->wait(add_token));
+    } else {
+        CHECK_EQ(add_token, unsupported);
+    }
     CHECK_EQ(queue->mul(x->view(), x->view(), y->view()), unsupported);
     CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
     CHECK_EQ(queue->linear(x->view(), w->view(), y->view()), unsupported);
@@ -572,16 +580,24 @@ inline void run_compute_capability_conformance(
     iom::TensorView stepped_y = y->view().slice(0, 0, 1);
     const iom::TensorView merged_x =
             x->view().reshape_leading(span_of({2}));
-    CHECK_EQ(queue->silu(stepped_x, stepped_y), unsupported);
-    CHECK_EQ(queue->add(merged_x, x->view(), y->view()), unsupported);
+    const iom::oid transformed_add =
+            queue->add(merged_x, x->view(), y->view());
+    if (add_supported) {
+        REQUIRE(iom::oid_is_token(transformed_add));
+        CHECK_NOTHROW(queue->wait(transformed_add));
+    } else {
+        CHECK_EQ(transformed_add, unsupported);
+    }
 
 
-    // No output changed and no sequence was consumed.
-    require_logical_bytes(y->view(), y_pattern, "y after capability failures");
-    require_logical_bytes(
-            attn->view(), attn_pattern, "attn after capability failures");
+    if (!add_supported) {
+        // No output changed and no sequence was consumed.
+        require_logical_bytes(y->view(), y_pattern, "y after capability failures");
+        require_logical_bytes(
+                attn->view(), attn_pattern, "attn after capability failures");
+    }
     const iom::oid probe = queue->copy(x->view(), scratch->view());
-    CHECK_EQ(token_sequence(probe), 1);
+    CHECK_EQ(token_sequence(probe), add_supported ? 3 : 1);
     queue->wait(probe);
     queue.reset();
 
@@ -596,14 +612,15 @@ inline void run_backend_conformance(
         const ConformanceDevices& devices,
         const std::span<const iom::DataType> supported_types,
         ConformanceObserver* observer = nullptr,
-        AcceleratorStorageOracle* oracle = nullptr) {
+        AcceleratorStorageOracle* oracle = nullptr,
+        bool add_supported = false) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
     run_async_copy_conformance(devices, supported_types, observer, oracle);
     run_copy_error_conformance(devices, supported_types, observer);
     run_transfer_error_conformance(devices, supported_types, observer);
     run_lifetime_conformance(devices.candidate, supported_types, observer);
     run_compute_capability_conformance(
-            devices.candidate, supported_types, observer);
+            devices.candidate, supported_types, observer, {}, add_supported);
 }
 
 }  // namespace iom_conformance

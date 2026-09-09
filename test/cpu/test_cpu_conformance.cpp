@@ -261,11 +261,11 @@ TEST_CASE("CPU conformance: deferred queue lifetime and stability") {
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: compute methods reject capability without submitting") {
+TEST_CASE("CPU conformance: ADD is supported and other compute methods reject") {
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CPU");
+            &devices.gate, "CPU", true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -274,7 +274,7 @@ TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate);
+            &devices.gate, nullptr, true);
     CHECK_FALSE(devices.gate.armed());
 }
 

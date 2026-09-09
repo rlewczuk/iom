@@ -1357,10 +1357,8 @@ TEST_CASE("CPU copies move logical planes without touching padding") {
 }
 
 // ---------------------------------------------------------------------------
-// Unsupported compute capabilities
-// ---------------------------------------------------------------------------
-
-TEST_CASE("CPU compute operations reject capability without submitting") {
+// CPU supports ADD while retaining Unsupported for other unimplemented hooks.
+TEST_CASE("CPU supports ADD and rejects other compute capabilities") {
     RecordingAllocator allocator;
     auto device = iom::make_cpu_device(allocator);
     auto queue = device->create_ops();
@@ -1376,9 +1374,9 @@ TEST_CASE("CPU compute operations reject capability without submitting") {
     const std::vector<std::byte> y_untouched = snapshot_storage(*y);
     const std::vector<std::byte> attn_untouched = snapshot_storage(*attn);
 
-    CHECK_EQ(
-            queue->add(x->view(), x->view(), y->view()),
-            iom::to_oid(iom::OidError::Unsupported));
+    const iom::oid add_token = queue->add(x->view(), x->view(), y->view());
+    REQUIRE(iom::oid_is_token(add_token));
+    queue->wait(add_token);
     CHECK_EQ(
             queue->mul(x->view(), x->view(), y->view()),
             iom::to_oid(iom::OidError::Unsupported));
@@ -1396,11 +1394,10 @@ TEST_CASE("CPU compute operations reject capability without submitting") {
                         attn->view()),
             iom::to_oid(iom::OidError::Unsupported));
 
-    expect_storage_matches(*y, y_untouched);
     expect_storage_matches(*attn, attn_untouched);
 
-    // Capability failures consumed no sequence numbers.
+    // Only the accepted ADD consumed the first sequence number.
     const iom::oid probe = queue->copy(x->view(), y->view());
-    CHECK_EQ(token_sequence(probe), 1);
+    CHECK_EQ(token_sequence(probe), 2);
     queue->wait(probe);
 }

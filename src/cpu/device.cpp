@@ -1,7 +1,9 @@
 #include "iom/cpu/device.hpp"
 
+
+#include <algorithm>
 #include <cassert>
-#include <array>
+#include <exception>
 #include <cstdint>
 #include <mutex>
 #include <cstring>
@@ -12,9 +14,10 @@
 #include <vector>
 
 #include "iom/iom.hpp"
+#include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/detail/aligned_storage.hpp"
+#include "../shared/scalar_add.hpp"
 #include "../shared/standard_tiled_copy.hpp"
-
 namespace iom {
 
     namespace {
@@ -365,7 +368,6 @@ namespace iom {
         [[nodiscard]] BackendKind backend_kind() const noexcept override {
             return BackendKind::CPU;
         }
-
         [[nodiscard]] std::uint32_t backend_device() const noexcept override {
             return 0;
         }
@@ -373,13 +375,16 @@ namespace iom {
                 supported_data_types() const noexcept override {
             return detail::standard_supported_data_types();
         }
-
+        [[nodiscard]] detail::RegistryState& registry_state() noexcept {
+            return registry_state_;
+        }
         [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                 const TensorSpec& spec) override;
         [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override;
 
     private:
         Allocator& allocator_;
+        detail::RegistryState registry_state_;
     };
 
     /**
@@ -592,9 +597,15 @@ namespace iom {
     class CpuQueue final : public DeviceOps {
     public:
         explicit CpuQueue(CpuDevice& device)
-                : DeviceOps(device), device_(&device) {}
+                : DeviceOps(device),
+                  device_(&device),
+                  registry_queue_id_(
+                          detail::allocate_queue_id(device.registry_state())) {}
 
-        ~CpuQueue() override = default;
+        ~CpuQueue() override {
+            device_->registry_state().registry.invalidate_entries_for_queue(
+                    registry_queue_id_);
+        }
 
         oid copy_impl(const TensorView& source, TensorView& destination) override {
             std::lock_guard<std::mutex> submission_lock(
@@ -615,6 +626,133 @@ namespace iom {
         }
 
     private:
+        static detail::FenceResult fence_success(const detail::Fence&) noexcept {
+            return detail::FenceResult::success();
+        }
+
+        static std::uint64_t load_bits(
+                const unsigned char* base, std::size_t bit,
+                std::size_t width) noexcept {
+            std::uint64_t value = 0;
+            for (std::size_t i = 0; i < width; ++i) {
+                value |= static_cast<std::uint64_t>(
+                                 (base[(bit + i) / 8] >> ((bit + i) % 8)) & 1u)
+                        << i;
+            }
+            return value;
+        }
+
+        static void store_bits(
+                unsigned char* base, std::size_t bit, std::size_t width,
+                std::uint64_t value) noexcept {
+            for (std::size_t i = 0; i < width; ++i) {
+                const std::size_t position = bit + i;
+                const unsigned char mask =
+                        static_cast<unsigned char>(1u << (position % 8));
+                if ((value >> i) & 1u) {
+                    base[position / 8] |= mask;
+                } else {
+                    base[position / 8] &= static_cast<unsigned char>(~mask);
+                }
+            }
+        }
+
+        static std::size_t source_plane(
+                const DeviceOps::AddViewSnapshot& source,
+                std::span<const std::size_t> result_dimensions,
+                const std::array<std::size_t, 8>& coordinates) {
+            const auto dimensions = source.spec.shape.dimensions();
+            const std::size_t leading = result_dimensions.size() - 2;
+            const std::size_t source_leading = dimensions.size() - 2;
+            const std::size_t offset = leading - source_leading;
+            std::size_t plane = source.plane_offset;
+            for (std::size_t axis = 0; axis < leading; ++axis) {
+                if (axis < offset || source.logical_plane_strides[axis] == 0) {
+                    continue;
+                }
+                plane += coordinates[axis] * source.logical_plane_strides[axis];
+            }
+            return plane;
+        }
+
+        static void add_elements(const DeviceOps::AddRequest& request) {
+            const auto result_dimensions = request.result_shape.dimensions();
+            if (result_dimensions.size() > 8) {
+                throw std::invalid_argument("CPU ADD rank exceeds implementation limit");
+            }
+            const std::size_t rank = result_dimensions.size();
+            const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
+            auto* out_base = static_cast<unsigned char*>(
+                    request.out.native_handle);
+            const auto* lhs_base = static_cast<const unsigned char*>(
+                    request.lhs.native_handle);
+            const auto* rhs_base = static_cast<const unsigned char*>(
+                    request.rhs.native_handle);
+            std::array<std::size_t, 8> coordinates{};
+            const std::size_t count = request.result_shape.element_count();
+            for (std::size_t linear = 0; linear < count; ++linear) {
+                std::size_t remainder = linear;
+                for (std::size_t axis = rank; axis-- > 0;) {
+                    coordinates[axis] = remainder % result_dimensions[axis];
+                    remainder /= result_dimensions[axis];
+                }
+                const std::size_t row = coordinates[rank - 2];
+                const std::size_t column = coordinates[rank - 1];
+                const std::size_t lhs_plane =
+                        source_plane(request.lhs, result_dimensions, coordinates);
+                const std::size_t rhs_plane =
+                        source_plane(request.rhs, result_dimensions, coordinates);
+                const std::size_t out_plane =
+                        source_plane(request.out, result_dimensions, coordinates);
+                const std::size_t lhs_row =
+                        request.lhs.broadcast_rows ? 0 : row;
+                const std::size_t rhs_row =
+                        request.rhs.broadcast_rows ? 0 : row;
+                const std::size_t lhs_column =
+                        request.lhs.broadcast_columns ? 0 : column;
+                const std::size_t rhs_column =
+                        request.rhs.broadcast_columns ? 0 : column;
+                const std::size_t lhs_slot = detail::standard_plane_slot(
+                        request.lhs.spec, lhs_plane, lhs_row, lhs_column);
+                const std::size_t rhs_slot = detail::standard_plane_slot(
+                        request.rhs.spec, rhs_plane, rhs_row, rhs_column);
+                const std::size_t out_slot = detail::standard_plane_slot(
+                        request.out.spec, out_plane, row, column);
+                const std::uint64_t lhs_value =
+                        load_bits(lhs_base, lhs_slot * bits, bits);
+                const std::uint64_t rhs_value =
+                        load_bits(rhs_base, rhs_slot * bits, bits);
+                store_bits(
+                        out_base, out_slot * bits, bits,
+                        detail::scalar_add(
+                                request.out.spec.data_type,
+                                lhs_value, rhs_value));
+            }
+        }
+
+        oid add_impl(const AddRequest& request) override {
+            std::lock_guard<std::mutex> submission_lock(
+                    submission_order_mutex_);
+            detail::Fence fence;
+            fence.invoke = &fence_success;
+            return submit_add(
+                    request, device_->registry_state(), registry_queue_id_,
+                    fence,
+                    [this](std::uint64_t sequence,
+                           const AddRequest& captured,
+                           detail::AddEntryRegistration entries) {
+                        std::exception_ptr failure;
+                        try {
+                            add_elements(captured);
+                        } catch (...) {
+                            failure = std::current_exception();
+                        }
+                        (void)detail::release_or_invalidate_add_entries(
+                                device_->registry_state().registry, entries,
+                                static_cast<bool>(failure), !failure);
+                        complete(sequence, std::move(failure));
+                    });
+        }
 
         static void copy_elements(
                 const TensorView& source, TensorView& destination) {
@@ -681,6 +819,7 @@ namespace iom {
         }
 
         CpuDevice* device_;
+        detail::QueueId registry_queue_id_;
         std::mutex submission_order_mutex_;
     };
 
