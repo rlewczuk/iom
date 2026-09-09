@@ -435,7 +435,13 @@ TEST_CASE("SYCL pre-enqueue failures preserve submission sequences") {
     for (const auto fault : faults) {
         auto queue = devices.candidate->create_ops();
         iom::sycl_detail::inject_submission_fault_for_testing(fault);
-        CHECK_THROWS(queue->copy(source->view(), destination->view()));
+        const iom::oid result = queue->copy(
+                source->view(), destination->view());
+        const iom::OidError expected =
+                fault == iom::sycl_detail::SubmissionFault::first_submit
+                ? iom::OidError::DeviceError
+                : iom::OidError::ResourceExhausted;
+        CHECK_EQ(result, iom::to_oid(expected));
         iom::sycl_detail::inject_submission_fault_for_testing(
                 iom::sycl_detail::SubmissionFault::none);
         const iom::oid token = queue->copy(

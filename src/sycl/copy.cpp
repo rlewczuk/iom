@@ -410,7 +410,8 @@ public:
             detail::RegistryState& state)
             : DeviceOps(device),
               device_(&device),
-              registry_queue_id_(detail::allocate_queue_id(*state_)),
+              state_(&state),
+              registry_queue_id_(detail::allocate_queue_id(state)),
               queue_(
                       context, native_device,
                       sycl::property_list{
