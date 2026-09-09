@@ -11,10 +11,11 @@ namespace iom {
 
     /**
      * The one explicit TTNN supported-leaf-type table. create_tensor accepts
-     * exactly these DataType values with QuantizationFormat::NONE and rejects
-     * every other leaf type before native allocation. The span covers
-     * immutable storage; the table is never empty and always contains
-     * DataType::BF16.
+     * exactly BOOL and the 21 numeric DataType values below with
+     * QuantizationFormat::NONE. Unsupported quantization formats and F8_E8M0
+     * remain rejected. Non-native leaves use an internal UINT32 carrier while
+     * preserving the public standard-byte representation.
+     * The span covers immutable storage and always contains BF16.
      */
     [[nodiscard]] std::span<const DataType> ttnn_supported_data_types() noexcept;
 

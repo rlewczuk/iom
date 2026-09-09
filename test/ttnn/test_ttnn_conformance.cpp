@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../../src/ttnn/staging.hpp"
+#include "backend/backend_conformance_oracle.hpp"
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -173,29 +174,53 @@ std::vector<std::byte> padded_plane_image(
     const std::size_t padded_columns =
             static_cast<std::size_t>(plane.padded_shape()[-1]);
     const std::size_t bits = iom::detail::leaf_bits(owner.data_type);
-    REQUIRE_EQ(bits % 8, std::size_t{0});
-    const std::size_t element_bytes = bits / 8;
+    const std::size_t carrier_bytes =
+            plane.dtype() == tt::tt_metal::DataType::UINT8
+            ? 1
+            : (plane.dtype() == tt::tt_metal::DataType::UINT16
+                               || plane.dtype()
+                                          == tt::tt_metal::DataType::BFLOAT16
+                       ? 2
+                       : 4);
+    const std::size_t factor = bits > 32 ? 2 : 1;
     std::vector<std::byte> padded(
-            padded_rows * padded_columns * element_bytes, std::byte{0});
+            padded_rows * padded_columns * carrier_bytes, std::byte{0});
     for (std::size_t row = 0; row < rows; ++row) {
         for (std::size_t column = 0; column < columns; ++column) {
-            const std::size_t slot = iom::detail::standard_plane_slot(
+            const std::size_t slot = iom_conformance::canonical_plane_slot(
                     owner, plane_index, row, column);
-            std::memcpy(
-                    padded.data()
-                            + (row * padded_columns + column) * element_bytes,
-                    encoded.data() + slot * element_bytes, element_bytes);
-        }
+            std::uint64_t value = 0;
+            for (std::size_t bit = 0; bit < bits; ++bit) {
+                const std::size_t source_bit = slot * bits + bit;
+                if ((std::to_integer<unsigned char>(
+                            encoded[source_bit / 8])
+                     >> (source_bit % 8))
+                    & 1u) {
+                    value |= std::uint64_t{1} << bit;
+                }
+            }
+            for (std::size_t part = 0; part < factor; ++part) {
+                std::memcpy(
+                        padded.data()
+                                + (row * padded_columns + column * factor
+                                   + part)
+                                        * carrier_bytes,
+                        reinterpret_cast<const std::byte*>(&value)
+                                + part * carrier_bytes,
+                        carrier_bytes);
+            }
+    }
     }
     for (const auto& [row, column] : planted) {
         const bool planted_inside_logical =
-                row < rows && column < columns;
+                row < rows && column < columns * factor;
         REQUIRE_FALSE(planted_inside_logical);
         REQUIRE(row < padded_rows);
         REQUIRE(column < padded_columns);
         std::byte* cell =
-                padded.data() + (row * padded_columns + column) * element_bytes;
-        std::fill(cell, cell + element_bytes, kObserverStorageSentinel);
+                padded.data()
+                + (row * padded_columns + column) * carrier_bytes;
+        std::fill(cell, cell + carrier_bytes, kObserverStorageSentinel);
     }
     return padded;
 }
@@ -220,42 +245,57 @@ void write_padded_plane_image(
 // tile-major bytes; coordinates are mapped through the native tile geometry,
 // never by assuming the native and standard layouts agree, so native padding
 // writes and physical tile-slot permutations surface instead of being
-// normalized away. Returns whether every native-only cell is zero.
 bool observe_plane_storage(
         std::span<const std::byte> readback,
         const ttnn::Tensor& plane, const iom::TensorSpec& owner,
-        std::size_t plane_index, std::size_t element_bytes,
+        std::size_t plane_index, std::size_t carrier_bytes,
         std::vector<std::byte>& storage) {
     const TtnnPlaneLayout native(plane);
-    REQUIRE_EQ(
-            readback.size(),
-            native.padded_rows * native.padded_columns * element_bytes);
-    const iom::TensorShape padded_shape = owner.standard_padded_shape();
-    const std::span<const std::size_t> padded = padded_shape.dimensions();
-    const std::size_t padded_rows = padded[padded.size() - 2];
-    const std::size_t padded_columns = padded[padded.size() - 1];
+    REQUIRE_EQ(readback.size(),
+               native.padded_rows * native.padded_columns * carrier_bytes);
+    const std::span<const std::size_t> dimensions = owner.shape.dimensions();
+    const std::size_t bits = iom::detail::leaf_bits(owner.data_type);
+    const std::size_t rows = dimensions[dimensions.size() - 2];
+    const std::size_t columns = dimensions[dimensions.size() - 1];
+    const std::size_t factor = bits > 32 ? 2 : 1;
+    const std::size_t padded_rows =
+            iom_conformance::canonical_padded_extent(rows);
+    const std::size_t padded_columns =
+            iom_conformance::canonical_padded_extent(columns);
     bool native_padding_zero = true;
     for (std::size_t row = 0; row < native.padded_rows; ++row) {
         for (std::size_t column = 0; column < native.padded_columns;
              ++column) {
-            const std::size_t position = native.element_index(row, column);
-            const std::byte* cell =
-                    readback.data() + position * element_bytes;
-            if (row >= padded_rows || column >= padded_columns) {
+            const std::byte* cell = readback.data()
+                    + native.element_index(row, column) * carrier_bytes;
+            if (row >= padded_rows || column >= padded_columns * factor) {
                 native_padding_zero = native_padding_zero
                         && std::all_of(
-                                cell, cell + element_bytes,
+                                cell, cell + carrier_bytes,
                                 [](std::byte value) {
                                     return value == std::byte{0};
                                 });
             }
-            if (row < padded_rows && column < padded_columns) {
-                const std::size_t slot = iom::detail::standard_plane_slot(
-                        owner, plane_index, row, column);
-                std::memcpy(
-                        storage.data() + slot * element_bytes, cell,
-                        element_bytes);
+        }
+        if (row >= padded_rows) continue;
+        for (std::size_t logical_column = 0;
+             logical_column < padded_columns
+                    && logical_column * factor < native.padded_columns;
+             ++logical_column) {
+            std::uint64_t value = 0;
+            for (std::size_t part = 0; part < factor; ++part) {
+                const std::size_t column = logical_column * factor + part;
+                if (column >= native.padded_columns) continue;
+                const std::byte* cell = readback.data()
+                        + native.element_index(row, column) * carrier_bytes;
+                std::uint32_t carrier = 0;
+                std::memcpy(&carrier, cell, carrier_bytes);
+                value |= std::uint64_t{carrier} << (part * 32);
             }
+            const std::size_t slot = iom_conformance::canonical_plane_slot(
+                    owner, plane_index, row, logical_column);
+            iom_conformance::write_storage_bits(
+                    storage.data(), slot * bits, bits, value);
         }
     }
     return native_padding_zero;
@@ -314,9 +354,14 @@ public:
         }
         const auto* planes =
                 static_cast<const ttnn::Tensor*>(view.native_handle());
-        const std::size_t bits = iom::detail::leaf_bits(owner.data_type);
-        REQUIRE_EQ(bits % 8, std::size_t{0});
-        const std::size_t element_bytes = bits / 8;
+        const std::size_t carrier_bytes =
+                planes[0].dtype() == tt::tt_metal::DataType::UINT8
+                ? 1
+                : (planes[0].dtype() == tt::tt_metal::DataType::UINT16
+                                   || planes[0].dtype()
+                                              == tt::tt_metal::DataType::BFLOAT16
+                           ? 2
+                           : 4);
 
         // Raw physical readback of every owner plane. copy_to_host returns
         // the complete native padded allocation in tile-major order — the
@@ -330,7 +375,7 @@ public:
         for (std::size_t i = 0; i < planes_count; ++i) {
             const TtnnPlaneLayout native(planes[i]);
             plane_bytes[i] =
-                    native.padded_rows * native.padded_columns * element_bytes;
+                    native.padded_rows * native.padded_columns * carrier_bytes;
             staging_bytes += plane_bytes[i];
         }
         std::unique_ptr<std::byte[]> staging =
@@ -351,8 +396,7 @@ public:
                     observe_plane_storage(
                             std::span<const std::byte>(
                                     staging.get() + offset, plane_bytes[i]),
-                            planes[i], owner, i, element_bytes, storage)
-                    && native_padding_zero_;
+                            planes[i], owner, i, carrier_bytes, storage);
             offset += plane_bytes[i];
         }
         return storage;
@@ -394,9 +438,8 @@ TEST_CASE("TTNN download retirement preserves slot ownership") {
     reclaimed.release();
 }
 
-// The supported-type table is explicit, nonempty, includes BF16, and is the
-// single source for both creation validation and conformance
-// parameterization. Every other declared leaf type and every grouped
+// The supported-type table is explicit and contains BOOL plus every required
+// numeric NONE leaf. Every other declared leaf type and every grouped
 // quantization format is rejected before native allocation.
 TEST_CASE("TTNN supported-type table acceptance and rejection") {
     require_hardware();
@@ -445,7 +488,7 @@ TEST_CASE("TTNN supported-type table acceptance and rejection") {
         CHECK_THROWS_AS(device->create_tensor(spec), std::runtime_error);
     }
 }
-TEST_CASE("Device::supported_data_types returns the per-backend 9-entry span") {
+TEST_CASE("Device::supported_data_types returns the canonical TTNN span") {
     require_hardware();
     const std::unique_ptr<iom::Device> candidate =
             iom::make_ttnn_device(0);
@@ -454,9 +497,18 @@ TEST_CASE("Device::supported_data_types returns the per-backend 9-entry span") {
     const std::span<const iom::DataType> canonical =
             iom::ttnn_supported_data_types();
     constexpr iom::DataType expected[] = {
-            iom::DataType::BOOL, iom::DataType::U8, iom::DataType::I8,
-            iom::DataType::U16, iom::DataType::I16, iom::DataType::U32,
-            iom::DataType::I32, iom::DataType::BF16, iom::DataType::F32,
+            iom::DataType::BOOL,
+            iom::DataType::I2, iom::DataType::U2,
+            iom::DataType::I4, iom::DataType::U4,
+            iom::DataType::I8, iom::DataType::U8,
+            iom::DataType::I16, iom::DataType::U16,
+            iom::DataType::I32, iom::DataType::U32,
+            iom::DataType::I64, iom::DataType::U64,
+            iom::DataType::F4_E2M1,
+            iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+            iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+            iom::DataType::F16, iom::DataType::BF16,
+            iom::DataType::F32, iom::DataType::F64,
     };
     REQUIRE_EQ(supported.size(), sizeof(expected) / sizeof(expected[0]));
     for (std::size_t i = 0; i < supported.size(); ++i) {

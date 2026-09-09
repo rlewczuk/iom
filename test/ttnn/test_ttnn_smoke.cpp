@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-
+#include <vector>
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
@@ -23,12 +23,20 @@ TEST_CASE("TTNN factory reports a live hardware device and owns its context") {
         CHECK(device->backend_kind() == iom::BackendKind::TTNN);
         CHECK(device->backend_device() == 0);
 
-        // An unsupported leaf type is rejected before native allocation.
-        CHECK_THROWS_AS(
-                device->create_tensor(
-                        iom::TensorSpec{
-                                iom::TensorShape{{16, 16}}, iom::DataType::F64}),
-                std::runtime_error);
+        // F64 uses the internal TTNN carrier and must be a usable storage
+        // capability rather than an advertise-only table entry.
+        auto f64 = device->create_tensor(
+                iom::TensorSpec{
+                        iom::TensorShape{{16, 16}}, iom::DataType::F64});
+        REQUIRE(f64 != nullptr);
+        std::vector<std::byte> f64_source(f64->view().spec().logical_nbytes());
+        for (std::size_t i = 0; i < f64_source.size(); ++i) {
+            f64_source[i] = std::byte{static_cast<unsigned char>(i * 17)};
+        }
+        f64->view().copy_from_host(f64_source);
+        std::vector<std::byte> f64_round_trip(f64_source.size());
+        f64->view().copy_to_host(f64_round_trip);
+        CHECK(f64_round_trip == f64_source);
 
         // Supported storage and a queue are now live capabilities.
         {

@@ -104,26 +104,34 @@ namespace iom {
 #endif
 
 
-        // The one explicit TTNN supported-type table: every leaf type whose
-        // host encoding TTNN tiled storage reproduces bit-for-bit. Signed
-        // 8/16-bit integers ride the unsigned tiles of the same width
-        // (two's-complement fields are bit-identical); BOOL rides UINT8 with
-        // canonical zero/one bytes validated by the common TensorView base.
+        // Native TTNN dtypes are used where they preserve the leaf width.
+        // Other NONE leaves use a UINT32 carrier; 64-bit leaves occupy two
+        // adjacent carrier columns per logical element. This keeps one stable
+        // TTNN-owned plane per leading allocation while conversion remains an
+        // internal detail of the transfer path.
         constexpr auto kSupportedToNative = std::array{
-                std::pair{
-                        DataType::BOOL, tt::tt_metal::DataType::UINT8},
-                std::pair{DataType::U8, tt::tt_metal::DataType::UINT8},
+                std::pair{DataType::BOOL, tt::tt_metal::DataType::UINT8},
+                std::pair{DataType::I2, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::U2, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::I4, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::U4, tt::tt_metal::DataType::UINT32},
                 std::pair{DataType::I8, tt::tt_metal::DataType::UINT8},
-                std::pair{
-                        DataType::U16, tt::tt_metal::DataType::UINT16},
-                std::pair{
-                        DataType::I16, tt::tt_metal::DataType::UINT16},
+                std::pair{DataType::U8, tt::tt_metal::DataType::UINT8},
+                std::pair{DataType::I16, tt::tt_metal::DataType::UINT16},
+                std::pair{DataType::U16, tt::tt_metal::DataType::UINT16},
+                std::pair{DataType::I32, tt::tt_metal::DataType::UINT32},
                 std::pair{DataType::U32, tt::tt_metal::DataType::UINT32},
-                std::pair{DataType::I32, tt::tt_metal::DataType::INT32},
-                std::pair{
-                        DataType::BF16,
-                        tt::tt_metal::DataType::BFLOAT16},
+                std::pair{DataType::I64, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::U64, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::F4_E2M1, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::F6_E2M3, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::F6_E3M2, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::F8_E4M3FN, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::F8_E5M2, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::F16, tt::tt_metal::DataType::UINT32},
+                std::pair{DataType::BF16, tt::tt_metal::DataType::BFLOAT16},
                 std::pair{DataType::F32, tt::tt_metal::DataType::FLOAT32},
+                std::pair{DataType::F64, tt::tt_metal::DataType::UINT32},
         };
 
         constexpr auto kSupportedKeys = [] {
@@ -156,7 +164,12 @@ namespace iom {
                    != supported.end();
         }
 
-        // Native tile dtype carrying the leaf encoding bit-for-bit.
+        [[nodiscard]] std::size_t carrier_factor(DataType type) {
+            return detail::leaf_bits(type) > 32 ? 2 : 1;
+        }
+
+        // Native tile dtype carrying the leaf encoding or its internal
+        // carrier. UINT32 is intentionally used for all non-native widths.
         [[nodiscard]] tt::tt_metal::DataType native_dtype(DataType type) {
             for (const auto& [supported_type, native_type] :
                  kSupportedToNative) {
@@ -301,6 +314,43 @@ namespace iom {
                 const std::span<const std::size_t> dimensions =
                         spec.shape.dimensions();
                 const std::size_t plane_count = checked_plane_count(spec);
+                std::size_t native_columns =
+                        dimensions[dimensions.size() - 1];
+                const std::size_t factor = carrier_factor(spec.data_type);
+                if (native_columns != 0
+                        && native_columns
+                                > std::numeric_limits<std::size_t>::max()
+                                        / factor) {
+                    throw std::overflow_error(
+                            "TTNN carrier column count overflows");
+                }
+                native_columns *= factor;
+                static_cast<void>(checked_to_uint32(
+                        native_columns, dimensions.size() - 1));
+                const std::size_t native_rows =
+                        (dimensions[dimensions.size() - 2] + 31) / 32 * 32;
+                const std::size_t native_padded_columns =
+                        (native_columns + 31) / 32 * 32;
+                const std::size_t native_bytes =
+                        native_dtype(spec.data_type)
+                                == tt::tt_metal::DataType::UINT8
+                        ? 1
+                        : native_dtype(spec.data_type)
+                                        == tt::tt_metal::DataType::UINT16
+                                || native_dtype(spec.data_type)
+                                           == tt::tt_metal::DataType::BFLOAT16
+                            ? 2
+                            : 4;
+                constexpr std::size_t kMaxNativePlaneBytes =
+                        std::size_t{1} << 30;
+                if (native_rows != 0 && native_padded_columns != 0
+                        && native_rows
+                                > kMaxNativePlaneBytes
+                                        / native_padded_columns
+                        || native_rows * native_padded_columns
+                                > kMaxNativePlaneBytes / native_bytes) {
+                    throw std::bad_alloc();
+                }
                 const tt::tt_metal::TensorSpec plane_spec(
                         tt::tt_metal::Shape{
                                 1u,
@@ -308,7 +358,7 @@ namespace iom {
                                         dimensions[dimensions.size() - 2],
                                         dimensions.size() - 2),
                                 checked_to_uint32(
-                                        dimensions[dimensions.size() - 1],
+                                        native_columns,
                                         dimensions.size() - 1)},
                         tt::tt_metal::TensorLayout(
                                 native_dtype(spec.data_type),

@@ -111,19 +111,22 @@ namespace iom::ttnn_detail {
             return plane;
         }
 
-        // Every supported leaf type is byte-aligned, so one logical element
-        // is one whole number of bytes.
+        // Native staging uses whole carrier cells; public logical encodings
+        // may be packed and are converted by the transfer helpers below.
         std::size_t element_bytes(DataType type) {
             const std::size_t bits = detail::leaf_bits(type);
-            if (bits % 8 != 0) {
-                throw std::logic_error(
-                        "TTNN supported type is not byte-aligned");
-            }
-            return bits / 8;
+            return (bits + 7) / 8;
         }
 
-        // Maps a supported native dtype to its retained upload staging slot
-        // list in TtnnHostStaging, mirroring the upload_typed dispatch below.
+        std::size_t carrier_bytes(tt::tt_metal::DataType type) {
+            switch (type) {
+                case tt::tt_metal::DataType::UINT8: return 1;
+                case tt::tt_metal::DataType::UINT16:
+                case tt::tt_metal::DataType::BFLOAT16: return 2;
+                default: return 4;
+            }
+        }
+
         std::size_t upload_slot_index(tt::tt_metal::DataType type) {
             switch (type) {
                 case tt::tt_metal::DataType::BFLOAT16: return 0;
@@ -152,17 +155,22 @@ namespace iom::ttnn_detail {
                     + (row % 16) * 16 + (column % 16);
         }
 
-        // Uploads one plane's logical row-major bytes into the plane's
-        // TTNN-native tiled tensor, zero-filling native padding. The buffer
-        // is the caller-held retained staging slot: only the padding cells
-        // the logical fill will not write are zero-initialized, and the
-        // borrowed typed host tensor always reads the slot in place.
+        // Uploads logical standard bytes into a native or UINT32 carrier
+        // plane. Sub-byte values are unpacked from the logical bitstream and
+        // 64-bit values occupy two little-endian carrier cells.
         void upload_plane(
                 ttnn::Tensor& plane,
                 TtnnHostStaging::UploadLease& lease,
                 const std::byte* source, std::size_t rows,
-                std::size_t columns, std::size_t element_size,
-                std::size_t plane_index) {
+                std::size_t columns, std::size_t bits,
+                std::size_t source_bit_base, std::size_t plane_index) {
+            const std::size_t carrier_bytes =
+                    plane.dtype() == tt::tt_metal::DataType::UINT8 ? 1
+                    : plane.dtype() == tt::tt_metal::DataType::UINT16 ? 2
+                    : plane.dtype() == tt::tt_metal::DataType::BFLOAT16 ? 2
+                    : plane.dtype() == tt::tt_metal::DataType::FLOAT32 ? 4
+                    : 4;
+            const std::size_t factor = bits > 32 ? 2 : 1;
             const std::size_t padded_rows =
                     static_cast<std::size_t>(plane.padded_shape()[-2]);
             const std::size_t padded_columns =
@@ -170,46 +178,36 @@ namespace iom::ttnn_detail {
             const std::size_t num_tile_cols = padded_columns / 32;
             const std::size_t padded_elements = padded_rows * padded_columns;
             std::byte* buffer = lease.data();
-
-            // Initialize only the required padding: the padded cells the
-            // logical fill below will not write. All logical cells are
-            // overwritten element-for-element, so padding is the retained
-            // buffer's only obligation to zero.
-            for (std::size_t row = rows; row < padded_rows; ++row) {
-                for (std::size_t column = 0; column < padded_columns;
-                     ++column) {
-                    std::memset(
-                            buffer
-                                    + padded_cell_index(
-                                              row, column, num_tile_cols)
-                                            * element_size,
-                            0, element_size);
+            std::memset(buffer, 0, padded_elements * carrier_bytes);
+            const auto value_at = [&](std::size_t index) {
+                std::uint64_t value = 0;
+                for (std::size_t bit = 0; bit < bits; ++bit) {
+                    const std::size_t source_bit =
+                            source_bit_base + index * bits + bit;
+                    if ((std::to_integer<unsigned char>(
+                                source[source_bit / 8])
+                         >> (source_bit % 8))
+                        & 1u) {
+                        value |= std::uint64_t{1} << bit;
+                    }
                 }
-            }
+                return value;
+            };
             for (std::size_t row = 0; row < rows; ++row) {
-                for (std::size_t column = columns; column < padded_columns;
-                     ++column) {
-                    std::memset(
-                            buffer
-                                    + padded_cell_index(
-                                              row, column, num_tile_cols)
-                                            * element_size,
-                            0, element_size);
-                }
-            }
-
-            for (std::size_t row = 0; row < rows; ++row) {
-                std::size_t col = 0;
-                while (col < columns) {
-                    const std::size_t seg_columns = std::min<std::size_t>(
-                            16 - (col % 16), columns - col);
-                    const std::size_t first_element_index =
-                            padded_cell_index(row, col, num_tile_cols);
-                    std::memcpy(
-                            buffer + first_element_index * element_size,
-                            source + (row * columns + col) * element_size,
-                            seg_columns * element_size);
-                    col += seg_columns;
+                for (std::size_t column = 0; column < columns; ++column) {
+                    const std::uint64_t value =
+                            value_at(row * columns + column);
+                    for (std::size_t part = 0; part < factor; ++part) {
+                        const std::size_t native_column =
+                                column * factor + part;
+                        const std::size_t index = padded_cell_index(
+                                row, native_column, num_tile_cols);
+                        std::memcpy(
+                                buffer + index * carrier_bytes,
+                                reinterpret_cast<const std::byte*>(&value)
+                                        + part * carrier_bytes,
+                                carrier_bytes);
+                    }
                 }
             }
 
@@ -228,26 +226,17 @@ namespace iom::ttnn_detail {
 #endif
                 ttnn::copy_to_device(host_tiled, plane);
             };
-
             switch (plane.dtype()) {
                 case tt::tt_metal::DataType::BFLOAT16:
-                    upload_typed.template operator()<bfloat16>();
-                    break;
+                    upload_typed.template operator()<bfloat16>(); break;
                 case tt::tt_metal::DataType::FLOAT32:
-                    upload_typed.template operator()<float>();
-                    break;
+                    upload_typed.template operator()<float>(); break;
                 case tt::tt_metal::DataType::UINT32:
-                    upload_typed.template operator()<std::uint32_t>();
-                    break;
-                case tt::tt_metal::DataType::INT32:
-                    upload_typed.template operator()<std::int32_t>();
-                    break;
+                    upload_typed.template operator()<std::uint32_t>(); break;
                 case tt::tt_metal::DataType::UINT16:
-                    upload_typed.template operator()<std::uint16_t>();
-                    break;
+                    upload_typed.template operator()<std::uint16_t>(); break;
                 case tt::tt_metal::DataType::UINT8:
-                    upload_typed.template operator()<std::uint8_t>();
-                    break;
+                    upload_typed.template operator()<std::uint8_t>(); break;
                 default:
                     throw std::logic_error(
                             "TTNN native dtype has no host element type");
@@ -267,24 +256,34 @@ namespace iom::ttnn_detail {
                     queue, plane, staging, std::nullopt, /*blocking=*/false);
         }
 
-        // Assembles one completed padded tile-major staging window into the
-        // logical row-major destination. Native padding never reaches it.
         void assemble_download_plane(
                 const std::byte* staging, std::byte* destination,
-                std::size_t rows, std::size_t columns,
-                std::size_t element_size, std::size_t num_tile_cols) {
+                std::size_t rows, std::size_t columns, std::size_t bits,
+                std::size_t carrier_size, std::size_t factor,
+                std::size_t destination_bit_base,
+                std::size_t num_tile_cols) {
             for (std::size_t row = 0; row < rows; ++row) {
-                std::size_t col = 0;
-                while (col < columns) {
-                    const std::size_t seg_columns = std::min<std::size_t>(
-                            16 - (col % 16), columns - col);
-                    const std::size_t first_element_index =
-                            padded_cell_index(row, col, num_tile_cols);
-                    std::memcpy(
-                            destination + (row * columns + col) * element_size,
-                            staging + first_element_index * element_size,
-                            seg_columns * element_size);
-                    col += seg_columns;
+                for (std::size_t column = 0; column < columns; ++column) {
+                    std::uint64_t value = 0;
+                    for (std::size_t part = 0; part < factor; ++part) {
+                        const std::size_t index = padded_cell_index(
+                                row, column * factor + part, num_tile_cols);
+                        std::uint32_t carrier = 0;
+                        std::memcpy(&carrier,
+                                    staging + index * carrier_size,
+                                    carrier_size);
+                        value |= std::uint64_t{carrier} << (part * 32);
+                    }
+                    const std::size_t element = row * columns + column;
+                    for (std::size_t bit = 0; bit < bits; ++bit) {
+                        if ((value >> bit) & 1u) {
+                            const std::size_t output_bit =
+                                    destination_bit_base + element * bits + bit;
+                            destination[output_bit / 8] |=
+                                    std::byte{static_cast<unsigned char>(
+                                            1u << (output_bit % 8))};
+                        }
+                    }
                 }
             }
         }
@@ -298,7 +297,6 @@ namespace iom::ttnn_detail {
             return view.spec().shape.dimension(
                     view.spec().shape.rank() - 1);
         }
-
     }  // namespace
 
     void region_from_host(
@@ -307,68 +305,52 @@ namespace iom::ttnn_detail {
             ttnn::Tensor* planes, std::span<const std::byte> source) {
         const std::size_t rows = view_rows(destination);
         const std::size_t columns = view_columns(destination);
-        const std::size_t element_size =
-                element_bytes(destination.spec().data_type);
-        const std::size_t plane_bytes = rows * columns * element_size;
+        const std::size_t bits =
+                detail::leaf_bits(destination.spec().data_type);
+        const std::size_t plane_bytes = (rows * columns * bits + 7) / 8;
         const std::size_t count = view_plane_count(destination);
-
-        // Each lease remains owned until the queue proves completion. A
-        // submission exception is conservatively treated as possibly in
-        // flight, even when the vendor call throws before returning.
+        const ttnn::Tensor& first = planes[owner_plane_at(destination, 0)];
+        const std::size_t carrier_size = carrier_bytes(first.dtype());
+        const std::size_t padded_rows =
+                static_cast<std::size_t>(first.padded_shape()[-2]);
+        const std::size_t padded_columns =
+                static_cast<std::size_t>(first.padded_shape()[-1]);
+        const std::size_t staging_bytes =
+                padded_rows * padded_columns * carrier_size;
         std::vector<TtnnHostStaging::UploadLease> leases;
         leases.reserve(count);
-        if (count != 0) {
-            const ttnn::Tensor& first_plane =
-                    planes[owner_plane_at(destination, 0)];
-            const std::size_t padded_rows = static_cast<std::size_t>(
-                    first_plane.padded_shape()[-2]);
-            const std::size_t padded_columns = static_cast<std::size_t>(
-                    first_plane.padded_shape()[-1]);
-            const std::size_t slot = upload_slot_index(first_plane.dtype());
-            for (std::size_t index = 0; index < count; ++index) {
-                leases.emplace_back(staging.acquire_upload(
-                        slot, padded_rows * padded_columns * element_size));
-            }
+        for (std::size_t index = 0; index < count; ++index) {
+            leases.emplace_back(staging.acquire_upload(
+                    upload_slot_index(first.dtype()), staging_bytes));
         }
-
         std::size_t submitted = 0;
-        bool submissions_complete = false;
+        bool complete = false;
         try {
             for (std::size_t index = 0; index < count; ++index) {
                 ++submitted;
-                upload_plane(
-                        planes[owner_plane_at(destination, index)],
-                        leases[index], source.data() + index * plane_bytes,
-                        rows, columns, element_size, index);
+                upload_plane(planes[owner_plane_at(destination, index)],
+                             leases[index], source.data(), rows, columns, bits,
+                             index * rows * columns * bits, index);
             }
-            submissions_complete = true;
+            complete = true;
             device.mesh_command_queue(0).finish();
-            for (TtnnHostStaging::UploadLease& lease : leases) {
-                lease.release();
-            }
+            for (auto& lease : leases) lease.release();
             staging.reclaim_retired_uploads();
         } catch (...) {
-            const std::exception_ptr original_failure =
-                    std::current_exception();
+            const std::exception_ptr failure = std::current_exception();
             bool drained = false;
-            if (submitted != 0 && !submissions_complete) {
+            if (submitted != 0 && !complete) {
                 try {
                     device.mesh_command_queue(0).finish();
                     drained = true;
                 } catch (...) {
                 }
             }
-            for (TtnnHostStaging::UploadLease& lease : leases) {
-                if (drained) {
-                    lease.release();
-                } else {
-                    lease.retire();
-                }
+            for (auto& lease : leases) {
+                if (drained) lease.release(); else lease.retire();
             }
-            if (drained) {
-                staging.reclaim_retired_uploads();
-            }
-            std::rethrow_exception(original_failure);
+            if (drained) staging.reclaim_retired_uploads();
+            std::rethrow_exception(failure);
         }
     }
 
@@ -378,52 +360,27 @@ namespace iom::ttnn_detail {
             const ttnn::Tensor* planes, std::span<std::byte> destination) {
         const std::size_t rows = view_rows(source);
         const std::size_t columns = view_columns(source);
-        const std::size_t element_size =
-                element_bytes(source.spec().data_type);
-        const std::size_t plane_bytes = rows * columns * element_size;
+        const std::size_t bits = detail::leaf_bits(source.spec().data_type);
+        const std::size_t plane_bytes = (rows * columns * bits + 7) / 8;
         const std::size_t count = view_plane_count(source);
-        const ttnn::Tensor& first_plane =
-                planes[owner_plane_at(source, 0)];
-        const std::size_t padded_rows = static_cast<std::size_t>(
-                first_plane.padded_shape()[-2]);
-        const std::size_t padded_columns = static_cast<std::size_t>(
-                first_plane.padded_shape()[-1]);
-        if (padded_rows != 0
-                && padded_columns
-                        > std::numeric_limits<std::size_t>::max()
-                                / padded_rows) {
-            throw std::overflow_error(
-                    "TTNN padded plane element count overflows");
-        }
-        const std::size_t padded_elements = padded_rows * padded_columns;
-        if (padded_elements != 0
-                && element_size
-                        > std::numeric_limits<std::size_t>::max()
-                                / padded_elements) {
-            throw std::overflow_error("TTNN padded plane byte count overflows");
-        }
+        const ttnn::Tensor& first = planes[owner_plane_at(source, 0)];
+        const std::size_t carrier_size = carrier_bytes(first.dtype());
+        const std::size_t padded_rows =
+                static_cast<std::size_t>(first.padded_shape()[-2]);
+        const std::size_t padded_columns =
+                static_cast<std::size_t>(first.padded_shape()[-1]);
         const std::size_t padded_plane_bytes =
-                padded_elements * element_size;
-        if (padded_plane_bytes != 0
-                && count
-                        > std::numeric_limits<std::size_t>::max()
-                                / padded_plane_bytes) {
-            throw std::overflow_error(
-                    "TTNN download staging byte count overflows");
-        }
-        // A retired slot still protects bytes referenced by an earlier
-        // transfer. Prove completion before reclaiming it for new work.
+                padded_rows * padded_columns * carrier_size;
         auto& queue = device.mesh_command_queue(0);
         if (staging.download_retired()) {
             queue.finish();
             staging.reclaim_download();
         }
-        // The retained byte staging buffer covers every padded plane of the
-        // region and is returned only after the single finish below.
-        const std::size_t total_bytes = count * padded_plane_bytes;
+        std::memset(
+                destination.data(), 0,
+                (count * rows * columns * bits + 7) / 8);
         TtnnHostStaging::DownloadLease lease =
-                staging.acquire_download(total_bytes);
-        std::exception_ptr original_failure;
+                staging.acquire_download(count * padded_plane_bytes);
         try {
             for (std::size_t index = 0; index < count; ++index) {
                 submit_download_plane(
@@ -431,37 +388,25 @@ namespace iom::ttnn_detail {
                         lease.data() + index * padded_plane_bytes, index);
             }
             queue.finish();
-
+            const std::size_t factor = bits > 32 ? 2 : 1;
             const std::size_t num_tile_cols = padded_columns / 32;
             for (std::size_t index = 0; index < count; ++index) {
                 assemble_download_plane(
                         lease.data() + index * padded_plane_bytes,
-                        destination.data() + index * plane_bytes, rows,
-                        columns, element_size, num_tile_cols);
+                        destination.data(), rows, columns, bits, carrier_size,
+                        factor, index * rows * columns * bits, num_tile_cols);
             }
             lease.release();
         } catch (...) {
-            if (!original_failure) {
-                original_failure = std::current_exception();
-            }
+            const std::exception_ptr failure = std::current_exception();
             bool drained = false;
             try {
                 queue.finish();
                 drained = true;
             } catch (...) {
             }
-            if (drained) {
-                // Every submitted plane reached the host staging; the
-                // faulted plane may hold partial bytes, so discard the
-                // storage instead of handing it out again.
-                lease.discard();
-            } else {
-                // The mesh cannot be drained: an asynchronous reader may
-                // still touch the staging, so it is retired — never reused
-                // and freed only when the device is torn down.
-                lease.retire();
-            }
-            std::rethrow_exception(original_failure);
+            if (drained) lease.discard(); else lease.retire();
+            std::rethrow_exception(failure);
         }
     }
 
@@ -475,13 +420,11 @@ namespace iom::ttnn_detail {
 #ifdef IOM_ENABLE_TESTING
             fail_copy_planes_submission_at(index);
 #endif
-            ttnn::copy(
-                    source_planes[owner_plane_at(source, index)],
-                    destination_planes[owner_plane_at(destination, index)]);
+            ttnn::copy(source_planes[owner_plane_at(source, index)],
+                       destination_planes[owner_plane_at(destination, index)]);
             any_submitted = true;
         }
     }
-
 }  // namespace iom::ttnn_detail
 
 #ifdef IOM_ENABLE_TESTING
