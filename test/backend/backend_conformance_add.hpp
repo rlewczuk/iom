@@ -79,7 +79,19 @@ inline std::uint64_t add(iom::DataType t, std::uint64_t a, std::uint64_t b) noex
             if (std::isnan(x) || std::isnan(y) ||
                 (std::isinf(x) && std::isinf(y) && std::signbit(x) != std::signbit(y)))
                 return round_encode(std::numeric_limits<long double>::quiet_NaN(), s);
-            return round_encode(x + y, s);
+            const long double sum = x + y;
+            // The device's F64 path overflows to infinity; narrower formats
+            // retain the established saturation contract.
+            if (s.e == 11 && s.inf && std::isfinite(sum)) {
+                const auto em = (std::uint64_t{1} << s.e) - 1;
+                const auto fm = (std::uint64_t{1} << s.f) - 1;
+                const auto max_raw = ((em - 1) << s.f) | fm;
+                const long double max_value = value(max_raw, s);
+                if (std::fabs(sum) > max_value)
+                    return round_encode(
+                            std::copysign(std::numeric_limits<long double>::infinity(), sum), s);
+            }
+            return round_encode(sum, s);
         }
     }
     return (a + b) & (w == 64 ? ~std::uint64_t{} : (std::uint64_t{1} << w) - 1);

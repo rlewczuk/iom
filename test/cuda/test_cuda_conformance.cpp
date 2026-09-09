@@ -328,6 +328,13 @@ TEST_CASE("CUDA ADD accepts every low-width leaf against the oracle") {
     CHECK_FALSE(devices.gate.armed());
 }
 
+TEST_CASE("CUDA ADD wide dtypes and boundary values against the oracle") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_gpu_add_wide_conformance(*devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("CUDA ADD broadcast, transform, tail, and exact alias mapping") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;

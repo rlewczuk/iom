@@ -480,6 +480,14 @@ TEST_CASE("ROCm ADD accepts every low-width leaf against the oracle") {
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm ADD wide dtypes and boundary values against the oracle") {
+    iom_conformance::TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto candidate = iom::make_rocm_device(0, allocator);
+    iom_conformance::run_gpu_add_wide_conformance(*candidate);
+    CHECK_FALSE(gate.armed());
+}
+
 TEST_CASE("ROCm ADD broadcast, transform, tail, and exact alias mapping") {
     iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
