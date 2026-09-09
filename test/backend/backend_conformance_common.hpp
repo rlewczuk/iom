@@ -34,6 +34,35 @@
 #include "iom/tensor.hpp"
 
 namespace iom_conformance {
+// Independent test policy for the standard 23-leaf capability contract. Keep
+// this literal oracle separate from every production capability declaration
+// so narrowing, reordering, or other drift remains observable in conformance
+// tests.
+inline constexpr std::array<iom::DataType, 23> kStandardCapabilityOracle = {
+        iom::DataType::BOOL,
+        iom::DataType::I2, iom::DataType::U2,
+        iom::DataType::I4, iom::DataType::U4,
+        iom::DataType::I8, iom::DataType::U8,
+        iom::DataType::I16, iom::DataType::U16,
+        iom::DataType::I32, iom::DataType::U32,
+        iom::DataType::I64, iom::DataType::U64,
+        iom::DataType::F4_E2M1,
+        iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+        iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+        iom::DataType::F8_E8M0,
+        iom::DataType::F16, iom::DataType::BF16,
+        iom::DataType::F32, iom::DataType::F64,
+};
+
+inline void require_standard_capabilities(
+        std::span<const iom::DataType> supported) {
+    REQUIRE_EQ(supported.size(), kStandardCapabilityOracle.size());
+    for (std::size_t i = 0;
+         i < supported.size() && i < kStandardCapabilityOracle.size(); ++i) {
+        CHECK_EQ(supported[i], kStandardCapabilityOracle[i]);
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Independent host-encoding model. The bit writer follows the host encoding
