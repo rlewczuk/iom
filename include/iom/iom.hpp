@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "oid.hpp"
+
 #include "tensor.hpp"
 
 namespace iom {
@@ -197,19 +199,20 @@ namespace iom {
 
     }  // namespace detail
 
-    typedef uint64_t oid;
 
     /**
      * One in-order asynchronous operation queue over caller-created tensor
-     * views. The common base leases one process-unique queue id in
-     * [1, 255] at construction and releases it at destruction, allocates a
-     * monotonic 56-bit submission sequence for every successfully queued
-     * operation, validates wait tokens, and records completions so waits
-     * are repeatable. The live-id pool is the only global queue state: it
-     * never selects a backend, device, or runtime context. Calls on one
-     * queue are serialized by the caller.
-     * Compute operations default to throwing `unsupported(backend_label(), op)`; backends override only implemented operations.
+     * views. The common base leases one process-unique queue id in [1, 255]
+     * at construction and releases it at destruction, allocates a monotonic
+     * 55-bit submission sequence for every successfully queued operation,
+     * validates wait tokens, and records completions so waits are repeatable.
+     * The live-id pool is the only global queue state: it never selects a
+     * backend, device, or runtime context. Calls on one queue are serialized
+     * by the caller.
+     * Compute operations default to throwing `unsupported(backend_label(), op)`;
+     * backends override only implemented operations.
      */
+
     class DeviceOps {
     public:
         DeviceOps(const DeviceOps&) = delete;
@@ -308,8 +311,7 @@ namespace iom {
 
         /**
          * Reserves this queue's next submission sequence before invoking
-         * queue_work, then returns the waitable token
-         * (queue_id << 56) | sequence. Allocating a sequence past 2^56 - 1
+         * (queue_id << 55) | sequence. Allocating a sequence past 2^55 - 1
          * throws std::overflow_error before queue_work runs. If queue_work
          * throws synchronously, submit reclaims the reservation only when no
          * later submission has reserved a sequence and the failing sequence
@@ -322,6 +324,7 @@ namespace iom {
          * then throws loses that retained failure when the reservation is
          * reclaimed; the failure persists only while a later reservation
          * leaves a gap.
+
          */
         template <typename QueueWork>
         oid submit(QueueWork queue_work) {
@@ -330,7 +333,7 @@ namespace iom {
                 std::lock_guard<std::mutex> lock(completion_mutex_);
                 if (next_sequence_ > kMaxSequence) {
                     throw std::overflow_error(
-                        "DeviceOps 56-bit submission sequence is exhausted");
+                        "DeviceOps 55-bit submission sequence is exhausted");
                 }
                 sequence = next_sequence_++;
             }
@@ -362,7 +365,7 @@ namespace iom {
         /**
          * Test seam: moves the next allocated sequence forward without
          * submitting work, letting deterministic fakes begin near the
-         * 56-bit limit. Never moves backward and never allocates.
+         * 55-bit limit. Never moves backward and never allocates.
          */
         void seek_next_sequence(std::uint64_t next_sequence);
 
@@ -371,7 +374,7 @@ namespace iom {
         static void release_queue_id(std::uint8_t queue_id) noexcept;
         [[nodiscard]] oid encode_token(std::uint64_t sequence) const noexcept;
 
-        static constexpr std::uint64_t kSequenceBits = 56;
+        static constexpr std::uint64_t kSequenceBits = 55;
         static constexpr std::uint64_t kSequenceMask = (std::uint64_t{1} << kSequenceBits) - 1;
         static constexpr std::uint64_t kMaxSequence = kSequenceMask;
         // Sequence ranges skipped by seek_next_sequence are never submitted.

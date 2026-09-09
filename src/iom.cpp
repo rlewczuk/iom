@@ -509,12 +509,18 @@ namespace iom {
     }
 
     oid DeviceOps::encode_token(std::uint64_t sequence) const noexcept {
-        return (static_cast<oid>(queue_id_) << kSequenceBits) | sequence;
+        const std::uint64_t encoded =
+                (std::uint64_t{queue_id_} << kSequenceBits) | sequence;
+        return static_cast<oid>(encoded);
     }
 
     void DeviceOps::wait(oid token) {
-        const std::uint64_t id = token >> kSequenceBits;
-        const std::uint64_t sequence = token & kSequenceMask;
+        if (token <= 0) {
+            throw std::invalid_argument("oid must be a positive token");
+        }
+        const std::uint64_t encoded = static_cast<std::uint64_t>(token);
+        const std::uint64_t id = encoded >> kSequenceBits;
+        const std::uint64_t sequence = encoded & kSequenceMask;
         if (id == 0) {
             throw std::invalid_argument("oid queue id is zero");
         }
@@ -524,10 +530,18 @@ namespace iom {
         if (id != queue_id_) {
             throw std::invalid_argument("oid belongs to another queue");
         }
-
         std::unique_lock<std::mutex> lock(completion_mutex_);
+
         if (sequence >= next_sequence_) {
             throw std::invalid_argument("oid sequence was never submitted");
+        }
+        const auto skipped = skipped_sequences_.upper_bound(sequence);
+        if (skipped != skipped_sequences_.begin()) {
+            auto previous = skipped;
+            --previous;
+            if (previous->second > sequence) {
+                throw std::invalid_argument("oid sequence was never submitted");
+            }
         }
         completion_cv_.wait(lock, [&] {
             return completed_ >= sequence || failures_.count(sequence) != 0;
@@ -620,7 +634,8 @@ namespace iom {
 
     void DeviceOps::seek_next_sequence(std::uint64_t next_sequence) {
         std::lock_guard<std::mutex> lock(completion_mutex_);
-        if (next_sequence == 0 || next_sequence < next_sequence_) {
+        if (next_sequence == 0 || next_sequence < next_sequence_
+                || next_sequence > kMaxSequence + 1) {
             throw std::invalid_argument("queue sequence numbers only move forward");
         }
         if (next_sequence > next_sequence_) {

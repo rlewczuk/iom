@@ -81,7 +81,7 @@ set(IOM_SOURCES
 
 set(IOM_HEADERS
         include/iom/iom.hpp
-        include/iom/gpu_algorithm.hpp
+        include/iom/oid.hpp
         include/iom/cpu/device.hpp
         include/iom/mmap.hpp
         include/iom/safetensors.hpp
