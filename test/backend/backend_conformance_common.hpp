@@ -232,16 +232,17 @@ inline void expect_repeated_runtime_failure(
 // Token decoding.
 // ---------------------------------------------------------------------------
 
-constexpr std::uint64_t kTokenSequenceBits = 56;
+constexpr std::uint64_t kTokenSequenceBits = 55;
 constexpr std::uint64_t kTokenSequenceMask =
         (std::uint64_t{1} << kTokenSequenceBits) - 1;
 
 inline std::uint8_t token_queue(iom::oid token) {
-    return static_cast<std::uint8_t>(token >> kTokenSequenceBits);
+    return static_cast<std::uint8_t>(
+            static_cast<std::uint64_t>(token) >> kTokenSequenceBits);
 }
 
 inline std::uint64_t token_sequence(iom::oid token) {
-    return token & kTokenSequenceMask;
+    return static_cast<std::uint64_t>(token) & kTokenSequenceMask;
 }
 
 // A span over a temporary initializer-list array; valid for the full
@@ -255,41 +256,40 @@ inline std::span<const std::size_t> span_of(
 // Compile-time checks of every compute method's view signature. No backend
 // header participates: the signatures live on the common DeviceOps base.
 // ---------------------------------------------------------------------------
-
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::copy),
               iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
-                                           iom::TensorView&)>);
+                                           iom::TensorView&) noexcept>);
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::add),
               iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
                                            const iom::TensorView&,
-                                           iom::TensorView&)>);
+                                           iom::TensorView&) noexcept>);
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::mul),
               iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
                                            const iom::TensorView&,
-                                           iom::TensorView&)>);
+                                           iom::TensorView&) noexcept>);
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::silu),
               iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
-                                           iom::TensorView&)>);
+                                           iom::TensorView&) noexcept>);
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::linear),
               iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
                                            const iom::TensorView&,
-                                           iom::TensorView&)>);
+                                           iom::TensorView&) noexcept>);
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::rmsnorm),
               iom::oid (iom::DeviceOps::*)(
                       const iom::TensorView&, iom::TensorView&,
-                      const iom::TensorView&, float, size_t)>);
+                      const iom::TensorView&, float, size_t) noexcept>);
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::sdpa),
               iom::oid (iom::DeviceOps::*)(
                       const iom::TensorView&, const iom::TensorView&,
                       const iom::TensorView&, size_t, size_t, size_t,
-                      iom::TensorView&)>);
+                      iom::TensorView&) noexcept>);
 static_assert(std::is_invocable_v<
               decltype(&iom::DeviceOps::silu), iom::DeviceOps*,
               const iom::TensorView&, iom::TensorView&>);

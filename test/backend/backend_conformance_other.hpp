@@ -41,6 +41,7 @@ namespace iom_conformance {
 
 class DeferredCopyQueue final : public iom::DeviceOps {
 public:
+    using iom::DeviceOps::copy;
     using iom::DeviceOps::complete;
     enum class CopyFailure {
         none,
@@ -72,13 +73,14 @@ public:
     iom::oid copy(
             const iom::Tensor& source_owner, const iom::TensorView& source,
             iom::Tensor& destination_owner, iom::TensorView& destination) {
-        const iom::oid token = copy(source, destination);
+        const iom::oid token = iom::DeviceOps::copy(source, destination);
         records_.back().source_owner = &source_owner;
         records_.back().destination_owner = &destination_owner;
         return token;
     }
 
-    iom::oid copy(
+protected:
+    iom::oid copy_impl(
             const iom::TensorView& source,
             iom::TensorView& destination) override {
         const CopyFailure failure =
@@ -99,6 +101,7 @@ public:
             }
         });
     }
+public:
 
     // View-less submission used to observe queue identity and sequence
     // allocation directly.
@@ -183,9 +186,11 @@ public:
         complete(sequence);
     }
 
-    iom::oid copy(const iom::TensorView&, iom::TensorView&) override {
+protected:
+    iom::oid copy_impl(const iom::TensorView&, iom::TensorView&) override {
         return probe();
     }
+public:
     [[nodiscard]] std::string_view backend_label() const noexcept override {
         return "instrumented";
     }
@@ -286,9 +291,9 @@ inline void run_lifetime_conformance(
         auto destination = candidate.create_tensor(spec);
 
         queue.inject_copy_failure(DeferredCopyQueue::CopyFailure::pre_enqueue);
-        CHECK_THROWS_AS(
+        CHECK_EQ(
                 queue.copy(source->view(), destination->view()),
-                std::invalid_argument);
+                iom::to_oid(iom::OidError::InvalidArgument));
         const iom::oid first =
                 queue.copy(*source, source->view(), *destination,
                            destination->view());
@@ -406,9 +411,8 @@ inline void run_lifetime_conformance(
     }
 }
 
-// Unsupported compute capabilities: every compute method rejects with
-// std::runtime_error before submitting, consuming a sequence, or changing an
-// output, including transformed operands.
+// Unsupported compute capabilities: every compute method returns the signed
+// unsupported OID before submitting, consuming a sequence, or changing output.
 inline void run_compute_capability_conformance(
         iom::Device& candidate,
         const std::span<const iom::DataType>,  // capability, not type-specific
@@ -427,69 +431,18 @@ inline void run_compute_capability_conformance(
     const std::vector<std::byte> y_pattern = encode_logical(spec, 41);
     const std::vector<std::byte> attn_pattern = encode_logical(spec, 42);
     y->view().copy_from_host(y_pattern);
-    attn->view().copy_from_host(attn_pattern);
-
     auto queue = candidate.create_ops();
-    if (backend_label.empty()) {
-        CHECK_THROWS_AS(queue->add(x->view(), x->view(), y->view()),
-                        std::runtime_error);
-    } else {
-        const std::string expected =
-                std::string(backend_label) + " backend does not implement add";
-        CHECK_THROWS_WITH_AS(queue->add(x->view(), x->view(), y->view()),
-                             expected.c_str(), std::runtime_error);
-    }
-    if (backend_label.empty()) {
-        CHECK_THROWS_AS(queue->mul(x->view(), x->view(), y->view()),
-                        std::runtime_error);
-    } else {
-        const std::string expected =
-                std::string(backend_label) + " backend does not implement mul";
-        CHECK_THROWS_WITH_AS(queue->mul(x->view(), x->view(), y->view()),
-                             expected.c_str(), std::runtime_error);
-    }
-    if (backend_label.empty()) {
-        CHECK_THROWS_AS(queue->silu(x->view(), y->view()), std::runtime_error);
-    } else {
-        const std::string expected =
-                std::string(backend_label) + " backend does not implement silu";
-        CHECK_THROWS_WITH_AS(queue->silu(x->view(), y->view()),
-                             expected.c_str(), std::runtime_error);
-    }
-    if (backend_label.empty()) {
-        CHECK_THROWS_AS(queue->linear(x->view(), w->view(), y->view()),
-                        std::runtime_error);
-    } else {
-        const std::string expected =
-                std::string(backend_label) + " backend does not implement linear";
-        CHECK_THROWS_WITH_AS(
-                queue->linear(x->view(), w->view(), y->view()),
-                expected.c_str(), std::runtime_error);
-    }
-    if (backend_label.empty()) {
-        CHECK_THROWS_AS(
-                queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
-                std::runtime_error);
-    } else {
-        const std::string expected =
-                std::string(backend_label) + " backend does not implement rmsnorm";
-        CHECK_THROWS_WITH_AS(
-                queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
-                expected.c_str(), std::runtime_error);
-    }
-    if (backend_label.empty()) {
-        CHECK_THROWS_AS(
-                queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
-                            attn->view()),
-                std::runtime_error);
-    } else {
-        const std::string expected =
-                std::string(backend_label) + " backend does not implement sdpa";
-        CHECK_THROWS_WITH_AS(
-                queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
-                             attn->view()),
-                expected.c_str(), std::runtime_error);
-    }
+    (void)backend_label;
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    CHECK_EQ(queue->add(x->view(), x->view(), y->view()), unsupported);
+    CHECK_EQ(queue->mul(x->view(), x->view(), y->view()), unsupported);
+    CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
+    CHECK_EQ(queue->linear(x->view(), w->view(), y->view()), unsupported);
+    CHECK_EQ(queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
+             unsupported);
+    CHECK_EQ(queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
+                         attn->view()),
+             unsupported);
 
     // Transformed operands compile against the view signatures and still
     // fail capability validation.
@@ -497,9 +450,9 @@ inline void run_compute_capability_conformance(
     iom::TensorView stepped_y = y->view().slice(0, 0, 1);
     const iom::TensorView merged_x =
             x->view().reshape_leading(span_of({2}));
-    CHECK_THROWS_AS(queue->silu(stepped_x, stepped_y), std::runtime_error);
-    CHECK_THROWS_AS(
-            queue->add(merged_x, x->view(), y->view()), std::runtime_error);
+    CHECK_EQ(queue->silu(stepped_x, stepped_y), unsupported);
+    CHECK_EQ(queue->add(merged_x, x->view(), y->view()), unsupported);
+
 
     // No output changed and no sequence was consumed.
     require_logical_bytes(y->view(), y_pattern, "y after capability failures");
