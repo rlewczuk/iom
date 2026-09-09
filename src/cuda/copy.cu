@@ -38,6 +38,7 @@ bool consume_submission_fault(
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
 
 #include "../shared/standard_tiled_copy.inl"
+#include "../shared/standard_tiled_add.inl"
 #undef IOM_LAUNCH_KERNEL
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_GLOBAL

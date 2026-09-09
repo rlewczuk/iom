@@ -16,6 +16,7 @@
 // non-dependent names.
 
 #include <cstdint>
+#include <optional>
 #include <exception>
 #include <map>
 #include <memory>
@@ -38,11 +39,12 @@ class GpuQueue final : public DeviceOps {
 
     struct Task {
         std::uint64_t sequence;
-        const TensorView* source;
-        TensorView* destination;
-        bool no_op;
-        // Owns the completion record while the task is queued; keeps the
-        // record alive for the worker callbacks referenced by fence.
+        const TensorView* source = nullptr;
+        TensorView* destination = nullptr;
+        bool no_op = false;
+        bool is_add = false;
+        std::optional<AddRequest> add_request;
+        detail::AddEntryRegistration add_entries{};
         std::shared_ptr<typename EventRing::Submission> submission;
         void* fence = nullptr;
         detail::EntryId source_entry_id = 0;
@@ -63,6 +65,13 @@ class GpuQueue final : public DeviceOps {
     static_assert(
             alignof(EventLeaseWithFailure)
             <= iom::detail::kFenceStorageAlign);
+
+    struct GpuOutcome {
+        detail::SequenceOutcome common{};
+        detail::AddEntryRegistration add_entries{};
+        std::exception_ptr retained_failure;
+        bool is_add = false;
+    };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
             const detail::Fence& fence) noexcept {
@@ -180,12 +189,80 @@ public:
                 });
     }
 
-    [[nodiscard]] std::string_view backend_label() const noexcept override {
-        return Policy::backend_label();
+    oid add_impl(const AddRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        Policy::activate(context_);
+        auto submission = state_->acquire();
+        const detail::Fence fence = build_fence(submission, nullptr);
+        return submit_add(
+                request, *registry_state_, registry_queue_id_, fence,
+                [this, submission = std::move(submission)](
+                        std::uint64_t sequence, const AddRequest& captured,
+                        detail::AddEntryRegistration entries) mutable {
+                    worker_.submit_copy(Task{
+                            sequence, nullptr, nullptr, false, true,
+                            std::optional<AddRequest>(captured), entries,
+                            std::move(submission)});
+                });
     }
 
 private:
     void execute(Task& task) {
+        if (task.is_add) {
+            Policy::activate(context_);
+            // Reserve the outcome — and its registration ownership — before
+            // any device effect. A failure here is pre-acceptance: the
+            // caller's submit_add rolls the sequence back with no live work.
+            {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                const auto [it, inserted] =
+                        outcomes_.try_emplace(task.sequence);
+                if (!inserted) {
+                    throw std::logic_error("duplicate ADD sequence");
+                }
+                it->second.add_entries = task.add_entries;
+                it->second.is_add = true;
+            }
+            std::exception_ptr failure;
+            try {
+                const detail::AddMetadata metadata =
+                        detail::make_add_metadata(*task.add_request);
+                detail::launch_grid_stride_add<Policy>(
+                        stream_,
+                        static_cast<const unsigned char*>(
+                                task.add_request->lhs.native_handle),
+                        static_cast<const unsigned char*>(
+                                task.add_request->rhs.native_handle),
+                        static_cast<unsigned char*>(
+                                task.add_request->out.native_handle),
+                        metadata);
+                Policy::check_kernel(Policy::copy_kernel_operation());
+                Policy::after_grid_stride_launch();
+                Policy::record_event(
+                        state_->event_of(*task.submission), stream_);
+                state_->mark_event_recorded(*task.submission);
+            } catch (...) {
+                // Post-launch: never throw through submit_copy. Retain the
+                // failure; completion releases entries and reports it.
+                failure = std::current_exception();
+                try {
+                    const bool recorded = Policy::record_event_no_fault(
+                            state_->event_of(*task.submission), stream_);
+                    if (recorded) {
+                        state_->mark_event_recorded(*task.submission);
+                    } else if (Policy::synchronize_stream_noexcept(stream_)) {
+                        state_->mark_stream_drained(*task.submission);
+                    }
+                } catch (...) {
+                }
+            }
+            if (failure) {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                outcomes_[task.sequence].retained_failure = failure;
+            }
+            task.fence = task.submission.get();
+            return;
+        }
         const TensorView& source = *task.source;
         TensorView& destination = *task.destination;
         task.source = nullptr;
@@ -285,20 +362,17 @@ private:
                     *registry_state_, registry_queue_id_, task.sequence,
                     const_cast<void*>(source.native_handle()),
                     destination.native_handle(), fence);
-            task.source_entry_id = entries.source;
-            task.destination_entry_id = entries.destination;
-            std::lock_guard<std::mutex> lock(outcome_mutex_);
-            const auto [it, inserted] = outcomes_.emplace(
-                    task.sequence,
-                    detail::SequenceOutcome{
-                            entries.source, entries.destination,
-                            outcome_failure});
+            const auto [it, inserted] =
+                    outcomes_.try_emplace(task.sequence);
             if (!inserted) {
                 throw std::logic_error(
                         std::string("duplicate ")
                         + Policy::backend_label()
                         + " outstanding-work sequence");
             }
+            it->second.common.source_entry_id = entries.source;
+            it->second.common.destination_entry_id = entries.destination;
+            it->second.common.retained_failure = outcome_failure;
         } catch (...) {
             if (entries.source != 0) {
                 registry_state_->registry.remove_entry_if_present(
@@ -324,10 +398,9 @@ private:
             commit_failure(task.sequence, outcome_failure);
         }
     }
-
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
-        detail::SequenceOutcome outcome;
+        GpuOutcome outcome;
         bool has_outcome = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -339,10 +412,24 @@ private:
             }
         }
         if (has_outcome) {
-            const bool fence_succeeded = !failure && !outcome.retained_failure;
-            (void)detail::release_or_invalidate_entries(
-                    registry_state_->registry, outcome,
-                    static_cast<bool>(failure), fence_succeeded);
+            std::exception_ptr combined = failure;
+            if (!combined) {
+                combined = outcome.retained_failure
+                        ? outcome.retained_failure
+                        : outcome.common.retained_failure;
+            }
+            const bool failed = static_cast<bool>(combined);
+            if (outcome.is_add) {
+                (void)detail::release_or_invalidate_add_entries(
+                        registry_state_->registry, outcome.add_entries,
+                        failed, !failed);
+            } else {
+                (void)detail::release_or_invalidate_entries(
+                        registry_state_->registry, outcome.common,
+                        failed, !failed);
+            }
+            complete(sequence, std::move(combined));
+            return;
         }
         complete(sequence, std::move(failure));
     }
@@ -356,8 +443,7 @@ private:
     std::shared_ptr<EventRing> state_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
-    std::map<std::uint64_t, detail::SequenceOutcome> outcomes_;
+    std::map<std::uint64_t, GpuOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
-
 }  // namespace iom::detail

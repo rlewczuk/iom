@@ -25,6 +25,7 @@
 
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_add_gpu.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/rocm/device.hpp"
@@ -466,7 +467,8 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
     HipAllocator candidate_allocator(gate);
     auto candidate = iom::make_rocm_device(0, candidate_allocator);
     iom_conformance::run_compute_capability_conformance(
-            *candidate, candidate->supported_data_types(), &gate, "ROCm");
+            *candidate, candidate->supported_data_types(), &gate, "ROCm",
+            true);
     CHECK_FALSE(gate.armed());
 }
 
@@ -484,8 +486,60 @@ TEST_CASE("ROCm conformance: full shared suite") {
     HipStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate, &oracle);
+            &gate, &oracle, true);
     CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm ADD accepts every low-width leaf against the oracle") {
+    iom_conformance::TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto candidate = iom::make_rocm_device(0, allocator);
+    iom_conformance::run_gpu_add_low_width_conformance(*candidate);
+    CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm ADD broadcast, transform, tail, and exact alias mapping") {
+    iom_conformance::TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto candidate = iom::make_rocm_device(0, allocator);
+    iom_conformance::run_gpu_add_mapping_conformance(*candidate);
+    CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm ADD retained launch failure keeps owners reusable") {
+    iom_conformance::TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto candidate = iom::make_rocm_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 16, 16}}, iom::DataType::U8};
+    auto lhs = candidate->create_tensor(spec);
+    auto out = candidate->create_tensor(spec);
+    std::vector<std::byte> pattern(spec.logical_nbytes());
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = std::byte{static_cast<unsigned char>(i * 3)};
+    }
+    lhs->view().copy_from_host(pattern);
+    auto queue = candidate->create_ops();
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::third_plane_launch);
+    const iom::oid failed = queue->add(lhs->view(), lhs->view(), out->view());
+    CHECK(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+
+    const iom::oid recovered =
+            queue->add(lhs->view(), lhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+    std::vector<std::byte> observed(spec.logical_nbytes());
+    out->view().copy_to_host(observed);
+    for (std::size_t i = 0; i < observed.size(); ++i) {
+        CHECK_EQ(
+                static_cast<unsigned>(observed[i]),
+                static_cast<unsigned>(pattern[i]) * 2 & 0xffu);
+    }
 }
 
 TEST_CASE("ROCm submission remains transactional across post-enqueue failures") {

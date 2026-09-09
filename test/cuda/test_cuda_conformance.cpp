@@ -19,6 +19,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_add_gpu.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/cuda/device.hpp"
 #include "cuda/copy.hpp"
@@ -322,7 +323,7 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     CudaDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CUDA");
+            &devices.gate, "CUDA", true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -333,8 +334,57 @@ TEST_CASE("CUDA conformance: full shared suite") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle);
+            &devices.gate, &oracle, true);
     CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA ADD accepts every low-width leaf against the oracle") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_gpu_add_low_width_conformance(*devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA ADD broadcast, transform, tail, and exact alias mapping") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_gpu_add_mapping_conformance(*devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA ADD retained launch failure keeps owners reusable") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 16, 16}}, iom::DataType::U8};
+    auto lhs = devices.candidate->create_tensor(spec);
+    auto out = devices.candidate->create_tensor(spec);
+    std::vector<std::byte> pattern(spec.logical_nbytes());
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = std::byte{static_cast<unsigned char>(i * 3)};
+    }
+    lhs->view().copy_from_host(pattern);
+    auto queue = devices.candidate->create_ops();
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::third_plane_launch);
+    const iom::oid failed = queue->add(lhs->view(), lhs->view(), out->view());
+    CHECK(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    const iom::oid recovered =
+            queue->add(lhs->view(), lhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+    std::vector<std::byte> observed(spec.logical_nbytes());
+    out->view().copy_to_host(observed);
+    for (std::size_t i = 0; i < observed.size(); ++i) {
+        CHECK_EQ(
+                static_cast<unsigned>(observed[i]),
+                static_cast<unsigned>(pattern[i]) * 2 & 0xffu);
+    }
 }
 
 TEST_CASE("CUDA submission remains transactional across post-enqueue failures") {
