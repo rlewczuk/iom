@@ -133,6 +133,7 @@ public:
             detail::RegistryState& registry_state)
             : DeviceOps(device),
               device_(&device),
+              registry_state_(&registry_state),
               registry_queue_id_(
                       detail::allocate_queue_id(*registry_state_)),
               context_(context),
