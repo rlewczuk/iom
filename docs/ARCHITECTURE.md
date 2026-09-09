@@ -56,9 +56,11 @@ can coexist without a process-wide selection step.
    CUDA, ROCm, and SYCL use the common standard layout; TTNN may use a native
    per-plane representation while maintaining the same public tensor contract.
 4. **Execution boundary.** `DeviceOps` is an in-order asynchronous queue over
-   caller-created views. `copy` is the required operation. Arithmetic methods
-   are capability hooks: an unimplemented backend reports an error instead of
-   silently falling back or allocating an output.
+   caller-created views. `copy` and `add` are the implemented operations.
+   `add(const TensorView&, const TensorView&, TensorView&) noexcept` is the
+   common three-view facade and its sole support signal: accepted work returns
+   a positive OID token; rejected work returns a negative `OidError`. Other
+   compute methods remain unsupported and never silently fall back or allocate.
 5. **Backend runtime implementation.** Backends turn a validated operation
    into synchronous host transfer, CPU work, or runtime stream submission. CUDA
    and ROCm share policy-templated queue, completion, staging, and copy
@@ -108,11 +110,18 @@ through `supported_data_types()`; `create_tensor` rejects unsupported
 specifications rather than converting them.
 
 The standard-layout backends—CPU, CUDA, ROCm, and SYCL—share one immutable set
-of 23 unquantized leaf encodings. The `QuantizationFormat` enumeration reserves
-the generic, OCP, NVIDIA, GGML, and Tenstorrent format names for future
-implementations; it does not make them valid specifications today. TTNN has an
-independent, narrower native capability table and rejects unsupported leaf
-types before native allocation.
+of 23 unquantized leaf encodings. ADD requires, with `QuantizationFormat::NONE`,
+exactly these 21 numeric leaves on every CPU, CUDA, ROCm, SYCL, and TTNN backend:
+`I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64`,
+`F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`,
+and `F64`. `BOOL` and `F8_E8M0` are excluded from ADD. A matching excluded
+leaf returns `Unsupported` only after spec-mismatch checks; every mismatch of
+recognized leaves or quantization returns `InvalidArgument`, and every
+recognized non-`NONE` quantization is invalid. A required numeric leaf is not
+`Unsupported` because a vendor SDK lacks native support: backend staging or
+emulation is internal. TTNN storage additionally covers `BOOL` and need not
+store `F8_E8M0`; its native per-plane 32x32 layout remains behind the public
+contract.
 
 ### Standard 16x16 tiled layout
 
@@ -196,16 +205,49 @@ work.
 
 ADD validation produces an immutable backend-neutral snapshot of all three
 views, including owner and device identities, handles, exact specifications,
-offsets and strides, and the result-aligned logical broadcast mapping. Backend
-queues consume that snapshot through the protected ADD hook. Once their
-pre-acceptance resources and fence are ready, later CPU, GPU, SYCL, and TTNN
-ADD implementations must use the protected `submit_add` seam with their
-device-owned `RegistryState`; it reserves the sequence, registers each distinct
-owner before the backend submission callback, and rolls registration back if
-that callback
-rejects the work. The queued outcome owns the copied snapshot and registration
-until it releases or invalidates the entries at terminal completion. No backend
-may retain the caller's `TensorView` objects.
+offsets and strides, and result-aligned logical broadcast mapping. Ranks below
+two are invalid. `[1,1]` is the sole scalar convention and broadcasts over all
+output axes; two such operands produce `[1,1]`. Otherwise ranks are right
+aligned with conceptual leading ones, axes must match or be one, and `out`
+must have exactly the maximum shape. Singleton coordinates—including tiled
+tails—map to zero before tile-slot mapping; padding is never read and
+broadcast materialization is internal, never a public zero-stride view.
+Transformed leading views retain independent offsets and plane strides.
+
+The three specs must match exactly before support is considered. Validate
+device identity, owner/view metadata, shapes, checked arithmetic, and aliasing
+before effects or token acceptance. Same-owner exact in-place alias is allowed
+only for identical spec, plane offset, plane strides, and logical mapping;
+reject all other input/output relationships, including disjoint or broadcast
+windows. Capture both input values before each output store, track all three
+owners through completion, deduplicate exact aliases, and retain metadata
+snapshots rather than caller view objects.
+
+ADD has no promotion or quantization behavior. Integers use two's-complement
+signed or ordinary unsigned interpretation and return the low `w` bits of the
+exact sum modulo `2^w`. Floating inputs decode by named format, sum as exact
+reals, and encode once with RNE; a backend returns the reference encoding or a
+finite value within one ULP. F4/F6 use the OCP MX v1.0 scalar tables with
+subnormals, RNE, and signed-maximum saturation; E4M3FN saturates with NaN
+`0x7f`; E5M2 permits infinity; F16/F32/F64 are IEEE and BF16 has IEEE-style
+specials with RNE. Gradual underflow and no FTZ/DAZ are required. `-0+-0`
+is `-0`, opposite signs and exact cancellation are `+0`, and rounded-zero
+signs follow the mathematical result; NaN and infinity classes and canonical
+reference NaNs are preserved (`0x7e`, `0x7e00`, `0x7fc0`, `0x7fc00000`,
+`0x7ff8000000000000` where applicable).
+
+ADD is in-order asynchronous work (CPU may complete inline), preserves caller
+serialization and ordering, and supports repeat waits. Invalid negative, zero,
+foreign, future, skipped, or unsubmitted values are rejected by `wait`;
+accepted asynchronous failures remain and are rethrown on every later wait.
+Pre-submit failures return a negative OID, do not mutate output, and do not
+consume a token; partial output after accepted failure is unspecified.
+ADD allocates neither operands nor result and never replaces or relocates caller
+storage, owners, or native handles. Internal temporary host/device buffers,
+backend tensors, workspace, staging, conversions, unpack/widen/repack, and
+emulation are permitted. Path selection is internal before acceptance; accepted
+native failures are not retried, and common code exposes no fallback device,
+vendor type, backend switch, or global state.
 
 ## Public API guide
 
@@ -231,16 +273,15 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `make_ttnn_device(ordinal)` | Creates a TTNN device, whose native storage is owned by TTNN. |
 | `ttnn_supported_data_types()` | Returns TTNN's immutable accepted unquantized leaf-type table. |
 | `Device` | Reports `backend_kind`, accepted data types, and ordinal; creates `Tensor` owners and `DeviceOps` queues. |
-| `Tensor::view()` | Returns the stable full-storage view. |
-| `TensorView` | Inspects its spec/device/opaque handle and applies leading-dimension transforms or synchronous host transfers. |
-| `DeviceOps` | Creates in-order asynchronous work with `copy`, `add`, `mul`, `silu`, `linear`, `rmsnorm`, and GQA `sdpa`; `wait(token)` observes completion. |
-| `Block` | Minimal abstract inference block interface: `forward(const Tensor& x, Tensor& y)`. |
+| `DeviceOps` | Creates in-order asynchronous work with `copy` and the exact three-view
+|             | `noexcept` `add` facade; `mul`, `silu`, `linear`, `rmsnorm`, and GQA `sdpa`
+|             | remain unsupported; `wait(token)` observes completion. |
 | `gpu_algorithm::compute_staging_size(logical_nbytes)` | Returns the logical transfer payload rounded to a 4-byte GPU word, rejecting rounding overflow. |
 
-`DeviceOps::copy` is pure device-to-device work on compatible views. The
-remaining compute entry points are public OID facades, but current hooks other
-than the later ADD implementation remain `Unsupported`; this document does
-not define ADD arithmetic or any future numeric capability.
+`DeviceOps::copy` is pure device-to-device work on compatible views. `add` is
+the sole ADD support signal and is fully specified above; other compute entry
+points return negative `Unsupported` without submission, mutation, or token
+acceptance. No documentation here claims support for those operations.
 
 ### OID compatibility contract
 

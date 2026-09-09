@@ -207,19 +207,19 @@ namespace iom {
 
     /**
      * One in-order asynchronous operation queue over caller-created tensor
-     * views. Every OID-returning operation below is a common noexcept facade:
+     * views. Every OID-returning operation is a common `noexcept` facade:
      * it validates, maps failures, encodes tokens, and registers lifetimes
-     * before backend effects or token acceptance. Backend implementations
-     * override only the protected hooks; those hooks are not alternate public
-     * entry points and cannot bypass that protocol.
+     * before backend effects or token acceptance. Backend hooks cannot bypass
+     * this protocol.
      *
-     * An oid is signed int64_t. Negative values are terminal OidError results
-     * (-1 InvalidArgument, -2 Unsupported, -3 Overflow, -4
-     * ResourceExhausted, -5 DeviceError, -6 InternalError); positive values
-     * are accepted tokens and zero is invalid. Callers must consume negative
-     * results and wait only on accepted positive tokens. The breaking cutover
-     * moves synchronous OID failures out of exceptions; wait still throws for
-     * invalid tokens and retained post-acceptance failures.
+     * `oid` is signed `int64_t`: -1 InvalidArgument, -2 Unsupported, -3
+     * Overflow, -4 ResourceExhausted, -5 DeviceError, and -6 InternalError.
+     * Negative results are terminal synchronous errors, positive values are
+     * accepted tokens, and zero is invalid. `add` itself is the sole ADD
+     * support signal; it has exactly three views and returns a positive token
+     * or one of these errors. Synchronous failures never cross the facade.
+     * `wait` still throws for invalid tokens and retained post-acceptance
+     * failures.
      */
     class DeviceOps {
     public:
@@ -241,9 +241,15 @@ namespace iom {
         void wait(oid token);
 
         /**
-         * Common noexcept OID facades. Successful tokens encode queue ID q in
-         * bits 55..62 for every q in [1, 255], with sequence 1..2^55-1 in
-         * the low 55 bits. Synchronous failures return OidError values.
+         * Common `noexcept` OID facades. Successful tokens encode queue ID q
+         * in bits 55..62 for q in [1,255], with sequence 1..2^55-1 in the
+         * low 55 bits; synchronous failures return OidError values.
+         * `add` is exactly the three-view signature below and the sole ADD
+         * support signal. It validates device, owner, spec, shape, view,
+         * checked arithmetic, and aliasing before matching-spec support:
+         * recognized BOOL/F8_E8M0/non-NONE quantization is Unsupported only
+         * after mismatch checks; malformed or mismatched inputs are
+         * InvalidArgument.
          */
         oid copy(const TensorView& source, TensorView& destination) noexcept;
         oid add(const TensorView& lhs, const TensorView& rhs,

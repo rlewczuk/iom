@@ -138,11 +138,13 @@ namespace iom {
     class Tensor;
 
     /**
-     * Non-owning tensor operand over one owner's storage: a plane offset and
-     * plane strides counting whole logical planes, never bytes or elements.
-     * The final two dimensions are the tiled matrix and cannot be
-     * transformed. Copyable so operations can receive views by value, but
-     * never assignable so a view can never be retargeted.
+     * Non-owning tensor operand over one stable caller-owned storage owner:
+     * a plane offset and plane strides count whole logical planes, never bytes
+     * or elements. The final two dimensions are a logical matrix represented
+     * by 16x16 tiles (native backends may use a different internal tile).
+     * Leading transforms preserve independent offsets and strides. Views are
+     * copyable but non-assignable; operations snapshot metadata and never
+     * retain the view object or expose broadcast zero strides.
      */
     class TensorView {
     public:
@@ -175,7 +177,9 @@ namespace iom {
         // Synchronous host transfers of exactly spec().logical_nbytes().
         // Host access never waits on operation queues: callers wait for
         // outstanding writes before a host read, and for every outstanding
-        // read or write before a host write or owner destruction.
+        // read or write before a host write or owner destruction. Queued ADD
+        // tracks all three owners through completion, deduplicating exact
+        // aliases; operations never allocate, replace, or relocate storage.
         void copy_from_host(std::span<const std::byte> source);
         void copy_to_host(std::span<std::byte> destination) const;
 

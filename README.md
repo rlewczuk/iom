@@ -76,9 +76,16 @@ cmake --build build/ttnn --target iom_ttnn
 The Tenstorrent SDK must be installed system-wide and expose its `tt-nn` and
 `tt-metalium` CMake packages (`TT::Metalium`, `TTNN::TTNN`). Enabling TTNN
 fails configuration when those packages are absent; it does not silently
-disable the backend. The supported leaf types are `BOOL`, `U8`, `I8`, `U16`,
-`I16`, `U32`, `I32`, `BF16`, and `F32`; every other declared leaf type and
-every grouped quantization format is rejected before native allocation. The
+disable the backend. TTNN owns native storage and uses internal staging or
+emulation for non-native numeric leaves while preserving public logical shape
+and ownership.
+The supported storage leaves include `BOOL` and all 21 required numeric
+`QuantizationFormat::NONE` leaves: `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`,
+`U16`, `I32`, `U32`, `I64`, `U64`, `F4_E2M1`, `F6_E2M3`, `F6_E3M2`,
+`F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`, and `F64`. TTNN need not store
+`F8_E8M0`; grouped quantization remains invalid. ADD excludes `BOOL` and
+`F8_E8M0`, and exposes no capability query: the exact three-view
+`noexcept` `add` facade returns a positive token or negative `OidError`.
 smoke test requires a usable Tenstorrent device/runtime and does not skip
 when TTNN is enabled:
 
@@ -120,9 +127,10 @@ cmake --build build/all --target iom_backend_coexistence_tests
 
 The coexistence test links `libiom` and every enabled backend library into
 one executable, constructs devices and queues from every backend in one
-process, interleaves asynchronous `BF16` copies across the queues, waits
-on each originating queue, and compares bit-identical logical results. It
-fails (never skips) when an enabled backend has no usable device:
+process, interleaves ADD (representative `I32`/`F32`) and asynchronous `BF16`
+copy work across the queues, waits on each originating queue, and compares
+bit-identical logical results. It fails (never skips) when an enabled backend
+has no usable device:
 
 ```sh
 ctest --test-dir build/all --output-on-failure \

@@ -154,28 +154,26 @@ Before considering a backend complete, confirm all of the following:
 3. There is no active-backend global, backend switch, or global runtime
    selection service. Backends expose their own factory and objects retain the
    identity of their creating `Device`.
-4. `supported_data_types()` MUST return immutable, nonempty storage and have
-   no side effects. It is the exact set accepted with
-   `QuantizationFormat::NONE`, not an aspirational list. A standard-layout
-   backend MUST return the shared 23-entry sequence: `BOOL`, `I2`, `U2`, `I4`,
-   `U4`, `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64`, `F4_E2M1`,
-   `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F8_E8M0`, `F16`, `BF16`,
-   `F32`, `F64`.
-5. A native backend MAY expose a smaller set, but every advertised type MUST
-   pass every shared scenario. It MUST reject a type not in that set before
-   allocating native storage.
+4. `supported_data_types()` MUST return an immutable, nonempty storage span.
+   Standard backends retain the shared 23-entry sequence. For ADD, every CPU,
+   CUDA, ROCm, SYCL, and TTNN backend must accept with `NONE` exactly the 21
+   numeric leaves `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`, `U16`, `I32`,
+   `U32`, `I64`, `U64`, `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`,
+   `F8_E5M2`, `F16`, `BF16`, `F32`, and `F64`. `BOOL` and `F8_E8M0` are
+   excluded from ADD. TTNN also stores `BOOL` but need not store `F8_E8M0`;
+   unsupported numeric SDK types use internal staging or emulation rather than
+   returning `Unsupported`.
+5. A capability table is exact storage capability, not an ADD query. It MUST
+   reject a type not in the advertised set before allocating native storage,
+   while ADD itself is the sole support signal.
 6. `create_tensor` MUST call/observe `TensorSpec::validate()`. Today that
    means rank at least two, nonzero dimensions, checked size arithmetic, a
    declared leaf type, and `QuantizationFormat::NONE`; every other declared
-   quantization format is currently invalid. It MUST reject capability,
-   allocation, context/device, and overflow errors before beginning work.
+   quantization format is invalid.
 7. `create_ops` MUST return an independent queue associated with that exact
-   device. A device may create multiple queues. A queue created by one device
-   MUST reject views from another device instance, even when both instances
-   target the same hardware ordinal.
+   device. A queue created by one device MUST reject foreign views.
 8. A backend factory MUST leave no partially usable device/context behind when
-   initialization fails. An enabled backend with unavailable SDK/hardware is a
-   configuration/runtime failure, never an implicit fallback to CPU.
+   initialization fails. Enabled hardware is never an implicit CPU fallback.
 
 ### 2. Tensor owner and allocation contract
 
@@ -320,56 +318,78 @@ Before considering a backend complete, confirm all of the following:
    stepped, selected, permuted, or nested views.
 4. Same-queue copies execute in call order without an intervening host wait.
    Waiting on the last token must make all earlier queued writes visible.
-### 7. Compute capability contract
+### 7. ADD compute contract
 
-1. `copy` is the only operation every current backend is required to
-   implement. The compute hooks `add`, `mul`, `silu`, `linear`, `rmsnorm`, and
-   `sdpa` remain opt-in; current hooks other than the later ADD implementation
-   report `Unsupported`. A backend MUST NOT claim a capability until it
-   supplies its real semantic, validation, asynchronous, and numerical
-   contract.
-2. An unsupported compute request MUST return the common negative
-   `Unsupported` OID result before submission, sequence consumption, effects,
-   or output mutation. The same rule applies to transformed operands and
-   outputs. It is not a synchronous exception crossing the OID facade.
-3. A future implementation of a compute hook MUST preserve caller-provided
-   operand/output storage, exact device identity, queue ordering, wait-token
-   behavior, and the no-hidden-allocation rule. It requires behavioral tests
-   before it becomes a reported capability.
+1. `add(const TensorView& lhs, const TensorView& rhs, TensorView& out) noexcept`
+   is exactly three views, a common non-virtual facade, and the sole ADD support
+   signal. Positive OIDs accept work; negative values are the six `OidError`
+   results. There is no options object, `add_support`, promotion, quantization
+   codec, capability query, fallback selector, or signature knob.
+2. Validate exact device identity, owners, recognized specs, shapes, view
+   offsets/strides, checked arithmetic, and aliasing before effects or token
+   acceptance. Mismatched recognized leaves or quantization are
+   `InvalidArgument`; only matching `BOOL`, `F8_E8M0`, or recognized non-`NONE`
+   quantization is `Unsupported`; malformed specs and device/shape/view/alias
+   errors are `InvalidArgument`; overflow is `Overflow`; pre-acceptance
+   temporary/metadata/staging/resource, backend, and internal failures map to
+   `ResourceExhausted`, `DeviceError`, and `InternalError`.
+3. Ranks below two are invalid. `[1,1]` broadcasts over every output axis
+   (two scalars yield `[1,1]`); otherwise ranks right-align with conceptual
+   leading ones, each axis equal or one, and output exactly the maximum shape.
+   Singleton coordinates, tiled tails included, map to zero before tile-slot
+   mapping and never read padding. Broadcast materialization is internal.
+4. All three specs have one leaf and no promotion. Integer output is the exact
+   sum modulo `2^w`, low `w` bits, with signed two's-complement and unsigned
+   binary interpretation. Floating values sum as exact reals and encode once
+   with RNE; the reference is required or a finite value within one ULP.
+   OCP MX F4/F6 tables, E4M3FN saturation/NaN, E5M2 infinity, IEEE F16/F32/F64,
+   BF16 specials, gradual underflow/no FTZ or DAZ, zero signs, and NaN/inf
+   classes follow the scalar reference and canonical NaN encodings.
+5. Inputs may overlap each other. Same-owner input/output exact in-place alias
+   is allowed only with identical spec, plane offset, plane strides, and
+   logical mapping; reject every other relationship before submission.
+   Capture both input values before each store, track all three owners through
+   completion, deduplicate exact aliases, and snapshot metadata, not view objects.
+6. ADD is in-order asynchronous (CPU may complete inline), repeat-waitable,
+   and preserves caller ordering and owner lifetimes. Invalid negative, zero,
+   foreign, future, skipped, and unsubmitted waits are rejected; accepted
+   failures are retained and rethrown on every wait. Pre-submit errors do not
+   mutate output or consume a token. Internal staging, conversion, emulation,
+   workspace, and backend tensors are permitted, but operands/results and
+   caller storage, owners, and handles are never allocated or relocated.
 
-### 8. Backend integration and conformance obligations
+### 8. Other compute capabilities
 
-The following suite files are the executable contract. A new backend driver
-must consume the shared harness rather than duplicate a weaker subset.
+All other compute hooks (`mul`, `silu`, `linear`, `rmsnorm`, and `sdpa`) remain
+unsupported and return negative `Unsupported` before submission, mutation, or
+token acceptance. They do not weaken or defer ADD's required contract.
+
+### 9. Backend integration and conformance obligations
+
+The following suite files are the executable contract. A backend driver consumes
+the shared harness but proves its own complete behavior; coexistence is only the
+cross-backend integration proof.
 
 | Contract area | Required harness/scenario | What it proves |
 | --- | --- | --- |
-| Logical bytes and API signatures | `test/backend/backend_conformance_common.hpp` | Independent LSB-first encoding, sentinel readback, token decoding, and all compute view signatures. |
-| Storage and transformed transfers | `run_storage_and_transfer_conformance` | Every advertised type; tile boundaries/padding; rank 2 through 6; full, sliced, selected, permuted, nested, stepped, and reshaped views. |
-| Physical layout | `run_storage_oracle_conformance` | Independent canonical 16x16 layout, padded bytes, and untouched owner planes; a perturbed map must fail. |
-| Asynchronous copy | `run_async_copy_conformance` | Queue order, tokens, idempotent wait, full/offset/stepped/permuted/nested/no-op copies, and bit-for-bit CPU-reference parity. |
-| Copy validation | `run_copy_error_conformance` | Invalid metadata/device rejection before writes/sequence consumption and a waitable identical-window no-op. |
-| Transfer failures | `run_transfer_error_conformance` | Exact-span and canonical-BOOL validation with stable view metadata and handle. |
-| Tokens and lifetime | `run_lifetime_conformance` | Stable owner/view/handle addresses, in-order completion, repeatable wait/failure, foreign tokens, and base queue-ID release behavior. |
-| Compute gaps | `run_compute_capability_conformance` | Unsupported methods fail before output mutation or submission. |
-| Aggregate gate | `run_backend_conformance` | Executes the storage, copy, error, lifetime, and capability scenarios in dependency order. |
-| Multi-backend process | `test/backend/test_backend_coexistence.cpp` | Enabled backend headers/libraries link together; multiple devices and queues execute without a registry or cross-backend interference. |
+| Public declarations and common validation | `test/backend/backend_conformance_common.hpp` (`CommonAddQueue`, `run_add_request_conformance`) | Exact three-view `noexcept` signature, OID errors, precedence, snapshots, aliases, owner registration, and repeat waits. |
+| Independent arithmetic reference | `test/backend/backend_conformance_add.hpp` (`add_oracle::add`) and `test_scalar_add.cpp` | Scalar integer modulo and bounded floating encodings/special classes independent of backend execution. |
+| Physical storage oracle | `test/backend/backend_conformance_oracle.hpp` (`AcceleratorStorageOracle`) | Canonical 16x16 padded mapping and untouched planes; native drivers independently observe storage. |
+| Shared transforms/storage/copies | `test/backend/backend_conformance_copy_storage.hpp` | Logical bytes, transformed leading views, tiles/tails, ownership, and copy behavior. |
+| CPU-local ADD proof | `test/cpu/test_cpu_conformance.cpp` (`CPU conformance: common ADD validation and lifetime policy`; `CPU conformance: ADD is supported and other compute methods reject`) | CPU backend-local validation, ownership, full ADD support, and non-ADD rejection. |
+| CUDA-local ADD proof | `test/cuda/test_cuda_conformance.cpp` (`CUDA ADD accepts every low-width leaf against the oracle`; `CUDA ADD broadcast, transform, tail, and exact alias mapping`; `CUDA ADD retained launch failure keeps owners reusable`) | CUDA full ADD paths, mapping, aliases, and retained failures. |
+| ROCm-local ADD proof | `test/rocm/test_rocm_conformance.cpp` (`ROCm ADD accepts every low-width leaf against the oracle`; `ROCm ADD broadcast, transform, tail, and exact alias mapping`; `ROCm ADD retained launch failure keeps owners reusable`) | ROCm full ADD paths, mapping, aliases, and retained failures. |
+| SYCL-local ADD proof | `test/sycl/test_sycl_conformance.cpp` (`SYCL conformance: ADD requests use native queue and owner registry`) plus `backend_conformance_add.hpp` | SYCL backend-local ADD execution, owner registry, and shared arithmetic coverage. |
+| TTNN-local ADD proof | `test/ttnn/test_ttnn_conformance.cpp` (`TTNN ADD exhaustively covers every compact leaf pair`; `TTNN ADD representative wide leaves match the oracle`; `TTNN ADD broadcast, tail, transformed views, and aliases`; `TTNN ADD retained failure repeats and staging stays reusable`) | TTNN `BOOL` storage, all 21 numeric leaves, native 32x32 staging, and ADD semantics. |
+| Full backend-local gate | `run_backend_conformance` in `backend_conformance_other.hpp` | Each backend's complete shared storage, copy, error, lifetime, capability, and ADD coverage. |
+| Cross-backend coexistence only | `test/backend/test_backend_coexistence.cpp`, target `iom_backend_coexistence_tests`, `Backend coexistence: ADD interleaves across enabled backends` | Independent factories, devices, queues, and interleaved ADD plus copy work coexist without global dispatch; it does not replace backend-local completeness. |
 
-CMake registration uses `add_iom_backend_tests` to create both
-`iom_<backend>_smoke_tests` and `iom_<backend>_conformance_tests`. Link the
-backend library, `libiom`, required vendor runtime libraries, include paths,
-and compile/link options into the appropriate targets. Add the backend to the
-combined coexistence target with a distinct `IOM_COEXIST_<BACKEND>` macro and a
-participant factory that creates two queues plus matching tensors.
+CMake registration uses `add_iom_backend_tests` to create smoke and
+conformance targets. Drivers provide allocator/context setup, CPU reference,
+foreign-device identity checks, hardware gating, and native storage oracles;
+enabled hardware runs and never skips.
 
-The conformance driver supplies backend-specific mechanics only: a valid
-allocator/context setup, CPU reference, foreign-device construction (or the
-nearest independent device that still tests identity rejection when a runtime
-forbids two live contexts), hardware gating, and a native storage oracle. It
-MUST use the candidate's advertised capability span, and it MUST run enabled
-hardware rather than skip it. The shared scenarios define the behavior.
-
-### 9. Contract source map
+### 10. Contract source map
 
 Use these sources when changing or extending the contract:
 
@@ -377,16 +397,18 @@ Use these sources when changing or extending the contract:
   `include/iom/tensor.hpp`, `include/iom/iom.hpp`;
 - standard capability and transfer interface:
   `src/shared/standard_tiled_copy.hpp`;
-- common conformance definitions and independent encoding:
-  `test/backend/backend_conformance_common.hpp`;
-- storage, transfer, copy, and error scenarios:
-  `test/backend/backend_conformance_copy_storage.hpp`;
-- independent physical oracle: `test/backend/backend_conformance_oracle.hpp`;
-- lifetime/capability/full-suite scenarios:
-  `test/backend/backend_conformance_other.hpp`;
-- backend target registration and coexistence:
-  `test/CMakeLists.txt` and `test/backend/test_backend_coexistence.cpp`.
+- common ADD policy and independent scalar oracle:
+  `test/backend/backend_conformance_common.hpp`,
+  `test/backend/backend_conformance_add.hpp`;
+- storage, transfer, copy, and physical oracle:
+  `test/backend/backend_conformance_copy_storage.hpp`,
+  `test/backend/backend_conformance_oracle.hpp`;
+- backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
+  `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
+  `test/sycl/test_sycl_conformance.cpp`, and
+  `test/ttnn/test_ttnn_conformance.cpp`;
+- coexistence integration: `test/backend/test_backend_coexistence.cpp` and
+  `test/CMakeLists.txt`.
 
-If implementation and this document differ, update the implementation,
-conformance suite, `ARCHITECTURE.md`, and this contract together. Do not solve a
-conformance failure by weakening the shared test or special-casing an input.
+If implementation and this document differ, update implementation, conformance,
+`ARCHITECTURE.md`, and this contract together. Do not weaken shared tests.
