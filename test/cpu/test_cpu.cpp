@@ -315,16 +315,18 @@ void expect_storage_matches(
                     "storage diverges from the model at byte " << mismatch);
 }
 
-constexpr std::uint64_t kTokenSequenceBits = 56;
+constexpr std::uint64_t kTokenSequenceBits = 55;
 constexpr std::uint64_t kTokenSequenceMask =
         (std::uint64_t{1} << kTokenSequenceBits) - 1;
 
 std::uint8_t token_queue(iom::oid token) {
-    return static_cast<std::uint8_t>(token >> kTokenSequenceBits);
+    return static_cast<std::uint8_t>(
+            static_cast<std::uint64_t>(token)
+            >> kTokenSequenceBits);
 }
 
 std::uint64_t token_sequence(iom::oid token) {
-    return token & kTokenSequenceMask;
+    return static_cast<std::uint64_t>(token) & kTokenSequenceMask;
 }
 
 constexpr std::initializer_list<iom::DataType> kAllDataTypes = {
@@ -1231,24 +1233,24 @@ TEST_CASE("CPU copy validates before submission and writes") {
     auto other_device = iom::make_cpu_device(other_allocator);
     auto foreign = other_device->create_tensor(spec);
 
-    CHECK_THROWS_AS(
+    CHECK_EQ(
             queue->copy(other_shape->view(), destination->view()),
-            std::invalid_argument);
-    CHECK_THROWS_AS(
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
             queue->copy(destination->view(), other_shape->view()),
-            std::invalid_argument);
-    CHECK_THROWS_AS(
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
             queue->copy(other_type->view(), destination->view()),
-            std::invalid_argument);
-    CHECK_THROWS_AS(
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
             queue->copy(destination->view(), other_type->view()),
-            std::invalid_argument);
-    CHECK_THROWS_AS(
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
             queue->copy(foreign->view(), destination->view()),
-            std::invalid_argument);
-    CHECK_THROWS_AS(
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
             queue->copy(destination->view(), foreign->view()),
-            std::invalid_argument);
+            iom::to_oid(iom::OidError::InvalidArgument));
 
     // Nothing was written and no sequence was consumed.
     expect_storage_matches(*destination, untouched);
@@ -1374,19 +1376,25 @@ TEST_CASE("CPU compute operations reject capability without submitting") {
     const std::vector<std::byte> y_untouched = snapshot_storage(*y);
     const std::vector<std::byte> attn_untouched = snapshot_storage(*attn);
 
-    CHECK_THROWS_AS(queue->add(x->view(), x->view(), y->view()),
-                    std::runtime_error);
-    CHECK_THROWS_AS(queue->mul(x->view(), x->view(), y->view()),
-                    std::runtime_error);
-    CHECK_THROWS_AS(queue->silu(x->view(), y->view()), std::runtime_error);
-    CHECK_THROWS_AS(queue->linear(x->view(), w->view(), y->view()),
-                    std::runtime_error);
-    CHECK_THROWS_AS(queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6f, 1),
-                    std::runtime_error);
-    CHECK_THROWS_AS(
+    CHECK_EQ(
+            queue->add(x->view(), x->view(), y->view()),
+            iom::to_oid(iom::OidError::Unsupported));
+    CHECK_EQ(
+            queue->mul(x->view(), x->view(), y->view()),
+            iom::to_oid(iom::OidError::Unsupported));
+    CHECK_EQ(
+            queue->silu(x->view(), y->view()),
+            iom::to_oid(iom::OidError::Unsupported));
+    CHECK_EQ(
+            queue->linear(x->view(), w->view(), y->view()),
+            iom::to_oid(iom::OidError::Unsupported));
+    CHECK_EQ(
+            queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6f, 1),
+            iom::to_oid(iom::OidError::Unsupported));
+    CHECK_EQ(
             queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
                         attn->view()),
-            std::runtime_error);
+            iom::to_oid(iom::OidError::Unsupported));
 
     expect_storage_matches(*y, y_untouched);
     expect_storage_matches(*attn, attn_untouched);
