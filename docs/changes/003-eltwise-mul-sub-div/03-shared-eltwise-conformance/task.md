@@ -2,8 +2,8 @@
 
 ## Summary
 
-Delivered operation-neutral shared four-operation conformance fixtures, independent-oracle cases, mapping coverage, and backend fault/lifecycle hooks; repaired the missing namespace closure in the shared harness.
+Delivered the operation-neutral shared conformance harness, independent-oracle cases, mapping coverage, backend fault/lifecycle hooks, and repaired missing namespace closures in both common and other harness headers.
 
 ## Verification
 
-- Focused CPU conformance gate: cmake -S . -B build && cmake --build build --target iom_backend_conformance_cpu_tests — blocked before harness compilation by intentional downstream CPU migration of removed ADD-specific hooks; shared harness source validation remains required after task04.
+- Focused CPU build diagnosis: cmake --build build --target iom_backend_conformance_cpu_tests reached downstream CPU migration first, then exposed missing shared-header namespace closures; both closures are now repaired, with full CPU conformance rerun pending downstream leaf replay.

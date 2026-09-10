@@ -623,3 +623,4 @@ inline void run_backend_conformance(
     run_compute_capability_conformance(
             devices.candidate, supported_types, observer, {}, binary_supported);
 }
+}  // namespace iom_conformance
