@@ -2,7 +2,7 @@
 
 ## Summary
 
-Delivered operation-neutral shared four-operation conformance fixtures, independent-oracle cases, mapping coverage, and backend fault/lifecycle hooks.
+Delivered operation-neutral shared four-operation conformance fixtures, independent-oracle cases, mapping coverage, and backend fault/lifecycle hooks; repaired the missing namespace closure in the shared harness.
 
 ## Verification
 

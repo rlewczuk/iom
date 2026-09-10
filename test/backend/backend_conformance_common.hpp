@@ -488,3 +488,4 @@ inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
         CHECK_NOTHROW(queue->wait(token));
     }
 }
+}  // namespace iom_conformance
