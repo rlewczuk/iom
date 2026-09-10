@@ -679,26 +679,25 @@ inline EntryRegistration register_copy_entries(
             destination, fence);
 }
 
-struct AddEntryRegistration {
+struct BinaryEntryRegistration {
     std::array<EntryId, 3> entries{};
     std::size_t count = 0;
 };
-struct AddOwnerRegistration {
+struct BinaryOwnerRegistration {
     const void* identity = nullptr;
     void* address = nullptr;
 };
 
-
-[[nodiscard]] inline AddEntryRegistration register_add_entries(
+[[nodiscard]] inline BinaryEntryRegistration register_binary_entries(
         RegistryState& state, QueueId queue_id, std::uint64_t sequence,
-        std::span<const AddOwnerRegistration> owners, const Fence& fence) {
+        std::span<const BinaryOwnerRegistration> owners, const Fence& fence) {
     std::lock_guard<std::mutex> lock(state.allocation_mutex);
-    AddEntryRegistration result;
+    BinaryEntryRegistration result;
     try {
         for (std::size_t index = 0; index < owners.size(); ++index) {
-            const AddOwnerRegistration owner = owners[index];
+            const BinaryOwnerRegistration owner = owners[index];
             if (owner.identity == nullptr || owner.address == nullptr) {
-                throw std::invalid_argument("ADD owner identity or address is null");
+                throw std::invalid_argument("binary owner identity or address is null");
             }
             bool duplicate = false;
             for (std::size_t prior = 0; prior < index; ++prior) {
@@ -711,7 +710,7 @@ struct AddOwnerRegistration {
                 continue;
             }
             if (result.count == result.entries.size()) {
-                throw std::invalid_argument("too many ADD owners");
+                throw std::invalid_argument("too many binary owners");
             }
             const EntryId id = allocate_registry_id(state.next_entry_id);
             state.registry.register_entry(
@@ -728,8 +727,8 @@ struct AddOwnerRegistration {
     return result;
 }
 
-[[nodiscard]] inline bool release_or_invalidate_add_entries(
-        OutstandingWorkRegistry& registry, const AddEntryRegistration& outcome,
+[[nodiscard]] inline bool release_or_invalidate_binary_entries(
+        OutstandingWorkRegistry& registry, const BinaryEntryRegistration& outcome,
         bool failure, bool fence_succeeded) noexcept {
     const std::span<const EntryId> ids(outcome.entries.data(), outcome.count);
     if (failure || !fence_succeeded) {

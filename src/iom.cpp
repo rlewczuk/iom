@@ -541,8 +541,20 @@ namespace iom {
             }
             return false;
         }
+        bool div_numeric_leaf(DataType value) noexcept {
+            switch (value) {
+                case DataType::F4_E2M1: case DataType::F6_E2M3:
+                case DataType::F6_E3M2: case DataType::F8_E4M3FN:
+                case DataType::F8_E5M2: case DataType::F16:
+                case DataType::BF16: case DataType::F32:
+                case DataType::F64:
+                    return true;
+                default:
+                    return false;
+            }
+        }
 
-        void validate_add_spec(const TensorSpec& spec) {
+        void validate_binary_spec(const TensorSpec& spec) {
             (void)detail::leaf_bits(spec.data_type);
             if (!recognized_quantization(spec.quantization)) {
                 throw std::invalid_argument("unknown quantization format");
@@ -558,7 +570,7 @@ namespace iom {
             }
         }
 
-        std::size_t checked_plane_count(const TensorShape& shape) {
+        std::size_t checked_binary_plane_count(const TensorShape& shape) {
             std::size_t planes = 1;
             const std::span<const std::size_t> dimensions =
                     shape.dimensions();
@@ -570,7 +582,7 @@ namespace iom {
             return planes;
         }
 
-        void validate_add_view(
+        void validate_binary_view(
                 const Device& device, const TensorView& view) {
             const Tensor* owner = view.owner_identity();
             if (owner == nullptr) {
@@ -623,7 +635,7 @@ namespace iom {
                                 "ADD plane address overflows"),
                         "ADD plane address overflows");
             }
-            if (max_plane >= checked_plane_count(owner_spec.shape)) {
+            if (max_plane >= checked_binary_plane_count(owner_spec.shape)) {
                 throw std::invalid_argument(
                         "ADD view addresses outside its owner");
             }
@@ -656,72 +668,63 @@ namespace iom {
     }  // namespace
 
 
-    DeviceOps::AddViewSnapshot DeviceOps::snapshot_add_view(
-                const TensorView& view,
-                std::span<const std::size_t> result_dimensions) {
-            const std::span<const std::size_t> dimensions =
-                    view.spec().shape.dimensions();
-            const std::size_t rank_offset =
-                    result_dimensions.size() - dimensions.size();
-            const std::size_t result_leading =
-                    result_dimensions.size() - 2;
-            std::vector<std::size_t> logical_plane_strides(
-                    result_leading, 0);
-            bool broadcasts = dimensions.size() != result_dimensions.size();
-            for (std::size_t axis = 0; axis < result_leading; ++axis) {
-                if (axis < rank_offset) {
-                    broadcasts = broadcasts || result_dimensions[axis] != 1;
-                    continue;
-                }
-                const std::size_t source_axis = axis - rank_offset;
-                if (dimensions[source_axis] == 1
-                        && result_dimensions[axis] != 1) {
-                    broadcasts = true;
-                    continue;
-                }
-                logical_plane_strides[axis] =
-                        view.plane_strides()[source_axis];
+    DeviceOps::BinaryViewSnapshot DeviceOps::snapshot_binary_view(
+            const TensorView& view,
+            std::span<const std::size_t> result_dimensions) {
+        const std::span<const std::size_t> dimensions =
+                view.spec().shape.dimensions();
+        const std::size_t rank_offset =
+                result_dimensions.size() - dimensions.size();
+        const std::size_t result_leading =
+                result_dimensions.size() - 2;
+        std::vector<std::size_t> logical_plane_strides(
+                result_leading, 0);
+        bool broadcasts = dimensions.size() != result_dimensions.size();
+        for (std::size_t axis = 0; axis < result_leading; ++axis) {
+            if (axis < rank_offset) {
+                broadcasts = broadcasts || result_dimensions[axis] != 1;
+                continue;
             }
-            const bool broadcast_rows =
-                    dimensions[dimensions.size() - 2] == 1
-                    && result_dimensions[result_dimensions.size() - 2] != 1;
-            const bool broadcast_columns =
-                    dimensions.back() == 1
-                    && result_dimensions.back() != 1;
-            broadcasts =
-                    broadcasts || broadcast_rows || broadcast_columns;
-            return DeviceOps::AddViewSnapshot{
-                    view.spec(),
-                    &view.device(),
-                    view.owner_identity(),
-                    const_cast<void*>(view.native_handle()),
-                    view.plane_offset(),
-                    {view.plane_strides().begin(),
-                     view.plane_strides().end()},
-                    std::move(logical_plane_strides),
-                    broadcast_rows,
-                    broadcast_columns,
-                    broadcasts};
+            const std::size_t source_axis = axis - rank_offset;
+            if (dimensions[source_axis] == 1
+                    && result_dimensions[axis] != 1) {
+                broadcasts = true;
+                continue;
+            }
+            logical_plane_strides[axis] =
+                    view.plane_strides()[source_axis];
         }
+        const bool broadcast_rows =
+                dimensions[dimensions.size() - 2] == 1
+                && result_dimensions[result_dimensions.size() - 2] != 1;
+        const bool broadcast_columns =
+                dimensions.back() == 1
+                && result_dimensions.back() != 1;
+        broadcasts = broadcasts || broadcast_rows || broadcast_columns;
+        return DeviceOps::BinaryViewSnapshot{
+                view.spec(), &view.device(), view.owner_identity(),
+                const_cast<void*>(view.native_handle()), view.plane_offset(),
+                {view.plane_strides().begin(), view.plane_strides().end()},
+                std::move(logical_plane_strides), broadcast_rows,
+                broadcast_columns, broadcasts};
+    }
 
-    DeviceOps::AddRequest DeviceOps::validate_add(
-            const Device& device, const TensorView& lhs,
-            const TensorView& rhs, const TensorView& out) {
-        validate_add_spec(lhs.spec());
-        validate_add_spec(rhs.spec());
-        validate_add_spec(out.spec());
-
+    DeviceOps::BinaryRequest DeviceOps::validate_binary(
+            const Device& device, BinaryOperation operation,
+            const TensorView& lhs, const TensorView& rhs,
+            const TensorView& out) {
+        validate_binary_spec(lhs.spec());
+        validate_binary_spec(rhs.spec());
+        validate_binary_spec(out.spec());
         if (lhs.spec().data_type != rhs.spec().data_type
                 || lhs.spec().data_type != out.spec().data_type
                 || lhs.spec().quantization != rhs.spec().quantization
                 || lhs.spec().quantization != out.spec().quantization) {
-            throw std::invalid_argument("ADD specifications do not match");
+            throw std::invalid_argument("binary specifications do not match");
         }
-
-        validate_add_view(device, lhs);
-        validate_add_view(device, rhs);
-        validate_add_view(device, out);
-
+        validate_binary_view(device, lhs);
+        validate_binary_view(device, rhs);
+        validate_binary_view(device, out);
         const auto lhs_dims = lhs.spec().shape.dimensions();
         const auto rhs_dims = rhs.spec().shape.dimensions();
         const std::size_t rank = std::max(lhs_dims.size(), rhs_dims.size());
@@ -735,25 +738,21 @@ namespace iom {
                     : rhs_dims[i - (rank - rhs_dims.size())];
             if (lhs_axis != rhs_axis && lhs_axis != 1 && rhs_axis != 1) {
                 throw std::invalid_argument(
-                        "ADD shapes are not broadcast compatible");
+                        "binary shapes are not broadcast compatible");
             }
             result[i] = std::max(lhs_axis, rhs_axis);
         }
-        const auto same_shape = [&result](const TensorShape& shape) {
-            return shape.dimensions().size() == result.size()
-                    && std::equal(
-                            shape.dimensions().begin(),
-                            shape.dimensions().end(), result.begin());
-        };
-        if (!same_shape(out.spec().shape)) {
-            throw std::invalid_argument("ADD output shape is incorrect");
+        if (out.spec().shape.dimensions().size() != result.size()
+                || !std::equal(out.spec().shape.dimensions().begin(),
+                               out.spec().shape.dimensions().end(),
+                               result.begin())) {
+            throw std::invalid_argument("binary output shape is incorrect");
         }
-
-        AddViewSnapshot lhs_snapshot = snapshot_add_view(lhs, result);
-        AddViewSnapshot rhs_snapshot = snapshot_add_view(rhs, result);
-        AddViewSnapshot out_snapshot = snapshot_add_view(out, result);
-        const auto exact_alias = [](const AddViewSnapshot& input,
-                                    const AddViewSnapshot& output) {
+        BinaryViewSnapshot lhs_snapshot = snapshot_binary_view(lhs, result);
+        BinaryViewSnapshot rhs_snapshot = snapshot_binary_view(rhs, result);
+        BinaryViewSnapshot out_snapshot = snapshot_binary_view(out, result);
+        const auto exact_alias = [](const BinaryViewSnapshot& input,
+                                    const BinaryViewSnapshot& output) {
             return !input.broadcasts
                     && input.owner_identity == output.owner_identity
                     && input.spec == output.spec
@@ -768,20 +767,19 @@ namespace iom {
                     && !exact_alias(lhs_snapshot, out_snapshot))
                 || (rhs_snapshot.owner_identity == out_snapshot.owner_identity
                     && !exact_alias(rhs_snapshot, out_snapshot))) {
-            throw std::invalid_argument("ADD input/output alias is forbidden");
+            throw std::invalid_argument("binary input/output alias is forbidden");
         }
-
         if (lhs.spec().quantization != QuantizationFormat::NONE
                 || lhs.spec().data_type == DataType::BOOL
                 || lhs.spec().data_type == DataType::F8_E8M0
-                || !add_numeric_leaf(lhs.spec().data_type)) {
+                || !add_numeric_leaf(lhs.spec().data_type)
+                || (operation == BinaryOperation::Div
+                    && !div_numeric_leaf(lhs.spec().data_type))) {
             throw UnsupportedOperation();
         }
-        return AddRequest{
-                std::move(lhs_snapshot),
-                std::move(rhs_snapshot),
-                std::move(out_snapshot),
-                TensorShape{std::move(result)}};
+        return BinaryRequest{operation, std::move(lhs_snapshot),
+                             std::move(rhs_snapshot), std::move(out_snapshot),
+                             TensorShape{std::move(result)}};
     }
 
 
@@ -829,7 +827,6 @@ namespace iom {
         }
         return *device_;
     }
-
     void DeviceOps::validate_views(
             const Device& device,
             std::initializer_list<const TensorView*> views) {
@@ -840,16 +837,12 @@ namespace iom {
             }
         }
     }
+    oid DeviceOps::binary_impl(const BinaryRequest&) {
+        throw UnsupportedOperation();
+    }
 
     oid DeviceOps::copy_impl(
             const TensorView&, TensorView&) {
-        throw UnsupportedOperation();
-    }
-    oid DeviceOps::add_impl(const AddRequest&) {
-        throw UnsupportedOperation();
-    }
-    oid DeviceOps::mul_impl(
-            const TensorView&, const TensorView&, TensorView&) {
         throw UnsupportedOperation();
     }
     oid DeviceOps::silu_impl(const TensorView&, TensorView&) {
@@ -907,23 +900,53 @@ namespace iom {
             return invoke_failure(std::current_exception());
         }
     }
-
     oid DeviceOps::add(
             const TensorView& lhs, const TensorView& rhs,
             TensorView& out) noexcept {
         try {
-            AddRequest request = validate_add(queue_device(), lhs, rhs, out);
-            return invoke(add_impl(request));
+            BinaryRequest request =
+                    validate_binary(queue_device(), BinaryOperation::Add,
+                                    lhs, rhs, out);
+            return invoke(binary_impl(request));
         } catch (...) {
             return invoke_failure(std::current_exception());
         }
     }
 
     oid DeviceOps::mul(
-            const TensorView& a, const TensorView& b, TensorView& c) noexcept {
+            const TensorView& lhs, const TensorView& rhs,
+            TensorView& out) noexcept {
         try {
-            validate_views(queue_device(), {&a, &b, &c});
-            return invoke(mul_impl(a, b, c));
+            BinaryRequest request =
+                    validate_binary(queue_device(), BinaryOperation::Mul,
+                                    lhs, rhs, out);
+            return invoke(binary_impl(request));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::sub(
+            const TensorView& lhs, const TensorView& rhs,
+            TensorView& out) noexcept {
+        try {
+            BinaryRequest request =
+                    validate_binary(queue_device(), BinaryOperation::Sub,
+                                    lhs, rhs, out);
+            return invoke(binary_impl(request));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    oid DeviceOps::div(
+            const TensorView& lhs, const TensorView& rhs,
+            TensorView& out) noexcept {
+        try {
+            BinaryRequest request =
+                    validate_binary(queue_device(), BinaryOperation::Div,
+                                    lhs, rhs, out);
+            return invoke(binary_impl(request));
         } catch (...) {
             return invoke_failure(std::current_exception());
         }

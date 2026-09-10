@@ -798,11 +798,11 @@ public:
         bool broadcasts;
     };
 
-    struct AddRecord {
+    struct BinaryRecord {
         std::uint64_t sequence;
         std::array<AddViewRecord, 3> views;
         std::vector<std::size_t> result_shape;
-        iom::detail::AddEntryRegistration entries;
+        iom::detail::BinaryEntryRegistration entries;
         bool retained_failure;
     };
 
@@ -821,7 +821,7 @@ public:
         next_add_failure_ = failure;
     }
 
-    [[nodiscard]] const std::vector<AddRecord>& add_records() const noexcept {
+    [[nodiscard]] const std::vector<BinaryRecord>& add_records() const noexcept {
         return add_records_;
     }
 
@@ -830,11 +830,11 @@ public:
     }
 
     void finish_add(std::uint64_t sequence) {
-        for (const AddRecord& record : add_records_) {
+        for (const BinaryRecord& record : add_records_) {
             if (record.sequence != sequence) {
                 continue;
             }
-            (void)iom::detail::release_or_invalidate_add_entries(
+            (void)iom::detail::release_or_invalidate_binary_entries(
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             complete(sequence);
@@ -866,7 +866,7 @@ protected:
         });
     }
 
-    iom::oid add_impl(const AddRequest& request) override {
+    iom::oid binary_impl(const BinaryRequest& request) override {
         const AddFailure failure =
                 std::exchange(next_add_failure_, AddFailure::none);
         switch (failure) {
@@ -885,13 +885,13 @@ protected:
         fence.invoke = [](const iom::detail::Fence&) noexcept {
             return iom::detail::FenceResult::pending();
         };
-        return submit_add(
+        return submit_binary(
                 request, registry_state_, registry_queue_id_, fence,
                 [this, failure](
-                        std::uint64_t sequence, const AddRequest& snapshot,
-                        iom::detail::AddEntryRegistration entries) {
+                        std::uint64_t sequence, const BinaryRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
                     const auto record_view =
-                            [](const AddViewSnapshot& view) {
+                            [](const BinaryViewSnapshot& view) {
                                 return AddViewRecord{
                                         view.spec,
                                         view.device_identity,
@@ -904,7 +904,7 @@ protected:
                                         view.broadcast_columns,
                                         view.broadcasts};
                             };
-                    AddRecord record{
+                    BinaryRecord record{
                             sequence,
                             {record_view(snapshot.lhs),
                              record_view(snapshot.rhs),
@@ -924,12 +924,6 @@ protected:
                 });
     }
 
-    iom::oid mul_impl(const iom::TensorView&, const iom::TensorView&,
-                      iom::TensorView&) override {
-        return submit([&](std::uint64_t sequence) {
-            submissions.push_back({sequence, "mul"});
-        });
-    }
 
     iom::oid silu_impl(const iom::TensorView& x, iom::TensorView& y) override {
         silu_aliased = &x == &y;
@@ -964,7 +958,7 @@ private:
     iom::detail::RegistryState registry_state_;
     iom::detail::QueueId registry_queue_id_ =
             iom::detail::allocate_queue_id(registry_state_);
-    std::vector<AddRecord> add_records_;
+    std::vector<BinaryRecord> add_records_;
     AddFailure next_add_failure_ = AddFailure::none;
 };
 
@@ -1852,6 +1846,12 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         decltype(&DeviceOps::linear),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
     static_assert(std::is_same_v<
+        decltype(&DeviceOps::sub),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::div),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+    static_assert(std::is_same_v<
         decltype(&DeviceOps::rmsnorm),
         iom::oid (DeviceOps::*)(const TensorView&, TensorView&, const TensorView&,
                                 float, size_t) noexcept>);
@@ -1935,7 +1935,7 @@ TEST_CASE("ADD accepts every numeric NONE leaf through immutable fake snapshots"
         REQUIRE(iom::oid_is_token(token));
         CHECK_EQ(token_sequence(token), expected_sequence);
         REQUIRE_EQ(queue.add_records().size(), expected_sequence);
-        const FakeQueue::AddRecord& record = queue.add_records().back();
+        const FakeQueue::BinaryRecord& record = queue.add_records().back();
         CHECK_EQ(record.sequence, expected_sequence);
         CHECK(record.views[0].spec == lhs.view().spec());
         CHECK(record.views[1].spec == rhs.view().spec());
@@ -2108,7 +2108,7 @@ TEST_CASE("ADD snapshots broadcast and transformed mappings before temporaries d
     const iom::oid broadcast =
             queue.add(lhs.view(), rhs.view(), out.view());
     REQUIRE(iom::oid_is_token(broadcast));
-    const FakeQueue::AddRecord& broadcast_record = queue.add_records().back();
+    const FakeQueue::BinaryRecord& broadcast_record = queue.add_records().back();
     CHECK_EQ(
             broadcast_record.result_shape,
             std::vector<std::size_t>({2, 4, 3, 5, 17, 33}));
@@ -2135,7 +2135,7 @@ TEST_CASE("ADD snapshots broadcast and transformed mappings before temporaries d
             transformed_rhs.view().slice(0, 0, 2).permute(span_of({1, 0})),
             out_view);
     REQUIRE(iom::oid_is_token(transformed));
-    const FakeQueue::AddRecord& transformed_record =
+    const FakeQueue::BinaryRecord& transformed_record =
             queue.add_records().back();
     CHECK_EQ(transformed_record.views[0].plane_offset, 3);
     CHECK_EQ(

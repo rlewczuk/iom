@@ -241,21 +241,18 @@ namespace iom {
         void wait(oid token);
 
         /**
-         * Common `noexcept` OID facades. Successful tokens encode queue ID q
-         * in bits 55..62 for q in [1,255], with sequence 1..2^55-1 in the
-         * low 55 bits; synchronous failures return OidError values.
-         * `add` is exactly the three-view signature below and the sole ADD
-         * support signal. It validates device, owner, spec, shape, view,
-         * checked arithmetic, and aliasing before matching-spec support:
-         * recognized BOOL/F8_E8M0/non-NONE quantization is Unsupported only
-         * after mismatch checks; malformed or mismatched inputs are
-         * InvalidArgument.
+         * Common `noexcept` OID facades for three-view binary operations.
+         * Validation and lifetime ownership are shared by all operations.
          */
         oid copy(const TensorView& source, TensorView& destination) noexcept;
         oid add(const TensorView& lhs, const TensorView& rhs,
                 TensorView& out) noexcept;
-        oid mul(const TensorView& a, const TensorView& b,
-                TensorView& c) noexcept;
+        oid mul(const TensorView& lhs, const TensorView& rhs,
+                TensorView& out) noexcept;
+        oid sub(const TensorView& lhs, const TensorView& rhs,
+                TensorView& out) noexcept;
+        oid div(const TensorView& lhs, const TensorView& rhs,
+                TensorView& out) noexcept;
         oid silu(const TensorView& x, TensorView& y) noexcept;
         oid linear(const TensorView& x, const TensorView& w,
                    TensorView& y) noexcept;
@@ -271,12 +268,9 @@ namespace iom {
          * facades retain common validation, error mapping, token encoding,
          * queue ordering, and lifetime registration.
          */
-        /**
-         * Immutable backend-neutral ADD metadata. logical_plane_strides is
-         * aligned to the result's leading axes; zero is an internal broadcast
-         * marker and is never exposed as TensorView stride metadata.
-         */
-        struct AddViewSnapshot {
+        enum class BinaryOperation { Add, Mul, Sub, Div };
+
+        struct BinaryViewSnapshot {
             TensorSpec spec;
             const Device* device_identity;
             const Tensor* owner_identity;
@@ -289,10 +283,11 @@ namespace iom {
             bool broadcasts;
         };
 
-        struct AddRequest {
-            AddViewSnapshot lhs;
-            AddViewSnapshot rhs;
-            AddViewSnapshot out;
+        struct BinaryRequest {
+            BinaryOperation operation;
+            BinaryViewSnapshot lhs;
+            BinaryViewSnapshot rhs;
+            BinaryViewSnapshot out;
             TensorShape result_shape;
         };
 
@@ -301,9 +296,7 @@ namespace iom {
 
         virtual oid copy_impl(
                 const TensorView& source, TensorView& destination);
-        virtual oid add_impl(const AddRequest& request);
-        virtual oid mul_impl(const TensorView& a, const TensorView& b,
-                             TensorView& c);
+        virtual oid binary_impl(const BinaryRequest& request);
         virtual oid silu_impl(const TensorView& x, TensorView& y);
         virtual oid linear_impl(const TensorView& x, const TensorView& w,
                                 TensorView& y);
@@ -319,10 +312,11 @@ namespace iom {
                 std::uint64_t sequence) noexcept;
         void record_post_completion_failure(
                 std::uint64_t sequence, std::exception_ptr failure);
-        [[nodiscard]] static AddRequest validate_add(
-                const Device& device, const TensorView& lhs,
-                const TensorView& rhs, const TensorView& out);
-        [[nodiscard]] static AddViewSnapshot snapshot_add_view(
+        [[nodiscard]] static BinaryRequest validate_binary(
+                const Device& device, BinaryOperation operation,
+                const TensorView& lhs, const TensorView& rhs,
+                const TensorView& out);
+        [[nodiscard]] static BinaryViewSnapshot snapshot_binary_view(
                 const TensorView& view,
                 std::span<const std::size_t> result_dimensions);
         static void validate_copy(
@@ -362,30 +356,20 @@ namespace iom {
             }
             return encode_token(sequence);
         }
-        /**
-         * Backend ADD queues use this after their pre-acceptance resources
-         * and fence are ready. It reserves the common sequence, registers
-         * each distinct owner before queue_work may submit backend work, and
-         * rolls registrations back if queue_work rejects the submission.
-         * queue_work must retain the returned registration in its queued
-         * outcome and release or invalidate it at terminal completion.
-         */
+
         template <typename QueueWork>
-        oid submit_add(
-                const AddRequest& request, detail::RegistryState& state,
+        oid submit_binary(
+                const BinaryRequest& request, detail::RegistryState& state,
                 detail::QueueId queue_id, const detail::Fence& fence,
                 QueueWork queue_work) {
             return submit([&](std::uint64_t sequence) {
-                const std::array<detail::AddOwnerRegistration, 3> owners{{
-                        {request.lhs.owner_identity,
-                         request.lhs.native_handle},
-                        {request.rhs.owner_identity,
-                         request.rhs.native_handle},
-                        {request.out.owner_identity,
-                         request.out.native_handle},
+                const std::array<detail::BinaryOwnerRegistration, 3> owners{{
+                        {request.lhs.owner_identity, request.lhs.native_handle},
+                        {request.rhs.owner_identity, request.rhs.native_handle},
+                        {request.out.owner_identity, request.out.native_handle},
                 }};
-                detail::AddEntryRegistration entries =
-                        detail::register_add_entries(
+                detail::BinaryEntryRegistration entries =
+                        detail::register_binary_entries(
                                 state, queue_id, sequence, owners, fence);
                 try {
                     queue_work(sequence, request, entries);
