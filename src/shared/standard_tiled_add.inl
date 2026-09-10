@@ -33,12 +33,13 @@ namespace {
 constexpr std::uint64_t kAddTile = TensorSpec::TILE;
 constexpr std::uint64_t kAddTileSlots = kAddTile * kAddTile;
 
-struct AddMetadata {
+struct BinaryMetadata {
     std::uint64_t rows;
     std::uint64_t columns;
     std::uint64_t total_words;
     std::uint32_t bits;
     std::uint32_t type;
+    std::uint32_t operation;
     std::uint32_t rank;
     std::uint64_t out_offset;
     std::uint64_t lhs_offset;
@@ -73,7 +74,7 @@ struct AddMetadata {
     }
     return left + right;
 }
-[[nodiscard]] std::size_t add_metadata_storage_bytes(
+[[nodiscard]] std::size_t binary_metadata_storage_bytes(
         std::size_t rank) {
     const std::size_t arrays = add_checked_mul(
             add_checked_mul(
@@ -81,7 +82,7 @@ struct AddMetadata {
                     "ADD metadata rank storage overflows"),
             4, "ADD metadata rank storage overflows");
     return add_checked_add(
-            sizeof(AddMetadata), arrays,
+            sizeof(BinaryMetadata), arrays,
             "ADD metadata storage size overflows");
 }
 
@@ -222,31 +223,63 @@ IOM_GPU_DEVICE std::uint64_t add_encode(double x, AddFormat f) noexcept {
 }
 
 IOM_GPU_DEVICE std::uint64_t add_integer(
-        std::uint64_t a, std::uint64_t b, unsigned bits) noexcept {
-    // Two's-complement and unsigned ADD share the low-w-bits modulo sum.
-    return bits == 64 ? a + b : (a + b) & ((std::uint64_t{1} << bits) - 1);
+        std::uint64_t a, std::uint64_t b, unsigned bits,
+        std::uint32_t operation) noexcept {
+    const std::uint64_t mask =
+            bits == 64 ? ~std::uint64_t{} : (std::uint64_t{1} << bits) - 1;
+    if (operation == 1) return (a * b) & mask;
+    if (operation == 2) return (a - b) & mask;
+    if (operation == 3) return 0;
+    return (a + b) & mask;
 }
 
 IOM_GPU_DEVICE std::uint64_t add_value(
         std::uint32_t type, std::uint64_t a, std::uint64_t b,
-        unsigned bits) noexcept {
+        unsigned bits, std::uint32_t operation) noexcept {
     if (type <= static_cast<std::uint32_t>(DataType::U64)) {
-        return add_integer(a, b, bits);
+        return add_integer(a, b, bits, operation);
     }
     const AddFormat f = add_format(type);
     const double x = add_decode(a, f);
     const double y = add_decode(b, f);
     double z;
-    if (isnan(x) || isnan(y)
-            || (isinf(x) && isinf(y) && signbit(x) != signbit(y))) {
+    if (isnan(x) || isnan(y)) {
+        z = add_quiet_nan();
+    } else if (operation == 1) {
+        if ((isinf(x) && y == 0) || (isinf(y) && x == 0)) {
+            z = add_quiet_nan();
+        } else {
+            z = x * y;
+            if (f.bits == 64 && isinf(z) && isfinite(x) && isfinite(y)) {
+                z = signbit(x) != signbit(y)
+                        ? -add_max_finite() : add_max_finite();
+            }
+        }
+    } else if (operation == 2) {
+        if (isinf(x) && isinf(y) && signbit(x) == signbit(y)) {
+            z = add_quiet_nan();
+        } else {
+            z = x - y;
+            if (f.bits == 64 && isinf(z) && isfinite(x) && isfinite(y))
+                z = signbit(z) ? -add_max_finite() : add_max_finite();
+        }
+    } else if (operation == 3) {
+        if ((x == 0 && y == 0) || (isinf(x) && isinf(y))) {
+            z = add_quiet_nan();
+        } else {
+            z = x / y;
+            if (f.bits == 64 && isinf(z) && isfinite(x) && isfinite(y)
+                    && y != 0)
+                z = signbit(x) != signbit(y)
+                        ? -add_max_finite() : add_max_finite();
+        }
+    } else if (isinf(x) && isinf(y) && signbit(x) != signbit(y)) {
         z = add_quiet_nan();
     } else if (x == 0 && y == 0) {
         z = (signbit(x) && signbit(y)) ? -0.0 : 0.0;
     } else {
         z = x + y;
-        if (z == 0) {
-            z = 0.0;
-        }
+        if (z == 0) z = 0.0;
     }
     return add_encode(z, f);
 }
@@ -308,9 +341,9 @@ IOM_GPU_DEVICE std::uint64_t add_plane_slot(
             + (row % kAddTile) * kAddTile + column % kAddTile;
 }
 
-IOM_GPU_DEVICE void add_body(
+IOM_GPU_DEVICE void binary_body(
         const unsigned char* lhs, const unsigned char* rhs,
-        unsigned char* out, const AddMetadata& m) noexcept {
+        unsigned char* out, const BinaryMetadata& m) noexcept {
     const std::uint64_t padded_rows =
             (m.rows + kAddTile - 1) / kAddTile * kAddTile;
     const std::uint64_t padded_columns =
@@ -379,7 +412,7 @@ IOM_GPU_DEVICE void add_body(
             const std::uint64_t b = add_load_bits(
                     rhs, rhs_slot * m.bits, m.bits);
             const std::uint64_t value =
-                    add_value(m.type, a, b, m.bits);
+                    add_value(m.type, a, b, m.bits, m.operation);
 
             const std::uint64_t lo = slot_bit > base ? slot_bit : base;
             const std::uint64_t hi =
@@ -397,29 +430,29 @@ IOM_GPU_DEVICE void add_body(
     }
 }
 
-IOM_GPU_GLOBAL void grid_stride_add_kernel(
+IOM_GPU_GLOBAL void grid_stride_binary_kernel(
         const unsigned char* lhs, const unsigned char* rhs,
-        unsigned char* out, AddMetadata metadata) {
-    add_body(lhs, rhs, out, metadata);
+        unsigned char* out, BinaryMetadata metadata) {
+    binary_body(lhs, rhs, out, metadata);
 }
 
 template <typename Policy>
-void launch_grid_stride_add(
+void launch_grid_stride_binary(
         typename Policy::stream_type stream, const unsigned char* lhs,
         const unsigned char* rhs, unsigned char* out,
-        const AddMetadata& metadata) {
+        const BinaryMetadata& metadata) {
     const std::uint64_t launch_words =
             add_checked_add(metadata.total_words, 255,
                     "ADD launch word count overflows");
     const unsigned int blocks = static_cast<unsigned int>(
             launch_words / 256 < 65535 ? launch_words / 256 : 65535);
     IOM_LAUNCH_KERNEL(
-            grid_stride_add_kernel, blocks, 256, stream, lhs, rhs, out,
+            grid_stride_binary_kernel, blocks, 256, stream, lhs, rhs, out,
             metadata);
 }
 
 template <typename Request>
-[[nodiscard]] AddMetadata make_add_metadata(const Request& request) {
+[[nodiscard]] BinaryMetadata make_binary_metadata(const Request& request) {
     const auto dimensions = request.result_shape.dimensions();
     if (dimensions.size() < 2) {
         throw std::invalid_argument("ADD rank below tiled matrix rank");
@@ -431,7 +464,7 @@ template <typename Request>
                 "ADD metadata rank representation overflows");
     }
     const std::size_t rank = dimensions.size();
-    AddMetadata metadata{};
+    BinaryMetadata metadata{};
     metadata.rank = static_cast<std::uint32_t>(rank);
     metadata.rows = dimensions[rank - 2];
     metadata.columns = dimensions[rank - 1];
@@ -439,6 +472,8 @@ template <typename Request>
             leaf_bits(request.out.spec.data_type));
     metadata.type =
             static_cast<std::uint32_t>(request.out.spec.data_type);
+    metadata.operation =
+            static_cast<std::uint32_t>(request.operation);
     metadata.out_offset = request.out.plane_offset;
     metadata.lhs_offset = request.lhs.plane_offset;
     metadata.rhs_offset = request.rhs.plane_offset;
@@ -490,16 +525,16 @@ template <typename Request>
 }
 
 template <typename Request>
-void write_add_metadata(
+void write_binary_metadata(
         void* host_storage, const void* device_storage,
         const Request& request) {
     const auto dimensions = request.result_shape.dimensions();
     const std::size_t rank = dimensions.size();
-    AddMetadata metadata = make_add_metadata(request);
+    BinaryMetadata metadata = make_binary_metadata(request);
     auto* host_bytes = static_cast<std::byte*>(host_storage);
     const auto* device_bytes =
             static_cast<const std::byte*>(device_storage);
-    const std::size_t arrays_offset = sizeof(AddMetadata);
+    const std::size_t arrays_offset = sizeof(BinaryMetadata);
     auto* host_dims = reinterpret_cast<std::uint64_t*>(
             host_bytes + arrays_offset);
     auto* host_lhs_strides = host_dims + rank;
@@ -525,7 +560,7 @@ void write_add_metadata(
     metadata.lhs_strides = device_dims + rank;
     metadata.rhs_strides = device_dims + rank * 2;
     metadata.out_strides = device_dims + rank * 3;
-    *reinterpret_cast<AddMetadata*>(host_storage) = metadata;
+    *reinterpret_cast<BinaryMetadata*>(host_storage) = metadata;
 }
 
 }  // namespace

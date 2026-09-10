@@ -81,9 +81,9 @@ class GpuQueue final : public DeviceOps {
         const TensorView* source = nullptr;
         TensorView* destination = nullptr;
         bool no_op = false;
-        bool is_add = false;
-        std::optional<AddRequest> add_request;
-        detail::AddEntryRegistration add_entries{};
+        bool is_binary = false;
+        std::optional<BinaryRequest> binary_request;
+        detail::BinaryEntryRegistration binary_entries{};
         std::shared_ptr<typename EventRing::Submission> submission;
         void* fence = nullptr;
         detail::EntryId source_entry_id = 0;
@@ -108,9 +108,9 @@ class GpuQueue final : public DeviceOps {
 
     struct GpuOutcome {
         detail::SequenceOutcome common{};
-        detail::AddEntryRegistration add_entries{};
+        detail::BinaryEntryRegistration binary_entries{};
         std::exception_ptr retained_failure;
-        bool is_add = false;
+        bool is_binary = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -231,14 +231,16 @@ public:
                 });
     }
 
-    oid add_impl(const AddRequest& request) override {
+    oid binary_impl(const BinaryRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
         // Validate rank-dependent arithmetic and reserve the complete
         // metadata representation before accepting the request. The slot is
         // retained by the completion submission once the worker receives it.
         const std::size_t metadata_bytes =
-                detail::add_metadata_storage_bytes(
+                detail::binary_metadata_storage_bytes(
                         request.result_shape.dimensions().size());
-        (void)detail::make_add_metadata(request);
+        (void)detail::make_binary_metadata(request);
         Policy::activate(context_);
         const std::size_t metadata_slot = metadata_pool_.acquire();
         try {
@@ -246,18 +248,18 @@ public:
                     metadata_slot, metadata_bytes);
             auto submission = state_->acquire();
             const detail::Fence fence = build_fence(submission, nullptr);
-            return submit_add(
+            return submit_binary(
                     request, *registry_state_, registry_queue_id_, fence,
                     [this, submission = std::move(submission),
                      metadata_slot](
                             std::uint64_t sequence,
-                            const AddRequest& captured,
-                            detail::AddEntryRegistration entries) mutable {
+                            const BinaryRequest& captured,
+                            detail::BinaryEntryRegistration entries) mutable {
                         Task task;
                         task.sequence = sequence;
-                        task.is_add = true;
-                        task.add_request.emplace(captured);
-                        task.add_entries = entries;
+                        task.is_binary = true;
+                        task.binary_request.emplace(captured);
+                        task.binary_entries = entries;
                         task.submission = std::move(submission);
                         task.metadata_lease = MetadataLease{
                                 &metadata_pool_, metadata_slot};
@@ -271,11 +273,11 @@ public:
 
 private:
     void execute(Task& task) {
-        if (task.is_add) {
+        if (task.is_binary) {
             Policy::activate(context_);
             // Reserve the outcome — and its registration ownership — before
             // any device effect. A failure here is pre-acceptance: the
-            // caller's submit_add rolls the sequence back with no live work.
+            // caller's submit_binary rolls the sequence back with no live work.
             {
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
                 const auto [it, inserted] =
@@ -283,40 +285,40 @@ private:
                 if (!inserted) {
                     throw std::logic_error("duplicate ADD sequence");
                 }
-                it->second.add_entries = task.add_entries;
-                it->second.is_add = true;
+                it->second.binary_entries = task.binary_entries;
+                it->second.is_binary = true;
             }
             std::exception_ptr failure;
             try {
                 const std::size_t metadata_bytes =
-                        detail::add_metadata_storage_bytes(
-                                task.add_request->result_shape
+                        detail::binary_metadata_storage_bytes(
+                                task.binary_request->result_shape
                                         .dimensions()
                                         .size());
                 const std::size_t metadata_slot =
                         task.metadata_lease.slot;
                 task.submission->attach_metadata_slot(metadata_slot);
                 task.metadata_lease.handoff();
-                detail::write_add_metadata(
+                detail::write_binary_metadata(
                         metadata_pool_.host_data(metadata_slot),
                         metadata_pool_.device_data(metadata_slot),
-                        *task.add_request);
+                        *task.binary_request);
                 Policy::copy_from_host(
                         stream_,
                         metadata_pool_.device_data(metadata_slot),
                         metadata_pool_.host_data(metadata_slot),
                         metadata_bytes);
-                const detail::AddMetadata metadata =
-                        *reinterpret_cast<const detail::AddMetadata*>(
+                const detail::BinaryMetadata metadata =
+                        *reinterpret_cast<const detail::BinaryMetadata*>(
                                 metadata_pool_.host_data(metadata_slot));
-                detail::launch_grid_stride_add<Policy>(
+                detail::launch_grid_stride_binary<Policy>(
                         stream_,
                         static_cast<const unsigned char*>(
-                                task.add_request->lhs.native_handle),
+                                task.binary_request->lhs.native_handle),
                         static_cast<const unsigned char*>(
-                                task.add_request->rhs.native_handle),
+                                task.binary_request->rhs.native_handle),
                         static_cast<unsigned char*>(
-                                task.add_request->out.native_handle),
+                                task.binary_request->out.native_handle),
                         metadata);
                 Policy::check_kernel(Policy::copy_kernel_operation());
                 Policy::after_grid_stride_launch();
@@ -501,9 +503,9 @@ private:
                         : outcome.common.retained_failure;
             }
             const bool failed = static_cast<bool>(combined);
-            if (outcome.is_add) {
-                (void)detail::release_or_invalidate_add_entries(
-                        registry_state_->registry, outcome.add_entries,
+            if (outcome.is_binary) {
+                (void)detail::release_or_invalidate_binary_entries(
+                        registry_state_->registry, outcome.binary_entries,
                         failed, !failed);
             } else {
                 (void)detail::release_or_invalidate_entries(

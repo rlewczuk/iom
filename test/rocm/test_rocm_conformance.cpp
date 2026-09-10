@@ -470,13 +470,30 @@ TEST_CASE("ROCm conformance: full shared suite") {
             &gate, &oracle, true);
     CHECK_FALSE(gate.armed());
 }
+TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
+    iom_conformance::TrafficGate gate;
+    HipAllocator allocator(gate);
+    auto candidate = iom::make_rocm_device(0, allocator);
+    for (const auto operation : {
+            iom_conformance::BinaryOperation::add,
+            iom_conformance::BinaryOperation::mul,
+            iom_conformance::BinaryOperation::sub,
+            iom_conformance::BinaryOperation::div}) {
+        iom_conformance::run_gpu_eltwise_conformance(
+                *candidate, operation);
+        iom_conformance::run_gpu_eltwise_mapping_conformance(
+                *candidate, operation);
+    }
+    CHECK_FALSE(gate.armed());
+}
 
 TEST_CASE("ROCm ADD accepts every low-width leaf against the oracle") {
     iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
     auto candidate = iom::make_rocm_device(0, allocator);
-    iom_conformance::run_gpu_add_low_width_conformance(*candidate);
-    iom_conformance::run_add_rank_boundary_conformance(*candidate);
+    iom_conformance::run_gpu_eltwise_conformance(
+            *candidate, iom_conformance::BinaryOperation::add);
+    iom_conformance::run_binary_rank_boundary_conformance(*candidate);
     CHECK_FALSE(gate.armed());
 }
 
@@ -484,7 +501,8 @@ TEST_CASE("ROCm ADD wide dtypes and boundary values against the oracle") {
     iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
     auto candidate = iom::make_rocm_device(0, allocator);
-    iom_conformance::run_gpu_add_wide_conformance(*candidate);
+    iom_conformance::run_gpu_eltwise_conformance(
+            *candidate, iom_conformance::BinaryOperation::add);
     CHECK_FALSE(gate.armed());
 }
 
@@ -492,7 +510,8 @@ TEST_CASE("ROCm ADD broadcast, transform, tail, and exact alias mapping") {
     iom_conformance::TrafficGate gate;
     HipAllocator allocator(gate);
     auto candidate = iom::make_rocm_device(0, allocator);
-    iom_conformance::run_gpu_add_mapping_conformance(*candidate);
+    iom_conformance::run_gpu_eltwise_mapping_conformance(
+            *candidate, iom_conformance::BinaryOperation::add);
     CHECK_FALSE(gate.armed());
 }
 

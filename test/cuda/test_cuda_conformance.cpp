@@ -318,12 +318,28 @@ TEST_CASE("CUDA conformance: full shared suite") {
             &devices.gate, &oracle, true);
     CHECK_FALSE(devices.gate.armed());
 }
+TEST_CASE("CUDA binary conformance: ADD MUL SUB DIV real queue") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    for (const auto operation : {
+            iom_conformance::BinaryOperation::add,
+            iom_conformance::BinaryOperation::mul,
+            iom_conformance::BinaryOperation::sub,
+            iom_conformance::BinaryOperation::div}) {
+        iom_conformance::run_gpu_eltwise_conformance(
+                *devices.candidate, operation);
+        iom_conformance::run_gpu_eltwise_mapping_conformance(
+                *devices.candidate, operation);
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
 
 TEST_CASE("CUDA ADD accepts every low-width leaf against the oracle") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
-    iom_conformance::run_gpu_add_low_width_conformance(*devices.candidate);
-    iom_conformance::run_add_rank_boundary_conformance(
+    iom_conformance::run_gpu_eltwise_conformance(
+            *devices.candidate, iom_conformance::BinaryOperation::add);
+    iom_conformance::run_binary_rank_boundary_conformance(
             *devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }
@@ -331,14 +347,16 @@ TEST_CASE("CUDA ADD accepts every low-width leaf against the oracle") {
 TEST_CASE("CUDA ADD wide dtypes and boundary values against the oracle") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
-    iom_conformance::run_gpu_add_wide_conformance(*devices.candidate);
+    iom_conformance::run_gpu_eltwise_conformance(
+            *devices.candidate, iom_conformance::BinaryOperation::add);
     CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CUDA ADD broadcast, transform, tail, and exact alias mapping") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
-    iom_conformance::run_gpu_add_mapping_conformance(*devices.candidate);
+    iom_conformance::run_gpu_eltwise_mapping_conformance(
+            *devices.candidate, iom_conformance::BinaryOperation::add);
     CHECK_FALSE(devices.gate.armed());
 }
 
