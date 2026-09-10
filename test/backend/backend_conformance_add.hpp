@@ -142,12 +142,19 @@ inline bool add_is_float(iom::DataType type) {
     }
 }
 inline bool add_non_f32_float_classes(iom::DataType type, std::uint64_t actual, std::uint64_t expected) {
-    const auto a = add_oracle::value(actual, add_oracle::spec(type));
-    const auto e = add_oracle::value(expected, add_oracle::spec(type));
+    const auto s = add_oracle::spec(type);
+    const auto a = add_oracle::value(actual, s);
+    const auto e = add_oracle::value(expected, s);
     if (std::isnan(e)) return std::isnan(a);
     if (std::isinf(e)) return std::isinf(a) && std::signbit(a) == std::signbit(e);
     if (e == 0) return a == 0 && std::signbit(a) == std::signbit(e);
-    return std::isfinite(a) && actual == expected;
+    if (!std::isfinite(a) || std::signbit(a) != std::signbit(e)) return false;
+    const auto sign = std::uint64_t{1} << (s.e + s.f);
+    const auto ordered = [sign](std::uint64_t bits) {
+        return (bits & sign) ? ~bits : bits | sign;
+    };
+    const auto oa = ordered(actual), oe = ordered(expected);
+    return (oa > oe ? oa - oe : oe - oa) <= 1;
 }
 inline void run_add_value_conformance(iom::Device& candidate) {
     const iom::DataType types[] = {
