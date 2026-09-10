@@ -56,11 +56,13 @@ can coexist without a process-wide selection step.
    CUDA, ROCm, and SYCL use the common standard layout; TTNN may use a native
    per-plane representation while maintaining the same public tensor contract.
 4. **Execution boundary.** `DeviceOps` is an in-order asynchronous queue over
-   caller-created views. `copy` and `add` are the implemented operations.
-   `add(const TensorView&, const TensorView&, TensorView&) noexcept` is the
-   common three-view facade and its sole support signal: accepted work returns
-   a positive OID token; rejected work returns a negative `OidError`. Other
-   compute methods remain unsupported and never silently fall back or allocate.
+   caller-created views. `copy` and the four binary operations are the shipped
+   compute operations:
+   `add`, `mul`, `sub`, and `div` each have the exact common signature
+   `oid op(const TensorView&, const TensorView&, TensorView&) noexcept`.
+   Accepted work returns a positive OID; rejected work returns a negative
+   `OidError`. Other compute methods remain unsupported and never silently
+   fall back or allocate.
 5. **Backend runtime implementation.** Backends turn a validated operation
    into synchronous host transfer, CPU work, or runtime stream submission. CUDA
    and ROCm share policy-templated queue, completion, staging, and copy
@@ -105,23 +107,22 @@ A `TensorSpec` contains:
 calculations. `TensorSpec::validate()` is the gate before storage or work: it
 rejects unknown leaf encodings and every quantization value other than the
 currently implemented `NONE`, as well as invalid shapes and arithmetic
-overflow. A device also exposes the exact unquantized leaf types it accepts
-through `supported_data_types()`; `create_tensor` rejects unsupported
-specifications rather than converting them.
+A device also exposes the exact unquantized leaf types it accepts through
+`supported_data_types()`; `create_tensor` rejects unsupported specifications
+rather than converting them.
 
 The standard-layout backends—CPU, CUDA, ROCm, and SYCL—share one immutable set
-of 23 unquantized leaf encodings. ADD requires, with `QuantizationFormat::NONE`,
-exactly these 21 numeric leaves on every CPU, CUDA, ROCm, SYCL, and TTNN backend:
+of 23 unquantized leaf encodings. ADD, MUL, and SUB require, with
+`QuantizationFormat::NONE`, exactly these 21 numeric leaves on every backend:
 `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64`,
 `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`,
-and `F64`. `BOOL` and `F8_E8M0` are excluded from ADD. A matching excluded
-leaf returns `Unsupported` only after spec-mismatch checks; every mismatch of
-recognized leaves or quantization returns `InvalidArgument`, and every
-recognized non-`NONE` quantization is invalid. A required numeric leaf is not
-`Unsupported` because a vendor SDK lacks native support: backend staging or
-emulation is internal. TTNN storage additionally covers `BOOL` and need not
-store `F8_E8M0`; its native per-plane 32x32 layout remains behind the public
-contract.
+and `F64`. DIV accepts exactly the nine floating leaves
+`F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`,
+and `F64`. Matching `BOOL`, `F8_E8M0`, non-`NONE` quantization, or integer DIV
+is `Unsupported` after all earlier validation. Required leaves are not limited
+by SDK native dtype support: staging or emulation is internal. TTNN storage
+additionally covers `BOOL` and need not store `F8_E8M0`; its native per-plane
+32x32 layout remains behind the public contract.
 
 ### Standard 16x16 tiled layout
 
@@ -196,58 +197,64 @@ not wait for `DeviceOps` queues:
 - retain all tensor owners until queued work using their storage has completed.
   Queues must snapshot any view metadata needed at submission: derived
   `TensorView` temporaries may be destroyed before `wait`.
-
 Queue copies validate that both views belong to the queue's device and have the
-same spec (shape, leaf type, and quantization). A copy whose windows are
-identical is a valid no-op. Device identity, capability, shape, dtype,
-quantization, buffer extent, and overflow are checked before the backend begins
-work.
+same spec. Every binary operation snapshots an immutable backend-neutral request
+for all three views, including owner/device identities, handles, exact specs,
+offsets, strides, and result-aligned broadcast mapping.
 
-ADD validation produces an immutable backend-neutral snapshot of all three
-views, including owner and device identities, handles, exact specifications,
-offsets and strides, and result-aligned logical broadcast mapping. Ranks below
-two are invalid. `[1,1]` is the sole scalar convention and broadcasts over all
-output axes; two such operands produce `[1,1]`. Otherwise ranks are right
-aligned with conceptual leading ones, axes must match or be one, and `out`
-must have exactly the maximum shape. Singleton coordinates—including tiled
-tails—map to zero before tile-slot mapping; padding is never read and
+Validation precedes effects, owner registration, token acceptance, and backend
+work: recognized specs/rank/dim/device/owner/handle/view/storage and checked
+arithmetic; identical leaf and quantization; right-aligned broadcasting and
+output shape; mapping snapshot; exact alias rule; then operation support.
+Malformed or mismatched input maps to `InvalidArgument`, checked arithmetic to
+`Overflow`, bounded pre-acceptance resources to `ResourceExhausted`, runtime
+failure before acceptance to `DeviceError`, and other failures to
+`InternalError`; unsupported matching domains map to `Unsupported`.
+
+Ranks below two are invalid. `[1,1]` is the scalar convention and broadcasts
+over every output axis; two such operands produce `[1,1]`. Otherwise ranks are
+right-aligned with conceptual leading ones, axes must match or be one, and
+`out` must have exactly the maximum shape. Singleton coordinates—including
+tiled tails—map to zero before tile-slot mapping; padding is never read and
 broadcast materialization is internal, never a public zero-stride view.
 Transformed leading views retain independent offsets and plane strides.
 
-The three specs must match exactly before support is considered. Validate
-device identity, owner/view metadata, shapes, checked arithmetic, and aliasing
-before effects or token acceptance. Same-owner exact in-place alias is allowed
-only for identical spec, plane offset, plane strides, and logical mapping;
-reject all other input/output relationships, including disjoint or broadcast
-windows. Capture both input values before each output store, track all three
-owners through completion, deduplicate exact aliases, and retain metadata
-snapshots rather than caller view objects.
+All four operations require the same leaf and quantization in all three views.
+ADD, MUL, and SUB support the 21 NONE numeric leaves listed above; DIV supports
+only the nine NONE floating leaves. BOOL, F8_E8M0, non-NONE quantization, and
+integer DIV are unsupported only after the preceding checks. No promotion,
+public query, fallback selector, or SDK dtype narrowing exists.
 
-ADD has no promotion or quantization behavior. Integers use two's-complement
-signed or ordinary unsigned interpretation and return the low `w` bits of the
-exact sum modulo `2^w`. Floating inputs decode by named format, sum as exact
-reals, and encode once with RNE; a backend returns the reference encoding or a
-finite value within one ULP. F4/F6 use the OCP MX v1.0 scalar tables with
-subnormals, RNE, and signed-maximum saturation; E4M3FN saturates with NaN
-`0x7f`; E5M2 permits infinity; F16/F32/F64 are IEEE and BF16 has IEEE-style
-specials with RNE. Gradual underflow and no FTZ/DAZ are required. `-0+-0`
-is `-0`, opposite signs and exact cancellation are `+0`, and rounded-zero
-signs follow the mathematical result; NaN and infinity classes and canonical
-reference NaNs are preserved (`0x7e`, `0x7e00`, `0x7fc0`, `0x7fc00000`,
-`0x7ff8000000000000` where applicable).
+Same-owner exact in-place alias is allowed only for identical spec, plane offset,
+plane strides, and logical mapping; reject all other input/output relationships,
+including disjoint or broadcast windows. Read/read overlap is valid. Capture
+both input values before each output store, track all three owners through
+completion, deduplicate exact aliases, and retain metadata snapshots rather than
+caller view objects.
 
-ADD is in-order asynchronous work (CPU may complete inline), preserves caller
-serialization and ordering, and supports repeat waits. Invalid negative, zero,
-foreign, future, skipped, or unsubmitted values are rejected by `wait`;
-accepted asynchronous failures remain and are rethrown on every later wait.
-Pre-submit failures return a negative OID, do not mutate output, and do not
-consume a token; partial output after accepted failure is unspecified.
-ADD allocates neither operands nor result and never replaces or relocates caller
-storage, owners, or native handles. Internal temporary host/device buffers,
-backend tensors, workspace, staging, conversions, unpack/widen/repack, and
-emulation are permitted. Path selection is internal before acceptance; accepted
-native failures are not retried, and common code exposes no fallback device,
-vendor type, backend switch, or global state.
+For width `w`, integer MUL and SUB return the low `w` bits of the exact product
+or difference modulo `2^w`, without signed-overflow UB; DIV is not integer.
+Floating values decode by named format, compute in the extended mathematical or
+IEEE domain, and encode once with RNE (no intermediate destination rounding).
+Gradual underflow and no FTZ/DAZ are required. MUL zero×infinity and any NaN
+are NaN; SUB same-sign infinities and any NaN are NaN; DIV NaN, 0/0, and
+infinity/infinity are NaN, with signed zero/infinity outcomes by operand signs.
+F4/F6 saturate finite overflow/infinity and encode NaN as their canonical
+maximum; E4M3FN saturates infinity/overflow and has a NaN class; E5M2, F16,
+BF16, F32, and F64 preserve infinity/NaN classes. Finite results use the
+reference encoding or an adjacent finite encoding within one ULP; operand
+order is observable (`sub` is lhs-rhs, `div` is lhs/rhs).
+
+ADD, MUL, SUB, and DIV are in-order asynchronous work (CPU may complete inline)
+with repeatable waits. Invalid negative, zero, foreign, future, skipped, or
+unsubmitted values are rejected by `wait`; accepted failures remain and are
+re-thrown on every later wait. Pre-submit failures return a negative OID, do not
+mutate output, and consume no token; partial output after accepted failure is
+unspecified. Operations allocate neither operands nor results and never replace
+or relocate caller storage, owners, or native handles. Internal staging,
+conversion, workspace, and emulation are permitted, and accepted failures are
+not retried. This additive SUB/DIV API and MUL behavioral cutover require
+rebuilding consumers; no mixed-version ABI is promised.
 
 ## Public API guide
 
@@ -272,16 +279,14 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `make_sycl_device(ordinal, allocator)` | Creates a SYCL accelerator device for one eligible backend-local ordinal. |
 | `make_ttnn_device(ordinal)` | Creates a TTNN device, whose native storage is owned by TTNN. |
 | `ttnn_supported_data_types()` | Returns TTNN's immutable accepted unquantized leaf-type table. |
-| `Device` | Reports `backend_kind`, accepted data types, and ordinal; creates `Tensor` owners and `DeviceOps` queues. |
-| `DeviceOps` | Creates in-order asynchronous work with `copy` and the exact three-view
-|             | `noexcept` `add` facade; `mul`, `silu`, `linear`, `rmsnorm`, and GQA `sdpa`
-|             | remain unsupported; `wait(token)` observes completion. |
+| `Device` | Reports backend identity and immutable storage capability table; creates `Tensor` owners and `DeviceOps` queues. |
+| `DeviceOps` | Provides `copy` plus exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades; `silu`, `linear`, `rmsnorm`, and GQA `sdpa` remain unsupported. `wait(token)` observes completion. |
 | `gpu_algorithm::compute_staging_size(logical_nbytes)` | Returns the logical transfer payload rounded to a 4-byte GPU word, rejecting rounding overflow. |
 
-`DeviceOps::copy` is pure device-to-device work on compatible views. `add` is
-the sole ADD support signal and is fully specified above; other compute entry
-points return negative `Unsupported` without submission, mutation, or token
-acceptance. No documentation here claims support for those operations.
+`DeviceOps::copy` is pure device-to-device work on compatible views. The four
+binary facades are the operation support signals and are fully specified above;
+unsupported domains return negative `Unsupported` without submission, mutation,
+or token acceptance.
 
 ### OID compatibility contract
 

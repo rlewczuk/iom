@@ -177,9 +177,10 @@ namespace iom {
         // Synchronous host transfers of exactly spec().logical_nbytes().
         // Host access never waits on operation queues: callers wait for
         // outstanding writes before a host read, and for every outstanding
-        // read or write before a host write or owner destruction. Queued ADD
-        // tracks all three owners through completion, deduplicating exact
-        // aliases; operations never allocate, replace, or relocate storage.
+        // read or write before a host write or owner destruction. Queued
+        // binary operations track all three owners through completion,
+        // deduplicate exact aliases, snapshot metadata, and never allocate,
+        // replace, or relocate storage.
         void copy_from_host(std::span<const std::byte> source);
         void copy_to_host(std::span<std::byte> destination) const;
 

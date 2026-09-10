@@ -83,9 +83,8 @@ The supported storage leaves include `BOOL` and all 21 required numeric
 `QuantizationFormat::NONE` leaves: `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`,
 `U16`, `I32`, `U32`, `I64`, `U64`, `F4_E2M1`, `F6_E2M3`, `F6_E3M2`,
 `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`, and `F64`. TTNN need not store
-`F8_E8M0`; grouped quantization remains invalid. ADD excludes `BOOL` and
-`F8_E8M0`, and exposes no capability query: the exact three-view
-`noexcept` `add` facade returns a positive token or negative `OidError`.
+`F8_E8M0`; grouped quantization remains invalid. Operation support is reported
+by the four exact three-view `noexcept` facades described below.
 smoke test requires a usable Tenstorrent device/runtime and does not skip
 when TTNN is enabled:
 
@@ -136,6 +135,37 @@ has no usable device:
 ctest --test-dir build/all --output-on-failure \
   -R '^iom_backend_coexistence_tests$'
 ```
+
+## Elementwise operation contract
+
+`DeviceOps` exposes four exact three-view asynchronous facades:
+
+```cpp
+oid add(const TensorView&, const TensorView&, TensorView&) noexcept;
+oid mul(const TensorView&, const TensorView&, TensorView&) noexcept;
+oid sub(const TensorView&, const TensorView&, TensorView&) noexcept;
+oid div(const TensorView&, const TensorView&, TensorView&) noexcept;
+```
+
+ADD, MUL, and SUB accept `QuantizationFormat::NONE` and the 21 numeric leaves
+`I2,U2,I4,U4,I8,U8,I16,U16,I32,U32,I64,U64,F4_E2M1,F6_E2M3,F6_E3M2,
+F8_E4M3FN,F8_E5M2,F16,BF16,F32,F64`. DIV accepts only the nine floating
+leaves `F4_E2M1,F6_E2M3,F6_E3M2,F8_E4M3FN,F8_E5M2,F16,BF16,F32,F64`.
+BOOL, F8_E8M0, non-NONE quantization, and integer DIV are `Unsupported`;
+matching-type validation happens first. There is no promotion, public query,
+fallback selector, or SDK dtype narrowing.
+
+Operations use right-aligned broadcasting (with `[1,1]` as the scalar
+convention), transformed leading views, tiled tails without padding reads, and
+exact in-place aliases only; read/read overlap is valid. Integer MUL/SUB are
+modulo `2^w`; floating operations decode, compute once in extended precision,
+and encode once with RNE, gradual underflow, format-specific special-value
+rules, and a one-ULP finite envelope. Operand order is `lhs-rhs` and `lhs/rhs`.
+Positive OIDs are accepted in-order queue work (CPU may complete inline);
+waits are repeatable and retained failures rethrow. Callers provide stable
+storage and owners—operations never allocate or relocate operands/results.
+SUB and DIV are additive APIs, while valid MUL now accepts work; rebuild
+consumers and do not mix header/library versions (no mixed-version ABI).
 
 Run:
 

@@ -30,10 +30,11 @@ namespace iom {
         [[nodiscard]] virtual BackendKind backend_kind() const noexcept = 0;
         /**
          * Returns an immutable storage table for `QuantizationFormat::NONE`.
-         * ADD support is communicated only by its three-view `noexcept`
-         * operation, not by a capability query. Every backend's ADD path
-         * accepts the 21 required numeric leaves; TTNN additionally stores
-         * BOOL and need not store F8_E8M0.
+         * ADD, MUL, and SUB accept the 21 required numeric leaves; DIV accepts
+         * the nine floating leaves. BOOL, F8_E8M0, non-NONE quantization, and
+         * integer DIV are unsupported by the operation facades after common
+         * validation. Required leaves are not narrowed for SDK limitations:
+         * staging or emulation is internal.
          */
         [[nodiscard]] virtual std::span<const iom::DataType> supported_data_types() const noexcept = 0;
         [[nodiscard]] virtual std::uint32_t backend_device() const noexcept = 0;

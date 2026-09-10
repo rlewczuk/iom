@@ -12,10 +12,11 @@ namespace iom {
     /**
      * TTNN storage accepts `BOOL` and all 21 numeric DataType values below
      * with `QuantizationFormat::NONE`; `F8_E8M0` storage is not required.
-     * ADD uses the same full 21-leaf matrix. Non-native leaves may use an
-     * internal UINT32 carrier, native 32x32 per-plane tiles, and staging or
-     * emulation while preserving public logical shape, ownership, transfers,
-     * copy, and queue semantics. Unsupported quantization remains rejected.
+     * ADD, MUL, and SUB accept the same full 21-leaf matrix; DIV accepts the
+     * nine floating leaves. Matching BOOL, F8_E8M0, non-NONE quantization,
+     * and integer DIV are unsupported after common validation. Non-native
+     * leaves may use an internal UINT32 carrier, native 32x32 per-plane tiles,
+     * staging, or emulation while preserving public queue semantics.
      */
     [[nodiscard]] std::span<const DataType> ttnn_supported_data_types() noexcept;
 

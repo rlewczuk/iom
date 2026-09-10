@@ -214,12 +214,11 @@ namespace iom {
      *
      * `oid` is signed `int64_t`: -1 InvalidArgument, -2 Unsupported, -3
      * Overflow, -4 ResourceExhausted, -5 DeviceError, and -6 InternalError.
-     * Negative results are terminal synchronous errors, positive values are
-     * accepted tokens, and zero is invalid. `add` itself is the sole ADD
-     * support signal; it has exactly three views and returns a positive token
-     * or one of these errors. Synchronous failures never cross the facade.
-     * `wait` still throws for invalid tokens and retained post-acceptance
-     * failures.
+     * Negative results are synchronous errors, positive values are accepted
+     * tokens, and zero is invalid. `add`, `mul`, `sub`, and `div` each have
+     * exactly three views and are the binary operation support signals.
+     * Synchronous failures never cross the facade; `wait` throws for invalid
+     * tokens and retained post-acceptance failures.
      */
     class DeviceOps {
     public:

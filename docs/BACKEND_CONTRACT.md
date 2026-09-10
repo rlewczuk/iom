@@ -155,17 +155,18 @@ Before considering a backend complete, confirm all of the following:
    selection service. Backends expose their own factory and objects retain the
    identity of their creating `Device`.
 4. `supported_data_types()` MUST return an immutable, nonempty storage span.
-   Standard backends retain the shared 23-entry sequence. For ADD, every CPU,
-   CUDA, ROCm, SYCL, and TTNN backend must accept with `NONE` exactly the 21
-   numeric leaves `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`, `U16`, `I32`,
-   `U32`, `I64`, `U64`, `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`,
-   `F8_E5M2`, `F16`, `BF16`, `F32`, and `F64`. `BOOL` and `F8_E8M0` are
-   excluded from ADD. TTNN also stores `BOOL` but need not store `F8_E8M0`;
-   unsupported numeric SDK types use internal staging or emulation rather than
-   returning `Unsupported`.
-5. A capability table is exact storage capability, not an ADD query. It MUST
-   reject a type not in the advertised set before allocating native storage,
-   while ADD itself is the sole support signal.
+   Standard backends retain the shared 23-entry sequence. ADD, MUL, and SUB
+   accept with `NONE` exactly the 21 numeric leaves `I2`, `U2`, `I4`, `U4`,
+   `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64`, `F4_E2M1`,
+   `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`, `F64`.
+   DIV accepts only the nine floating leaves
+   `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`,
+   `F32`, and `F64`. Matching `BOOL`, `F8_E8M0`, non-`NONE` quantization, and
+   integer DIV are `Unsupported` after earlier validation. Required numeric
+   leaves MUST use internal staging or emulation rather than SDK narrowing.
+5. A capability table describes storage, not an operation query. It MUST reject
+   unadvertised storage types before native allocation; operation support is
+   reported only by the operation facade.
 6. `create_tensor` MUST call/observe `TensorSpec::validate()`. Today that
    means rank at least two, nonzero dimensions, checked size arithmetic, a
    declared leaf type, and `QuantizationFormat::NONE`; every other declared
@@ -317,72 +318,77 @@ Before considering a backend complete, confirm all of the following:
    plane offsets and strides; source and destination may be full, offset,
    stepped, selected, permuted, or nested views.
 4. Same-queue copies execute in call order without an intervening host wait.
-   Waiting on the last token must make all earlier queued writes visible.
-### 7. ADD compute contract
+### 7. Binary elementwise contract
 
-1. `add(const TensorView& lhs, const TensorView& rhs, TensorView& out) noexcept`
-   is exactly three views, a common non-virtual facade, and the sole ADD support
-   signal. Positive OIDs accept work; negative values are the six `OidError`
-   results. There is no options object, `add_support`, promotion, quantization
-   codec, capability query, fallback selector, or signature knob.
-2. Validate exact device identity, owners, recognized specs, shapes, view
-   offsets/strides, checked arithmetic, and aliasing before effects or token
-   acceptance. Mismatched recognized leaves or quantization are
-   `InvalidArgument`; only matching `BOOL`, `F8_E8M0`, or recognized non-`NONE`
-   quantization is `Unsupported`; malformed specs and device/shape/view/alias
-   errors are `InvalidArgument`; overflow is `Overflow`; pre-acceptance
-   temporary/metadata/staging/resource, backend, and internal failures map to
-   `ResourceExhausted`, `DeviceError`, and `InternalError`.
-3. Ranks below two are invalid. `[1,1]` broadcasts over every output axis
-   (two scalars yield `[1,1]`); otherwise ranks right-align with conceptual
-   leading ones, each axis equal or one, and output exactly the maximum shape.
-   Singleton coordinates, tiled tails included, map to zero before tile-slot
-   mapping and never read padding. Broadcast materialization is internal.
-4. All three specs have one leaf and no promotion. Integer output is the exact
-   sum modulo `2^w`, low `w` bits, with signed two's-complement and unsigned
-   binary interpretation. Floating values sum as exact reals and encode once
-   with RNE; the reference is required or a finite value within one ULP.
-   OCP MX F4/F6 tables, E4M3FN saturation/NaN, E5M2 infinity, IEEE F16/F32/F64,
-   BF16 specials, gradual underflow/no FTZ or DAZ, zero signs, and NaN/inf
-   classes follow the scalar reference and canonical NaN encodings.
-5. Inputs may overlap each other. Same-owner input/output exact in-place alias
-   is allowed only with identical spec, plane offset, plane strides, and
-   logical mapping; reject every other relationship before submission.
-   Capture both input values before each store, track all three owners through
-   completion, deduplicate exact aliases, and snapshot metadata, not view objects.
-6. ADD is in-order asynchronous (CPU may complete inline), repeat-waitable,
-   and preserves caller ordering and owner lifetimes. Invalid negative, zero,
-   foreign, future, skipped, and unsubmitted waits are rejected; accepted
-   failures are retained and rethrown on every wait. Pre-submit errors do not
-   mutate output or consume a token. Internal staging, conversion, emulation,
-   workspace, and backend tensors are permitted, but operands/results and
-   caller storage, owners, and handles are never allocated or relocated.
+1. `add`, `mul`, `sub`, and `div` each have exactly the common non-virtual
+   signature `oid op(const TensorView&, const TensorView&, TensorView&) noexcept`.
+   Positive OIDs accept work; synchronous rejection returns one of the six
+   negative `OidError` values. There are no options, promotion, public query,
+   fallback selector, or signature knobs.
+2. Validate in this order before effects, owner registration, sequence
+   consumption, or token acceptance: recognized specs/rank/dim/device/owner/
+   handle/view/storage and checked arithmetic; matching leaf/quantization;
+   right-aligned broadcasting/output shape; mapping snapshot; exact alias rule;
+   operation support. Mismatched recognized leaves or quantization are
+   `InvalidArgument`; malformed view/device/shape/alias errors are
+   `InvalidArgument`; checked arithmetic is `Overflow`; bounded resources,
+   pre-acceptance runtime, and other failures map to `ResourceExhausted`,
+   `DeviceError`, and `InternalError`.
+3. Ranks below two are invalid. `[1,1]` broadcasts over all output axes (two
+   scalars yield `[1,1]`); otherwise ranks right-align with conceptual leading
+   ones, each axis equal or one, and output exactly the maximum shape.
+   Singleton coordinates, including tiled tails, map to zero before tile-slot
+   mapping; padding is never read. Transformed leading views preserve offsets
+   and strides; broadcasting is internal, not a public zero-stride view.
+4. ADD, MUL, and SUB support the 21 NONE numeric leaves listed in section 1;
+   DIV supports the nine NONE floating leaves listed there. Matching BOOL,
+   F8_E8M0, non-NONE quantization, and integer DIV return `Unsupported` only
+   after earlier checks. Operand order is observable: SUB is lhs-rhs and DIV
+   is lhs/rhs.
+5. Integer MUL and SUB return low `w` bits modulo `2^w` with two's-complement
+   signed or ordinary unsigned interpretation, without signed-overflow UB.
+   Floating operands decode in their named format, compute in the extended
+   mathematical/IEEE domain, and encode once with RNE. Gradual underflow and
+   no FTZ/DAZ are required. MUL zero×infinity and NaN are NaN; SUB same-sign
+   infinities and NaN are NaN; DIV NaN, 0/0, and infinity/infinity are NaN.
+   Format-specific saturation and infinity/NaN classes follow the scalar
+   reference; finite outputs are within one ULP.
+6. Read/read overlap is valid. Same-owner input/output is allowed only for an
+   exact unbroadcasted alias with identical spec, offset, strides, and mapping;
+   all other relationships are rejected. Capture both inputs before each store,
+   snapshot metadata rather than views, and register all three distinct owners
+   with exact aliases deduplicated.
+7. Binary work is in-order asynchronous (CPU may complete inline), repeat
+   waits are valid, and accepted failures are retained and rethrown on every
+   wait. Invalid waits throw `std::invalid_argument`. Pre-submit errors do not
+   mutate output, consume a sequence, or register an owner. No caller operand/
+   output storage is allocated, replaced, or relocated; staging, conversion,
+   workspace, and emulation are internal. Accepted failures are not retried.
 
 ### 8. Other compute capabilities
 
-All other compute hooks (`mul`, `silu`, `linear`, `rmsnorm`, and `sdpa`) remain
-unsupported and return negative `Unsupported` before submission, mutation, or
-token acceptance. They do not weaken or defer ADD's required contract.
+Other compute hooks (`silu`, `linear`, `rmsnorm`, and `sdpa`) remain unsupported
+and return negative `Unsupported` before submission, mutation, or token
+acceptance.
 
 ### 9. Backend integration and conformance obligations
 
-The following suite files are the executable contract. A backend driver consumes
-the shared harness but proves its own complete behavior; coexistence is only the
-cross-backend integration proof.
+The following source map is executable contract coverage. Shared scalar and
+common validation live in `test/backend/backend_conformance_common.hpp` and
+`backend_conformance_add.hpp`; storage, transforms, tails, padding, and copies
+live in `backend_conformance_copy_storage.hpp` and the independent
+`AcceleratorStorageOracle`. Backend-local targets are
+`iom_cpu_conformance_tests`, `iom_cuda_conformance_tests`,
+`iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
+`iom_ttnn_conformance_tests`, registered by `add_iom_backend_tests`.
+`test/backend/test_backend_coexistence.cpp` and target
+`iom_backend_coexistence_tests` provide the combined coexistence gate.
 
-| Contract area | Required harness/scenario | What it proves |
-| --- | --- | --- |
-| Public declarations and common validation | `test/backend/backend_conformance_common.hpp` (`CommonAddQueue`, `run_add_request_conformance`) | Exact three-view `noexcept` signature, OID errors, precedence, snapshots, aliases, owner registration, and repeat waits. |
-| Independent arithmetic reference | `test/backend/backend_conformance_add.hpp` (`add_oracle::add`) and `test_scalar_add.cpp` | Scalar integer modulo and bounded floating encodings/special classes independent of backend execution. |
-| Physical storage oracle | `test/backend/backend_conformance_oracle.hpp` (`AcceleratorStorageOracle`) | Canonical 16x16 padded mapping and untouched planes; native drivers independently observe storage. |
-| Shared transforms/storage/copies | `test/backend/backend_conformance_copy_storage.hpp` | Logical bytes, transformed leading views, tiles/tails, ownership, and copy behavior. |
-| CPU-local ADD proof | `test/cpu/test_cpu_conformance.cpp` (`CPU conformance: common ADD validation and lifetime policy`; `CPU conformance: ADD is supported and other compute methods reject`) | CPU backend-local validation, ownership, full ADD support, and non-ADD rejection. |
-| CUDA-local ADD proof | `test/cuda/test_cuda_conformance.cpp` (`CUDA ADD accepts every low-width leaf against the oracle`; `CUDA ADD broadcast, transform, tail, and exact alias mapping`; `CUDA ADD retained launch failure keeps owners reusable`) | CUDA full ADD paths, mapping, aliases, and retained failures. |
-| ROCm-local ADD proof | `test/rocm/test_rocm_conformance.cpp` (`ROCm ADD accepts every low-width leaf against the oracle`; `ROCm ADD broadcast, transform, tail, and exact alias mapping`; `ROCm ADD retained launch failure keeps owners reusable`) | ROCm full ADD paths, mapping, aliases, and retained failures. |
-| SYCL-local ADD proof | `test/sycl/test_sycl_conformance.cpp` (`SYCL conformance: ADD requests use native queue and owner registry`) plus `backend_conformance_add.hpp` | SYCL backend-local ADD execution, owner registry, and shared arithmetic coverage. |
-| TTNN-local ADD proof | `test/ttnn/test_ttnn_conformance.cpp` (`TTNN ADD exhaustively covers every compact leaf pair`; `TTNN ADD representative wide leaves match the oracle`; `TTNN ADD broadcast, tail, transformed views, and aliases`; `TTNN ADD retained failure repeats and staging stays reusable`) | TTNN `BOOL` storage, all 21 numeric leaves, native 32x32 staging, and ADD semantics. |
-| Full backend-local gate | `run_backend_conformance` in `backend_conformance_other.hpp` | Each backend's complete shared storage, copy, error, lifetime, capability, and ADD coverage. |
-| Cross-backend coexistence only | `test/backend/test_backend_coexistence.cpp`, target `iom_backend_coexistence_tests`, `Backend coexistence: ADD interleaves across enabled backends` | Independent factories, devices, queues, and interleaved ADD plus copy work coexist without global dispatch; it does not replace backend-local completeness. |
+Each backend driver exercises ADD, MUL, SUB, and DIV through its real queue for
+every required leaf, as well as unsupported domains, validation precedence,
+broadcasting, transformed mappings, exact aliases, owner deduplication, repeat
+waits, and retained failures. CPU may complete inline; accelerator queues and
+TTNN staging/emulation preserve the same contract without SDK dtype narrowing.
 
 CMake registration uses `add_iom_backend_tests` to create smoke and
 conformance targets. Drivers provide allocator/context setup, CPU reference,
@@ -397,7 +403,7 @@ Use these sources when changing or extending the contract:
   `include/iom/tensor.hpp`, `include/iom/iom.hpp`;
 - standard capability and transfer interface:
   `src/shared/standard_tiled_copy.hpp`;
-- common ADD policy and independent scalar oracle:
+- common binary validation, operation dispatch, and independent scalar oracle:
   `test/backend/backend_conformance_common.hpp`,
   `test/backend/backend_conformance_add.hpp`;
 - storage, transfer, copy, and physical oracle:
