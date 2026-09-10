@@ -26,6 +26,8 @@ enum class SubmissionFault {
     third_plane_launch,
     event_record,
     stream_synchronize,
+    registration,
+    outcome_insertion,
 };
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
@@ -54,6 +56,14 @@ struct gpu_policy {
         check_cuda(
                 "cuCtxSetCurrent",
                 driver_calls.ctx_set_current(context));
+    }
+    [[nodiscard]] static bool consume_copy_registration_fault() noexcept {
+        return consume_submission_fault(SubmissionFault::registration);
+    }
+
+    [[nodiscard]] static bool consume_copy_outcome_insertion_fault()
+            noexcept {
+        return consume_submission_fault(SubmissionFault::outcome_insertion);
     }
 
     [[nodiscard]] static stream_type create_queue_stream() {

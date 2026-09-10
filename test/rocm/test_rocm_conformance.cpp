@@ -394,6 +394,49 @@ TEST_CASE("ROCm conformance: copy validation fails before writes and sequences")
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm copy reservation failures roll back before native work") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(16 * 1024 * 1024);
+    HipAllocator allocator(gate);
+    auto device = iom::make_rocm_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 16, 16}}, iom::DataType::U8};
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    const std::vector<std::byte> source_bytes(
+            spec.logical_nbytes(), static_cast<std::byte>(0x11));
+    const std::vector<std::byte> destination_bytes(
+            spec.logical_nbytes(), static_cast<std::byte>(0x22));
+    source->view().copy_from_host(source_bytes);
+    destination->view().copy_from_host(destination_bytes);
+    auto queue = device->create_ops();
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::registration);
+    CHECK_EQ(
+            queue->copy(source->view(), destination->view()),
+            iom::to_oid(iom::OidError::ResourceExhausted));
+    std::vector<std::byte> observed(spec.logical_nbytes());
+    destination->view().copy_to_host(observed);
+    CHECK(observed == destination_bytes);
+
+    const iom::oid first = queue->copy(source->view(), destination->view());
+    CHECK_EQ(iom_conformance::token_sequence(first), 1);
+    CHECK_NOTHROW(queue->wait(first));
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::outcome_insertion);
+    CHECK_EQ(
+            queue->copy(source->view(), destination->view()),
+            iom::to_oid(iom::OidError::ResourceExhausted));
+    const iom::oid second = queue->copy(source->view(), destination->view());
+    CHECK_EQ(iom_conformance::token_sequence(second), 2);
+    CHECK_NOTHROW(queue->wait(second));
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+    CHECK_FALSE(gate.armed());
+}
+
 TEST_CASE("ROCm conformance: transfer failures keep metadata and ownership") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);

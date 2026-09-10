@@ -217,7 +217,6 @@ public:
         stream_ = Policy::null_stream();
         state_.reset();
     }
-
     iom::oid copy_impl(
             const TensorView& source, TensorView& destination) override {
         std::lock_guard<std::mutex> submission_lock(
@@ -226,8 +225,75 @@ public:
         return submit(
                 [this, &source, &destination, no_op](
                         std::uint64_t sequence) {
-                    worker_.submit_copy(
-                            Task{sequence, &source, &destination, no_op});
+                    if (no_op) {
+                        worker_.submit_copy(
+                                Task{sequence, &source, &destination, true});
+                        return;
+                    }
+
+                    Policy::activate(context_);
+                    const detail::CopyMetadataLayout layout =
+                            detail::copy_metadata_layout(source, destination);
+                    auto submission = state_->acquire();
+                    MetadataLease metadata_lease;
+                    if (layout.bytes > sizeof(detail::InlineCopyMetadata)) {
+                        const std::size_t metadata_slot = metadata_pool_.acquire();
+                        try {
+                            metadata_pool_.ensure_slot_capacity(
+                                    metadata_slot, layout.bytes);
+                        } catch (...) {
+                            metadata_pool_.release(metadata_slot);
+                            throw;
+                        }
+                        metadata_lease = MetadataLease{
+                                &metadata_pool_, metadata_slot};
+                    }
+
+                    const detail::Fence fence =
+                            build_fence(submission, nullptr);
+                    detail::EntryRegistration entries;
+                    try {
+                        if (Policy::consume_copy_registration_fault()) {
+                            throw std::bad_alloc();
+                        }
+                        entries = detail::register_copy_entries(
+                                *registry_state_, registry_queue_id_, sequence,
+                                const_cast<void*>(source.native_handle()),
+                                destination.native_handle(), fence);
+                        if (Policy::consume_copy_outcome_insertion_fault()) {
+                            throw std::bad_alloc();
+                        }
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] =
+                                outcomes_.try_emplace(sequence);
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    std::string("duplicate ")
+                                    + Policy::backend_label()
+                                    + " outstanding-work sequence");
+                        }
+                        it->second.common.source_entry_id = entries.source;
+                        it->second.common.destination_entry_id =
+                                entries.destination;
+                    } catch (...) {
+                        rollback_copy_transaction(
+                                sequence, entries, source, destination);
+                        submission.reset();
+                        throw;
+                    }
+
+                    Task task{sequence, &source, &destination, false};
+                    task.source_entry_id = entries.source;
+                    task.destination_entry_id = entries.destination;
+                    task.submission = std::move(submission);
+                    task.metadata_lease = std::move(metadata_lease);
+                    try {
+                        worker_.submit_copy(std::move(task));
+                    } catch (...) {
+                        rollback_copy_transaction(
+                                sequence, entries, source, destination);
+                        throw;
+                    }
                 });
     }
 
@@ -272,6 +338,21 @@ public:
     }
 
 private:
+    void rollback_copy_transaction(
+            std::uint64_t sequence, const detail::EntryRegistration& entries,
+            const TensorView& source, const TensorView& destination) noexcept {
+        if (entries.source != 0) {
+            registry_state_->registry.remove_entry_if_present(
+                    entries.source, const_cast<void*>(source.native_handle()));
+        }
+        if (entries.destination != 0) {
+            registry_state_->registry.remove_entry_if_present(
+                    entries.destination,
+                    const_cast<void*>(destination.native_handle()));
+        }
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
+        outcomes_.erase(sequence);
+    }
     void execute(Task& task) {
         if (task.is_binary) {
             Policy::activate(context_);
@@ -360,18 +441,15 @@ private:
         Policy::activate(context_);
         const detail::CopyMetadataLayout layout =
                 detail::copy_metadata_layout(source, destination);
-        std::shared_ptr<typename EventRing::Submission> submission;
-        std::size_t metadata_slot = EventRing::kNoAttachedSlot;
-        bool metadata_acquired = false;
-        bool kernel_enqueued = false;
+        bool native_work_submitted = false;
         bool event_recorded = false;
         std::exception_ptr retained_failure;
         detail::InlineCopyMetadata inline_metadata{};
         try {
-            submission = state_->acquire();
             if (layout.bytes <= sizeof(detail::InlineCopyMetadata)) {
                 detail::write_copy_metadata(
                         inline_metadata, source, destination);
+                native_work_submitted = true;
                 detail::launch_grid_stride_copy<Policy>(
                         stream_,
                         static_cast<const unsigned char*>(
@@ -380,17 +458,18 @@ private:
                                 destination.native_handle()),
                         inline_metadata, layout.total_words);
             } else {
-                metadata_slot = metadata_pool_.acquire();
-                metadata_acquired = true;
-                metadata_pool_.ensure_slot_capacity(
-                        metadata_slot, layout.bytes);
+                const std::size_t metadata_slot =
+                        task.metadata_lease.slot;
                 detail::write_copy_metadata(
                         metadata_pool_.host_data(metadata_slot),
                         source, destination);
-                submission->attach_metadata_slot(metadata_slot);
+                task.submission->attach_metadata_slot(metadata_slot);
+                task.metadata_lease.handoff();
+                native_work_submitted = true;
                 Policy::copy_from_host(
                         stream_, metadata_pool_.device_data(metadata_slot),
                         metadata_pool_.host_data(metadata_slot), layout.bytes);
+                native_work_submitted = true;
                 detail::launch_grid_stride_copy<Policy>(
                         stream_,
                         static_cast<const unsigned char*>(
@@ -401,85 +480,41 @@ private:
                                 metadata_pool_.device_data(metadata_slot)),
                         layout.total_words);
             }
-            kernel_enqueued = true;
+            native_work_submitted = true;
             Policy::check_kernel(Policy::copy_kernel_operation());
             Policy::after_grid_stride_launch();
             Policy::record_event(
-                    state_->event_of(*submission), stream_);
+                    state_->event_of(*task.submission), stream_);
             event_recorded = true;
-            state_->mark_event_recorded(*submission);
-            task.submission = submission;
-            task.fence = submission.get();
+            state_->mark_event_recorded(*task.submission);
+            task.fence = task.submission.get();
         } catch (...) {
             const std::exception_ptr failure = std::current_exception();
-            if (submission == nullptr) {
+            if (!native_work_submitted) {
                 throw;
             }
-            if (kernel_enqueued) {
-                if (!event_recorded) {
-                    event_recorded = Policy::record_event_no_fault(
-                            state_->event_of(*submission), stream_);
-                    if (event_recorded) {
-                        state_->mark_event_recorded(*submission);
-                    } else if (Policy::synchronize_stream_noexcept(stream_)) {
-                        state_->mark_stream_drained(*submission);
-                    }
+
+            if (!event_recorded) {
+                event_recorded = Policy::record_event_no_fault(
+                        state_->event_of(*task.submission), stream_);
+                if (event_recorded) {
+                    state_->mark_event_recorded(*task.submission);
+                } else if (Policy::synchronize_stream_noexcept(stream_)) {
+                    state_->mark_stream_drained(*task.submission);
+                } else {
+                    state_->mark_retire_unknown(*task.submission);
                 }
-                task.submission = submission;
-                task.fence = submission.get();
-                retained_failure = failure;
-            } else {
-                if (metadata_acquired) {
-                    metadata_pool_.release(metadata_slot);
-                }
-                submission.reset();
-                throw;
             }
+            task.fence = task.submission.get();
+            retained_failure = failure;
         }
 
-        const std::exception_ptr outcome_failure = retained_failure;
-        const detail::Fence fence = build_fence(
-                submission, std::move(retained_failure));
-        detail::EntryRegistration entries;
-        try {
-            entries = detail::register_copy_entries(
-                    *registry_state_, registry_queue_id_, task.sequence,
-                    const_cast<void*>(source.native_handle()),
-                    destination.native_handle(), fence);
-            const auto [it, inserted] =
-                    outcomes_.try_emplace(task.sequence);
-            if (!inserted) {
-                throw std::logic_error(
-                        std::string("duplicate ")
-                        + Policy::backend_label()
-                        + " outstanding-work sequence");
+        if (retained_failure) {
+            std::lock_guard<std::mutex> lock(outcome_mutex_);
+            const auto it = outcomes_.find(task.sequence);
+            if (it != outcomes_.end()) {
+                it->second.common.retained_failure = retained_failure;
             }
-            it->second.common.source_entry_id = entries.source;
-            it->second.common.destination_entry_id = entries.destination;
-            it->second.common.retained_failure = outcome_failure;
-        } catch (...) {
-            if (entries.source != 0) {
-                registry_state_->registry.remove_entry_if_present(
-                        entries.source,
-                        const_cast<void*>(source.native_handle()));
-            }
-            if (entries.destination != 0) {
-                registry_state_->registry.remove_entry_if_present(
-                        entries.destination,
-                        destination.native_handle());
-            }
-            if (task.fence != nullptr) {
-                state_->on_worker_destroy(
-                        *static_cast<typename EventRing::Submission*>(
-                                task.fence));
-                task.submission.reset();
-                task.fence = nullptr;
-            }
-            throw;
-        }
-
-        if (outcome_failure) {
-            commit_failure(task.sequence, outcome_failure);
         }
     }
     void complete_task(

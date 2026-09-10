@@ -163,6 +163,10 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         submission.stream_drained_ = true;
     }
+    void mark_retire_unknown(Submission& submission) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        submission.disposition_ = CompletionDisposition::RetireUnknown;
+    }
 
     void on_worker_complete(Submission& submission) {
         std::unique_lock<std::mutex> lock(mutex_);
