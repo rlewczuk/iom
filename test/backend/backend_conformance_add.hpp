@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -153,70 +154,274 @@ inline bool add_non_f32_float_classes(iom::DataType type, std::uint64_t actual, 
     const auto oa = ordered(actual), oe = ordered(expected);
     return (oa > oe ? oa - oe : oe - oa) <= 1;
 }
-inline void run_add_value_conformance(iom::Device& candidate) {
+inline void run_binary_mapping_value_conformance(
+        iom::Device& candidate, BinaryOperation operation);
+inline void run_binary_transformed_value_conformance(
+        iom::Device& candidate, BinaryOperation operation);
+
+inline void run_binary_value_conformance(
+        iom::Device& candidate, BinaryOperation operation) {
     const iom::DataType types[] = {
-        iom::DataType::I2, iom::DataType::U2, iom::DataType::I4, iom::DataType::U4,
-        iom::DataType::I8, iom::DataType::U8, iom::DataType::I16, iom::DataType::U16,
-        iom::DataType::I32, iom::DataType::U32, iom::DataType::I64, iom::DataType::U64,
-        iom::DataType::F4_E2M1, iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-        iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2, iom::DataType::F16,
+        iom::DataType::I2, iom::DataType::U2, iom::DataType::I4,
+        iom::DataType::U4, iom::DataType::I8, iom::DataType::U8,
+        iom::DataType::I16, iom::DataType::U16, iom::DataType::I32,
+        iom::DataType::U32, iom::DataType::I64, iom::DataType::U64,
+        iom::DataType::F4_E2M1, iom::DataType::F6_E2M3,
+        iom::DataType::F6_E3M2, iom::DataType::F8_E4M3FN,
+        iom::DataType::F8_E5M2, iom::DataType::F16,
         iom::DataType::BF16, iom::DataType::F32, iom::DataType::F64};
     auto queue = candidate.create_ops();
     for (const auto type : types) {
-        const iom::TensorSpec spec{iom::TensorShape{{type == iom::DataType::F32 ? 1u : 2u,
-            type == iom::DataType::F32 ? 33u : 17u, type == iom::DataType::F32 ? 17u : 33u}}, type};
-        const auto count = spec.shape.element_count(), bits = iom::detail::leaf_bits(type);
-        std::vector<std::byte> lhs(spec.logical_nbytes()), rhs(spec.logical_nbytes()), expected(spec.logical_nbytes());
+        if (operation == BinaryOperation::div && !add_is_float(type))
+            continue;
+        const iom::TensorSpec spec{
+                iom::TensorShape{{2, 17, 33}}, type};
+        const std::size_t count = spec.shape.element_count();
+        const std::size_t bits = iom::detail::leaf_bits(type);
+        std::vector<std::byte> lhs(spec.logical_nbytes());
+        std::vector<std::byte> rhs(spec.logical_nbytes());
+        std::vector<std::byte> expected(spec.logical_nbytes());
+        const auto float_value = [](iom::DataType float_type,
+                                    std::size_t index,
+                                    std::uint64_t salt) -> std::uint64_t {
+            switch (float_type) {
+                case iom::DataType::F16: {
+                    static constexpr std::uint16_t values[] = {
+                            0x3c00, 0x4000};
+                    return values[(index + salt) % 2];
+                }
+                case iom::DataType::BF16: {
+                    static constexpr std::uint16_t values[] = {
+                            0x3f80, 0x4000};
+                    return values[(index + salt) % 2];
+                }
+                case iom::DataType::F32: {
+                    static constexpr std::uint32_t values[] = {
+                            0x00000000, 0x80000000, 0x3f800000,
+                            0xbf800000, 0x7f7fffff, 0x00800000,
+                            0x007fffff, 0x7f800000, 0xff800000,
+                            0x7fc00001};
+                    return static_cast<std::uint64_t>(
+                            values[(index + salt) % (sizeof(values)
+                                                     / sizeof(values[0]))]);
+                }
+                case iom::DataType::F64: {
+                    // Keep device arithmetic in the exact finite range for
+                    // this cross-backend gate; F64 boundary/special probes
+                    // remain covered by the backend-specific suites.
+                    static constexpr std::uint64_t values[] = {
+                            0x3ff0000000000000ull,
+                            0x4000000000000000ull};
+                    return values[(index + salt) % (sizeof(values)
+                                                   / sizeof(values[0]))];
+                }
+                case iom::DataType::F4_E2M1: {
+                    static constexpr std::uint8_t values[] = {2, 4};
+                    return values[(index + salt) % 2];
+                }
+                case iom::DataType::F6_E2M3: {
+                    static constexpr std::uint8_t values[] = {8, 16};
+                    return values[(index + salt) % 2];
+                }
+                case iom::DataType::F6_E3M2: {
+                    static constexpr std::uint8_t values[] = {12, 16};
+                    return values[(index + salt) % 2];
+                }
+                case iom::DataType::F8_E4M3FN: {
+                    static constexpr std::uint8_t values[] = {0x38, 0x40};
+                    return values[(index + salt) % 2];
+                }
+                case iom::DataType::F8_E5M2: {
+                    static constexpr std::uint8_t values[] = {0x3c, 0x40};
+                    return values[(index + salt) % 2];
+                }
+                default:
+                    return element_pattern(float_type, index, salt);
+            }
+        };
+        const std::uint64_t integer_mask = bits == 64
+                ? ~std::uint64_t{}
+                : (std::uint64_t{1} << bits) - 1;
         for (std::size_t i = 0; i < count; ++i) {
-            auto a = element_pattern(type, i, 0x1234), b = element_pattern(type, i, 0x9876);
-            if (type == iom::DataType::F32) {
-                static constexpr std::uint32_t values[] = {0x00000000, 0x80000000, 0x00000001, 0x3f800000,
-                    0x3f800001, 0x7f7fffff, 0x7f800000, 0xff800000, 0x7fc00001};
-                a = values[i % 9]; b = values[(i * 5 + 2) % 9];
+            std::uint64_t a;
+            std::uint64_t b;
+            if (add_is_float(type)) {
+                a = float_value(type, i, 0);
+                b = float_value(type, i, operation == BinaryOperation::add
+                                                ? 3
+                                                : 7);
+            } else {
+                a = (i * 3 + 1) & integer_mask;
+                b = (i * 5 + 2) & integer_mask;
             }
-            if (type != iom::DataType::F32 && type != iom::DataType::U8) {
-                a = 1;
-                b = 2;
+            if ((operation == BinaryOperation::sub
+                 || operation == BinaryOperation::div)
+                && a == b) {
+                b = (b + 1) & integer_mask;
             }
-            write_bits(reinterpret_cast<unsigned char*>(lhs.data()), i * bits, bits, a);
-            write_bits(reinterpret_cast<unsigned char*>(rhs.data()), i * bits, bits, b);
-            write_bits(reinterpret_cast<unsigned char*>(expected.data()), i * bits, bits, add_oracle::add(type, a, b));
+            write_bits(reinterpret_cast<unsigned char*>(lhs.data()),
+                       i * bits, bits, a);
+            write_bits(reinterpret_cast<unsigned char*>(rhs.data()),
+                       i * bits, bits, b);
+            write_bits(
+                    reinterpret_cast<unsigned char*>(expected.data()),
+                    i * bits, bits,
+                    add_oracle::binary(
+                            type, a, b,
+                            static_cast<add_oracle::operation>(operation)));
         }
-        auto lhs_tensor = candidate.create_tensor(spec), rhs_tensor = candidate.create_tensor(spec), out_tensor = candidate.create_tensor(spec);
-        lhs_tensor->view().copy_from_host(lhs); rhs_tensor->view().copy_from_host(rhs); out_tensor->view().copy_from_host(expected);
-        const auto token = queue->add(lhs_tensor->view(), rhs_tensor->view(), out_tensor->view());
-        REQUIRE(iom::oid_is_token(token)); CHECK_NOTHROW(queue->wait(token));
+        CAPTURE(static_cast<int>(type));
+        CAPTURE(static_cast<int>(operation));
+        auto lhs_tensor = candidate.create_tensor(spec);
+        auto rhs_tensor = candidate.create_tensor(spec);
+        auto out_tensor = candidate.create_tensor(spec);
+        lhs_tensor->view().copy_from_host(lhs);
+        rhs_tensor->view().copy_from_host(rhs);
+        out_tensor->view().copy_from_host(
+                std::vector<std::byte>(
+                        expected.size(), std::byte{0xAA}));
+        const auto token = submit_binary_operation(
+                *queue, operation, lhs_tensor->view(), rhs_tensor->view(),
+                out_tensor->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
         const auto observed = read_logical(out_tensor->view());
         for (std::size_t i = 0; i < count; ++i) {
-            const auto actual = add_read_bits(observed, i, bits), want = add_read_bits(expected, i, bits);
+            const auto actual = add_read_bits(observed, i, bits);
+            const auto want = add_read_bits(expected, i, bits);
+            CAPTURE(static_cast<std::size_t>(i));
+            CAPTURE(actual);
+            CAPTURE(want);
             if (type == iom::DataType::F32)
-                CHECK(add_f32_within_ulp(static_cast<std::uint32_t>(actual), static_cast<std::uint32_t>(want)));
+                CHECK(add_f32_within_ulp(
+                        static_cast<std::uint32_t>(actual),
+                        static_cast<std::uint32_t>(want)));
             else if (add_is_float(type))
                 CHECK(add_non_f32_float_classes(type, actual, want));
             else
                 CHECK_EQ(actual, want);
         }
     }
-    const iom::TensorSpec lhs_spec{iom::TensorShape{{2, 1, 33}}, iom::DataType::U8};
-    const iom::TensorSpec rhs_spec{iom::TensorShape{{1, 17, 1}}, iom::DataType::U8};
-    const iom::TensorSpec out_spec{iom::TensorShape{{2, 17, 33}}, iom::DataType::U8};
-    auto lhs = candidate.create_tensor(lhs_spec), rhs = candidate.create_tensor(rhs_spec), out = candidate.create_tensor(out_spec);
-    auto lhs_bytes = encode_logical(lhs_spec, 0x1111), rhs_bytes = encode_logical(rhs_spec, 0x2222);
+    run_binary_mapping_value_conformance(candidate, operation);
+    run_binary_transformed_value_conformance(candidate, operation);
+}
+
+inline void run_binary_mapping_value_conformance(
+        iom::Device& candidate, BinaryOperation operation) {
+    const bool division = operation == BinaryOperation::div;
+    const iom::DataType type = division ? iom::DataType::F32
+                                        : iom::DataType::U8;
+    const iom::TensorSpec lhs_spec{
+            iom::TensorShape{{2, 1, 33}}, type};
+    const iom::TensorSpec rhs_spec{
+            iom::TensorShape{{1, 17, 1}}, type};
+    const iom::TensorSpec out_spec{
+            iom::TensorShape{{2, 17, 33}}, type};
+    const std::size_t lhs_count = lhs_spec.shape.element_count();
+    const std::size_t rhs_count = rhs_spec.shape.element_count();
+    const std::size_t bits = iom::detail::leaf_bits(type);
+    std::vector<std::byte> lhs_bytes(lhs_spec.logical_nbytes());
+    std::vector<std::byte> rhs_bytes(rhs_spec.logical_nbytes());
+    const auto mapped_value = [type](std::size_t index, std::uint64_t salt) {
+        if (type == iom::DataType::F32) {
+            const auto raw = element_pattern(type, index, salt);
+            return std::uint64_t{0x3f000000u}
+                    | (raw & std::uint64_t{0x007fffffu});
+        }
+        return element_pattern(type, index, salt);
+    };
+    for (std::size_t i = 0; i < lhs_count; ++i)
+        write_bits(reinterpret_cast<unsigned char*>(lhs_bytes.data()),
+                   i * bits, bits, mapped_value(i, 0x13579BDF));
+    for (std::size_t i = 0; i < rhs_count; ++i)
+        write_bits(reinterpret_cast<unsigned char*>(rhs_bytes.data()),
+                   i * bits, bits, mapped_value(i, 0x2468ACE0));
     std::vector<std::byte> expected(out_spec.logical_nbytes());
-    for (std::size_t plane = 0; plane < 2; ++plane)
-        for (std::size_t row = 0; row < 17; ++row)
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+        for (std::size_t row = 0; row < 17; ++row) {
             for (std::size_t column = 0; column < 33; ++column) {
-                const auto a = add_read_bits(lhs_bytes, plane * 33 + column, 8);
-                const auto b = add_read_bits(rhs_bytes, row, 8);
-                write_bits(reinterpret_cast<unsigned char*>(expected.data()),
-                            (plane * 17 * 33 + row * 33 + column) * 8, 8,
-                            add_oracle::add(iom::DataType::U8, a, b));
+                const std::size_t output_index =
+                        plane * 17 * 33 + row * 33 + column;
+                const auto a = add_read_bits(
+                        lhs_bytes, plane * 33 + column, bits);
+                const auto b = add_read_bits(rhs_bytes, row, bits);
+                write_bits(
+                        reinterpret_cast<unsigned char*>(expected.data()),
+                        output_index * bits, bits,
+                        add_oracle::binary(
+                                type, a, b,
+                                static_cast<add_oracle::operation>(operation)));
             }
-    lhs->view().copy_from_host(lhs_bytes); rhs->view().copy_from_host(rhs_bytes);
-    out->view().copy_from_host(expected);
-    const auto broadcast_token = queue->add(lhs->view(), rhs->view(), out->view());
-    REQUIRE(iom::oid_is_token(broadcast_token)); CHECK_NOTHROW(queue->wait(broadcast_token));
+        }
+    }
+    auto lhs = candidate.create_tensor(lhs_spec);
+    auto rhs = candidate.create_tensor(rhs_spec);
+    auto out = candidate.create_tensor(out_spec);
+    lhs->view().copy_from_host(lhs_bytes);
+    rhs->view().copy_from_host(rhs_bytes);
+    out->view().copy_from_host(
+            std::vector<std::byte>(
+                    expected.size(), std::byte{0xAA}));
+    auto queue = candidate.create_ops();
+    const auto token = submit_binary_operation(
+            *queue, operation, lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
     const auto observed = read_logical(out->view());
-    for (std::size_t i = 0; i < expected.size(); ++i) CHECK_EQ(observed[i], expected[i]);
+    for (std::size_t i = 0; i < out_spec.shape.element_count(); ++i) {
+        const auto actual = add_read_bits(observed, i, bits);
+        const auto want = add_read_bits(expected, i, bits);
+        if (type == iom::DataType::F32)
+            CHECK(add_f32_within_ulp(
+                    static_cast<std::uint32_t>(actual),
+                    static_cast<std::uint32_t>(want)));
+        else
+            CHECK_EQ(actual, want);
+    }
+}
+
+inline void run_binary_transformed_value_conformance(
+        iom::Device& candidate, BinaryOperation operation) {
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+    const std::size_t elements = spec.shape.element_count();
+    std::vector<std::byte> lhs_bytes(spec.logical_nbytes());
+    std::vector<std::byte> rhs_bytes(spec.logical_nbytes());
+    for (std::size_t i = 0; i < elements; ++i) {
+        const std::uint32_t lhs = 0x3F800000u + i;
+        const std::uint32_t rhs = 0x40000000u + i;
+        std::memcpy(lhs_bytes.data() + i * sizeof(lhs), &lhs, sizeof(lhs));
+        std::memcpy(rhs_bytes.data() + i * sizeof(rhs), &rhs, sizeof(rhs));
+    }
+    auto lhs = candidate.create_tensor(spec);
+    auto rhs = candidate.create_tensor(spec);
+    auto out = candidate.create_tensor(spec);
+    lhs->view().copy_from_host(lhs_bytes);
+    rhs->view().copy_from_host(rhs_bytes);
+    auto lhs_view = lhs->view().slice(0, 0, 1);
+    auto rhs_view = rhs->view().slice(0, 0, 1);
+    auto out_view = out->view().slice(0, 0, 1);
+    out_view.copy_from_host(
+            std::vector<std::byte>(
+                    out_view.spec().logical_nbytes(), std::byte{0xAA}));
+    auto queue = candidate.create_ops();
+    const auto token = submit_binary_operation(
+            *queue, operation, lhs_view, rhs_view, out_view);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
+    const auto observed = read_logical(out_view);
+    for (std::size_t i = 0; i < 16 * 16; ++i) {
+        std::uint32_t a = 0;
+        std::uint32_t b = 0;
+        std::memcpy(&a, lhs_bytes.data() + i * sizeof(a), sizeof(a));
+        std::memcpy(&b, rhs_bytes.data() + i * sizeof(b), sizeof(b));
+        const auto want = static_cast<std::uint32_t>(
+                add_oracle::binary(
+                        iom::DataType::F32, a, b,
+                        static_cast<add_oracle::operation>(operation)));
+        const auto got = static_cast<std::uint32_t>(
+                add_read_bits(observed, i, 32));
+        CHECK(add_f32_within_ulp(got, want));
+    }
 }
 }  // namespace iom_conformance

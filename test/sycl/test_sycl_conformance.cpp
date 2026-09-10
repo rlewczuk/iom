@@ -700,8 +700,15 @@ TEST_CASE("SYCL conformance: binary requests use native queue and owner registry
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("SYCL conformance: ADD values through the real queue") {
+TEST_CASE("SYCL conformance: binary MUL SUB and floating DIV values through real queue") {
     SyclDevices devices;
-    iom_conformance::run_add_value_conformance(*devices.candidate);
+    for (const auto operation : {
+                 iom_conformance::BinaryOperation::add,
+                 iom_conformance::BinaryOperation::mul,
+                 iom_conformance::BinaryOperation::sub,
+                 iom_conformance::BinaryOperation::div}) {
+        iom_conformance::run_binary_value_conformance(
+                *devices.candidate, operation);
+    }
     CHECK_FALSE(devices.gate.armed());
 }

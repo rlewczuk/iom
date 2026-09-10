@@ -908,6 +908,19 @@ TEST_CASE("TTNN conformance: full shared suite") {
             true);
 }
 
+TEST_CASE("TTNN conformance: binary MUL SUB and floating DIV values through real queue") {
+    require_hardware();
+    TtnnDevices devices;
+    for (const auto operation : {
+                 iom_conformance::BinaryOperation::add,
+                 iom_conformance::BinaryOperation::mul,
+                 iom_conformance::BinaryOperation::sub,
+                 iom_conformance::BinaryOperation::div}) {
+        iom_conformance::run_binary_value_conformance(
+                *devices.candidate, operation);
+    }
+}
+
 TEST_CASE("TTNN quarantine action allocation failure leaks native storage") {
     require_hardware();
     const iom::TensorSpec spec{

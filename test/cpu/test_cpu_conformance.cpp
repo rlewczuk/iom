@@ -238,6 +238,19 @@ TEST_CASE("CPU conformance: all binary operations through the real queue") {
     CHECK_FALSE(devices.gate.armed());
 }
 
+TEST_CASE("CPU conformance: binary MUL SUB and floating DIV values through real queue") {
+    CpuDevices devices;
+    for (const auto operation : {
+                 iom_conformance::BinaryOperation::add,
+                 iom_conformance::BinaryOperation::mul,
+                 iom_conformance::BinaryOperation::sub,
+                 iom_conformance::BinaryOperation::div}) {
+        iom_conformance::run_binary_value_conformance(
+                *devices.candidate, operation);
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("CPU conformance: transfer failures keep metadata and ownership") {
     CpuDevices devices;
     iom_conformance::run_transfer_error_conformance(

@@ -548,8 +548,10 @@ private:
             const auto* bytes =
                     static_cast<const unsigned char*>(ptr);
             for (std::size_t i = 0; i < bits; ++i)
-                value |= ((bytes[(bit + i) / 8] >>
-                           ((bit + i) % 8)) & 1u) << i;
+                value |= static_cast<std::uint64_t>(
+                                 (bytes[(bit + i) / 8]
+                                  >> ((bit + i) % 8)) & 1u)
+                        << i;
             return value;
         };
         auto store = [bits](void* ptr, std::size_t bit,
