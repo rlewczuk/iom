@@ -2146,3 +2146,69 @@ TEST_CASE("TTNN ADD retained failure repeats and staging stays reusable") {
                          0x4000 + i));
     }
 }
+
+TEST_CASE("TTNN binary completion publishes one finish for every operation") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 32, 32}}, iom::DataType::F32};
+    auto lhs = devices.candidate->create_tensor(spec);
+    auto rhs = devices.candidate->create_tensor(spec);
+    auto out = devices.candidate->create_tensor(spec);
+    std::vector<std::byte> lhs_bytes(spec.logical_nbytes(), std::byte{0});
+    std::vector<std::byte> rhs_bytes(spec.logical_nbytes(), std::byte{0});
+    for (std::size_t index = 0; index < 2 * 32 * 32; ++index) {
+        const float left = 2.0F;
+        const float right = 4.0F;
+        std::memcpy(lhs_bytes.data() + index * sizeof(float), &left,
+                    sizeof(float));
+        std::memcpy(rhs_bytes.data() + index * sizeof(float), &right,
+                    sizeof(float));
+    }
+    lhs->view().copy_from_host(lhs_bytes);
+    rhs->view().copy_from_host(rhs_bytes);
+    auto queue = devices.candidate->create_ops();
+
+    struct BinaryCase {
+        enum class Kind { add, mul, sub, div };
+        Kind kind;
+        float expected;
+    };
+    const BinaryCase cases[] = {
+            {BinaryCase::Kind::add, 6.0F},
+            {BinaryCase::Kind::mul, 8.0F},
+            {BinaryCase::Kind::sub, -2.0F},
+            {BinaryCase::Kind::div, 0.5F}};
+    for (const BinaryCase test : cases) {
+        iom::ttnn_test::reset_copy_finish_count_for_testing();
+        iom::oid token = 0;
+        switch (test.kind) {
+            case BinaryCase::Kind::add:
+                token = queue->add(lhs->view(), rhs->view(), out->view());
+                break;
+            case BinaryCase::Kind::mul:
+                token = queue->mul(lhs->view(), rhs->view(), out->view());
+                break;
+            case BinaryCase::Kind::sub:
+                token = queue->sub(lhs->view(), rhs->view(), out->view());
+                break;
+            case BinaryCase::Kind::div:
+                token = queue->div(lhs->view(), rhs->view(), out->view());
+                break;
+        }
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        CHECK_EQ(iom::ttnn_test::copy_finish_count_for_testing(), 1);
+
+        std::vector<std::byte> observed(spec.logical_nbytes(), std::byte{0});
+        out->view().copy_to_host(observed);
+        for (std::size_t index = 0; index < 2 * 32 * 32; ++index) {
+            float value = 0.0F;
+            std::memcpy(&value,
+                        observed.data() + index * sizeof(float),
+                        sizeof(float));
+            CHECK_EQ(value, test.expected);
+        }
+    }
+}

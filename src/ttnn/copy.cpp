@@ -422,8 +422,10 @@ namespace iom::ttnn_detail {
             tt::tt_metal::distributed::MeshDevice& device,
             TtnnHostStaging& staging, const BinaryRequest& request,
             ttnn::Tensor* lhs_planes, ttnn::Tensor* rhs_planes,
-            ttnn::Tensor* out_planes, bool& any_submitted) {
+            ttnn::Tensor* out_planes, bool& any_submitted,
+            bool& native_drained, BinaryFinish finish) {
         any_submitted = false;
+        native_drained = false;
         const auto dims = request.result_shape.dimensions();
         const std::size_t rank = dims.size();
         const std::size_t leading_rank = rank - 2;
@@ -598,7 +600,8 @@ namespace iom::ttnn_detail {
         }
         // One queue finish proves completion of every upload; only then
         // are the retained staging slots handed back for reuse.
-        queue.finish();
+        finish(device);
+        native_drained = true;
         for (auto& lease : leases) {
             lease.release();
         }

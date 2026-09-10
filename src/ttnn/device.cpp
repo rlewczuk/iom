@@ -492,7 +492,8 @@ namespace iom {
         // path routes through here so an armed finish-failure seam faults
         // exactly those attempts; host transfers, fence invokes, and
         // quarantine drains keep their own finish calls unaffected.
-        void finish_locked(TtnnDevice& device) {
+        void finish_locked_mesh(
+                tt::tt_metal::distributed::MeshDevice& device) {
 #ifdef IOM_ENABLE_TESTING
             g_copy_mesh_finish_count.fetch_add(1, std::memory_order_relaxed);
             if (consume_copy_finish_fault()) {
@@ -500,7 +501,11 @@ namespace iom {
                         "injected TTNN copy finish failure");
             }
 #endif
-            device.mesh().mesh_command_queue(0).finish();
+            device.mesh_command_queue(0).finish();
+        }
+
+        void finish_locked(TtnnDevice& device) {
+            finish_locked_mesh(device.mesh());
         }
 
         detail::FenceResult finish_native(TtnnDevice& device) noexcept {
@@ -544,9 +549,9 @@ class TtnnQueue final : public DeviceOps {
     struct BinaryOutcome {
         detail::BinaryEntryRegistration entries;
         bool native_work_submitted = false;
+        bool native_completion_proven = false;
         std::exception_ptr retained_failure;
     };
-
 public:
     explicit TtnnQueue(TtnnDevice& device)
             : DeviceOps(device),
@@ -624,6 +629,7 @@ public:
     void execute(Task& task) {
         if (task.is_binary) {
             bool submitted = false;
+            bool completion_proven = false;
             try {
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -636,20 +642,29 @@ public:
                         throw std::logic_error("duplicate TTNN binary sequence");
                     }
                 }
-                std::lock_guard<std::mutex> api_lock(device_->api_mutex());
-                auto* lhs = static_cast<ttnn::Tensor*>(
-                        task.binary_request.lhs.native_handle);
-                auto* rhs = static_cast<ttnn::Tensor*>(
-                        task.binary_request.rhs.native_handle);
-                auto* out = static_cast<ttnn::Tensor*>(
-                        task.binary_request.out.native_handle);
-                ttnn_detail::binary_planes(
-                        device_->mesh(), device_->host_staging(),
-                        task.binary_request, lhs, rhs, out, submitted);
+                {
+                    std::lock_guard<std::mutex> api_lock(
+                            device_->api_mutex());
+                    auto* lhs = static_cast<ttnn::Tensor*>(
+                            task.binary_request.lhs.native_handle);
+                    auto* rhs = static_cast<ttnn::Tensor*>(
+                            task.binary_request.rhs.native_handle);
+                    auto* out = static_cast<ttnn::Tensor*>(
+                            task.binary_request.out.native_handle);
+                    ttnn_detail::binary_planes(
+                            device_->mesh(), device_->host_staging(),
+                            task.binary_request, lhs, rhs, out, submitted,
+                            completion_proven, finish_locked_mesh);
+                }
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
                     binary_outcomes_.at(task.sequence).native_work_submitted =
                             submitted;
+                    binary_outcomes_.at(task.sequence)
+                            .native_completion_proven = completion_proven;
+                }
+                if (completion_proven) {
+                    publish_native_completion(task.sequence);
                 }
                 executed_seq_.store(task.sequence, std::memory_order_release);
                 return;
@@ -669,17 +684,32 @@ public:
                 // registrations, and staging leases under the normal
                 // completion/quarantine path so the public token remains a
                 // repeatably failed retained submission.
-                std::lock_guard<std::mutex> lock(outcome_mutex_);
-                auto it = binary_outcomes_.find(task.sequence);
-                if (it != binary_outcomes_.end()) {
-                    it->second.retained_failure = submission_failure;
-                    it->second.native_work_submitted = submitted;
+                {
+                    std::lock_guard<std::mutex> lock(outcome_mutex_);
+                    auto it = binary_outcomes_.find(task.sequence);
+                    if (it != binary_outcomes_.end()) {
+                        it->second.retained_failure = submission_failure;
+                        it->second.native_work_submitted = submitted;
+                        it->second.native_completion_proven =
+                                completion_proven;
+                    }
+                }
+                if (completion_proven) {
+                    publish_native_completion(task.sequence);
                 }
                 executed_seq_.store(task.sequence, std::memory_order_release);
                 return;
             }
         }
         execute_copy(task);
+    }
+    void publish_native_completion(std::uint64_t sequence) noexcept {
+        std::lock_guard<std::mutex> fence_lock(fence_mutex_);
+        const std::uint64_t now =
+                last_finished_seq_.load(std::memory_order_acquire);
+        if (sequence > now) {
+            last_finished_seq_.store(sequence, std::memory_order_release);
+        }
     }
 
     void execute_copy(Task& task) {
@@ -839,15 +869,26 @@ public:
         }
         if (is_binary) {
             detail::FenceResult fence_result = detail::FenceResult::success();
-            if (binary_outcome.native_work_submitted) {
+            bool completion_proven =
+                    binary_outcome.native_completion_proven;
+            if (binary_outcome.native_work_submitted
+                    && !completion_proven) {
                 fence_result = finish_native(*device_);
+                completion_proven =
+                        fence_result.succeeded && !fence_result.failure;
+                if (completion_proven) {
+                    publish_native_completion(sequence);
+                }
             }
             const std::exception_ptr operation_failure =
                     failure ? failure : binary_outcome.retained_failure;
+            const bool fence_succeeded =
+                    fence_result.succeeded && !fence_result.failure;
             const bool released = detail::release_or_invalidate_binary_entries(
                     state_->registry, binary_outcome.entries,
-                    static_cast<bool>(operation_failure),
-                    fence_result.succeeded && !fence_result.failure);
+                    static_cast<bool>(operation_failure)
+                            && !completion_proven,
+                    fence_succeeded);
             (void)released;
             complete(sequence, operation_failure
                     ? operation_failure : fence_result.failure);

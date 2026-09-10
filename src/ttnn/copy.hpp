@@ -27,5 +27,10 @@ struct BinaryRequest {
     BinarySnapshot out;
     TensorShape result_shape;
 };
-void binary_planes(tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&, const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*, bool&);
+using BinaryFinish =
+        void (*)(tt::tt_metal::distributed::MeshDevice&);
+void binary_planes(
+        tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&,
+        const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*,
+        bool&, bool&, BinaryFinish);
 }  // namespace iom::ttnn_detail
