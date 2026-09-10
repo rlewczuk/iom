@@ -10,6 +10,7 @@
 #include "iom/tensor.hpp"
 #include "iom/iom.hpp"
 
+#include "scalar_binary_codec.hpp"
 #ifndef IOM_GPU_DEVICE
 #error "IOM_GPU_DEVICE must be defined before including standard_tiled_add.inl"
 #endif
@@ -93,182 +94,49 @@ struct BinaryMetadata {
 // encoding reproduces the reference encodings bit for bit.
 // ---------------------------------------------------------------------------
 
-struct AddFormat {
-    unsigned bits, ebits, fbits;
-    int bias;
-    bool finite_only, infs;
+struct DeviceTraits {
+    using carrier_type = double;
+
+    IOM_GPU_DEVICE static carrier_type positive_infinity() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7ff0000000000000ull));
+    }
+    IOM_GPU_DEVICE static carrier_type quiet_nan() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7ff8000000000000ull));
+    }
+    IOM_GPU_DEVICE static carrier_type max_finite() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7fefffffffffffffull));
+    }
+    IOM_GPU_DEVICE static bool isnan(carrier_type value) noexcept {
+        return ::isnan(value);
+    }
+    IOM_GPU_DEVICE static bool isinf(carrier_type value) noexcept {
+        return ::isinf(value);
+    }
+    IOM_GPU_DEVICE static bool signbit(carrier_type value) noexcept {
+        return ::signbit(value);
+    }
+    IOM_GPU_DEVICE static carrier_type fabs(carrier_type value) noexcept {
+        return ::fabs(value);
+    }
+    IOM_GPU_DEVICE static carrier_type floor(carrier_type value) noexcept {
+        return ::floor(value);
+    }
+    IOM_GPU_DEVICE static carrier_type ldexp(
+            carrier_type value, int exponent) noexcept {
+        return ::ldexp(value, exponent);
+    }
+    IOM_GPU_DEVICE static carrier_type frexp(
+            carrier_type value, int* exponent) noexcept {
+        return ::frexp(value, exponent);
+    }
 };
 
-IOM_GPU_DEVICE AddFormat add_format(std::uint32_t type) noexcept {
-    switch (static_cast<DataType>(type)) {
-        case DataType::F4_E2M1: return {4, 2, 1, 1, true, false};
-        case DataType::F6_E2M3: return {6, 2, 3, 1, true, false};
-        case DataType::F6_E3M2: return {6, 3, 2, 3, true, false};
-        case DataType::F8_E4M3FN: return {8, 4, 3, 7, true, false};
-        case DataType::F8_E5M2: return {8, 5, 2, 15, false, true};
-        case DataType::F16: return {16, 5, 10, 15, false, true};
-        case DataType::BF16: return {16, 8, 7, 127, false, true};
-        case DataType::F32: return {32, 8, 23, 127, false, true};
-        default: return {64, 11, 52, 1023, false, true};
-    }
-}
+using DeviceCodec = scalar_binary_codec_detail::Codec<DeviceTraits>;
+using DeviceBinaryOp = scalar_binary_codec_detail::BinaryOp;
 
-IOM_GPU_DEVICE double add_positive_infinity() noexcept {
-    return __longlong_as_double(
-            static_cast<long long>(0x7ff0000000000000ull));
-}
-
-IOM_GPU_DEVICE double add_quiet_nan() noexcept {
-    return __longlong_as_double(
-            static_cast<long long>(0x7ff8000000000000ull));
-}
-
-IOM_GPU_DEVICE double add_max_finite() noexcept {
-    return __longlong_as_double(
-            static_cast<long long>(0x7fefffffffffffffull));
-}
-
-IOM_GPU_DEVICE double add_decode(std::uint64_t raw, AddFormat f) noexcept {
-    const std::uint64_t sign = raw >> (f.ebits + f.fbits);
-    const std::uint64_t emask = (std::uint64_t{1} << f.ebits) - 1;
-    const std::uint64_t frac = raw & ((std::uint64_t{1} << f.fbits) - 1);
-    const std::uint64_t exp = (raw >> f.fbits) & emask;
-    if (exp == emask && (!f.finite_only || f.ebits >= 4)) {
-        if (f.infs && frac == 0) {
-            return sign ? -add_positive_infinity()
-                        : add_positive_infinity();
-        }
-        return add_quiet_nan();
-    }
-    double v;
-    if (exp == 0) {
-        v = ldexp(static_cast<double>(frac),
-                  1 - f.bias - static_cast<int>(f.fbits));
-    } else {
-        v = ldexp(
-                static_cast<double>((std::uint64_t{1} << f.fbits) + frac),
-                static_cast<int>(exp) - f.bias - static_cast<int>(f.fbits));
-    }
-    return sign ? -v : v;
-}
-
-IOM_GPU_DEVICE std::uint64_t add_round_even(double y) noexcept {
-    const double q = floor(y);
-    const double r = y - q;
-    if (r > 0.5
-            || (r == 0.5
-                && (static_cast<std::uint64_t>(q) & 1))) {
-        return static_cast<std::uint64_t>(q) + 1;
-    }
-    return static_cast<std::uint64_t>(q);
-}
-
-IOM_GPU_DEVICE std::uint64_t add_encode(double x, AddFormat f) noexcept {
-    const std::uint64_t sign = signbit(x) ? 1 : 0;
-    x = fabs(x);
-    const std::uint64_t emask = (std::uint64_t{1} << f.ebits) - 1;
-    const std::uint64_t fmask = (std::uint64_t{1} << f.fbits) - 1;
-    const bool tiny = f.finite_only && f.ebits < 4;
-    const std::uint64_t overflow =
-            (sign << (f.ebits + f.fbits))
-            | (f.infs ? (emask << f.fbits)
-                      : ((tiny ? emask : emask - 1) << f.fbits) | fmask);
-    if (isnan(x)) {
-        if (tiny) {
-            x = add_max_finite();
-        } else {
-            return (sign << (f.ebits + f.fbits))
-                    | (f.finite_only
-                       ? (emask << f.fbits) | fmask
-                       : (emask << f.fbits)
-                               | (std::uint64_t{1} << (f.fbits - 1)));
-        }
-    }
-    if (isinf(x)) return overflow;
-    if (x == 0) {
-        return sign << (f.ebits + f.fbits);
-    }
-    const int min_sub = 1 - f.bias - static_cast<int>(f.fbits);
-    const int max_exp = static_cast<int>(tiny ? emask : emask - 1) - f.bias;
-    int e = 0;
-    (void)frexp(x, &e);
-    --e;
-    if (e < min_sub + static_cast<int>(f.fbits)) {
-        const std::uint64_t q = add_round_even(ldexp(x, -min_sub));
-        if (q == (std::uint64_t{1} << f.fbits)) {
-            return (sign << (f.ebits + f.fbits))
-                    | (std::uint64_t{1} << f.fbits);
-        }
-        return (sign << (f.ebits + f.fbits)) | q;
-    }
-    if (e > max_exp) {
-        return overflow;
-    }
-    std::uint64_t frac = add_round_even(
-            ldexp(x, f.fbits - e)
-            - static_cast<double>(std::uint64_t{1} << f.fbits));
-    if (frac == (std::uint64_t{1} << f.fbits)) {
-        ++e;
-        frac = 0;
-    }
-    if (e > max_exp) {
-        return overflow;
-    }
-    return (sign << (f.ebits + f.fbits))
-            | (static_cast<std::uint64_t>(e + f.bias) << f.fbits) | frac;
-}
-
-IOM_GPU_DEVICE std::uint64_t add_integer(
-        std::uint64_t a, std::uint64_t b, unsigned bits,
-        std::uint32_t operation) noexcept {
-    const std::uint64_t mask =
-            bits == 64 ? ~std::uint64_t{} : (std::uint64_t{1} << bits) - 1;
-    if (operation == 1) return (a * b) & mask;
-    if (operation == 2) return (a - b) & mask;
-    if (operation == 3) return 0;
-    return (a + b) & mask;
-}
-
-IOM_GPU_DEVICE std::uint64_t add_value(
-        std::uint32_t type, std::uint64_t a, std::uint64_t b,
-        unsigned bits, std::uint32_t operation) noexcept {
-    if (type <= static_cast<std::uint32_t>(DataType::U64)) {
-        return add_integer(a, b, bits, operation);
-    }
-    const AddFormat f = add_format(type);
-    const double x = add_decode(a, f);
-    const double y = add_decode(b, f);
-    double z;
-    if (isnan(x) || isnan(y)) {
-        z = add_quiet_nan();
-    } else if (operation == 1) {
-        if ((isinf(x) && y == 0) || (isinf(y) && x == 0)) {
-            z = add_quiet_nan();
-        } else {
-            z = x * y;
-        }
-    } else if (operation == 2) {
-        if (isinf(x) && isinf(y) && signbit(x) == signbit(y)) {
-            z = add_quiet_nan();
-        } else {
-            z = x - y;
-        }
-    } else if (operation == 3) {
-        if ((x == 0 && y == 0) || (isinf(x) && isinf(y))) {
-            z = add_quiet_nan();
-        } else {
-            z = x / y;
-        }
-    } else if (isinf(x) && isinf(y) && signbit(x) != signbit(y)) {
-        z = add_quiet_nan();
-    } else if (x == 0 && y == 0) {
-        z = (signbit(x) && signbit(y)) ? -0.0 : 0.0;
-    } else {
-        z = x + y;
-        if (z == 0) z = 0.0;
-    }
-    return add_encode(z, f);
-}
 
 // ---------------------------------------------------------------------------
 // Packed-field primitives. Element slot s of a plane occupies bits
@@ -327,6 +195,7 @@ IOM_GPU_DEVICE std::uint64_t add_plane_slot(
             + (row % kAddTile) * kAddTile + column % kAddTile;
 }
 
+template <DeviceBinaryOp Op>
 IOM_GPU_DEVICE void binary_body(
         const unsigned char* lhs, const unsigned char* rhs,
         unsigned char* out, const BinaryMetadata& m) noexcept {
@@ -398,7 +267,8 @@ IOM_GPU_DEVICE void binary_body(
             const std::uint64_t b = add_load_bits(
                     rhs, rhs_slot * m.bits, m.bits);
             const std::uint64_t value =
-                    add_value(m.type, a, b, m.bits, m.operation);
+                    DeviceCodec::binary<Op>(
+                            static_cast<DataType>(m.type), a, b);
 
             const std::uint64_t lo = slot_bit > base ? slot_bit : base;
             const std::uint64_t hi =
@@ -419,7 +289,20 @@ IOM_GPU_DEVICE void binary_body(
 IOM_GPU_GLOBAL void grid_stride_binary_kernel(
         const unsigned char* lhs, const unsigned char* rhs,
         unsigned char* out, BinaryMetadata metadata) {
-    binary_body(lhs, rhs, out, metadata);
+    switch (metadata.operation) {
+        case static_cast<std::uint32_t>(DeviceBinaryOp::add):
+            binary_body<DeviceBinaryOp::add>(lhs, rhs, out, metadata);
+            break;
+        case static_cast<std::uint32_t>(DeviceBinaryOp::mul):
+            binary_body<DeviceBinaryOp::mul>(lhs, rhs, out, metadata);
+            break;
+        case static_cast<std::uint32_t>(DeviceBinaryOp::sub):
+            binary_body<DeviceBinaryOp::sub>(lhs, rhs, out, metadata);
+            break;
+        case static_cast<std::uint32_t>(DeviceBinaryOp::div):
+            binary_body<DeviceBinaryOp::div>(lhs, rhs, out, metadata);
+            break;
+    }
 }
 
 template <typename Policy>
