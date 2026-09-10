@@ -42,15 +42,17 @@ inline long double value(std::uint64_t r, Spec s) noexcept {
 inline std::uint64_t round_encode(long double x, Spec s) noexcept {
     const auto em = (std::uint64_t{1} << s.e) - 1, fm = (std::uint64_t{1} << s.f) - 1;
     const auto sg = std::signbit(x) ? std::uint64_t{1} : 0; x = std::fabs(x);
+    const auto finite_emax = s.finite && s.e < 4 ? em : em - 1;
+    const auto overflow = (sg << (s.e + s.f))
+            | (s.inf ? (em << s.f) : (finite_emax << s.f) | fm);
     if (std::isnan(x))
         return (sg << (s.e + s.f)) | (em << s.f) |
                (s.finite ? fm : std::uint64_t{1} << (s.f - 1));
-    if (std::isinf(x)) return (sg << (s.e + s.f)) |
-        (s.inf ? em << s.f : ((s.finite && s.e < 4 ? em : em - 1) << s.f) | fm);
+    if (std::isinf(x)) return overflow;
     if (x == 0) return sg << (s.e + s.f);
     int e = 0; std::frexp(x, &e); --e;
     const int minsub = 1 - s.bias - static_cast<int>(s.f);
-    const int maxe = static_cast<int>((s.finite && s.e < 4 ? em : em - 1) - s.bias);
+    const int maxe = static_cast<int>(finite_emax - s.bias);
     auto rn = [](long double q) {
         const auto n = std::floor(q), r = q - n;
         return static_cast<std::uint64_t>(n + (r > .5L || (r == .5L && (static_cast<std::uint64_t>(n) & 1))));
@@ -59,10 +61,10 @@ inline std::uint64_t round_encode(long double x, Spec s) noexcept {
         const auto q = rn(std::ldexp(x, -minsub));
         return (sg << (s.e + s.f)) | (q == (std::uint64_t{1} << s.f) ? std::uint64_t{1} << s.f : q);
     }
-    if (e > maxe) return (sg << (s.e + s.f)) | ((s.finite && s.e < 4 ? em : em - 1) << s.f) | fm;
+    if (e > maxe) return overflow;
     auto q = rn(std::ldexp(x, static_cast<int>(s.f) - e) - (std::uint64_t{1} << s.f));
     if (q == (std::uint64_t{1} << s.f)) { ++e; q = 0; }
-    if (e > maxe) return (sg << (s.e + s.f)) | ((s.finite && s.e < 4 ? em : em - 1) << s.f) | fm;
+    if (e > maxe) return overflow;
     return (sg << (s.e + s.f)) | (static_cast<std::uint64_t>(e + s.bias) << s.f) | q;
 }
 enum class operation { add, mul, sub, div };
@@ -102,11 +104,6 @@ inline std::uint64_t binary(iom::DataType t, std::uint64_t a, std::uint64_t b, o
     } else {
         z = ((x == 0 && y == 0) || (std::isinf(x) && std::isinf(y)))
             ? std::numeric_limits<long double>::quiet_NaN() : x / y;
-    }
-    if (op == operation::add && s.e == 11 && s.inf && std::isfinite(z)) {
-        const auto em = (std::uint64_t{1} << s.e) - 1, fm = (std::uint64_t{1} << s.f) - 1;
-        if (std::fabs(z) > value(((em - 1) << s.f) | fm, s))
-            z = std::copysign(std::numeric_limits<long double>::infinity(), z);
     }
     return round_encode(z, s);
 }

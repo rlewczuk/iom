@@ -169,6 +169,10 @@ IOM_GPU_DEVICE std::uint64_t add_encode(double x, AddFormat f) noexcept {
     const std::uint64_t emask = (std::uint64_t{1} << f.ebits) - 1;
     const std::uint64_t fmask = (std::uint64_t{1} << f.fbits) - 1;
     const bool tiny = f.finite_only && f.ebits < 4;
+    const std::uint64_t overflow =
+            (sign << (f.ebits + f.fbits))
+            | (f.infs ? (emask << f.fbits)
+                      : ((tiny ? emask : emask - 1) << f.fbits) | fmask);
     if (isnan(x)) {
         if (tiny) {
             x = add_max_finite();
@@ -180,13 +184,7 @@ IOM_GPU_DEVICE std::uint64_t add_encode(double x, AddFormat f) noexcept {
                                | (std::uint64_t{1} << (f.fbits - 1)));
         }
     }
-    if (isinf(x)) {
-        if (f.infs) {
-            return (sign << (f.ebits + f.fbits)) | (emask << f.fbits);
-        }
-        return (sign << (f.ebits + f.fbits))
-                | ((tiny ? emask : emask - 1) << f.fbits) | fmask;
-    }
+    if (isinf(x)) return overflow;
     if (x == 0) {
         return sign << (f.ebits + f.fbits);
     }
@@ -204,8 +202,7 @@ IOM_GPU_DEVICE std::uint64_t add_encode(double x, AddFormat f) noexcept {
         return (sign << (f.ebits + f.fbits)) | q;
     }
     if (e > max_exp) {
-        return (sign << (f.ebits + f.fbits))
-                | ((tiny ? emask : emask - 1) << f.fbits) | fmask;
+        return overflow;
     }
     std::uint64_t frac = add_round_even(
             ldexp(x, f.fbits - e)
@@ -215,8 +212,7 @@ IOM_GPU_DEVICE std::uint64_t add_encode(double x, AddFormat f) noexcept {
         frac = 0;
     }
     if (e > max_exp) {
-        return (sign << (f.ebits + f.fbits))
-                | ((tiny ? emask : emask - 1) << f.fbits) | fmask;
+        return overflow;
     }
     return (sign << (f.ebits + f.fbits))
             | (static_cast<std::uint64_t>(e + f.bias) << f.fbits) | frac;
@@ -250,28 +246,18 @@ IOM_GPU_DEVICE std::uint64_t add_value(
             z = add_quiet_nan();
         } else {
             z = x * y;
-            if (f.bits == 64 && isinf(z) && isfinite(x) && isfinite(y)) {
-                z = signbit(x) != signbit(y)
-                        ? -add_max_finite() : add_max_finite();
-            }
         }
     } else if (operation == 2) {
         if (isinf(x) && isinf(y) && signbit(x) == signbit(y)) {
             z = add_quiet_nan();
         } else {
             z = x - y;
-            if (f.bits == 64 && isinf(z) && isfinite(x) && isfinite(y))
-                z = signbit(z) ? -add_max_finite() : add_max_finite();
         }
     } else if (operation == 3) {
         if ((x == 0 && y == 0) || (isinf(x) && isinf(y))) {
             z = add_quiet_nan();
         } else {
             z = x / y;
-            if (f.bits == 64 && isinf(z) && isfinite(x) && isfinite(y)
-                    && y != 0)
-                z = signbit(x) != signbit(y)
-                        ? -add_max_finite() : add_max_finite();
         }
     } else if (isinf(x) && isinf(y) && signbit(x) != signbit(y)) {
         z = add_quiet_nan();

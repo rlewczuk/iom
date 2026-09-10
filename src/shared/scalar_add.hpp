@@ -51,11 +51,12 @@ inline std::uint64_t encode_small(long double x, Format f) noexcept {
     const auto pack = [&](std::uint64_t e, std::uint64_t m) {
         return (sign << (f.ebits + f.fbits)) | (e << f.fbits) | m;
     };
+    const auto overflow = f.infs ? pack(emask, 0) : pack(finite_emax, fmask);
     if (std::isnan(x)) {
         if (f.finite_only && f.ebits < 4) x = std::numeric_limits<long double>::max();
         else return pack(emask, f.finite_only ? fmask : std::uint64_t{1} << (f.fbits - 1));
     }
-    if (std::isinf(x)) return f.infs ? pack(emask, 0) : pack(finite_emax, fmask);
+    if (std::isinf(x)) return overflow;
     if (x == 0) return sign << (f.ebits + f.fbits);
     const int min_sub = 1 - f.bias - static_cast<int>(f.fbits);
     const int max_exp = static_cast<int>(finite_emax) - f.bias;
@@ -72,10 +73,10 @@ inline std::uint64_t encode_small(long double x, Format f) noexcept {
         const auto q = round_even(std::ldexp(x, -min_sub));
         return q == (std::uint64_t{1} << f.fbits) ? pack(1, 0) : pack(0, q);
     }
-    if (e > max_exp) return pack(finite_emax, fmask);
+    if (e > max_exp) return overflow;
     auto frac = round_even(std::ldexp(x, f.fbits - e) - static_cast<long double>(std::uint64_t{1} << f.fbits));
     if (frac == (std::uint64_t{1} << f.fbits)) { ++e; frac = 0; }
-    if (e > max_exp) return pack(finite_emax, fmask);
+    if (e > max_exp) return overflow;
     return pack(static_cast<std::uint64_t>(e + f.bias), frac);
 }
 
