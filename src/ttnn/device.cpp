@@ -510,37 +510,32 @@ class TtnnQueue final : public DeviceOps {
         const TensorView* source = nullptr;
         TensorView* destination = nullptr;
         bool no_op = false;
-        bool is_add = false;
-        ttnn_detail::AddRequest add_request{
-                {TensorSpec{TensorShape{{1, 1}}, DataType::I32},
-                 nullptr, 0, {}},
-                {TensorSpec{TensorShape{{1, 1}}, DataType::I32},
-                 nullptr, 0, {}},
-                {TensorSpec{TensorShape{{1, 1}}, DataType::I32},
-                 nullptr, 0, {}},
+        bool is_binary = false;
+        ttnn_detail::BinaryRequest binary_request{
+                ttnn_detail::BinaryOperation::add,
+                {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
+                {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
+                {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
                 TensorShape{{1, 1}}};
         void* fence = nullptr;
-        detail::AddEntryRegistration add_entries{};
+        detail::BinaryEntryRegistration binary_entries{};
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
 
-        Task(std::uint64_t sequence_,
-             const TensorView& source_,
-             TensorView& destination_,
-             bool no_op_)
+        Task(std::uint64_t sequence_, const TensorView& source_,
+             TensorView& destination_, bool no_op_)
             : sequence(sequence_), source(&source_), destination(&destination_),
               no_op(no_op_) {}
-        Task(std::uint64_t sequence_, const ttnn_detail::AddRequest& request,
-             detail::AddEntryRegistration entries)
-            : sequence(sequence_), is_add(true), add_request(request),
-              add_entries(entries) {}
+        Task(std::uint64_t sequence_, const ttnn_detail::BinaryRequest& request,
+             detail::BinaryEntryRegistration entries)
+            : sequence(sequence_), is_binary(true), binary_request(request),
+              binary_entries(entries) {}
     };
-    struct AddOutcome {
-        detail::AddEntryRegistration entries;
+    struct BinaryOutcome {
+        detail::BinaryEntryRegistration entries;
         bool native_work_submitted = false;
         std::exception_ptr retained_failure;
     };
-
 
 public:
     explicit TtnnQueue(TtnnDevice& device)
@@ -588,15 +583,21 @@ public:
                     worker_.submit_copy(std::move(task));
                 });
     }
-    oid add_impl(const AddRequest& request) override {
-        std::lock_guard<std::mutex> submission_lock(
-                submission_order_mutex_);
+    oid binary_impl(const BinaryRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
         detail::Fence fence = build_ttnn_fence(*device_);
-        return submit_add(
+        return submit_binary(
                 request, *state_, registry_queue_id_, fence,
-                [this](std::uint64_t sequence, const AddRequest& captured,
-                       detail::AddEntryRegistration entries) {
-                    ttnn_detail::AddRequest internal{
+                [this](std::uint64_t sequence, const BinaryRequest& captured,
+                       detail::BinaryEntryRegistration entries) {
+                    ttnn_detail::BinaryRequest internal{
+                            captured.operation == BinaryOperation::Add
+                                    ? ttnn_detail::BinaryOperation::add
+                                    : captured.operation == BinaryOperation::Mul
+                                            ? ttnn_detail::BinaryOperation::mul
+                                            : captured.operation == BinaryOperation::Sub
+                                                    ? ttnn_detail::BinaryOperation::sub
+                                                    : ttnn_detail::BinaryOperation::div,
                             {captured.lhs.spec, captured.lhs.native_handle,
                              captured.lhs.plane_offset,
                              captured.lhs.logical_plane_strides},
@@ -607,51 +608,42 @@ public:
                              captured.out.plane_offset,
                              captured.out.logical_plane_strides},
                             captured.result_shape};
-                    worker_.submit_copy(
-                            Task(sequence, internal, entries));
+                    worker_.submit_copy(Task(sequence, internal, entries));
                 });
     }
-    [[nodiscard]] std::string_view backend_label() const noexcept override {
-        return "TTNN";
-    }
-
-private:
     void execute(Task& task) {
-        if (task.is_add) {
-            // A failure after this point may have left mesh work in
-            // flight; a failure before add_planes is pre-submission and
-            // finishes no native work.
+        if (task.is_binary) {
             bool submitted = false;
             try {
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
-                    const auto [it, inserted] = add_outcomes_.emplace(
-                            task.sequence, AddOutcome{task.add_entries});
+                    const auto [it, inserted] = binary_outcomes_.emplace(
+                            task.sequence, BinaryOutcome{task.binary_entries});
                     if (!inserted) {
-                        throw std::logic_error("duplicate TTNN ADD sequence");
+                        throw std::logic_error("duplicate TTNN binary sequence");
                     }
                 }
                 std::lock_guard<std::mutex> api_lock(device_->api_mutex());
                 auto* lhs = static_cast<ttnn::Tensor*>(
-                        task.add_request.lhs.native_handle);
+                        task.binary_request.lhs.native_handle);
                 auto* rhs = static_cast<ttnn::Tensor*>(
-                        task.add_request.rhs.native_handle);
+                        task.binary_request.rhs.native_handle);
                 auto* out = static_cast<ttnn::Tensor*>(
-                        task.add_request.out.native_handle);
-                ttnn_detail::add_planes(
+                        task.binary_request.out.native_handle);
+                ttnn_detail::binary_planes(
                         device_->mesh(), device_->host_staging(),
-                        task.add_request, lhs, rhs, out, submitted);
+                        task.binary_request, lhs, rhs, out, submitted);
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
-                    add_outcomes_.at(task.sequence).native_work_submitted =
+                    binary_outcomes_.at(task.sequence).native_work_submitted =
                             submitted;
                 }
                 executed_seq_.store(task.sequence, std::memory_order_release);
                 return;
             } catch (...) {
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
-                auto it = add_outcomes_.find(task.sequence);
-                if (it != add_outcomes_.end()) {
+                auto it = binary_outcomes_.find(task.sequence);
+                if (it != binary_outcomes_.end()) {
                     it->second.retained_failure = std::current_exception();
                     it->second.native_work_submitted = submitted;
                 }
@@ -806,26 +798,26 @@ private:
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
-        AddOutcome add_outcome;
-        bool is_add = false;
+        BinaryOutcome binary_outcome;
+        bool is_binary = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
-            const auto it = add_outcomes_.find(sequence);
-            if (it != add_outcomes_.end()) {
-                add_outcome = std::move(it->second);
-                add_outcomes_.erase(it);
-                is_add = true;
+            const auto it = binary_outcomes_.find(sequence);
+            if (it != binary_outcomes_.end()) {
+                binary_outcome = std::move(it->second);
+                binary_outcomes_.erase(it);
+                is_binary = true;
             }
         }
-        if (is_add) {
+        if (is_binary) {
             detail::FenceResult fence_result = detail::FenceResult::success();
-            if (add_outcome.native_work_submitted) {
+            if (binary_outcome.native_work_submitted) {
                 fence_result = finish_native(*device_);
             }
             const std::exception_ptr operation_failure =
-                    failure ? failure : add_outcome.retained_failure;
-            const bool released = detail::release_or_invalidate_add_entries(
-                    state_->registry, add_outcome.entries,
+                    failure ? failure : binary_outcome.retained_failure;
+            const bool released = detail::release_or_invalidate_binary_entries(
+                    state_->registry, binary_outcome.entries,
                     static_cast<bool>(operation_failure),
                     fence_result.succeeded && !fence_result.failure);
             (void)released;
@@ -833,20 +825,15 @@ private:
                     ? operation_failure : fence_result.failure);
             return;
         }
-        // Copy completion follows.
-        // reached the mesh, which keeps the single finish below from
-        // racing a not-yet-enqueued task.
         std::vector<std::pair<std::uint64_t, detail::SequenceOutcome>> batch;
         bool has_outcome = false;
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
             const auto first = outcomes_.find(sequence);
             if (first != outcomes_.end()) {
-                batch.emplace_back(
-                        sequence, std::move(first->second));
+                batch.emplace_back(sequence, std::move(first->second));
                 outcomes_.erase(first);
                 has_outcome = true;
-
                 const std::uint64_t executed =
                         executed_seq_.load(std::memory_order_acquire);
                 std::uint64_t next = sequence + 1;
@@ -911,7 +898,7 @@ private:
     }
 
     TtnnDevice* device_;
-    std::map<std::uint64_t, AddOutcome> add_outcomes_;
+    std::map<std::uint64_t, BinaryOutcome> binary_outcomes_;
     detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
     std::mutex submission_order_mutex_;

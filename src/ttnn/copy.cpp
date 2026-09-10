@@ -418,9 +418,9 @@ namespace iom::ttnn_detail {
     }
 
 
-    void add_planes(
+    void binary_planes(
             tt::tt_metal::distributed::MeshDevice& device,
-            TtnnHostStaging& staging, const AddRequest& request,
+            TtnnHostStaging& staging, const BinaryRequest& request,
             ttnn::Tensor* lhs_planes, ttnn::Tensor* rhs_planes,
             ttnn::Tensor* out_planes, bool& any_submitted) {
         any_submitted = false;
@@ -449,7 +449,7 @@ namespace iom::ttnn_detail {
             }
             return it->second;
         };
-        auto plane_at = [&](const AddSnapshot& view,
+        auto plane_at = [&](const BinarySnapshot& view,
                             std::span<const std::size_t> coordinates) {
             std::size_t plane = view.plane_offset;
             for (std::size_t i = 0; i < leading_rank; ++i) {
@@ -457,7 +457,7 @@ namespace iom::ttnn_detail {
             }
             return plane;
         };
-        auto read = [&](const AddSnapshot& view,
+        auto read = [&](const BinarySnapshot& view,
                         ttnn::Tensor* planes,
                         auto& cache, std::span<const std::size_t> coordinates,
                         std::size_t row, std::size_t column) {
@@ -498,7 +498,7 @@ namespace iom::ttnn_detail {
             const std::size_t matrix = rem;
             const std::size_t row = matrix / columns;
             const std::size_t column = matrix % columns;
-            auto operand_coord = [&](const AddSnapshot& view) {
+            auto operand_coord = [&](const BinarySnapshot& view) {
                 std::vector<std::size_t> mapped(leading_rank, 0);
                 const auto vdims = view.spec.shape.dimensions();
                 const std::size_t leading_operand_rank = vdims.size() - 2;
@@ -519,10 +519,29 @@ namespace iom::ttnn_detail {
                     request.lhs.spec.shape.rank() - 1) == 1 ? 0 : column;
             const std::size_t rcol = request.rhs.spec.shape.dimension(
                     request.rhs.spec.shape.rank() - 1) == 1 ? 0 : column;
-            const std::uint64_t value = detail::scalar_add(
-                    request.out.spec.data_type,
-                    read(request.lhs, lhs_planes, lhs_cache, lc, lr, lcol),
-                    read(request.rhs, rhs_planes, rhs_cache, rc, rr, rcol));
+            const auto left = read(
+                    request.lhs, lhs_planes, lhs_cache, lc, lr, lcol);
+            const auto right = read(
+                    request.rhs, rhs_planes, rhs_cache, rc, rr, rcol);
+            const auto scalar = [&] {
+                using Op = detail::scalar_add_detail::BinaryOp;
+                switch (request.operation) {
+                    case BinaryOperation::add:
+                        return detail::scalar_binary<Op::add>(
+                                request.out.spec.data_type, left, right);
+                    case BinaryOperation::mul:
+                        return detail::scalar_binary<Op::mul>(
+                                request.out.spec.data_type, left, right);
+                    case BinaryOperation::sub:
+                        return detail::scalar_binary<Op::sub>(
+                                request.out.spec.data_type, left, right);
+                    case BinaryOperation::div:
+                        return detail::scalar_binary<Op::div>(
+                                request.out.spec.data_type, left, right);
+                }
+                return std::uint64_t{0};
+            };
+            const std::uint64_t value = scalar();
             const std::size_t plane = plane_at(request.out, coordinates);
             auto& raw = load(out_planes, plane, out_cache);
             const std::size_t padded_columns =

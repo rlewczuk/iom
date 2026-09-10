@@ -1768,7 +1768,7 @@ TEST_CASE("TTNN ADD representative wide leaves match the oracle") {
 TEST_CASE("TTNN ADD accepts documented rank boundaries") {
     require_hardware();
     TtnnDevices devices;
-    iom_conformance::run_add_rank_boundary_conformance(
+    iom_conformance::run_binary_rank_boundary_conformance(
             *devices.candidate);
 }
 
