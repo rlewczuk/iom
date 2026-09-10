@@ -397,13 +397,13 @@ class SyclQueue final : public DeviceOps {
         void* fence = state.get();
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
-        std::optional<AddRequest> add_request;
-        detail::AddEntryRegistration add_entries;
+        std::optional<BinaryRequest> binary_request;
+        detail::BinaryEntryRegistration binary_entries;
     };
     struct SyclSequenceOutcome {
         detail::SequenceOutcome common;
         std::shared_ptr<SyclFenceState> state;
-        std::optional<detail::AddEntryRegistration> add_entries;
+        std::optional<detail::BinaryEntryRegistration> binary_entries;
     };
 
 
@@ -478,7 +478,7 @@ public:
                 });
     }
 
-    oid add_impl(const AddRequest& request) override {
+    oid binary_impl(const BinaryRequest& request) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
         if (consume_submission_fault(SubmissionFault::state_allocation)) {
@@ -486,17 +486,17 @@ public:
         }
         auto state = std::make_shared<SyclFenceState>();
         detail::Fence fence = build_sycl_fence(state);
-        return submit_add(
+        return submit_binary(
                 request, *state_, registry_queue_id_, fence,
                 [this, state](std::uint64_t sequence,
-                              const AddRequest& captured,
-                              detail::AddEntryRegistration entries) {
+                              const BinaryRequest& captured,
+                              detail::BinaryEntryRegistration entries) {
                     Task task;
                     task.sequence = sequence;
                     task.state = state;
                     task.fence = state.get();
-                    task.add_request.emplace(captured);
-                    task.add_entries = entries;
+                    task.binary_request.emplace(captured);
+                    task.binary_entries = entries;
                     worker_.submit_copy(std::move(task));
                 });
     }
@@ -506,13 +506,13 @@ public:
     }
 
 private:
-    // Device-USM-safe ADD staging extent: whole plane blocks up to the
+    // Device-USM-safe binary staging extent: whole plane blocks up to the
     // view's highest addressed plane, so untouched planes and tile padding
-    // round-trip unchanged. validate_add bounded this walk with checked
+    // round-trip unchanged. validate_binary bounded this walk with checked
     // arithmetic and equal plane geometry, so the recompute cannot
     // overflow for an accepted request.
-    static std::size_t add_view_staging_bytes(
-            const AddRequest& captured, const AddViewSnapshot& view) {
+    static std::size_t binary_view_staging_bytes(
+            const BinaryRequest& captured, const BinaryViewSnapshot& view) {
         const std::span<const std::size_t> dims =
                 view.spec.shape.dimensions();
         const std::size_t leading_rank = dims.size() - 2;
@@ -535,8 +535,9 @@ private:
     }
 
     // Exact shared scalar loop over host staging buffers.
-    static void add_elements(
-            const AddRequest& captured, const unsigned char* lhs_storage,
+    template <detail::scalar_add_detail::BinaryOp Op>
+    static void binary_elements_impl(
+            const BinaryRequest& captured, const unsigned char* lhs_storage,
             const unsigned char* rhs_storage, unsigned char* out_storage) {
         const auto dims = captured.result_shape.dimensions();
         const std::size_t rank = dims.size();
@@ -573,7 +574,7 @@ private:
                 coord[axis] = rest % dims[axis];
                 rest /= dims[axis];
             }
-            auto plane = [&](const AddViewSnapshot& view) {
+            auto plane = [&](const BinaryViewSnapshot& view) {
                 std::size_t result = view.plane_offset;
                 for (std::size_t axis = 0; axis < rank - 2;
                      ++axis) {
@@ -585,7 +586,7 @@ private:
             };
             const std::size_t row = coord[rank - 2];
             const std::size_t col = coord[rank - 1];
-            const auto slot = [&](const AddViewSnapshot& view,
+            const auto slot = [&](const BinaryViewSnapshot& view,
                                   std::size_t p,
                                   std::size_t r,
                                   std::size_t c) {
@@ -604,12 +605,35 @@ private:
                     captured.out, plane(captured.out), row, col);
             store(out_storage,
                   destination_slot * bits,
-                  detail::scalar_add(
+                  detail::scalar_binary<Op>(
                           captured.out.spec.data_type, a, b));
         }
     }
 
-    static void free_add_staging(
+    static void binary_elements(
+            const BinaryRequest& captured, const unsigned char* lhs_storage,
+            const unsigned char* rhs_storage, unsigned char* out_storage) {
+        switch (captured.operation) {
+            case BinaryOperation::Add:
+                return binary_elements_impl<
+                        detail::scalar_add_detail::BinaryOp::add>(
+                        captured, lhs_storage, rhs_storage, out_storage);
+            case BinaryOperation::Mul:
+                return binary_elements_impl<
+                        detail::scalar_add_detail::BinaryOp::mul>(
+                        captured, lhs_storage, rhs_storage, out_storage);
+            case BinaryOperation::Sub:
+                return binary_elements_impl<
+                        detail::scalar_add_detail::BinaryOp::sub>(
+                        captured, lhs_storage, rhs_storage, out_storage);
+            case BinaryOperation::Div:
+                return binary_elements_impl<
+                        detail::scalar_add_detail::BinaryOp::div>(
+                        captured, lhs_storage, rhs_storage, out_storage);
+        }
+    }
+
+    static void free_binary_staging(
             void* staging, const sycl::context& context) noexcept {
         if (staging == nullptr) {
             return;
@@ -621,7 +645,7 @@ private:
     }
 
     void execute(Task& task) {
-        if (task.add_request.has_value()) {
+        if (task.binary_request.has_value()) {
             if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
                 throw std::bad_alloc();
             }
@@ -631,18 +655,18 @@ private:
                         task.sequence,
                         SyclSequenceOutcome{
                                 detail::SequenceOutcome{},
-                                task.state, task.add_entries});
+                                task.state, task.binary_entries});
                 if (!inserted) {
                     throw std::logic_error("duplicate SYCL outstanding-work sequence");
                 }
             }
-            const AddRequest& captured = *task.add_request;
+            const BinaryRequest& captured = *task.binary_request;
             const std::size_t lhs_bytes =
-                    add_view_staging_bytes(captured, captured.lhs);
+                    binary_view_staging_bytes(captured, captured.lhs);
             const std::size_t rhs_bytes =
-                    add_view_staging_bytes(captured, captured.rhs);
+                    binary_view_staging_bytes(captured, captured.rhs);
             const std::size_t out_bytes =
-                    add_view_staging_bytes(captured, captured.out);
+                    binary_view_staging_bytes(captured, captured.out);
             const sycl::context context = queue_.get_context();
             void* lhs_stage = nullptr;
             void* rhs_stage = nullptr;
@@ -716,7 +740,7 @@ private:
                 queue_.memcpy(rhs_stage, rhs_device, rhs_bytes);
                 queue_.memcpy(out_stage, out_device, out_bytes);
                 queue_.wait_and_throw();
-                add_elements(
+                binary_elements(
                         captured,
                         static_cast<const unsigned char*>(lhs_stage),
                         static_cast<const unsigned char*>(rhs_stage),
@@ -744,19 +768,19 @@ private:
                     } catch (...) {
                     }
                 }
-                free_add_staging(lhs_stage, context);
-                free_add_staging(rhs_stage, context);
-                free_add_staging(out_stage, context);
-                free_add_staging(lhs_device, context);
-                free_add_staging(rhs_device, context);
-                free_add_staging(out_device, context);
+                free_binary_staging(lhs_stage, context);
+                free_binary_staging(rhs_stage, context);
+                free_binary_staging(out_stage, context);
+                free_binary_staging(lhs_device, context);
+                free_binary_staging(rhs_device, context);
+                free_binary_staging(out_device, context);
                 if (!submitted) {
                     {
                         std::lock_guard<std::mutex> lock(outcome_mutex_);
                         outcomes_.erase(task.sequence);
                     }
-                    // Entry rollback belongs to submit_add: it registered
-                    // the ADD entries, and a second remove here replaced
+                    // Entry rollback belongs to submit_binary: it registered
+                    // the binary entries, and a second remove here replaced
                     // the original failure with invalid_argument.
                     task.state.reset();
                     task.fence = nullptr;
@@ -765,12 +789,12 @@ private:
                 task.state->set_failure(std::current_exception());
                 return;
             }
-            free_add_staging(lhs_stage, context);
-            free_add_staging(rhs_stage, context);
-            free_add_staging(out_stage, context);
-            free_add_staging(lhs_device, context);
-            free_add_staging(rhs_device, context);
-            free_add_staging(out_device, context);
+            free_binary_staging(lhs_stage, context);
+            free_binary_staging(rhs_stage, context);
+            free_binary_staging(out_stage, context);
+            free_binary_staging(lhs_device, context);
+            free_binary_staging(rhs_device, context);
+            free_binary_staging(out_device, context);
             return;
         }
         if (task.no_op) {
@@ -930,9 +954,9 @@ private:
                                           : callback_failure;
             const bool fence_succeeded =
                     fence_result.succeeded && !fence_result.failure;
-            if (outcome.add_entries.has_value()) {
-                (void)detail::release_or_invalidate_add_entries(
-                        state_->registry, *outcome.add_entries,
+            if (outcome.binary_entries.has_value()) {
+                (void)detail::release_or_invalidate_binary_entries(
+                        state_->registry, *outcome.binary_entries,
                         static_cast<bool>(callback_failure),
                         fence_succeeded);
             } else {
