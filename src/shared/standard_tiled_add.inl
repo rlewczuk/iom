@@ -31,8 +31,6 @@
 namespace iom::detail {
 namespace {
 
-constexpr std::uint64_t kAddTile = TensorSpec::TILE;
-constexpr std::uint64_t kAddTileSlots = kAddTile * kAddTile;
 
 struct BinaryMetadata {
     std::uint64_t rows;
@@ -183,30 +181,17 @@ IOM_GPU_DEVICE std::uint64_t add_load_bits(
                : ((std::uint64_t{1} << bits) - 1));
 }
 
-IOM_GPU_DEVICE std::uint64_t add_plane_slot(
-        std::uint64_t plane, std::uint64_t row, std::uint64_t column,
-        std::uint64_t rows, std::uint64_t columns) noexcept {
-    const std::uint64_t tile_rows = (rows + kAddTile - 1) / kAddTile;
-    const std::uint64_t tile_columns = (columns + kAddTile - 1) / kAddTile;
-    const std::uint64_t tile_index =
-            plane * tile_rows * tile_columns
-            + (row / kAddTile) * tile_columns + column / kAddTile;
-    return tile_index * kAddTileSlots
-            + (row % kAddTile) * kAddTile + column % kAddTile;
-}
 
 template <DeviceBinaryOp Op>
 IOM_GPU_DEVICE void binary_body(
         const unsigned char* lhs, const unsigned char* rhs,
         unsigned char* out, const BinaryMetadata& m) noexcept {
     const std::uint64_t padded_rows =
-            (m.rows + kAddTile - 1) / kAddTile * kAddTile;
+            (m.rows + kTile - 1) / kTile * kTile;
     const std::uint64_t padded_columns =
-            (m.columns + kAddTile - 1) / kAddTile * kAddTile;
+            (m.columns + kTile - 1) / kTile * kTile;
     const std::uint64_t words_per_plane =
             (padded_rows * padded_columns * m.bits + 31) / 32;
-    const std::uint64_t tile_columns =
-            (m.columns + kAddTile - 1) / kAddTile;
     const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
 
     for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX;
@@ -240,14 +225,10 @@ IOM_GPU_DEVICE void binary_body(
             if (slot_bit + m.bits <= base || slot_bit >= base + 32) {
                 continue;
             }
-            const std::uint64_t tile_index = slot / kAddTileSlots;
-            const std::uint64_t in_tile = slot % kAddTileSlots;
-            const std::uint64_t row =
-                    (tile_index / tile_columns) * kAddTile
-                    + in_tile / kAddTile;
-            const std::uint64_t column =
-                    (tile_index % tile_columns) * kAddTile
-                    + in_tile % kAddTile;
+            const PhysicalCoordinate coordinate =
+                    physical_coordinate(slot, m.rows, m.columns);
+            const std::uint64_t row = coordinate.row;
+            const std::uint64_t column = coordinate.column;
             if (row >= m.rows || column >= m.columns) {
                 continue;  // padding slots are never read or written
             }
@@ -255,10 +236,10 @@ IOM_GPU_DEVICE void binary_body(
             const std::uint64_t lhs_column = m.lhs_bcol ? 0 : column;
             const std::uint64_t rhs_row = m.rhs_brow ? 0 : row;
             const std::uint64_t rhs_column = m.rhs_bcol ? 0 : column;
-            const std::uint64_t lhs_slot = add_plane_slot(
+            const std::uint64_t lhs_slot = plane_slot(
                     lhs_plane, lhs_row, lhs_column,
                     m.lhs_rows, m.lhs_columns);
-            const std::uint64_t rhs_slot = add_plane_slot(
+            const std::uint64_t rhs_slot = plane_slot(
                     rhs_plane, rhs_row, rhs_column,
                     m.rhs_rows, m.rhs_columns);
             // Capture both input values before any output store.
@@ -365,19 +346,19 @@ template <typename Request>
     const std::size_t padded_rows = add_checked_mul(
             (add_checked_add(
                     static_cast<std::size_t>(metadata.rows),
-                    static_cast<std::size_t>(kAddTile) - 1,
+                    static_cast<std::size_t>(kTile) - 1,
                     "ADD metadata row padding overflows")
-             / static_cast<std::size_t>(kAddTile)),
-            static_cast<std::size_t>(kAddTile),
+             / static_cast<std::size_t>(kTile)),
+            static_cast<std::size_t>(kTile),
             "ADD metadata padded rows overflow");
     const std::size_t padded_columns = add_checked_mul(
             (add_checked_add(
                     static_cast<std::size_t>(metadata.columns),
-                    static_cast<std::size_t>(kAddTile) - 1,
+                    static_cast<std::size_t>(kTile) - 1,
                     "ADD metadata column padding overflows")
-             / static_cast<std::size_t>(kAddTile)),
-            static_cast<std::size_t>(kAddTile),
-            "ADD metadata padded columns overflow");
+             / static_cast<std::size_t>(kTile)),
+            static_cast<std::size_t>(kTile),
+            "ADD metadata column padding overflow");
     const std::size_t words_per_plane = add_checked_add(
             add_checked_mul(
                     add_checked_mul(
