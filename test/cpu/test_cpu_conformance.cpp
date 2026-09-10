@@ -220,18 +220,21 @@ TEST_CASE("CPU conformance: copy validation fails before writes and sequences") 
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: common ADD validation and lifetime policy") {
+TEST_CASE("CPU conformance: common binary validation and lifetime policy") {
     CpuDevices devices;
-    iom_conformance::run_add_request_conformance(
-            devices.conformance(), &devices.gate);
-    iom_conformance::run_add_rank_boundary_conformance(
+    iom_conformance::run_binary_request_conformance(
+            devices.conformance(), nullptr);
+    iom_conformance::run_binary_rank_boundary_conformance(
             *devices.candidate);
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: ADD values through the real queue") {
+TEST_CASE("CPU conformance: all binary operations through the real queue") {
     CpuDevices devices;
-    iom_conformance::run_add_value_conformance(*devices.candidate);
+    iom_conformance::run_backend_conformance(
+            devices.conformance(),
+            devices.candidate->supported_data_types().subspan(0, 1),
+            &devices.gate, nullptr, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -251,7 +254,7 @@ TEST_CASE("CPU conformance: deferred queue lifetime and stability") {
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: ADD is supported and other compute methods reject") {
+TEST_CASE("CPU conformance: binary operations are supported") {
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),

@@ -1357,8 +1357,9 @@ TEST_CASE("CPU copies move logical planes without touching padding") {
 }
 
 // ---------------------------------------------------------------------------
-// CPU supports ADD while retaining Unsupported for other unimplemented hooks.
-TEST_CASE("CPU supports ADD and rejects other compute capabilities") {
+// CPU supports all four binary operations while retaining Unsupported for
+// unrelated compute hooks.
+TEST_CASE("CPU supports binary operations and rejects other compute capabilities") {
     RecordingAllocator allocator;
     auto device = iom::make_cpu_device(allocator);
     auto queue = device->create_ops();
@@ -1371,15 +1372,21 @@ TEST_CASE("CPU supports ADD and rejects other compute capabilities") {
 
     fill_storage(*y, kSentinel);
     fill_storage(*attn, kSentinel);
-    const std::vector<std::byte> y_untouched = snapshot_storage(*y);
     const std::vector<std::byte> attn_untouched = snapshot_storage(*attn);
 
     const iom::oid add_token = queue->add(x->view(), x->view(), y->view());
+    const iom::oid mul_token = queue->mul(x->view(), x->view(), y->view());
+    const iom::oid sub_token = queue->sub(x->view(), x->view(), y->view());
+    const iom::oid div_token = queue->div(x->view(), x->view(), y->view());
     REQUIRE(iom::oid_is_token(add_token));
+    REQUIRE(iom::oid_is_token(mul_token));
+    REQUIRE(iom::oid_is_token(sub_token));
+    REQUIRE(iom::oid_is_token(div_token));
     queue->wait(add_token);
-    CHECK_EQ(
-            queue->mul(x->view(), x->view(), y->view()),
-            iom::to_oid(iom::OidError::Unsupported));
+    queue->wait(mul_token);
+    queue->wait(sub_token);
+    queue->wait(div_token);
+
     CHECK_EQ(
             queue->silu(x->view(), y->view()),
             iom::to_oid(iom::OidError::Unsupported));
@@ -1396,8 +1403,8 @@ TEST_CASE("CPU supports ADD and rejects other compute capabilities") {
 
     expect_storage_matches(*attn, attn_untouched);
 
-    // Only the accepted ADD consumed the first sequence number.
+    // The four accepted binary operations consume the first four sequences.
     const iom::oid probe = queue->copy(x->view(), y->view());
-    CHECK_EQ(token_sequence(probe), 2);
+    CHECK_EQ(token_sequence(probe), 5);
     queue->wait(probe);
 }

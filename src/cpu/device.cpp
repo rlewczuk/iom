@@ -665,8 +665,11 @@ namespace iom {
             }
         }
 
+        using ScalarBinary = std::uint64_t (*)(
+                DataType, std::uint64_t, std::uint64_t) noexcept;
+
         static std::size_t source_plane(
-                const DeviceOps::AddViewSnapshot& source,
+                const DeviceOps::BinaryViewSnapshot& source,
                 std::span<const std::size_t> result_dimensions,
                 std::span<const std::size_t> coordinates) {
             const auto dimensions = source.spec.shape.dimensions();
@@ -683,10 +686,34 @@ namespace iom {
             return plane;
         }
 
-        static void add_elements(const DeviceOps::AddRequest& request) {
+        static ScalarBinary select_binary(
+                DeviceOps::BinaryOperation operation) {
+            switch (operation) {
+                case DeviceOps::BinaryOperation::Add:
+                    return &detail::scalar_binary<
+                            detail::scalar_add_detail::BinaryOp::add>;
+                case DeviceOps::BinaryOperation::Mul:
+                    return &detail::scalar_binary<
+                            detail::scalar_add_detail::BinaryOp::mul>;
+                case DeviceOps::BinaryOperation::Sub:
+                    return &detail::scalar_binary<
+                            detail::scalar_add_detail::BinaryOp::sub>;
+                case DeviceOps::BinaryOperation::Div:
+                    return &detail::scalar_binary<
+                            detail::scalar_add_detail::BinaryOp::div>;
+            }
+            throw std::invalid_argument("unknown CPU binary operation");
+        }
+
+        static void binary_elements(
+                const DeviceOps::BinaryRequest& request,
+                ScalarBinary scalar) {
             const auto result_dimensions = request.result_shape.dimensions();
             const std::size_t rank = result_dimensions.size();
-            const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
+            const std::size_t rows = result_dimensions[rank - 2];
+            const std::size_t columns = result_dimensions[rank - 1];
+            const std::size_t bits = detail::leaf_bits(
+                    request.out.spec.data_type);
             auto* out_base = static_cast<unsigned char*>(
                     request.out.native_handle);
             const auto* lhs_base = static_cast<const unsigned char*>(
@@ -694,66 +721,106 @@ namespace iom {
             const auto* rhs_base = static_cast<const unsigned char*>(
                     request.rhs.native_handle);
             std::vector<std::size_t> coordinates(rank);
-            const std::size_t count = request.result_shape.element_count();
-            for (std::size_t linear = 0; linear < count; ++linear) {
-                std::size_t remainder = linear;
-                for (std::size_t axis = rank; axis-- > 0;) {
-                    coordinates[axis] = remainder % result_dimensions[axis];
-                    remainder /= result_dimensions[axis];
+            auto visit = [&](auto&& self, std::size_t axis) -> void {
+                if (axis + 2 < rank) {
+                    for (std::size_t index = 0;
+                         index < result_dimensions[axis]; ++index) {
+                        coordinates[axis] = index;
+                        self(self, axis + 1);
+                    }
+                    return;
                 }
-                const std::size_t row = coordinates[rank - 2];
-                const std::size_t column = coordinates[rank - 1];
-                const std::size_t lhs_plane =
-                        source_plane(request.lhs, result_dimensions, coordinates);
-                const std::size_t rhs_plane =
-                        source_plane(request.rhs, result_dimensions, coordinates);
-                const std::size_t out_plane =
-                        source_plane(request.out, result_dimensions, coordinates);
-                const std::size_t lhs_row =
-                        request.lhs.broadcast_rows ? 0 : row;
-                const std::size_t rhs_row =
-                        request.rhs.broadcast_rows ? 0 : row;
-                const std::size_t lhs_column =
-                        request.lhs.broadcast_columns ? 0 : column;
-                const std::size_t rhs_column =
-                        request.rhs.broadcast_columns ? 0 : column;
-                const std::size_t lhs_slot = detail::standard_plane_slot(
-                        request.lhs.spec, lhs_plane, lhs_row, lhs_column);
-                const std::size_t rhs_slot = detail::standard_plane_slot(
-                        request.rhs.spec, rhs_plane, rhs_row, rhs_column);
-                const std::size_t out_slot = detail::standard_plane_slot(
-                        request.out.spec, out_plane, row, column);
-                const std::uint64_t lhs_value =
-                        load_bits(lhs_base, lhs_slot * bits, bits);
-                const std::uint64_t rhs_value =
-                        load_bits(rhs_base, rhs_slot * bits, bits);
-                store_bits(
-                        out_base, out_slot * bits, bits,
-                        detail::scalar_add(
-                                request.out.spec.data_type,
-                                lhs_value, rhs_value));
-            }
+                const std::size_t lhs_plane = source_plane(
+                        request.lhs, result_dimensions, coordinates);
+                const std::size_t rhs_plane = source_plane(
+                        request.rhs, result_dimensions, coordinates);
+                const std::size_t out_plane = source_plane(
+                        request.out, result_dimensions, coordinates);
+                const std::size_t tile_rows =
+                        (rows + TensorSpec::TILE - 1) / TensorSpec::TILE;
+                const std::size_t tile_columns =
+                        (columns + TensorSpec::TILE - 1) / TensorSpec::TILE;
+                for (std::size_t tile_row = 0; tile_row < tile_rows;
+                     ++tile_row) {
+                    const std::size_t first_row =
+                            tile_row * TensorSpec::TILE;
+                    for (std::size_t row_in_tile = 0;
+                         row_in_tile < TensorSpec::TILE
+                                 && first_row + row_in_tile < rows;
+                         ++row_in_tile) {
+                        const std::size_t row = first_row + row_in_tile;
+                        for (std::size_t tile_column = 0;
+                             tile_column < tile_columns; ++tile_column) {
+                            const std::size_t first_column =
+                                    tile_column * TensorSpec::TILE;
+                            const std::size_t elements = std::min(
+                                    TensorSpec::TILE, columns - first_column);
+                            for (std::size_t offset = 0; offset < elements;
+                                 ++offset) {
+                                const std::size_t column =
+                                        first_column + offset;
+                                const std::size_t lhs_row =
+                                        request.lhs.broadcast_rows ? 0 : row;
+                                const std::size_t rhs_row =
+                                        request.rhs.broadcast_rows ? 0 : row;
+                                const std::size_t lhs_column =
+                                        request.lhs.broadcast_columns
+                                        ? 0
+                                        : column;
+                                const std::size_t rhs_column =
+                                        request.rhs.broadcast_columns
+                                        ? 0
+                                        : column;
+                                const std::size_t lhs_slot =
+                                        detail::standard_plane_slot(
+                                                request.lhs.spec, lhs_plane,
+                                                lhs_row, lhs_column);
+                                const std::size_t rhs_slot =
+                                        detail::standard_plane_slot(
+                                                request.rhs.spec, rhs_plane,
+                                                rhs_row, rhs_column);
+                                const std::size_t out_slot =
+                                        detail::standard_plane_slot(
+                                                request.out.spec, out_plane,
+                                                row, column);
+                                const std::uint64_t lhs_value = load_bits(
+                                        lhs_base, lhs_slot * bits, bits);
+                                const std::uint64_t rhs_value = load_bits(
+                                        rhs_base, rhs_slot * bits, bits);
+                                const std::uint64_t result =
+                                        scalar(request.out.spec.data_type,
+                                               lhs_value, rhs_value);
+                                store_bits(
+                                        out_base, out_slot * bits, bits,
+                                        result);
+                            }
+                        }
+                    }
+                }
+            };
+            visit(visit, 0);
         }
 
-
-        oid add_impl(const AddRequest& request) override {
+        oid binary_impl(const BinaryRequest& request) override {
             std::lock_guard<std::mutex> submission_lock(
                     submission_order_mutex_);
+            const ScalarBinary scalar = select_binary(request.operation);
             detail::Fence fence;
             fence.invoke = &fence_success;
-            return submit_add(
+            return submit_binary(
                     request, device_->registry_state(), registry_queue_id_,
                     fence,
-                    [this](std::uint64_t sequence,
-                           const AddRequest& captured,
-                           detail::AddEntryRegistration entries) {
+                    [this, scalar](
+                            std::uint64_t sequence,
+                            const BinaryRequest& captured,
+                            detail::BinaryEntryRegistration entries) {
                         std::exception_ptr failure;
                         try {
-                            add_elements(captured);
+                            binary_elements(captured, scalar);
                         } catch (...) {
                             failure = std::current_exception();
                         }
-                        (void)detail::release_or_invalidate_add_entries(
+                        (void)detail::release_or_invalidate_binary_entries(
                                 device_->registry_state().registry, entries,
                                 static_cast<bool>(failure), !failure);
                         complete(sequence, std::move(failure));
