@@ -418,9 +418,10 @@ namespace iom::ttnn_detail {
     }
 
 
-    void binary_planes(
-            tt::tt_metal::distributed::MeshDevice& device,
-            TtnnHostStaging& staging, const BinaryRequest& request,
+template <detail::scalar_add_detail::BinaryOp Op>
+void binary_planes(
+        tt::tt_metal::distributed::MeshDevice& device,
+        TtnnHostStaging& staging, const BinaryRequest& request,
             ttnn::Tensor* lhs_planes, ttnn::Tensor* rhs_planes,
             ttnn::Tensor* out_planes, bool& any_submitted,
             bool& native_drained, BinaryFinish finish) {
@@ -525,25 +526,8 @@ namespace iom::ttnn_detail {
                     request.lhs, lhs_planes, lhs_cache, lc, lr, lcol);
             const auto right = read(
                     request.rhs, rhs_planes, rhs_cache, rc, rr, rcol);
-            const auto scalar = [&] {
-                using Op = detail::scalar_add_detail::BinaryOp;
-                switch (request.operation) {
-                    case BinaryOperation::add:
-                        return detail::scalar_binary<Op::add>(
-                                request.out.spec.data_type, left, right);
-                    case BinaryOperation::mul:
-                        return detail::scalar_binary<Op::mul>(
-                                request.out.spec.data_type, left, right);
-                    case BinaryOperation::sub:
-                        return detail::scalar_binary<Op::sub>(
-                                request.out.spec.data_type, left, right);
-                    case BinaryOperation::div:
-                        return detail::scalar_binary<Op::div>(
-                                request.out.spec.data_type, left, right);
-                }
-                return std::uint64_t{0};
-            };
-            const std::uint64_t value = scalar();
+            const std::uint64_t value = detail::scalar_binary<Op>(
+                    request.out.spec.data_type, left, right);
             const std::size_t plane = plane_at(request.out, coordinates);
             auto& raw = load(out_planes, plane, out_cache);
             const std::size_t padded_columns =
@@ -606,6 +590,22 @@ namespace iom::ttnn_detail {
             lease.release();
         }
     }
+template void binary_planes<detail::scalar_add_detail::BinaryOp::add>(
+        tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&,
+        const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*,
+        bool&, bool&, BinaryFinish);
+template void binary_planes<detail::scalar_add_detail::BinaryOp::mul>(
+        tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&,
+        const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*,
+        bool&, bool&, BinaryFinish);
+template void binary_planes<detail::scalar_add_detail::BinaryOp::sub>(
+        tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&,
+        const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*,
+        bool&, bool&, BinaryFinish);
+template void binary_planes<detail::scalar_add_detail::BinaryOp::div>(
+        tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&,
+        const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*,
+        bool&, bool&, BinaryFinish);
 }  // namespace iom::ttnn_detail
 
 #ifdef IOM_ENABLE_TESTING

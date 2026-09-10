@@ -392,15 +392,31 @@ private:
                 const detail::BinaryMetadata metadata =
                         *reinterpret_cast<const detail::BinaryMetadata*>(
                                 metadata_pool_.host_data(metadata_slot));
-                detail::launch_grid_stride_binary<Policy>(
-                        stream_,
-                        static_cast<const unsigned char*>(
-                                task.binary_request->lhs.native_handle),
-                        static_cast<const unsigned char*>(
-                                task.binary_request->rhs.native_handle),
-                        static_cast<unsigned char*>(
-                                task.binary_request->out.native_handle),
-                        metadata);
+                const auto launch = [&]<DeviceBinaryOp Op>() {
+                    detail::launch_grid_stride_binary<Policy, Op>(
+                            stream_,
+                            static_cast<const unsigned char*>(
+                                    task.binary_request->lhs.native_handle),
+                            static_cast<const unsigned char*>(
+                                    task.binary_request->rhs.native_handle),
+                            static_cast<unsigned char*>(
+                                    task.binary_request->out.native_handle),
+                            metadata);
+                };
+                switch (task.binary_request->operation) {
+                    case DeviceOps::BinaryOperation::Add:
+                        launch.template operator()<DeviceBinaryOp::add>();
+                        break;
+                    case DeviceOps::BinaryOperation::Mul:
+                        launch.template operator()<DeviceBinaryOp::mul>();
+                        break;
+                    case DeviceOps::BinaryOperation::Sub:
+                        launch.template operator()<DeviceBinaryOp::sub>();
+                        break;
+                    case DeviceOps::BinaryOperation::Div:
+                        launch.template operator()<DeviceBinaryOp::div>();
+                        break;
+                }
                 Policy::check_kernel(Policy::copy_kernel_operation());
                 Policy::after_grid_stride_launch();
                 Policy::record_event(

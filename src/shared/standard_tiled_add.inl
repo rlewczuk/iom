@@ -38,7 +38,6 @@ struct BinaryMetadata {
     std::uint64_t total_words;
     std::uint32_t bits;
     std::uint32_t type;
-    std::uint32_t operation;
     std::uint32_t rank;
     std::uint64_t out_offset;
     std::uint64_t lhs_offset;
@@ -267,26 +266,14 @@ IOM_GPU_DEVICE void binary_body(
     }
 }
 
+template <DeviceBinaryOp Op>
 IOM_GPU_GLOBAL void grid_stride_binary_kernel(
         const unsigned char* lhs, const unsigned char* rhs,
         unsigned char* out, BinaryMetadata metadata) {
-    switch (metadata.operation) {
-        case static_cast<std::uint32_t>(DeviceBinaryOp::add):
-            binary_body<DeviceBinaryOp::add>(lhs, rhs, out, metadata);
-            break;
-        case static_cast<std::uint32_t>(DeviceBinaryOp::mul):
-            binary_body<DeviceBinaryOp::mul>(lhs, rhs, out, metadata);
-            break;
-        case static_cast<std::uint32_t>(DeviceBinaryOp::sub):
-            binary_body<DeviceBinaryOp::sub>(lhs, rhs, out, metadata);
-            break;
-        case static_cast<std::uint32_t>(DeviceBinaryOp::div):
-            binary_body<DeviceBinaryOp::div>(lhs, rhs, out, metadata);
-            break;
-    }
+    binary_body<Op>(lhs, rhs, out, metadata);
 }
 
-template <typename Policy>
+template <typename Policy, DeviceBinaryOp Op>
 void launch_grid_stride_binary(
         typename Policy::stream_type stream, const unsigned char* lhs,
         const unsigned char* rhs, unsigned char* out,
@@ -297,7 +284,7 @@ void launch_grid_stride_binary(
     const unsigned int blocks = static_cast<unsigned int>(
             launch_words / 256 < 65535 ? launch_words / 256 : 65535);
     IOM_LAUNCH_KERNEL(
-            grid_stride_binary_kernel, blocks, 256, stream, lhs, rhs, out,
+            grid_stride_binary_kernel<Op>, blocks, 256, stream, lhs, rhs, out,
             metadata);
 }
 
@@ -322,8 +309,6 @@ template <typename Request>
             leaf_bits(request.out.spec.data_type));
     metadata.type =
             static_cast<std::uint32_t>(request.out.spec.data_type);
-    metadata.operation =
-            static_cast<std::uint32_t>(request.operation);
     metadata.out_offset = request.out.plane_offset;
     metadata.lhs_offset = request.lhs.plane_offset;
     metadata.rhs_offset = request.rhs.plane_offset;

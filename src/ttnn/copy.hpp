@@ -4,6 +4,7 @@
 #include <vector>
 #include <ttnn/tensor/tensor.hpp>
 #include "iom/iom.hpp"
+#include "../shared/scalar_add.hpp"
 
 namespace tt::tt_metal::distributed { class MeshDevice; }
 
@@ -13,7 +14,6 @@ void region_from_host(tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&, 
 void region_to_host(tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&, const TensorView&, const ttnn::Tensor*, std::span<std::byte>);
 void copy_planes(const TensorView&, const ttnn::Tensor*, const TensorView&, ttnn::Tensor*, bool&);
 
-enum class BinaryOperation { add, mul, sub, div };
 struct BinarySnapshot {
     TensorSpec spec;
     void* native_handle;
@@ -21,7 +21,6 @@ struct BinarySnapshot {
     std::vector<std::size_t> logical_plane_strides;
 };
 struct BinaryRequest {
-    BinaryOperation operation;
     BinarySnapshot lhs;
     BinarySnapshot rhs;
     BinarySnapshot out;
@@ -29,6 +28,7 @@ struct BinaryRequest {
 };
 using BinaryFinish =
         void (*)(tt::tt_metal::distributed::MeshDevice&);
+template <detail::scalar_add_detail::BinaryOp Op>
 void binary_planes(
         tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&,
         const BinaryRequest&, ttnn::Tensor*, ttnn::Tensor*, ttnn::Tensor*,

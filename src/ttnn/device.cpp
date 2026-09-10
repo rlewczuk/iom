@@ -526,8 +526,9 @@ class TtnnQueue final : public DeviceOps {
         TensorView* destination = nullptr;
         bool no_op = false;
         bool is_binary = false;
+        DeviceOps::BinaryOperation operation =
+                DeviceOps::BinaryOperation::Add;
         ttnn_detail::BinaryRequest binary_request{
-                ttnn_detail::BinaryOperation::add,
                 {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
                 {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
                 {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
@@ -541,10 +542,13 @@ class TtnnQueue final : public DeviceOps {
              TensorView& destination_, bool no_op_)
             : sequence(sequence_), source(&source_), destination(&destination_),
               no_op(no_op_) {}
-        Task(std::uint64_t sequence_, const ttnn_detail::BinaryRequest& request,
-             detail::BinaryEntryRegistration entries)
-            : sequence(sequence_), is_binary(true), binary_request(request),
-              binary_entries(entries) {}
+        Task(
+                std::uint64_t sequence_,
+                DeviceOps::BinaryOperation operation_,
+                const ttnn_detail::BinaryRequest& request,
+                detail::BinaryEntryRegistration entries)
+            : sequence(sequence_), is_binary(true), operation(operation_),
+              binary_request(request), binary_entries(entries) {}
     };
     struct BinaryOutcome {
         detail::BinaryEntryRegistration entries;
@@ -606,13 +610,6 @@ public:
                 [this](std::uint64_t sequence, const BinaryRequest& captured,
                        detail::BinaryEntryRegistration entries) {
                     ttnn_detail::BinaryRequest internal{
-                            captured.operation == BinaryOperation::Add
-                                    ? ttnn_detail::BinaryOperation::add
-                                    : captured.operation == BinaryOperation::Mul
-                                            ? ttnn_detail::BinaryOperation::mul
-                                            : captured.operation == BinaryOperation::Sub
-                                                    ? ttnn_detail::BinaryOperation::sub
-                                                    : ttnn_detail::BinaryOperation::div,
                             {captured.lhs.spec, captured.lhs.native_handle,
                              captured.lhs.plane_offset,
                              captured.lhs.logical_plane_strides},
@@ -623,7 +620,8 @@ public:
                              captured.out.plane_offset,
                              captured.out.logical_plane_strides},
                             captured.result_shape};
-                    worker_.submit_copy(Task(sequence, internal, entries));
+                    worker_.submit_copy(
+                            Task(sequence, captured.operation, internal, entries));
                 });
     }
     void execute(Task& task) {
@@ -651,10 +649,30 @@ public:
                             task.binary_request.rhs.native_handle);
                     auto* out = static_cast<ttnn::Tensor*>(
                             task.binary_request.out.native_handle);
-                    ttnn_detail::binary_planes(
-                            device_->mesh(), device_->host_staging(),
-                            task.binary_request, lhs, rhs, out, submitted,
-                            completion_proven, finish_locked_mesh);
+                    const auto binary = [&]<detail::scalar_add_detail::BinaryOp Op>() {
+                        ttnn_detail::binary_planes<Op>(
+                                device_->mesh(), device_->host_staging(),
+                                task.binary_request, lhs, rhs, out, submitted,
+                                completion_proven, finish_locked_mesh);
+                    };
+                    switch (task.operation) {
+                        case DeviceOps::BinaryOperation::Add:
+                            binary.template operator()<
+                                    detail::scalar_add_detail::BinaryOp::add>();
+                            break;
+                        case DeviceOps::BinaryOperation::Mul:
+                            binary.template operator()<
+                                    detail::scalar_add_detail::BinaryOp::mul>();
+                            break;
+                        case DeviceOps::BinaryOperation::Sub:
+                            binary.template operator()<
+                                    detail::scalar_add_detail::BinaryOp::sub>();
+                            break;
+                        case DeviceOps::BinaryOperation::Div:
+                            binary.template operator()<
+                                    detail::scalar_add_detail::BinaryOp::div>();
+                            break;
+                    }
                 }
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
