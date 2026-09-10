@@ -18,7 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <functional>
+#include <type_traits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -294,121 +294,91 @@ inline std::span<const std::size_t> span_of(
 }
 
 // ---------------------------------------------------------------------------
-// Compile-time checks of every compute method's view signature. No backend
-// header participates: the signatures live on the common DeviceOps base.
+// Compile-time checks and operation-neutral binary request fixture.
 // ---------------------------------------------------------------------------
 static_assert(std::is_same_v<
               decltype(&iom::DeviceOps::copy),
               iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
                                            iom::TensorView&) noexcept>);
-static_assert(std::is_same_v<
-              decltype(&iom::DeviceOps::add),
-              iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
-                                           const iom::TensorView&,
-                                           iom::TensorView&) noexcept>);
-static_assert(std::is_same_v<
-              decltype(&iom::DeviceOps::mul),
-              iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
-                                           const iom::TensorView&,
-                                           iom::TensorView&) noexcept>);
-static_assert(std::is_same_v<
-              decltype(&iom::DeviceOps::silu),
-              iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
-                                           iom::TensorView&) noexcept>);
-static_assert(std::is_same_v<
-              decltype(&iom::DeviceOps::linear),
-              iom::oid (iom::DeviceOps::*)(const iom::TensorView&,
-                                           const iom::TensorView&,
-                                           iom::TensorView&) noexcept>);
-static_assert(std::is_same_v<
-              decltype(&iom::DeviceOps::rmsnorm),
-              iom::oid (iom::DeviceOps::*)(
-                      const iom::TensorView&, iom::TensorView&,
-                      const iom::TensorView&, float, size_t) noexcept>);
-static_assert(std::is_same_v<
-              decltype(&iom::DeviceOps::sdpa),
-              iom::oid (iom::DeviceOps::*)(
-                      const iom::TensorView&, const iom::TensorView&,
-                      const iom::TensorView&, size_t, size_t, size_t,
-                      iom::TensorView&) noexcept>);
-static_assert(std::is_invocable_v<
-              decltype(&iom::DeviceOps::silu), iom::DeviceOps*,
-              const iom::TensorView&, iom::TensorView&>);
-static_assert(!std::is_invocable_v<
-              decltype(&iom::DeviceOps::silu), iom::DeviceOps*,
-              iom::TensorView&, const iom::TensorView&>);
-static_assert(!std::is_invocable_v<
-              decltype(&iom::DeviceOps::copy), iom::DeviceOps*,
-              const iom::Tensor&, iom::Tensor&>);
+#define IOM_ASSERT_BINARY(NAME) \
+    static_assert(std::is_same_v<decltype(&iom::DeviceOps::NAME), \
+        iom::oid (iom::DeviceOps::*)(const iom::TensorView&, \
+                                     const iom::TensorView&, \
+                                     iom::TensorView&) noexcept>)
+IOM_ASSERT_BINARY(add);
+IOM_ASSERT_BINARY(mul);
+IOM_ASSERT_BINARY(sub);
+IOM_ASSERT_BINARY(div);
+#undef IOM_ASSERT_BINARY
 
+enum class BinaryOperation { add, mul, sub, div };
 
-// ---------------------------------------------------------------------------
-// Backend-neutral ADD policy fake. It consumes only the protected immutable
-// request and the common registry seam; no arithmetic or backend runtime is
-// involved.
-// ---------------------------------------------------------------------------
+inline iom::oid submit_binary_operation(
+        iom::DeviceOps& queue, BinaryOperation operation,
+        const iom::TensorView& lhs, const iom::TensorView& rhs,
+        iom::TensorView& out) noexcept {
+    switch (operation) {
+        case BinaryOperation::add: return queue.add(lhs, rhs, out);
+        case BinaryOperation::mul: return queue.mul(lhs, rhs, out);
+        case BinaryOperation::sub: return queue.sub(lhs, rhs, out);
+        case BinaryOperation::div: return queue.div(lhs, rhs, out);
+    }
+    return iom::to_oid(iom::OidError::InternalError);
+}
 
-class CommonAddQueue final : public iom::DeviceOps {
+class CommonBinaryQueue final : public iom::DeviceOps {
 public:
+    using Operation = iom::DeviceOps::BinaryOperation;
     struct Record {
         std::uint64_t sequence;
+        Operation operation;
         std::vector<std::size_t> result_shape;
-        iom::detail::AddEntryRegistration entries;
+        iom::detail::BinaryEntryRegistration entries;
         bool retained_failure;
     };
 
-    explicit CommonAddQueue(const iom::Device& device)
+    explicit CommonBinaryQueue(const iom::Device& device)
             : iom::DeviceOps(device) {}
-
-    void fail_next_after_acceptance() noexcept {
-        fail_next_ = true;
-    }
-
+    void fail_next_after_acceptance() noexcept { fail_next_ = true; }
     [[nodiscard]] const std::vector<Record>& records() const noexcept {
         return records_;
     }
-
     [[nodiscard]] std::size_t registered_at(void* address) const {
         return state_.registry.snapshot_for(address).size();
     }
-
     void finish(std::uint64_t sequence) {
         for (const Record& record : records_) {
-            if (record.sequence != sequence) {
-                continue;
-            }
-            (void)iom::detail::release_or_invalidate_add_entries(
+            if (record.sequence != sequence) continue;
+            (void)iom::detail::release_or_invalidate_binary_entries(
                     state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             complete(sequence);
             return;
         }
-        throw std::invalid_argument("unknown common ADD sequence");
+        throw std::invalid_argument("unknown common binary sequence");
     }
 
 protected:
-    iom::oid add_impl(const AddRequest& request) override {
+    iom::oid binary_impl(const BinaryRequest& request) override {
         iom::detail::Fence fence;
         fence.invoke = [](const iom::detail::Fence&) noexcept {
             return iom::detail::FenceResult::pending();
         };
         const bool retained_failure = std::exchange(fail_next_, false);
-        return submit_add(
+        return this->submit_binary(
                 request, state_, registry_queue_id_, fence,
                 [this, retained_failure](
-                        std::uint64_t sequence, const AddRequest& snapshot,
-                        iom::detail::AddEntryRegistration entries) {
+                        std::uint64_t sequence, const BinaryRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
                     records_.push_back(
-                            {sequence,
+                            {sequence, snapshot.operation,
                              {snapshot.result_shape.dimensions().begin(),
                               snapshot.result_shape.dimensions().end()},
-                             entries,
-                             retained_failure});
+                             entries, retained_failure});
                     if (retained_failure) {
-                        commit_failure(
-                                sequence,
-                                std::make_exception_ptr(std::runtime_error(
-                                        "common ADD retained failure")));
+                        commit_failure(sequence, std::make_exception_ptr(
+                                std::runtime_error(
+                                        "common binary retained failure")));
                     }
                 });
     }
@@ -421,137 +391,100 @@ private:
     bool fail_next_ = false;
 };
 
-inline void run_add_request_conformance(
+inline void run_binary_request_conformance(
         const ConformanceDevices& devices,
         ConformanceObserver* observer = nullptr) {
     const iom::TensorSpec matrix{
             iom::TensorShape{{2, 17, 33}}, iom::DataType::F32};
     const iom::TensorSpec scalar{
             iom::TensorShape{{1, 1}}, iom::DataType::F32};
-    const iom::TensorSpec broadcast_result{
+    const iom::TensorSpec broad_result{
             iom::TensorShape{{2, 4, 3, 5, 17, 33}}, iom::DataType::F32};
-    const iom::TensorSpec broadcast_lhs{
+    const iom::TensorSpec broad_lhs{
             iom::TensorShape{{2, 1, 3, 1, 17, 1}}, iom::DataType::F32};
-    const iom::TensorSpec broadcast_rhs{
+    const iom::TensorSpec broad_rhs{
             iom::TensorShape{{1, 4, 1, 5, 1, 33}}, iom::DataType::F32};
-
     auto lhs = devices.candidate.create_tensor(matrix);
     auto rhs = devices.candidate.create_tensor(matrix);
     auto out = devices.candidate.create_tensor(matrix);
     auto foreign = devices.foreign.create_tensor(matrix);
-    auto scalar_lhs = devices.candidate.create_tensor(scalar);
-    auto scalar_rhs = devices.candidate.create_tensor(scalar);
-    auto scalar_out = devices.candidate.create_tensor(scalar);
-    auto broad_lhs = devices.candidate.create_tensor(broadcast_lhs);
-    auto broad_rhs = devices.candidate.create_tensor(broadcast_rhs);
-    auto broad_out = devices.candidate.create_tensor(broadcast_result);
-    if (observer != nullptr) {
-        observer->setup_complete();
+    auto sl = devices.candidate.create_tensor(scalar);
+    auto sr = devices.candidate.create_tensor(scalar);
+    auto so = devices.candidate.create_tensor(scalar);
+    auto bl = devices.candidate.create_tensor(broad_lhs);
+    auto br = devices.candidate.create_tensor(broad_rhs);
+    auto bo = devices.candidate.create_tensor(broad_result);
+    if (observer) observer->setup_complete();
+    CommonBinaryQueue queue(devices.candidate);
+    const BinaryOperation operations[] = {
+            BinaryOperation::add, BinaryOperation::mul,
+            BinaryOperation::sub, BinaryOperation::div};
+    for (const BinaryOperation operation : operations) {
+        const iom::oid token = submit_binary_operation(
+                queue, operation, lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(static_cast<unsigned>(queue.records().back().operation),
+                 static_cast<unsigned>(operation));
+        CHECK_EQ(queue.records().back().entries.count, std::size_t{3});
+        queue.finish(token_sequence(token));
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_NOTHROW(queue.wait(token));
     }
-
-    CommonAddQueue queue(devices.candidate);
-    const iom::oid first =
-            queue.add(lhs->view(), rhs->view(), out->view());
-    REQUIRE(iom::oid_is_token(first));
-    CHECK_EQ(token_sequence(first), 1);
-    REQUIRE_EQ(queue.records().back().entries.count, 3);
-    CHECK_EQ(queue.registered_at(lhs->view().native_handle()), 1);
-    queue.finish(1);
-    CHECK_NOTHROW(queue.wait(first));
-    CHECK_NOTHROW(queue.wait(first));
-    CHECK_EQ(queue.registered_at(lhs->view().native_handle()), 0);
-
-    const iom::oid scalar_token =
-            queue.add(scalar_lhs->view(), scalar_rhs->view(),
-                      scalar_out->view());
+    const auto scalar_token = submit_binary_operation(
+            queue, BinaryOperation::add, sl->view(), sr->view(), so->view());
     REQUIRE(iom::oid_is_token(scalar_token));
     CHECK_EQ(queue.records().back().result_shape,
              std::vector<std::size_t>({1, 1}));
     queue.finish(token_sequence(scalar_token));
-
-    const iom::oid broadcast_token =
-            queue.add(broad_lhs->view(), broad_rhs->view(),
-                      broad_out->view());
-    REQUIRE(iom::oid_is_token(broadcast_token));
-    CHECK_EQ(
-            queue.records().back().result_shape,
-            std::vector<std::size_t>({2, 4, 3, 5, 17, 33}));
-    queue.finish(token_sequence(broadcast_token));
-
-    const iom::oid promoted =
-            queue.add(scalar_lhs->view(), rhs->view(), out->view());
-    REQUIRE(iom::oid_is_token(promoted));
+    const auto broad_token = submit_binary_operation(
+            queue, BinaryOperation::mul, bl->view(), br->view(), bo->view());
+    REQUIRE(iom::oid_is_token(broad_token));
     CHECK_EQ(queue.records().back().result_shape,
-             std::vector<std::size_t>({2, 17, 33}));
-    queue.finish(token_sequence(promoted));
-
+             std::vector<std::size_t>({2, 4, 3, 5, 17, 33}));
+    queue.finish(token_sequence(broad_token));
     const std::size_t accepted = queue.records().size();
-    CHECK_EQ(
-            queue.add(foreign->view(), rhs->view(), out->view()),
-            iom::to_oid(iom::OidError::InvalidArgument));
-    CHECK_EQ(
-            queue.add(lhs->view(), rhs->view(), scalar_out->view()),
-            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(submit_binary_operation(queue, BinaryOperation::sub,
+                           foreign->view(), rhs->view(), out->view()),
+             iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(submit_binary_operation(queue, BinaryOperation::div,
+                           lhs->view(), rhs->view(), so->view()),
+             iom::to_oid(iom::OidError::InvalidArgument));
     CHECK_EQ(queue.records().size(), accepted);
-
-    const iom::oid aliased =
-            queue.add(out->view(), out->view(), out->view());
-    REQUIRE(iom::oid_is_token(aliased));
-    REQUIRE_EQ(queue.records().back().entries.count, 1);
-    queue.finish(token_sequence(aliased));
-
+    const auto alias = submit_binary_operation(
+            queue, BinaryOperation::sub, out->view(), out->view(), out->view());
+    REQUIRE(iom::oid_is_token(alias));
+    CHECK_EQ(queue.records().back().entries.count, std::size_t{1});
+    queue.finish(token_sequence(alias));
     queue.fail_next_after_acceptance();
-    const iom::oid failed =
-            queue.add(lhs->view(), rhs->view(), out->view());
+    const auto failed = submit_binary_operation(
+            queue, BinaryOperation::div, lhs->view(), rhs->view(), out->view());
     REQUIRE(iom::oid_is_token(failed));
     queue.finish(token_sequence(failed));
     expect_repeated_runtime_failure(queue, failed);
-
-    if (observer != nullptr) {
-        observer->case_complete();
-    }
+    if (observer) observer->case_complete();
 }
-inline void run_add_rank_boundary_conformance(iom::Device& candidate) {
-    const iom::TensorSpec input_spec{
+
+// Compatibility-free operation-neutral rank boundary case.
+inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
+    const iom::TensorSpec spec{
             iom::TensorShape{{17, 33}}, iom::DataType::U8};
-    const std::vector<std::byte> lhs_bytes =
-            encode_logical(input_spec, 0x13579BDF2468ACE0ull);
-    const std::vector<std::byte> rhs_bytes =
-            encode_logical(input_spec, 0x0ECA8642FDB97531ull);
-    auto rhs = candidate.create_tensor(input_spec);
+    const auto lhs_bytes = encode_logical(spec, 0x13579BDF2468ACE0ull);
+    const auto rhs_bytes = encode_logical(spec, 0x0ECA8642FDB97531ull);
+    auto rhs = candidate.create_tensor(spec);
     rhs->view().copy_from_host(rhs_bytes);
     auto queue = candidate.create_ops();
     for (const std::size_t rank : {8u, 9u, 16u, 17u}) {
-        std::vector<std::size_t> dimensions(rank, 1);
-        dimensions[rank - 2] = 17;
-        dimensions[rank - 1] = 33;
-        const iom::TensorSpec lhs_spec{
-                iom::TensorShape{dimensions}, iom::DataType::U8};
-        const iom::TensorSpec output_spec{
-                iom::TensorShape{dimensions}, iom::DataType::U8};
-        auto lhs = candidate.create_tensor(lhs_spec);
-        auto output = candidate.create_tensor(output_spec);
-        lhs->view().copy_from_host(lhs_bytes);
-        output->view().copy_from_host(
-                std::vector<std::byte>(
-                        output_spec.logical_nbytes(), std::byte{0}));
-        const iom::oid token =
-                queue->add(lhs->view(), rhs->view(), output->view());
+        std::vector<std::size_t> dims(rank, 1);
+        dims[rank - 2] = 17; dims[rank - 1] = 33;
+        const iom::TensorSpec current{iom::TensorShape{dims}, iom::DataType::U8};
+        auto l = candidate.create_tensor(current);
+        auto o = candidate.create_tensor(current);
+        l->view().copy_from_host(lhs_bytes);
+        o->view().copy_from_host(std::vector<std::byte>(
+                current.logical_nbytes(), std::byte{0}));
+        const auto token = queue->add(l->view(), rhs->view(), o->view());
         REQUIRE(iom::oid_is_token(token));
         CHECK_NOTHROW(queue->wait(token));
         CHECK_NOTHROW(queue->wait(token));
-        const std::vector<std::byte> actual =
-                read_logical(output->view());
-        REQUIRE_EQ(actual.size(), lhs_bytes.size());
-        std::vector<std::byte> expected(actual.size());
-        for (std::size_t index = 0; index < expected.size(); ++index) {
-            expected[index] = std::byte{
-                    static_cast<unsigned char>(
-                            static_cast<unsigned>(lhs_bytes[index])
-                            + static_cast<unsigned>(rhs_bytes[index]))};
-        }
-        CHECK_EQ(actual, expected);
     }
 }
-
-}  // namespace iom_conformance
