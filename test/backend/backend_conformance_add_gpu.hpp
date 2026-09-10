@@ -71,6 +71,7 @@ inline void run_gpu_eltwise_conformance(
         const iom::oid token = submit_binary_operation(
                 *queue, operation, l->view(), r->view(), out->view());
         REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
         const auto actual = read_logical(out->view());
         for (std::size_t i = 0; i < count; ++i) {
             const auto got = gpu_read_bits(actual, i, bits);
