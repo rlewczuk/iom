@@ -20,6 +20,11 @@ namespace iom::ttnn_test {
             std::size_t plane_index) noexcept;
     bool copy_planes_submission_fault_consumed_for_testing() noexcept;
 
+    // Fails the binary backend's provisional completion-outcome insertion
+    // before any native output upload; the common transaction must then
+    // remove all registered owners and roll back the sequence.
+    void fail_next_binary_outcome_insertion_for_testing() noexcept;
+    bool binary_outcome_insertion_fault_consumed_for_testing() noexcept;
     // Fails the next copy's registration phase with std::bad_alloc before
     // any native plane is submitted: either the entry registration itself
     // or the outcome insertion after both entries were registered.

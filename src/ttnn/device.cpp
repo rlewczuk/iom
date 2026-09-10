@@ -53,8 +53,10 @@ namespace iom {
         // are consumed here where the transaction runs.
         std::atomic<bool> g_fail_next_copy_registration{false};
         std::atomic<bool> g_fail_next_copy_outcome_insertion{false};
+        std::atomic<bool> g_fail_next_binary_outcome_insertion{false};
         std::atomic<bool> g_copy_registration_fault_consumed{false};
         std::atomic<bool> g_copy_outcome_insertion_fault_consumed{false};
+        std::atomic<bool> g_binary_outcome_insertion_fault_consumed{false};
 
         // Remaining mesh-finish attempts that must fail. Count semantics let
         // a test fail both drain attempts of one failed submission (the
@@ -81,6 +83,14 @@ namespace iom {
             if (g_fail_next_copy_outcome_insertion.exchange(
                         false, std::memory_order_acquire)) {
                 g_copy_outcome_insertion_fault_consumed.store(
+                        true, std::memory_order_release);
+                throw std::bad_alloc();
+            }
+        }
+        void consume_binary_outcome_insertion_fault() noexcept(false) {
+            if (g_fail_next_binary_outcome_insertion.exchange(
+                        false, std::memory_order_acquire)) {
+                g_binary_outcome_insertion_fault_consumed.store(
                         true, std::memory_order_release);
                 throw std::bad_alloc();
             }
@@ -617,6 +627,9 @@ public:
             try {
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
+#ifdef IOM_ENABLE_TESTING
+                    consume_binary_outcome_insertion_fault();
+#endif
                     const auto [it, inserted] = binary_outcomes_.emplace(
                             task.sequence, BinaryOutcome{task.binary_entries});
                     if (!inserted) {
@@ -641,10 +654,25 @@ public:
                 executed_seq_.store(task.sequence, std::memory_order_release);
                 return;
             } catch (...) {
+                const std::exception_ptr submission_failure =
+                        std::current_exception();
+                if (!submitted) {
+                    // No output upload reached the mesh. The common
+                    // submit_binary transaction owns both registry rollback
+                    // and sequence rollback; only discard this provisional
+                    // backend outcome before propagating the failure.
+                    std::lock_guard<std::mutex> lock(outcome_mutex_);
+                    binary_outcomes_.erase(task.sequence);
+                    std::rethrow_exception(submission_failure);
+                }
+                // Native work was accepted. Keep the outcome, owner
+                // registrations, and staging leases under the normal
+                // completion/quarantine path so the public token remains a
+                // repeatably failed retained submission.
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
                 auto it = binary_outcomes_.find(task.sequence);
                 if (it != binary_outcomes_.end()) {
-                    it->second.retained_failure = std::current_exception();
+                    it->second.retained_failure = submission_failure;
                     it->second.native_work_submitted = submitted;
                 }
                 executed_seq_.store(task.sequence, std::memory_order_release);
@@ -946,6 +974,15 @@ void TtnnQueue::fence_through_sequence(
             return g_quarantine_action_fault_consumed;
         }
 
+        void fail_next_binary_outcome_insertion_for_testing() noexcept {
+            g_fail_next_binary_outcome_insertion.store(
+                    true, std::memory_order_release);
+        }
+
+        bool binary_outcome_insertion_fault_consumed_for_testing() noexcept {
+            return g_binary_outcome_insertion_fault_consumed.load(
+                    std::memory_order_acquire);
+        }
         void fail_next_copy_registration_for_testing() noexcept {
             g_fail_next_copy_registration.store(
                     true, std::memory_order_release);

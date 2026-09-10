@@ -1100,6 +1100,100 @@ TEST_CASE("TTNN registration and outcome insertion failures roll back ownership"
     }
 }
 
+TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
+    require_hardware();
+    TtnnDevices devices;
+    const std::size_t output_rows[] = {33, 65, 129, 257};
+    const std::size_t output_columns[] = {17, 33, 65, 129};
+
+    for (std::size_t operation = 0; operation < 4; ++operation) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, output_rows[operation],
+                                  output_columns[operation]}},
+                iom::DataType::BF16};
+        CAPTURE(operation);
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+
+        // Seed all three owners through the native path so the public host
+        // staging pool has no capacity before the first output upload.
+        auto* lhs_planes =
+                static_cast<ttnn::Tensor*>(lhs->view().native_handle());
+        auto* rhs_planes =
+                static_cast<ttnn::Tensor*>(rhs->view().native_handle());
+        auto* out_planes =
+                static_cast<ttnn::Tensor*>(out->view().native_handle());
+        const ttnn::Tensor& out_plane = out_planes[0];
+        const std::size_t carrier_bytes =
+                out_plane.dtype() == tt::tt_metal::DataType::UINT8
+                ? 1
+                : (out_plane.dtype() == tt::tt_metal::DataType::UINT16
+                                   || out_plane.dtype()
+                                              == tt::tt_metal::DataType::BFLOAT16
+                           ? 2
+                           : 4);
+        const std::size_t native_bytes =
+                static_cast<std::size_t>(out_plane.padded_shape()[-2])
+                * static_cast<std::size_t>(out_plane.padded_shape()[-1])
+                * carrier_bytes;
+        std::vector<std::byte> native_input(native_bytes, std::byte{0});
+        std::vector<std::byte> native_sentinel(
+                native_bytes, kObserverStorageSentinel);
+        write_padded_plane_image(lhs_planes[0], native_input);
+        write_padded_plane_image(rhs_planes[0], native_input);
+        write_padded_plane_image(out_planes[0], native_sentinel);
+        out_plane.device()->mesh_command_queue(0).finish();
+        std::vector<std::byte> before(spec.logical_nbytes());
+        out->view().copy_to_host(before);
+
+        auto queue = devices.candidate->create_ops();
+        const auto submit = [&](std::size_t index) {
+            switch (index) {
+                case 0:
+                    return queue->add(
+                            lhs->view(), rhs->view(), out->view());
+                case 1:
+                    return queue->mul(
+                            lhs->view(), rhs->view(), out->view());
+                case 2:
+                    return queue->sub(
+                            lhs->view(), rhs->view(), out->view());
+                case 3:
+                    return queue->div(
+                            lhs->view(), rhs->view(), out->view());
+            }
+            return iom::to_oid(iom::OidError::InternalError);
+        };
+        iom::ttnn_test::fail_next_binary_outcome_insertion_for_testing();
+        const iom::oid outcome_rejected = submit(operation);
+        CHECK_EQ(
+                outcome_rejected,
+                iom::to_oid(iom::OidError::ResourceExhausted));
+        CHECK(iom::ttnn_test::
+                      binary_outcome_insertion_fault_consumed_for_testing());
+        std::vector<std::byte> after_outcome_failure(
+                spec.logical_nbytes());
+        out->view().copy_to_host(after_outcome_failure);
+        CHECK_EQ(after_outcome_failure, before);
+
+        iom::ttnn_test::
+                fail_next_host_transfer_staging_allocation_for_testing();
+        const iom::oid rejected = submit(operation);
+        CHECK_EQ(rejected, iom::to_oid(iom::OidError::ResourceExhausted));
+        CHECK(iom::ttnn_test::
+                      host_transfer_staging_allocation_fault_consumed_for_testing());
+        std::vector<std::byte> after(spec.logical_nbytes());
+        out->view().copy_to_host(after);
+        CHECK_EQ(after, before);
+
+        const iom::oid accepted = submit(operation);
+        REQUIRE(iom::oid_is_token(accepted));
+        CHECK_EQ(iom_conformance::token_sequence(accepted), 1);
+        REQUIRE_NOTHROW(queue->wait(accepted));
+    }
+}
+
 TEST_CASE("TTNN un-drainable failed submission reports a repeatable failed token") {
     require_hardware();
     TtnnDevices devices;
