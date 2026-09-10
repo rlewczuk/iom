@@ -45,7 +45,8 @@ inline std::uint64_t round_encode(long double x, Spec s) noexcept {
     if (std::isnan(x))
         return (sg << (s.e + s.f)) | (em << s.f) |
                (s.finite ? fm : std::uint64_t{1} << (s.f - 1));
-    if (std::isinf(x)) return (sg << (s.e + s.f)) | (s.inf ? em << s.f : ((em - 1) << s.f) | fm);
+    if (std::isinf(x)) return (sg << (s.e + s.f)) |
+        (s.inf ? em << s.f : ((s.finite && s.e < 4 ? em : em - 1) << s.f) | fm);
     if (x == 0) return sg << (s.e + s.f);
     int e = 0; std::frexp(x, &e); --e;
     const int minsub = 1 - s.bias - static_cast<int>(s.f);
@@ -64,7 +65,8 @@ inline std::uint64_t round_encode(long double x, Spec s) noexcept {
     if (e > maxe) return (sg << (s.e + s.f)) | ((s.finite && s.e < 4 ? em : em - 1) << s.f) | fm;
     return (sg << (s.e + s.f)) | (static_cast<std::uint64_t>(e + s.bias) << s.f) | q;
 }
-inline std::uint64_t add(iom::DataType t, std::uint64_t a, std::uint64_t b) noexcept {
+enum class operation { add, mul, sub, div };
+inline std::uint64_t binary(iom::DataType t, std::uint64_t a, std::uint64_t b, operation op) noexcept {
     unsigned w = 0;
     switch (t) {
         case iom::DataType::I2: case iom::DataType::U2: w = 2; break;
@@ -73,28 +75,43 @@ inline std::uint64_t add(iom::DataType t, std::uint64_t a, std::uint64_t b) noex
         case iom::DataType::I16: case iom::DataType::U16: w = 16; break;
         case iom::DataType::I32: case iom::DataType::U32: w = 32; break;
         case iom::DataType::I64: case iom::DataType::U64: w = 64; break;
-        default: {
-            const auto s = spec(t);
-            const auto x = value(a, s), y = value(b, s);
-            if (std::isnan(x) || std::isnan(y) ||
-                (std::isinf(x) && std::isinf(y) && std::signbit(x) != std::signbit(y)))
-                return round_encode(std::numeric_limits<long double>::quiet_NaN(), s);
-            const long double sum = x + y;
-            // The device's F64 path overflows to infinity; narrower formats
-            // retain the established saturation contract.
-            if (s.e == 11 && s.inf && std::isfinite(sum)) {
-                const auto em = (std::uint64_t{1} << s.e) - 1;
-                const auto fm = (std::uint64_t{1} << s.f) - 1;
-                const auto max_raw = ((em - 1) << s.f) | fm;
-                const long double max_value = value(max_raw, s);
-                if (std::fabs(sum) > max_value)
-                    return round_encode(
-                            std::copysign(std::numeric_limits<long double>::infinity(), sum), s);
-            }
-            return round_encode(sum, s);
-        }
+        default: break;
     }
-    return (a + b) & (w == 64 ? ~std::uint64_t{} : (std::uint64_t{1} << w) - 1);
+    if (w) {
+        if (op == operation::div) return 0;
+        const auto mask = w == 64 ? ~std::uint64_t{} : (std::uint64_t{1} << w) - 1;
+        if (op == operation::mul) return (a * b) & mask;
+        if (op == operation::sub) return (a - b) & mask;
+        return (a + b) & mask;
+    }
+    const auto s = spec(t);
+    const auto x = value(a, s), y = value(b, s);
+    long double z;
+    if (std::isnan(x) || std::isnan(y)) z = std::numeric_limits<long double>::quiet_NaN();
+    else if (op == operation::add) {
+        if (std::isinf(x) && std::isinf(y) && std::signbit(x) != std::signbit(y))
+            z = std::numeric_limits<long double>::quiet_NaN();
+        else if (x == 0 && y == 0) z = (std::signbit(x) && std::signbit(y)) ? -0.0L : 0.0L;
+        else { z = x + y; if (z == 0) z = 0.0L; }
+    } else if (op == operation::mul) {
+        z = ((std::isinf(x) && y == 0) || (std::isinf(y) && x == 0))
+            ? std::numeric_limits<long double>::quiet_NaN() : x * y;
+    } else if (op == operation::sub) {
+        z = (std::isinf(x) && std::isinf(y) && std::signbit(x) == std::signbit(y))
+            ? std::numeric_limits<long double>::quiet_NaN() : x - y;
+    } else {
+        z = ((x == 0 && y == 0) || (std::isinf(x) && std::isinf(y)))
+            ? std::numeric_limits<long double>::quiet_NaN() : x / y;
+    }
+    if (op == operation::add && s.e == 11 && s.inf && std::isfinite(z)) {
+        const auto em = (std::uint64_t{1} << s.e) - 1, fm = (std::uint64_t{1} << s.f) - 1;
+        if (std::fabs(z) > value(((em - 1) << s.f) | fm, s))
+            z = std::copysign(std::numeric_limits<long double>::infinity(), z);
+    }
+    return round_encode(z, s);
+}
+inline std::uint64_t add(iom::DataType t, std::uint64_t a, std::uint64_t b) noexcept {
+    return binary(t, a, b, operation::add);
 }
 }  // namespace add_oracle
 
