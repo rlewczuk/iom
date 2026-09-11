@@ -35,116 +35,12 @@ extern char** environ;
 
 namespace {
 
+// Every standard-GPU conformance fixture reserves this tensor-data arena:
+// the largest concurrent set is three 8192x4096 F32 tensors plus one
+// quarantined operand (512 MiB), and fixtures also keep a foreign device
+// alive with the same budget.
+constexpr std::size_t kConformanceArenaBytes = 640u * 1024 * 1024;
 
-class HipAllocator final : public iom::Allocator {
-public:
-    explicit HipAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
-
-    void* alloc(std::size_t size) override {
-        CHECK_MESSAGE(
-                !gate_.armed(),
-                "tensor storage allocated inside a transfer, transform, or operation");
-        void* block = nullptr;
-        const hipError_t status = hipMalloc(&block, size);
-        if (status != hipSuccess) {
-            throw std::runtime_error("hipMalloc failed in test allocator");
-        }
-        live_.insert(block);
-        ++allocations;
-        return block;
-    }
-
-    void free(void* buffer) override {
-        CHECK_MESSAGE(
-                !gate_.armed(),
-                "tensor storage freed inside a transfer, transform, or operation");
-        const auto found = live_.find(buffer);
-        REQUIRE_MESSAGE(
-                found != live_.end(),
-                "ROCm allocator freed an address it never handed out");
-        live_.erase(found);
-        CHECK(hipFree(buffer) == hipSuccess);
-        ++frees;
-    }
-
-    void reset() override { ++resets; }
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-    std::size_t resets = 0;
-
-private:
-    const iom_conformance::TrafficGate& gate_;
-    std::unordered_set<void*> live_;
-};
-class ReusingHipAllocator final : public iom::Allocator {
-public:
-    ~ReusingHipAllocator() override {
-        for (const Slot& slot : free_) {
-            (void)hipFree(slot.pointer);
-        }
-        for (const auto& [pointer, size] : live_) {
-            (void)size;
-            (void)hipFree(pointer);
-        }
-    }
-
-    void* alloc(std::size_t size) override {
-        for (auto it = free_.begin(); it != free_.end(); ++it) {
-            if (it->size != size) {
-                continue;
-            }
-            void* pointer = it->pointer;
-            live_.emplace(pointer, size);
-            free_.erase(it);
-            return pointer;
-        }
-
-        void* pointer = nullptr;
-        if (hipMalloc(&pointer, size) != hipSuccess) {
-            throw std::bad_alloc();
-        }
-        try {
-            live_.emplace(pointer, size);
-        } catch (...) {
-            (void)hipFree(pointer);
-            throw;
-        }
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        const auto found = live_.find(buffer);
-        if (found == live_.end()) {
-            throw std::runtime_error(
-                    "ROCm reuse allocator received an unknown address");
-        }
-        free_.push_back({buffer, found->second});
-        live_.erase(found);
-    }
-
-    void reset() override {}
-
-    void release_free() noexcept {
-        for (const Slot& slot : free_) {
-            (void)hipFree(slot.pointer);
-        }
-        free_.clear();
-    }
-
-    [[nodiscard]] std::size_t free_count() const noexcept {
-        return free_.size();
-    }
-
-private:
-    struct Slot {
-        void* pointer;
-        std::size_t size;
-    };
-
-    std::vector<Slot> free_;
-    std::unordered_map<void*, std::size_t> live_;
-};
 const char* g_executable_path = nullptr;
 
 [[nodiscard]] const char* watchdog_fault_name(
@@ -187,8 +83,8 @@ const char* g_executable_path = nullptr;
     }
 
     try {
-        ReusingHipAllocator allocator;
-        auto device = iom::make_rocm_device(0, allocator);
+        auto device = iom::make_rocm_device(
+                0, iom::DeviceMemoryConfig{1 * 1024 * 1024});
         const iom::TensorSpec spec{
                 iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
         auto source = device->create_tensor(spec);
@@ -266,9 +162,9 @@ void expect_bounded_wait_in_subprocess(
 }  // namespace
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
     const std::unique_ptr<iom::Device> candidate =
-            iom::make_rocm_device(0, allocator);
+            iom::make_rocm_device(
+                    0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::require_standard_capabilities(
             candidate->supported_data_types());
 }
@@ -278,11 +174,11 @@ TEST_CASE("ROCm conformance: storage and host transfers for every leaf type") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     iom_conformance::run_storage_and_transfer_conformance(
@@ -322,11 +218,11 @@ TEST_CASE("ROCm conformance: storage oracle identifies perturbed transfer map") 
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     const std::span<const iom::DataType> one_type =
@@ -346,11 +242,11 @@ TEST_CASE("ROCm conformance: storage oracle covers every leaf width and padded s
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     HipStorageOracle oracle;
@@ -365,11 +261,11 @@ TEST_CASE("ROCm conformance: asynchronous copies against the CPU reference") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     HipStorageOracle oracle;
@@ -382,11 +278,11 @@ TEST_CASE("ROCm conformance: copy validation fails before writes and sequences")
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     iom_conformance::run_copy_error_conformance(
@@ -397,8 +293,8 @@ TEST_CASE("ROCm conformance: copy validation fails before writes and sequences")
 TEST_CASE("ROCm copy reservation failures roll back before native work") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);
-    HipAllocator allocator(gate);
-    auto device = iom::make_rocm_device(0, allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{2, 16, 16}}, iom::DataType::U8};
     auto source = device->create_tensor(spec);
@@ -441,11 +337,11 @@ TEST_CASE("ROCm conformance: transfer failures keep metadata and ownership") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     iom_conformance::run_transfer_error_conformance(
@@ -455,8 +351,8 @@ TEST_CASE("ROCm conformance: transfer failures keep metadata and ownership") {
 
 TEST_CASE("ROCm conformance: deferred queue lifetime and stability") {
     iom_conformance::TrafficGate gate;
-    HipAllocator candidate_allocator(gate);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_lifetime_conformance(
             *candidate, candidate->supported_data_types(), &gate);
     CHECK_FALSE(gate.armed());
@@ -464,8 +360,8 @@ TEST_CASE("ROCm conformance: deferred queue lifetime and stability") {
 
 TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the staged atomic word") {
     iom_conformance::TrafficGate gate;
-    HipAllocator candidate_allocator(gate);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     constexpr std::uint64_t salt = 0x180001ull;
     for (const iom::DataType type : {
                  iom::DataType::I2,
@@ -488,8 +384,8 @@ TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the stag
 
 TEST_CASE("ROCm conformance: compute methods reject capability without submitting") {
     iom_conformance::TrafficGate gate;
-    HipAllocator candidate_allocator(gate);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_compute_capability_conformance(
             *candidate, candidate->supported_data_types(), &gate, "ROCm",
             true);
@@ -500,11 +396,11 @@ TEST_CASE("ROCm conformance: full shared suite") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
-    HipAllocator candidate_allocator(gate);
-    HipAllocator foreign_allocator(gate);
     auto reference = iom::make_cpu_device(reference_allocator);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
-    auto foreign = iom::make_rocm_device(0, foreign_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     HipStorageOracle oracle;
@@ -515,8 +411,8 @@ TEST_CASE("ROCm conformance: full shared suite") {
 }
 TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto candidate = iom::make_rocm_device(0, allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     for (const auto operation : {
             iom_conformance::BinaryOperation::add,
             iom_conformance::BinaryOperation::mul,
@@ -532,8 +428,8 @@ TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
 
 TEST_CASE("ROCm ADD accepts every low-width leaf against the oracle") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto candidate = iom::make_rocm_device(0, allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_gpu_eltwise_conformance(
             *candidate, iom_conformance::BinaryOperation::add);
     iom_conformance::run_binary_rank_boundary_conformance(*candidate);
@@ -542,8 +438,8 @@ TEST_CASE("ROCm ADD accepts every low-width leaf against the oracle") {
 
 TEST_CASE("ROCm ADD wide dtypes and boundary values against the oracle") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto candidate = iom::make_rocm_device(0, allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_gpu_eltwise_conformance(
             *candidate, iom_conformance::BinaryOperation::add);
     CHECK_FALSE(gate.armed());
@@ -551,8 +447,8 @@ TEST_CASE("ROCm ADD wide dtypes and boundary values against the oracle") {
 
 TEST_CASE("ROCm ADD broadcast, transform, tail, and exact alias mapping") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto candidate = iom::make_rocm_device(0, allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_gpu_eltwise_mapping_conformance(
             *candidate, iom_conformance::BinaryOperation::add);
     CHECK_FALSE(gate.armed());
@@ -560,8 +456,8 @@ TEST_CASE("ROCm ADD broadcast, transform, tail, and exact alias mapping") {
 
 TEST_CASE("ROCm ADD retained launch failure keeps owners reusable") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto candidate = iom::make_rocm_device(0, allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{2, 16, 16}}, iom::DataType::U8};
     auto lhs = candidate->create_tensor(spec);
@@ -596,8 +492,8 @@ TEST_CASE("ROCm ADD retained launch failure keeps owners reusable") {
 
 TEST_CASE("ROCm submission remains transactional across post-enqueue failures") {
     iom_conformance::TrafficGate gate;
-    HipAllocator candidate_allocator(gate);
-    auto candidate = iom::make_rocm_device(0, candidate_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
     const iom::TensorSpec mismatch{
@@ -650,8 +546,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     // Failed work remains quarantined until device teardown; the allocator
     // must not recycle either operand while its failed entries are retained.
     {
-        ReusingHipAllocator allocator;
-        auto device = iom::make_rocm_device(0, allocator);
+        auto device = iom::make_rocm_device(
+                0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
         auto canary_source = device->create_tensor(spec);
         auto canary_destination = device->create_tensor(spec);
         const std::vector<std::byte> storage_canary(
@@ -695,10 +591,7 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
         fresh_source.reset();
         fresh_destination.reset();
         canary_queue.reset();
-        allocator.release_free();
-        CHECK_EQ(allocator.free_count(), 0);
         device.reset();
-        CHECK_EQ(allocator.free_count(), 2);
     }
     iom::rocm_detail::inject_submission_fault_for_testing(
             iom::rocm_detail::SubmissionFault::none);
@@ -706,8 +599,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
 
 TEST_CASE("ROCm queue destruction fences pending copies") {
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto device = iom::make_rocm_device(0, allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
     auto source = device->create_tensor(spec);
@@ -757,8 +650,8 @@ TEST_CASE("ROCm pre-wait source destruction keeps storage until completion") {
     const std::vector<std::byte> empty(
             spec.tiled_storage_nbytes(), std::byte{0});
 
-    ReusingHipAllocator allocator;
-    auto device = iom::make_rocm_device(0, allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     HipStorageOracle oracle;
     auto source = device->create_tensor(spec);
     auto destination = device->create_tensor(spec);
@@ -785,8 +678,6 @@ TEST_CASE("ROCm pre-wait source destruction keeps storage until completion") {
     fresh.reset();
     queue.reset();
     destination.reset();
-    allocator.release_free();
-    CHECK_EQ(allocator.free_count(), 0);
     device.reset();
 }
 
@@ -801,8 +692,8 @@ TEST_CASE("ROCm shared-operand copies release storage after both complete") {
     const std::vector<std::byte> empty(
             spec.tiled_storage_nbytes(), std::byte{0});
 
-    ReusingHipAllocator allocator;
-    auto device = iom::make_rocm_device(0, allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     HipStorageOracle oracle;
     auto source = device->create_tensor(spec);
     auto first_destination = device->create_tensor(spec);
@@ -837,8 +728,6 @@ TEST_CASE("ROCm shared-operand copies release storage after both complete") {
     queue.reset();
     first_destination.reset();
     second_destination.reset();
-    allocator.release_free();
-    CHECK_EQ(allocator.free_count(), 0);
     device.reset();
 }
 
@@ -848,14 +737,14 @@ TEST_CASE("ROCm operands destroyed after queue teardown remain quarantined") {
     REQUIRE(device_count > 0);
     // Queue destruction invalidates every outstanding registry entry up
     // front, so the operand fences provably report failure when the operands
-    // are destroyed afterwards: the reusing allocator cannot recycle either
-    // block until device teardown, deterministically, with no timing
-    // dependence on the worker or the GPU.
+    // are destroyed afterwards: the data arena cannot recycle either range
+    // until device teardown, deterministically, with no timing dependence on
+    // the worker or the GPU.
     const iom::TensorSpec spec{
             iom::TensorShape{{4096, 2048}}, iom::DataType::F32};
 
-    ReusingHipAllocator allocator;
-    auto device = iom::make_rocm_device(0, allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     auto source = device->create_tensor(spec);
     auto destination = device->create_tensor(spec);
     {
@@ -876,14 +765,10 @@ TEST_CASE("ROCm operands destroyed after queue teardown remain quarantined") {
     CHECK_NE(fresh_source->view().native_handle(), destination_address);
     CHECK_NE(fresh_destination->view().native_handle(), source_address);
     CHECK_NE(fresh_destination->view().native_handle(), destination_address);
-    CHECK_EQ(allocator.free_count(), 0);
 
     fresh_source.reset();
     fresh_destination.reset();
-    allocator.release_free();
-    CHECK_EQ(allocator.free_count(), 0);
     device.reset();
-    CHECK_EQ(allocator.free_count(), 2);
 }
 
 TEST_CASE("ROCm conformance: rank boundary covers rank-eight owners and rejects rank nine") {
@@ -891,8 +776,8 @@ TEST_CASE("ROCm conformance: rank boundary covers rank-eight owners and rejects 
     REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
     REQUIRE(device_count > 0);
     iom_conformance::TrafficGate gate;
-    HipAllocator allocator(gate);
-    auto device = iom::make_rocm_device(0, allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     HipStorageOracle oracle;
     const std::vector<std::vector<std::size_t>> shapes = {
             {2, 2, 2, 2, 2, 2, 16, 16},

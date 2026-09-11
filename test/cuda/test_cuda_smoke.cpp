@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <map>
 #include <memory>
 #include <new>
@@ -18,7 +19,6 @@
 #include <thread>
 #include <vector>
 
-#include "iom/alloc.hpp"
 #include "iom/cuda/device.hpp"
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
@@ -189,66 +189,17 @@ private:
 }  // namespace
 namespace {
 
-class UnusedAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t) override {
-        ++allocations;
-        return nullptr;
-    }
+// Standard arena capacity for smoke tests: 64 MiB covers every live tensor
+// set below (the largest single tensor is 2048x2048 F32 = 16 MiB, with at
+// most three such tensors live together).
+constexpr std::size_t kArenaBytes = 64u * 1024 * 1024;
 
-    void free(void*) override { ++frees; }
-
-    void reset() override { ++resets; }
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-    std::size_t resets = 0;
-};
+[[nodiscard]] iom::TensorSpec spec_16x16_f32() {
+    return iom::TensorSpec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+}
 
 }  // namespace
-
-class MisalignedAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t size) override {
-        ++allocations;
-        raw_ = ::operator new(size + 32, std::align_val_t(32));
-        return static_cast<char*>(raw_) + 1;
-    }
-
-    void free(void* buffer) override {
-        ++frees;
-        CHECK(buffer == static_cast<char*>(raw_) + 1);
-        ::operator delete(raw_, std::align_val_t(32));
-        raw_ = nullptr;
-    }
-
-    void reset() override {}
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-
-private:
-    void* raw_ = nullptr;
-};
-
-class CudaAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t size) override {
-        void* pointer = nullptr;
-        if (cudaMalloc(&pointer, size) != cudaSuccess) {
-            throw std::bad_alloc();
-        }
-        return pointer;
-    }
-
-    void free(void* pointer) override {
-        if (pointer != nullptr && cudaFree(pointer) != cudaSuccess) {
-            throw std::runtime_error("cudaFree failed in smoke allocator");
-        }
-    }
-
-    void reset() override {}
-};
 
 TEST_CASE("CUDA factory reports a live hardware device and owns its context") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
@@ -257,9 +208,9 @@ TEST_CASE("CUDA factory reports a live hardware device and owns its context") {
     REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
     REQUIRE(device_count > 0);
 
-    UnusedAllocator allocator;
     {
-        auto device = iom::make_cuda_device(0, allocator);
+        auto device = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
         REQUIRE(device != nullptr);
         CHECK(device->backend_kind() == iom::BackendKind::CUDA);
         CHECK(device->backend_device() == 0);
@@ -268,33 +219,17 @@ TEST_CASE("CUDA factory reports a live hardware device and owns its context") {
         REQUIRE(cuCtxGetCurrent(&current_context) == CUDA_SUCCESS);
         CHECK(current_context != nullptr);
 
-        const iom::TensorSpec spec{
-                iom::TensorShape{{16, 16}}, iom::DataType::F32};
-        CHECK_THROWS_AS((void)device->create_tensor(spec), std::bad_alloc);
+        auto tensor = device->create_tensor(spec_16x16_f32());
+        REQUIRE(tensor != nullptr);
         auto queue = device->create_ops();
         REQUIRE(queue != nullptr);
-        CHECK(allocator.allocations == 1);
-        CHECK(allocator.frees == 0);
     }
 
-    auto recreated = iom::make_cuda_device(0, allocator);
+    auto recreated = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     REQUIRE(recreated != nullptr);
     CHECK(recreated->backend_kind() == iom::BackendKind::CUDA);
     CHECK(recreated->backend_device() == 0);
-    CHECK(allocator.allocations == 1);
-    CHECK(allocator.frees == 0);
-}
-
-TEST_CASE("CUDA tensor rejects misaligned allocator storage exactly once") {
-    REQUIRE(cuInit(0) == CUDA_SUCCESS);
-
-    MisalignedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
-    const iom::TensorSpec spec{
-            iom::TensorShape{{16, 16}}, iom::DataType::F32};
-    CHECK_THROWS_AS((void)device->create_tensor(spec), std::runtime_error);
-    CHECK(allocator.allocations == 1);
-    CHECK(allocator.frees == 1);
 }
 
 TEST_CASE("CUDA factory rejects the first unavailable ordinal") {
@@ -304,13 +239,17 @@ TEST_CASE("CUDA factory rejects the first unavailable ordinal") {
     REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
     REQUIRE(device_count > 0);
 
-    UnusedAllocator allocator;
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
     CHECK_THROWS_AS(
             (void)iom::make_cuda_device(
-                    static_cast<std::uint32_t>(device_count), allocator),
+                    static_cast<std::uint32_t>(device_count),
+                    iom::DeviceMemoryConfig{kArenaBytes}),
             std::invalid_argument);
-    CHECK(allocator.allocations == 0);
-    CHECK(allocator.frees == 0);
+    CHECK(probe.records.empty());
 }
 
 TEST_CASE("CUDA factory releases retained context when activation fails") {
@@ -332,10 +271,10 @@ TEST_CASE("CUDA factory releases retained context when activation fails") {
     calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
-    UnusedAllocator allocator;
     bool threw = false;
     try {
-        (void)iom::make_cuda_device(0, allocator);
+        (void)iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
     } catch (const std::runtime_error& error) {
         threw = true;
         CHECK(std::string_view(error.what()).starts_with(
@@ -350,7 +289,9 @@ TEST_CASE("CUDA factory releases retained context when activation fails") {
     CHECK(probe.released_device == probe.retained_device);
 }
 
-TEST_CASE("CUDA factory releases retained context when device allocation fails") {
+TEST_CASE(
+        "CUDA factory rolls back the data backing and context when device "
+        "allocation fails") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
 
     int device_count = 0;
@@ -369,11 +310,150 @@ TEST_CASE("CUDA factory releases retained context when device allocation fails")
     calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
-    UnusedAllocator allocator;
+    AllocationCallsRestore allocation_restore;
+    AllocationProbe allocation_probe;
+    active_allocation_probe = &allocation_probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+    iom::cuda_detail::allocation_calls.mem_alloc = &failing_mem_alloc;
+
+    bool threw = false;
+    try {
+        (void)iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    } catch (...) {
+        FAIL("CUDA factory threw an unexpected exception type");
+    }
+
+    CHECK(threw);
+    CHECK(probe.retained);
+    CHECK(probe.release_count == 1);
+    CHECK(probe.released_device == probe.retained_device);
+
+    // The failed data-backing attempt stays observable and no backing was
+    // freed because none was acquired.
+    REQUIRE_EQ(allocation_probe.records.size(), 1u);
+    const auto& record = allocation_probe.records.front();
+    CHECK(record.phase == iom::cuda_detail::AllocationPhase::setup);
+    CHECK(record.classification
+          == iom::cuda_detail::AllocationClass::data_backing);
+    CHECK(record.kind == iom::cuda_detail::AllocationKind::allocate);
+    CHECK_FALSE(record.succeeded);
+    CHECK(record.address == nullptr);
+}
+
+TEST_CASE(
+        "CUDA factory rolls back both backings when the metadata backing "
+        "allocation fails") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+
+    int device_count = 0;
+    REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
+    REQUIRE(device_count > 0);
+
+    DriverCallsRestore restore;
+    DriverCallProbe probe;
+    active_probe = &probe;
+    auto calls = iom::cuda_detail::driver_calls;
+    calls.primary_ctx_retain = &counting_primary_ctx_retain;
+    calls.ctx_set_current = &pass_through_ctx_set_current;
+    calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
+    iom::cuda_detail::driver_calls = calls;
+
+    AllocationCallsRestore allocation_restore;
+    AllocationProbe allocation_probe;
+    active_allocation_probe = &allocation_probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+    iom::cuda_detail::allocation_calls.mem_alloc =
+            [](CUdeviceptr* address, std::size_t bytes) {
+                static thread_local std::size_t calls = 0;
+                (void)bytes;
+                if (calls++ == 0) {
+                    return cuMemAlloc(address, bytes);
+                }
+                return CUresult{CUDA_ERROR_OUT_OF_MEMORY};
+            };
+
+    bool threw = false;
+    try {
+        (void)iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    } catch (...) {
+        FAIL("CUDA factory threw an unexpected exception type");
+    }
+
+    CHECK(threw);
+    CHECK(probe.retained);
+    CHECK(probe.release_count == 1);
+    CHECK(probe.released_device == probe.retained_device);
+
+    // Setup allocated the data backing, failed the metadata backing, then
+    // rolled the data backing back through the same seam before the context
+    // was released.
+    REQUIRE_EQ(allocation_probe.records.size(), 3u);
+    const auto& data_alloc = allocation_probe.records[0];
+    const auto& metadata_alloc = allocation_probe.records[1];
+    const auto& data_free = allocation_probe.records[2];
+    CHECK(data_alloc.phase == iom::cuda_detail::AllocationPhase::setup);
+    CHECK(data_alloc.classification
+          == iom::cuda_detail::AllocationClass::data_backing);
+    CHECK(data_alloc.kind == iom::cuda_detail::AllocationKind::allocate);
+    CHECK(data_alloc.succeeded);
+    CHECK(data_alloc.address != nullptr);
+    CHECK_EQ(data_alloc.bytes, kArenaBytes);
+    CHECK(metadata_alloc.classification
+          == iom::cuda_detail::AllocationClass::metadata_backing);
+    CHECK(metadata_alloc.kind == iom::cuda_detail::AllocationKind::allocate);
+    CHECK_FALSE(metadata_alloc.succeeded);
+    CHECK(data_free.phase == iom::cuda_detail::AllocationPhase::setup);
+    CHECK(data_free.classification
+          == iom::cuda_detail::AllocationClass::data_backing);
+    CHECK(data_free.kind == iom::cuda_detail::AllocationKind::free);
+    CHECK(data_free.address == data_alloc.address);
+}
+
+TEST_CASE(
+        "CUDA factory rolls back both backings and context when host "
+        "allocation fails") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+
+    int device_count = 0;
+    REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
+    REQUIRE(device_count > 0);
+
+    DriverCallsRestore restore;
+    DriverCallProbe probe;
+    active_probe = &probe;
+    auto calls = iom::cuda_detail::driver_calls;
+    calls.primary_ctx_retain = &counting_primary_ctx_retain;
+    calls.ctx_set_current = &pass_through_ctx_set_current;
+    calls.primary_ctx_release = &counting_primary_ctx_release;
+    calls.init = &counting_init;
+    calls.device_get_count = &counting_device_get_count;
+    calls.device_get = &counting_device_get;
+    iom::cuda_detail::driver_calls = calls;
+
+    AllocationCallsRestore allocation_restore;
+    AllocationProbe allocation_probe;
+    // Pre-reserve so the probe's own record push_backs never consume the
+    // injected host-allocation failure below; the failure must land on the
+    // factory's arena bookkeeping so the two backings are acquired, listed,
+    // and rolled back in reverse order.
+    allocation_probe.records.reserve(8);
+    active_allocation_probe = &allocation_probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
     bool threw = false;
     cuda_test::fail_next_allocation = true;
     try {
-        (void)iom::make_cuda_device(0, allocator);
+        (void)iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
     } catch (const std::bad_alloc&) {
         threw = true;
     } catch (...) {
@@ -385,6 +465,24 @@ TEST_CASE("CUDA factory releases retained context when device allocation fails")
     CHECK(probe.retained);
     CHECK(probe.release_count == 1);
     CHECK(probe.released_device == probe.retained_device);
+
+    // Both setup backings were acquired and then freed in reverse order by
+    // the rollback path.
+    REQUIRE_EQ(allocation_probe.records.size(), 4u);
+    CHECK(allocation_probe.records[0].classification
+          == iom::cuda_detail::AllocationClass::data_backing);
+    CHECK(allocation_probe.records[0].succeeded);
+    CHECK(allocation_probe.records[1].classification
+          == iom::cuda_detail::AllocationClass::metadata_backing);
+    CHECK(allocation_probe.records[1].succeeded);
+    CHECK(allocation_probe.records[2].classification
+          == iom::cuda_detail::AllocationClass::metadata_backing);
+    CHECK(allocation_probe.records[2].kind
+          == iom::cuda_detail::AllocationKind::free);
+    CHECK(allocation_probe.records[3].classification
+          == iom::cuda_detail::AllocationClass::data_backing);
+    CHECK(allocation_probe.records[3].kind
+          == iom::cuda_detail::AllocationKind::free);
 }
 
 TEST_CASE("CUDA factory dismisses the primary-context guard on success") {
@@ -406,8 +504,8 @@ TEST_CASE("CUDA factory dismisses the primary-context guard on success") {
     calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     REQUIRE(device != nullptr);
     CHECK(probe.release_count == 0);
 
@@ -430,8 +528,8 @@ void require_cuda_hardware() {
 
 TEST_CASE("CUDA host transfers on independent threads do not share a stream") {
     require_cuda_hardware();
-    CudaAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{2048, 2048}}, iom::DataType::F32};
     auto tensor_a = device->create_tensor(spec);
@@ -490,8 +588,8 @@ TEST_CASE(
         "CUDA host transfers from multiple queues on one device share the "
         "transfer-stream pool") {
     require_cuda_hardware();
-    CudaAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
     auto tensor_a = device->create_tensor(spec);
@@ -550,8 +648,8 @@ TEST_CASE(
 
 TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
     require_cuda_hardware();
-    CudaAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
     auto tensor = device->create_tensor(spec);
@@ -580,8 +678,8 @@ TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
 
 TEST_CASE("CUDA poisoned Scope drops its stream from the pool") {
     require_cuda_hardware();
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::cuda_detail::TransferStreamPool pool;
     {
         auto scope = pool.acquire();
@@ -597,8 +695,8 @@ TEST_CASE("CUDA poisoned Scope drops its stream from the pool") {
 
 TEST_CASE("CUDA staging pool preserves accounting across allocation failures") {
     require_cuda_hardware();
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::cuda_detail::StagingSlotPool pool;
 
     CHECK_THROWS_AS(
@@ -669,8 +767,8 @@ TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {
     calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     REQUIRE(device != nullptr);
     CHECK(probe.init_count == 1);
     CHECK(probe.device_get_count_count == 1);
@@ -689,8 +787,8 @@ TEST_CASE("CUDA event ring reuses events and enforces bounded capacity") {
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
@@ -736,8 +834,8 @@ TEST_CASE("CUDA event ring consumes create faults before allocating") {
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
@@ -756,8 +854,8 @@ TEST_CASE("CUDA event ring releases attached metadata when retired") {
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
@@ -798,8 +896,8 @@ TEST_CASE("CUDA event ring fences are pending until own completion") {
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
@@ -840,8 +938,8 @@ TEST_CASE("CUDA double-fault retirement protects metadata until covering drain")
     require_cuda_hardware();
     CUcontext context = nullptr;
     REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
             context);
     auto state = std::make_shared<iom::cuda_detail::EventRingState>(
@@ -895,14 +993,16 @@ TEST_CASE("CUDA create_tensor validates the spec before any context activation")
     calls.device_get = &counting_device_get;
     iom::cuda_detail::driver_calls = calls;
 
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    // Two 16x16 F32 tensors of 1024 bytes each fit a 2048-byte arena
+    // exactly; a third request exposes arena exhaustion.
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{2048});
     REQUIRE(device != nullptr);
     const std::size_t activation_count = probe.ctx_set_current_count;
 
     // Rank and dimension violations are rejected by TensorShape before
-    // create_tensor is reached, with no driver interaction and no
-    // allocator allocation.
+    // create_tensor is reached, with no driver interaction and no arena
+    // activity.
     try {
         (void)iom::TensorSpec{
                 iom::TensorShape{{16}}, iom::DataType::F32};
@@ -916,12 +1016,10 @@ TEST_CASE("CUDA create_tensor validates the spec before any context activation")
     } catch (const std::invalid_argument&) {
     }
     CHECK(probe.ctx_set_current_count == activation_count);
-    CHECK(allocator.allocations == 0);
 
     // Grouped quantization is rejected by the base Tensor ctor's spec
     // validation with the same error the ctor produces today, while the
-    // driver-call probe records zero context-set calls and the allocator
-    // never runs.
+    // driver-call probe records zero context-set calls.
     const iom::TensorSpec invalid_spec{
             iom::TensorShape{{16, 16}}, iom::DataType::F32,
             iom::QuantizationFormat::INT8_SYMMETRIC};
@@ -935,30 +1033,40 @@ TEST_CASE("CUDA create_tensor validates the spec before any context activation")
         FAIL("create_tensor threw an unexpected exception type");
     }
     CHECK(probe.ctx_set_current_count == activation_count);
-    CHECK(allocator.allocations == 0);
 
-    // A valid spec activates the runtime exactly once, at allocation time,
-    // through the CudaTensor ctor's pre_allocate callback; the allocator's
-    // nullptr return then surfaces as bad_alloc before any storage exists.
-    const iom::TensorSpec valid_spec{
-            iom::TensorShape{{16, 16}}, iom::DataType::F32};
-    CHECK_THROWS_AS(
-            (void)device->create_tensor(valid_spec), std::bad_alloc);
+    // A valid spec activates the runtime exactly once for its setup work;
+    // storage suballocates from the data arena.
+    auto first = device->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{16, 16}}, iom::DataType::F32});
+    REQUIRE(first != nullptr);
     CHECK(probe.ctx_set_current_count == activation_count + 1);
-    CHECK(allocator.allocations == 1);
-    CHECK(allocator.frees == 0);
+
+    auto second = device->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{16, 16}}, iom::DataType::F32});
+    REQUIRE(second != nullptr);
+    CHECK(probe.ctx_set_current_count == activation_count + 2);
+
+    // Arena exhaustion is reported before any native interaction: the
+    // failed request never reaches the activation callback.
+    CHECK_THROWS_AS(
+            (void)device->create_tensor(
+                    iom::TensorSpec{
+                            iom::TensorShape{{16, 16}}, iom::DataType::F32}),
+            std::bad_alloc);
+    CHECK(probe.ctx_set_current_count == activation_count + 2);
 }
 
 TEST_CASE(
-        "CUDA native allocation seam observes hidden staging and metadata "
-        "boundaries without caller tensor traffic") {
+        "CUDA native allocation seam observes exactly two setup backings and "
+        "post-publication staging and metadata boundaries") {
     require_cuda_hardware();
     AllocationCallsRestore restore;
     AllocationProbe probe;
     active_allocation_probe = &probe;
     iom::cuda_detail::allocation_observer.complete = &capture_allocation;
 
-    CudaAllocator allocator;
     const iom::TensorSpec staging_spec{
             iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
     // The queue binary path always backs its metadata in a device-side
@@ -966,8 +1074,11 @@ TEST_CASE(
     // rank-four tensor reliably forces the hidden native allocation.
     const iom::TensorSpec binary_spec{
             iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+    iom::cuda_detail::AllocationRecord data_backing;
+    iom::cuda_detail::AllocationRecord metadata_backing;
     {
-        auto device = iom::make_cuda_device(0, allocator);
+        auto device = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
         REQUIRE(device != nullptr);
         auto staging_tensor = device->create_tensor(staging_spec);
         auto lhs = device->create_tensor(binary_spec);
@@ -976,10 +1087,52 @@ TEST_CASE(
         auto queue = device->create_ops();
         REQUIRE(queue != nullptr);
 
-        // Caller-Allocator tensor traffic (cudaMalloc runtime API) plus
-        // factory, tensor, and queue setup never route through the seam:
-        // the IOM-native record starts empty.
-        CHECK(probe.records.empty());
+        // Factory setup produced exactly two instrumented backing
+        // allocations; tensor and queue creation suballocate and never
+        // route through the seam.
+        std::vector<iom::cuda_detail::AllocationRecord> setup_allocations;
+        for (const auto& record : probe.records) {
+            if (record.phase == iom::cuda_detail::AllocationPhase::setup
+                    && record.kind
+                            == iom::cuda_detail::AllocationKind::allocate) {
+                setup_allocations.push_back(record);
+            }
+        }
+        REQUIRE_EQ(setup_allocations.size(), 2u);
+        CHECK_EQ(probe.records.size(), 2u);
+        std::size_t data_count = 0;
+        std::size_t metadata_count = 0;
+        for (const auto& record : setup_allocations) {
+            CHECK(record.succeeded);
+            CHECK(record.address != nullptr);
+            CHECK(reinterpret_cast<std::uintptr_t>(record.address) % 32 == 0);
+            if (record.classification
+                == iom::cuda_detail::AllocationClass::data_backing) {
+                ++data_count;
+                data_backing = record;
+            }
+            if (record.classification
+                == iom::cuda_detail::AllocationClass::metadata_backing) {
+                ++metadata_count;
+                metadata_backing = record;
+            }
+        }
+        CHECK_EQ(data_count, 1u);
+        CHECK_EQ(metadata_count, 1u);
+        CHECK_EQ(data_backing.bytes, kArenaBytes);
+        CHECK_EQ(metadata_backing.bytes, 4 * 16 * 512u);
+
+        // Disjoint data and metadata domains.
+        const std::uintptr_t data_begin =
+                reinterpret_cast<std::uintptr_t>(data_backing.address);
+        const std::uintptr_t data_end = data_begin + data_backing.bytes;
+        const std::uintptr_t metadata_begin =
+                reinterpret_cast<std::uintptr_t>(metadata_backing.address);
+        const std::uintptr_t metadata_end =
+                metadata_begin + metadata_backing.bytes;
+        const bool domains_disjoint =
+                data_end <= metadata_begin || metadata_end <= data_begin;
+        CHECK(domains_disjoint);
 
         std::vector<std::byte> input(
                 staging_spec.logical_nbytes(), std::byte{0x5a});
@@ -989,21 +1142,21 @@ TEST_CASE(
                 queue->add(lhs->view(), rhs->view(), out->view());
         REQUIRE(iom::oid_is_token(token));
         queue->wait(token);
-    }  // queue and device teardown free the pooled metadata and staging
+    }  // queue and device teardown free the pooled metadata, staging, and
+       // the two arena backings
 
     std::size_t staging_allocations = 0;
     std::size_t metadata_allocations = 0;
     std::size_t failed = 0;
     std::map<void*, std::size_t> outstanding;
+    // Seed with the two setup backings so their post-publication teardown
+    // frees pair up with the reservation that created them.
+    outstanding[data_backing.address] = data_backing.bytes;
+    outstanding[metadata_backing.address] = metadata_backing.bytes;
     for (const auto& record : probe.records) {
-        CHECK(record.phase
-              == iom::cuda_detail::AllocationPhase::post_publication);
-        CHECK_FALSE(
-                record.classification
-                == iom::cuda_detail::AllocationClass::data_backing);
-        CHECK_FALSE(
-                record.classification
-                == iom::cuda_detail::AllocationClass::metadata_backing);
+        if (record.phase == iom::cuda_detail::AllocationPhase::setup) {
+            continue;
+        }
         if (record.kind == iom::cuda_detail::AllocationKind::allocate) {
             if (!record.succeeded) {
                 ++failed;
@@ -1033,17 +1186,53 @@ TEST_CASE(
 }
 
 TEST_CASE(
-        "CUDA native allocation seam retains failed attempts and cleanup "
-        "frees") {
+        "CUDA tensor create and destroy after setup make no native "
+        "allocation or free calls") {
     require_cuda_hardware();
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+
     AllocationCallsRestore restore;
     AllocationProbe probe;
     active_allocation_probe = &probe;
     iom::cuda_detail::allocation_observer.complete = &capture_allocation;
 
-    UnusedAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::U8};
+    const void* first_address = nullptr;
+    {
+        auto first = device->create_tensor(spec);
+        first_address = first->view().native_handle();
+        CHECK(first_address != nullptr);
+    }
+    {
+        // The destroyed tensor's range is legally reusable by the arena
+        // (best-fit of the same size lands on the same block), so no
+        // address inequality is asserted; the no-churn point is that the
+        // create/destroy cycle performs zero native calls.
+        auto second = device->create_tensor(spec);
+        CHECK(second->view().native_handle() != nullptr);
+        auto third = device->create_tensor(spec);
+        CHECK(third->view().native_handle() != nullptr);
+    }
+    CHECK(probe.records.empty());
+}
+
+TEST_CASE(
+        "CUDA native allocation seam retains failed attempts and cleanup "
+        "frees") {
+    require_cuda_hardware();
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     REQUIRE(device != nullptr);
+
+    // Arm the seam after setup so the record covers only pool traffic: the
+    // two setup backing reservations must not pollute this scenario.
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
 
     iom::cuda_detail::StagingSlotPool pool;
 
@@ -1091,4 +1280,274 @@ TEST_CASE(
     CHECK_EQ(successful_allocations, 1u);
     CHECK_EQ(cleanup_frees, 1u);
     CHECK(outstanding.empty());
+}
+
+namespace {
+
+struct BackingProbe {
+    iom::cuda_detail::AllocationRecord data;
+    iom::cuda_detail::AllocationRecord metadata;
+};
+
+// Creates a device with the given memory/queue configuration and returns
+// the two classified setup backing records.
+[[nodiscard]] BackingProbe probe_setup_backings(
+        std::size_t arena_bytes, iom::QueueConfig queue_config) {
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{arena_bytes}, queue_config);
+    REQUIRE(device != nullptr);
+
+    BackingProbe result;
+    std::size_t data_count = 0;
+    std::size_t metadata_count = 0;
+    for (const auto& record : probe.records) {
+        if (record.phase != iom::cuda_detail::AllocationPhase::setup
+                || record.kind
+                        != iom::cuda_detail::AllocationKind::allocate) {
+            continue;
+        }
+        REQUIRE(record.succeeded);
+        if (record.classification
+            == iom::cuda_detail::AllocationClass::data_backing) {
+            result.data = record;
+            ++data_count;
+        }
+        if (record.classification
+            == iom::cuda_detail::AllocationClass::metadata_backing) {
+            result.metadata = record;
+            ++metadata_count;
+        }
+    }
+    REQUIRE_EQ(data_count, 1u);
+    REQUIRE_EQ(metadata_count, 1u);
+    return result;
+}
+
+void require_disjoint_domains(
+        const iom::cuda_detail::AllocationRecord& data,
+        const iom::cuda_detail::AllocationRecord& metadata) {
+    const std::uintptr_t data_begin =
+            reinterpret_cast<std::uintptr_t>(data.address);
+    const std::uintptr_t data_end = data_begin + data.bytes;
+    const std::uintptr_t metadata_begin =
+            reinterpret_cast<std::uintptr_t>(metadata.address);
+    const std::uintptr_t metadata_end = metadata_begin + metadata.bytes;
+    const bool domains_disjoint =
+            data_end <= metadata_begin || metadata_end <= data_begin;
+    CHECK(domains_disjoint);
+    CHECK(reinterpret_cast<std::uintptr_t>(data.address) % 32 == 0);
+    CHECK(reinterpret_cast<std::uintptr_t>(metadata.address) % 32 == 0);
+}
+
+}  // namespace
+
+TEST_CASE(
+        "CUDA factory setups reserve exactly two backings for default and "
+        "custom C") {
+    require_cuda_hardware();
+
+    {
+        const BackingProbe backing = probe_setup_backings(
+                kArenaBytes, iom::QueueConfig{});
+        CHECK_EQ(backing.data.bytes, kArenaBytes);
+        CHECK_EQ(backing.metadata.bytes, 4 * 16 * 512u);
+        require_disjoint_domains(backing.data, backing.metadata);
+    }
+    {
+        const BackingProbe backing = probe_setup_backings(
+                kArenaBytes, iom::QueueConfig{1});
+        CHECK_EQ(backing.data.bytes, kArenaBytes);
+        CHECK_EQ(backing.metadata.bytes, 4 * 1 * 512u);
+        require_disjoint_domains(backing.data, backing.metadata);
+    }
+    {
+        const BackingProbe backing = probe_setup_backings(
+                kArenaBytes, iom::QueueConfig{17});
+        CHECK_EQ(backing.data.bytes, kArenaBytes);
+        CHECK_EQ(backing.metadata.bytes, 4 * 17 * 512u);
+        require_disjoint_domains(backing.data, backing.metadata);
+    }
+}
+
+TEST_CASE("CUDA factory rejects invalid configurations before publication") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    int device_count = 0;
+    REQUIRE(cuDeviceGetCount(&device_count) == CUDA_SUCCESS);
+    REQUIRE(device_count > 0);
+
+    CHECK_THROWS_AS(iom::QueueConfig{0}, std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::make_cuda_device(
+                    0, iom::DeviceMemoryConfig{0}),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::make_cuda_device(
+                    0, iom::DeviceMemoryConfig{16}),
+            std::invalid_argument);
+
+    // 4 * C * 512 overflows size_t for this capacity.
+    CHECK_THROWS_AS(
+            (void)iom::make_cuda_device(
+                    0, iom::DeviceMemoryConfig{kArenaBytes},
+                    iom::QueueConfig{std::numeric_limits<std::size_t>::max()
+                                     / 2048 + 1}),
+            std::overflow_error);
+}
+
+TEST_CASE(
+        "CUDA tensor storage stays inside the disjoint data arena and is "
+        "32-byte aligned") {
+    require_cuda_hardware();
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+
+    const std::uintptr_t data_base = [&] {
+        for (const auto& record : probe.records) {
+            if (record.phase == iom::cuda_detail::AllocationPhase::setup
+                    && record.classification
+                            == iom::cuda_detail::AllocationClass::data_backing) {
+                return reinterpret_cast<std::uintptr_t>(record.address);
+            }
+        }
+        FAIL("no data backing record");
+        return std::uintptr_t{0};
+    }();
+    const std::uintptr_t data_end = data_base + kArenaBytes;
+
+    const iom::TensorSpec sizes[] = {
+            iom::TensorSpec{iom::TensorShape{{16, 16}}, iom::DataType::U8},
+            iom::TensorSpec{iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::U8},
+            iom::TensorSpec{iom::TensorShape{{16, 16}}, iom::DataType::F32},
+    };
+    for (const iom::TensorSpec& spec : sizes) {
+        auto tensor = device->create_tensor(spec);
+        REQUIRE(tensor != nullptr);
+        const std::uintptr_t address =
+                reinterpret_cast<std::uintptr_t>(
+                        tensor->view().native_handle());
+        CHECK(address % 32 == 0);
+        CHECK(address >= data_base);
+        CHECK(address < data_end);
+        // The requested storage never crosses the arena boundary.
+        CHECK(address + spec.tiled_storage_nbytes() <= data_end);
+    }
+}
+
+TEST_CASE(
+        "CUDA data arena fragments, reuses, and coalesces with stable live "
+        "addresses") {
+    require_cuda_hardware();
+    // 2048 bytes: two 512-byte blocks and one 1024-byte block fill it.
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{2048});
+    REQUIRE(device != nullptr);
+
+    const iom::TensorSpec half{
+            iom::TensorShape{{16, 16}}, iom::DataType::U16};
+    const iom::TensorSpec full{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    const iom::TensorSpec one_and_half{
+            iom::TensorShape{{3, 2, 16, 16}}, iom::DataType::U8};
+
+    auto a = device->create_tensor(half);  // offset 0, 512 bytes
+    auto b = device->create_tensor(half);  // offset 512, 512 bytes
+    auto c = device->create_tensor(full);  // offset 1024, 1024 bytes
+    const std::uintptr_t a_address =
+            reinterpret_cast<std::uintptr_t>(a->view().native_handle());
+    const std::uintptr_t c_address =
+            reinterpret_cast<std::uintptr_t>(c->view().native_handle());
+
+    // Fragmentation: freeing a and c leaves 1536 aggregate free bytes split
+    // into 512 + 1024, so a 1536-byte contiguous request must fail even
+    // though the total free space is sufficient.
+    a.reset();
+    c.reset();
+    CHECK_THROWS_AS((void)device->create_tensor(one_and_half), std::bad_alloc);
+
+    // The live 512-byte tensor keeps its exact address.
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  b->view().native_handle())
+          == a_address + 512);
+
+    // Best-fit reuse: a 1024-byte request lands exactly on the freed
+    // 1024-byte block.
+    auto reused = device->create_tensor(full);
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  reused->view().native_handle())
+          == c_address);
+
+    // Coalescing: freeing the surviving middle block merges all three
+    // ranges back into one contiguous 2048-byte block.
+    b.reset();
+    reused.reset();
+    auto whole = device->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{4, 2, 16, 16}}, iom::DataType::U8});
+    REQUIRE(whole != nullptr);
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  whole->view().native_handle())
+          == a_address);
+}
+
+TEST_CASE("CUDA concurrent tensor bookkeeping is race-free and in-arena") {
+    require_cuda_hardware();
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{256 * 1024});
+    REQUIRE(device != nullptr);
+
+    constexpr int kThreads = 8;
+    constexpr int kIterations = 50;
+    const iom::TensorSpec small{
+            iom::TensorShape{{16, 16}}, iom::DataType::U8};
+    const iom::TensorSpec large{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    std::atomic<bool> failed = false;
+    std::barrier start_gate(kThreads + 1);
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int worker = 0; worker < kThreads; ++worker) {
+        threads.emplace_back([&, worker] {
+            try {
+                start_gate.arrive_and_wait();
+                for (int iteration = 0; iteration < kIterations; ++iteration) {
+                    auto first = device->create_tensor(small);
+                    auto second = device->create_tensor(large);
+                    auto third = device->create_tensor(small);
+                    if (reinterpret_cast<std::uintptr_t>(
+                                first->view().native_handle())
+                                    % 32
+                            != 0
+                            || reinterpret_cast<std::uintptr_t>(
+                                       second->view().native_handle())
+                                    % 32
+                                    != 0) {
+                        failed.store(true, std::memory_order_release);
+                    }
+                    third.reset();
+                    auto fourth = device->create_tensor(large);
+                    (void)fourth;
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_release);
+            }
+        });
+    }
+    start_gate.arrive_and_wait();
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    CHECK_FALSE(failed.load(std::memory_order_acquire));
 }

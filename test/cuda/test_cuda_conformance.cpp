@@ -62,123 +62,23 @@ private:
     std::size_t traffic_ = 0;
 };
 
-
-class CudaAllocator final : public iom::Allocator {
-public:
-    explicit CudaAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
-
-    void* alloc(std::size_t size) override {
-        CHECK_MESSAGE(
-                !gate_.armed(),
-                "tensor storage allocated inside a transfer, transform, or operation");
-        void* pointer = nullptr;
-        REQUIRE(cudaMalloc(&pointer, size) == cudaSuccess);
-        live_.insert(pointer);
-        ++traffic_;
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        CHECK_MESSAGE(
-                !gate_.armed(),
-                "tensor storage freed inside a transfer, transform, or operation");
-        const auto found = live_.find(buffer);
-        REQUIRE_MESSAGE(
-                found != live_.end(),
-                "allocator freed an address it never handed out");
-        live_.erase(found);
-        ++traffic_;
-        REQUIRE(cudaFree(buffer) == cudaSuccess);
-    }
-
-    void reset() override { ++traffic_; }
-
-private:
-    const iom_conformance::TrafficGate& gate_;
-    std::unordered_set<void*> live_;
-    std::size_t traffic_ = 0;
-};
-class ReusingCudaAllocator final : public iom::Allocator {
-public:
-    ~ReusingCudaAllocator() override {
-        for (const Slot& slot : free_) {
-            (void)cudaFree(slot.pointer);
-        }
-        for (const auto& [pointer, size] : live_) {
-            (void)size;
-            (void)cudaFree(pointer);
-        }
-    }
-
-    void* alloc(std::size_t size) override {
-        for (auto it = free_.begin(); it != free_.end(); ++it) {
-            if (it->size != size) {
-                continue;
-            }
-            void* pointer = it->pointer;
-            live_.emplace(pointer, size);
-            free_.erase(it);
-            return pointer;
-        }
-
-        void* pointer = nullptr;
-        if (cudaMalloc(&pointer, size) != cudaSuccess) {
-            throw std::bad_alloc();
-        }
-        try {
-            live_.emplace(pointer, size);
-        } catch (...) {
-            (void)cudaFree(pointer);
-            throw;
-        }
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        const auto found = live_.find(buffer);
-        if (found == live_.end()) {
-            throw std::runtime_error(
-                    "CUDA reuse allocator received an unknown address");
-        }
-        free_.push_back({buffer, found->second});
-        live_.erase(found);
-    }
-
-    void reset() override {}
-
-    void release_free() noexcept {
-        for (const Slot& slot : free_) {
-            (void)cudaFree(slot.pointer);
-        }
-        free_.clear();
-    }
-
-    [[nodiscard]] std::size_t free_count() const noexcept {
-        return free_.size();
-    }
-
-private:
-    struct Slot {
-        void* pointer;
-        std::size_t size;
-    };
-
-    std::vector<Slot> free_;
-    std::unordered_map<void*, std::size_t> live_;
-};
-
+// Every standard-GPU conformance fixture reserves this tensor-data arena:
+// the largest concurrent set is three 8192x4096 F32 tensors plus one
+// quarantined operand (512 MiB), and the fixture also keeps a foreign
+// device alive with the same budget.
+constexpr std::size_t kConformanceArenaBytes = 640u * 1024 * 1024;
 
 struct CudaDevices {
     iom_conformance::TrafficGate gate;
     HostAllocator reference_allocator{gate};
-    CudaAllocator candidate_allocator{gate};
-    CudaAllocator foreign_allocator{gate};
     std::unique_ptr<iom::Device> reference =
             iom::make_cpu_device(reference_allocator);
     std::unique_ptr<iom::Device> candidate =
-            iom::make_cuda_device(0, candidate_allocator);
+            iom::make_cuda_device(
+                    0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     std::unique_ptr<iom::Device> foreign =
-            iom::make_cuda_device(0, foreign_allocator);
+            iom::make_cuda_device(
+                    0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
 
     [[nodiscard]] iom_conformance::ConformanceDevices conformance() const {
         return {*reference, *candidate, *foreign};
@@ -219,9 +119,9 @@ public:
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     iom_conformance::TrafficGate gate;
-    CudaAllocator allocator(gate);
     const std::unique_ptr<iom::Device> candidate =
-            iom::make_cuda_device(0, allocator);
+            iom::make_cuda_device(
+                    0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::require_standard_capabilities(
             candidate->supported_data_types());
 }
@@ -484,11 +384,12 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::none);
 
-    // Failed work remains quarantined until device teardown; the allocator
-    // must not recycle either operand while its failed entries are retained.
+    // Failed work remains quarantined until device teardown; the data
+    // arena must not recycle either operand while its failed entries are
+    // retained.
     {
-        ReusingCudaAllocator allocator;
-        auto device = iom::make_cuda_device(0, allocator);
+        auto device = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
         auto canary_source = device->create_tensor(spec);
         auto canary_destination = device->create_tensor(spec);
         const std::vector<std::byte> storage_canary(
@@ -532,10 +433,7 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
         fresh_source.reset();
         fresh_destination.reset();
         canary_queue.reset();
-        allocator.release_free();
-        CHECK_EQ(allocator.free_count(), 0);
         device.reset();
-        CHECK_EQ(allocator.free_count(), 2);
     }
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::none);
@@ -544,8 +442,8 @@ TEST_CASE("CUDA submission remains transactional across post-enqueue failures") 
 TEST_CASE("CUDA queue destruction fences pending copies") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     iom_conformance::TrafficGate gate;
-    CudaAllocator allocator(gate);
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
     auto source = device->create_tensor(spec);
@@ -582,10 +480,10 @@ TEST_CASE("CUDA pre-wait source destruction keeps storage until completion") {
     // host destroys the source; the assertions below hold under every
     // worker/interleaving outcome: the copy completes from storage that was
     // either quarantined or released only after its event fired, so waiting
-    // the token always yields correct destination bytes and the allocator
-    // never sees a double free. The deterministic quarantine/no-reuse
-    // contract is pinned by the ring smoke tests and by the
-    // queue-teardown case below.
+    // the token always yields correct destination bytes and the data arena
+    // never releases the range early. The deterministic quarantine/no-reuse
+    // contract is pinned by the ring smoke tests and by the queue-teardown
+    // case below.
     const iom::TensorSpec spec{
             iom::TensorShape{{8192, 4096}}, iom::DataType::F32};
     const std::vector<std::byte> expected =
@@ -593,8 +491,8 @@ TEST_CASE("CUDA pre-wait source destruction keeps storage until completion") {
     const std::vector<std::byte> empty(
             spec.tiled_storage_nbytes(), std::byte{0});
 
-    ReusingCudaAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     CudaStorageOracle oracle;
     auto source = device->create_tensor(spec);
     auto destination = device->create_tensor(spec);
@@ -608,11 +506,19 @@ TEST_CASE("CUDA pre-wait source destruction keeps storage until completion") {
 
     // Destroy the source before any explicit wait. The registry fence never
     // reports success while the recorded event is pending, so the source
-    // block is either quarantined or released only after the copy finished
-    // reading it; in both cases the fresh allocation is safe and the copy
-    // still produces the expected bytes.
+    // range is either quarantined or released only after the copy proved
+    // completion and the worker retired its entries; on a fast-enough
+    // device the copy completes first and the proved-safe range is legally
+    // reused by the arena. In both cases the fresh allocation is safe, the
+    // copy still produces the expected bytes, and the deterministic
+    // quarantine/no-reuse contract is pinned by the ring smoke tests, the
+    // injected-launch-failure case, and the queue-teardown case below.
     source.reset();
     auto fresh = device->create_tensor(spec);
+    REQUIRE(fresh != nullptr);
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  fresh->view().native_handle())
+          % 32 == 0);
 
     CHECK_NOTHROW(queue->wait(token));
     oracle.set_owner_spec(spec);
@@ -621,8 +527,6 @@ TEST_CASE("CUDA pre-wait source destruction keeps storage until completion") {
     fresh.reset();
     queue.reset();
     destination.reset();
-    allocator.release_free();
-    CHECK_EQ(allocator.free_count(), 0);
     device.reset();
 }
 
@@ -635,8 +539,8 @@ TEST_CASE("CUDA shared-operand copies release storage after both complete") {
     const std::vector<std::byte> empty(
             spec.tiled_storage_nbytes(), std::byte{0});
 
-    ReusingCudaAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     CudaStorageOracle oracle;
     auto source = device->create_tensor(spec);
     auto first_destination = device->create_tensor(spec);
@@ -671,8 +575,6 @@ TEST_CASE("CUDA shared-operand copies release storage after both complete") {
     queue.reset();
     first_destination.reset();
     second_destination.reset();
-    allocator.release_free();
-    CHECK_EQ(allocator.free_count(), 0);
     device.reset();
 }
 
@@ -680,14 +582,14 @@ TEST_CASE("CUDA operands destroyed after queue teardown remain quarantined") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     // Queue destruction invalidates every outstanding registry entry up
     // front, so the operand fences provably report failure when the operands
-    // are destroyed afterwards: the reusing allocator cannot recycle either
-    // block until device teardown, deterministically, with no timing
-    // dependence on the worker or the GPU.
+    // are destroyed afterwards: the data arena cannot recycle either range
+    // until device teardown, deterministically, with no timing dependence on
+    // the worker or the GPU.
     const iom::TensorSpec spec{
             iom::TensorShape{{4096, 2048}}, iom::DataType::F32};
 
-    ReusingCudaAllocator allocator;
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     auto source = device->create_tensor(spec);
     auto destination = device->create_tensor(spec);
     {
@@ -708,21 +610,17 @@ TEST_CASE("CUDA operands destroyed after queue teardown remain quarantined") {
     CHECK_NE(fresh_source->view().native_handle(), destination_address);
     CHECK_NE(fresh_destination->view().native_handle(), source_address);
     CHECK_NE(fresh_destination->view().native_handle(), destination_address);
-    CHECK_EQ(allocator.free_count(), 0);
 
     fresh_source.reset();
     fresh_destination.reset();
-    allocator.release_free();
-    CHECK_EQ(allocator.free_count(), 0);
     device.reset();
-    CHECK_EQ(allocator.free_count(), 2);
 }
 
 TEST_CASE("CUDA conformance: rank boundary covers rank-eight owners and rejects rank nine") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     iom_conformance::TrafficGate gate;
-    CudaAllocator allocator(gate);
-    auto device = iom::make_cuda_device(0, allocator);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     CudaStorageOracle oracle;
     const std::vector<std::vector<std::size_t>> shapes = {
             {2, 2, 2, 2, 2, 2, 16, 16},

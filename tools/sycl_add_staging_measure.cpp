@@ -30,34 +30,25 @@ constexpr std::size_t kWarmup = 10;
 constexpr std::size_t kDefaultIterations = 100;
 constexpr std::size_t kBudget = 1ULL << 30;
 
-struct Allocator final : iom::Allocator {
-    void bind(const sycl::context& context) {
-        context_ = context;
-        devices_ = context.get_devices();
-    }
-    void* alloc(std::size_t bytes) override {
-        if (!context_ || devices_.empty()) throw std::bad_alloc();
-        void* result = sycl::malloc_shared(bytes, devices_.front(), *context_);
-        if (result == nullptr) throw std::bad_alloc();
-        return result;
-    }
-    void free(void* pointer) override {
-        if (pointer != nullptr && context_) sycl::free(pointer, *context_);
-    }
-    void reset() override {}
-    std::optional<sycl::context> context_;
-    std::vector<sycl::device> devices_;
-};
+// The harness observes the device's private context through the factory's
+// context_ready seam so allocation measurement runs in the exact arena
+// context; tensor data itself suballocates the fixed device arena.
+std::optional<sycl::context> active_context;
 
-Allocator* active_allocator = nullptr;
 void capture_context(const sycl::context& context) {
-    if (active_allocator == nullptr) throw std::logic_error("allocator callback is not installed");
-    active_allocator->bind(context);
+    active_context = context;
 }
 
 struct ContextRestore {
     iom::sycl_detail::ContextCalls saved;
-    ~ContextRestore() { iom::sycl_detail::context_calls = saved; }
+    std::optional<sycl::context> saved_context;
+    ContextRestore()
+            : saved(iom::sycl_detail::context_calls),
+              saved_context(active_context) {}
+    ~ContextRestore() {
+        iom::sycl_detail::context_calls = saved;
+        active_context = saved_context;
+    }
 };
 
 double seconds(Clock::duration duration) {
@@ -264,8 +255,6 @@ int main(int argc, char** argv) {
         iterations = std::max<std::size_t>(100, std::strtoull(argv[2], nullptr, 10));
     if (argc != 1 && argc != 3) return 2;
     ContextRestore restore;
-    Allocator allocator;
-    active_allocator = &allocator;
     iom::sycl_detail::context_calls.context_ready = &capture_context;
     const sycl::device selected(sycl::gpu_selector_v);
     if (selected.get_backend() != sycl::backend::ext_oneapi_level_zero)
@@ -275,7 +264,14 @@ int main(int argc, char** argv) {
               << selected.get_info<sycl::info::device::name>()
               << " driver=" << selected.get_info<sycl::info::device::driver_version>()
               << " compiler=" << __VERSION__ << " iterations_minimum=100\n";
-    auto device = iom::make_sycl_device(0, allocator);
+    // The tensor data arena reserves the declared budget; metadata is
+    // additional checked 4 * C * 512 bytes.
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kBudget}, iom::QueueConfig{});
+    if (!active_context.has_value()) {
+        throw std::logic_error("factory did not deliver the device context");
+    }
+    const sycl::context& context = *active_context;
     auto ops = device->create_ops();
     sycl::queue independent(selected);
     for (const auto& [type, shape] : std::vector<std::pair<iom::DataType, std::vector<std::size_t>>>{
@@ -284,7 +280,7 @@ int main(int argc, char** argv) {
              {iom::DataType::BF16, {1, 1024, 1024}},
              {iom::DataType::F32, {1, 1024, 1024}},
              {iom::DataType::I64, {2, 33, 65}}}) {
-        print_result(measure(*device, *ops, independent, allocator.context_.value(),
+        print_result(measure(*device, *ops, independent, context,
                              selected, type, shape, iterations));
     }
 }

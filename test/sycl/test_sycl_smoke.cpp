@@ -3,17 +3,20 @@
 #include <sycl/sycl.hpp>
 #include <algorithm>
 
+#include <atomic>
+#include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
-#include "iom/alloc.hpp"
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/sycl/device.hpp"
@@ -23,57 +26,10 @@
 
 namespace {
 
-class UnusedAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t) override {
-        ++allocations;
-        return nullptr;
-    }
-
-    void free(void*) override { ++frees; }
-
-    void reset() override { ++resets; }
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-    std::size_t resets = 0;
-};
-class SyclAllocator final : public iom::Allocator {
-public:
-    void bind_context(const sycl::context& context) {
-        context_ = context;
-        const std::vector<sycl::device> devices = context.get_devices();
-        REQUIRE(!devices.empty());
-        device_ = devices.front();
-    }
-
-    void* alloc(std::size_t size) override {
-        REQUIRE(context_.has_value());
-        void* pointer = sycl::malloc_shared(size, device_, *context_);
-        if (pointer == nullptr) {
-            throw std::bad_alloc();
-        }
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        REQUIRE(context_.has_value());
-        sycl::free(buffer, *context_);
-    }
-
-    void reset() override {}
-
-private:
-    std::optional<sycl::context> context_;
-    sycl::device device_;
-};
-
-SyclAllocator* active_allocator = nullptr;
-
-void capture_context(const sycl::context& context) {
-    REQUIRE(active_allocator != nullptr);
-    active_allocator->bind_context(context);
-}
+// Standard arena capacity for smoke tests: 64 MiB covers every live tensor
+// set below (the largest tensor set is two 1024x1024 F32 staging tensors,
+// two 2x32x32x64 F32 exercise tensors, and three binary operands).
+constexpr std::size_t kArenaBytes = 64u * 1024 * 1024;
 
 struct LaunchProbe {
     std::size_t launches = 0;
@@ -127,8 +83,7 @@ class ContextCallsRestore final {
 public:
     ContextCallsRestore()
             : saved_(iom::sycl_detail::context_calls),
-              saved_probe_(active_probe),
-              saved_allocator_(active_allocator) {}
+              saved_probe_(active_probe) {}
 
     ContextCallsRestore(const ContextCallsRestore&) = delete;
     ContextCallsRestore& operator=(const ContextCallsRestore&) = delete;
@@ -136,13 +91,11 @@ public:
     ~ContextCallsRestore() {
         iom::sycl_detail::context_calls = saved_;
         active_probe = saved_probe_;
-        active_allocator = saved_allocator_;
     }
 
 private:
     iom::sycl_detail::ContextCalls saved_;
     ContextProbe* saved_probe_;
-    SyclAllocator* saved_allocator_;
 };
 
 namespace {
@@ -217,16 +170,16 @@ TEST_CASE("SYCL factory enumerates real accelerator devices") {
     REQUIRE(runtime_count > 0);
     CHECK(iom::sycl_detail::eligible_device_count() == runtime_count);
 
-    UnusedAllocator allocator;
-    auto device = iom::make_sycl_device(0, allocator);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     REQUIRE(device != nullptr);
     CHECK(device->backend_kind() == iom::BackendKind::SYCL);
     CHECK(device->backend_device() == 0);
-    CHECK(allocator.allocations == 0);
 
     const iom::TensorSpec spec{
             iom::TensorShape{{16, 16}}, iom::DataType::F32};
-    CHECK_THROWS_AS((void)device->create_tensor(spec), std::bad_alloc);
+    auto tensor = device->create_tensor(spec);
+    REQUIRE(tensor != nullptr);
     auto queue = device->create_ops();
     CHECK(queue != nullptr);
 }
@@ -240,9 +193,9 @@ TEST_CASE("SYCL factory owns and tears down one context") {
     iom::sycl_detail::context_calls = {
             &count_context_created, &count_context_destroyed};
 
-    UnusedAllocator allocator;
     {
-        auto device = iom::make_sycl_device(0, allocator);
+        auto device = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
         REQUIRE(device != nullptr);
         CHECK(probe.created == 1);
         CHECK(probe.destroyed == 0);
@@ -261,12 +214,11 @@ TEST_CASE("SYCL factory rejects the first unavailable ordinal") {
     iom::sycl_detail::context_calls = {
             &count_context_created, &count_context_destroyed};
 
-    UnusedAllocator allocator;
     CHECK_THROWS_AS(
             (void)iom::make_sycl_device(
-                    static_cast<std::uint32_t>(device_count), allocator),
+                    static_cast<std::uint32_t>(device_count),
+                    iom::DeviceMemoryConfig{kArenaBytes}),
             std::invalid_argument);
-    CHECK(allocator.allocations == 0);
     CHECK(probe.created == 0);
     CHECK(probe.destroyed == 0);
 }
@@ -320,11 +272,8 @@ TEST_CASE("SYCL staging pool preserves accounting across allocation failures") {
 TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
     REQUIRE(eligible_device_count_from_runtime() > 0);
 
-    ContextCallsRestore context_restore;
-    SyclAllocator allocator;
-    active_allocator = &allocator;
-    iom::sycl_detail::context_calls.context_ready = &capture_context;
-    auto device = iom::make_sycl_device(0, allocator);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
     REQUIRE(device != nullptr);
     auto queue = device->create_ops();
     REQUIRE(queue != nullptr);
@@ -389,14 +338,9 @@ TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
 }
 
 TEST_CASE(
-        "SYCL native allocation seam observes metadata, staging, and "
-        "binary-fallback boundaries without caller tensor traffic") {
+        "SYCL native allocation seam observes exactly two setup backings and "
+        "metadata, staging, and binary-fallback boundaries") {
     REQUIRE(eligible_device_count_from_runtime() > 0);
-
-    ContextCallsRestore context_restore;
-    SyclAllocator allocator;
-    active_allocator = &allocator;
-    iom::sycl_detail::context_calls.context_ready = &capture_context;
 
     AllocationCallsRestore restore;
     AllocationProbe probe;
@@ -410,8 +354,11 @@ TEST_CASE(
     // one padded plane pair (2 x 1 KiB for F32).
     const iom::TensorSpec binary_spec{
             iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
+    iom::sycl_detail::AllocationRecord data_backing;
+    iom::sycl_detail::AllocationRecord metadata_backing;
     {
-        auto device = iom::make_sycl_device(0, allocator);
+        auto device = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes});
         REQUIRE(device != nullptr);
         auto staging_source = device->create_tensor(staging_spec);
         auto staging_destination = device->create_tensor(staging_spec);
@@ -421,10 +368,52 @@ TEST_CASE(
         auto queue = device->create_ops();
         REQUIRE(queue != nullptr);
 
-        // Caller-Allocator tensor traffic (malloc_shared USM) plus
-        // factory, tensor, and queue setup never route through the seam:
-        // the IOM-native record starts empty.
-        CHECK(probe.records.empty());
+        // Factory setup produced exactly two instrumented backing
+        // allocations; tensor and queue creation suballocate and never
+        // route through the seam.
+        std::vector<iom::sycl_detail::AllocationRecord> setup_allocations;
+        for (const auto& record : probe.records) {
+            if (record.phase == iom::sycl_detail::AllocationPhase::setup
+                    && record.kind
+                            == iom::sycl_detail::AllocationKind::allocate) {
+                setup_allocations.push_back(record);
+            }
+        }
+        REQUIRE_EQ(setup_allocations.size(), 2u);
+        CHECK_EQ(probe.records.size(), 2u);
+        std::size_t data_count = 0;
+        std::size_t metadata_count = 0;
+        for (const auto& record : setup_allocations) {
+            CHECK(record.succeeded);
+            CHECK(record.address != nullptr);
+            CHECK(reinterpret_cast<std::uintptr_t>(record.address) % 32 == 0);
+            if (record.classification
+                == iom::sycl_detail::AllocationClass::data_backing) {
+                ++data_count;
+                data_backing = record;
+            }
+            if (record.classification
+                == iom::sycl_detail::AllocationClass::metadata_backing) {
+                ++metadata_count;
+                metadata_backing = record;
+            }
+        }
+        CHECK_EQ(data_count, 1u);
+        CHECK_EQ(metadata_count, 1u);
+        CHECK_EQ(data_backing.bytes, kArenaBytes);
+        CHECK_EQ(metadata_backing.bytes, 4 * 16 * 512u);
+
+        // Disjoint data and metadata domains.
+        const std::uintptr_t data_begin =
+                reinterpret_cast<std::uintptr_t>(data_backing.address);
+        const std::uintptr_t data_end = data_begin + data_backing.bytes;
+        const std::uintptr_t metadata_begin =
+                reinterpret_cast<std::uintptr_t>(metadata_backing.address);
+        const std::uintptr_t metadata_end =
+                metadata_begin + metadata_backing.bytes;
+        const bool domains_disjoint =
+                data_end <= metadata_begin || metadata_end <= data_begin;
+        CHECK(domains_disjoint);
 
         std::vector<std::byte> input(
                 staging_spec.logical_nbytes(), std::byte{0x3c});
@@ -438,22 +427,22 @@ TEST_CASE(
                 queue->add(lhs->view(), rhs->view(), out->view());
         REQUIRE(iom::oid_is_token(binary_token));
         queue->wait(binary_token);
-    }  // queue and device teardown free the pooled metadata and staging
+    }  // queue and device teardown free the pooled metadata, staging, and
+       // the two arena backings
 
     std::size_t metadata_allocations = 0;
     std::size_t staging_allocations = 0;
     std::size_t staging_2048 = 0;
     std::size_t failed = 0;
     std::map<void*, std::size_t> outstanding;
+    // Seed with the two setup backings so their post-publication teardown
+    // frees pair up with the reservation that created them.
+    outstanding[data_backing.address] = data_backing.bytes;
+    outstanding[metadata_backing.address] = metadata_backing.bytes;
     for (const auto& record : probe.records) {
-        CHECK(record.phase
-              == iom::sycl_detail::AllocationPhase::post_publication);
-        CHECK_FALSE(
-                record.classification
-                == iom::sycl_detail::AllocationClass::data_backing);
-        CHECK_FALSE(
-                record.classification
-                == iom::sycl_detail::AllocationClass::metadata_backing);
+        if (record.phase == iom::sycl_detail::AllocationPhase::setup) {
+            continue;
+        }
         if (record.kind == iom::sycl_detail::AllocationKind::allocate) {
             if (!record.succeeded) {
                 ++failed;
@@ -544,4 +533,335 @@ TEST_CASE(
     CHECK_EQ(successful_allocations, 1u);
     CHECK_EQ(cleanup_frees, 1u);
     CHECK(outstanding.empty());
+}
+
+namespace {
+
+struct BackingProbe {
+    iom::sycl_detail::AllocationRecord data;
+    iom::sycl_detail::AllocationRecord metadata;
+};
+
+// Creates a device with the given memory/queue configuration and returns
+// the two classified setup backing records.
+[[nodiscard]] BackingProbe probe_setup_backings(
+        std::size_t arena_bytes, iom::QueueConfig queue_config) {
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{arena_bytes}, queue_config);
+    REQUIRE(device != nullptr);
+
+    BackingProbe result;
+    std::size_t data_count = 0;
+    std::size_t metadata_count = 0;
+    for (const auto& record : probe.records) {
+        if (record.phase != iom::sycl_detail::AllocationPhase::setup
+                || record.kind
+                        != iom::sycl_detail::AllocationKind::allocate) {
+            continue;
+        }
+        REQUIRE(record.succeeded);
+        if (record.classification
+            == iom::sycl_detail::AllocationClass::data_backing) {
+            result.data = record;
+            ++data_count;
+        }
+        if (record.classification
+            == iom::sycl_detail::AllocationClass::metadata_backing) {
+            result.metadata = record;
+            ++metadata_count;
+        }
+    }
+    REQUIRE_EQ(data_count, 1u);
+    REQUIRE_EQ(metadata_count, 1u);
+    return result;
+}
+
+void require_disjoint_domains(
+        const iom::sycl_detail::AllocationRecord& data,
+        const iom::sycl_detail::AllocationRecord& metadata) {
+    const std::uintptr_t data_begin =
+            reinterpret_cast<std::uintptr_t>(data.address);
+    const std::uintptr_t data_end = data_begin + data.bytes;
+    const std::uintptr_t metadata_begin =
+            reinterpret_cast<std::uintptr_t>(metadata.address);
+    const std::uintptr_t metadata_end = metadata_begin + metadata.bytes;
+    const bool domains_disjoint =
+            data_end <= metadata_begin || metadata_end <= data_begin;
+    CHECK(domains_disjoint);
+    CHECK(reinterpret_cast<std::uintptr_t>(data.address) % 32 == 0);
+    CHECK(reinterpret_cast<std::uintptr_t>(metadata.address) % 32 == 0);
+}
+
+}  // namespace
+
+TEST_CASE(
+        "SYCL factory setups reserve exactly two backings for default and "
+        "custom C") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+
+    {
+        const BackingProbe backing = probe_setup_backings(
+                kArenaBytes, iom::QueueConfig{});
+        CHECK_EQ(backing.data.bytes, kArenaBytes);
+        CHECK_EQ(backing.metadata.bytes, 4 * 16 * 512u);
+        require_disjoint_domains(backing.data, backing.metadata);
+    }
+    {
+        const BackingProbe backing = probe_setup_backings(
+                kArenaBytes, iom::QueueConfig{1});
+        CHECK_EQ(backing.data.bytes, kArenaBytes);
+        CHECK_EQ(backing.metadata.bytes, 4 * 1 * 512u);
+        require_disjoint_domains(backing.data, backing.metadata);
+    }
+    {
+        const BackingProbe backing = probe_setup_backings(
+                kArenaBytes, iom::QueueConfig{17});
+        CHECK_EQ(backing.data.bytes, kArenaBytes);
+        CHECK_EQ(backing.metadata.bytes, 4 * 17 * 512u);
+        require_disjoint_domains(backing.data, backing.metadata);
+    }
+}
+
+TEST_CASE("SYCL factory rejects invalid configurations before publication") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+
+    CHECK_THROWS_AS(iom::QueueConfig{0}, std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::make_sycl_device(
+                    0, iom::DeviceMemoryConfig{0}),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::make_sycl_device(
+                    0, iom::DeviceMemoryConfig{16}),
+            std::invalid_argument);
+
+    // 4 * C * 512 overflows size_t for this capacity.
+    CHECK_THROWS_AS(
+            (void)iom::make_sycl_device(
+                    0, iom::DeviceMemoryConfig{kArenaBytes},
+                    iom::QueueConfig{std::numeric_limits<std::size_t>::max()
+                                     / 2048 + 1}),
+            std::overflow_error);
+}
+
+TEST_CASE(
+        "SYCL factory rolls back no backing when the data backing "
+        "allocation fails") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+    iom::sycl_detail::allocation_calls.device_alloc = &failing_device_alloc;
+
+    CHECK_THROWS_AS(
+            (void)iom::make_sycl_device(
+                    0, iom::DeviceMemoryConfig{kArenaBytes}),
+            std::bad_alloc);
+
+    // The failed data-backing attempt stays observable and no backing was
+    // freed because none was acquired.
+    REQUIRE_EQ(probe.records.size(), 1u);
+    const auto& record = probe.records.front();
+    CHECK(record.phase == iom::sycl_detail::AllocationPhase::setup);
+    CHECK(record.classification
+          == iom::sycl_detail::AllocationClass::data_backing);
+    CHECK(record.kind == iom::sycl_detail::AllocationKind::allocate);
+    CHECK_FALSE(record.succeeded);
+    CHECK(record.address == nullptr);
+}
+
+TEST_CASE(
+        "SYCL factory rolls back the data backing when the metadata backing "
+        "allocation fails") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+    iom::sycl_detail::allocation_calls.device_alloc =
+            [](std::size_t bytes, const sycl::device& device,
+               const sycl::context& context) -> void* {
+                static thread_local std::size_t calls = 0;
+                if (calls++ == 0) {
+                    return sycl::malloc_device(bytes, device, context);
+                }
+                return nullptr;
+            };
+
+    CHECK_THROWS_AS(
+            (void)iom::make_sycl_device(
+                    0, iom::DeviceMemoryConfig{kArenaBytes}),
+            std::bad_alloc);
+
+    // Setup allocated the data backing, failed the metadata backing, then
+    // rolled the data backing back through the same seam.
+    REQUIRE_EQ(probe.records.size(), 3u);
+    const auto& data_alloc = probe.records[0];
+    const auto& metadata_alloc = probe.records[1];
+    const auto& data_free = probe.records[2];
+    CHECK(data_alloc.phase == iom::sycl_detail::AllocationPhase::setup);
+    CHECK(data_alloc.classification
+          == iom::sycl_detail::AllocationClass::data_backing);
+    CHECK(data_alloc.kind == iom::sycl_detail::AllocationKind::allocate);
+    CHECK(data_alloc.succeeded);
+    CHECK(data_alloc.address != nullptr);
+    CHECK_EQ(data_alloc.bytes, kArenaBytes);
+    CHECK(metadata_alloc.classification
+          == iom::sycl_detail::AllocationClass::metadata_backing);
+    CHECK(metadata_alloc.kind == iom::sycl_detail::AllocationKind::allocate);
+    CHECK_FALSE(metadata_alloc.succeeded);
+    CHECK(data_free.phase == iom::sycl_detail::AllocationPhase::setup);
+    CHECK(data_free.classification
+          == iom::sycl_detail::AllocationClass::data_backing);
+    CHECK(data_free.kind == iom::sycl_detail::AllocationKind::free);
+    CHECK(data_free.address == data_alloc.address);
+}
+
+TEST_CASE(
+        "SYCL tensor create and destroy after setup make no native "
+        "allocation or free calls") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::U8};
+    const void* first_address = nullptr;
+    {
+        auto first = device->create_tensor(spec);
+        first_address = first->view().native_handle();
+        CHECK(first_address != nullptr);
+    }
+    {
+        // The destroyed tensor's range is legally reusable by the arena
+        // (best-fit of the same size lands on the same block), so no
+        // address inequality is asserted; the no-churn point is that the
+        // create/destroy cycle performs zero native calls.
+        auto second = device->create_tensor(spec);
+        CHECK(second->view().native_handle() != nullptr);
+        auto third = device->create_tensor(spec);
+        CHECK(third->view().native_handle() != nullptr);
+    }
+    CHECK(probe.records.empty());
+}
+
+TEST_CASE(
+        "SYCL data arena fragments, reuses, and coalesces with stable live "
+        "addresses") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    // 2048 bytes: two 512-byte blocks and one 1024-byte block fill it.
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{2048});
+    REQUIRE(device != nullptr);
+
+    const iom::TensorSpec half{
+            iom::TensorShape{{16, 16}}, iom::DataType::U16};
+    const iom::TensorSpec full{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    const iom::TensorSpec one_and_half{
+            iom::TensorShape{{3, 2, 16, 16}}, iom::DataType::U8};
+
+    auto a = device->create_tensor(half);  // offset 0, 512 bytes
+    auto b = device->create_tensor(half);  // offset 512, 512 bytes
+    auto c = device->create_tensor(full);  // offset 1024, 1024 bytes
+    const std::uintptr_t a_address =
+            reinterpret_cast<std::uintptr_t>(a->view().native_handle());
+    const std::uintptr_t c_address =
+            reinterpret_cast<std::uintptr_t>(c->view().native_handle());
+
+    // Fragmentation: freeing a and c leaves 1536 aggregate free bytes split
+    // into 512 + 1024, so a 1536-byte contiguous request must fail even
+    // though the total free space is sufficient.
+    a.reset();
+    c.reset();
+    CHECK_THROWS_AS((void)device->create_tensor(one_and_half), std::bad_alloc);
+
+    // The live 512-byte tensor keeps its exact address.
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  b->view().native_handle())
+          == a_address + 512);
+
+    // Best-fit reuse: a 1024-byte request lands exactly on the freed
+    // 1024-byte block.
+    auto reused = device->create_tensor(full);
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  reused->view().native_handle())
+          == c_address);
+
+    // Coalescing: freeing the surviving middle block merges all three
+    // ranges back into one contiguous 2048-byte block.
+    b.reset();
+    reused.reset();
+    auto whole = device->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{4, 2, 16, 16}}, iom::DataType::U8});
+    REQUIRE(whole != nullptr);
+    CHECK(reinterpret_cast<std::uintptr_t>(
+                  whole->view().native_handle())
+          == a_address);
+}
+
+TEST_CASE("SYCL concurrent tensor bookkeeping is race-free and in-arena") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{256 * 1024});
+    REQUIRE(device != nullptr);
+
+    constexpr int kThreads = 4;
+    constexpr int kIterations = 20;
+    const iom::TensorSpec small{
+            iom::TensorShape{{16, 16}}, iom::DataType::U8};
+    const iom::TensorSpec large{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    std::atomic<bool> failed = false;
+    std::barrier start_gate(kThreads + 1);
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int worker = 0; worker < kThreads; ++worker) {
+        threads.emplace_back([&, worker] {
+            try {
+                start_gate.arrive_and_wait();
+                for (int iteration = 0; iteration < kIterations; ++iteration) {
+                    auto first = device->create_tensor(small);
+                    auto second = device->create_tensor(large);
+                    auto third = device->create_tensor(small);
+                    if (reinterpret_cast<std::uintptr_t>(
+                                first->view().native_handle())
+                                    % 32
+                            != 0
+                            || reinterpret_cast<std::uintptr_t>(
+                                       second->view().native_handle())
+                                    % 32
+                                    != 0) {
+                        failed.store(true, std::memory_order_release);
+                    }
+                    third.reset();
+                    auto fourth = device->create_tensor(small);
+                    (void)fourth;
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_release);
+            }
+        });
+    }
+    start_gate.arrive_and_wait();
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    CHECK_FALSE(failed.load(std::memory_order_acquire));
 }

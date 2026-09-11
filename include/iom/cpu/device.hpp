@@ -13,8 +13,10 @@ namespace iom {
      * standard 16x16 tiled layout, performs synchronous logical host
      * transfers, and serves any number of independent in-order asynchronous
      * queues. The allocator is borrowed and must outlive the returned
-     * device and every resource created through it.
+     * device and every resource created through it. The queue configuration
+     * is immutable for the Device and applies to every queue it creates.
      */
-    [[nodiscard]] std::unique_ptr<Device> make_cpu_device(Allocator& allocator);
+    [[nodiscard]] std::unique_ptr<Device> make_cpu_device(
+            Allocator& allocator, QueueConfig queue_config = {});
 
 }  // namespace iom

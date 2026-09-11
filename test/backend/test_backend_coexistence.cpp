@@ -104,83 +104,11 @@ private:
     std::atomic<std::size_t> frees_{0};
 };
 
+// Coexistence traffic is tensors of at most a few KiB each, so a modest
+// fixed data arena covers every live set on the standard-GPU backends.
+constexpr std::size_t kCoexistenceArenaBytes = 16u * 1024 * 1024;
+
 #ifdef IOM_COEXIST_SYCL
-class SyclUsmAllocator final : public iom::Allocator {
-public:
-    void bind_context(const sycl::context& context) {
-        context_ = context;
-        const std::vector<sycl::device> devices = context.get_devices();
-        REQUIRE(!devices.empty());
-        device_ = devices.front();
-    }
-
-    void* alloc(std::size_t size) override {
-        REQUIRE(context_.has_value());
-        void* pointer = sycl::malloc_shared(size, device_, *context_);
-        if (pointer == nullptr) {
-            throw std::bad_alloc();
-        }
-        ++allocations_;
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        REQUIRE(context_.has_value());
-        ++frees_;
-        sycl::free(buffer, *context_);
-    }
-
-    void reset() override {}
-
-    [[nodiscard]] std::size_t allocation_count() const noexcept {
-        return allocations_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] std::size_t free_count() const noexcept {
-        return frees_.load(std::memory_order_relaxed);
-    }
-
-private:
-    std::optional<sycl::context> context_;
-    sycl::device device_;
-    std::atomic<std::size_t> allocations_{0};
-    std::atomic<std::size_t> frees_{0};
-};
-
-SyclUsmAllocator* active_sycl_allocator = nullptr;
-
-void capture_sycl_context(const sycl::context& context) {
-    REQUIRE(active_sycl_allocator != nullptr);
-    active_sycl_allocator->bind_context(context);
-}
-
-class SyclContextCallsRestore final {
-public:
-    SyclContextCallsRestore()
-            : saved_(iom::sycl_detail::context_calls),
-              saved_allocator_(active_sycl_allocator) {}
-
-    SyclContextCallsRestore(const SyclContextCallsRestore&) = delete;
-    SyclContextCallsRestore& operator=(const SyclContextCallsRestore&) = delete;
-
-    ~SyclContextCallsRestore() {
-        iom::sycl_detail::context_calls = saved_;
-        active_sycl_allocator = saved_allocator_;
-    }
-
-private:
-    iom::sycl_detail::ContextCalls saved_;
-    SyclUsmAllocator* saved_allocator_;
-};
-
-std::unique_ptr<iom::Device> make_sycl_device_with_allocator(
-        std::uint32_t ordinal, SyclUsmAllocator& allocator) {
-    SyclContextCallsRestore restore;
-    active_sycl_allocator = &allocator;
-    iom::sycl_detail::context_calls.context_ready = &capture_sycl_context;
-    return iom::make_sycl_device(ordinal, allocator);
-}
-
 [[nodiscard]] std::size_t sycl_runtime_device_count() {
     const auto devices = sycl::device::get_devices();
     const std::size_t count = static_cast<std::size_t>(std::count_if(
@@ -194,36 +122,6 @@ std::unique_ptr<iom::Device> make_sycl_device_with_allocator(
 
 
 #ifdef IOM_COEXIST_CUDA
-class CudaMemoryAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t size) override {
-        CUdeviceptr device_pointer = 0;
-        REQUIRE(cuMemAlloc(&device_pointer, size) == CUDA_SUCCESS);
-        ++allocations_;
-        return reinterpret_cast<void*>(device_pointer);
-    }
-
-    void free(void* buffer) override {
-        REQUIRE(cuMemFree(reinterpret_cast<CUdeviceptr>(buffer))
-                == CUDA_SUCCESS);
-        ++frees_;
-    }
-
-    void reset() override {}
-
-    [[nodiscard]] std::size_t allocation_count() const noexcept {
-        return allocations_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] std::size_t free_count() const noexcept {
-        return frees_.load(std::memory_order_relaxed);
-    }
-
-private:
-    std::atomic<std::size_t> allocations_{0};
-    std::atomic<std::size_t> frees_{0};
-};
-
 // Hardware is required, never skipped: an enabled backend fails the test
 // when its runtime reports no usable device.
 [[nodiscard]] int cuda_runtime_device_count() {
@@ -236,35 +134,6 @@ private:
 #endif
 
 #ifdef IOM_COEXIST_ROCM
-class HipMemoryAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t size) override {
-        void* block = nullptr;
-        REQUIRE(hipMalloc(&block, size) == kHipSuccess);
-        ++allocations_;
-        return block;
-    }
-
-    void free(void* buffer) override {
-        REQUIRE(hipFree(buffer) == kHipSuccess);
-        ++frees_;
-    }
-
-    void reset() override {}
-
-    [[nodiscard]] std::size_t allocation_count() const noexcept {
-        return allocations_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] std::size_t free_count() const noexcept {
-        return frees_.load(std::memory_order_relaxed);
-    }
-
-private:
-    std::atomic<std::size_t> allocations_{0};
-    std::atomic<std::size_t> frees_{0};
-};
-
 [[nodiscard]] int hip_runtime_device_count() {
     int count = 0;
     REQUIRE(hipGetDeviceCount(&count) == kHipSuccess);
@@ -314,11 +183,12 @@ BackendParticipant make_cpu_participant(HostAllocator& allocator) {
 }
 
 #ifdef IOM_COEXIST_CUDA
-BackendParticipant make_cuda_participant(CudaMemoryAllocator& allocator) {
+BackendParticipant make_cuda_participant() {
     BackendParticipant participant;
     participant.name = "cuda";
     participant.kind = iom::BackendKind::CUDA;
-    participant.owned_device = iom::make_cuda_device(0, allocator);
+    participant.owned_device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
     participant.device = participant.owned_device.get();
     participant.source = participant.device->create_tensor(coexistence_spec());
     participant.queues.push_back(participant.device->create_ops());
@@ -333,11 +203,12 @@ BackendParticipant make_cuda_participant(CudaMemoryAllocator& allocator) {
 #endif
 
 #ifdef IOM_COEXIST_ROCM
-BackendParticipant make_rocm_participant(HipMemoryAllocator& allocator) {
+BackendParticipant make_rocm_participant() {
     BackendParticipant participant;
     participant.name = "rocm";
     participant.kind = iom::BackendKind::ROCM;
-    participant.owned_device = iom::make_rocm_device(0, allocator);
+    participant.owned_device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
     participant.device = participant.owned_device.get();
     participant.source = participant.device->create_tensor(coexistence_spec());
     participant.queues.push_back(participant.device->create_ops());
@@ -352,12 +223,12 @@ BackendParticipant make_rocm_participant(HipMemoryAllocator& allocator) {
 #endif
 
 #ifdef IOM_COEXIST_SYCL
-BackendParticipant make_sycl_participant(SyclUsmAllocator& allocator) {
+BackendParticipant make_sycl_participant() {
     BackendParticipant participant;
     participant.name = "sycl";
     participant.kind = iom::BackendKind::SYCL;
-    participant.owned_device =
-            make_sycl_device_with_allocator(0, allocator);
+    participant.owned_device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
     participant.device = participant.owned_device.get();
     participant.source = participant.device->create_tensor(coexistence_spec());
     participant.queues.push_back(participant.device->create_ops());
@@ -405,19 +276,15 @@ TEST_CASE("Backend coexistence: enabled backends interleave in one process") {
     BackendParticipant cpu_participant = make_cpu_participant(cpu_allocator);
     std::vector<BackendParticipant*> participants{&cpu_participant};
 #ifdef IOM_COEXIST_CUDA
-    CudaMemoryAllocator cuda_allocator;
-    BackendParticipant cuda_participant = make_cuda_participant(cuda_allocator);
+    BackendParticipant cuda_participant = make_cuda_participant();
     participants.push_back(&cuda_participant);
 #endif
 #ifdef IOM_COEXIST_ROCM
-    HipMemoryAllocator rocm_allocator;
-    BackendParticipant rocm_participant = make_rocm_participant(rocm_allocator);
+    BackendParticipant rocm_participant = make_rocm_participant();
     participants.push_back(&rocm_participant);
 #endif
 #ifdef IOM_COEXIST_SYCL
-    SyclUsmAllocator sycl_allocator;
-    BackendParticipant sycl_participant =
-            make_sycl_participant(sycl_allocator);
+    BackendParticipant sycl_participant = make_sycl_participant();
     participants.push_back(&sycl_participant);
 #endif
 #ifdef IOM_COEXIST_TTNN
@@ -541,10 +408,10 @@ TEST_CASE("Backend coexistence: queues reject views from another device") {
             *(iom::make_cpu_device(foreign_allocator)));
 #ifdef IOM_COEXIST_CUDA
     {
-        CudaMemoryAllocator device_allocator;
-        CudaMemoryAllocator foreign_device_allocator;
-        auto device = iom::make_cuda_device(0, device_allocator);
-        auto foreign = iom::make_cuda_device(0, foreign_device_allocator);
+        auto device = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+        auto foreign = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         CHECK(device->backend_kind() == iom::BackendKind::CUDA);
         CHECK(foreign->backend_kind() == iom::BackendKind::CUDA);
         CHECK(device->backend_device() == foreign->backend_device());
@@ -553,10 +420,10 @@ TEST_CASE("Backend coexistence: queues reject views from another device") {
 #endif
 #ifdef IOM_COEXIST_ROCM
     {
-        HipMemoryAllocator device_allocator;
-        HipMemoryAllocator foreign_device_allocator;
-        auto device = iom::make_rocm_device(0, device_allocator);
-        auto foreign = iom::make_rocm_device(0, foreign_device_allocator);
+        auto device = iom::make_rocm_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+        auto foreign = iom::make_rocm_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         CHECK(device->backend_kind() == iom::BackendKind::ROCM);
         CHECK(foreign->backend_kind() == iom::BackendKind::ROCM);
         CHECK(device->backend_device() == foreign->backend_device());
@@ -565,11 +432,10 @@ TEST_CASE("Backend coexistence: queues reject views from another device") {
 #endif
 #ifdef IOM_COEXIST_SYCL
     {
-        SyclUsmAllocator device_allocator;
-        SyclUsmAllocator foreign_device_allocator;
-        auto device = make_sycl_device_with_allocator(0, device_allocator);
-        auto foreign =
-                make_sycl_device_with_allocator(0, foreign_device_allocator);
+        auto device = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+        auto foreign = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         CHECK(device->backend_kind() == iom::BackendKind::SYCL);
         CHECK(foreign->backend_kind() == iom::BackendKind::SYCL);
         CHECK(device->backend_device() == foreign->backend_device());
@@ -602,8 +468,8 @@ TEST_CASE("Backend coexistence: second devices report their own ordinal") {
 
 #ifdef IOM_COEXIST_CUDA
     if (cuda_runtime_device_count() > 1) {
-        CudaMemoryAllocator second_allocator;
-        auto second = iom::make_cuda_device(1, second_allocator);
+        auto second = iom::make_cuda_device(
+                1, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         REQUIRE(second != nullptr);
         CHECK(second->backend_kind() == iom::BackendKind::CUDA);
         CHECK(second->backend_device() == 1);
@@ -611,8 +477,8 @@ TEST_CASE("Backend coexistence: second devices report their own ordinal") {
 #endif
 #ifdef IOM_COEXIST_ROCM
     if (hip_runtime_device_count() > 1) {
-        HipMemoryAllocator second_allocator;
-        auto second = iom::make_rocm_device(1, second_allocator);
+        auto second = iom::make_rocm_device(
+                1, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         REQUIRE(second != nullptr);
         CHECK(second->backend_kind() == iom::BackendKind::ROCM);
         CHECK(second->backend_device() == 1);
@@ -620,9 +486,8 @@ TEST_CASE("Backend coexistence: second devices report their own ordinal") {
 #endif
 #ifdef IOM_COEXIST_SYCL
     if (sycl_runtime_device_count() > 1) {
-        SyclUsmAllocator second_allocator;
-        auto second =
-                make_sycl_device_with_allocator(1, second_allocator);
+        auto second = iom::make_sycl_device(
+                1, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         REQUIRE(second != nullptr);
         CHECK(second->backend_kind() == iom::BackendKind::SYCL);
         CHECK(second->backend_device() == 1);
@@ -696,14 +561,15 @@ TEST_CASE("Backend coexistence: queue ids release, reuse, and stay unique") {
 // while submitting multi-plane copies; every queue must end up with a
 // distinct registry identity, every operation with one unique entry pair,
 // and destroying one queue must invalidate only that queue's own entries.
-// The counting allocator makes the invalidation observable: a surviving
-// queue's outstanding entry stays live, so its destination storage is
-// released (freed) at tensor destruction -- never quarantined by another
-// queue's teardown -- and every allocated tensor storage is freed exactly
-// once. TTNN owns native storage and has no caller allocator, so its call
-// site passes a scalar placeholder (`int`, never dereferenced); for
-// non-class placeholders the allocator-count code is discarded at compile
-// time and the scenario runs without the free-count assertions.
+// The counting allocator makes the invalidation observable for CPU: a
+// surviving queue's outstanding entry stays live, so its destination
+// storage is released (freed) at tensor destruction -- never quarantined by
+// another queue's teardown -- and every allocated tensor storage is freed
+// exactly once. TTNN owns native storage and the standard-GPU backends
+// suballocate device arenas, so their call sites pass a scalar placeholder
+// (`int`, never dereferenced); for non-class placeholders the
+// allocator-count code is discarded at compile time and the scenario runs
+// without the free-count assertions.
 template <typename CountingAllocator>
 void run_concurrent_queue_scenario(
         const char* name, iom::Device& device,
@@ -852,23 +718,26 @@ TEST_CASE(
     }
 #ifdef IOM_COEXIST_CUDA
     {
-        CudaMemoryAllocator allocator;
-        auto device = iom::make_cuda_device(0, allocator);
-        run_concurrent_queue_scenario("cuda", *device, &allocator);
+        auto device = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+        // Tensor storage now suballocates the device data arena; the
+        // registry invalidation scenario runs without caller-allocator
+        // traffic on the standard-GPU backends.
+        run_concurrent_queue_scenario<int>("cuda", *device, nullptr);
     }
 #endif
 #ifdef IOM_COEXIST_ROCM
     {
-        HipMemoryAllocator allocator;
-        auto device = iom::make_rocm_device(0, allocator);
-        run_concurrent_queue_scenario("rocm", *device, &allocator);
+        auto device = iom::make_rocm_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+        run_concurrent_queue_scenario<int>("rocm", *device, nullptr);
     }
 #endif
 #ifdef IOM_COEXIST_SYCL
     {
-        SyclUsmAllocator allocator;
-        auto device = make_sycl_device_with_allocator(0, allocator);
-        run_concurrent_queue_scenario("sycl", *device, &allocator);
+        auto device = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+        run_concurrent_queue_scenario<int>("sycl", *device, nullptr);
     }
 #endif
 #ifdef IOM_COEXIST_TTNN
@@ -1103,18 +972,15 @@ TEST_CASE("Backend coexistence: ADD interleaves across enabled backends") {
     BackendParticipant cpu_participant = make_cpu_participant(cpu_allocator);
     std::vector<BackendParticipant*> participants{&cpu_participant};
 #ifdef IOM_COEXIST_CUDA
-    CudaMemoryAllocator cuda_allocator;
-    BackendParticipant cuda_participant = make_cuda_participant(cuda_allocator);
+    BackendParticipant cuda_participant = make_cuda_participant();
     participants.push_back(&cuda_participant);
 #endif
 #ifdef IOM_COEXIST_ROCM
-    HipMemoryAllocator rocm_allocator = {};
-    BackendParticipant rocm_participant = make_rocm_participant(rocm_allocator);
+    BackendParticipant rocm_participant = make_rocm_participant();
     participants.push_back(&rocm_participant);
 #endif
 #ifdef IOM_COEXIST_SYCL
-    SyclUsmAllocator sycl_allocator;
-    BackendParticipant sycl_participant = make_sycl_participant(sycl_allocator);
+    BackendParticipant sycl_participant = make_sycl_participant();
     participants.push_back(&sycl_participant);
 #endif
 #ifdef IOM_COEXIST_TTNN

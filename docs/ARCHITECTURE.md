@@ -273,11 +273,13 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `LinearAllocator` | One monotonic allocation region over caller-supplied memory. |
 | `ListAllocator` | Reusable/coalescing allocation region with `free_bytes()`. |
 | `FixedSizeAllocator` | Fixed-payload slot allocator with index, capacity, free-count, payload, and stride inspection. |
-| `make_cpu_device(allocator)` | Creates the CPU reference device. |
-| `make_cuda_device(ordinal, allocator)` | Creates a CUDA device for one backend-local ordinal. |
-| `make_rocm_device(ordinal, allocator)` | Creates a ROCm device for one backend-local ordinal. |
-| `make_sycl_device(ordinal, allocator)` | Creates a SYCL accelerator device for one eligible backend-local ordinal. |
-| `make_ttnn_device(ordinal)` | Creates a TTNN device, whose native storage is owned by TTNN. |
+| `QueueConfig` | Immutable per-device queue configuration; `max_in_flight_per_queue` defaults to 16 (zero rejected) and applies to every queue the Device creates. |
+| `DeviceMemoryConfig` | Explicit standard-GPU tensor-data arena capacity; capacity must be nonzero and divisible by 32. |
+| `make_cpu_device(allocator, queue_config)` | Creates the CPU reference device over the borrowed caller allocator. |
+| `make_cuda_device(ordinal, memory_config, queue_config)` | Creates a CUDA device for one backend-local ordinal; reserves one data and one checked metadata arena during setup. |
+| `make_rocm_device(ordinal, memory_config, queue_config)` | Creates a ROCm device for one backend-local ordinal; reserves one data and one checked metadata arena during setup. |
+| `make_sycl_device(ordinal, memory_config, queue_config)` | Creates a SYCL accelerator device for one eligible backend-local ordinal; reserves one data and one checked metadata arena during setup. |
+| `make_ttnn_device(ordinal, queue_config)` | Creates a TTNN device, whose native per-plane storage is owned by TTNN (no raw arena). |
 | `ttnn_supported_data_types()` | Returns TTNN's immutable accepted unquantized leaf-type table. |
 | `Device` | Reports backend identity and immutable storage capability table; creates `Tensor` owners and `DeviceOps` queues. |
 | `DeviceOps` | Provides `copy` plus exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades; `silu`, `linear`, `rmsnorm`, and GQA `sdpa` remain unsupported. `wait(token)` observes completion. |

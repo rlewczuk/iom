@@ -904,7 +904,8 @@ namespace iom {
         return std::make_unique<CpuQueue>(*this);
     }
 
-    std::unique_ptr<Device> make_cpu_device(Allocator& allocator) {
+    std::unique_ptr<Device> make_cpu_device(
+            Allocator& allocator, QueueConfig) {
         return std::make_unique<CpuDevice>(allocator);
     }
 

@@ -1102,7 +1102,7 @@ void TtnnQueue::fence_through_sequence(
     }
 
     std::unique_ptr<Device> make_ttnn_device(
-            std::uint32_t device_ordinal) {
+            std::uint32_t device_ordinal, QueueConfig) {
         const std::size_t device_count =
                 tt::tt_metal::GetNumAvailableDevices();
         if (static_cast<std::size_t>(device_ordinal) >= device_count

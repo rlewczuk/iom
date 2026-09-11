@@ -62,232 +62,45 @@ private:
     std::unordered_set<void*> live_;
 };
 
-class SyclAllocator final : public iom::Allocator {
-public:
-    explicit SyclAllocator(const iom_conformance::TrafficGate& gate) : gate_(gate) {}
+// Every standard-GPU conformance fixture reserves this tensor-data arena:
+// the largest concurrent set in the shared suite stays well below 512 MiB.
+constexpr std::size_t kConformanceArenaBytes = 640u * 1024 * 1024;
 
-    void bind_context(const sycl::context& context) {
-        context_ = context;
-        const std::vector<sycl::device> devices = context.get_devices();
-        REQUIRE(!devices.empty());
-        device_ = devices.front();
-    }
-
-    void* alloc(std::size_t size) override {
-        CHECK_MESSAGE(
-                !gate_.armed(),
-                "tensor storage allocated inside a transfer, transform, or operation");
-        REQUIRE(context_.has_value());
-        void* pointer = sycl::malloc_shared(size, device_, *context_);
-        if (pointer == nullptr) {
-            throw std::bad_alloc();
-        }
-        live_.insert(pointer);
-        ++allocations;
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        CHECK_MESSAGE(
-                !gate_.armed(),
-                "tensor storage freed inside a transfer, transform, or operation");
-        const auto found = live_.find(buffer);
-        REQUIRE_MESSAGE(
-                found != live_.end(),
-                "allocator freed an address it never handed out");
-        live_.erase(found);
-        REQUIRE(context_.has_value());
-        sycl::free(buffer, *context_);
-        ++frees;
-    }
-
-    void reset() override {}
-
-    [[nodiscard]] const sycl::context& context() const {
-        REQUIRE(context_.has_value());
-        return *context_;
-    }
-
-    [[nodiscard]] const sycl::device& device() const {
-        REQUIRE(context_.has_value());
-        return device_;
-    }
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-
-private:
-    const iom_conformance::TrafficGate& gate_;
-    std::optional<sycl::context> context_;
-    sycl::device device_;
-    std::unordered_set<void*> live_;
-};
-
-class ReusingSyclAllocator final : public iom::Allocator {
-public:
-    ~ReusingSyclAllocator() override {
-        if (!context_.has_value()) {
-            return;
-        }
-        for (const Slot& slot : free_) {
-            try {
-                sycl::free(slot.pointer, *context_);
-            } catch (...) {
-            }
-        }
-        for (const auto& [pointer, size] : live_) {
-            (void)size;
-            try {
-                sycl::free(pointer, *context_);
-            } catch (...) {
-            }
-        }
-    }
-
-    void bind_context(const sycl::context& context) {
-        context_ = context;
-        const std::vector<sycl::device> devices = context.get_devices();
-        REQUIRE(!devices.empty());
-        device_ = devices.front();
-    }
-
-    void* alloc(std::size_t size) override {
-        REQUIRE(context_.has_value());
-        for (auto it = free_.begin(); it != free_.end(); ++it) {
-            if (it->size != size) {
-                continue;
-            }
-            void* pointer = it->pointer;
-            live_.emplace(pointer, size);
-            free_.erase(it);
-            ++allocations;
-            return pointer;
-        }
-
-        void* pointer = sycl::malloc_shared(size, device_, *context_);
-        if (pointer == nullptr) {
-            throw std::bad_alloc();
-        }
-        try {
-            live_.emplace(pointer, size);
-        } catch (...) {
-            sycl::free(pointer, *context_);
-            throw;
-        }
-        ++allocations;
-        return pointer;
-    }
-
-    void free(void* buffer) override {
-        const auto found = live_.find(buffer);
-        REQUIRE_MESSAGE(
-                found != live_.end(),
-                "SYCL reuse allocator received an unknown address");
-        free_.push_back({buffer, found->second});
-        live_.erase(found);
-        ++frees;
-    }
-
-    void reset() override {}
-
-    void release_free() noexcept {
-        if (!context_.has_value()) {
-            return;
-        }
-        for (const Slot& slot : free_) {
-            try {
-                sycl::free(slot.pointer, *context_);
-            } catch (...) {
-            }
-        }
-        free_.clear();
-    }
-
-    [[nodiscard]] std::size_t free_count() const noexcept {
-        return free_.size();
-    }
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-
-private:
-    struct Slot {
-        void* pointer;
-        std::size_t size;
-    };
-
-    std::optional<sycl::context> context_;
-    sycl::device device_;
-    std::vector<Slot> free_;
-    std::unordered_map<void*, std::size_t> live_;
-};
-
-
-class HostPointerAllocator final : public iom::Allocator {
-public:
-    void* alloc(std::size_t size) override {
-        ++allocations;
-        raw_ = ::operator new(size, std::align_val_t(32));
-        return raw_;
-    }
-
-    void free(void* buffer) override {
-        CHECK_EQ(buffer, raw_);
-        ++frees;
-        ::operator delete(raw_, std::align_val_t(32));
-        raw_ = nullptr;
-    }
-
-    void reset() override {}
-
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-
-private:
-    void* raw_ = nullptr;
-};
-
-SyclAllocator* active_context_allocator = nullptr;
-ReusingSyclAllocator* active_reusing_allocator = nullptr;
+// The factory's context_ready seam delivers each device's private context
+// to the fixture so storage oracles and pooled-transfer helpers can build
+// queues in the exact device context.
+std::optional<sycl::context>* active_context_sink = nullptr;
 
 void capture_context(const sycl::context& context) {
-    REQUIRE(active_context_allocator != nullptr);
-    active_context_allocator->bind_context(context);
-}
-
-void capture_reusing_context(const sycl::context& context) {
-    REQUIRE(active_reusing_allocator != nullptr);
-    active_reusing_allocator->bind_context(context);
+    REQUIRE(active_context_sink != nullptr);
+    active_context_sink->emplace(context);
 }
 
 class ContextCallsRestore final {
 public:
     ContextCallsRestore()
             : saved_(iom::sycl_detail::context_calls),
-              saved_allocator_(active_context_allocator),
-              saved_reusing_allocator_(active_reusing_allocator) {}
+              saved_sink_(active_context_sink) {}
 
     ContextCallsRestore(const ContextCallsRestore&) = delete;
     ContextCallsRestore& operator=(const ContextCallsRestore&) = delete;
 
     ~ContextCallsRestore() {
         iom::sycl_detail::context_calls = saved_;
-        active_context_allocator = saved_allocator_;
-        active_reusing_allocator = saved_reusing_allocator_;
+        active_context_sink = saved_sink_;
     }
 
 private:
     iom::sycl_detail::ContextCalls saved_;
-    SyclAllocator* saved_allocator_;
-    ReusingSyclAllocator* saved_reusing_allocator_;
+    std::optional<sycl::context>* saved_sink_;
 };
 
 struct SyclDevices {
     ContextCallsRestore context_restore;
     iom_conformance::TrafficGate gate;
     HostAllocator reference_allocator{gate};
-    SyclAllocator candidate_allocator{gate};
-    SyclAllocator foreign_allocator{gate};
+    std::optional<sycl::context> candidate_context;
+    std::optional<sycl::context> foreign_context;
     std::unique_ptr<iom::Device> reference;
     std::unique_ptr<iom::Device> candidate;
     std::unique_ptr<iom::Device> foreign;
@@ -296,11 +109,15 @@ struct SyclDevices {
         iom::sycl_detail::context_calls.context_ready = &capture_context;
         reference = iom::make_cpu_device(reference_allocator);
 
-        active_context_allocator = &candidate_allocator;
-        candidate = iom::make_sycl_device(0, candidate_allocator);
-        active_context_allocator = &foreign_allocator;
-        foreign = iom::make_sycl_device(0, foreign_allocator);
-        active_context_allocator = nullptr;
+        active_context_sink = &candidate_context;
+        candidate = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+        active_context_sink = &foreign_context;
+        foreign = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+        active_context_sink = nullptr;
+        REQUIRE(candidate_context.has_value());
+        REQUIRE(foreign_context.has_value());
     }
 
     [[nodiscard]] iom_conformance::ConformanceDevices conformance() const {
@@ -308,25 +125,11 @@ struct SyclDevices {
     }
 };
 
-struct ReusingSyclDevice {
-    ContextCallsRestore context_restore;
-    ReusingSyclAllocator allocator;
-    std::unique_ptr<iom::Device> device;
-
-    ReusingSyclDevice() {
-        iom::sycl_detail::context_calls.context_ready =
-                &capture_reusing_context;
-        active_reusing_allocator = &allocator;
-        device = iom::make_sycl_device(0, allocator);
-        active_reusing_allocator = nullptr;
-    }
-};
-
 class SyclStorageOracle final
         : public iom_conformance::AcceleratorStorageOracle {
 public:
-    explicit SyclStorageOracle(const SyclAllocator& allocator)
-            : allocator_(allocator) {}
+    explicit SyclStorageOracle(const sycl::context& context)
+            : context_(context) {}
 
     void seed(
             iom::TensorView& view,
@@ -334,7 +137,7 @@ public:
         const std::size_t bytes = owner_spec().tiled_storage_nbytes();
         REQUIRE_EQ(encoded.size(), bytes);
         sycl::queue queue(
-                allocator_.context(), allocator_.device(),
+                context_, context_.get_devices().front(),
                 sycl::property_list{sycl::property::queue::in_order{}});
         queue.memcpy(view.native_handle(), encoded.data(), bytes)
                 .wait_and_throw();
@@ -345,7 +148,7 @@ public:
         const std::size_t bytes = owner_spec().tiled_storage_nbytes();
         std::vector<std::byte> result(bytes);
         sycl::queue queue(
-                allocator_.context(), allocator_.device(),
+                context_, context_.get_devices().front(),
                 sycl::property_list{sycl::property::queue::in_order{}});
         queue.memcpy(result.data(), view.native_handle(), bytes)
                 .wait_and_throw();
@@ -353,7 +156,7 @@ public:
     }
 
 private:
-    const SyclAllocator& allocator_;
+    sycl::context context_;
 };
 
 }  // namespace
@@ -365,11 +168,12 @@ TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") 
 
 TEST_CASE("SYCL tensor destruction fences queued work") {
     REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
-    ReusingSyclDevice devices;
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
-    auto source = devices.device->create_tensor(spec);
-    auto destination = devices.device->create_tensor(spec);
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
     const std::vector<std::byte> pattern(
             spec.logical_nbytes(), static_cast<std::byte>(0x3c));
     const std::vector<std::byte> zero(
@@ -377,11 +181,11 @@ TEST_CASE("SYCL tensor destruction fences queued work") {
     source->view().copy_from_host(pattern);
     destination->view().copy_from_host(zero);
 
-    auto queue = devices.device->create_ops();
+    auto queue = device->create_ops();
     const iom::oid token = queue->copy(
             source->view(), destination->view());
     source.reset();
-    auto fresh_source = devices.device->create_tensor(spec);
+    auto fresh_source = device->create_tensor(spec);
     fresh_source->view().copy_from_host(
             std::vector<std::byte>(
                     spec.logical_nbytes(), static_cast<std::byte>(0xa5)));
@@ -394,11 +198,7 @@ TEST_CASE("SYCL tensor destruction fences queued work") {
     fresh_source.reset();
     destination.reset();
     queue.reset();
-    CHECK_EQ(devices.allocator.frees, 3);
-    CHECK_EQ(devices.allocator.allocations, 3);
-    devices.device.reset();
-    devices.allocator.release_free();
-    CHECK_EQ(devices.allocator.free_count(), 0);
+    device.reset();
 }
 
 TEST_CASE("SYCL pre-enqueue failures preserve submission sequences") {
@@ -435,15 +235,16 @@ TEST_CASE("SYCL pre-enqueue failures preserve submission sequences") {
 
 TEST_CASE("SYCL submission remains transactional across post-enqueue failures") {
     REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
-    ReusingSyclDevice devices;
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
-    auto source = devices.device->create_tensor(spec);
-    auto destination = devices.device->create_tensor(spec);
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
     const void* source_address = source->view().native_handle();
     const void* destination_address =
             destination->view().native_handle();
-    auto queue = devices.device->create_ops();
+    auto queue = device->create_ops();
 
     iom::sycl_detail::inject_submission_fault_for_testing(
             iom::sycl_detail::SubmissionFault::post_launch);
@@ -454,8 +255,8 @@ TEST_CASE("SYCL submission remains transactional across post-enqueue failures") 
 
     source.reset();
     destination.reset();
-    auto fresh_source = devices.device->create_tensor(spec);
-    auto fresh_destination = devices.device->create_tensor(spec);
+    auto fresh_source = device->create_tensor(spec);
+    auto fresh_destination = device->create_tensor(spec);
     CHECK_NE(fresh_source->view().native_handle(), source_address);
     CHECK_NE(
             fresh_destination->view().native_handle(), destination_address);
@@ -466,27 +267,23 @@ TEST_CASE("SYCL submission remains transactional across post-enqueue failures") 
     fresh_source.reset();
     fresh_destination.reset();
     queue.reset();
-    CHECK_EQ(devices.allocator.frees, 2);
-    CHECK_EQ(devices.allocator.allocations, 4);
-    devices.device.reset();
-    CHECK_EQ(devices.allocator.frees, 4);
-    devices.allocator.release_free();
-    CHECK_EQ(devices.allocator.free_count(), 0);
+    device.reset();
 }
 
 TEST_CASE("SYCL queue destruction fences pending copies") {
     REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
-    ReusingSyclDevice devices;
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     const iom::TensorSpec spec{
             iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
-    auto source = devices.device->create_tensor(spec);
-    auto destination = devices.device->create_tensor(spec);
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
     const void* source_address = source->view().native_handle();
     const void* destination_address =
             destination->view().native_handle();
 
     {
-        auto queue = devices.device->create_ops();
+        auto queue = device->create_ops();
         CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
         CHECK(iom::oid_is_token(queue->copy(source->view(), destination->view())));
         iom::sycl_detail::inject_submission_fault_for_testing(
@@ -498,19 +295,14 @@ TEST_CASE("SYCL queue destruction fences pending copies") {
 
     source.reset();
     destination.reset();
-    CHECK_EQ(devices.allocator.frees, 0);
-    auto fresh_source = devices.device->create_tensor(spec);
-    auto fresh_destination = devices.device->create_tensor(spec);
+    auto fresh_source = device->create_tensor(spec);
+    auto fresh_destination = device->create_tensor(spec);
     CHECK_NE(fresh_source->view().native_handle(), source_address);
     CHECK_NE(
             fresh_destination->view().native_handle(), destination_address);
     fresh_source.reset();
     fresh_destination.reset();
-    CHECK_EQ(devices.allocator.frees, 2);
-    devices.device.reset();
-    CHECK_EQ(devices.allocator.frees, 4);
-    devices.allocator.release_free();
-    CHECK_EQ(devices.allocator.free_count(), 0);
+    device.reset();
 }
 
 TEST_CASE("SYCL identical-window copy is a no-op") {
@@ -531,12 +323,12 @@ TEST_CASE("SYCL host transfers reuse pooled staging") {
             iom::TensorShape{{1, 17}}, iom::DataType::U4};
     auto odd_tensor = devices.candidate->create_tensor(odd_spec);
     sycl::queue transfer_queue(
-            devices.candidate_allocator.context(),
-            devices.candidate_allocator.device(),
+            *devices.candidate_context,
+            devices.candidate_context->get_devices().front(),
             sycl::property_list{sycl::property::queue::in_order{}});
     iom::sycl_detail::StagingSlotPool pool(
-            devices.candidate_allocator.context(),
-            devices.candidate_allocator.device());
+            *devices.candidate_context,
+            devices.candidate_context->get_devices().front());
 
     std::vector<std::byte> odd_source(odd_spec.logical_nbytes());
     for (std::size_t index = 0; index < odd_source.size(); ++index) {
@@ -595,19 +387,6 @@ TEST_CASE("SyclFenceState::result() idempotency and snapshot-after-clear") {
 }
 
 
-TEST_CASE("SYCL rejects aligned non-USM allocator storage") {
-    REQUIRE(iom::sycl_detail::eligible_device_count() > 0);
-
-    HostPointerAllocator allocator;
-    auto device = iom::make_sycl_device(0, allocator);
-    const iom::TensorSpec spec{
-            iom::TensorShape{{16, 16}}, iom::DataType::F32};
-
-    CHECK_THROWS((void)device->create_tensor(spec));
-    CHECK_EQ(allocator.allocations, 1);
-    CHECK_EQ(allocator.frees, 1);
-}
-
 TEST_CASE("SYCL conformance: storage and host transfers for every leaf type") {
     SyclDevices devices;
     iom_conformance::run_storage_and_transfer_conformance(
@@ -623,7 +402,7 @@ TEST_CASE("SYCL conformance: storage oracle identifies perturbed transfer map") 
     iom_conformance::run_storage_and_transfer_conformance(
             devices.conformance(), one_type, &devices.gate);
 
-    SyclStorageOracle direct(devices.candidate_allocator);
+    SyclStorageOracle direct(*devices.candidate_context);
     iom_conformance::PermutingStorageOracle perturbed(
             direct, iom_conformance::swap_first_adjacent_slots);
     CHECK_FALSE(iom_conformance::run_storage_oracle_conformance(
@@ -634,7 +413,7 @@ TEST_CASE("SYCL conformance: storage oracle identifies perturbed transfer map") 
 
 TEST_CASE("SYCL conformance: storage oracle covers every leaf width and padded shape") {
     SyclDevices devices;
-    SyclStorageOracle oracle(devices.candidate_allocator);
+    SyclStorageOracle oracle(*devices.candidate_context);
     REQUIRE(iom_conformance::run_storage_oracle_conformance(
             devices.conformance(), devices.candidate->supported_data_types(),
             oracle, &devices.gate));
@@ -643,7 +422,7 @@ TEST_CASE("SYCL conformance: storage oracle covers every leaf width and padded s
 
 TEST_CASE("SYCL conformance: asynchronous copies against the CPU reference") {
     SyclDevices devices;
-    SyclStorageOracle oracle(devices.candidate_allocator);
+    SyclStorageOracle oracle(*devices.candidate_context);
     iom_conformance::run_async_copy_conformance(
             devices.conformance(), devices.candidate->supported_data_types(),
             &devices.gate, &oracle);
@@ -684,7 +463,7 @@ TEST_CASE("SYCL conformance: compute methods reject capability without submittin
 
 TEST_CASE("SYCL conformance: full shared suite") {
     SyclDevices devices;
-    SyclStorageOracle oracle(devices.candidate_allocator);
+    SyclStorageOracle oracle(*devices.candidate_context);
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),

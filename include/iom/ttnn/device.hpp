@@ -23,9 +23,11 @@ namespace iom {
     /**
      * Creates one TTNN device with an owned native device context for the
      * requested backend-local ordinal. TTNN owns native tensor storage, so no
-     * iom::Allocator is supplied.
+     * iom::Allocator is supplied and no raw arena is manufactured. The queue
+     * configuration is immutable for the Device and applies to every queue
+     * it creates.
      */
     [[nodiscard]] std::unique_ptr<Device> make_ttnn_device(
-            std::uint32_t device_ordinal);
+            std::uint32_t device_ordinal, QueueConfig queue_config = {});
 
 }  // namespace iom
