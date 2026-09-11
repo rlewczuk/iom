@@ -15,7 +15,7 @@
 #include <deque>
 #include <exception>
 #include <limits>
-#include <memory>
+#include <optional>
 #include <new>
 #include <mutex>
 #include <stdexcept>
@@ -252,8 +252,10 @@ namespace iom {
         public:
             TtnnDevice(
                     std::uint32_t ordinal,
-                    std::shared_ptr<ttnn::MeshDevice> native_device)
-                    : ordinal_(ordinal), native_device_(std::move(native_device)) {}
+                    std::shared_ptr<ttnn::MeshDevice> native_device,
+                    QueueConfig queue_config)
+                : Device(queue_config), ordinal_(ordinal),
+                  native_device_(std::move(native_device)) {}
 
             TtnnDevice(const TtnnDevice&) = delete;
             TtnnDevice& operator=(const TtnnDevice&) = delete;
@@ -532,13 +534,11 @@ namespace iom {
                 return detail::FenceResult::failed(
                         std::current_exception());
             }
-        }
-
 class TtnnQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
-        const TensorView* source = nullptr;
-        TensorView* destination = nullptr;
+        std::optional<ttnn_detail::CopySnapshot> source;
+        std::optional<ttnn_detail::CopySnapshot> destination;
         bool no_op = false;
         bool is_binary = false;
         DeviceOps::BinaryOperation operation =
@@ -554,10 +554,21 @@ class TtnnQueue final : public DeviceOps {
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
 
-        Task(std::uint64_t sequence_, const TensorView& source_,
-             TensorView& destination_, bool no_op_)
-            : sequence(sequence_), source(&source_), destination(&destination_),
-              no_op(no_op_) {}
+        Task(
+                std::uint64_t sequence_, const CopyRequest& request,
+                detail::EntryRegistration entries)
+            : sequence(sequence_),
+              source(ttnn_detail::CopySnapshot{
+                      request.source.spec, request.source.native_handle,
+                      request.source.plane_offset,
+                      request.source.plane_strides}),
+              destination(ttnn_detail::CopySnapshot{
+                      request.destination.spec,
+                      request.destination.native_handle,
+                      request.destination.plane_offset,
+                      request.destination.plane_strides}),
+              no_op(request.no_op), source_entry_id(entries.source),
+              destination_entry_id(entries.destination) {}
         Task(
                 std::uint64_t sequence_,
                 DeviceOps::BinaryOperation operation_,
@@ -600,12 +611,11 @@ public:
     }
 
     ~TtnnQueue() override {
-        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
-        // The drain completes every published task, including retained-failure
-        // sequences left by an un-drainable failed submission: complete_task
-        // retries the native finish and delivers the retained failure to the
-        // wait tokens, under the device API mutex.
+        // Drain published tasks while the native worker and device state are
+        // still alive; unresolved registrations are invalidated only after
+        // their terminal callbacks have had a chance to prove completion.
         worker_.shutdown_and_drain();
+        state_->registry.invalidate_entries_for_queue(registry_queue_id_);
     }
 
     oid copy_impl(
@@ -613,12 +623,27 @@ public:
             TensorView& destination) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
-        const bool no_op = identical_window(source, destination);
-        return submit(
-                [this, &source, &destination, no_op](
-                        std::uint64_t sequence) {
-                    Task task(sequence, source, destination, no_op);
-                    worker_.submit_copy(std::move(task));
+#ifdef IOM_ENABLE_TESTING
+        consume_copy_registration_fault();
+#endif
+        detail::Fence fence = build_ttnn_fence(*device_);
+        return submit_copy(
+                source, destination, *state_, registry_queue_id_, fence,
+                [this](std::uint64_t sequence,
+                       const CopyRequest& captured,
+                       detail::EntryRegistration entries) {
+                    try {
+                        worker_.submit_copy(
+                                Task(sequence, captured, entries));
+                    } catch (...) {
+                        state_->registry.remove_entry_if_present(
+                                entries.source,
+                                captured.source.native_handle);
+                        state_->registry.remove_entry_if_present(
+                                entries.destination,
+                                captured.destination.native_handle);
+                        std::rethrow_exception(std::current_exception());
+                    }
                 });
     }
     oid binary_impl(const BinaryRequest& request) override {
@@ -628,20 +653,29 @@ public:
                 request, *state_, registry_queue_id_, fence,
                 [this](std::uint64_t sequence, const BinaryRequest& captured,
                        detail::BinaryEntryRegistration entries) {
-                    ttnn_detail::BinaryRequest internal{
-                            {captured.lhs.spec, captured.lhs.native_handle,
-                             captured.lhs.plane_offset,
-                             captured.lhs.logical_plane_strides},
-                            {captured.rhs.spec, captured.rhs.native_handle,
-                             captured.rhs.plane_offset,
-                             captured.rhs.logical_plane_strides},
-                            {captured.out.spec, captured.out.native_handle,
-                             captured.out.plane_offset,
-                             captured.out.logical_plane_strides},
-                            captured.result_shape};
-                    worker_.submit_copy(
-                            Task(sequence, captured.operation, internal, entries,
-                                 captured.workspace_lease));
+                    try {
+                        ttnn_detail::BinaryRequest internal{
+                                {captured.lhs.spec, captured.lhs.native_handle,
+                                 captured.lhs.plane_offset,
+                                 captured.lhs.logical_plane_strides},
+                                {captured.rhs.spec, captured.rhs.native_handle,
+                                 captured.rhs.plane_offset,
+                                 captured.rhs.logical_plane_strides},
+                                {captured.out.spec, captured.out.native_handle,
+                                 captured.out.plane_offset,
+                                 captured.out.logical_plane_strides},
+                                captured.result_shape};
+                        worker_.submit_copy(
+                                Task(sequence, captured.operation, internal,
+                                     entries, captured.workspace_lease));
+                    } catch (...) {
+                        state_->registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        detail::complete_workspace_lease(
+                                *state_, captured.workspace_lease, true);
+                        std::rethrow_exception(std::current_exception());
+                    }
                 });
     }
     void execute(Task& task) {
@@ -754,24 +788,9 @@ public:
     }
 
     void execute_copy(Task& task) {
-        // The transaction registers source and destination ownership before
-        // any native plane reaches the mesh, so every submitted command is
-        // associated with a completion record from the instant it is
-        // enqueued. A failure during registration or outcome insertion
-        // happens before any submission: roll back the partial entries and
-        // rethrow, with nothing pending on the device.
-        const detail::Fence fence = build_ttnn_fence(*device_);
-        detail::EntryRegistration entries;
+        const detail::EntryRegistration entries{
+                task.source_entry_id, task.destination_entry_id};
         try {
-#ifdef IOM_ENABLE_TESTING
-            consume_copy_registration_fault();
-#endif
-            entries = detail::register_copy_entries(
-                    *state_, registry_queue_id_, task.sequence,
-                    const_cast<void*>(task.source->native_handle()),
-                    task.destination->native_handle(), fence);
-            task.source_entry_id = entries.source;
-            task.destination_entry_id = entries.destination;
             {
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
 #ifdef IOM_ENABLE_TESTING
@@ -788,16 +807,12 @@ public:
                 }
             }
         } catch (...) {
-            if (entries.source != 0) {
-                state_->registry.remove_entry_if_present(
-                        entries.source,
-                        const_cast<void*>(task.source->native_handle()));
-            }
-            if (entries.destination != 0) {
-                state_->registry.remove_entry_if_present(
-                        entries.destination,
-                        task.destination->native_handle());
-            }
+            state_->registry.remove_entry_if_present(
+                    entries.source,
+                    task.source->native_handle);
+            state_->registry.remove_entry_if_present(
+                    entries.destination,
+                    task.destination->native_handle);
             throw;
         }
 
@@ -815,10 +830,10 @@ public:
         try {
             const ttnn::Tensor* source_planes =
                     static_cast<const ttnn::Tensor*>(
-                            task.source->native_handle());
+                            task.source->native_handle);
             ttnn::Tensor* destination_planes =
                     static_cast<ttnn::Tensor*>(
-                            task.destination->native_handle());
+                            task.destination->native_handle);
             ttnn_detail::copy_planes(
                     *task.source, source_planes,
                     *task.destination, destination_planes,
@@ -844,10 +859,10 @@ public:
             // propagates synchronously with no device work outstanding.
             state_->registry.remove_entry_if_present(
                     entries.source,
-                    const_cast<void*>(task.source->native_handle()));
+                    task.source->native_handle);
             state_->registry.remove_entry_if_present(
                     entries.destination,
-                    task.destination->native_handle());
+                    task.destination->native_handle);
             {
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
                 outcomes_.erase(task.sequence);
@@ -884,10 +899,10 @@ public:
         }
         state_->registry.remove_entry_if_present(
                 entries.source,
-                const_cast<void*>(task.source->native_handle()));
+                task.source->native_handle);
         state_->registry.remove_entry_if_present(
                 entries.destination,
-                task.destination->native_handle());
+                task.destination->native_handle);
         {
             std::lock_guard<std::mutex> lock(outcome_mutex_);
             outcomes_.erase(task.sequence);
@@ -1141,7 +1156,7 @@ void TtnnQueue::fence_through_sequence(
     }
 
     std::unique_ptr<Device> make_ttnn_device(
-            std::uint32_t device_ordinal, QueueConfig) {
+            std::uint32_t device_ordinal, QueueConfig queue_config) {
         const std::size_t device_count =
                 tt::tt_metal::GetNumAvailableDevices();
         if (static_cast<std::size_t>(device_ordinal) >= device_count
@@ -1153,7 +1168,8 @@ void TtnnQueue::fence_through_sequence(
 
         return std::make_unique<TtnnDevice>(
                 device_ordinal,
-                ttnn::open_mesh_device(static_cast<int>(device_ordinal)));
+                ttnn::open_mesh_device(static_cast<int>(device_ordinal)),
+                queue_config);
     }
 
 }  // namespace iom

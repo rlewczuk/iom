@@ -56,8 +56,9 @@ namespace iom {
      */
     class Device {
     public:
+        explicit Device(QueueConfig queue_config = {})
+                : queue_config_(queue_config) {}
         virtual ~Device() = default;
-        Device() = default;
         Device(const Device&) = delete;
         Device& operator=(const Device&) = delete;
         Device(Device&&) = delete;
@@ -92,6 +93,10 @@ namespace iom {
                 create_workspace(std::size_t bytes) = 0;
         [[nodiscard]] virtual std::unique_ptr<DeviceOps> create_ops() = 0;
 
+        [[nodiscard]] const QueueConfig& queue_config() const noexcept {
+            return queue_config_;
+        }
+
         /**
          * True exactly when `workspace` is a live owner created by this
          * Device. The pointer is used only as an opaque identity for the
@@ -100,6 +105,8 @@ namespace iom {
          */
         [[nodiscard]] bool owns_workspace(
                 const RawWorkspace* workspace) const noexcept;
+
+        friend class DeviceOps;
 
     protected:
         friend class RawWorkspace;
@@ -110,9 +117,18 @@ namespace iom {
         void unregister_workspace(
                 const RawWorkspace* workspace) const noexcept;
 
+        // Device-local admission reservation. DeviceOps acquires this slot
+        // before publishing any queue worker/native stream and releases it
+        // only after the queue has stopped accepting and drained.
+        void reserve_queue_slot() const;
+        void release_queue_slot() const noexcept;
+
     private:
+        QueueConfig queue_config_;
         mutable std::mutex workspace_registry_mutex_;
         mutable std::set<const RawWorkspace*> live_workspaces_;
+        mutable std::mutex queue_registry_mutex_;
+        mutable std::size_t live_queue_count_ = 0;
     };
 
 }  // namespace iom

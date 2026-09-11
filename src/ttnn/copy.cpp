@@ -102,6 +102,29 @@ namespace iom::ttnn_detail {
             }
             return plane;
         }
+        std::size_t snapshot_plane_count(const CopySnapshot& view) {
+            const std::span<const std::size_t> dimensions =
+                    view.spec.shape.dimensions();
+            std::size_t planes = 1;
+            for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
+                planes *= dimensions[i];
+            }
+            return planes;
+        }
+
+        std::size_t snapshot_owner_plane_at(
+                const CopySnapshot& view, std::size_t index) {
+            const std::span<const std::size_t> dimensions =
+                    view.spec.shape.dimensions();
+            const std::size_t leading_rank = dimensions.size() - 2;
+            std::size_t plane = view.plane_offset;
+            for (std::size_t k = leading_rank; k-- > 0;) {
+                plane += (index % dimensions[k]) * view.plane_strides[k];
+                index /= dimensions[k];
+            }
+            return plane;
+        }
+
 
         // Native staging uses whole carrier cells; public logical encodings
         // may be packed and are converted by the transfer helpers below.
@@ -402,17 +425,20 @@ namespace iom::ttnn_detail {
         }
     }
     void copy_planes(
-            const TensorView& source, const ttnn::Tensor* source_planes,
-            const TensorView& destination, ttnn::Tensor* destination_planes,
+            const CopySnapshot& source, const ttnn::Tensor* source_planes,
+            const CopySnapshot& destination,
+            ttnn::Tensor* destination_planes,
             bool& any_submitted) {
         any_submitted = false;
-        const std::size_t count = view_plane_count(source);
+        const std::size_t count = snapshot_plane_count(source);
         for (std::size_t index = 0; index < count; ++index) {
 #ifdef IOM_ENABLE_TESTING
             fail_copy_planes_submission_at(index);
 #endif
-            ttnn::copy(source_planes[owner_plane_at(source, index)],
-                       destination_planes[owner_plane_at(destination, index)]);
+            ttnn::copy(
+                    source_planes[snapshot_owner_plane_at(source, index)],
+                    destination_planes[
+                            snapshot_owner_plane_at(destination, index)]);
             any_submitted = true;
         }
     }

@@ -12,8 +12,13 @@ namespace iom::ttnn_detail {
 class TtnnHostStaging;
 void region_from_host(tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&, const TensorView&, ttnn::Tensor*, std::span<const std::byte>);
 void region_to_host(tt::tt_metal::distributed::MeshDevice&, TtnnHostStaging&, const TensorView&, const ttnn::Tensor*, std::span<std::byte>);
-void copy_planes(const TensorView&, const ttnn::Tensor*, const TensorView&, ttnn::Tensor*, bool&);
-
+struct CopySnapshot {
+    TensorSpec spec;
+    void* native_handle;
+    std::size_t plane_offset;
+    std::vector<std::size_t> plane_strides;
+};
+void copy_planes(const CopySnapshot&, const ttnn::Tensor*, const CopySnapshot&, ttnn::Tensor*, bool&);
 struct BinarySnapshot {
     TensorSpec spec;
     void* native_handle;

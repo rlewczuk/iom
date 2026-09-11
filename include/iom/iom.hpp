@@ -1,14 +1,17 @@
 #pragma once
 
 #include <array>
-#include <initializer_list>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -359,6 +362,18 @@ namespace iom {
             bool broadcasts;
         };
 
+        struct CopyViewSnapshot {
+            TensorSpec spec;
+            const Device* device_identity;
+            const Tensor* owner_identity;
+            void* native_handle;
+            std::size_t plane_offset;
+            std::vector<std::size_t> plane_strides;
+        };
+
+        [[nodiscard]] static CopyViewSnapshot snapshot_copy_view(
+                const TensorView& view);
+
         struct BinaryRequest {
             BinaryOperation operation;
             BinaryViewSnapshot lhs;
@@ -394,6 +409,22 @@ namespace iom {
                   workspace_lease(other.workspace_lease) {}
         };
 
+        // Immutable host-side copy descriptor retained by admission. It
+        // contains value-copied view metadata and stable owner identities; no
+        // callback may retain the caller's borrowed view object.
+        struct CopyRequest {
+            CopyViewSnapshot source;
+            CopyViewSnapshot destination;
+            bool no_op = false;
+
+            CopyRequest(
+                    const TensorView& source_, const TensorView& destination_,
+                    bool no_op_)
+                : source(snapshot_copy_view(source_)),
+                  destination(snapshot_copy_view(destination_)),
+                  no_op(no_op_) {}
+        };
+
         DeviceOps();
         explicit DeviceOps(const Device& device);
 
@@ -415,8 +446,6 @@ namespace iom {
          * Receives an already fully validated request snapshot and must
          * stay pure: no allocation beyond the returned value, no
          * registration, lease, token/queue resource, or backend effect.
-         * The base reports `{0, 1}`; SYCL overrides with its checked
-         * whole-plane staging sum.
          */
         [[nodiscard]] virtual WorkspaceRequirements
                 binary_workspace_requirements(const BinaryRequest& request);
@@ -447,78 +476,158 @@ namespace iom {
         [[nodiscard]] static std::runtime_error unsupported(
                 std::string_view backend, std::string_view operation);
 
+        // Admission callbacks are prepared synchronously, then retained in
+        // an immutable FIFO node until a native credit is available.
+        oid submit_prepared(
+                std::function<void(std::uint64_t)> prepare,
+                std::function<void(std::uint64_t)> dispatch,
+                std::function<void()> rollback = {});
+
         template <typename QueueWork>
         oid submit(QueueWork queue_work) {
-            std::uint64_t sequence = 0;
-            {
-                std::lock_guard<std::mutex> lock(completion_mutex_);
-                if (next_sequence_ > kMaxSequence) {
-                    throw std::overflow_error(
-                        "DeviceOps 55-bit submission sequence is exhausted");
-                }
-                sequence = next_sequence_++;
-            }
-            try {
-                queue_work(sequence);
-            } catch (...) {
-                std::lock_guard<std::mutex> lock(completion_mutex_);
-                if (next_sequence_ == sequence + 1
-                        && completed_ < sequence) {
-                    pending_failures_.erase(sequence);
-                    next_sequence_ = sequence;
-                }
-                // A queue callback may complete the sequence before
-                // reporting a post-completion failure. Preserve that
-                // completion while propagating the callback exception so the
-                // facade maps it to DeviceError instead of returning a
-                // seemingly successful token.
-                throw;
-            }
-            return encode_token(sequence);
+            auto work = std::make_shared<QueueWork>(std::move(queue_work));
+            return submit_prepared(
+                    {}, [work](std::uint64_t sequence) {
+                        (*work)(sequence);
+                    });
         }
+
+        template <typename QueueWork>
+        oid submit_copy(
+                const TensorView& source, const TensorView& destination,
+                detail::RegistryState& state, detail::QueueId queue_id,
+                const detail::Fence& fence, QueueWork queue_work) {
+            struct Prepared {
+                CopyRequest request;
+                detail::EntryRegistration entries;
+                std::function<void(
+                        std::uint64_t, const CopyRequest&,
+                        detail::EntryRegistration)> work;
+
+                Prepared(
+                        const TensorView& source_,
+                        const TensorView& destination_, bool no_op_,
+                        QueueWork work_)
+                    : request(source_, destination_, no_op_),
+                      work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    source, destination, identical_window(source, destination),
+                    std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, fence](
+                            std::uint64_t sequence) {
+                        prepared->entries = detail::register_copy_entries(
+                                state, queue_id, sequence,
+                                prepared->request.source.native_handle,
+                                prepared->request.destination.native_handle,
+                                fence);
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.source != 0) {
+                            state.registry.remove_entry_if_present(
+                                    prepared->entries.source,
+                                    prepared->request.source.native_handle);
+                        }
+                        if (prepared->entries.destination != 0) {
+                            state.registry.remove_entry_if_present(
+                                    prepared->entries.destination,
+                                    prepared->request.destination.native_handle);
+                        }
+                    });
+        }
+
         template <typename QueueWork>
         oid submit_binary(
                 const BinaryRequest& request, detail::RegistryState& state,
                 detail::QueueId queue_id, const detail::Fence& fence,
                 QueueWork queue_work) {
-            return submit([&](std::uint64_t sequence) {
-                BinaryRequest captured = request;
+            struct Prepared {
+                BinaryRequest request;
                 detail::WorkspaceLease workspace_lease;
                 detail::BinaryEntryRegistration entries;
-                try {
-                    if (request.workspace_requirements.bytes != 0) {
-                        workspace_lease = detail::acquire_workspace_lease(
-                                state, request.workspace.owner_identity(),
-                                request.workspace.range_address(),
-                                request.workspace.byte_size(), sequence,
-                                queue_id, fence);
-                        captured.workspace_lease = workspace_lease;
-                    }
-                    const std::array<detail::BinaryOwnerRegistration, 3>
-                            owners{{
-                                    {request.lhs.owner_identity,
-                                     request.lhs.native_handle},
-                                    {request.rhs.owner_identity,
-                                     request.rhs.native_handle},
-                                    {request.out.owner_identity,
-                                     request.out.native_handle},
-                            }};
-                    entries = detail::register_binary_entries(
-                            state, queue_id, sequence, owners, fence);
-                    queue_work(sequence, captured, entries);
-                } catch (...) {
-                    if (entries.count != 0) {
-                        state.registry.remove_entries(
-                                std::span<const detail::EntryId>(
-                                        entries.entries.data(), entries.count));
-                    }
-                    if (workspace_lease.entry_id != 0) {
-                        detail::complete_workspace_lease(
-                                state, workspace_lease, true);
-                    }
-                    throw;
-                }
-            });
+                std::function<void(
+                        std::uint64_t, const BinaryRequest&,
+                        detail::BinaryEntryRegistration)> work;
+
+                Prepared(
+                        const BinaryRequest& request_, QueueWork work_)
+                    : request(request_), work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    request, std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, fence](
+                            std::uint64_t sequence) {
+                        try {
+                            if (prepared->request.workspace_requirements.bytes
+                                    != 0) {
+                                prepared->workspace_lease =
+                                        detail::acquire_workspace_lease(
+                                                state,
+                                                prepared->request.workspace
+                                                        .owner_identity(),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
+                                                sequence, queue_id, fence);
+                                prepared->request.workspace_lease =
+                                        prepared->workspace_lease;
+                            }
+                            const std::array<detail::BinaryOwnerRegistration, 3>
+                                    owners{{
+                                            {prepared->request.lhs
+                                                     .owner_identity,
+                                             prepared->request.lhs.native_handle},
+                                            {prepared->request.rhs
+                                                     .owner_identity,
+                                             prepared->request.rhs.native_handle},
+                                            {prepared->request.out
+                                                     .owner_identity,
+                                             prepared->request.out.native_handle},
+                                    }};
+                            prepared->entries = detail::register_binary_entries(
+                                    state, queue_id, sequence, owners, fence);
+                        } catch (...) {
+                            if (prepared->entries.count != 0) {
+                                state.registry.remove_entries(
+                                        std::span<const detail::EntryId>(
+                                                prepared->entries.entries.data(),
+                                                prepared->entries.count));
+                                prepared->entries = {};
+                            }
+                            if (prepared->workspace_lease.entry_id != 0) {
+                                detail::complete_workspace_lease(
+                                        state, prepared->workspace_lease, true);
+                                prepared->workspace_lease = {};
+                                prepared->request.workspace_lease = {};
+                            }
+                            throw;
+                        }
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.count != 0) {
+                            state.registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            prepared->entries.entries.data(),
+                                            prepared->entries.count));
+                        }
+                        if (prepared->workspace_lease.entry_id != 0) {
+                            detail::complete_workspace_lease(
+                                    state, prepared->workspace_lease, true);
+                        }
+                    });
         }
 
         void complete(std::uint64_t sequence,
@@ -526,6 +635,10 @@ namespace iom {
         void commit_failure(std::uint64_t sequence,
                             std::exception_ptr failure);
         void seek_next_sequence(std::uint64_t next_sequence);
+
+        // Backend destructors call this before their worker/native members
+        // disappear. It closes acceptance and drains accepted FIFO nodes.
+        void close_and_drain() noexcept;
 
     private:
         [[nodiscard]] oid invoke(oid result) noexcept;
@@ -537,7 +650,7 @@ namespace iom {
         [[nodiscard]] oid encode_token(std::uint64_t sequence) const noexcept;
 
         const Device* device_ = nullptr;
-        std::uint8_t queue_id_;
+        std::uint8_t queue_id_ = 0;
         static constexpr std::uint64_t kSequenceBits = 55;
         static constexpr std::uint64_t kSequenceMask =
                 (std::uint64_t{1} << kSequenceBits) - 1;
@@ -549,6 +662,26 @@ namespace iom {
         std::condition_variable completion_cv_;
         std::map<std::uint64_t, std::exception_ptr> failures_;
         std::map<std::uint64_t, std::exception_ptr> pending_failures_;
+        struct AdmissionNode {
+            std::function<void(std::uint64_t)> dispatch;
+            // Resources prepared before admission are released if queue
+            // teardown drains this parked node before dispatch.
+            std::function<void()> rollback;
+            bool executing = false;
+        };
+
+        void pump_admission(
+                std::exception_ptr* synchronous_failure = nullptr,
+                std::uint64_t synchronous_sequence = 0) noexcept;
+        void abandon_sequence(std::uint64_t sequence) noexcept;
+
+        std::map<std::uint64_t, AdmissionNode> admission_nodes_;
+        std::deque<std::uint64_t> admission_fifo_;
+        std::size_t admission_credits_ = 0;
+        std::size_t admission_capacity_ = 16;
+        bool admission_pumping_ = false;
+        bool admission_closing_ = false;
+        bool queue_slot_reserved_ = false;
     };
 
     class Block {

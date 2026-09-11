@@ -647,6 +647,21 @@ namespace iom {
         live_workspaces_.erase(workspace);
     }
 
+    void Device::reserve_queue_slot() const {
+        std::lock_guard<std::mutex> lock(queue_registry_mutex_);
+        if (live_queue_count_ == 4) {
+            throw std::bad_alloc();
+        }
+        ++live_queue_count_;
+    }
+
+    void Device::release_queue_slot() const noexcept {
+        std::lock_guard<std::mutex> lock(queue_registry_mutex_);
+        if (live_queue_count_ != 0) {
+            --live_queue_count_;
+        }
+    }
+
     namespace {
 
         // The only global queue state: the live eight-bit queue ids. Bit i
@@ -839,6 +854,14 @@ namespace iom {
     }  // namespace
 
 
+    DeviceOps::CopyViewSnapshot DeviceOps::snapshot_copy_view(
+            const TensorView& view) {
+        return DeviceOps::CopyViewSnapshot{
+                view.spec(), &view.device(), view.owner_identity(),
+                const_cast<void*>(view.native_handle()), view.plane_offset(),
+                {view.plane_strides().begin(), view.plane_strides().end()}};
+    }
+
     DeviceOps::BinaryViewSnapshot DeviceOps::snapshot_binary_view(
             const TensorView& view,
             std::span<const std::size_t> result_dimensions) {
@@ -994,8 +1017,20 @@ namespace iom {
             : queue_id_(lease_queue_id()) {}
 
     DeviceOps::DeviceOps(const Device& device)
-            : device_(&device), queue_id_(lease_queue_id()) {}
-
+            : device_(&device), queue_id_(0) {
+        device.reserve_queue_slot();
+        queue_slot_reserved_ = true;
+        try {
+            queue_id_ = lease_queue_id();
+            admission_capacity_ =
+                    std::max<std::size_t>(
+                            1, device.queue_config().max_in_flight_per_queue);
+        } catch (...) {
+            device.release_queue_slot();
+            queue_slot_reserved_ = false;
+            throw;
+        }
+    }
 
     const Device& DeviceOps::queue_device() const {
         if (device_ == nullptr) {
@@ -1015,6 +1050,189 @@ namespace iom {
     }
     oid DeviceOps::binary_impl(const BinaryRequest&) {
         throw UnsupportedOperation();
+    }
+    oid DeviceOps::submit_prepared(
+            std::function<void(std::uint64_t)> prepare,
+            std::function<void(std::uint64_t)> dispatch,
+            std::function<void()> rollback) {
+        std::uint64_t sequence = 0;
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            if (admission_closing_) {
+                throw std::logic_error("operation queue is closed");
+            }
+            if (next_sequence_ > kMaxSequence) {
+                throw std::overflow_error(
+                        "DeviceOps 55-bit submission sequence is exhausted");
+            }
+            sequence = next_sequence_++;
+        }
+
+        try {
+            if (prepare) {
+                prepare(sequence);
+            }
+            AdmissionNode node;
+            node.dispatch = std::move(dispatch);
+            // Keep a second callback handle locally so an insertion or FIFO
+            // allocation failure can still roll back prepared ownership.
+            // The node-owned copy is used if teardown drains it while parked.
+            node.rollback = rollback;
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex_);
+                if (admission_closing_) {
+                    throw std::logic_error("operation queue is closed");
+                }
+                const auto [it, inserted] =
+                        admission_nodes_.emplace(sequence, std::move(node));
+                if (!inserted) {
+                    throw std::logic_error(
+                            "duplicate admission sequence");
+                }
+                try {
+                    admission_fifo_.push_back(sequence);
+                } catch (...) {
+                    admission_nodes_.erase(it);
+                    throw;
+                }
+            }
+        } catch (...) {
+            if (rollback) {
+                try {
+                    rollback();
+                } catch (...) {
+                }
+            }
+            abandon_sequence(sequence);
+            throw;
+        }
+        std::exception_ptr dispatch_failure;
+        pump_admission(&dispatch_failure, sequence);
+        if (dispatch_failure) {
+            std::rethrow_exception(dispatch_failure);
+        }
+        return encode_token(sequence);
+    }
+
+    void DeviceOps::abandon_sequence(std::uint64_t sequence) noexcept {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        pending_failures_.erase(sequence);
+        if (next_sequence_ == sequence + 1 && completed_ < sequence) {
+            --next_sequence_;
+            return;
+        }
+        skipped_sequences_.emplace(sequence, sequence + 1);
+    }
+
+    void DeviceOps::pump_admission(
+            std::exception_ptr* synchronous_failure,
+            std::uint64_t synchronous_sequence) noexcept {
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            if (admission_pumping_) {
+                return;
+            }
+            admission_pumping_ = true;
+        }
+        for (;;) {
+            std::uint64_t sequence = 0;
+            std::function<void(std::uint64_t)> dispatch;
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex_);
+                if (admission_credits_ >= admission_capacity_
+                        || admission_fifo_.empty()) {
+                    admission_pumping_ = false;
+                    return;
+                }
+                auto candidate = admission_fifo_.begin();
+                while (candidate != admission_fifo_.end()) {
+                    const auto it = admission_nodes_.find(*candidate);
+                    if (it == admission_nodes_.end()) {
+                        candidate = admission_fifo_.erase(candidate);
+                        continue;
+                    }
+                    if (!it->second.executing) {
+                        break;
+                    }
+                    ++candidate;
+                }
+                if (candidate == admission_fifo_.end()) {
+                    admission_pumping_ = false;
+                    return;
+                }
+                sequence = *candidate;
+                const auto it = admission_nodes_.find(sequence);
+                if (it == admission_nodes_.end()) {
+                    admission_fifo_.erase(candidate);
+                    continue;
+                }
+                it->second.executing = true;
+                ++admission_credits_;
+                dispatch = std::move(it->second.dispatch);
+            }
+            try {
+                dispatch(sequence);
+            } catch (...) {
+                const std::exception_ptr failure =
+                        std::current_exception();
+                const bool preacceptance =
+                        synchronous_failure != nullptr
+                        && sequence == synchronous_sequence;
+                std::function<void()> rollback;
+                bool unaccepted = false;
+                {
+                    std::lock_guard<std::mutex> lock(completion_mutex_);
+                    const auto node = admission_nodes_.find(sequence);
+                    if (node != admission_nodes_.end()) {
+                        if (preacceptance) {
+                            // A dispatch failure while the submitting call
+                            // is still on the stack is pre-acceptance. Drop
+                            // its node and sequence instead of manufacturing
+                            // a positive token for work that never linked.
+                            rollback = std::move(node->second.rollback);
+                            if (node->second.executing
+                                    && admission_credits_ != 0) {
+                                --admission_credits_;
+                            }
+                            admission_nodes_.erase(node);
+                            const auto fifo = std::find(
+                                    admission_fifo_.begin(),
+                                    admission_fifo_.end(), sequence);
+                            if (fifo != admission_fifo_.end()) {
+                                admission_fifo_.erase(fifo);
+                            }
+                            completion_cv_.notify_all();
+                            unaccepted = true;
+                        } else {
+                            // The token was already returned before a
+                            // parked-node retirement failed. Keep it
+                            // terminally waitable and only release prepared
+                            // state that never reached the backend.
+                            rollback = std::move(node->second.rollback);
+                        }
+                    }
+                }
+                if (rollback) {
+                    try {
+                        rollback();
+                    } catch (...) {
+                    }
+                }
+                if (preacceptance) {
+                    if (unaccepted) {
+                        abandon_sequence(sequence);
+                    }
+                    if (*synchronous_failure == nullptr) {
+                        *synchronous_failure = failure;
+                    }
+                } else {
+                    try {
+                        complete(sequence, failure);
+                    } catch (...) {
+                    }
+                }
+            }
+        }
     }
 
     oid DeviceOps::copy_impl(
@@ -1348,7 +1566,12 @@ namespace iom {
         }
     }
     DeviceOps::~DeviceOps() {
+        close_and_drain();
         release_queue_id(queue_id_);
+        if (queue_slot_reserved_ && device_ != nullptr) {
+            device_->release_queue_slot();
+            queue_slot_reserved_ = false;
+        }
     }
 
     std::uint8_t DeviceOps::lease_queue_id() {
@@ -1435,23 +1658,99 @@ namespace iom {
         if (sequence == 0) {
             throw std::invalid_argument("completion sequence is zero");
         }
-        std::lock_guard<std::mutex> lock(completion_mutex_);
-        if (sequence >= next_sequence_) {
-            throw std::invalid_argument(
-                    "completion of a sequence that was never submitted");
+        bool should_pump = false;
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            if (sequence >= next_sequence_) {
+                throw std::invalid_argument(
+                        "completion of a sequence that was never submitted");
+            }
+            const auto node = admission_nodes_.find(sequence);
+            if (node == admission_nodes_.end()) {
+                if (failures_.find(sequence) != failures_.end()) {
+                    return;
+                }
+                throw std::invalid_argument(
+                        "completion of an unknown admission sequence");
+            }
+            if (const auto pending = pending_failures_.find(sequence);
+                    pending != pending_failures_.end()) {
+                if (!failure) {
+                    failure = pending->second;
+                }
+                pending_failures_.erase(pending);
+            }
+            if (failure && failures_.find(sequence) == failures_.end()) {
+                failures_.emplace(sequence, failure);
+            }
+            if (node->second.executing && admission_credits_ != 0) {
+                --admission_credits_;
+            }
+            admission_nodes_.erase(node);
+            if (!admission_fifo_.empty()
+                    && admission_fifo_.front() == sequence) {
+                admission_fifo_.pop_front();
+            } else {
+                const auto fifo = std::find(
+                        admission_fifo_.begin(), admission_fifo_.end(),
+                        sequence);
+                if (fifo != admission_fifo_.end()) {
+                    admission_fifo_.erase(fifo);
+                }
+            }
+            if (completed_ < sequence) {
+                completed_ = sequence;
+            }
+            completion_cv_.notify_all();
+            should_pump = !admission_closing_;
         }
-        if (const auto pending = pending_failures_.find(sequence);
-                pending != pending_failures_.end()) {
-            failure = std::move(pending->second);
-            pending_failures_.erase(pending);
+        if (should_pump) {
+            pump_admission();
         }
-        if (failure) {
-            failures_[sequence] = std::move(failure);
+    }
+
+    void DeviceOps::close_and_drain() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            admission_closing_ = true;
         }
-        if (completed_ < sequence) {
-            completed_ = sequence;
+        // A derived worker may have completed all native work already. Any
+        // callback that never published completion is terminally failed here;
+        // token history remains observable and no future submission can
+        // replace it.
+        std::vector<std::uint64_t> unresolved;
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex_);
+            unresolved.assign(admission_fifo_.begin(), admission_fifo_.end());
         }
-        completion_cv_.notify_all();
+        for (const std::uint64_t sequence : unresolved) {
+            // A parked node has prepared ownership but has never reached a
+            // backend callback. Release that state before making its token
+            // terminal; executing nodes are left to their backend drain and
+            // completion path, which may need to quarantine unknown work.
+            std::function<void()> rollback;
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex_);
+                const auto node = admission_nodes_.find(sequence);
+                if (node != admission_nodes_.end()
+                        && !node->second.executing) {
+                    rollback = std::move(node->second.rollback);
+                }
+            }
+            if (rollback) {
+                try {
+                    rollback();
+                } catch (...) {
+                }
+            }
+            try {
+                complete(
+                        sequence,
+                        std::make_exception_ptr(std::runtime_error(
+                                "operation queue drained before completion")));
+            } catch (...) {
+            }
+        }
     }
 
     /**

@@ -3,13 +3,17 @@
 
 #include <algorithm>
 #include <cassert>
-#include <exception>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <exception>
+#include <functional>
 #include <mutex>
 #include <cstring>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -244,10 +248,13 @@ namespace iom {
 
         template <typename Op>
         static inline void for_each_tile_lockstep(
-                const TensorView& source, const TensorView& destination,
+                const TensorSpec& source_spec,
+                std::size_t source_offset,
+                std::span<const std::size_t> source_strides,
+                const TensorSpec& destination_spec,
+                std::size_t destination_offset,
+                std::span<const std::size_t> destination_strides,
                 Op&& op) {
-            const TensorSpec& source_spec = source.spec();
-            const TensorSpec& destination_spec = destination.spec();
             const std::span<const std::size_t> source_dimensions =
                     source_spec.shape.dimensions();
             const std::size_t leading_rank = source_dimensions.size() - 2;
@@ -264,12 +271,8 @@ namespace iom {
                     detail::leaf_bits(source_spec.data_type);
             const std::size_t destination_bits =
                     detail::leaf_bits(destination_spec.data_type);
-            const std::span<const std::size_t> source_strides =
-                    source.plane_strides();
-            const std::span<const std::size_t> destination_strides =
-                    destination.plane_strides();
             bool identical_layout =
-                    source.plane_offset() == destination.plane_offset()
+                    source_offset == destination_offset
                     && source_strides.size() == destination_strides.size();
             for (std::size_t index = 0;
                  identical_layout && index < source_strides.size(); ++index) {
@@ -353,8 +356,8 @@ namespace iom {
                 }
             };
             visit(
-                    visit, 0, source.plane_offset(),
-                    destination.plane_offset());
+                    visit, 0, source_offset,
+                    destination_offset);
         }
 
 
@@ -362,8 +365,8 @@ namespace iom {
 
     class CpuDevice final : public Device {
     public:
-        explicit CpuDevice(Allocator& allocator)
-                : allocator_(allocator) {}
+        explicit CpuDevice(Allocator& allocator, QueueConfig queue_config)
+                : Device(queue_config), allocator_(allocator) {}
 
         [[nodiscard]] BackendKind backend_kind() const noexcept override {
             return BackendKind::CPU;
@@ -400,16 +403,36 @@ namespace iom {
                 : RawWorkspace(device, bytes) {}
     };
 
-    /**
-     * Owner of one standard-layout allocation. The Tensor base validates
-     * the specification before the body allocates; every construction
-     * failure after allocation frees the storage before propagating.
-     */
+    class CpuStorageCleanup final : public detail::CleanupAction {
+    public:
+        CpuStorageCleanup(Allocator& allocator, void* address)
+            : allocator_(allocator), address_(address) {}
+
+        void run() noexcept override {
+            detail::release_aligned_storage(allocator_, address_);
+            attempted_ = true;
+        }
+        [[nodiscard]] bool completed() const noexcept override {
+            return attempted_;
+        }
+        [[nodiscard]] bool failed() const noexcept override {
+            return false;
+        }
+        [[nodiscard]] std::exception_ptr failure() const noexcept override {
+            return nullptr;
+        }
+
+    private:
+        Allocator& allocator_;
+        void* address_;
+        bool attempted_ = false;
+    };
+
     class CpuTensor final : public Tensor {
     public:
         CpuTensor(const TensorSpec& spec, CpuDevice& device,
                   Allocator& allocator)
-                : Tensor(spec, device), allocator_(allocator) {
+                : Tensor(spec, device), device_(device), allocator_(allocator) {
             address_ = iom::detail::allocate_aligned_storage(
                     allocator_,
                     view().spec().tiled_storage_nbytes(),
@@ -426,10 +449,27 @@ namespace iom {
         }
 
         ~CpuTensor() noexcept override {
-            // CPU copies complete inline before CpuQueue::copy returns, so no
-            // deferred outstanding-work registry protection exists: release
-            // the allocator block exactly once, directly to the allocator.
-            iom::detail::release_aligned_storage(allocator_, address_);
+            void* address = address_;
+            if (address == nullptr) {
+                return;
+            }
+            detail::release_or_quarantine(
+                    device_.registry_state().registry, address,
+                    [this, address] {
+                        try {
+                            device_.registry_state().quarantine
+                                    .emplace<CpuStorageCleanup>(
+                                            allocator_, address);
+                            address_ = nullptr;
+                        } catch (...) {
+                            // Retain the address if quarantine bookkeeping
+                            // itself cannot allocate.
+                        }
+                    },
+                    [this] {
+                        iom::detail::release_aligned_storage(
+                                allocator_, address_);
+                    });
         }
 
     private:
@@ -613,19 +653,34 @@ namespace iom {
                         }
                     });
         }
+        CpuDevice& device_;
         Allocator& allocator_;
         void* address_ = nullptr;
     };
 
     class CpuQueue final : public DeviceOps {
+        struct HostTask {
+            std::function<void()> work;
+        };
+
     public:
         explicit CpuQueue(CpuDevice& device)
                 : DeviceOps(device),
                   device_(&device),
                   registry_queue_id_(
-                          detail::allocate_queue_id(device.registry_state())) {}
+                          detail::allocate_queue_id(device.registry_state())) {
+            worker_ = std::thread([this] { run_worker(); });
+        }
 
         ~CpuQueue() override {
+            {
+                std::lock_guard<std::mutex> lock(worker_mutex_);
+                worker_shutdown_ = true;
+            }
+            worker_cv_.notify_all();
+            if (worker_.joinable()) {
+                worker_.join();
+            }
             device_->registry_state().registry.invalidate_entries_for_queue(
                     registry_queue_id_);
         }
@@ -633,14 +688,47 @@ namespace iom {
         oid copy_impl(const TensorView& source, TensorView& destination) override {
             std::lock_guard<std::mutex> submission_lock(
                     submission_order_mutex_);
-            const bool no_op = identical_window(source, destination);
-            return submit(
-                    [this, &source, &destination, no_op](
-                            std::uint64_t sequence) {
-                        if (!no_op) {
-                            copy_elements(source, destination);
+            detail::Fence fence;
+            fence.invoke = &fence_pending;
+            return submit_copy(
+                    source, destination, device_->registry_state(),
+                    registry_queue_id_, fence,
+                    [this](std::uint64_t sequence,
+                           const CopyRequest& captured,
+                           detail::EntryRegistration entries) {
+                        try {
+                            enqueue(HostTask{
+                                    [this, sequence, captured, entries] {
+                                        std::exception_ptr failure;
+                                        try {
+                                            if (!captured.no_op) {
+                                                copy_elements(
+                                                        captured.source,
+                                                        captured.destination);
+                                            }
+                                        } catch (...) {
+                                            failure = std::current_exception();
+                                        }
+                                        const detail::SequenceOutcome outcome{
+                                                entries.source, entries.destination,
+                                                failure, false};
+                                        (void)detail::release_or_invalidate_entries(
+                                                device_->registry_state().registry,
+                                                outcome,
+                                                static_cast<bool>(failure), true);
+                                        complete(sequence, std::move(failure));
+                                    }});
+                        } catch (...) {
+                            device_->registry_state().registry
+                                    .remove_entry_if_present(
+                                            entries.source,
+                                            captured.source.native_handle);
+                            device_->registry_state().registry
+                                    .remove_entry_if_present(
+                                            entries.destination,
+                                            captured.destination.native_handle);
+                            throw;
                         }
-                        complete(sequence, nullptr);
                     });
         }
 
@@ -649,6 +737,42 @@ namespace iom {
         }
 
     private:
+        void enqueue(HostTask task) {
+            {
+                std::lock_guard<std::mutex> lock(worker_mutex_);
+                if (worker_shutdown_) {
+                    throw std::logic_error("CPU queue worker is shut down");
+                }
+                worker_tasks_.push_back(std::move(task));
+            }
+            worker_cv_.notify_one();
+        }
+
+        void run_worker() noexcept {
+            for (;;) {
+                HostTask task;
+                {
+                    std::unique_lock<std::mutex> lock(worker_mutex_);
+                    worker_cv_.wait(lock, [this] {
+                        return worker_shutdown_ || !worker_tasks_.empty();
+                    });
+                    if (worker_tasks_.empty()) {
+                        return;
+                    }
+                    task = std::move(worker_tasks_.front());
+                    worker_tasks_.pop_front();
+                }
+                try {
+                    task.work();
+                } catch (...) {
+                }
+            }
+        }
+
+        static detail::FenceResult fence_pending(
+                const detail::Fence&) noexcept {
+            return detail::FenceResult::pending();
+        }
         static detail::FenceResult fence_success(const detail::Fence&) noexcept {
             return detail::FenceResult::success();
         }
@@ -821,7 +945,7 @@ namespace iom {
                     submission_order_mutex_);
             const ScalarBinary scalar = select_binary(request.operation);
             detail::Fence fence;
-            fence.invoke = &fence_success;
+            fence.invoke = &fence_pending;
             return submit_binary(
                     request, device_->registry_state(), registry_queue_id_,
                     fence,
@@ -829,30 +953,49 @@ namespace iom {
                             std::uint64_t sequence,
                             const BinaryRequest& captured,
                             detail::BinaryEntryRegistration entries) {
-                        std::exception_ptr failure;
                         try {
-                            binary_elements(captured, scalar);
+                            enqueue(HostTask{
+                                    [this, scalar, sequence, captured, entries] {
+                                        std::exception_ptr failure;
+                                        try {
+                                            binary_elements(captured, scalar);
+                                        } catch (...) {
+                                            failure = std::current_exception();
+                                        }
+                                        (void)
+                                                detail::release_or_invalidate_binary_entries(
+                                                        device_->registry_state()
+                                                                .registry,
+                                                        entries,
+                                                        static_cast<bool>(failure),
+                                                        true);
+                                        detail::complete_workspace_lease(
+                                                device_->registry_state(),
+                                                captured.workspace_lease, true);
+                                        complete(sequence, std::move(failure));
+                                    }});
                         } catch (...) {
-                            failure = std::current_exception();
+                            device_->registry_state().registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            entries.entries.data(),
+                                            entries.count));
+                            detail::complete_workspace_lease(
+                                    device_->registry_state(),
+                                    captured.workspace_lease, true);
+                            throw;
                         }
-                        (void)detail::release_or_invalidate_binary_entries(
-                                device_->registry_state().registry, entries,
-                                static_cast<bool>(failure), true);
-                        detail::complete_workspace_lease(
-                                device_->registry_state(),
-                                captured.workspace_lease, true);
-                        complete(sequence, std::move(failure));
                     });
         }
 
         static void copy_elements(
-                const TensorView& source, TensorView& destination) {
+                const CopyViewSnapshot& source,
+                const CopyViewSnapshot& destination) {
             const auto* source_base = static_cast<const unsigned char*>(
-                    source.native_handle());
+                    source.native_handle);
             auto* destination_base = static_cast<unsigned char*>(
-                    destination.native_handle());
+                    destination.native_handle);
             const std::size_t bits =
-                    detail::leaf_bits(source.spec().data_type);
+                    detail::leaf_bits(source.spec.data_type);
             std::array<std::uint32_t, TensorSpec::TILE> shift_table{};
             std::array<std::uint32_t, TensorSpec::TILE> mask_table{};
             if (bits % 8 != 0) {
@@ -865,7 +1008,9 @@ namespace iom {
                 }
             }
             for_each_tile_lockstep(
-                    source, destination,
+                    source.spec, source.plane_offset, source.plane_strides,
+                    destination.spec, destination.plane_offset,
+                    destination.plane_strides,
                     [&](std::size_t, std::size_t,
                         std::size_t source_byte,
                         std::size_t destination_byte,
@@ -912,8 +1057,12 @@ namespace iom {
         CpuDevice* device_;
         detail::QueueId registry_queue_id_;
         std::mutex submission_order_mutex_;
+        std::mutex worker_mutex_;
+        std::condition_variable worker_cv_;
+        std::deque<HostTask> worker_tasks_;
+        bool worker_shutdown_ = false;
+        std::thread worker_;
     };
-
     std::unique_ptr<Tensor> CpuDevice::create_tensor(const TensorSpec& spec) {
         return std::make_unique<CpuTensor>(spec, *this, allocator_);
     }
@@ -936,8 +1085,8 @@ namespace iom {
     }
 
     std::unique_ptr<Device> make_cpu_device(
-            Allocator& allocator, QueueConfig) {
-        return std::make_unique<CpuDevice>(allocator);
+            Allocator& allocator, QueueConfig queue_config) {
+        return std::make_unique<CpuDevice>(allocator, queue_config);
     }
 
 }  // namespace iom
