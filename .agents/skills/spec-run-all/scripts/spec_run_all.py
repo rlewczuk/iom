@@ -180,8 +180,8 @@ def _load_state(path_value: str | None, repo: Path, names: set[str]) -> tuple[di
             raise QueueError(f"state.outcomes[{key!r}] must be an object")
         status = value.get("status")
         reason = value.get("reason")
-        if not isinstance(status, str) or status not in {"blocked", "failed", "ready"} or not isinstance(reason, str) or not reason.strip():
-            state_errors[key] = "state outcome requires status blocked, failed, or ready and a nonempty reason"
+        if not isinstance(status, str) or status not in {"blocked", "failed", "ready", "running"} or not isinstance(reason, str) or not reason.strip():
+            state_errors[key] = "state outcome requires status blocked, failed, ready, or running and a nonempty reason"
         else:
             outcome_values[key] = {"status": status, "reason": reason.strip()}
     return dep_overrides, outcome_values, state_errors
@@ -285,7 +285,10 @@ def queue(repo: Path, target: str, state_path: str | None) -> dict[str, Any]:
             if outcome["status"] in {"blocked", "failed"}:
                 blocked.append({"name": name, "reason": outcome["reason"]})
             else:
-                waiting.append({"name": name, "reason": "outcome already recorded as ready: " + outcome["reason"]})
+                waiting.append({
+                    "name": name,
+                    "reason": f"outcome already recorded as {outcome['status']}: {outcome['reason']}",
+                })
             continue
         if name in cyclic:
             waiting.append({"name": name, "reason": "dependency cycle involving: " + ", ".join(sorted(cyclic))})
@@ -306,7 +309,7 @@ def queue(repo: Path, target: str, state_path: str | None) -> dict[str, Any]:
         else:
             candidates.append(name)
 
-    ready = candidates[:5]
+    ready = candidates
     finished = len(already_done) == len(tasks) and not blocked and not waiting
     result.update({
         "ready": ready,
@@ -337,6 +340,14 @@ def prepare(repo: Path, target: str, state_path: str | None) -> dict[str, Any]:
     })
     return selected
 
+def control(repo: Path) -> dict[str, str]:
+    integration_branch, integration_head = helper.validate_control(repo)
+    return {
+        "repo_root": str(repo),
+        "integration_branch": integration_branch,
+        "integration_head": integration_head,
+    }
+
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
@@ -349,6 +360,7 @@ def parser() -> argparse.ArgumentParser:
         sub = commands.add_parser(command, help=f"{command.title()} direct child specifications")
         sub.add_argument("target")
         sub.add_argument("--state", help="Caller-owned temporary state JSON")
+    commands.add_parser("control", help="Refresh integration checkout control state")
     return result
 
 
@@ -360,8 +372,10 @@ def main() -> int:
             output = scan(repo, args.target)
         elif args.command == "queue":
             output = queue(repo, args.target, args.state)
-        else:
+        elif args.command == "prepare":
             output = prepare(repo, args.target, args.state)
+        else:
+            output = control(repo)
         print(json.dumps(output, indent=2 if args.pretty else None, sort_keys=True))
         return 0
     except (QueueError, helper.TaskError, OSError, UnicodeError, json.JSONDecodeError) as exc:

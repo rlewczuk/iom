@@ -57,7 +57,9 @@ class RunnerTests(unittest.TestCase):
         return directory
 
     def run_cli(self, command, *, target="example", state=None, success=True):
-        args = [sys.executable, str(RUNNER), "--repo", str(self.repo), command, target]
+        args = [sys.executable, str(RUNNER), "--repo", str(self.repo), command]
+        if command != "control":
+            args.append(target)
         if state is not None:
             self.state.write_text(json.dumps(state), encoding="utf-8")
             args.extend(["--state", str(self.state)])
@@ -76,7 +78,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def test_discovery_omits_only_done_and_caps_alphabetical_wave(self):
+    def test_discovery_queues_and_prepares_all_unfinished_tasks(self):
         self.task("00-done", status="done")
         self.task("01-ready", status="ready")
         self.task("02-failed", status="failed")
@@ -89,8 +91,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(names, sorted(p.name for p in self.target.iterdir() if (p / "spec.md").is_file()))
         queue = self.run_cli("queue")
         self.assertEqual(queue["already_done"], ["00-done"])
-        self.assertEqual(queue["ready"], names[1:6])
+        self.assertEqual(queue["ready"], names[1:])
         self.assertFalse(queue["finished"])
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        prepared = self.run_cli("prepare")
+        self.assertEqual([entry["name"] for entry in prepared["prepared"]], names[1:])
 
     def test_dependencies_override_alphabet_and_only_done_unlocks(self):
         self.task("01-consumer", "`03-provider`, `02-provider`")
@@ -127,6 +133,37 @@ class RunnerTests(unittest.TestCase):
         self.task("01-provider", status="done")
         self.assertEqual(self.run_cli("queue", state=state)["ready"], ["02-consumer", "03-independent"])
 
+    def test_running_outcomes_wait_and_canonical_done_overrides_them(self):
+        self.task("01-provider")
+        self.task("02-consumer", "01-provider")
+        state = {"outcomes": {"01-provider": {"status": "running", "reason": "owner dispatched"}}}
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["ready"], [])
+        self.assertEqual(queue["blocked"], [])
+        self.assertFalse(queue["finished"])
+        waiting = {item["name"]: item["reason"] for item in queue["waiting"]}
+        self.assertIn("01-provider", waiting)
+        self.assertIn("02-consumer", waiting)
+        state["outcomes"]["01-provider"] = {"status": "ready", "reason": "owner completed"}
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["ready"], [])
+        self.assertEqual(queue["blocked"], [])
+        self.assertIn("01-provider", {item["name"] for item in queue["waiting"]})
+        self.task("01-provider", status="done")
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["already_done"], ["01-provider"])
+        self.assertEqual(queue["ready"], ["02-consumer"])
+        self.assertFalse(queue["finished"])
+
+    def test_running_only_work_is_unfinished_and_waiting(self):
+        self.task("01-owner")
+        state = {"outcomes": {"01-owner": {"status": "running", "reason": "long-running owner"}}}
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["ready"], [])
+        self.assertEqual(queue["blocked"], [])
+        self.assertEqual([item["name"] for item in queue["waiting"]], ["01-owner"])
+        self.assertFalse(queue["finished"])
+
     def test_explicit_dependency_resolution_and_external_completion(self):
         self.task("01-consumer", "After the provider's API is available")
         self.task("02-provider", status="done")
@@ -151,6 +188,10 @@ class RunnerTests(unittest.TestCase):
         self.run_cli("queue", state={"outcomes": {"unknown": {"status": "blocked", "reason": "missing"}}}, success=False)
         invalid_outcome = {"outcomes": {"02-independent": {"status": [], "reason": "invalid"}}}
         self.assertEqual(self.run_cli("queue", state=invalid_outcome)["ready"], [])
+        invalid_running = {"outcomes": {"02-independent": {"status": "running", "reason": " "}}}
+        queue = self.run_cli("queue", state=invalid_running)
+        self.assertEqual(queue["ready"], [])
+        self.assertEqual({item["name"] for item in queue["blocked"]}, {"01-invalid", "02-independent"})
 
     def test_empty_and_completed_targets_are_terminal(self):
         self.assertTrue(self.run_cli("queue")["finished"])
@@ -159,29 +200,87 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(queue["finished"])
         self.assertEqual(queue["ready"], [])
 
-    def test_prepare_reuse_and_integration_unlock_canonical_dependency(self):
+    def test_prepare_reuse_integration_and_dependency_refill_while_owner_runs(self):
         self.task("01-consumer", "02-provider")
         self.task("02-provider")
+        self.task("03-slow")
+        self.task("04-second-consumer", "02-provider")
         self.git("add", ".")
         self.git("commit", "-m", "fixture")
-        prepared = self.run_cli("prepare")["prepared"]
-        self.assertEqual([entry["name"] for entry in prepared], ["02-provider"])
-        provider = prepared[0]
-        worktree = Path(provider["worktree"])
-        self.assertNotEqual(worktree, self.repo)
+        initial = self.run_cli("prepare")["prepared"]
+        self.assertEqual([entry["name"] for entry in initial], ["02-provider", "03-slow"])
+        provider = initial[0]
+        slow = initial[1]
+        provider_worktree = Path(provider["worktree"])
+        slow_worktree = Path(slow["worktree"])
+        self.assertNotEqual(provider_worktree, self.repo)
         self.assertTrue(Path(provider["spec_path"]).is_file())
-        self.assertEqual(self.run_cli("prepare")["prepared"][0]["worktree"], str(worktree))
+        preserved = slow_worktree / "owned.txt"
+        preserved.write_text("slow owner work", encoding="utf-8")
+        state = {"outcomes": {"03-slow": {"status": "running", "reason": "slow owner active"}}}
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["ready"], ["02-provider"])
+        self.assertEqual(queue["blocked"], [])
+        self.assertIn("03-slow", {item["name"] for item in queue["waiting"]})
+        prepared = self.run_cli("prepare", state=state)["prepared"]
+        self.assertEqual([entry["name"] for entry in prepared], ["02-provider"])
+        self.assertEqual(prepared[0]["worktree"], str(provider_worktree))
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "slow owner work")
+        self.assertTrue(self.helper("show", "example/03-slow")["dirty"])
+
+        state["outcomes"]["02-provider"] = {"status": "running", "reason": "provider dispatched"}
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["ready"], [])
+        self.assertEqual(queue["blocked"], [])
+        self.assertIn("02-provider", {item["name"] for item in queue["waiting"]})
+        self.assertIn("03-slow", {item["name"] for item in queue["waiting"]})
+        self.assertEqual(self.run_cli("prepare", state=state)["prepared"], [])
+
         task_path = provider["task_path"]
         self.helper("annotate", task_path, "--status", "ready", "--summary", "Prepared fixture")
         self.helper("commit", task_path, "--status", "ready", "--outcome", "complete fixture")
-        state = {"outcomes": {"02-provider": {"status": "ready", "reason": "Awaiting integration"}}}
+        state["outcomes"]["02-provider"] = {"status": "ready", "reason": "Awaiting integration"}
         self.assertEqual(self.run_cli("queue", state=state)["ready"], [])
         self.helper("annotate", task_path, "--status", "done", "--summary", "Fixture paths verified",
                     "--verification", "Prepared spec path exists and worktree reused")
         self.helper("commit", task_path, "--status", "done")
         self.assertEqual(self.run_cli("queue", state=state)["ready"], [])
-        self.helper("integrate", task_path)
-        self.assertEqual(self.run_cli("queue", state=state)["ready"], ["01-consumer"])
+        integrated = self.helper("integrate", task_path)
+        integration_head = integrated["integration_head"]
+        control = self.run_cli("control")
+        self.assertEqual(control["integration_head"], integration_head)
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "slow owner work")
+        queue = self.run_cli("queue", state=state)
+        self.assertEqual(queue["already_done"], ["02-provider"])
+        self.assertEqual(queue["ready"], ["01-consumer", "04-second-consumer"])
+        self.assertIn("03-slow", {item["name"] for item in queue["waiting"]})
+        refilled = self.run_cli("prepare", state=state)
+        self.assertEqual(
+            [entry["name"] for entry in refilled["prepared"]],
+            ["01-consumer", "04-second-consumer"],
+        )
+        self.assertEqual(refilled["integration_head"], integration_head)
+        self.assertTrue(all(entry["base"] == integration_head for entry in refilled["prepared"]))
+        for name in ("01-consumer", "04-second-consumer"):
+            state["outcomes"][name] = {"status": "running", "reason": "dependent dispatched"}
+        self.assertEqual(self.run_cli("queue", state=state)["ready"], [])
+        self.assertEqual(self.run_cli("prepare", state=state)["prepared"], [])
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "slow owner work")
+
+    def test_control_refreshes_head_without_target_or_root_spec(self):
+        self.target.rmdir()
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("advance integration", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-m", "advance")
+        expected_head = self.git("rev-parse", "HEAD")
+        control = self.run_cli("control")
+        self.assertEqual(control["repo_root"], str(self.repo.resolve()))
+        self.assertEqual(control["integration_branch"], "main")
+        self.assertEqual(control["integration_head"], expected_head)
+        self.assertEqual(self.git("status", "--short"), "")
 
     def test_preparation_failure_does_not_abort_independent_owner(self):
         self.task("01-collision")

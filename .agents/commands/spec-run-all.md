@@ -1,5 +1,5 @@
 ---
-description: Implement all direct subtasks of docs/changes/<task-name> in dependency-aware isolated worktree waves
+description: Implement all eligible direct subtasks of docs/changes/<task-name> continuously in parallel, dispatching dependents immediately after integration
 ---
 
 Read `skill://spec-run-all` with the read tool and follow it exactly.
