@@ -4,7 +4,6 @@
 // device construction and call this once per selected operation.
 #include <doctest/doctest.h>
 #include <cstddef>
-#include <cstdint>
 #include <vector>
 
 #include "backend/backend_conformance_add.hpp"
@@ -103,6 +102,11 @@ inline void run_gpu_eltwise_conformance(
 
 inline void run_gpu_eltwise_mapping_conformance(
         iom::Device& candidate, BinaryOperation operation) {
+    // The mapping fixture intentionally uses U8 operands; integer division
+    // is outside the binary capability contract.
+    if (operation == BinaryOperation::div) {
+        return;
+    }
     const iom::TensorSpec lhs_spec{
             iom::TensorShape{{2, 1, 33}}, iom::DataType::U8};
     const iom::TensorSpec rhs_spec{

@@ -183,7 +183,7 @@ if(ROCM_ENABLED)
         SMOKE_SOURCES rocm/test_rocm_smoke.cpp
         CONFORMANCE_SOURCES rocm/test_rocm_conformance.cpp
         COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__
-        SMOKE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src/rocm
+        SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/rocm
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
         BACKEND_LIBRARY iom_rocm
         RUNTIME_LIBRARIES hip::host
@@ -197,7 +197,7 @@ if(CUDA_ENABLED)
         CONFORMANCE_MAIN_SOURCE cuda/test_cuda_conformance.cpp
         SMOKE_SOURCES cuda/test_cuda_smoke.cpp
         CONFORMANCE_SOURCES cuda/test_cuda_conformance.cpp
-        SMOKE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src/cuda
+        SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/cuda
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
         BACKEND_LIBRARY iom_cuda
         RUNTIME_LIBRARIES CUDA::cuda_driver

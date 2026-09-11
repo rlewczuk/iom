@@ -47,6 +47,89 @@ namespace iom::detail {
 template <typename Policy>
 class GpuQueue final : public DeviceOps {
     using EventRing = iom::detail::EventRingState<Policy>;
+
+    struct CompletionState {
+        mutable std::mutex mutex;
+        std::shared_ptr<typename EventRing::Submission> submission;
+        std::exception_ptr retained_failure;
+        bool finalized = false;
+        detail::FenceResult final_result = detail::FenceResult::pending();
+        bool final_completion_proven = false;
+
+        void bind(
+                std::shared_ptr<typename EventRing::Submission> value) noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            submission = std::move(value);
+        }
+
+        void clear() noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            submission.reset();
+        }
+
+        void set_failure(std::exception_ptr failure) noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (retained_failure == nullptr) {
+                retained_failure = std::move(failure);
+            }
+        }
+
+        [[nodiscard]] detail::FenceResult finalize(
+                std::exception_ptr callback_failure) noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (finalized) {
+                return final_result;
+            }
+            detail::FenceResult result = detail::FenceResult::pending();
+            if (submission != nullptr) {
+                result = submission->invoke_result();
+                final_completion_proven = submission->completion_proven();
+            }
+            if (callback_failure != nullptr) {
+                result = detail::FenceResult::failed(
+                        std::move(callback_failure));
+            } else if (retained_failure != nullptr) {
+                result = detail::FenceResult::failed(retained_failure);
+            }
+            final_result = result;
+            finalized = true;
+            // The terminal result is now independent of the reusable event
+            // generation. Unknown generations remain quarantined by the ring
+            // even after this shared_ptr is released.
+            submission.reset();
+            return final_result;
+        }
+
+        [[nodiscard]] detail::FenceResult result() const noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (finalized) {
+                return final_result;
+            }
+            if (submission == nullptr) {
+                return detail::FenceResult::pending();
+            }
+            detail::FenceResult result = submission->invoke_result();
+            if (retained_failure != nullptr) {
+                result = detail::FenceResult::failed(retained_failure);
+            }
+            return result;
+        }
+
+        [[nodiscard]] bool completion_proven() const noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (finalized) {
+                return final_completion_proven;
+            }
+            return submission != nullptr && submission->completion_proven();
+        }
+    };
+
+    struct GpuFenceCapture {
+        std::shared_ptr<CompletionState> completion;
+    };
+    static_assert(sizeof(GpuFenceCapture) <= detail::kFenceStorageBytes);
+    static_assert(alignof(GpuFenceCapture) <= detail::kFenceStorageAlign);
+
     struct MetadataLease {
         MetadataSlotPool* pool = nullptr;
         std::size_t slot = EventRing::kNoAttachedSlot;
@@ -59,8 +142,7 @@ class GpuQueue final : public DeviceOps {
 
         MetadataLease() = default;
         MetadataLease(
-                MetadataSlotPool* pool_value,
-                std::size_t slot_value)
+                MetadataSlotPool* pool_value, std::size_t slot_value)
                 : pool(pool_value), slot(slot_value) {}
         MetadataLease(const MetadataLease&) = delete;
         MetadataLease& operator=(const MetadataLease&) = delete;
@@ -86,85 +168,70 @@ class GpuQueue final : public DeviceOps {
         }
     };
 
-
     struct Task {
-        std::uint64_t sequence;
-        const TensorView* source = nullptr;
-        TensorView* destination = nullptr;
-        bool no_op = false;
+        std::uint64_t sequence = 0;
+        std::optional<CopyRequest> copy_request;
         bool is_binary = false;
         std::optional<BinaryRequest> binary_request;
         detail::BinaryEntryRegistration binary_entries{};
-        std::shared_ptr<typename EventRing::Submission> submission;
+        detail::EntryRegistration entries{};
+        typename EventRing::Submission* submission = nullptr;
+        std::shared_ptr<CompletionState> completion;
         void* fence = nullptr;
-        detail::EntryId source_entry_id = 0;
-        detail::EntryId destination_entry_id = 0;
         MetadataLease metadata_lease;
     };
 
-    // One submission's completion lease paired with a post-launch retained
-    // failure. Captured by the registry fence so the completion record —
-    // and its fixed completion resource — stays reserved until every
-    // registry entry and destructor snapshot referencing it has disappeared.
-    struct EventLeaseWithFailure {
-        std::shared_ptr<typename EventRing::Submission> submission;
-        std::exception_ptr retained_failure;
+    struct SnapshotView {
+        const CopyViewSnapshot& value;
+
+        [[nodiscard]] const TensorSpec& spec() const noexcept {
+            return value.spec;
+        }
+        [[nodiscard]] std::size_t plane_offset() const noexcept {
+            return value.plane_offset;
+        }
+        [[nodiscard]] std::span<const std::size_t> plane_strides()
+                const noexcept {
+            return value.plane_strides;
+        }
     };
-    static_assert(
-            sizeof(EventLeaseWithFailure)
-            <= iom::detail::kFenceStorageBytes);
-    static_assert(
-            alignof(EventLeaseWithFailure)
-            <= iom::detail::kFenceStorageAlign);
 
     struct GpuOutcome {
         detail::SequenceOutcome common{};
         detail::BinaryEntryRegistration binary_entries{};
         detail::WorkspaceLease workspace_lease{};
-        std::shared_ptr<typename EventRing::Submission> submission;
-        std::exception_ptr retained_failure;
+        std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
             const detail::Fence& fence) noexcept {
         const auto& capture =
-                *std::launder(reinterpret_cast<const EventLeaseWithFailure*>(
+                *std::launder(reinterpret_cast<const GpuFenceCapture*>(
                         fence.storage));
-        if (capture.submission == nullptr) {
-            return detail::FenceResult::success();
+        if (capture.completion == nullptr) {
+            return detail::FenceResult::pending();
         }
-        detail::FenceResult result = capture.submission->invoke_result();
-        if (result.succeeded && result.failure == nullptr
-                && capture.retained_failure) {
-            result = detail::FenceResult::failed(capture.retained_failure);
-        }
-        return result;
+        return capture.completion->result();
     }
 
     static_assert(noexcept(fence_invoke(
             std::declval<const detail::Fence&>())));
 
     [[nodiscard]] static detail::Fence build_fence(
-            std::shared_ptr<typename EventRing::Submission> submission,
-            std::exception_ptr retained_failure) noexcept {
+            std::shared_ptr<CompletionState> completion) noexcept {
         detail::Fence fence;
-        ::new (fence.storage)
-                EventLeaseWithFailure{std::move(submission),
-                        std::move(retained_failure)};
+        ::new (fence.storage) GpuFenceCapture{std::move(completion)};
         fence.invoke = &GpuQueue::fence_invoke;
         fence.copy_construct =
-                &detail::FenceCaptureOps<EventLeaseWithFailure>::copy_construct;
+                &detail::FenceCaptureOps<GpuFenceCapture>::copy_construct;
         fence.move_construct =
-                &detail::FenceCaptureOps<EventLeaseWithFailure>::move_construct;
+                &detail::FenceCaptureOps<GpuFenceCapture>::move_construct;
         fence.destroy =
-                &detail::FenceCaptureOps<EventLeaseWithFailure>::destroy;
+                &detail::FenceCaptureOps<GpuFenceCapture>::destroy;
         return fence;
     }
 
-    // The worker's four callbacks. Built in a helper so the dependent
-    // Callbacks type is named with `typename` outside a member initializer,
-    // where a braced-init-list of a qualified dependent name would misparse.
     [[nodiscard]] static typename detail::StagedWorker<Task>::Callbacks
     make_worker_callbacks(GpuQueue* self, std::shared_ptr<EventRing> state) {
         typename detail::StagedWorker<Task>::Callbacks callbacks{
@@ -229,9 +296,20 @@ public:
     }
 
     ~GpuQueue() override {
+        // Invalidate owner fences before draining the worker. Accepted work
+        // that outlives this queue must quarantine its tensor payloads when
+        // owners are destroyed after queue teardown; the device retains the
+        // backing until a covering proof at its boundary.
         registry_state_->registry.invalidate_entries_for_queue(
                 registry_queue_id_);
+        // Close common admission before worker drain so no new operation
+        // can race teardown; parked prepared leases are finished by the
+        // second close after executing work retires.
+        close_and_drain();
         worker_.shutdown_and_drain();
+        // The first close leaves executing nodes to the backend drain. Once
+        // the worker has retired them, finish the parked tail in FIFO order.
+        close_and_drain();
         bool drained = false;
         try {
             Policy::activate(context_);
@@ -302,65 +380,57 @@ public:
             const TensorView& source, TensorView& destination) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
-        const bool no_op = identical_window(source, destination);
-        return submit(
-                [this, &source, &destination, no_op](
-                        std::uint64_t sequence) {
-                    if (no_op) {
-                        worker_.submit_copy(
-                                Task{sequence, &source, &destination, true});
-                        return;
+        // These injected failures model host registration/preparation faults,
+        // so they are consumed before common acceptance reserves a sequence.
+        if (Policy::consume_copy_registration_fault()
+                || Policy::consume_copy_outcome_insertion_fault()) {
+            throw std::bad_alloc();
+        }
+        auto completion = std::make_shared<CompletionState>();
+        const detail::Fence fence = build_fence(completion);
+        return submit_copy(
+                source, destination, *registry_state_, registry_queue_id_,
+                fence,
+                [this, completion](
+                        std::uint64_t sequence,
+                        const CopyRequest& captured,
+                        detail::EntryRegistration entries) {
+                    auto submission = state_->try_acquire();
+                    if (submission == nullptr) {
+                        throw detail::AdmissionResourceUnavailable{};
                     }
-
-                    Policy::activate(context_);
-                    const detail::CopyMetadataLayout layout =
-                            detail::copy_metadata_layout(source, destination);
-                    auto submission = state_->acquire();
-                    // Rank 2–8 copy descriptors always fit the inline
-                    // representation, so copies consume no metadata slot.
-
-                    const detail::Fence fence =
-                            build_fence(submission, nullptr);
-                    detail::EntryRegistration entries;
+                    completion->bind(submission);
                     try {
-                        if (Policy::consume_copy_registration_fault()) {
-                            throw std::bad_alloc();
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            const auto [it, inserted] =
+                                    outcomes_.try_emplace(sequence);
+                            if (!inserted) {
+                                throw std::logic_error(
+                                        std::string("duplicate ")
+                                        + Policy::backend_label()
+                                        + " outstanding-work sequence");
+                            }
+                            it->second.common.source_entry_id =
+                                    entries.source;
+                            it->second.common.destination_entry_id =
+                                    entries.destination;
+                            it->second.completion = completion;
                         }
-                        entries = detail::register_copy_entries(
-                                *registry_state_, registry_queue_id_, sequence,
-                                const_cast<void*>(source.native_handle()),
-                                destination.native_handle(), fence);
-                        if (Policy::consume_copy_outcome_insertion_fault()) {
-                            throw std::bad_alloc();
-                        }
-                        std::lock_guard<std::mutex> lock(outcome_mutex_);
-                        const auto [it, inserted] =
-                                outcomes_.try_emplace(sequence);
-                        if (!inserted) {
-                            throw std::logic_error(
-                                    std::string("duplicate ")
-                                    + Policy::backend_label()
-                                    + " outstanding-work sequence");
-                        }
-                        it->second.common.source_entry_id = entries.source;
-                        it->second.common.destination_entry_id =
-                                entries.destination;
-                    } catch (...) {
-                        rollback_copy_transaction(
-                                sequence, entries, source, destination);
-                        submission.reset();
-                        throw;
-                    }
-
-                    Task task{sequence, &source, &destination, false};
-                    task.source_entry_id = entries.source;
-                    task.destination_entry_id = entries.destination;
-                    task.submission = std::move(submission);
-                    try {
+                        Task task;
+                        task.sequence = sequence;
+                        task.copy_request.emplace(captured);
+                        task.entries = entries;
+                        task.submission = submission.get();
+                        task.completion = completion;
+                        task.fence = task.submission;
                         worker_.submit_copy(std::move(task));
                     } catch (...) {
-                        rollback_copy_transaction(
-                                sequence, entries, source, destination);
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            outcomes_.erase(sequence);
+                        }
+                        completion->clear();
                         throw;
                     }
                 });
@@ -369,94 +439,89 @@ public:
     oid binary_impl(const BinaryRequest& request) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
-        // Validate rank-dependent arithmetic and reserve one fixed metadata
-        // slot of this queue's partition before accepting the request. The
-        // slot is retained by the completion submission once the worker
-        // receives it and is released only after a completion proof.
+        // Validate descriptor arithmetic before common acceptance. The
+        // metadata slot itself is acquired only by the dispatching head.
         (void)detail::make_binary_metadata(request);
-        Policy::activate(context_);
-        MetadataLease metadata_lease{
-                metadata_pool_.get(), metadata_pool_->acquire()};
-        try {
-            auto submission = state_->acquire();
-            const detail::Fence fence = build_fence(submission, nullptr);
-            return submit_binary(
-                    request, *registry_state_, registry_queue_id_, fence,
-                    [this, submission = std::move(submission),
-                     lease = std::move(metadata_lease)](
-                            std::uint64_t sequence,
-                            const BinaryRequest& captured,
-                            detail::BinaryEntryRegistration entries) mutable {
+        auto completion = std::make_shared<CompletionState>();
+        const detail::Fence fence = build_fence(completion);
+        return submit_binary(
+                request, *registry_state_, registry_queue_id_, fence,
+                [this, completion](
+                        std::uint64_t sequence,
+                        const BinaryRequest& captured,
+                        detail::BinaryEntryRegistration entries) {
+                    auto submission = state_->try_acquire();
+                    if (submission == nullptr) {
+                        throw detail::AdmissionResourceUnavailable{};
+                    }
+                    const auto metadata_slot = metadata_pool_->try_acquire();
+                    if (!metadata_slot.has_value()) {
+                        throw detail::AdmissionResourceUnavailable{};
+                    }
+                    MetadataLease metadata_lease{
+                            metadata_pool_.get(), *metadata_slot};
+                    completion->bind(submission);
+                    try {
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            const auto [it, inserted] =
+                                    outcomes_.try_emplace(sequence);
+                            if (!inserted) {
+                                throw std::logic_error(
+                                        "duplicate GPU binary sequence");
+                            }
+                            it->second.binary_entries = entries;
+                            it->second.workspace_lease =
+                                    captured.workspace_lease;
+                            it->second.completion = completion;
+                            it->second.is_binary = true;
+                        }
                         Task task;
                         task.sequence = sequence;
                         task.is_binary = true;
                         task.binary_request.emplace(captured);
                         task.binary_entries = entries;
-                        task.submission = std::move(submission);
-                        task.metadata_lease = std::move(lease);
+                        task.submission = submission.get();
+                        task.completion = completion;
+                        task.fence = task.submission;
+                        task.metadata_lease = std::move(metadata_lease);
                         worker_.submit_copy(std::move(task));
-                    });
-        } catch (...) {
-            // The lease destructor returns the fixed slot; the descriptor's
-            // host mirror stays untouched because nothing was written yet.
-            throw;
-        }
+                    } catch (...) {
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            outcomes_.erase(sequence);
+                        }
+                        completion->clear();
+                        throw;
+                    }
+                });
     }
 
 private:
-    void rollback_copy_transaction(
-            std::uint64_t sequence, const detail::EntryRegistration& entries,
-            const TensorView& source, const TensorView& destination) noexcept {
-        if (entries.source != 0) {
-            registry_state_->registry.remove_entry_if_present(
-                    entries.source, const_cast<void*>(source.native_handle()));
-        }
-        if (entries.destination != 0) {
-            registry_state_->registry.remove_entry_if_present(
-                    entries.destination,
-                    const_cast<void*>(destination.native_handle()));
-        }
-        std::lock_guard<std::mutex> lock(outcome_mutex_);
-        outcomes_.erase(sequence);
-    }
     void execute(Task& task) {
-        if (task.is_binary) {
+        task.fence = task.submission;
+        std::exception_ptr retained_failure;
+        bool native_work_submitted = false;
+        bool event_recorded = false;
+
+        try {
             Policy::activate(context_);
-            // Reserve the outcome — and its registration ownership — before
-            // any device effect. A failure here is pre-acceptance: the
-            // caller's submit_binary rolls the sequence back with no live work.
-            {
-                const auto [it, inserted] =
-                        outcomes_.try_emplace(task.sequence);
-                if (!inserted) {
-                    throw std::logic_error("duplicate ADD sequence");
-                }
-                it->second.binary_entries = task.binary_entries;
-                it->second.workspace_lease =
-                        task.binary_request->workspace_lease;
-                it->second.submission = task.submission;
-                it->second.is_binary = true;
-            }
-            std::exception_ptr failure;
-            try {
+            if (task.is_binary) {
+                const BinaryRequest& request = *task.binary_request;
                 const std::size_t metadata_bytes =
                         detail::binary_metadata_storage_bytes(
-                                task.binary_request->result_shape
-                                        .dimensions()
-                                        .size());
+                                request.result_shape.dimensions().size());
                 const std::size_t metadata_slot =
                         task.metadata_lease.slot;
                 task.submission->attach_metadata_slot(metadata_slot);
                 task.metadata_lease.handoff();
                 detail::write_binary_metadata(
                         metadata_pool_->host_data(metadata_slot),
-                        metadata_pool_->device_data(metadata_slot),
-                        *task.binary_request);
+                        metadata_pool_->device_data(metadata_slot), request);
+                native_work_submitted = true;
                 Policy::copy_from_host(
-                        stream_,
-                        metadata_pool_->device_data(metadata_slot),
-                        metadata_pool_->host_data(metadata_slot),
-                        metadata_bytes);
+                        stream_, metadata_pool_->device_data(metadata_slot),
+                        metadata_pool_->host_data(metadata_slot), metadata_bytes);
                 const detail::BinaryMetadata metadata =
                         *reinterpret_cast<const detail::BinaryMetadata*>(
                                 metadata_pool_->host_data(metadata_slot));
@@ -464,14 +529,13 @@ private:
                     detail::launch_grid_stride_binary<Policy, Op>(
                             stream_,
                             static_cast<const unsigned char*>(
-                                    task.binary_request->lhs.native_handle),
+                                    request.lhs.native_handle),
                             static_cast<const unsigned char*>(
-                                    task.binary_request->rhs.native_handle),
+                                    request.rhs.native_handle),
                             static_cast<unsigned char*>(
-                                    task.binary_request->out.native_handle),
-                            metadata);
+                                    request.out.native_handle), metadata);
                 };
-                switch (task.binary_request->operation) {
+                switch (request.operation) {
                     case DeviceOps::BinaryOperation::Add:
                         launch.template operator()<DeviceBinaryOp::add>();
                         break;
@@ -489,97 +553,65 @@ private:
                 Policy::after_grid_stride_launch();
                 Policy::record_event(
                         state_->event_of(*task.submission), stream_);
+                event_recorded = true;
                 state_->mark_event_recorded(*task.submission);
-            } catch (...) {
-                // Post-launch: never throw through submit_copy. Retain the
-                // failure; completion releases entries and reports it.
-                failure = std::current_exception();
+            } else {
+                const CopyRequest& request = *task.copy_request;
+                if (request.no_op) {
+                    state_->mark_stream_drained(*task.submission);
+                    return;
+                }
+                const detail::CopyMetadataLayout layout =
+                        detail::copy_metadata_layout(
+                                SnapshotView{request.source},
+                                SnapshotView{request.destination});
+                detail::InlineCopyMetadata metadata{};
+                detail::write_copy_metadata(
+                        metadata, SnapshotView{request.source},
+                        SnapshotView{request.destination});
+                native_work_submitted = true;
+                detail::launch_grid_stride_copy<Policy>(
+                        stream_,
+                        static_cast<const unsigned char*>(
+                                request.source.native_handle),
+                        static_cast<unsigned char*>(
+                                request.destination.native_handle),
+                        metadata, layout.total_words);
+                Policy::check_kernel(Policy::copy_kernel_operation());
+                Policy::after_grid_stride_launch();
+                Policy::record_event(
+                        state_->event_of(*task.submission), stream_);
+                event_recorded = true;
+                state_->mark_event_recorded(*task.submission);
+            }
+        } catch (...) {
+            retained_failure = std::current_exception();
+            if (native_work_submitted && !event_recorded) {
                 try {
-                    const bool recorded = Policy::record_event_no_fault(
+                    event_recorded = Policy::record_event_no_fault(
                             state_->event_of(*task.submission), stream_);
-                    if (recorded) {
+                    if (event_recorded) {
                         state_->mark_event_recorded(*task.submission);
                     } else if (Policy::synchronize_stream_noexcept(stream_)) {
                         state_->mark_stream_drained(*task.submission);
+                    } else {
+                        state_->mark_retire_unknown(*task.submission);
                     }
                 } catch (...) {
-                }
-            }
-            if (failure) {
-                std::lock_guard<std::mutex> lock(outcome_mutex_);
-                outcomes_[task.sequence].retained_failure = failure;
-            }
-            task.fence = task.submission.get();
-            return;
-        }
-        const TensorView& source = *task.source;
-        TensorView& destination = *task.destination;
-        task.source = nullptr;
-        task.destination = nullptr;
-        if (task.no_op) {
-            task.submission.reset();
-            task.fence = nullptr;
-            return;
-        }
-
-        Policy::activate(context_);
-        const detail::CopyMetadataLayout layout =
-                detail::copy_metadata_layout(source, destination);
-        bool native_work_submitted = false;
-        bool event_recorded = false;
-        std::exception_ptr retained_failure;
-        detail::InlineCopyMetadata inline_metadata{};
-        try {
-            // Rank 2–8 copy descriptors fit the inline representation, so
-            // the launch parameter itself carries the immutable snapshot
-            // and no metadata slot is consumed.
-            detail::write_copy_metadata(
-                    inline_metadata, source, destination);
-            native_work_submitted = true;
-            detail::launch_grid_stride_copy<Policy>(
-                    stream_,
-                    static_cast<const unsigned char*>(
-                            source.native_handle()),
-                    static_cast<unsigned char*>(
-                            destination.native_handle()),
-                    inline_metadata, layout.total_words);
-            native_work_submitted = true;
-            Policy::check_kernel(Policy::copy_kernel_operation());
-            Policy::after_grid_stride_launch();
-            Policy::record_event(
-                    state_->event_of(*task.submission), stream_);
-            event_recorded = true;
-            state_->mark_event_recorded(*task.submission);
-            task.fence = task.submission.get();
-        } catch (...) {
-            const std::exception_ptr failure = std::current_exception();
-            if (!native_work_submitted) {
-                throw;
-            }
-
-            if (!event_recorded) {
-                event_recorded = Policy::record_event_no_fault(
-                        state_->event_of(*task.submission), stream_);
-                if (event_recorded) {
-                    state_->mark_event_recorded(*task.submission);
-                } else if (Policy::synchronize_stream_noexcept(stream_)) {
-                    state_->mark_stream_drained(*task.submission);
-                } else {
                     state_->mark_retire_unknown(*task.submission);
                 }
+            } else if (!native_work_submitted) {
+                // No native operation was attempted, so the fixed event
+                // resource is safe even though the accepted token fails.
+                state_->mark_stream_drained(*task.submission);
             }
-            task.fence = task.submission.get();
-            retained_failure = failure;
         }
 
-        if (retained_failure) {
-            std::lock_guard<std::mutex> lock(outcome_mutex_);
-            const auto it = outcomes_.find(task.sequence);
-            if (it != outcomes_.end()) {
-                it->second.common.retained_failure = retained_failure;
-            }
+        if (retained_failure != nullptr) {
+            task.completion->set_failure(retained_failure);
         }
     }
+
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure) {
         GpuOutcome outcome;
@@ -593,32 +625,31 @@ private:
                 has_outcome = true;
             }
         }
-        if (has_outcome) {
-            std::exception_ptr combined = failure;
-            if (!combined) {
-                combined = outcome.retained_failure
-                        ? outcome.retained_failure
-                        : outcome.common.retained_failure;
-            }
-            const bool failed = static_cast<bool>(combined);
-            if (outcome.is_binary) {
-                (void)detail::release_or_invalidate_binary_entries(
-                        registry_state_->registry, outcome.binary_entries,
-                        failed, !failed);
-                const bool workspace_proven =
-                        outcome.submission == nullptr
-                        || state_->completion_proven(
-                                *outcome.submission);
-                detail::complete_workspace_lease(
-                        *registry_state_, outcome.workspace_lease,
-                        workspace_proven);
-            } else {
-                (void)detail::release_or_invalidate_entries(
-                        registry_state_->registry, outcome.common,
-                        failed, !failed);
-            }
-            complete(sequence, std::move(combined));
+        if (!has_outcome) {
+            complete(sequence, std::move(failure));
             return;
+        }
+
+        if (outcome.completion != nullptr) {
+            const detail::FenceResult result =
+                    outcome.completion->finalize(std::move(failure));
+            failure = result.failure;
+        }
+        const bool failed = static_cast<bool>(failure);
+        const bool completion_proven =
+                outcome.completion == nullptr
+                || outcome.completion->completion_proven();
+        if (outcome.is_binary) {
+            (void)detail::release_or_invalidate_binary_entries(
+                    registry_state_->registry, outcome.binary_entries,
+                    failed, completion_proven);
+            detail::complete_workspace_lease(
+                    *registry_state_, outcome.workspace_lease,
+                    completion_proven);
+        } else {
+            (void)detail::release_or_invalidate_entries(
+                    registry_state_->registry, outcome.common, failed,
+                    completion_proven);
         }
         complete(sequence, std::move(failure));
     }

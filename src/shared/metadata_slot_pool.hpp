@@ -11,7 +11,7 @@
 
 #include <array>
 #include <condition_variable>
-#include <cstddef>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -108,6 +108,19 @@ public:
         }
         throw std::logic_error("metadata slot acquisition lost a free slot");
     }
+    // Nonblocking form used by FIFO dispatch so a quarantined partition
+    // cannot deadlock an accepted operation while no slot is reusable.
+    [[nodiscard]] std::optional<std::size_t> try_acquire() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t index = 0; index < slot_count_; ++index) {
+            if (!in_use_[index]) {
+                in_use_[index] = true;
+                return index;
+            }
+        }
+        return std::nullopt;
+    }
+
 
     // Retain a slot whose completion could not be proven: it stays reserved
     // forever until a covering proof releases it. Protected slots are never

@@ -30,6 +30,16 @@
 namespace iom {
 
     namespace detail {
+        // A backend dispatch may defer an accepted FIFO head when a fixed
+        // completion or metadata resource is quarantined. This is not a
+        // terminal operation failure and must leave the node parked.
+        class AdmissionResourceUnavailable final : public std::exception {
+        public:
+            [[nodiscard]] const char* what() const noexcept override {
+                return "fixed admission resource is unavailable";
+            }
+        };
+
 
         /**
          * One backend-neutral staged submission worker. Tasks are executed

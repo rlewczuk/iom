@@ -39,25 +39,24 @@ public:
             std::numeric_limits<std::size_t>::max();
 
     // One fixed completion resource. Created eagerly at queue setup and
-    // reused for later submissions only after every record referencing it
-    // is gone and its last use is proved.
+    // reused for later submissions only after the current event use is
+    // proved. The Submission retains only the immutable terminal result.
     struct Slot {
         event_type event = nullptr;
+        void* owner = nullptr;
         bool in_use = false;
+        bool quarantined = false;
     };
 
     // One submission's completion record. The registry fence captures a
-    // shared_ptr to this record, so the record — and its fixed completion
-    // resource — stays reserved until every registry entry (and destructor
-    // snapshot) that references it has disappeared. Re-acquiring the
-    // resource for a later submission therefore cannot change the result
-    // observed by an earlier fence. The result starts pending (non-success)
-    // and only becomes success after the worker has synchronized this
-    // submission's event.
+    // shared_ptr to this record, so the terminal result remains available
+    // after a proven event generation is returned to the fixed pool. An
+    // unknown generation remains quarantined by the ring until a covering
+    // queue drain proves that it is safe to reuse.
     class Submission final {
     public:
         ~Submission() noexcept {
-            ring_->return_resource(pool_index_);
+            ring_->return_resource(*this);
         }
 
         // Returns the result recorded by this submission's worker, or a
@@ -134,10 +133,11 @@ public:
     ~EventRingState() noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            // No submission record can outlive the ring (every record holds
-            // a shared reference), so no resource is reserved here.
+            // Submission records hold the ring alive until their cached
+            // result and any quarantine state are no longer referenced.
             for (std::size_t index = 0; index < event_count_; ++index) {
                 event_slots_[index].in_use = false;
+                event_slots_[index].owner = nullptr;
             }
         }
         try {
@@ -173,13 +173,33 @@ public:
         for (std::size_t index = 0; index < event_count_; ++index) {
             Slot& slot = event_slots_[index];
             if (!slot.in_use) {
-                slot.in_use = true;
-                return std::make_shared<Submission>(
+                auto submission = std::make_shared<Submission>(
                         this->shared_from_this(), index);
+                slot.in_use = true;
+                slot.owner = submission.get();
+                return submission;
             }
         }
         throw std::logic_error(
                 "event ring acquisition lost a free completion resource");
+    }
+
+    // Dispatch callbacks use this nonblocking form so a quarantined event
+    // cannot turn common FIFO admission into a worker or submitter deadlock.
+    [[nodiscard]] std::shared_ptr<Submission> try_acquire() {
+        Policy::check_acquire_event_fault();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t index = 0; index < event_count_; ++index) {
+            Slot& slot = event_slots_[index];
+            if (!slot.in_use) {
+                auto submission = std::make_shared<Submission>(
+                        this->shared_from_this(), index);
+                slot.in_use = true;
+                slot.owner = submission.get();
+                return submission;
+            }
+        }
+        return nullptr;
     }
 
     void mark_event_recorded(Submission& submission) noexcept {
@@ -227,14 +247,36 @@ public:
     void on_worker_destroy(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!submission.synchronized_on_complete_
+                && submission.stream_drained_) {
+            submission.result_ = FenceResult::success();
+            submission.synchronized_on_complete_ = true;
+            submission.disposition_ = CompletionDisposition::Complete;
+        } else if (!submission.synchronized_on_complete_
                 && submission.event_recorded_) {
             try {
                 Policy::activate(context_);
                 Policy::synchronize_event(
                         event_slots_[submission.pool_index_].event);
+                // Preserve a failure already observed by the worker callback;
+                // a later covering proof makes reuse safe but cannot erase
+                // the token's terminal failure.
+                if (submission.result_.failure == nullptr) {
+                    submission.result_ = FenceResult::success();
+                }
+                submission.synchronized_on_complete_ = true;
+                if (submission.disposition_
+                        == CompletionDisposition::RetireUnknown) {
+                    if (unproved_unknowns_ != 0) {
+                        --unproved_unknowns_;
+                    }
+                    event_slots_[submission.pool_index_].quarantined = false;
+                }
                 submission.disposition_ = CompletionDisposition::Complete;
             } catch (...) {
+                const std::exception_ptr failure =
+                        std::current_exception();
                 set_retire_unknown_locked(submission);
+                submission.result_ = FenceResult::failed(failure);
             }
         }
         if (submission.metadata_slot_ != kNoAttachedSlot) {
@@ -249,6 +291,12 @@ public:
             }
             submission.metadata_slot_ = kNoAttachedSlot;
         }
+        if (submission.disposition_ == CompletionDisposition::Complete) {
+            // Completion callbacks run before the worker destroys its Task.
+            // Return the event now so common FIFO pumping cannot wait on the
+            // current Task's raw completion pointer.
+            release_resource_locked(submission);
+        }
     }
 
     // A queue drain covers every retired submission on its stream: all
@@ -259,6 +307,14 @@ public:
         }
         std::lock_guard<std::mutex> lock(mutex_);
         unproved_unknowns_ = 0;
+        for (std::size_t index = 0; index < event_count_; ++index) {
+            if (event_slots_[index].quarantined) {
+                event_slots_[index].quarantined = false;
+                event_slots_[index].in_use = false;
+                event_slots_[index].owner = nullptr;
+                completion_.notify_one();
+            }
+        }
         metadata_pool_->release_all_protected();
     }
 
@@ -306,14 +362,25 @@ private:
     void set_retire_unknown_locked(Submission& submission) noexcept {
         if (submission.disposition_ != CompletionDisposition::RetireUnknown) {
             submission.disposition_ = CompletionDisposition::RetireUnknown;
+            if (submission.pool_index_ < event_count_) {
+                event_slots_[submission.pool_index_].quarantined = true;
+            }
             ++unproved_unknowns_;
         }
     }
 
-    void return_resource(std::size_t index) noexcept {
+    void return_resource(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (index < event_count_ && event_slots_[index].in_use) {
+        release_resource_locked(submission);
+    }
+
+    void release_resource_locked(Submission& submission) noexcept {
+        const std::size_t index = submission.pool_index_;
+        if (index < event_count_ && event_slots_[index].in_use
+                && event_slots_[index].owner == &submission
+                && !event_slots_[index].quarantined) {
             event_slots_[index].in_use = false;
+            event_slots_[index].owner = nullptr;
             completion_.notify_one();
         }
     }

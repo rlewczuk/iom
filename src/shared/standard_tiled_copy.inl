@@ -387,8 +387,9 @@ struct CopyMetadataLayout {
     std::size_t total_words;
 };
 
+template <typename View>
 [[nodiscard]] CopyMetadataLayout copy_metadata_layout(
-        const TensorView& source, const TensorView& destination) {
+        const View& source, const View& destination) {
     const std::span<const std::size_t> dimensions =
             source.spec().shape.dimensions();
     const std::size_t leading_rank = dimensions.size() - 2;
@@ -438,9 +439,10 @@ struct CopyMetadataLayout {
     return {bytes, total_words_size};
 }
 
+template <typename View>
 void write_copy_metadata(
-        std::byte* storage, const TensorView& source,
-        const TensorView& destination) {
+        std::byte* storage, const View& source,
+        const View& destination) {
     const std::span<const std::size_t> dimensions =
             source.spec().shape.dimensions();
     const std::size_t leading_rank = dimensions.size() - 2;
@@ -475,9 +477,10 @@ void write_copy_metadata(
                 dimensions[axis], "metadata leading dimension overflows");
     }
 }
+template <typename View>
 void write_copy_metadata(
-        InlineCopyMetadata& storage, const TensorView& source,
-        const TensorView& destination) {
+        InlineCopyMetadata& storage, const View& source,
+        const View& destination) {
     write_copy_metadata(
             reinterpret_cast<std::byte*>(&storage), source, destination);
 }

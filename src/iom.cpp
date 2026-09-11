@@ -1172,6 +1172,30 @@ namespace iom {
             }
             try {
                 dispatch(sequence);
+            } catch (const detail::AdmissionResourceUnavailable&) {
+                // The accepted node remains the FIFO head. Restore its
+                // callback and credit without rolling back prepared owners;
+                // a later completion will retry admission after resources
+                // become reusable.
+                bool retry = false;
+                {
+                    std::lock_guard<std::mutex> lock(completion_mutex_);
+                    const auto node = admission_nodes_.find(sequence);
+                    if (node != admission_nodes_.end()) {
+                        node->second.dispatch = std::move(dispatch);
+                        node->second.executing = false;
+                        if (admission_credits_ != 0) {
+                            --admission_credits_;
+                        }
+                        retry = true;
+                    }
+                    admission_pumping_ = false;
+                    completion_cv_.notify_all();
+                }
+                if (retry) {
+                    pump_admission(synchronous_failure, synchronous_sequence);
+                }
+                return;
             } catch (...) {
                 const std::exception_ptr failure =
                         std::current_exception();
@@ -1714,28 +1738,31 @@ namespace iom {
             std::lock_guard<std::mutex> lock(completion_mutex_);
             admission_closing_ = true;
         }
-        // A derived worker may have completed all native work already. Any
-        // callback that never published completion is terminally failed here;
-        // token history remains observable and no future submission can
-        // replace it.
-        std::vector<std::uint64_t> unresolved;
+        // Close marks admission immediately, but only parked nodes can be
+        // completed here. Executing nodes still own backend resources and
+        // must finish through their worker's drain before their terminal
+        // result is recorded.
+        std::vector<std::uint64_t> parked;
         {
             std::lock_guard<std::mutex> lock(completion_mutex_);
-            unresolved.assign(admission_fifo_.begin(), admission_fifo_.end());
+            for (const std::uint64_t sequence : admission_fifo_) {
+                const auto node = admission_nodes_.find(sequence);
+                if (node != admission_nodes_.end()
+                        && !node->second.executing) {
+                    parked.push_back(sequence);
+                }
+            }
         }
-        for (const std::uint64_t sequence : unresolved) {
-            // A parked node has prepared ownership but has never reached a
-            // backend callback. Release that state before making its token
-            // terminal; executing nodes are left to their backend drain and
-            // completion path, which may need to quarantine unknown work.
+        for (const std::uint64_t sequence : parked) {
             std::function<void()> rollback;
             {
                 std::lock_guard<std::mutex> lock(completion_mutex_);
                 const auto node = admission_nodes_.find(sequence);
-                if (node != admission_nodes_.end()
-                        && !node->second.executing) {
-                    rollback = std::move(node->second.rollback);
+                if (node == admission_nodes_.end()
+                        || node->second.executing) {
+                    continue;
                 }
+                rollback = std::move(node->second.rollback);
             }
             if (rollback) {
                 try {

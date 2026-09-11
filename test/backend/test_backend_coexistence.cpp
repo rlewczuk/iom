@@ -13,8 +13,6 @@
 #include <string>
 #include <thread>
 #include <type_traits>
-#include <vector>
-
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "iom/alloc.hpp"
@@ -783,6 +781,7 @@ void run_interleaved_operations(
         const std::vector<BackendParticipant*>& participants,
         iom::DataType type, std::uint64_t lhs_value,
         std::uint64_t rhs_value) {
+    using iom_conformance::BinaryOperation;
     const iom::TensorSpec spec{iom::TensorShape{{2, 17, 33}}, type};
     const std::vector<std::byte> lhs_bytes =
             coexistence_uniform(spec, lhs_value);
@@ -798,6 +797,7 @@ void run_interleaved_operations(
         void* lhs_handle = nullptr;
         void* rhs_handle = nullptr;
         iom::Device* device = nullptr;
+        std::vector<std::unique_ptr<iom::DeviceOps>> queues;
         std::vector<std::unique_ptr<iom::RawWorkspace>> binary_workspaces;
         struct Expected {
             iom::oid token;
@@ -1012,6 +1012,7 @@ void run_interleaved_operations(
                                       iom_conformance::add_oracle::operation::add)),
                 participants[i]->name);
     }
+    work.clear();
 
     // A retained failure must remain observable without poisoning another queue.
     auto fault_lhs = participants.front()->device->create_tensor(spec);

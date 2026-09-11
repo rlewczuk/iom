@@ -439,6 +439,7 @@ namespace iom {
             detail::RegistryState registry_state_;
             std::unique_ptr<CudaTransferResource> transfer_resource_;
             mutable std::mutex transfer_mutex_;
+            bool transfer_resource_poisoned_ = false;
             std::mutex bookkeeping_mutex_;
             std::unique_ptr<ListAllocator> data_allocator_;
             std::unique_ptr<FixedSizeAllocator> metadata_allocator_;
@@ -559,7 +560,8 @@ namespace iom {
                 cuda_detail::region_from_host(
                         device_.transfer_resource_->stream(),
                         device_.context_, device_, device_.registry_state_,
-                        destination, workspace, source);
+                        destination, workspace, source,
+                        device_.transfer_resource_poisoned_);
             }
 
             void region_to_host(
@@ -570,7 +572,8 @@ namespace iom {
                 cuda_detail::region_to_host(
                         device_.transfer_resource_->stream(),
                         device_.context_, device_, device_.registry_state_,
-                        source, workspace, destination);
+                        source, workspace, destination,
+                        device_.transfer_resource_poisoned_);
             }
             CudaDevice& device_;
             detail::RegistryState* state_;

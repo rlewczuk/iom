@@ -104,11 +104,13 @@ WorkspaceAdmission begin_workspace_transfer(
         const Device& device, detail::RegistryState& registry_state,
         const TensorView& view, RawWorkspaceView workspace,
         bool& resource_poisoned) {
-    const iom::WorkspaceRequirements requirements =
+    const WorkspaceRequirements requirements =
             view.copy_from_host_workspace_requirements();
+    const std::array<TensorView, 1> operands{view};
     const RawWorkspaceView checked =
             detail::WorkspaceValidation::validated(
-                    device, workspace, requirements, view);
+                    device, workspace, requirements.bytes,
+                    requirements.alignment, operands);
     if (resource_poisoned) {
         throw std::bad_alloc();
     }
@@ -118,7 +120,8 @@ WorkspaceAdmission begin_workspace_transfer(
             detail::acquire_workspace_lease(
                     registry_state, workspace.owner_identity(),
                     detail::WorkspaceValidation::address(checked),
-                    checked.byte_size(), queue_id, queue_id, transfer_fence()),
+                    checked.byte_size(), queue_id, queue_id,
+                    transfer_fence()),
             detail::WorkspaceValidation::address(checked)};
 }
 void finish_workspace_transfer(

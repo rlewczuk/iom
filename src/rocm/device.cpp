@@ -399,6 +399,7 @@ namespace iom {
             detail::RegistryState registry_state_;
             std::unique_ptr<RocmTransferResource> transfer_resource_;
             mutable std::mutex transfer_mutex_;
+            bool transfer_resource_poisoned_ = false;
             std::mutex bookkeeping_mutex_;
             std::unique_ptr<ListAllocator> data_allocator_;
             std::unique_ptr<FixedSizeAllocator> metadata_allocator_;
@@ -518,7 +519,8 @@ namespace iom {
                 rocm_detail::region_from_host(
                         device_.transfer_resource_->stream(),
                         static_cast<int>(device_.ordinal()), device_,
-                        device_.registry_state_, destination, workspace, source);
+                        device_.registry_state_, destination, workspace, source,
+                        device_.transfer_resource_poisoned_);
             }
 
             void region_to_host(
@@ -529,7 +531,8 @@ namespace iom {
                 rocm_detail::region_to_host(
                         device_.transfer_resource_->stream(),
                         static_cast<int>(device_.ordinal()), device_,
-                        device_.registry_state_, source, workspace, destination);
+                        device_.registry_state_, source, workspace, destination,
+                        device_.transfer_resource_poisoned_);
             }
 
             RocmDevice& device_;
