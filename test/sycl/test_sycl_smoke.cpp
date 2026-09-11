@@ -678,6 +678,8 @@ TEST_CASE(
             iom::sycl_detail::queue_resource_snapshot_for_testing(
                     *queues.back(), snapshot);
             CHECK_EQ(snapshot.slot_count, slots);
+            CHECK_EQ(snapshot.events_total, slots);
+            CHECK_EQ(snapshot.events_in_use, 0u);
             CHECK_EQ(snapshot.slot_stride, 512u);
             CHECK_EQ(snapshot.slots_protected, 0u);
             const auto base =

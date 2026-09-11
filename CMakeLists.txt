@@ -210,7 +210,6 @@ if(ROCM_ENABLED)
 
     target_link_libraries(iom_rocm
         PRIVATE
-            libiom
             hip::host
     )
 

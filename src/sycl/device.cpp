@@ -362,6 +362,7 @@ namespace iom {
             detail::RegistryState registry_state_;
             std::uint32_t ordinal_;
             mutable std::mutex transfer_mutex_;
+            bool transfer_resource_poisoned_ = false;
             std::mutex bookkeeping_mutex_;
             std::unique_ptr<ListAllocator> data_allocator_;
             std::unique_ptr<FixedSizeAllocator> metadata_allocator_;
@@ -489,7 +490,7 @@ namespace iom {
                 sycl_detail::region_from_host(
                         device_.transfer_queue(), device_,
                         device_.registry_state_, destination, workspace,
-                        source);
+                        source, device_.transfer_resource_poisoned_);
             }
 
             void region_to_host(
@@ -499,7 +500,8 @@ namespace iom {
                 std::lock_guard<std::mutex> lock(device_.transfer_mutex_);
                 sycl_detail::region_to_host(
                         device_.transfer_queue(), device_,
-                        device_.registry_state_, source, workspace, destination);
+                        device_.registry_state_, source, workspace, destination,
+                        device_.transfer_resource_poisoned_);
             }
 
             SyclDevice& device_;

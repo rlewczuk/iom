@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "iom/alloc.hpp"
@@ -945,7 +946,8 @@ void run_interleaved_operations(
                                       ? 0 : 1;
             item.queues[queue]->wait(expected.token);
             iom_conformance::require_logical_bytes(
-                    expected.output->view(), expected.bytes, participants[i]->name);
+                    expected.output->view(), expected.bytes,
+                    participants[i]->name);
         }
         item.queues[0]->wait(item.expected.front().token);
         CHECK(item.lhs_owner == item.lhs->view().owner_identity());
