@@ -556,16 +556,36 @@ inline void run_compute_capability_conformance(
     auto queue = candidate.create_ops();
     (void)backend_label;
     const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    const auto submit_supported_binary =
+            [&](const BinaryOperation operation) {
+                const auto requirements =
+                        query_binary_workspace_requirements(
+                                *queue, operation, x->view(), x->view(),
+                                y->view());
+                std::unique_ptr<iom::RawWorkspace> workspace_owner;
+                if (requirements.bytes != 0) {
+                    workspace_owner =
+                            candidate.create_workspace(requirements.bytes);
+                }
+                if (workspace_owner) {
+                    const iom::RawWorkspaceView workspace =
+                            workspace_owner->view();
+                    return submit_binary_operation(
+                            *queue, operation, x->view(), x->view(),
+                            y->view(), workspace);
+                }
+                return submit_binary_operation(
+                        *queue, operation, x->view(), x->view(), y->view());
+            };
     const iom::oid binary_token =
-            queue->add(x->view(), x->view(), y->view());
+            submit_supported_binary(BinaryOperation::add);
     if (binary_supported) {
         REQUIRE(iom::oid_is_token(binary_token));
         CHECK_NOTHROW(queue->wait(binary_token));
         for (const auto operation : {BinaryOperation::mul,
                                      BinaryOperation::sub,
                                      BinaryOperation::div}) {
-            const iom::oid token = submit_binary_operation(
-                    *queue, operation, x->view(), x->view(), y->view());
+            const iom::oid token = submit_supported_binary(operation);
             REQUIRE(iom::oid_is_token(token));
             CHECK_NOTHROW(queue->wait(token));
         }

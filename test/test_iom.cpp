@@ -816,6 +816,7 @@ public:
         std::array<AddViewRecord, 3> views;
         std::vector<std::size_t> result_shape;
         iom::detail::BinaryEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
         bool retained_failure;
     };
 
@@ -841,7 +842,6 @@ public:
     [[nodiscard]] std::size_t registered_at(void* address) const {
         return registry_state_.registry.snapshot_for(address).size();
     }
-
     void finish_add(std::uint64_t sequence) {
         for (const BinaryRecord& record : add_records_) {
             if (record.sequence != sequence) {
@@ -850,6 +850,8 @@ public:
             (void)iom::detail::release_or_invalidate_binary_entries(
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
+            iom::detail::complete_workspace_lease(
+                    registry_state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -925,6 +927,7 @@ protected:
                             {snapshot.result_shape.dimensions().begin(),
                              snapshot.result_shape.dimensions().end()},
                             entries,
+                            snapshot.workspace_lease,
                             failure == AddFailure::post_acceptance};
                     add_records_.push_back(std::move(record));
                     submissions.push_back({sequence, "add"});
@@ -2019,30 +2022,36 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         iom::oid (DeviceOps::*)(const TensorView&, TensorView&) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::add),
-        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::mul),
-        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::silu),
         iom::oid (DeviceOps::*)(const TensorView&, TensorView&) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::linear),
-        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::sub),
-        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::div),
-        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::rmsnorm),
-        iom::oid (DeviceOps::*)(const TensorView&, TensorView&, const TensorView&,
-                                float, size_t) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&,
+                                const TensorView&, float, size_t) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::sdpa),
-        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&, const TensorView&,
-                                size_t, size_t, size_t, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                const TensorView&, size_t, size_t, size_t,
+                                TensorView&) noexcept>);
 
     // silu deliberately accepts the same window as const input and mutable
     // output; a const view is refused as an output.

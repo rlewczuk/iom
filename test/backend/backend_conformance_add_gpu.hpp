@@ -68,8 +68,22 @@ inline void run_gpu_eltwise_conformance(
         l->view().copy_from_host(lhs);
         r->view().copy_from_host(rhs);
         out->view().copy_from_host(std::vector<std::byte>(expected.size(), std::byte{0xAA}));
-        const iom::oid token = submit_binary_operation(
+        const auto requirements = query_binary_workspace_requirements(
                 *queue, operation, l->view(), r->view(), out->view());
+        std::unique_ptr<iom::RawWorkspace> workspace_owner;
+        if (requirements.bytes != 0) {
+            workspace_owner = candidate.create_workspace(requirements.bytes);
+        }
+        iom::oid token = 0;
+        if (workspace_owner) {
+            const iom::RawWorkspaceView workspace = workspace_owner->view();
+            token = submit_binary_operation(
+                    *queue, operation, l->view(), r->view(), out->view(),
+                    workspace);
+        } else {
+            token = submit_binary_operation(
+                    *queue, operation, l->view(), r->view(), out->view());
+        }
         REQUIRE(iom::oid_is_token(token));
         CHECK_NOTHROW(queue->wait(token));
         const auto actual = read_logical(out->view());
@@ -106,8 +120,22 @@ inline void run_gpu_eltwise_mapping_conformance(
             std::vector<std::byte>(
                     out_spec.logical_nbytes(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
-    const auto token = submit_binary_operation(
+    const auto requirements = query_binary_workspace_requirements(
             *queue, operation, lhs->view(), rhs->view(), out->view());
+    std::unique_ptr<iom::RawWorkspace> workspace_owner;
+    if (requirements.bytes != 0) {
+        workspace_owner = candidate.create_workspace(requirements.bytes);
+    }
+    iom::oid token = 0;
+    if (workspace_owner) {
+        const iom::RawWorkspaceView workspace = workspace_owner->view();
+        token = submit_binary_operation(
+                *queue, operation, lhs->view(), rhs->view(), out->view(),
+                workspace);
+    } else {
+        token = submit_binary_operation(
+                *queue, operation, lhs->view(), rhs->view(), out->view());
+    }
     if (operation == BinaryOperation::div) {
         CHECK_EQ(token, iom::to_oid(iom::OidError::Unsupported));
 
@@ -163,9 +191,27 @@ inline void run_gpu_eltwise_mapping_conformance(
         out_f32->view().copy_from_host(
                 std::vector<std::byte>(
                         expected_f32.size(), std::byte{0xAA}));
-        const auto f32_token = submit_binary_operation(
-                *queue, operation, lhs_f32->view(), rhs_f32->view(),
-                out_f32->view());
+        const auto f32_requirements =
+                query_binary_workspace_requirements(
+                        *queue, operation, lhs_f32->view(), rhs_f32->view(),
+                        out_f32->view());
+        std::unique_ptr<iom::RawWorkspace> f32_workspace_owner;
+        if (f32_requirements.bytes != 0) {
+            f32_workspace_owner =
+                    candidate.create_workspace(f32_requirements.bytes);
+        }
+        iom::oid f32_token = 0;
+        if (f32_workspace_owner) {
+            const iom::RawWorkspaceView workspace =
+                    f32_workspace_owner->view();
+            f32_token = submit_binary_operation(
+                    *queue, operation, lhs_f32->view(), rhs_f32->view(),
+                    out_f32->view(), workspace);
+        } else {
+            f32_token = submit_binary_operation(
+                    *queue, operation, lhs_f32->view(), rhs_f32->view(),
+                    out_f32->view());
+        }
         REQUIRE(iom::oid_is_token(f32_token));
         CHECK_NOTHROW(queue->wait(f32_token));
         const auto actual_f32 = read_logical(out_f32->view());

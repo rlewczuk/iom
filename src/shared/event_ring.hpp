@@ -82,6 +82,10 @@ public:
                 std::size_t pool_index) noexcept
                 : ring_(std::move(ring)), pool_index_(pool_index) {}
 
+        [[nodiscard]] bool completion_proven() const noexcept {
+            std::lock_guard<std::mutex> lock(ring_->mutex_);
+            return disposition_ == CompletionDisposition::Complete;
+        }
     private:
         friend class EventRingState;
 
@@ -270,6 +274,10 @@ public:
     [[nodiscard]] event_type event_of(
             const Submission& submission) const noexcept {
         return event_slots_[submission.pool_index_].event;
+    }
+    [[nodiscard]] bool completion_proven(
+            const Submission& submission) const noexcept {
+        return submission.completion_proven();
     }
 
     [[nodiscard]] std::size_t slot_index(

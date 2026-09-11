@@ -73,6 +73,16 @@ public:
         retained_failure_ = std::move(incoming);
     }
 
+    void mark_completion_proven() noexcept {
+        std::lock_guard<std::mutex> lock(mu_);
+        proved_ = true;
+    }
+
+    [[nodiscard]] bool completion_proven() const noexcept {
+        std::lock_guard<std::mutex> lock(mu_);
+        return proved_;
+    }
+
     [[nodiscard]] detail::FenceResult result() noexcept {
         std::lock_guard<std::mutex> lock(mu_);
         if (cached_.has_value()) {
@@ -92,10 +102,10 @@ public:
         if (!result.failure && retained_failure_) {
             result = detail::FenceResult::failed(retained_failure_);
         }
-        // The fixed slot's host mirror stays immutable until this
-        // submission's completion is proved; an unproved result protects
-        // the slot until a covering queue drain.
-        proved_ = result.succeeded && result.failure == nullptr;
+        // The fixed slot's host mirror stays immutable until this result is
+        // known. An operation failure can be retained independently from
+        // the completion proof established by the explicit queue drain.
+        proved_ = proved_ || (result.succeeded && result.failure == nullptr);
         cached_ = result;
         return result;
     }
@@ -135,7 +145,7 @@ private:
         slot_ = slot;
     }
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::optional<sycl::event> event_;
     std::exception_ptr retained_failure_;
     std::optional<detail::FenceResult> cached_;
@@ -290,6 +300,7 @@ class SyclQueue final : public DeviceOps {
         detail::SequenceOutcome common;
         std::shared_ptr<SyclFenceState> state;
         std::optional<detail::BinaryEntryRegistration> binary_entries;
+        detail::WorkspaceLease workspace_lease;
     };
 
 
@@ -672,7 +683,7 @@ private:
         }
     }
 
-    static void free_binary_staging(
+    static void free_binary_host_staging(
             void* staging, const sycl::context& context) noexcept {
         if (staging == nullptr) {
             return;
@@ -683,18 +694,6 @@ private:
         }
     }
 
-    // Device-USM variant: routed through the native-boundary seam so the
-    // temporary buffer's free stays paired with its allocation even on the
-    // noexcept rollback path.
-    static void free_binary_device_staging(
-            void* staging, const sycl::context& context) noexcept {
-        if (staging == nullptr) {
-            return;
-        }
-        free_attempt_device(
-                staging, context, AllocationClass::staging,
-                AllocationPhase::post_publication);
-    }
 
     void execute(Task& task) {
         if (task.binary_request.has_value()) {
@@ -702,14 +701,15 @@ private:
                 throw std::bad_alloc();
             }
             {
-                std::lock_guard<std::mutex> lock(outcome_mutex_);
                 const auto [it, inserted] = outcomes_.emplace(
                         task.sequence,
                         SyclSequenceOutcome{
                                 detail::SequenceOutcome{},
-                                task.state, task.binary_entries});
+                                task.state, task.binary_entries,
+                                task.binary_request->workspace_lease});
                 if (!inserted) {
-                    throw std::logic_error("duplicate SYCL outstanding-work sequence");
+                    throw std::logic_error(
+                            "duplicate SYCL outstanding-work sequence");
                 }
             }
             const BinaryRequest& captured = *task.binary_request;
@@ -735,7 +735,7 @@ private:
                 // Tensor storage is device USM and this runtime rejects
                 // direct queue memcpy operations involving caller handles.
                 // The existing copy kernels can access those handles, so
-                // each extent first crosses through a temporary device-USM
+                // each extent first crosses through a temporary host-USM
                 // buffer. Only the temporary buffers participate in memcpy;
                 // the host scalar loop still uses the exact shared
                 // long-double implementation, preserving cross-backend
@@ -745,22 +745,19 @@ private:
                 lhs_stage = sycl::malloc_host(lhs_bytes, context);
                 rhs_stage = sycl::malloc_host(rhs_bytes, context);
                 out_stage = sycl::malloc_host(out_bytes, context);
-                // The three temporary device-USM buffers are the current
-                // binary-fallback staging set; each is recorded at the
-                // native boundary and paired with its rollback or success
-                // free below.
-                lhs_device = alloc_attempt_device(
-                        lhs_bytes, queue_.get_device(), context,
-                        AllocationClass::staging,
-                        AllocationPhase::post_publication);
-                rhs_device = alloc_attempt_device(
-                        rhs_bytes, queue_.get_device(), context,
-                        AllocationClass::staging,
-                        AllocationPhase::post_publication);
-                out_device = alloc_attempt_device(
-                        out_bytes, queue_.get_device(), context,
-                        AllocationClass::staging,
-                        AllocationPhase::post_publication);
+                const std::size_t lhs_aligned =
+                        align_up_checked(lhs_bytes, 32);
+                const std::size_t rhs_aligned =
+                        align_up_checked(rhs_bytes, 32);
+                const std::size_t out_offset = checked_add_local(
+                        lhs_aligned, rhs_aligned,
+                        "SYCL workspace staging offset overflows");
+                auto* workspace_base = static_cast<std::byte*>(
+                        iom::detail::WorkspaceValidation::address(
+                                captured.workspace));
+                lhs_device = workspace_base;
+                rhs_device = workspace_base + lhs_aligned;
+                out_device = workspace_base + out_offset;
                 if (lhs_stage == nullptr || rhs_stage == nullptr
                         || out_stage == nullptr || lhs_device == nullptr
                         || rhs_device == nullptr || out_device == nullptr) {
@@ -771,13 +768,18 @@ private:
                                 captured.lhs.native_handle);
                 auto* lhs_target =
                         static_cast<unsigned char*>(lhs_device);
+                // Once the first native enqueue is attempted, conservatively
+                // retain the accepted outcome even if the enqueue throws:
+                // the runtime may have submitted work before reporting the
+                // error, and only a successful drain proves the workspace
+                // range can be released.
+                staged_enqueued = true;
+                submitted = true;
                 queue_.parallel_for(
                         sycl::range<1>(lhs_bytes),
                         [=](sycl::id<1> item) {
                             lhs_target[item[0]] = lhs_source[item[0]];
                         });
-                staged_enqueued = true;
-                submitted = true;
                 const auto* rhs_source =
                         static_cast<const unsigned char*>(
                                 captured.rhs.native_handle);
@@ -823,19 +825,19 @@ private:
                     throw std::runtime_error("injected SYCL post-launch failure");
                 }
                 queue_.wait_and_throw();
+                task.state->mark_completion_proven();
             } catch (...) {
+                bool completion_proven = false;
                 if (staged_enqueued) {
                     try {
                         queue_.wait_and_throw();
+                        completion_proven = true;
                     } catch (...) {
                     }
                 }
-                free_binary_staging(lhs_stage, context);
-                free_binary_staging(rhs_stage, context);
-                free_binary_staging(out_stage, context);
-                free_binary_device_staging(lhs_device, context);
-                free_binary_device_staging(rhs_device, context);
-                free_binary_device_staging(out_device, context);
+                free_binary_host_staging(lhs_stage, context);
+                free_binary_host_staging(rhs_stage, context);
+                free_binary_host_staging(out_stage, context);
                 if (!submitted) {
                     {
                         std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -848,15 +850,14 @@ private:
                     task.fence = nullptr;
                     throw;
                 }
+                if (completion_proven) {
+                    task.state->mark_completion_proven();
+                }
                 task.state->set_failure(std::current_exception());
-                return;
             }
-            free_binary_staging(lhs_stage, context);
-            free_binary_staging(rhs_stage, context);
-            free_binary_staging(out_stage, context);
-            free_binary_device_staging(lhs_device, context);
-            free_binary_device_staging(rhs_device, context);
-            free_binary_device_staging(out_device, context);
+            free_binary_host_staging(lhs_stage, context);
+            free_binary_host_staging(rhs_stage, context);
+            free_binary_host_staging(out_stage, context);
             return;
         }
         if (task.no_op) {
@@ -1023,6 +1024,9 @@ private:
                         state_->registry, *outcome.binary_entries,
                         static_cast<bool>(callback_failure),
                         fence_succeeded);
+                detail::complete_workspace_lease(
+                        *state_, outcome.workspace_lease,
+                        outcome.state->completion_proven());
             } else {
                 (void)detail::release_or_invalidate_entries(
                         state_->registry, outcome.common,

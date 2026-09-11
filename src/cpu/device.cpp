@@ -835,7 +835,10 @@ namespace iom {
                         }
                         (void)detail::release_or_invalidate_binary_entries(
                                 device_->registry_state().registry, entries,
-                                static_cast<bool>(failure), !failure);
+                                static_cast<bool>(failure), true);
+                        detail::complete_workspace_lease(
+                                device_->registry_state(),
+                                captured.workspace_lease, true);
                         complete(sequence, std::move(failure));
                     });
         }

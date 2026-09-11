@@ -156,6 +156,7 @@ namespace iom {
     }  // namespace detail
 
     class Device;
+    class DeviceOps;
     class Tensor;
     class RawWorkspace;
 
@@ -229,6 +230,7 @@ namespace iom {
 
     private:
         friend class RawWorkspace;
+        friend class DeviceOps;
         friend class detail::WorkspaceValidation;
         RawWorkspaceView(const RawWorkspace& owner, std::size_t offset,
                          std::size_t bytes);

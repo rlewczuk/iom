@@ -120,6 +120,8 @@ class GpuQueue final : public DeviceOps {
     struct GpuOutcome {
         detail::SequenceOutcome common{};
         detail::BinaryEntryRegistration binary_entries{};
+        detail::WorkspaceLease workspace_lease{};
+        std::shared_ptr<typename EventRing::Submission> submission;
         std::exception_ptr retained_failure;
         bool is_binary = false;
     };
@@ -424,13 +426,15 @@ private:
             // any device effect. A failure here is pre-acceptance: the
             // caller's submit_binary rolls the sequence back with no live work.
             {
-                std::lock_guard<std::mutex> lock(outcome_mutex_);
                 const auto [it, inserted] =
                         outcomes_.try_emplace(task.sequence);
                 if (!inserted) {
                     throw std::logic_error("duplicate ADD sequence");
                 }
                 it->second.binary_entries = task.binary_entries;
+                it->second.workspace_lease =
+                        task.binary_request->workspace_lease;
+                it->second.submission = task.submission;
                 it->second.is_binary = true;
             }
             std::exception_ptr failure;
@@ -601,6 +605,13 @@ private:
                 (void)detail::release_or_invalidate_binary_entries(
                         registry_state_->registry, outcome.binary_entries,
                         failed, !failed);
+                const bool workspace_proven =
+                        outcome.submission == nullptr
+                        || state_->completion_proven(
+                                *outcome.submission);
+                detail::complete_workspace_lease(
+                        *registry_state_, outcome.workspace_lease,
+                        workspace_proven);
             } else {
                 (void)detail::release_or_invalidate_entries(
                         registry_state_->registry, outcome.common,

@@ -350,9 +350,9 @@ TEST_CASE(
 
     const iom::TensorSpec staging_spec{
             iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
-    // Two leading planes: the binary fallback stages this tensor through
-    // three temporary device-USM buffers (one per operand), each exactly
-    // one padded plane pair (2 x 1 KiB for F32).
+    // Three temporary host-USM buffers stage each operand through the
+    // caller-supplied raw workspace; only the separate copy path uses the
+    // device staging pool.
     const iom::TensorSpec binary_spec{
             iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     iom::sycl_detail::AllocationRecord data_backing;
@@ -424,12 +424,17 @@ TEST_CASE(
         REQUIRE(iom::oid_is_token(copy_token));
         queue->wait(copy_token);
 
-        const iom::oid binary_token =
-                queue->add(lhs->view(), rhs->view(), out->view());
+        const auto requirements = queue->add_workspace_requirements(
+                lhs->view(), rhs->view(), out->view());
+        REQUIRE_EQ(requirements.alignment, std::size_t{32});
+        auto workspace_owner = device->create_workspace(requirements.bytes);
+        const iom::RawWorkspaceView workspace = workspace_owner->view();
+        const iom::oid binary_token = queue->add(
+                lhs->view(), rhs->view(), out->view(), workspace);
         REQUIRE(iom::oid_is_token(binary_token));
         queue->wait(binary_token);
-    }  // queue and device teardown free the pooled metadata, staging, and
-       // the two arena backings
+    }  // queue and device teardown free the pooled metadata, host staging,
+       // workspace owner, and the two arena backings
 
     std::size_t metadata_allocations = 0;
     std::size_t staging_allocations = 0;
@@ -471,8 +476,8 @@ TEST_CASE(
     }
     CHECK_EQ(failed, 0u);
     CHECK_EQ(metadata_allocations, 0u);  // fixed slots; no metadata growth
-    CHECK_GE(staging_allocations, 4u);   // staging pool + binary fallback
-    CHECK_EQ(staging_2048, 3u);          // the three binary temporary buffers
+    CHECK_GE(staging_allocations, 1u);   // copy staging pool only
+    CHECK_EQ(staging_2048, 0u);          // binary staging uses workspace
     CHECK(outstanding.empty());          // every allocation freed by teardown
 }
 

@@ -280,9 +280,24 @@ inline void run_binary_value_conformance(
         out_tensor->view().copy_from_host(
                 std::vector<std::byte>(
                         expected.size(), std::byte{0xAA}));
-        const auto token = submit_binary_operation(
+        const auto requirements = query_binary_workspace_requirements(
                 *queue, operation, lhs_tensor->view(), rhs_tensor->view(),
                 out_tensor->view());
+        std::unique_ptr<iom::RawWorkspace> workspace_owner;
+        if (requirements.bytes != 0) {
+            workspace_owner = candidate.create_workspace(requirements.bytes);
+        }
+        iom::oid token = 0;
+        if (workspace_owner) {
+            const iom::RawWorkspaceView workspace = workspace_owner->view();
+            token = submit_binary_operation(
+                    *queue, operation, lhs_tensor->view(), rhs_tensor->view(),
+                    out_tensor->view(), workspace);
+        } else {
+            token = submit_binary_operation(
+                    *queue, operation, lhs_tensor->view(), rhs_tensor->view(),
+                    out_tensor->view());
+        }
         REQUIRE(iom::oid_is_token(token));
         CHECK_NOTHROW(queue->wait(token));
         const auto observed = read_logical(out_tensor->view());
@@ -363,8 +378,22 @@ inline void run_binary_mapping_value_conformance(
             std::vector<std::byte>(
                     expected.size(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
-    const auto token = submit_binary_operation(
+    const auto requirements = query_binary_workspace_requirements(
             *queue, operation, lhs->view(), rhs->view(), out->view());
+    std::unique_ptr<iom::RawWorkspace> workspace_owner;
+    if (requirements.bytes != 0) {
+        workspace_owner = candidate.create_workspace(requirements.bytes);
+    }
+    iom::oid token = 0;
+    if (workspace_owner) {
+        const iom::RawWorkspaceView workspace = workspace_owner->view();
+        token = submit_binary_operation(
+                *queue, operation, lhs->view(), rhs->view(), out->view(),
+                workspace);
+    } else {
+        token = submit_binary_operation(
+                *queue, operation, lhs->view(), rhs->view(), out->view());
+    }
     REQUIRE(iom::oid_is_token(token));
     CHECK_NOTHROW(queue->wait(token));
     const auto observed = read_logical(out->view());
@@ -405,8 +434,21 @@ inline void run_binary_transformed_value_conformance(
             std::vector<std::byte>(
                     out_view.spec().logical_nbytes(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
-    const auto token = submit_binary_operation(
+    const auto requirements = query_binary_workspace_requirements(
             *queue, operation, lhs_view, rhs_view, out_view);
+    std::unique_ptr<iom::RawWorkspace> workspace_owner;
+    if (requirements.bytes != 0) {
+        workspace_owner = candidate.create_workspace(requirements.bytes);
+    }
+    iom::oid token = 0;
+    if (workspace_owner) {
+        const iom::RawWorkspaceView workspace = workspace_owner->view();
+        token = submit_binary_operation(
+                *queue, operation, lhs_view, rhs_view, out_view, workspace);
+    } else {
+        token = submit_binary_operation(
+                *queue, operation, lhs_view, rhs_view, out_view);
+    }
     REQUIRE(iom::oid_is_token(token));
     CHECK_NOTHROW(queue->wait(token));
     const auto observed = read_logical(out_view);

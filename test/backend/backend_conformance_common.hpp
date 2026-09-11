@@ -304,7 +304,8 @@ static_assert(std::is_same_v<
     static_assert(std::is_same_v<decltype(&iom::DeviceOps::NAME), \
         iom::oid (iom::DeviceOps::*)(const iom::TensorView&, \
                                      const iom::TensorView&, \
-                                     iom::TensorView&) noexcept>)
+                                     iom::TensorView&, \
+                                     iom::RawWorkspaceView) noexcept>)
 IOM_ASSERT_BINARY(add);
 IOM_ASSERT_BINARY(mul);
 IOM_ASSERT_BINARY(sub);
@@ -316,14 +317,31 @@ enum class BinaryOperation { add, mul, sub, div };
 inline iom::oid submit_binary_operation(
         iom::DeviceOps& queue, BinaryOperation operation,
         const iom::TensorView& lhs, const iom::TensorView& rhs,
-        iom::TensorView& out) noexcept {
+        iom::TensorView& out,
+        iom::RawWorkspaceView workspace = {}) noexcept {
     switch (operation) {
-        case BinaryOperation::add: return queue.add(lhs, rhs, out);
-        case BinaryOperation::mul: return queue.mul(lhs, rhs, out);
-        case BinaryOperation::sub: return queue.sub(lhs, rhs, out);
-        case BinaryOperation::div: return queue.div(lhs, rhs, out);
+        case BinaryOperation::add: return queue.add(lhs, rhs, out, workspace);
+        case BinaryOperation::mul: return queue.mul(lhs, rhs, out, workspace);
+        case BinaryOperation::sub: return queue.sub(lhs, rhs, out, workspace);
+        case BinaryOperation::div: return queue.div(lhs, rhs, out, workspace);
     }
     return iom::to_oid(iom::OidError::InternalError);
+}
+inline iom::WorkspaceRequirements query_binary_workspace_requirements(
+        iom::DeviceOps& queue, BinaryOperation operation,
+        const iom::TensorView& lhs, const iom::TensorView& rhs,
+        const iom::TensorView& out) {
+    switch (operation) {
+        case BinaryOperation::add:
+            return queue.add_workspace_requirements(lhs, rhs, out);
+        case BinaryOperation::mul:
+            return queue.mul_workspace_requirements(lhs, rhs, out);
+        case BinaryOperation::sub:
+            return queue.sub_workspace_requirements(lhs, rhs, out);
+        case BinaryOperation::div:
+            return queue.div_workspace_requirements(lhs, rhs, out);
+    }
+    throw std::logic_error("unknown binary operation");
 }
 
 class CommonBinaryQueue final : public iom::DeviceOps {
@@ -334,6 +352,7 @@ public:
         Operation operation;
         std::vector<std::size_t> result_shape;
         iom::detail::BinaryEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
         bool retained_failure;
     };
 
@@ -348,10 +367,14 @@ public:
     }
     void finish(std::uint64_t sequence) {
         for (const Record& record : records_) {
-            if (record.sequence != sequence) continue;
+            if (record.sequence != sequence) {
+                continue;
+            }
             (void)iom::detail::release_or_invalidate_binary_entries(
                     state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
+            iom::detail::complete_workspace_lease(
+                    state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -374,7 +397,8 @@ protected:
                             {sequence, snapshot.operation,
                              {snapshot.result_shape.dimensions().begin(),
                               snapshot.result_shape.dimensions().end()},
-                             entries, retained_failure});
+                             entries, snapshot.workspace_lease,
+                             retained_failure});
                     if (retained_failure) {
                         commit_failure(sequence, std::make_exception_ptr(
                                 std::runtime_error(
@@ -420,6 +444,10 @@ inline void run_binary_request_conformance(
             BinaryOperation::add, BinaryOperation::mul,
             BinaryOperation::sub, BinaryOperation::div};
     for (const BinaryOperation operation : operations) {
+        const auto requirements = query_binary_workspace_requirements(
+                queue, operation, lhs->view(), rhs->view(), out->view());
+        CHECK_EQ(requirements.bytes, std::size_t{0});
+        CHECK_EQ(requirements.alignment, std::size_t{1});
         const iom::oid token = submit_binary_operation(
                 queue, operation, lhs->view(), rhs->view(), out->view());
         REQUIRE(iom::oid_is_token(token));
@@ -486,9 +514,22 @@ inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
         l->view().copy_from_host(lhs_bytes);
         o->view().copy_from_host(std::vector<std::byte>(
                 current.logical_nbytes(), std::byte{0}));
-        const auto token = queue->add(l->view(), rhs->view(), o->view());
+        const auto requirements = query_binary_workspace_requirements(
+                *queue, BinaryOperation::add, l->view(), rhs->view(),
+                o->view());
+        std::unique_ptr<iom::RawWorkspace> workspace_owner;
+        if (requirements.bytes != 0) {
+            workspace_owner = candidate.create_workspace(requirements.bytes);
+        }
+        iom::oid token = 0;
+        if (workspace_owner) {
+            const iom::RawWorkspaceView workspace = workspace_owner->view();
+            token = queue->add(
+                    l->view(), rhs->view(), o->view(), workspace);
+        } else {
+            token = queue->add(l->view(), rhs->view(), o->view());
+        }
         REQUIRE(iom::oid_is_token(token));
-        CHECK_NOTHROW(queue->wait(token));
         CHECK_NOTHROW(queue->wait(token));
     }
     for (const std::size_t rank : {9u, 16u, 17u}) {
@@ -525,7 +566,20 @@ inline void run_accelerator_rank_boundary_conformance(iom::Device& candidate) {
     out->view().copy_from_host(std::vector<std::byte>(
             out_spec.logical_nbytes(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
-    const auto token = queue->add(lhs->view(), rhs->view(), out->view());
+    const auto requirements = query_binary_workspace_requirements(
+            *queue, BinaryOperation::add, lhs->view(), rhs->view(),
+            out->view());
+    std::unique_ptr<iom::RawWorkspace> workspace_owner;
+    if (requirements.bytes != 0) {
+        workspace_owner = candidate.create_workspace(requirements.bytes);
+    }
+    iom::oid token = 0;
+    if (workspace_owner) {
+        const iom::RawWorkspaceView workspace = workspace_owner->view();
+        token = queue->add(lhs->view(), rhs->view(), out->view(), workspace);
+    } else {
+        token = queue->add(lhs->view(), rhs->view(), out->view());
+    }
     REQUIRE(iom::oid_is_token(token));
     CHECK_NOTHROW(queue->wait(token));
     std::vector<std::byte> expected(out_spec.logical_nbytes(), std::byte{0});

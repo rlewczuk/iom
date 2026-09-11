@@ -798,7 +798,8 @@ void run_interleaved_operations(
         const iom::Tensor* rhs_owner = nullptr;
         void* lhs_handle = nullptr;
         void* rhs_handle = nullptr;
-        std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+        iom::Device* device = nullptr;
+        std::vector<std::unique_ptr<iom::RawWorkspace>> binary_workspaces;
         struct Expected {
             iom::oid token;
             iom::Tensor* output;
@@ -811,6 +812,7 @@ void run_interleaved_operations(
     work.reserve(participants.size());
     for (BackendParticipant* participant : participants) {
         Work item;
+        item.device = participant->device;
         item.lhs = participant->device->create_tensor(spec);
         item.rhs = participant->device->create_tensor(spec);
         item.staged = participant->device->create_tensor(spec);
@@ -847,24 +849,38 @@ void run_interleaved_operations(
                             iom::Tensor& lhs, iom::Tensor& rhs,
                             iom::Tensor& output, std::uint64_t a,
                             std::uint64_t b) {
+        const BinaryOperation binary_operation = [&] {
+            switch (operation) {
+                case iom_conformance::add_oracle::operation::add:
+                    return BinaryOperation::add;
+                case iom_conformance::add_oracle::operation::mul:
+                    return BinaryOperation::mul;
+                case iom_conformance::add_oracle::operation::sub:
+                    return BinaryOperation::sub;
+                case iom_conformance::add_oracle::operation::div:
+                    return BinaryOperation::div;
+            }
+            throw std::logic_error("unknown binary operation");
+        }();
+        auto& queue = *item.queues[queue_index];
+        const auto requirements = query_binary_workspace_requirements(
+                queue, binary_operation, lhs.view(), rhs.view(),
+                output.view());
+        if (requirements.bytes != 0) {
+            item.binary_workspaces.push_back(
+                    item.device->create_workspace(requirements.bytes));
+        }
         iom::oid token = iom::to_oid(iom::OidError::InternalError);
-        switch (operation) {
-            case iom_conformance::add_oracle::operation::add:
-                token = item.queues[queue_index]->add(
-                        lhs.view(), rhs.view(), output.view());
-                break;
-            case iom_conformance::add_oracle::operation::mul:
-                token = item.queues[queue_index]->mul(
-                        lhs.view(), rhs.view(), output.view());
-                break;
-            case iom_conformance::add_oracle::operation::sub:
-                token = item.queues[queue_index]->sub(
-                        lhs.view(), rhs.view(), output.view());
-                break;
-            case iom_conformance::add_oracle::operation::div:
-                token = item.queues[queue_index]->div(
-                        lhs.view(), rhs.view(), output.view());
-                break;
+        if (requirements.bytes != 0) {
+            const iom::RawWorkspaceView workspace =
+                    item.binary_workspaces.back()->view();
+            token = submit_binary_operation(
+                    queue, binary_operation, lhs.view(), rhs.view(),
+                    output.view(), workspace);
+        } else {
+            token = submit_binary_operation(
+                    queue, binary_operation, lhs.view(), rhs.view(),
+                    output.view());
         }
         REQUIRE(iom::oid_is_token(token));
         item.expected.push_back(
@@ -940,17 +956,53 @@ void run_interleaved_operations(
         auto lhs_derived = item.lhs->view().slice(0, 0, 2);
         auto rhs_derived = item.rhs->view().slice(0, 0, 2);
         auto out_derived = item.add_out->view().slice(0, 0, 2);
-        const iom::oid derived = item.queues[0]->add(
-                lhs_derived, rhs_derived, out_derived);
+        const auto derived_requirements =
+                query_binary_workspace_requirements(
+                        *item.queues[0], BinaryOperation::add, lhs_derived,
+                        rhs_derived, out_derived);
+        if (derived_requirements.bytes != 0) {
+            item.binary_workspaces.push_back(
+                    item.device->create_workspace(
+                            derived_requirements.bytes));
+        }
+        iom::oid derived = iom::to_oid(iom::OidError::InternalError);
+        if (derived_requirements.bytes != 0) {
+            const iom::RawWorkspaceView workspace =
+                    item.binary_workspaces.back()->view();
+            derived = item.queues[0]->add(
+                    lhs_derived, rhs_derived, out_derived, workspace);
+        } else {
+            derived = item.queues[0]->add(
+                    lhs_derived, rhs_derived, out_derived);
+        }
         REQUIRE(iom::oid_is_token(derived));
         item.queues[0]->wait(derived);
         const std::uint64_t add_value =
                 iom_conformance::add_oracle::binary(
                         type, lhs_value, rhs_value,
                         iom_conformance::add_oracle::operation::add);
-        const iom::oid alias = item.queues[1]->add(
-                item.add_out->view(), item.add_out->view(),
-                item.add_out->view());
+        const auto alias_requirements =
+                query_binary_workspace_requirements(
+                        *item.queues[1], BinaryOperation::add,
+                        item.add_out->view(), item.add_out->view(),
+                        item.add_out->view());
+        if (alias_requirements.bytes != 0) {
+            item.binary_workspaces.push_back(
+                    item.device->create_workspace(
+                            alias_requirements.bytes));
+        }
+        iom::oid alias = iom::to_oid(iom::OidError::InternalError);
+        if (alias_requirements.bytes != 0) {
+            const iom::RawWorkspaceView workspace =
+                    item.binary_workspaces.back()->view();
+            alias = item.queues[1]->add(
+                    item.add_out->view(), item.add_out->view(),
+                    item.add_out->view(), workspace);
+        } else {
+            alias = item.queues[1]->add(
+                    item.add_out->view(), item.add_out->view(),
+                    item.add_out->view());
+        }
         REQUIRE(iom::oid_is_token(alias));
         item.queues[1]->wait(alias);
         iom_conformance::require_logical_bytes(

@@ -548,6 +548,7 @@ class TtnnQueue final : public DeviceOps {
                 TensorShape{{1, 1}}};
         void* fence = nullptr;
         detail::BinaryEntryRegistration binary_entries{};
+        detail::WorkspaceLease workspace_lease{};
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
 
@@ -559,12 +560,15 @@ class TtnnQueue final : public DeviceOps {
                 std::uint64_t sequence_,
                 DeviceOps::BinaryOperation operation_,
                 const ttnn_detail::BinaryRequest& request,
-                detail::BinaryEntryRegistration entries)
+                detail::BinaryEntryRegistration entries,
+                detail::WorkspaceLease workspace_lease_)
             : sequence(sequence_), is_binary(true), operation(operation_),
-              binary_request(request), binary_entries(entries) {}
+              binary_request(request), binary_entries(entries),
+              workspace_lease(workspace_lease_) {}
     };
     struct BinaryOutcome {
         detail::BinaryEntryRegistration entries;
+        detail::WorkspaceLease workspace_lease;
         bool native_work_submitted = false;
         bool native_completion_proven = false;
         std::exception_ptr retained_failure;
@@ -634,7 +638,8 @@ public:
                              captured.out.logical_plane_strides},
                             captured.result_shape};
                     worker_.submit_copy(
-                            Task(sequence, captured.operation, internal, entries));
+                            Task(sequence, captured.operation, internal, entries,
+                                 captured.workspace_lease));
                 });
     }
     void execute(Task& task) {
@@ -648,7 +653,10 @@ public:
                     consume_binary_outcome_insertion_fault();
 #endif
                     const auto [it, inserted] = binary_outcomes_.emplace(
-                            task.sequence, BinaryOutcome{task.binary_entries});
+                            task.sequence,
+                            BinaryOutcome{
+                                    task.binary_entries,
+                                    task.workspace_lease});
                     if (!inserted) {
                         throw std::logic_error("duplicate TTNN binary sequence");
                     }
@@ -921,6 +929,9 @@ public:
                             && !completion_proven,
                     fence_succeeded);
             (void)released;
+            detail::complete_workspace_lease(
+                    *state_, binary_outcome.workspace_lease,
+                    completion_proven);
             complete(sequence, operation_failure
                     ? operation_failure : fence_result.failure);
             return;
