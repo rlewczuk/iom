@@ -2,6 +2,9 @@
 
 #include <cuda.h>
 
+#include <algorithm>
+#include <array>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -9,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "copy.hpp"
 #include "driver.hpp"
@@ -106,7 +110,8 @@ namespace iom {
             bool armed_ = true;
         };
 
-        class CudaDevice final : public Device {
+        class CudaDevice final : public Device,
+                                 public detail::QueueResourceProvider {
         public:
             CudaDevice(
                     std::uint32_t ordinal, CUdevice device, CUcontext context,
@@ -120,7 +125,9 @@ namespace iom {
                       metadata_allocator_(std::move(metadata_allocator)),
                       data_backing_(data_backing),
                       data_backing_bytes_(data_backing_bytes),
-                      metadata_backing_(metadata_backing) {}
+                      metadata_backing_(metadata_backing),
+                      queue_slot_count_(metadata_allocator_->block_count()
+                                        / detail::kMaxLiveGpuQueues) {}
 
             CudaDevice(const CudaDevice&) = delete;
             CudaDevice& operator=(const CudaDevice&) = delete;
@@ -134,6 +141,12 @@ namespace iom {
                     } catch (...) {
                     }
                     registry_state_.quarantine.drain();
+                    // Covering-proof every retained unknown-completion
+                    // lease; unproven bundles are discarded best-effort
+                    // while the native context is still valid, before
+                    // allocator bookkeeping disappears.
+                    reclaim_retained_leases();
+                    discard_all_retained_leases();
                     // Destroy allocator bookkeeping before releasing the
                     // native backings so no live owner, lease, or retained
                     // quarantine action can reference an allocator past this
@@ -183,7 +196,114 @@ namespace iom {
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 activate();
                 return cuda_detail::make_queue(
-                        *this, context_, registry_state_);
+                        *this, *this, context_, registry_state_);
+            }
+
+            // -- detail::QueueResourceProvider: fixed queue-resource
+            // geometry. All allocator bookkeeping is serialized here at the
+            // device boundary and never held across native stream/event
+            // creation, waits, submissions, callbacks, or drains.
+            [[nodiscard]] std::size_t queue_slot_count() const noexcept
+                    override {
+                return queue_slot_count_;
+            }
+
+            [[nodiscard]] detail::QueueResourceLease
+                    reserve_queue_resources() override {
+                std::lock_guard<std::mutex> lock(bookkeeping_mutex_);
+                const std::size_t slot_count = queue_slot_count_;
+                std::vector<std::size_t> indices;
+                indices.reserve(slot_count);
+                try {
+                    for (std::size_t index = 0; index < slot_count;
+                         ++index) {
+                        void* block =
+                                metadata_allocator_->alloc(
+                                        detail::kMetadataSlotBytes);
+                        indices.push_back(
+                                metadata_allocator_->index_of(block));
+                    }
+                } catch (...) {
+                    for (const std::size_t index : indices) {
+                        metadata_allocator_->free(
+                                metadata_allocator_->ptr_from_index(index));
+                    }
+                    // Propagates std::bad_alloc for a fifth live queue.
+                    throw;
+                }
+                std::sort(indices.begin(), indices.end());
+                const std::size_t base = indices.front();
+                for (std::size_t index = 0; index < slot_count; ++index) {
+                    if (indices[index] != base + index
+                            || base % slot_count != 0) {
+                        release_queue_resources_locked(base, slot_count);
+                        throw std::logic_error(
+                                "metadata partition reservation lost the "
+                                "device's C-slot geometry");
+                    }
+                }
+                const std::size_t mirror_bytes =
+                        slot_count * detail::kMetadataSlotBytes;
+                std::unique_ptr<std::byte[]> host_mirrors;
+                try {
+                    host_mirrors = std::make_unique<std::byte[]>(
+                            mirror_bytes);
+                } catch (...) {
+                    release_queue_resources_locked(base, slot_count);
+                    throw;
+                }
+                return make_lease(
+                        *this, base, slot_count,
+                        metadata_allocator_->ptr_from_index(base),
+                        std::move(host_mirrors));
+            }
+
+            void release_queue_resources(
+                    std::size_t first_slot,
+                    std::size_t slot_count) noexcept override {
+                std::lock_guard<std::mutex> lock(bookkeeping_mutex_);
+                release_queue_resources_locked(first_slot, slot_count);
+            }
+
+            void retain_unknown_lease(
+                    std::function<bool()> reclaim,
+                    std::function<void()> discard) override {
+                std::lock_guard<std::mutex> lock(retained_mutex_);
+                if (retained_count_ >= detail::kMaxLiveGpuQueues) {
+                    // One retained lease per partition; this cannot exceed
+                    // the queue-count bound.
+                    throw std::logic_error(
+                            "retained queue-lease quarantine is full");
+                }
+                retained_leases_[retained_count_].reclaim =
+                        std::move(reclaim);
+                retained_leases_[retained_count_].discard =
+                        std::move(discard);
+                ++retained_count_;
+            }
+
+            void reclaim_retained_leases() override {
+                std::array<RetainedLease, detail::kMaxLiveGpuQueues> pending;
+                std::size_t pending_count = 0;
+                {
+                    std::lock_guard<std::mutex> lock(retained_mutex_);
+                    pending_count = retained_count_;
+                    for (std::size_t index = 0; index < pending_count;
+                         ++index) {
+                        pending[index] = std::move(retained_leases_[index]);
+                        retained_leases_[index] = {};
+                    }
+                    retained_count_ = 0;
+                }
+                // Callbacks synchronize retained streams: never under any
+                // device lock.
+                for (std::size_t index = 0; index < pending_count; ++index) {
+                    if (!pending[index].reclaim()) {
+                        std::lock_guard<std::mutex> lock(retained_mutex_);
+                        retained_leases_[retained_count_++] =
+                                std::move(pending[index]);
+                    }
+                }
             }
 
             void activate() const {
@@ -264,6 +384,31 @@ namespace iom {
             }
 
         private:
+            struct RetainedLease {
+                std::function<bool()> reclaim;
+                std::function<void()> discard;
+            };
+
+            // Host bookkeeping only; caller holds bookkeeping_mutex_.
+            void release_queue_resources_locked(
+                    std::size_t first_slot, std::size_t slot_count) noexcept {
+                for (std::size_t index = 0; index < slot_count; ++index) {
+                    metadata_allocator_->free(
+                            metadata_allocator_->ptr_from_index(
+                                    first_slot + index));
+                }
+            }
+
+            void discard_all_retained_leases() noexcept {
+                std::lock_guard<std::mutex> lock(retained_mutex_);
+                for (std::size_t index = 0; index < retained_count_;
+                     ++index) {
+                    retained_leases_[index].discard();
+                    retained_leases_[index] = {};
+                }
+                retained_count_ = 0;
+            }
+
             std::uint32_t ordinal_;
             CUdevice device_;
             CUcontext context_;
@@ -276,6 +421,13 @@ namespace iom {
             CUdeviceptr data_backing_ = 0;
             std::size_t data_backing_bytes_ = 0;
             CUdeviceptr metadata_backing_ = 0;
+            // Fixed queue-resource geometry: exactly C slots per partition,
+            // four partitions, and at most one retained lease per credit.
+            std::size_t queue_slot_count_ = 0;
+            std::mutex retained_mutex_;
+            std::array<RetainedLease, detail::kMaxLiveGpuQueues>
+                    retained_leases_{};
+            std::size_t retained_count_ = 0;
             friend class CudaTensor;
         };
 

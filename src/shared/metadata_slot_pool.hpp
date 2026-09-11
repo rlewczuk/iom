@@ -1,132 +1,175 @@
 #pragma once
 
+// Fixed per-queue metadata slot bookkeeping over one reserved partition of
+// the Device-wide metadata arena. The pool owns no native storage at all:
+// device slots address the partition's fixed 512-byte blocks inside the
+// Device metadata backing, and host mirrors are the lease's fixed C
+// 512-byte buffers. Nothing here allocates, frees, resizes, or replaces
+// storage after construction; only in-use/protected bookkeeping changes.
+// A protected slot (unknown completion) is never reassigned and is released
+// only by a covering proof.
+
 #include <array>
 #include <condition_variable>
 #include <cstddef>
-#include <limits>
 #include <memory>
 #include <mutex>
-
 #include <stdexcept>
+
+#include "queue_resources.hpp"
+
 namespace iom::detail {
 
-template <typename Policy>
 class MetadataSlotPool final {
 public:
-    static constexpr std::size_t kMetadataSlotCount = 16;
-
-    explicit MetadataSlotPool(typename Policy::context_type context)
-            : context_(context) {}
-
-    ~MetadataSlotPool() noexcept {
-        try {
-            Policy::activate(context_);
-        } catch (...) {
+    // Takes ownership of one queue's reserved partition and its fixed host
+    // mirrors. Construction performs no native work.
+    explicit MetadataSlotPool(QueueResourceLease resources)
+            : resources_(std::move(resources)),
+              slot_count_(resources_.slot_count()),
+              in_use_(std::make_unique<bool[]>(slot_count_)),
+              protected_(std::make_unique<bool[]>(slot_count_)) {
+        if (slot_count_ == 0) {
+            throw std::invalid_argument(
+                    "metadata slot pool requires a reserved partition");
         }
-        for (Slot& slot : slots_) {
-            // A protected slot may still be referenced by work whose
-            // completion could not be proven. Do not speculatively free it
-            // during pool teardown; retain both device and host storage.
-            if (!slot.protected_) {
-                Policy::free_noexcept(slot.device);
-            } else {
-                (void)slot.host.release();
-            }
-            slot.device = nullptr;
+        for (std::size_t index = 0; index < slot_count_; ++index) {
+            in_use_[index] = false;
+            protected_[index] = false;
         }
     }
 
     MetadataSlotPool(const MetadataSlotPool&) = delete;
     MetadataSlotPool& operator=(const MetadataSlotPool&) = delete;
 
-    void protect(std::size_t index) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < slots_.size()) {
-            slots_[index].protected_ = true;
-            slots_[index].in_use = true;
-        }
+    ~MetadataSlotPool() noexcept = default;
+
+    [[nodiscard]] std::size_t slot_count() const noexcept {
+        return slot_count_;
     }
 
-    void release_after_proof(std::size_t index) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < slots_.size() && slots_[index].in_use) {
-            slots_[index].protected_ = false;
-            slots_[index].in_use = false;
-            completion_.notify_one();
-        }
+    [[nodiscard]] std::size_t slot_stride() const noexcept {
+        return kMetadataSlotBytes;
     }
 
+    // Device address of the partition's first slot inside the Device
+    // metadata backing; slot i lives at base + i * 512 with 32-byte
+    // alignment.
+    [[nodiscard]] void* device_base() const noexcept {
+        return resources_.device_base();
+    }
+
+    // Base of the fixed host mirrors backing every slot.
+    [[nodiscard]] std::byte* host_mirrors() const noexcept {
+        return resources_.host_mirrors();
+    }
+
+    [[nodiscard]] std::size_t in_use_count() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < slot_count_; ++index) {
+            count += in_use_[index] ? 1u : 0u;
+        }
+        return count;
+    }
+
+    [[nodiscard]] std::size_t protected_count() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < slot_count_; ++index) {
+            count += protected_[index] ? 1u : 0u;
+        }
+        return count;
+    }
+
+    // True when any slot is reserved by live work or retained by an
+    // unproven completion; such a partition must never be released.
+    [[nodiscard]] bool has_unproven_leases() noexcept {
+        return in_use_count() != 0;
+    }
+
+    // Wait for a free fixed slot of this queue's partition. Exactly C slots
+    // exist; acquisition never grows, borrows, or replaces storage.
     [[nodiscard]] std::size_t acquire() {
         std::unique_lock<std::mutex> lock(mutex_);
         completion_.wait(lock, [this] {
-            for (const Slot& slot : slots_) {
-                if (!slot.in_use) {
+            for (std::size_t index = 0; index < slot_count_; ++index) {
+                if (!in_use_[index]) {
                     return true;
                 }
             }
             return false;
         });
-        for (std::size_t index = 0; index < slots_.size(); ++index) {
-            if (!slots_[index].in_use) {
-                slots_[index].in_use = true;
+        for (std::size_t index = 0; index < slot_count_; ++index) {
+            if (!in_use_[index]) {
+                in_use_[index] = true;
                 return index;
             }
         }
         throw std::logic_error("metadata slot acquisition lost a free slot");
     }
 
+    // Retain a slot whose completion could not be proven: it stays reserved
+    // forever until a covering proof releases it. Protected slots are never
+    // handed out again.
+    void protect(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < slot_count_) {
+            protected_[index] = true;
+            in_use_[index] = true;
+        }
+    }
+
+    void release_after_proof(std::size_t index) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_locked(index);
+    }
+
     void release(std::size_t index) noexcept {
         release_after_proof(index);
     }
 
-    // acquire() only returns a slot after its owning fence has retired, so
-    // replacing its storage does not require draining unrelated stream work.
-    void ensure_slot_capacity(
-            std::size_t index, std::size_t required_bytes) {
-        Slot& slot = slots_.at(index);
-        if (slot.capacity >= required_bytes) {
-            return;
-        }
-        std::size_t capacity = slot.capacity == 0 ? 256 : slot.capacity;
-        while (capacity < required_bytes) {
-            if (capacity > std::numeric_limits<std::size_t>::max() / 2) {
-                capacity = required_bytes;
-                break;
+    // Covering proof: every protected slot's asynchronous use has ended.
+    void release_all_protected() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t index = 0; index < slot_count_; ++index) {
+            if (protected_[index]) {
+                release_locked(index);
             }
-            capacity *= 2;
         }
-        std::unique_ptr<std::byte[]> replacement(
-                new std::byte[capacity]);
-        void* replacement_device = Policy::allocate(capacity);
-        void* old_device = slot.device;
-        slot.host = std::move(replacement);
-        slot.device = replacement_device;
-        slot.capacity = capacity;
-        Policy::free_noexcept(old_device);
     }
 
+    // Out-of-range slot indices are programming errors; these accessors
+    // report them with std::out_of_range rather than noexcept termination.
     [[nodiscard]] std::byte* host_data(std::size_t index) {
-        return slots_.at(index).host.get();
+        if (index >= slot_count_) {
+            throw std::out_of_range("metadata slot index is out of range");
+        }
+        return resources_.host_data(index);
     }
 
     [[nodiscard]] void* device_data(std::size_t index) {
-        return slots_.at(index).device;
+        if (index >= slot_count_) {
+            throw std::out_of_range("metadata slot index is out of range");
+        }
+        return resources_.device_data(index);
     }
 
 private:
-    struct Slot {
-        std::unique_ptr<std::byte[]> host;
-        void* device = nullptr;
-        std::size_t capacity = 0;
-        bool in_use = false;
-        bool protected_ = false;
-    };
+    void release_locked(std::size_t index) noexcept {
+        if (index < slot_count_ && in_use_[index]) {
+            protected_[index] = false;
+            in_use_[index] = false;
+            completion_.notify_one();
+        }
+    }
 
-    typename Policy::context_type context_;
-    std::array<Slot, kMetadataSlotCount> slots_;
+    QueueResourceLease resources_;
+    std::size_t slot_count_ = 0;
+    std::unique_ptr<bool[]> in_use_;
+    std::unique_ptr<bool[]> protected_;
     std::mutex mutex_;
     std::condition_variable completion_;
 };
 
 }  // namespace iom::detail
-

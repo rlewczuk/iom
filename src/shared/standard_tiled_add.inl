@@ -10,6 +10,7 @@
 #include "iom/tensor.hpp"
 #include "iom/iom.hpp"
 
+#include "queue_resources.hpp"
 #include "scalar_binary_codec.hpp"
 #ifndef IOM_GPU_DEVICE
 #error "IOM_GPU_DEVICE must be defined before including standard_tiled_add.inl"
@@ -56,6 +57,19 @@ struct BinaryMetadata {
     std::uint32_t rhs_bcol;
 };
 
+// Fixed-slot layout contract: the rank-eight binary descriptor is
+// sizeof(BinaryMetadata) + 4 * 8 * sizeof(std::uint64_t) bytes and must fit
+// one 512-byte metadata slot (alignment 32). A future overflow requires an
+// intentional ABI/spec update, never automatic slot growth.
+static_assert(
+        sizeof(BinaryMetadata) + 4 * 8 * sizeof(std::uint64_t)
+        == sizeof(BinaryMetadata) + 256);
+static_assert(
+        sizeof(BinaryMetadata) + 4 * 8 * sizeof(std::uint64_t)
+        <= kMetadataSlotBytes);
+static_assert(
+        alignof(BinaryMetadata) <= 32
+        && kMetadataSlotBytes % alignof(BinaryMetadata) == 0);
 
 [[nodiscard]] std::size_t add_checked_mul(
         std::size_t left, std::size_t right, const char* message) {

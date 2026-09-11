@@ -22,6 +22,7 @@
 #include "iom/sycl/device.hpp"
 #include "staging_pool.hpp"
 #include "iom/tensor.hpp"
+#include "copy.hpp"
 #include "runtime.hpp"
 
 namespace {
@@ -469,7 +470,7 @@ TEST_CASE(
         }
     }
     CHECK_EQ(failed, 0u);
-    CHECK_GE(metadata_allocations, 1u);  // queue copy metadata slot
+    CHECK_EQ(metadata_allocations, 0u);  // fixed slots; no metadata growth
     CHECK_GE(staging_allocations, 4u);   // staging pool + binary fallback
     CHECK_EQ(staging_2048, 3u);          // the three binary temporary buffers
     CHECK(outstanding.empty());          // every allocation freed by teardown
@@ -864,4 +865,210 @@ TEST_CASE("SYCL concurrent tensor bookkeeping is race-free and in-arena") {
         thread.join();
     }
     CHECK_FALSE(failed.load(std::memory_order_acquire));
+}
+
+namespace {
+
+// Extracts the metadata arena backing range recorded by the native
+// allocation seam while the device was constructed.
+[[nodiscard]] std::uintptr_t sycl_metadata_backing_begin(
+        AllocationProbe& probe) {
+    std::lock_guard<std::mutex> lock(probe.mutex);
+    for (const auto& record : probe.records) {
+        if (record.phase == iom::sycl_detail::AllocationPhase::setup
+                && record.classification
+                        == iom::sycl_detail::AllocationClass::metadata_backing
+                && record.kind == iom::sycl_detail::AllocationKind::allocate
+                && record.succeeded) {
+            return reinterpret_cast<std::uintptr_t>(record.address);
+        }
+    }
+    FAIL("no metadata backing allocation was observed");
+    return 0;
+}
+
+}  // namespace
+
+TEST_CASE(
+        "SYCL four live queues own four disjoint fixed C-slot partitions "
+        "for C = 1, 16, 17") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    for (const std::size_t slots : {std::size_t{1}, std::size_t{16},
+             std::size_t{17}}) {
+        AllocationCallsRestore restore;
+        AllocationProbe probe;
+        active_allocation_probe = &probe;
+        iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+
+        auto device = iom::make_sycl_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes},
+                iom::QueueConfig{slots});
+        REQUIRE(device != nullptr);
+        const std::uintptr_t metadata_begin =
+                sycl_metadata_backing_begin(probe);
+        const std::uintptr_t metadata_end =
+                metadata_begin + 4 * slots * 512u;
+        active_allocation_probe = nullptr;
+
+        std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+        std::vector<std::uintptr_t> bases;
+        for (std::size_t index = 0; index < 4; ++index) {
+            queues.push_back(device->create_ops());
+            REQUIRE(queues.back() != nullptr);
+            iom::sycl_detail::QueueResourceSnapshot snapshot;
+            iom::sycl_detail::queue_resource_snapshot_for_testing(
+                    *queues.back(), snapshot);
+            CHECK_EQ(snapshot.slot_count, slots);
+            CHECK_EQ(snapshot.slot_stride, 512u);
+            CHECK_EQ(snapshot.slots_protected, 0u);
+            const auto base =
+                    reinterpret_cast<std::uintptr_t>(snapshot.device_base);
+            // Pointer-copy descriptors address the queue's own partition
+            // inside the Device metadata backing at 32-byte alignment.
+            CHECK(base % 32 == 0);
+            CHECK(base >= metadata_begin);
+            CHECK(base + slots * 512u <= metadata_end);
+            bases.push_back(base);
+        }
+        for (std::size_t a = 0; a < bases.size(); ++a) {
+            for (std::size_t b = a + 1; b < bases.size(); ++b) {
+                const bool disjoint =
+                        bases[a] + slots * 512u <= bases[b]
+                        || bases[b] + slots * 512u <= bases[a];
+                CHECK(disjoint);
+            }
+        }
+    }
+}
+
+TEST_CASE("SYCL fifth live queue throws bad_alloc before queue resources") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+
+    std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+    for (std::size_t index = 0; index < 4; ++index) {
+        queues.push_back(device->create_ops());
+        REQUIRE(queues.back() != nullptr);
+    }
+    CHECK_THROWS_AS((void)device->create_ops(), std::bad_alloc);
+
+    for (const auto& queue : queues) {
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        CHECK(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+    }
+}
+
+TEST_CASE("SYCL failed queue construction rolls back every reservation") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+
+    std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+    for (std::size_t index = 0; index < 3; ++index) {
+        queues.push_back(device->create_ops());
+        REQUIRE(queues.back() != nullptr);
+    }
+
+    // Native queue creation failure during construction.
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::queue_stream_create);
+    CHECK_THROWS_AS((void)device->create_ops(), std::runtime_error);
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+
+    // The rolled-back attempt returned its partition and credit: the fourth
+    // live queue is still publishable.
+    auto fourth = device->create_ops();
+    REQUIRE(fourth != nullptr);
+    iom::sycl_detail::QueueResourceSnapshot snapshot;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(*fourth, snapshot);
+    CHECK_EQ(snapshot.slot_count, 16u);
+    CHECK_THROWS_AS((void)device->create_ops(), std::bad_alloc);
+}
+
+TEST_CASE("SYCL safely drained queue partitions are reusable") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes}, iom::QueueConfig{1});
+    REQUIRE(device != nullptr);
+
+    auto first = device->create_ops();
+    REQUIRE(first != nullptr);
+    iom::sycl_detail::QueueResourceSnapshot first_snapshot;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *first, first_snapshot);
+    first.reset();
+
+    auto recreated = device->create_ops();
+    REQUIRE(recreated != nullptr);
+    iom::sycl_detail::QueueResourceSnapshot recreated_snapshot;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *recreated, recreated_snapshot);
+    CHECK_EQ(recreated_snapshot.device_base, first_snapshot.device_base);
+    CHECK_EQ(recreated_snapshot.slot_count, 1u);
+}
+
+TEST_CASE(
+        "SYCL queued copies use one fixed slot, protect unproved slots, "
+        "and make no post-setup native metadata calls") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+    std::vector<std::byte> pattern(
+            spec.logical_nbytes(), static_cast<std::byte>(0x5a));
+    source->view().copy_from_host(pattern);
+
+    auto queue = device->create_ops();
+    REQUIRE(queue != nullptr);
+
+    // Arm the seam after device setup: queue creation, submissions, waits,
+    // and destruction must not touch native device allocation/free for
+    // metadata at all.
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+
+    const iom::oid copy_token =
+            queue->copy(source->view(), destination->view());
+    REQUIRE(iom::oid_is_token(copy_token));
+    CHECK_NOTHROW(queue->wait(copy_token));
+
+    iom::sycl_detail::QueueResourceSnapshot after_copy;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(*queue, after_copy);
+    CHECK_EQ(after_copy.slots_in_use, 0u);
+
+    // A retained post-launch failure leaves the copy's completion unproved:
+    // its fixed slot is protected and never reassigned, and repeated waits
+    // keep reporting the original failure.
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::post_launch);
+    const iom::oid failed_token =
+            queue->copy(source->view(), destination->view());
+    REQUIRE(iom::oid_is_token(failed_token));
+    CHECK_THROWS_AS(queue->wait(failed_token), std::runtime_error);
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+
+    iom::sycl_detail::QueueResourceSnapshot protected_snapshot;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *queue, protected_snapshot);
+    CHECK_EQ(protected_snapshot.slots_protected, 1u);
+
+    queue.reset();
+    CHECK(probe.records.empty());
 }

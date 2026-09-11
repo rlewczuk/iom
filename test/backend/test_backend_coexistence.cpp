@@ -575,7 +575,9 @@ void run_concurrent_queue_scenario(
         const char* name, iom::Device& device,
         CountingAllocator* counting_allocator) {
     CAPTURE(name);
-    constexpr int kQueues = 6;
+    // Deliberate four-live-queue cap per Device (change 004); a fifth
+    // create_ops must be rejected, never raced here.
+    constexpr int kQueues = 4;
     constexpr int kCopiesPerQueue = 12;
     const iom::TensorSpec spec = coexistence_spec();
     const std::vector<std::byte> expected =
@@ -609,14 +611,27 @@ void run_concurrent_queue_scenario(
         threads.reserve(kQueues);
         for (int worker = 0; worker < kQueues; ++worker) {
             threads.emplace_back([&, worker] {
+                // A worker that fails must still contribute its remaining
+                // barrier arrivals so a phase can never strand the main
+                // thread; non-blocking arrive() drains without disturbing
+                // the healthy workers' phase waits.
+                int arrivals = 0;
+                auto drain_arrivals = [&] {
+                    while (arrivals < 3) {
+                        (void)gate.arrive();
+                        ++arrivals;
+                    }
+                };
                 try {
                     // Queue creation races the per-device registry
                     // queue-id counter across these threads.
                     gate.arrive_and_wait();
+                    ++arrivals;
                     queue[worker] = device.create_ops();
                     // Copy submission races the per-device entry-id
                     // counter across the queues' worker paths.
                     gate.arrive_and_wait();
+                    ++arrivals;
                     for (int copy_index = 0;
                          copy_index < kCopiesPerQueue; ++copy_index) {
                         tokens[worker].push_back(queue[worker]->copy(
@@ -624,11 +639,13 @@ void run_concurrent_queue_scenario(
                                 destination[worker]->view()));
                     }
                     gate.arrive_and_wait();
+                    ++arrivals;
                     for (const iom::oid token : tokens[worker]) {
                         queue[worker]->wait(token);
                     }
                 } catch (...) {
                     failed.store(true, std::memory_order_release);
+                    drain_arrivals();
                 }
             });
         }
@@ -692,15 +709,18 @@ void run_concurrent_queue_scenario(
         }
     }
 
-    // All 12 tensor storages were freed exactly once at their destruction:
-    // none was left quarantined by a cross-queue invalidation and none was
-    // released twice.
+    // All 2 * kQueues tensor storages (one source + kQueues destinations +
+    // kQueues - 1 late destinations) were freed exactly once at their
+    // destruction: none was left quarantined by a cross-queue invalidation
+    // and none was released twice.
     if constexpr (std::is_class_v<CountingAllocator>) {
         if (counting_allocator != nullptr) {
             CHECK_EQ(
                     counting_allocator->allocation_count(),
-                    allocations_before + 12);
-            CHECK_EQ(counting_allocator->free_count(), frees_before + 12);
+                    allocations_before + 2 * kQueues);
+            CHECK_EQ(
+                    counting_allocator->free_count(),
+                    frees_before + 2 * kQueues);
         }
     }
 }

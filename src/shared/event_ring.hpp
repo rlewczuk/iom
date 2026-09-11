@@ -1,16 +1,18 @@
 #pragma once
 
+// Each queue owns exactly C completion resources, eagerly created at queue
+// construction before the queue is published, and reuses them proof-by-proof.
 // A pooled event is only a completion proof after the current submission
-// records it successfully. A covering stream drain is an equivalent proof
-// for the exceptional path where both event-record attempts fail.
+// records it successfully. A covering queue drain is an equivalent proof
+// for the exceptional path where both event-record attempts fail. There is
+// no lazy creation, replacement, or array resizing after setup: acquiring a
+// submission waits for one of the fixed C resources to become free.
 
 #include <stdexcept>
 
 #include <array>
 #include <condition_variable>
 #include <cstddef>
-#include <vector>
-#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -33,28 +35,29 @@ public:
     using context_type = typename Policy::context_type;
     using event_type = typename Policy::event_type;
 
-    static constexpr std::size_t kEventRingCount = 16;
     static constexpr std::size_t kNoAttachedSlot =
             std::numeric_limits<std::size_t>::max();
 
-    // One pooled event. Owned by the ring for its whole lifetime and reused
-    // for later submissions once every record referencing it is gone.
+    // One fixed completion resource. Created eagerly at queue setup and
+    // reused for later submissions only after every record referencing it
+    // is gone and its last use is proved.
     struct Slot {
         event_type event = nullptr;
         bool in_use = false;
     };
 
     // One submission's completion record. The registry fence captures a
-    // shared_ptr to this record, so the record — and its pooled event — stays
-    // reserved until every registry entry (and destructor snapshot) that
-    // references it has disappeared. Re-acquiring the pool entry for a later
-    // submission therefore cannot change the result observed by an earlier
-    // fence. The result starts pending (non-success) and only becomes
-    // success after the worker has synchronized this submission's event.
+    // shared_ptr to this record, so the record — and its fixed completion
+    // resource — stays reserved until every registry entry (and destructor
+    // snapshot) that references it has disappeared. Re-acquiring the
+    // resource for a later submission therefore cannot change the result
+    // observed by an earlier fence. The result starts pending (non-success)
+    // and only becomes success after the worker has synchronized this
+    // submission's event.
     class Submission final {
     public:
         ~Submission() noexcept {
-            ring_->return_pool_entry(pool_index_);
+            ring_->return_resource(pool_index_);
         }
 
         // Returns the result recorded by this submission's worker, or a
@@ -72,8 +75,8 @@ public:
         // Public so std::make_shared can allocate the record in a single
         // allocation: access to a nested class's private constructor is not
         // granted inside <memory>'s make_shared instantiation. Only
-        // EventRingState::acquire constructs it, with a valid pool index
-        // and while holding the ring's own shared reference.
+        // EventRingState::acquire constructs it, with a valid resource
+        // index and while holding the ring's own shared reference.
         Submission(
                 std::shared_ptr<EventRingState> ring,
                 std::size_t pool_index) noexcept
@@ -93,25 +96,52 @@ public:
                 CompletionDisposition::Pending;
     };
 
+    // Eagerly creates exactly event_count completion resources through the
+    // backend policy. Any failure destroys only the resources already
+    // created; the caller's rollback then returns the partition and
+    // queue-count reservation while the native context remains valid.
     EventRingState(
-            context_type context, MetadataSlotPool<Policy>& metadata_pool)
-            : context_(context), metadata_pool_(&metadata_pool) {}
+            context_type context, MetadataSlotPool& metadata_pool,
+            std::size_t event_count)
+            : context_(context),
+              metadata_pool_(&metadata_pool),
+              event_count_(event_count),
+              event_slots_(std::make_unique<Slot[]>(event_count)) {
+        if (event_count_ == 0) {
+            throw std::invalid_argument(
+                    "event ring requires at least one completion resource");
+        }
+        Policy::activate(context_);
+        try {
+            for (std::size_t index = 0; index < event_count_; ++index) {
+                Policy::check_queue_event_fault();
+                Policy::create_event(&event_slots_[index].event);
+            }
+        } catch (...) {
+            // Destroy only what was already created; nothing is published.
+            for (std::size_t index = 0; index < event_count_; ++index) {
+                Policy::destroy_event_noexcept(event_slots_[index].event);
+                event_slots_[index].event = nullptr;
+            }
+            throw;
+        }
+    }
 
     ~EventRingState() noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             // No submission record can outlive the ring (every record holds
-            // a shared reference), so no pool entry is reserved here.
-            for (std::size_t index = 0; index < created_count_; ++index) {
-                slots_[index].in_use = false;
+            // a shared reference), so no resource is reserved here.
+            for (std::size_t index = 0; index < event_count_; ++index) {
+                event_slots_[index].in_use = false;
             }
         }
         try {
             Policy::activate(context_);
         } catch (...) {
         }
-        for (std::size_t index = 0; index < created_count_; ++index) {
-            Slot& slot = slots_[index];
+        for (std::size_t index = 0; index < event_count_; ++index) {
+            Slot& slot = event_slots_[index];
             Policy::synchronize_event_noexcept(slot.event);
             Policy::destroy_event_noexcept(slot.event);
             slot.event = nullptr;
@@ -123,37 +153,31 @@ public:
     EventRingState(EventRingState&&) = delete;
     EventRingState& operator=(EventRingState&&) = delete;
 
+    // Waits for one of the fixed C completion resources to become free.
+    // Never creates, grows, or replaces a resource.
     [[nodiscard]] std::shared_ptr<Submission> acquire() {
         Policy::check_acquire_event_fault();
         std::unique_lock<std::mutex> lock(mutex_);
-        for (;;) {
-            for (std::size_t index = 0; index < created_count_; ++index) {
-                Slot& slot = slots_[index];
-                if (!slot.in_use) {
-                    slot.in_use = true;
-                    return std::make_shared<Submission>(
-                            this->shared_from_this(), index);
+        completion_.wait(lock, [this] {
+            for (std::size_t index = 0; index < event_count_; ++index) {
+                if (!event_slots_[index].in_use) {
+                    return true;
                 }
             }
-            if (created_count_ < kEventRingCount) {
-                Slot& slot = slots_[created_count_];
-                Policy::create_event(&slot.event);
-                ++created_count_;
+            return false;
+        });
+        for (std::size_t index = 0; index < event_count_; ++index) {
+            Slot& slot = event_slots_[index];
+            if (!slot.in_use) {
                 slot.in_use = true;
                 return std::make_shared<Submission>(
-                        this->shared_from_this(), created_count_ - 1);
+                        this->shared_from_this(), index);
             }
-            completion_.wait(lock, [this] {
-                for (std::size_t index = 0; index < created_count_; ++index) {
-                    if (!slots_[index].in_use) {
-                        return true;
-
-                    }
-                }
-                return false;
-            });
         }
+        throw std::logic_error(
+                "event ring acquisition lost a free completion resource");
     }
+
     void mark_event_recorded(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         submission.event_recorded_ = true;
@@ -165,7 +189,7 @@ public:
     }
     void mark_retire_unknown(Submission& submission) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        submission.disposition_ = CompletionDisposition::RetireUnknown;
+        set_retire_unknown_locked(submission);
     }
 
     void on_worker_complete(Submission& submission) {
@@ -177,7 +201,7 @@ public:
             } else if (submission.event_recorded_) {
                 Policy::activate(context_);
                 Policy::synchronize_event(
-                        slots_[submission.pool_index_].event);
+                        event_slots_[submission.pool_index_].event);
                 result = FenceResult::success();
             } else {
                 throw std::runtime_error(
@@ -187,7 +211,7 @@ public:
             submission.disposition_ = CompletionDisposition::Complete;
         } catch (...) {
             result = FenceResult::failed(std::current_exception());
-            submission.disposition_ = CompletionDisposition::RetireUnknown;
+            set_retire_unknown_locked(submission);
         }
         submission.result_ = result;
         lock.unlock();
@@ -203,17 +227,18 @@ public:
             try {
                 Policy::activate(context_);
                 Policy::synchronize_event(
-                        slots_[submission.pool_index_].event);
+                        event_slots_[submission.pool_index_].event);
                 submission.disposition_ = CompletionDisposition::Complete;
             } catch (...) {
-                submission.disposition_ = CompletionDisposition::RetireUnknown;
+                set_retire_unknown_locked(submission);
             }
         }
         if (submission.metadata_slot_ != kNoAttachedSlot) {
             if (submission.disposition_
                     == CompletionDisposition::RetireUnknown) {
+                // Unknown completion: the whole lease stays reserved; this
+                // slot is never reassigned until a covering proof.
                 metadata_pool_->protect(submission.metadata_slot_);
-                retired_metadata_.push_back(submission.metadata_slot_);
             } else {
                 metadata_pool_->release_after_proof(
                         submission.metadata_slot_);
@@ -222,23 +247,29 @@ public:
         }
     }
 
-    // A queue drain covers every retired submission on its stream.
+    // A queue drain covers every retired submission on its stream: all
+    // unknown completions are proved and every protected slot is released.
     void on_queue_drain(bool successful) noexcept {
         if (!successful) {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const std::size_t slot : retired_metadata_) {
-            metadata_pool_->release_after_proof(slot);
-        }
-        retired_metadata_.clear();
+        unproved_unknowns_ = 0;
+        metadata_pool_->release_all_protected();
+    }
+
+    // True while any submission of this queue retired with an unknown
+    // completion and no covering drain has proved it yet.
+    [[nodiscard]] bool has_unproven_completion() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return unproved_unknowns_ != 0;
     }
 
     // The pooled event recorded for this submission. The event does not
     // change while the record lives.
     [[nodiscard]] event_type event_of(
             const Submission& submission) const noexcept {
-        return slots_[submission.pool_index_].event;
+        return event_slots_[submission.pool_index_].event;
     }
 
     [[nodiscard]] std::size_t slot_index(
@@ -247,36 +278,43 @@ public:
     }
 
 #ifdef IOM_ENABLE_TESTING
-    [[nodiscard]] std::size_t created_event_count_for_testing()
-            const noexcept {
+    // Exactly the C resources created at queue setup; never larger.
+    [[nodiscard]] std::size_t event_count_for_testing() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        return created_count_;
+        return event_count_;
     }
 
     [[nodiscard]] std::size_t in_use_count_for_testing() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         std::size_t count = 0;
-        for (std::size_t index = 0; index < created_count_; ++index) {
-            count += slots_[index].in_use ? 1 : 0;
+        for (std::size_t index = 0; index < event_count_; ++index) {
+            count += event_slots_[index].in_use ? 1 : 0;
         }
         return count;
     }
 #endif
 
 private:
-    void return_pool_entry(std::size_t index) noexcept {
+    void set_retire_unknown_locked(Submission& submission) noexcept {
+        if (submission.disposition_ != CompletionDisposition::RetireUnknown) {
+            submission.disposition_ = CompletionDisposition::RetireUnknown;
+            ++unproved_unknowns_;
+        }
+    }
+
+    void return_resource(std::size_t index) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (index < created_count_ && slots_[index].in_use) {
-            slots_[index].in_use = false;
+        if (index < event_count_ && event_slots_[index].in_use) {
+            event_slots_[index].in_use = false;
             completion_.notify_one();
         }
     }
 
     context_type context_;
-    MetadataSlotPool<Policy>* metadata_pool_;
-    std::vector<std::size_t> retired_metadata_;
-    std::array<Slot, kEventRingCount> slots_;
-    std::size_t created_count_ = 0;
+    MetadataSlotPool* metadata_pool_;
+    std::size_t event_count_ = 0;
+    std::unique_ptr<Slot[]> event_slots_;
+    std::size_t unproved_unknowns_ = 0;
     mutable std::mutex mutex_;
     std::condition_variable completion_;
 };

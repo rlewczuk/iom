@@ -6,8 +6,18 @@
 // quarantine, and queue-destruction protocol; only the runtime primitives
 // and diagnostics differ, and those stay behind the backend-local
 // `gpu_policy` type. The template composes the shared EventRingState<Policy>,
-// MetadataSlotPool<Policy>, StagedWorker<Task>, register_copy_entries, and
-// release_or_invalidate_entries primitives.
+// MetadataSlotPool, StagedWorker<Task>, register_copy_entries, and
+// release_or_invalidate_entries primitives over one fixed queue-resource
+// lease reserved at the Device boundary.
+//
+// Queue construction is transactional and ordered: the queue-count credit
+// and one disjoint C-slot metadata partition are reserved first (a fifth
+// live queue throws std::bad_alloc there), then the exactly C completion
+// resources are created eagerly, then the native stream and the worker
+// start. Any failure destroys only what was already created and returns
+// every reservation. After publication, submission, dispatch, retirement,
+// waits, and queue operations never allocate, free, resize, or replace
+// native resources.
 //
 // This header must be included by a backend translation unit only after the
 // backend-specific expansion of standard_tiled_copy.inl, because the queue
@@ -30,6 +40,7 @@
 #include "event_ring.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/iom.hpp"
+#include "queue_resources.hpp"
 
 namespace iom::detail {
 
@@ -37,7 +48,7 @@ template <typename Policy>
 class GpuQueue final : public DeviceOps {
     using EventRing = iom::detail::EventRingState<Policy>;
     struct MetadataLease {
-        MetadataSlotPool<Policy>* pool = nullptr;
+        MetadataSlotPool* pool = nullptr;
         std::size_t slot = EventRing::kNoAttachedSlot;
 
         ~MetadataLease() {
@@ -48,7 +59,7 @@ class GpuQueue final : public DeviceOps {
 
         MetadataLease() = default;
         MetadataLease(
-                MetadataSlotPool<Policy>* pool_value,
+                MetadataSlotPool* pool_value,
                 std::size_t slot_value)
                 : pool(pool_value), slot(slot_value) {}
         MetadataLease(const MetadataLease&) = delete;
@@ -93,8 +104,8 @@ class GpuQueue final : public DeviceOps {
 
     // One submission's completion lease paired with a post-launch retained
     // failure. Captured by the registry fence so the completion record —
-    // and its pooled event — stays reserved until every registry entry and
-    // destructor snapshot referencing it has disappeared.
+    // and its fixed completion resource — stays reserved until every
+    // registry entry and destructor snapshot referencing it has disappeared.
     struct EventLeaseWithFailure {
         std::shared_ptr<typename EventRing::Submission> submission;
         std::exception_ptr retained_failure;
@@ -177,17 +188,30 @@ class GpuQueue final : public DeviceOps {
     }
 
 public:
+    // Reservation order is fixed by member declaration order: the queue
+    // resource lease (credit plus disjoint C-slot partition) is reserved
+    // first, then the exactly C completion resources are created eagerly,
+    // and only then does the constructor body create the native stream and
+    // start the worker. A fifth live queue therefore throws std::bad_alloc
+    // before any stream, worker, or completion resource exists.
     GpuQueue(
-            const Device& device, typename Policy::context_type context,
+            const Device& device,
+            QueueResourceProvider& resource_provider,
+            typename Policy::context_type context,
             detail::RegistryState& registry_state)
             : DeviceOps(device),
               device_(&device),
               registry_state_(&registry_state),
               registry_queue_id_(
                       detail::allocate_queue_id(*registry_state_)),
+              resource_provider_(&resource_provider),
               context_(context),
-              metadata_pool_(context_),
-              state_(std::make_shared<EventRing>(context_, metadata_pool_)),
+              metadata_pool_(std::make_shared<MetadataSlotPool>(
+                      resource_provider.reserve_queue_resources())),
+              state_(std::make_shared<EventRing>(
+                      context_,
+                      *metadata_pool_,
+                      metadata_pool_->slot_count())),
               worker_(
                       make_worker_callbacks(this, state_),
                       detail::StagedWorker<Task>::PublishPolicy::Splice) {
@@ -210,12 +234,67 @@ public:
         try {
             Policy::activate(context_);
             drained = Policy::synchronize_stream_noexcept(stream_);
-            state_->on_queue_drain(drained);
-            Policy::destroy_queue_stream_noexcept(stream_);
         } catch (...) {
+            drained = false;
         }
+        state_->on_queue_drain(drained);
+        if (drained || !state_->has_unproven_completion()) {
+            // Every lease is proved: release the native stream and return
+            // the partition, queue-count reservation, and completion
+            // resources for reuse.
+            Policy::destroy_queue_stream_noexcept(stream_);
+            stream_ = Policy::null_stream();
+            state_.reset();
+            metadata_pool_.reset();
+            return;
+        }
+        // Unknown completion: quarantine the entire unresolved lease at the
+        // Device boundary. The partition and queue-count reservation stay
+        // retained with the completion resources, host mirrors, and the
+        // queue's own covering-proof handle until this queue's own drain is
+        // proved; a drain of another queue is never sufficient. Capture
+        // order matters: the pool must be destroyed after the ring that
+        // borrows it, so it is declared first (lambda captures are
+        // destroyed in reverse declaration order).
+        const typename Policy::context_type retained_context = context_;
+        const typename Policy::stream_type retained_stream = stream_;
         stream_ = Policy::null_stream();
-        state_.reset();
+        std::shared_ptr<MetadataSlotPool> retained_pool =
+                std::move(metadata_pool_);
+        std::shared_ptr<EventRing> retained_state = std::move(state_);
+        resource_provider_->retain_unknown_lease(
+                [retained_context, retained_stream, retained_pool,
+                 retained_state]() mutable -> bool {
+                    try {
+                        Policy::activate(retained_context);
+                    } catch (...) {
+                        return false;
+                    }
+                    if (!Policy::synchronize_stream_noexcept(
+                                retained_stream)) {
+                        return false;
+                    }
+                    // Covering proof: release protected slots and drop the
+                    // lease. Dropping the captures destroys the completion
+                    // resources and returns the partition and credit.
+                    retained_state->on_queue_drain(true);
+                    Policy::destroy_queue_stream_noexcept(retained_stream);
+                    retained_state.reset();
+                    retained_pool.reset();
+                    return true;
+                },
+                [retained_context, retained_stream, retained_pool,
+                 retained_state]() mutable {
+                    // Best-effort teardown while the native context is still
+                    // valid; unproven leases keep their outcome untouched.
+                    try {
+                        Policy::activate(retained_context);
+                    } catch (...) {
+                    }
+                    Policy::destroy_queue_stream_noexcept(retained_stream);
+                    retained_state.reset();
+                    retained_pool.reset();
+                });
     }
     iom::oid copy_impl(
             const TensorView& source, TensorView& destination) override {
@@ -235,19 +314,8 @@ public:
                     const detail::CopyMetadataLayout layout =
                             detail::copy_metadata_layout(source, destination);
                     auto submission = state_->acquire();
-                    MetadataLease metadata_lease;
-                    if (layout.bytes > sizeof(detail::InlineCopyMetadata)) {
-                        const std::size_t metadata_slot = metadata_pool_.acquire();
-                        try {
-                            metadata_pool_.ensure_slot_capacity(
-                                    metadata_slot, layout.bytes);
-                        } catch (...) {
-                            metadata_pool_.release(metadata_slot);
-                            throw;
-                        }
-                        metadata_lease = MetadataLease{
-                                &metadata_pool_, metadata_slot};
-                    }
+                    // Rank 2–8 copy descriptors always fit the inline
+                    // representation, so copies consume no metadata slot.
 
                     const detail::Fence fence =
                             build_fence(submission, nullptr);
@@ -286,7 +354,6 @@ public:
                     task.source_entry_id = entries.source;
                     task.destination_entry_id = entries.destination;
                     task.submission = std::move(submission);
-                    task.metadata_lease = std::move(metadata_lease);
                     try {
                         worker_.submit_copy(std::move(task));
                     } catch (...) {
@@ -300,24 +367,21 @@ public:
     oid binary_impl(const BinaryRequest& request) override {
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
-        // Validate rank-dependent arithmetic and reserve the complete
-        // metadata representation before accepting the request. The slot is
-        // retained by the completion submission once the worker receives it.
-        const std::size_t metadata_bytes =
-                detail::binary_metadata_storage_bytes(
-                        request.result_shape.dimensions().size());
+        // Validate rank-dependent arithmetic and reserve one fixed metadata
+        // slot of this queue's partition before accepting the request. The
+        // slot is retained by the completion submission once the worker
+        // receives it and is released only after a completion proof.
         (void)detail::make_binary_metadata(request);
         Policy::activate(context_);
-        const std::size_t metadata_slot = metadata_pool_.acquire();
+        MetadataLease metadata_lease{
+                metadata_pool_.get(), metadata_pool_->acquire()};
         try {
-            metadata_pool_.ensure_slot_capacity(
-                    metadata_slot, metadata_bytes);
             auto submission = state_->acquire();
             const detail::Fence fence = build_fence(submission, nullptr);
             return submit_binary(
                     request, *registry_state_, registry_queue_id_, fence,
                     [this, submission = std::move(submission),
-                     metadata_slot](
+                     lease = std::move(metadata_lease)](
                             std::uint64_t sequence,
                             const BinaryRequest& captured,
                             detail::BinaryEntryRegistration entries) mutable {
@@ -327,12 +391,12 @@ public:
                         task.binary_request.emplace(captured);
                         task.binary_entries = entries;
                         task.submission = std::move(submission);
-                        task.metadata_lease = MetadataLease{
-                                &metadata_pool_, metadata_slot};
+                        task.metadata_lease = std::move(lease);
                         worker_.submit_copy(std::move(task));
                     });
         } catch (...) {
-            metadata_pool_.release(metadata_slot);
+            // The lease destructor returns the fixed slot; the descriptor's
+            // host mirror stays untouched because nothing was written yet.
             throw;
         }
     }
@@ -381,17 +445,17 @@ private:
                 task.submission->attach_metadata_slot(metadata_slot);
                 task.metadata_lease.handoff();
                 detail::write_binary_metadata(
-                        metadata_pool_.host_data(metadata_slot),
-                        metadata_pool_.device_data(metadata_slot),
+                        metadata_pool_->host_data(metadata_slot),
+                        metadata_pool_->device_data(metadata_slot),
                         *task.binary_request);
                 Policy::copy_from_host(
                         stream_,
-                        metadata_pool_.device_data(metadata_slot),
-                        metadata_pool_.host_data(metadata_slot),
+                        metadata_pool_->device_data(metadata_slot),
+                        metadata_pool_->host_data(metadata_slot),
                         metadata_bytes);
                 const detail::BinaryMetadata metadata =
                         *reinterpret_cast<const detail::BinaryMetadata*>(
-                                metadata_pool_.host_data(metadata_slot));
+                                metadata_pool_->host_data(metadata_slot));
                 const auto launch = [&]<DeviceBinaryOp Op>() {
                     detail::launch_grid_stride_binary<Policy, Op>(
                             stream_,
@@ -462,40 +526,19 @@ private:
         std::exception_ptr retained_failure;
         detail::InlineCopyMetadata inline_metadata{};
         try {
-            if (layout.bytes <= sizeof(detail::InlineCopyMetadata)) {
-                detail::write_copy_metadata(
-                        inline_metadata, source, destination);
-                native_work_submitted = true;
-                detail::launch_grid_stride_copy<Policy>(
-                        stream_,
-                        static_cast<const unsigned char*>(
-                                source.native_handle()),
-                        static_cast<unsigned char*>(
-                                destination.native_handle()),
-                        inline_metadata, layout.total_words);
-            } else {
-                const std::size_t metadata_slot =
-                        task.metadata_lease.slot;
-                detail::write_copy_metadata(
-                        metadata_pool_.host_data(metadata_slot),
-                        source, destination);
-                task.submission->attach_metadata_slot(metadata_slot);
-                task.metadata_lease.handoff();
-                native_work_submitted = true;
-                Policy::copy_from_host(
-                        stream_, metadata_pool_.device_data(metadata_slot),
-                        metadata_pool_.host_data(metadata_slot), layout.bytes);
-                native_work_submitted = true;
-                detail::launch_grid_stride_copy<Policy>(
-                        stream_,
-                        static_cast<const unsigned char*>(
-                                source.native_handle()),
-                        static_cast<unsigned char*>(
-                                destination.native_handle()),
-                        static_cast<const detail::CopyMetadataHeader*>(
-                                metadata_pool_.device_data(metadata_slot)),
-                        layout.total_words);
-            }
+            // Rank 2–8 copy descriptors fit the inline representation, so
+            // the launch parameter itself carries the immutable snapshot
+            // and no metadata slot is consumed.
+            detail::write_copy_metadata(
+                    inline_metadata, source, destination);
+            native_work_submitted = true;
+            detail::launch_grid_stride_copy<Policy>(
+                    stream_,
+                    static_cast<const unsigned char*>(
+                            source.native_handle()),
+                    static_cast<unsigned char*>(
+                            destination.native_handle()),
+                    inline_metadata, layout.total_words);
             native_work_submitted = true;
             Policy::check_kernel(Policy::copy_kernel_operation());
             Policy::after_grid_stride_launch();
@@ -569,12 +612,25 @@ private:
         complete(sequence, std::move(failure));
     }
 
+#ifdef IOM_ENABLE_TESTING
+public:
+    [[nodiscard]] MetadataSlotPool& metadata_pool_for_testing() noexcept {
+        return *metadata_pool_;
+    }
+
+    [[nodiscard]] EventRing& event_ring_for_testing() noexcept {
+        return *state_;
+    }
+#endif
+
+private:
     const Device* device_;
     detail::RegistryState* registry_state_;
     detail::QueueId registry_queue_id_;
+    QueueResourceProvider* resource_provider_;
     typename Policy::context_type context_;
     typename Policy::stream_type stream_ = Policy::null_stream();
-    detail::MetadataSlotPool<Policy> metadata_pool_;
+    std::shared_ptr<MetadataSlotPool> metadata_pool_;
     std::shared_ptr<EventRing> state_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;

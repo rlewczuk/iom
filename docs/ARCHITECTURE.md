@@ -338,13 +338,14 @@ outstanding-work registration ID.
 
 On `copy`, the queue first validates device/spec compatibility and serializes
 submission ordering. It reserves a public token, stages a task, and the worker
-submits it to the stream. A copy launch either embeds small metadata in the
-kernel argument or obtains a metadata slot, copies the larger metadata to the
-device, and launches the standard tiled grid-stride copy kernel. The stream
-then records a completion event. After launch, the queue registers source and
-destination storage in the outstanding-work registry with a fence tied to that
-submission. That registry prevents unsafe transfer, reuse, or destruction
-while work remains live.
+submits it to the stream. A copy launch embeds its rank-2–8 descriptor in the
+kernel argument (inline copies and no-op copies consume no metadata slot). A
+binary operation or SYCL pointer copy writes its immutable descriptor into one
+fixed 512-byte slot of the queue's own partition, uploads it, and launches the
+standard tiled grid-stride kernel. The stream then records a completion event.
+After launch, the queue registers source and destination storage in the
+outstanding-work registry with a fence tied to that submission. That registry
+prevents unsafe transfer, reuse, or destruction while work remains live.
 
 The worker waits for each task's completion proof in queue order, removes or
 invalidates the corresponding registry entries, releases associated resources,
@@ -352,8 +353,11 @@ and completes the public token. It preserves failures after work was enqueued:
 if the normal event record fails, it attempts a fault-free record, then uses a
 successful stream drain as the last completion proof. If no launch occurred,
 the submission fails synchronously and no live-work registration is retained.
-Queue destruction invalidates its registrations, drains the worker, synchronizes
-and destroys its stream, then releases the shared state.
+Queue destruction invalidates its registrations and drains the worker; a
+safely drained queue destroys its stream and returns its partition and
+queue-count reservation, while a queue whose completion stayed unknown
+quarantines its entire lease at the Device boundary until its own covering
+proof.
 
 `StagedWorker` is the backend-neutral worker primitive used by the GPU queue.
 It first executes the staging/launch callback, publishes the task only after
@@ -362,32 +366,50 @@ thread waits for a task fence, destroys the fence, and reports the completion.
 Shutdown drains staged and published work without waiting again on work already
 being torn down, so completion tokens remain observable.
 
-### Event ring
+### Fixed queue resources
 
-`EventRingState` lazily creates and pools up to 16 runtime events. Acquiring a
-submission reserves one event and blocks if all pooled events are still in use.
-The event is not reused merely when the worker has observed completion: the
-submission record is retained by the outstanding-work fence, so it stays
-reserved until every registry entry and destruction snapshot referencing it is
-gone. This prevents a later submission from overwriting the completion state an
-earlier fence must still observe.
+Each standard-GPU Device owns exactly one metadata `FixedSizeAllocator`
+spanning `4 * C` fixed 512-byte blocks (alignment 32) and at most four live
+queues. Queue construction reserves, at the Device boundary and before any
+native stream or worker exists, one queue-count credit plus one disjoint
+`C`-block partition; a fifth live queue throws `std::bad_alloc` there.
+Construction then eagerly creates exactly `C` completion resources
+(`cudaEventCreateWithFlags`/`hipEventCreateWithFlags`; on SYCL the vendor
+event objects returned by each enqueued kernel and the fixed `C`-slot
+partition bound native in-flight work) and exactly `C` fixed host metadata
+mirrors. A fault at any setup stage destroys only what was already created
+and returns every reservation, so no partially initialized queue is ever
+published. After setup, submission, dispatch, retirement, waits, and queue
+operations perform no native allocation, free, growth, or resizing.
 
-A `Submission` starts pending. The worker marks it successful only after it has
-synchronized a recorded event, or after the exceptional path has proved
+`EventRingState` owns those `C` fixed completion resources for CUDA and
+ROCm. Acquiring a submission reserves one resource and blocks if all of them
+are still in use. The event is not reused merely when the worker has
+observed completion: the submission record is retained by the outstanding-work
+fence, so it stays reserved until every registry entry and destruction
+snapshot referencing it is gone. This prevents a later submission from
+overwriting the completion state an earlier fence must still observe.
+
+A `Submission` starts pending. The worker marks it successful only after it
+has synchronized a recorded event, or after the exceptional path has proved
 completion by draining the stream. Synchronization failure becomes a retained
-failure. Metadata attached to the submission is released during cleanup; the
-event itself returns to the ring only when the submission record's last shared
-reference is destroyed.
+failure. Metadata attached to the submission is protected — never reassigned
+— until a covering proof; the completion resource itself returns to the
+queue's fixed set only when the submission record's last shared reference is
+destroyed.
 
-### Metadata-slot pool
+### Fixed metadata-slot partitions
 
 Large view/copy descriptors do not become unbounded per-copy allocations.
-`MetadataSlotPool` owns 16 host/device metadata slot pairs. A submission
-acquires a slot only after the previous submission using that slot has retired,
-so resizing its host and device storage cannot race unrelated stream work. The
-slot grows only when required, exposes host and device pointers to the queue,
-and is released with the submission cleanup. Small descriptors bypass this pool
-and are passed inline to the kernel.
+`MetadataSlotPool` is a per-queue view over the queue's reserved partition of
+the Device-wide fixed metadata arena: exactly `C` fixed 512-byte device slots
+inside the Device metadata backing and exactly `C` fixed host mirrors, with
+no native storage of its own. A submission acquires a fixed slot, keeps its
+host mirror immutable until the upload and all device readers are done, and
+releases it only after a completion proof; an unproven completion protects
+the slot until the queue's covering drain. Compiled rank-eight copy and
+binary descriptors are compile-time asserted to fit one 512-byte slot at
+32-byte alignment, so slots never grow.
 
 ### Staging pool and transfer-stream pool
 

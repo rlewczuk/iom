@@ -2,6 +2,8 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <atomic>
+
 #include <exception>
 #include <cstddef>
 #include <memory>
@@ -12,6 +14,7 @@
 #include "driver.hpp"
 #include "../shared/event_ring.hpp"
 #include "../shared/metadata_slot_pool.hpp"
+#include "../shared/queue_resources.hpp"
 #include "../shared/staging_pool.hpp"
 #include "../shared/transfer_pool.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
@@ -21,6 +24,8 @@ namespace iom::rocm_detail {
 enum class SubmissionFault {
     none,
     event_create,
+    queue_event_create,
+    queue_stream_create,
     third_plane_launch,
     event_record,
     stream_synchronize,
@@ -30,6 +35,16 @@ enum class SubmissionFault {
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
 [[nodiscard]] bool consume_submission_fault(SubmissionFault fault) noexcept;
+
+#ifdef IOM_ENABLE_TESTING
+// Counters over the policy's native queue-resource lifecycle. Queue setup
+// creates every stream and completion resource eagerly; tests assert that a
+// rejected fifth queue creates none of them.
+extern std::atomic<std::size_t> event_create_count_for_testing;
+extern std::atomic<std::size_t> event_destroy_count_for_testing;
+extern std::atomic<std::size_t> stream_create_count_for_testing;
+extern std::atomic<std::size_t> stream_destroy_count_for_testing;
+#endif  // IOM_ENABLE_TESTING
 
 [[nodiscard]] inline std::runtime_error hip_error(
         const char* operation, hipError_t status) {
@@ -70,17 +85,42 @@ struct gpu_policy {
         return consume_submission_fault(SubmissionFault::outcome_insertion);
     }
 
+    // Queue setup fault points: a queue's C completion resources are
+    // created eagerly at construction, so queue_event_create surfaces a
+    // completion-resource failure during construction rollback, while
+    // event_create remains the submission-time acquisition fault.
+    static void check_queue_event_fault() {
+        if (consume_submission_fault(SubmissionFault::queue_event_create)) {
+            check_hip("hipEventCreateWithFlags", hipErrorInvalidValue);
+        }
+    }
+
+    static void check_create_queue_stream_fault() {
+        if (consume_submission_fault(
+                    SubmissionFault::queue_stream_create)) {
+            check_hip(
+                    "hipStreamCreateWithFlags", hipErrorInvalidValue);
+        }
+    }
+
     [[nodiscard]] static stream_type create_queue_stream() {
+        check_create_queue_stream_fault();
         stream_type stream = nullptr;
         check_hip(
                 "hipStreamCreateWithFlags",
                 hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+#ifdef IOM_ENABLE_TESTING
+        ++stream_create_count_for_testing;
+#endif
         return stream;
     }
 
     static void destroy_queue_stream_noexcept(stream_type stream) noexcept {
         if (stream != nullptr) {
             (void)hipStreamDestroy(stream);
+#ifdef IOM_ENABLE_TESTING
+            ++stream_destroy_count_for_testing;
+#endif
         }
     }
 
@@ -94,11 +134,17 @@ struct gpu_policy {
         check_hip(
                 "hipEventCreateWithFlags",
                 hipEventCreateWithFlags(event, hipEventDisableTiming));
+#ifdef IOM_ENABLE_TESTING
+        ++event_create_count_for_testing;
+#endif
     }
 
     static void destroy_event_noexcept(event_type event) noexcept {
         if (event != nullptr) {
             (void)hipEventDestroy(event);
+#ifdef IOM_ENABLE_TESTING
+            ++event_destroy_count_for_testing;
+#endif
         }
     }
 
@@ -282,7 +328,31 @@ void region_to_host(
         std::span<std::byte> destination);
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
-        const Device& device, int device_ordinal,
-        detail::RegistryState& registry_state);
+        const Device& device, detail::QueueResourceProvider& resource_provider,
+        int device_ordinal, detail::RegistryState& registry_state);
+
+#ifdef IOM_ENABLE_TESTING
+// Observed fixed resource geometry of one live queue: the reserved
+// partition (device address of its first 512-byte slot inside the Device
+// metadata backing), the immutable per-queue C, the eagerly created C
+// completion resources, and the current fixed-slot bookkeeping state.
+struct QueueResourceSnapshot {
+    std::size_t slot_count = 0;
+    void* device_base = nullptr;
+    std::size_t slot_stride = 0;
+    std::size_t events_total = 0;
+    std::size_t events_in_use = 0;
+    std::size_t slots_in_use = 0;
+    std::size_t slots_protected = 0;
+};
+
+void queue_resource_snapshot_for_testing(
+        DeviceOps& queue, QueueResourceSnapshot& snapshot);
+
+// Attempts a covering proof for every queue lease retained by unknown
+// completion on this Device's boundary; reclaimed leases return their
+// partition and queue-count reservation.
+void reclaim_retained_queue_leases_for_testing(Device& device);
+#endif  // IOM_ENABLE_TESTING
 
 }  // namespace iom::rocm_detail

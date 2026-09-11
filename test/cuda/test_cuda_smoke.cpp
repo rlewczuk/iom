@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -783,195 +784,389 @@ TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {
     CHECK(probe.release_count == 1);
 }
 
-TEST_CASE("CUDA event ring reuses events and enforces bounded capacity") {
+namespace {
+
+// Extracts the metadata arena backing range recorded by the native
+// allocation seam while the device was constructed.
+[[nodiscard]] std::uintptr_t metadata_backing_begin(
+        const AllocationProbe& probe) {
+    for (const auto& record : probe.records) {
+        if (record.phase == iom::cuda_detail::AllocationPhase::setup
+                && record.classification
+                        == iom::cuda_detail::AllocationClass::metadata_backing
+                && record.kind == iom::cuda_detail::AllocationKind::allocate
+                && record.succeeded) {
+            return reinterpret_cast<std::uintptr_t>(record.address);
+        }
+    }
+    FAIL("no metadata backing allocation was observed");
+    return 0;
+}
+
+}  // namespace
+
+TEST_CASE(
+        "CUDA four live queues own four disjoint fixed C-slot partitions "
+        "for C = 1, 16, 17") {
     require_cuda_hardware();
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
-            context);
-    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
-            context, metadata_pool);
+    for (const std::size_t slots : {std::size_t{1}, std::size_t{16},
+             std::size_t{17}}) {
+        AllocationCallsRestore restore;
+        AllocationProbe probe;
+        active_allocation_probe = &probe;
+        iom::cuda_detail::allocation_observer.complete = &capture_allocation;
 
-    for (int i = 0; i < 32; ++i) {
-        auto record = state->acquire();
-    }
-    CHECK_EQ(state->created_event_count_for_testing(), 1);
-    CHECK_EQ(state->in_use_count_for_testing(), 0);
+        auto device = iom::make_cuda_device(
+                0, iom::DeviceMemoryConfig{kArenaBytes},
+                iom::QueueConfig{slots});
+        REQUIRE(device != nullptr);
+        const std::uintptr_t metadata_begin = metadata_backing_begin(probe);
+        const std::uintptr_t metadata_end =
+                metadata_begin + 4 * slots * 512u;
+        active_allocation_probe = nullptr;
 
-    std::vector<
-            std::shared_ptr<iom::cuda_detail::EventRingState::Submission>>
-            held;
-    held.reserve(iom::cuda_detail::EventRingState::kEventRingCount);
-    for (std::size_t i = 0;
-         i < iom::cuda_detail::EventRingState::kEventRingCount; ++i) {
-        held.push_back(state->acquire());
-    }
-    CHECK_EQ(state->created_event_count_for_testing(), 16);
-    CHECK_EQ(state->in_use_count_for_testing(), 16);
-
-    std::atomic<bool> waiter_started = false;
-    std::atomic<bool> waiter_acquired = false;
-    std::thread waiter([&] {
-        waiter_started.store(true, std::memory_order_release);
-        auto record = state->acquire();
-        waiter_acquired.store(true, std::memory_order_release);
-    });
-    while (!waiter_started.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-    CHECK_EQ(state->in_use_count_for_testing(), 16);
-    held.front().reset();
-    waiter.join();
-    CHECK(waiter_acquired.load(std::memory_order_acquire));
-    for (auto& record : held) {
-        record.reset();
+        std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+        std::vector<std::uintptr_t> bases;
+        for (std::size_t index = 0; index < 4; ++index) {
+            queues.push_back(device->create_ops());
+            REQUIRE(queues.back() != nullptr);
+            iom::cuda_detail::QueueResourceSnapshot snapshot;
+            iom::cuda_detail::queue_resource_snapshot_for_testing(
+                    *queues.back(), snapshot);
+            CHECK_EQ(snapshot.slot_count, slots);
+            CHECK_EQ(snapshot.slot_stride, 512u);
+            CHECK_EQ(snapshot.events_total, slots);
+            CHECK_EQ(snapshot.slots_protected, 0u);
+            const auto base =
+                    reinterpret_cast<std::uintptr_t>(snapshot.device_base);
+            // Descriptor backing addresses lie inside the Device metadata
+            // backing, keep the allocator's 32-byte slot alignment, and
+            // never leave the partition.
+            CHECK(base % 32 == 0);
+            CHECK(base >= metadata_begin);
+            CHECK(base + slots * 512u <= metadata_end);
+            bases.push_back(base);
+        }
+        // The four partitions are pairwise disjoint.
+        for (std::size_t a = 0; a < bases.size(); ++a) {
+            for (std::size_t b = a + 1; b < bases.size(); ++b) {
+                const bool disjoint =
+                        bases[a] + slots * 512u <= bases[b]
+                        || bases[b] + slots * 512u <= bases[a];
+                CHECK(disjoint);
+            }
+        }
     }
 }
 
-TEST_CASE("CUDA event ring consumes create faults before allocating") {
+TEST_CASE(
+        "CUDA fifth live queue throws bad_alloc before native queue "
+        "resources") {
     require_cuda_hardware();
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
     auto device = iom::make_cuda_device(
             0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
-            context);
-    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
-            context, metadata_pool);
+    REQUIRE(device != nullptr);
+    const iom::TensorSpec spec = spec_16x16_f32();
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
 
+    std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+    for (std::size_t index = 0; index < 4; ++index) {
+        queues.push_back(device->create_ops());
+        REQUIRE(queues.back() != nullptr);
+    }
+
+    const auto events_before =
+            iom::cuda_detail::event_create_count_for_testing.load();
+    const auto streams_before =
+            iom::cuda_detail::stream_create_count_for_testing.load();
+    CHECK_THROWS_AS((void)device->create_ops(), std::bad_alloc);
+    // The rejected fifth queue created no stream, no worker, and no
+    // completion resource.
+    CHECK_EQ(iom::cuda_detail::event_create_count_for_testing.load(),
+            events_before);
+    CHECK_EQ(iom::cuda_detail::stream_create_count_for_testing.load(),
+            streams_before);
+
+    // Every live queue still owns its lease and processes work.
+    for (const auto& queue : queues) {
+        const iom::oid token =
+                queue->copy(source->view(), destination->view());
+        CHECK(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+    }
+}
+
+TEST_CASE("CUDA failed queue construction rolls back every reservation") {
+    require_cuda_hardware();
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes});
+    REQUIRE(device != nullptr);
+
+    std::vector<std::unique_ptr<iom::DeviceOps>> queues;
+    for (std::size_t index = 0; index < 3; ++index) {
+        queues.push_back(device->create_ops());
+        REQUIRE(queues.back() != nullptr);
+    }
+
+    // Completion-resource failure during construction.
     iom::cuda_detail::inject_submission_fault_for_testing(
-            iom::cuda_detail::SubmissionFault::event_create);
-    CHECK_THROWS_AS((void)state->acquire(), std::runtime_error);
-    CHECK_EQ(state->created_event_count_for_testing(), 0);
-    CHECK_EQ(state->in_use_count_for_testing(), 0);
+            iom::cuda_detail::SubmissionFault::queue_event_create);
+    CHECK_THROWS_AS((void)device->create_ops(), std::runtime_error);
     iom::cuda_detail::inject_submission_fault_for_testing(
             iom::cuda_detail::SubmissionFault::none);
+    // Native stream failure during construction.
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::queue_stream_create);
+    CHECK_THROWS_AS((void)device->create_ops(), std::runtime_error);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    // Both rolled-back attempts returned their partition and credit: the
+    // fourth live queue is still publishable.
+    auto fourth = device->create_ops();
+    REQUIRE(fourth != nullptr);
+    iom::cuda_detail::QueueResourceSnapshot snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(*fourth, snapshot);
+    CHECK_EQ(snapshot.slot_count, 16u);
+    CHECK_EQ(snapshot.events_total, 16u);
+    CHECK_THROWS_AS((void)device->create_ops(), std::bad_alloc);
 }
 
-TEST_CASE("CUDA event ring releases attached metadata when retired") {
+TEST_CASE("CUDA safely drained queue partitions are reusable") {
     require_cuda_hardware();
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
     auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
-            context);
-    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
-            context, metadata_pool);
-    auto submission = state->acquire();
-    std::vector<std::size_t> metadata_slots;
-    metadata_slots.reserve(
-            iom::detail::MetadataSlotPool<
-                    iom::cuda_detail::gpu_policy>::kMetadataSlotCount);
-    for (std::size_t i = 0;
-         i < iom::detail::MetadataSlotPool<
-                     iom::cuda_detail::gpu_policy>::kMetadataSlotCount;
-         ++i) {
-        metadata_slots.push_back(metadata_pool.acquire());
-    }
-    submission->attach_metadata_slot(metadata_slots.front());
-    // Retiring the submission releases the attached metadata; the pooled
-    // event stays reserved until the last record reference is dropped.
-    state->on_worker_destroy(*submission);
-    CHECK_EQ(state->in_use_count_for_testing(), 1);
-    submission.reset();
-    CHECK_EQ(state->in_use_count_for_testing(), 0);
-    for (std::size_t i = 1; i < metadata_slots.size(); ++i) {
-        metadata_pool.release(metadata_slots[i]);
-    }
-    std::vector<std::size_t> reacquired_slots;
-    reacquired_slots.reserve(metadata_slots.size());
-    for (std::size_t i = 0; i < metadata_slots.size(); ++i) {
-        reacquired_slots.push_back(metadata_pool.acquire());
-    }
-    CHECK_EQ(reacquired_slots.size(), metadata_slots.size());
-    for (const std::size_t slot : reacquired_slots) {
-        metadata_pool.release(slot);
-    }
-}
+            0, iom::DeviceMemoryConfig{kArenaBytes}, iom::QueueConfig{1});
+    REQUIRE(device != nullptr);
 
-TEST_CASE("CUDA event ring fences are pending until own completion") {
-    require_cuda_hardware();
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
-            context);
-    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
-            context, metadata_pool);
-    auto first = state->acquire();
-    const std::size_t first_index = state->slot_index(*first);
-
-    // A pending submission never reports the cached default success: an
-    // in-use slot must not claim success before its event is synchronized.
-    CHECK_FALSE(first->invoke_result().succeeded);
-    state->mark_event_recorded(*first);
-    state->on_worker_complete(*first);
-    state->on_worker_destroy(*first);
-    const iom::detail::FenceResult recorded = first->invoke_result();
-    CHECK(recorded.succeeded);
-
-    // A fence reference (as held by registry entries and destructor
-    // snapshots) keeps the pooled event reserved, so a later submission
-    // cannot reuse the slot and cannot alter the earlier fence's result.
-    auto earlier_fence = first;
+    auto first = device->create_ops();
+    REQUIRE(first != nullptr);
+    iom::cuda_detail::QueueResourceSnapshot first_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *first, first_snapshot);
     first.reset();
-    CHECK_EQ(state->in_use_count_for_testing(), 1);
-    auto reused = state->acquire();
-    CHECK_NE(state->slot_index(*reused), first_index);
-    CHECK_FALSE(reused->invoke_result().succeeded);
-    CHECK(earlier_fence->invoke_result().succeeded);
 
-    // Once the earlier fence reference is gone the slot is reusable; a
-    // later submission may land on it and still starts pending.
-    earlier_fence.reset();
-    auto resettled = state->acquire();
-    CHECK_EQ(state->slot_index(*resettled), first_index);
-    CHECK_FALSE(resettled->invoke_result().succeeded);
-    resettled.reset();
+    // The safely drained queue returned its partition and queue-count
+    // reservation, and a recreated queue receives the same geometry.
+    auto recreated = device->create_ops();
+    REQUIRE(recreated != nullptr);
+    iom::cuda_detail::QueueResourceSnapshot recreated_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *recreated, recreated_snapshot);
+    CHECK_EQ(recreated_snapshot.device_base, first_snapshot.device_base);
+    CHECK_EQ(recreated_snapshot.slot_count, 1u);
+    CHECK_EQ(recreated_snapshot.events_total, 1u);
 }
 
-TEST_CASE("CUDA double-fault retirement protects metadata until covering drain") {
+TEST_CASE(
+        "CUDA unknown completion quarantines the queue lease until a "
+        "covering proof") {
     require_cuda_hardware();
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes}, iom::QueueConfig{1});
+    REQUIRE(device != nullptr);
+    const iom::TensorSpec spec = spec_16x16_f32();
+    auto source = device->create_tensor(spec);
+    auto destination = device->create_tensor(spec);
+
+    auto unknown = device->create_ops();
+    REQUIRE(unknown != nullptr);
+    iom::cuda_detail::QueueResourceSnapshot unknown_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *unknown, unknown_snapshot);
+
+    // Double fault: both event records fail and the stream drain fails, so
+    // the submission retires with unknown completion.
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::event_record);
+    const iom::oid unresolved =
+            unknown->copy(source->view(), destination->view());
+    CHECK(iom::oid_is_token(unresolved));
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+    // The covering drain at destruction fails too, so the whole lease is
+    // quarantined instead of released.
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::stream_synchronize);
+    unknown.reset();
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    // Three more queues fit; the quarantined lease keeps its own partition.
+    std::vector<std::unique_ptr<iom::DeviceOps>> live;
+    for (std::size_t index = 0; index < 3; ++index) {
+        auto queue = device->create_ops();
+        REQUIRE(queue != nullptr);
+        iom::cuda_detail::QueueResourceSnapshot snapshot;
+        iom::cuda_detail::queue_resource_snapshot_for_testing(
+                *queue, snapshot);
+        CHECK_NE(snapshot.device_base, unknown_snapshot.device_base);
+        live.push_back(std::move(queue));
+    }
+    // Live plus quarantined leases exhaust all four credits: a fifth queue
+    // cannot reuse the quarantined partition.
+    CHECK_THROWS_AS((void)device->create_ops(), std::bad_alloc);
+
+    // Even with one live queue safely drained, the recreated queue receives
+    // the drained partition - never the quarantined one.
+    iom::cuda_detail::QueueResourceSnapshot drained_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *live.back(), drained_snapshot);
+    live.pop_back();
+    auto fifth = device->create_ops();
+    REQUIRE(fifth != nullptr);
+    iom::cuda_detail::QueueResourceSnapshot fifth_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *fifth, fifth_snapshot);
+    CHECK_EQ(fifth_snapshot.device_base, drained_snapshot.device_base);
+    CHECK_NE(fifth_snapshot.device_base, unknown_snapshot.device_base);
+
+    // A covering proof for the quarantined queue reclaims its partition and
+    // reservation without changing the original token outcome.
+    iom::cuda_detail::reclaim_retained_queue_leases_for_testing(*device);
+    auto reclaimed = device->create_ops();
+    REQUIRE(reclaimed != nullptr);
+    iom::cuda_detail::QueueResourceSnapshot reclaimed_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *reclaimed, reclaimed_snapshot);
+    CHECK_EQ(reclaimed_snapshot.device_base, unknown_snapshot.device_base);
+    const iom::oid token =
+            reclaimed->copy(source->view(), destination->view());
+    CHECK(iom::oid_is_token(token));
+    CHECK_NOTHROW(reclaimed->wait(token));
+}
+
+TEST_CASE(
+        "CUDA inline copies, no-op copies, and binary operations run "
+        "without post-setup native calls or dummy slots") {
+    require_cuda_hardware();
     auto device = iom::make_cuda_device(
             0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::detail::MetadataSlotPool<iom::cuda_detail::gpu_policy> metadata_pool(
-            context);
-    auto state = std::make_shared<iom::cuda_detail::EventRingState>(
-            context, metadata_pool);
-    auto submission = state->acquire();
-    const auto first = metadata_pool.acquire();
-    submission->attach_metadata_slot(first);
-    CHECK_THROWS_AS(state->on_worker_complete(*submission), std::runtime_error);
-    state->on_worker_destroy(*submission);
-    std::vector<std::size_t> held;
-    for (std::size_t i = 1;
-         i < iom::detail::MetadataSlotPool<
-                     iom::cuda_detail::gpu_policy>::kMetadataSlotCount;
-         ++i) {
-        held.push_back(metadata_pool.acquire());
+    REQUIRE(device != nullptr);
+    const iom::TensorSpec copy_spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    const iom::TensorSpec binary_spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+    auto source = device->create_tensor(copy_spec);
+    auto destination = device->create_tensor(copy_spec);
+    auto lhs = device->create_tensor(binary_spec);
+    auto rhs = device->create_tensor(binary_spec);
+    auto out = device->create_tensor(binary_spec);
+
+    auto queue = device->create_ops();
+    REQUIRE(queue != nullptr);
+
+    // Arm the seam after device setup: queue creation, submissions,
+    // dispatch, retirement, waits, and queue destruction must not touch
+    // native allocation/free at all.
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
+    iom::cuda_detail::QueueResourceSnapshot before;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(*queue, before);
+
+    const iom::oid copy_token =
+            queue->copy(source->view(), destination->view());
+    CHECK(iom::oid_is_token(copy_token));
+    // A no-op copy never consumes a metadata slot.
+    const iom::oid no_op_token =
+            queue->copy(source->view(), source->view());
+    CHECK(iom::oid_is_token(no_op_token));
+    const iom::oid binary_token =
+            queue->add(lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(binary_token));
+    CHECK_NOTHROW(queue->wait(copy_token));
+    CHECK_NOTHROW(queue->wait(no_op_token));
+    CHECK_NOTHROW(queue->wait(binary_token));
+
+    iom::cuda_detail::QueueResourceSnapshot after;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(*queue, after);
+    CHECK_EQ(after.slots_in_use, 0u);
+    CHECK_EQ(after.events_in_use, 0u);
+
+    queue.reset();
+    CHECK(probe.records.empty());
+}
+
+TEST_CASE(
+        "CUDA simultaneous submissions keep independent snapshots and C "
+        "bounds native in-flight work") {
+    require_cuda_hardware();
+    auto device = iom::make_cuda_device(
+            0, iom::DeviceMemoryConfig{kArenaBytes}, iom::QueueConfig{17});
+    REQUIRE(device != nullptr);
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+    auto lhs = device->create_tensor(spec);
+    auto rhs = device->create_tensor(spec);
+    auto first_out = device->create_tensor(spec);
+    auto second_out = device->create_tensor(spec);
+    std::vector<std::byte> lhs_bytes(spec.logical_nbytes());
+    std::vector<std::byte> rhs_bytes(spec.logical_nbytes());
+    for (std::size_t index = 0; index < lhs_bytes.size(); ++index) {
+        lhs_bytes[index] = std::byte{static_cast<unsigned char>(index % 251)};
+        rhs_bytes[index] = std::byte{static_cast<unsigned char>((index * 7)
+                                                               % 251)};
     }
-    std::atomic<bool> acquired = false;
-    std::thread waiter([&] {
-        const auto slot = metadata_pool.acquire();
-        acquired.store(true, std::memory_order_release);
-        metadata_pool.release(slot);
-    });
-    std::this_thread::yield();
-    CHECK_FALSE(acquired.load(std::memory_order_acquire));
-    state->on_queue_drain(false);
-    CHECK_FALSE(acquired.load(std::memory_order_acquire));
-    state->on_queue_drain(true);
-    waiter.join();
-    CHECK(acquired.load(std::memory_order_acquire));
-    for (const auto slot : held) {
-        metadata_pool.release(slot);
+    lhs->view().copy_from_host(lhs_bytes);
+    rhs->view().copy_from_host(rhs_bytes);
+
+    auto queue = device->create_ops();
+    REQUIRE(queue != nullptr);
+    // Simultaneous views of the same owners on one queue snapshot
+    // independently: both in-flight descriptors keep their own fixed slot
+    // and mapping, and both outputs are exact.
+    const iom::oid first =
+            queue->add(lhs->view(), rhs->view(), first_out->view());
+    const iom::oid second =
+            queue->add(rhs->view(), lhs->view(), second_out->view());
+    REQUIRE(iom::oid_is_token(first));
+    REQUIRE(iom::oid_is_token(second));
+    CHECK_NOTHROW(queue->wait(first));
+    CHECK_NOTHROW(queue->wait(second));
+    // lhs + rhs and rhs + lhs round-trip bitwise identically for F32, and
+    // each in-flight descriptor keeps its own fixed slot and mapping.
+    std::vector<float> lhs_values(lhs_bytes.size() / sizeof(float));
+    std::vector<float> rhs_values(rhs_bytes.size() / sizeof(float));
+    std::memcpy(
+            lhs_values.data(), lhs_bytes.data(), lhs_bytes.size());
+    std::memcpy(
+            rhs_values.data(), rhs_bytes.data(), rhs_bytes.size());
+    std::vector<std::byte> expected_bytes(lhs_bytes.size());
+    std::vector<float> expected_values(lhs_values.size());
+    for (std::size_t index = 0; index < expected_values.size(); ++index) {
+        expected_values[index] = lhs_values[index] + rhs_values[index];
     }
+    std::memcpy(
+            expected_bytes.data(), expected_values.data(),
+            expected_bytes.size());
+    std::vector<std::byte> first_actual(expected_bytes.size());
+    std::vector<std::byte> second_actual(expected_bytes.size());
+    first_out->view().copy_to_host(first_actual);
+    second_out->view().copy_to_host(second_actual);
+    CHECK(first_actual == expected_bytes);
+    CHECK(second_actual == expected_bytes);
+
+    // C = 17 rapid submissions on one queue all succeed; the fixed
+    // completion-resource set bounds native in-flight work without growth.
+    std::vector<iom::oid> tokens;
+    for (int index = 0; index < 17; ++index) {
+        const iom::oid token =
+                queue->copy(lhs->view(), first_out->view());
+        CHECK(iom::oid_is_token(token));
+        tokens.push_back(token);
+    }
+    for (const iom::oid token : tokens) {
+        CHECK_NOTHROW(queue->wait(token));
+    }
+    iom::cuda_detail::QueueResourceSnapshot snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(*queue, snapshot);
+    CHECK_EQ(snapshot.slot_count, 17u);
+    CHECK_EQ(snapshot.events_total, 17u);
+    CHECK_EQ(snapshot.events_in_use, 0u);
+    CHECK_EQ(snapshot.slots_in_use, 0u);
 }
 
 TEST_CASE("CUDA create_tensor validates the spec before any context activation") {
@@ -1069,9 +1264,9 @@ TEST_CASE(
 
     const iom::TensorSpec staging_spec{
             iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
-    // The queue binary path always backs its metadata in a device-side
-    // operation-metadata slot (grown lazily from 256 bytes), so a plain
-    // rank-four tensor reliably forces the hidden native allocation.
+    // The queue binary path backs its descriptor in one fixed 512-byte slot
+    // of the queue's reserved partition, so a plain rank-four tensor
+    // exercises the fixed-slot path without any native allocation.
     const iom::TensorSpec binary_spec{
             iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
     iom::cuda_detail::AllocationRecord data_backing;
@@ -1181,7 +1376,7 @@ TEST_CASE(
     }
     CHECK_EQ(failed, 0u);
     CHECK_GE(staging_allocations, 1u);   // host-transfer staging boundary
-    CHECK_GE(metadata_allocations, 1u);  // hidden lazy metadata boundary
+    CHECK_EQ(metadata_allocations, 0u);  // fixed slots; no metadata growth
     CHECK(outstanding.empty());          // every allocation freed by teardown
 }
 

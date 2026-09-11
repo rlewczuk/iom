@@ -1,5 +1,7 @@
 #include "copy.hpp"
 
+#include "iom/device.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -51,151 +53,9 @@ std::atomic<std::size_t> g_fence_wait_count{0};
             expected, SubmissionFault::none, std::memory_order_acq_rel);
 }
 
-class SyclMetadataSlotPool final {
-public:
-    static constexpr std::size_t kMetadataSlotCount = 16;
-
-    SyclMetadataSlotPool(
-            const sycl::context& context, sycl::queue& queue)
-            : context_(context), queue_(queue) {}
-
-    ~SyclMetadataSlotPool() noexcept {
-        for (Slot& slot : slots_) {
-            free_slot_noexcept(slot);
-        }
-    }
-
-    SyclMetadataSlotPool(const SyclMetadataSlotPool&) = delete;
-    SyclMetadataSlotPool& operator=(const SyclMetadataSlotPool&) = delete;
-
-    [[nodiscard]] std::size_t acquire() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        completion_.wait(lock, [this] {
-            for (std::size_t index = 0; index < slot_count_; ++index) {
-                if (!slots_[index].in_use) {
-                    return true;
-                }
-            }
-            return slot_count_ < kMetadataSlotCount;
-        });
-        for (std::size_t index = 0; index < slot_count_; ++index) {
-            if (!slots_[index].in_use) {
-                slots_[index].in_use = true;
-                return index;
-            }
-        }
-        if (slot_count_ == kMetadataSlotCount) {
-            throw std::logic_error(
-                    "metadata slot acquisition lost a free slot");
-        }
-        const std::size_t index = slot_count_++;
-        slots_[index].in_use = true;
-        return index;
-    }
-
-    void release(std::size_t index) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < slot_count_ && slots_[index].in_use) {
-            slots_[index].in_use = false;
-            completion_.notify_one();
-        }
-    }
-
-    void ensure_slot_capacity(
-            std::size_t index, std::size_t required_bytes) {
-        Slot& slot = slots_.at(index);
-        if (slot.capacity >= required_bytes) {
-            return;
-        }
-        std::size_t capacity = slot.capacity == 0 ? 256 : slot.capacity;
-        while (capacity < required_bytes) {
-            if (capacity > std::numeric_limits<std::size_t>::max() / 2) {
-                capacity = required_bytes;
-                break;
-            }
-            capacity *= 2;
-        }
-
-        void* replacement_device = alloc_attempt_device(
-                capacity, queue_.get_device(), context_,
-                AllocationClass::operation_metadata,
-                AllocationPhase::post_publication);
-        if (replacement_device == nullptr) {
-            throw std::bad_alloc();
-        }
-        void* replacement_host = nullptr;
-        try {
-            replacement_host = sycl::malloc_host(capacity, context_);
-            if (replacement_host == nullptr) {
-                throw std::bad_alloc();
-            }
-        } catch (...) {
-            // Rollback free of the successful device allocation stays
-            // observable as an operation-metadata free.
-            free_attempt_device(
-                    replacement_device, context_,
-                    AllocationClass::operation_metadata,
-                    AllocationPhase::post_publication);
-            throw;
-        }
-
-        void* old_device = slot.device;
-        void* old_host = slot.host;
-        slot.device = replacement_device;
-        slot.host = replacement_host;
-        slot.capacity = capacity;
-        free_device_pointer_noexcept(old_device);
-        free_pointer_noexcept(old_host);
-    }
-
-    [[nodiscard]] std::byte* host_data(std::size_t index) {
-        return static_cast<std::byte*>(slots_.at(index).host);
-    }
-
-    [[nodiscard]] void* device_data(std::size_t index) {
-        return slots_.at(index).device;
-    }
-
-private:
-    struct Slot {
-        void* device = nullptr;
-        void* host = nullptr;
-        std::size_t capacity = 0;
-        bool in_use = false;
-    };
-
-    void free_device_pointer_noexcept(void* pointer) noexcept {
-        if (pointer == nullptr) {
-            return;
-        }
-        free_attempt_device(
-                pointer, context_, AllocationClass::operation_metadata,
-                AllocationPhase::post_publication);
-    }
-
-    void free_pointer_noexcept(void* pointer) noexcept {
-        if (pointer == nullptr) {
-            return;
-        }
-        try {
-            sycl::free(pointer, context_);
-        } catch (...) {
-        }
-    }
-
-    void free_slot_noexcept(Slot& slot) noexcept {
-        free_device_pointer_noexcept(slot.device);
-        free_pointer_noexcept(slot.host);
-        slot = Slot{};
-    }
-
-    sycl::context context_;
-    sycl::queue& queue_;
-    std::array<Slot, kMetadataSlotCount> slots_;
-    std::size_t slot_count_ = 0;
-    std::mutex mutex_;
-    std::condition_variable completion_;
-};
+// The queue's fixed metadata bookkeeping is the shared, policy-free
+// MetadataSlotPool over its reserved C-slot partition: no duplicate pool,
+// no growth, and no native allocation or free after Device setup.
 
 class SyclFenceState final {
 public:
@@ -232,6 +92,10 @@ public:
         if (!result.failure && retained_failure_) {
             result = detail::FenceResult::failed(retained_failure_);
         }
+        // The fixed slot's host mirror stays immutable until this
+        // submission's completion is proved; an unproved result protects
+        // the slot until a covering queue drain.
+        proved_ = result.succeeded && result.failure == nullptr;
         cached_ = result;
         return result;
     }
@@ -242,23 +106,31 @@ public:
     }
 
     void release_metadata_slot() noexcept {
-        SyclMetadataSlotPool* pool = nullptr;
+        detail::MetadataSlotPool* pool = nullptr;
         std::size_t slot = 0;
+        bool proved = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
             pool = pool_;
             slot = slot_;
+            proved = proved_;
             pool_ = nullptr;
             slot_ = 0;
         }
         if (pool != nullptr) {
-            pool->release(slot);
+            if (proved) {
+                pool->release_after_proof(slot);
+            } else {
+                // Unknown completion: the whole lease stays reserved; this
+                // slot is never reassigned until a covering proof.
+                pool->protect(slot);
+            }
         }
     }
 
 private:
     void set_metadata_slot(
-            SyclMetadataSlotPool& pool, std::size_t slot) noexcept {
+            detail::MetadataSlotPool& pool, std::size_t slot) noexcept {
         pool_ = &pool;
         slot_ = slot;
     }
@@ -267,8 +139,9 @@ private:
     std::optional<sycl::event> event_;
     std::exception_ptr retained_failure_;
     std::optional<detail::FenceResult> cached_;
+    bool proved_ = false;
     std::size_t slot_ = 0;
-    SyclMetadataSlotPool* pool_ = nullptr;
+    detail::MetadataSlotPool* pool_ = nullptr;
 
     friend class SyclQueue;
 };
@@ -421,19 +294,32 @@ class SyclQueue final : public DeviceOps {
 
 
 public:
+#ifdef IOM_ENABLE_TESTING
+    [[nodiscard]] detail::MetadataSlotPool&
+            metadata_pool_for_testing() noexcept {
+        return *metadata_pool_;
+    }
+#endif
+
+    // Reservation order is fixed by member declaration order: the queue
+    // resource lease (credit plus disjoint C-slot partition) is reserved
+    // first, then the native in-order queue is created, and only then does
+    // the worker start. A fifth live queue therefore throws std::bad_alloc
+    // before any stream or worker exists.
     SyclQueue(
-            const Device& device, const sycl::context& context,
+            const Device& device,
+            detail::QueueResourceProvider& resource_provider,
+            const sycl::context& context,
             const sycl::device& native_device,
             detail::RegistryState& state)
             : DeviceOps(device),
               device_(&device),
               state_(&state),
+              resource_provider_(&resource_provider),
               registry_queue_id_(detail::allocate_queue_id(state)),
-              queue_(
-                      context, native_device,
-                      sycl::property_list{
-                              sycl::property::queue::in_order{}}),
-              metadata_pool_(context, queue_),
+              metadata_pool_(std::make_shared<detail::MetadataSlotPool>(
+                      resource_provider.reserve_queue_resources())),
+              queue_(make_queue_with_fault_check(context, native_device)),
               worker_(
                       detail::StagedWorker<Task>::Callbacks{
                               [this](Task& task) {
@@ -467,14 +353,54 @@ public:
     }
 
     ~SyclQueue() override {
-        // Drain queued device work before destroying task captures and
-        // their owner registrations.
+        // Covering drain attempt: a successful wait proves every enqueued
+        // access and releases all protected slots.
+        bool drained = false;
         try {
             queue_.wait_and_throw();
+            drained = true;
         } catch (...) {
         }
         worker_.shutdown_and_drain();
         state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        if (drained) {
+            metadata_pool_->release_all_protected();
+            return;
+        }
+        if (!metadata_pool_->has_unproven_leases()) {
+            // Nothing native is unproven; release the lease normally.
+            return;
+        }
+        // Unknown completion: quarantine the entire unresolved lease at the
+        // Device boundary. The partition and queue-count reservation stay
+        // retained with the queue's own covering-proof handle until this
+        // queue's own drain is proved; a drain of another queue is never
+        // sufficient.
+        sycl::queue retained_queue = std::move(queue_);
+        std::shared_ptr<detail::MetadataSlotPool> retained_pool =
+                std::move(metadata_pool_);
+        resource_provider_->retain_unknown_lease(
+                [retained_queue, retained_pool]() mutable -> bool {
+                    try {
+                        retained_queue.wait_and_throw();
+                    } catch (...) {
+                        return false;
+                    }
+                    // Covering proof: release protected slots and drop the
+                    // lease (which returns the partition and credit).
+                    retained_pool->release_all_protected();
+                    retained_pool.reset();
+                    return true;
+                },
+                [retained_queue, retained_pool]() mutable {
+                    // Best-effort teardown; unproven leases keep their
+                    // original token outcomes untouched.
+                    try {
+                        retained_queue.wait_and_throw();
+                    } catch (...) {
+                    }
+                    retained_pool.reset();
+                });
     }
 
     oid copy_impl(
@@ -1002,18 +928,20 @@ private:
                         "injected SYCL first-submit failure");
             }
 
-            const std::size_t metadata_slot = metadata_pool_.acquire();
-            task.state->set_metadata_slot(metadata_pool_, metadata_slot);
+            // One fixed 512-byte slot from this queue's partition carries
+            // the immutable pointer-copy descriptor; no growth, replacement,
+            // or native allocation ever happens here.
+            const std::size_t metadata_slot = metadata_pool_->acquire();
+            task.state->set_metadata_slot(*metadata_pool_, metadata_slot);
             const detail::CopyMetadataLayout layout =
                     detail::copy_metadata_layout(
                             *task.source, *task.destination);
-            metadata_pool_.ensure_slot_capacity(metadata_slot, layout.bytes);
             detail::write_copy_metadata(
-                    metadata_pool_.host_data(metadata_slot),
+                    metadata_pool_->host_data(metadata_slot),
                     *task.source, *task.destination);
             queue_.memcpy(
-                    metadata_pool_.device_data(metadata_slot),
-                    metadata_pool_.host_data(metadata_slot), layout.bytes);
+                    metadata_pool_->device_data(metadata_slot),
+                    metadata_pool_->host_data(metadata_slot), layout.bytes);
             metadata_enqueued = true;
 
             const auto* source_handle = static_cast<const unsigned char*>(
@@ -1022,7 +950,7 @@ private:
                     task.destination->native_handle());
             const auto* metadata = static_cast<
                     const detail::CopyMetadataHeader*>(
-                    metadata_pool_.device_data(metadata_slot));
+                    metadata_pool_->device_data(metadata_slot));
             sycl::event event = queue_.parallel_for(
                     sycl::range<1>(layout.total_words),
                     [=](sycl::id<1> item) {
@@ -1106,18 +1034,52 @@ private:
         complete(sequence, std::move(combined_failure));
     }
 
+    // Constructs the native in-order queue behind the queue-stream fault
+    // seam so construction rollback stays transactional.
+    static sycl::queue make_queue_with_fault_check(
+            const sycl::context& context, const sycl::device& native_device) {
+        if (consume_submission_fault(SubmissionFault::queue_stream_create)) {
+            throw std::runtime_error(
+                    "injected SYCL queue creation failure");
+        }
+        return sycl::queue(
+                context, native_device,
+                sycl::property_list{sycl::property::queue::in_order{}});
+    }
+
     const Device* device_;
     detail::RegistryState* state_;
+    detail::QueueResourceProvider* resource_provider_;
     detail::QueueId registry_queue_id_;
+    // The fixed partition lease is reserved before the native queue is
+    // constructed (member declaration order).
+    std::shared_ptr<detail::MetadataSlotPool> metadata_pool_;
     sycl::queue queue_;
-    SyclMetadataSlotPool metadata_pool_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
     std::map<std::uint64_t, SyclSequenceOutcome> outcomes_;
     detail::StagedWorker<Task> worker_;
 };
 
+
 }  // namespace
+
+#ifdef IOM_ENABLE_TESTING
+void queue_resource_snapshot_for_testing(
+        DeviceOps& queue, QueueResourceSnapshot& snapshot) {
+    auto* sycl_queue = dynamic_cast<SyclQueue*>(&queue);
+    if (sycl_queue == nullptr) {
+        throw std::logic_error("queue is not a live SYCL queue");
+    }
+    detail::MetadataSlotPool& pool =
+            sycl_queue->metadata_pool_for_testing();
+    snapshot.slot_count = pool.slot_count();
+    snapshot.device_base = pool.device_base();
+    snapshot.slot_stride = pool.slot_stride();
+    snapshot.slots_in_use = pool.in_use_count();
+    snapshot.slots_protected = pool.protected_count();
+}
+#endif  // IOM_ENABLE_TESTING
 
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
@@ -1201,11 +1163,23 @@ void region_to_host(
 }
 
 std::unique_ptr<DeviceOps> make_queue(
-        const Device& device, const sycl::context& context,
-        const sycl::device& native_device,
+        const Device& device, detail::QueueResourceProvider& resource_provider,
+        const sycl::context& context, const sycl::device& native_device,
         detail::RegistryState& registry_state) {
     return std::make_unique<SyclQueue>(
-            device, context, native_device, registry_state);
+            device, resource_provider, context, native_device,
+            registry_state);
 }
+
+#ifdef IOM_ENABLE_TESTING
+void reclaim_retained_queue_leases_for_testing(Device& device) {
+    auto* provider =
+            dynamic_cast<detail::QueueResourceProvider*>(&device);
+    if (provider == nullptr) {
+        throw std::logic_error("device does not own fixed queue resources");
+    }
+    provider->reclaim_retained_leases();
+}
+#endif  // IOM_ENABLE_TESTING
 
 }  // namespace iom::sycl_detail

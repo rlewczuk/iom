@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include "iom/gpu_algorithm.hpp"
+#include "queue_resources.hpp"
 
 #ifndef IOM_GPU_DEVICE
 #error "IOM_GPU_DEVICE must be defined before including standard_tiled_copy.inl"
@@ -327,6 +328,25 @@ struct InlineCopyMetadata {
 static_assert(std::is_trivially_copyable_v<InlineCopyMetadata>);
 static_assert(sizeof(InlineCopyMetadata) == 240);
 static_assert(sizeof(InlineCopyMetadata) % 16 == 0);
+// Fixed-slot layout contract: the compiled rank-eight copy descriptor is
+// 48 header bytes plus 3 * kInlineMetadataMaxRank stride words, and the
+// rank-eight descriptor a submission actually writes is
+// 48 + 24 * (max rank - 2) leading-rank bytes. Both the compiled
+// representation and the rank-eight payload must fit one 512-byte metadata
+// slot (alignment 32). A future overflow requires an intentional ABI/spec
+// update, never automatic slot growth.
+static_assert(
+        sizeof(CopyMetadataHeader)
+                + 3 * (kInlineMetadataMaxRank - 2) * sizeof(std::uint64_t)
+        == 48 + 24 * 6);
+static_assert(
+        sizeof(CopyMetadataHeader)
+                + 3 * (kInlineMetadataMaxRank - 2) * sizeof(std::uint64_t)
+        <= kMetadataSlotBytes);
+static_assert(sizeof(InlineCopyMetadata) <= kMetadataSlotBytes);
+static_assert(
+        alignof(InlineCopyMetadata) <= 32
+        && kMetadataSlotBytes % alignof(InlineCopyMetadata) == 0);
 static_assert(sizeof(InlineCopyMetadata) <= 1024);
 
 static_assert(std::is_trivially_copyable_v<CopyMetadataHeader>);

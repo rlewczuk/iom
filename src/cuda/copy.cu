@@ -1,5 +1,7 @@
 #include "copy.hpp"
 
+#include "iom/device.hpp"
+
 #include <cuda_runtime_api.h>
 
 #include <atomic>
@@ -23,6 +25,15 @@ std::atomic<int> g_event_record_failures{0};
 std::atomic<int> g_stream_sync_failures{0};
 
 }  // namespace
+
+// External linkage: the policy's inline member functions in copy.hpp
+// reference these from every including translation unit.
+#ifdef IOM_ENABLE_TESTING
+std::atomic<std::size_t> event_create_count_for_testing{0};
+std::atomic<std::size_t> event_destroy_count_for_testing{0};
+std::atomic<std::size_t> stream_create_count_for_testing{0};
+std::atomic<std::size_t> stream_destroy_count_for_testing{0};
+#endif  // IOM_ENABLE_TESTING
 
 bool consume_submission_fault(
         SubmissionFault point) noexcept {
@@ -92,10 +103,39 @@ void region_to_host(
 }
 
 std::unique_ptr<DeviceOps> make_queue(
-        const Device& device, CUcontext context,
+        const Device& device,
+        detail::QueueResourceProvider& resource_provider, CUcontext context,
         detail::RegistryState& registry_state) {
     return std::make_unique<detail::GpuQueue<gpu_policy>>(
-            device, context, registry_state);
+            device, resource_provider, context, registry_state);
 }
+
+#ifdef IOM_ENABLE_TESTING
+void queue_resource_snapshot_for_testing(
+        DeviceOps& queue, QueueResourceSnapshot& snapshot) {
+    auto* gpu_queue = dynamic_cast<detail::GpuQueue<gpu_policy>*>(&queue);
+    if (gpu_queue == nullptr) {
+        throw std::logic_error("queue is not a live CUDA GpuQueue");
+    }
+    detail::MetadataSlotPool& pool = gpu_queue->metadata_pool_for_testing();
+    EventRingState& ring = gpu_queue->event_ring_for_testing();
+    snapshot.slot_count = pool.slot_count();
+    snapshot.device_base = pool.device_base();
+    snapshot.slot_stride = pool.slot_stride();
+    snapshot.events_total = ring.event_count_for_testing();
+    snapshot.events_in_use = ring.in_use_count_for_testing();
+    snapshot.slots_in_use = pool.in_use_count();
+    snapshot.slots_protected = pool.protected_count();
+}
+
+void reclaim_retained_queue_leases_for_testing(Device& device) {
+    auto* provider =
+            dynamic_cast<detail::QueueResourceProvider*>(&device);
+    if (provider == nullptr) {
+        throw std::logic_error("device does not own fixed queue resources");
+    }
+    provider->reclaim_retained_leases();
+}
+#endif  // IOM_ENABLE_TESTING
 
 }  // namespace iom::cuda_detail
