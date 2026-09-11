@@ -71,8 +71,11 @@ namespace iom {
             std::size_t size;
         };
 
-        void insert_free_block(Block block);
-        void coalesce();
+        // Free-range bookkeeping helpers that prepare a complete transition
+        // into a caller-supplied vector so that allocation/free can mutate
+        // the published free list only through a noexcept commit.
+        static void insert_free_block(std::vector<Block>& blocks, Block block);
+        static void coalesce(std::vector<Block>& blocks);
 
         std::vector<Block> free_;
         std::unordered_map<std::uintptr_t, std::size_t> allocated_;

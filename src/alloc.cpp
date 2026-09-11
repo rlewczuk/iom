@@ -5,7 +5,6 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
-#include <utility>
 
 namespace iom {
 
@@ -143,21 +142,39 @@ namespace iom {
         }
 
         const auto chosen = free_[best_index];
-        free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(best_index));
-
         const auto block_addr = begin_ + chosen.offset;
         const auto padding = static_cast<std::size_t>(best_addr - block_addr);
-        if (padding != 0) {
-            insert_free_block(Block{chosen.offset, padding});
-        }
-
         const auto suffix_offset = chosen.offset + best_total;
         const auto suffix_size = chosen.size - best_total;
-        if (suffix_size != 0) {
-            insert_free_block(Block{suffix_offset, suffix_size});
-        }
 
+        // Prepare the complete post-split free-range geometry in a local
+        // vector before touching any allocator state. The chosen block is
+        // replaced by its padding and suffix ranges at the same sorted
+        // positions, so a bookkeeping failure below leaves ownership, free
+        // ranges, free_bytes(), and address geometry exactly as before.
+        std::vector<Block> next;
+        next.reserve(free_.size() + 1);
+        next.insert(
+                next.end(),
+                free_.begin(),
+                free_.begin() + static_cast<std::ptrdiff_t>(best_index));
+        if (padding != 0) {
+            next.push_back(Block{chosen.offset, padding});
+        }
+        if (suffix_size != 0) {
+            next.push_back(Block{suffix_offset, suffix_size});
+        }
+        next.insert(
+                next.end(),
+                free_.begin() + static_cast<std::ptrdiff_t>(best_index) + 1,
+                free_.end());
+
+        // Record the returned address before publishing the new free list:
+        // the map insert either completes or leaves the map unchanged, and
+        // the vector swap below cannot throw.
         allocated_[best_addr] = sz;
+        free_.swap(next);
+
         return ptr_from_addr(best_addr);
     }
 
@@ -173,10 +190,20 @@ namespace iom {
         }
 
         const auto sz = allocated->second;
-        allocated_.erase(allocated);
+        const Block released{static_cast<std::size_t>(address - begin_), sz};
 
-        insert_free_block(Block{static_cast<std::size_t>(address - begin_), sz});
-        coalesce();
+        // Prepare the complete post-release geometry (sorted insertion plus
+        // adjacent coalescing) in a local vector first. Any bookkeeping
+        // failure below leaves ownership, free ranges, free_bytes(), and
+        // address geometry exactly as before the call.
+        std::vector<Block> next;
+        next.insert(next.end(), free_.begin(), free_.end());
+        insert_free_block(next, released);
+        coalesce(next);
+
+        // Publish the release; both operations are noexcept.
+        allocated_.erase(allocated);
+        free_.swap(next);
     }
 
     void ListAllocator::reset() {
@@ -197,38 +224,33 @@ namespace iom {
         return result;
     }
 
-    void ListAllocator::insert_free_block(Block block) {
+    void ListAllocator::insert_free_block(std::vector<Block>& blocks, Block block) {
         const auto pos = std::lower_bound(
-                free_.begin(),
-                free_.end(),
+                blocks.begin(),
+                blocks.end(),
                 block.offset,
                 [](const Block& lhs, std::size_t offset) {
                     return lhs.offset < offset;
                 });
 
-        free_.insert(pos, block);
+        blocks.insert(pos, block);
     }
 
-    void ListAllocator::coalesce() {
-        if (free_.empty()) {
+    void ListAllocator::coalesce(std::vector<Block>& blocks) {
+        if (blocks.empty()) {
             return;
         }
 
-        std::vector<Block> merged;
-        merged.reserve(free_.size());
-        merged.push_back(free_[0]);
-
-        for (std::size_t i = 1; i < free_.size(); ++i) {
-            auto& last = merged.back();
-            const auto& current = free_[i];
-            if (last.offset + last.size == current.offset) {
-                last.size += current.size;
+        std::size_t out = 0;
+        for (std::size_t i = 1; i < blocks.size(); ++i) {
+            if (blocks[out].offset + blocks[out].size == blocks[i].offset) {
+                blocks[out].size += blocks[i].size;
             } else {
-                merged.push_back(current);
+                ++out;
+                blocks[out] = blocks[i];
             }
         }
-
-        free_ = std::move(merged);
+        blocks.resize(out + 1);
     }
 
     FixedSizeAllocator::FixedSizeAllocator(void* buffer, std::size_t size, std::size_t payload_size)
@@ -278,8 +300,13 @@ namespace iom {
             throw std::invalid_argument("double free");
         }
 
-        in_use_[index] = false;
+        // Append the released index before clearing the slot. If appending
+        // throws, the slot remains marked in use and owned by the caller; a
+        // successful release records the index exactly once and only then
+        // makes the slot reusable (the next free is rejected by the in-use
+        // check, so no index is ever pushed twice).
         free_indices_.push_back(index);
+        in_use_[index] = false;
     }
 
     void FixedSizeAllocator::reset() {

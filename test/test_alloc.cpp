@@ -9,10 +9,39 @@
 
 #include "iom/alloc.hpp"
 
+// The counting allocation-fault harness installed by test_iom.cpp's global
+// operator new replace: it arms a failure at an exact allocation ordinal and
+// counts observations. Declarations mirror test_iom.cpp exactly.
+namespace iom_test {
+bool should_fail_allocation() noexcept;
+void arm_counting() noexcept;
+void arm_failure(std::size_t ordinal) noexcept;
+std::size_t disarm() noexcept;
+}  // namespace iom_test
+
 namespace {
 
 bool is_aligned(void* ptr, std::size_t alignment) {
     return reinterpret_cast<std::uintptr_t>(ptr) % alignment == 0;
+}
+
+// Builds a deterministic ListAllocator geometry: after this call the free
+// list is [0,64) [72,24) [120,8) (96 free bytes) with the 8-byte block at
+// offset 64 and the 24-byte block at offset 96 still outstanding. Alignment
+// 32 keeps every returned address aligned.
+void prepare_split_list_state(
+        iom::ListAllocator& allocator,
+        void*& first,
+        void*& second,
+        void*& third,
+        void*& fourth) {
+    allocator.reset();
+    first = allocator.alloc(32);
+    second = allocator.alloc(32);
+    third = allocator.alloc(8);
+    fourth = allocator.alloc(24);
+    allocator.free(first);
+    allocator.free(second);
 }
 
 }  // namespace
@@ -345,4 +374,234 @@ TEST_CASE("FixedSizeAllocator rejects overflowing payload stride") {
             iom::FixedSizeAllocator(buffer.data(), buffer.size(), 32, std::numeric_limits<std::size_t>::max()),
             std::overflow_error);
     CHECK_THROWS_AS(iom::FixedSizeAllocator(buffer.data(), buffer.size(), 32, 0), std::invalid_argument);
+}
+
+TEST_CASE("ListAllocator allocation bookkeeping failure rolls back atomically") {
+    // Prepared geometry: free list [0,64) [72,24) [120,8), 96 free bytes.
+    // A 16-byte request best-fits [0,64) and splits it into suffix [16,48)
+    // at the head; the next aligned 16-byte request then serves at +32.
+    alignas(32) std::array<std::byte, 128> probe_buffer{};
+    iom::ListAllocator probe(probe_buffer.data(), probe_buffer.size(), 32);
+    void* first = nullptr;
+    void* second = nullptr;
+    void* third = nullptr;
+    void* fourth = nullptr;
+    prepare_split_list_state(probe, first, second, third, fourth);
+    CHECK_EQ(probe.free_bytes(), 96);
+
+    // Measure how many host bookkeeping allocations one allocation performs.
+    iom_test::arm_counting();
+    void* probed = probe.alloc(16);
+    const std::size_t fault_points = iom_test::disarm();
+    REQUIRE_EQ(probed, probe_buffer.data());
+    REQUIRE(fault_points > 0);
+
+    for (std::size_t ordinal = 1; ordinal <= fault_points; ++ordinal) {
+        alignas(32) std::array<std::byte, 128> buffer{};
+        iom::ListAllocator allocator(buffer.data(), buffer.size(), 32);
+        prepare_split_list_state(allocator, first, second, third, fourth);
+        CHECK_EQ(allocator.free_bytes(), 96);
+
+        iom_test::arm_failure(ordinal);
+        bool threw_bad_alloc = false;
+        bool threw_unexpected = false;
+        try {
+            allocator.alloc(16);
+        } catch (const std::bad_alloc&) {
+            threw_bad_alloc = true;
+        } catch (...) {
+            threw_unexpected = true;
+        }
+        const std::size_t allocations_seen = iom_test::disarm();
+
+        REQUIRE_EQ(allocations_seen, ordinal);
+        REQUIRE(threw_bad_alloc);
+        CHECK_FALSE(threw_unexpected);
+        // No range was removed, split, or duplicated: free bytes and the
+        // rest of the geometry are exactly as before the call.
+        CHECK_EQ(allocator.free_bytes(), 96);
+
+        // Recovery reuses the exact address the failed call would have
+        // returned, exactly once. The split leaves the suffix [16,48) free;
+        // offset 16 is not 32-aligned, so the next 16-byte request lands at
+        // +32 (16 bytes padding) and the following one would take [48,64).
+        void* recovered = allocator.alloc(16);
+        REQUIRE_EQ(recovered, buffer.data());
+        CHECK_EQ(allocator.free_bytes(), 80);
+        void* following = allocator.alloc(16);
+        REQUIRE_EQ(following, buffer.data() + 32);
+        CHECK_EQ(allocator.free_bytes(), 64);
+    }
+
+    // One allocation past every internal fault point succeeds.
+    alignas(32) std::array<std::byte, 128> last_buffer{};
+    iom::ListAllocator last(last_buffer.data(), last_buffer.size(), 32);
+    prepare_split_list_state(last, first, second, third, fourth);
+    iom_test::arm_failure(fault_points + 1);
+    bool threw = false;
+    void* result = nullptr;
+    try {
+        result = last.alloc(16);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    } catch (...) {
+        threw = true;
+    }
+    iom_test::disarm();
+    REQUIRE_FALSE(threw);
+    REQUIRE_EQ(result, last_buffer.data());
+}
+
+TEST_CASE("ListAllocator release bookkeeping failure rolls back atomically") {
+    // Two free blocks [0,64) [80,48) (112 free bytes) with the 16-byte block
+    // at offset 64 outstanding. Freeing it inserts [64,16) and coalesces the
+    // whole buffer back to [0,128), so recovery is observable as one 128-byte
+    // reusable range at the original base address.
+    const auto make_state = [](iom::ListAllocator& allocator) {
+        void* a = allocator.alloc(64);
+        void* b = allocator.alloc(16);
+        allocator.free(a);
+        return b;
+    };
+
+    alignas(32) std::array<std::byte, 128> probe_buffer{};
+    iom::ListAllocator probe(probe_buffer.data(), probe_buffer.size(), 32);
+    void* probe_owned = make_state(probe);
+    CHECK_EQ(probe_owned, probe_buffer.data() + 64);
+    CHECK_EQ(probe.free_bytes(), 112);
+
+    iom_test::arm_counting();
+    probe.free(probe_owned);
+    const std::size_t fault_points = iom_test::disarm();
+    REQUIRE(fault_points > 0);
+
+    for (std::size_t ordinal = 1; ordinal <= fault_points; ++ordinal) {
+        alignas(32) std::array<std::byte, 128> buffer{};
+        iom::ListAllocator allocator(buffer.data(), buffer.size(), 32);
+        void* owned = make_state(allocator);
+        CHECK_EQ(allocator.free_bytes(), 112);
+
+        iom_test::arm_failure(ordinal);
+        bool threw_bad_alloc = false;
+        bool threw_unexpected = false;
+        try {
+            allocator.free(owned);
+        } catch (const std::bad_alloc&) {
+            threw_bad_alloc = true;
+        } catch (...) {
+            threw_unexpected = true;
+        }
+        const std::size_t allocations_seen = iom_test::disarm();
+
+        REQUIRE_EQ(allocations_seen, ordinal);
+        REQUIRE(threw_bad_alloc);
+        CHECK_FALSE(threw_unexpected);
+        // The release did not happen: free bytes are unchanged and the
+        // caller still owns the block.
+        CHECK_EQ(allocator.free_bytes(), 112);
+
+        // Recovery releases the block exactly once and coalesces the
+        // original range exactly once into the full 128-byte range.
+        CHECK_NOTHROW(allocator.free(owned));
+        CHECK_EQ(allocator.free_bytes(), 128);
+        CHECK_THROWS_AS(allocator.free(owned), std::invalid_argument);
+        CHECK_EQ(allocator.free_bytes(), 128);
+
+        // The coalesced range is reusable at its original base address and
+        // no capacity was lost.
+        void* merged = allocator.alloc(128);
+        REQUIRE_EQ(merged, buffer.data());
+        CHECK_EQ(allocator.free_bytes(), 0);
+        CHECK_THROWS_AS(static_cast<void>(allocator.alloc(1)), std::bad_alloc);
+    }
+
+    // One allocation past every internal fault point succeeds.
+    alignas(32) std::array<std::byte, 128> last_buffer{};
+    iom::ListAllocator last(last_buffer.data(), last_buffer.size(), 32);
+    void* owned = make_state(last);
+    iom_test::arm_failure(fault_points + 1);
+    bool threw = false;
+    try {
+        last.free(owned);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    } catch (...) {
+        threw = true;
+    }
+    iom_test::disarm();
+    REQUIRE_FALSE(threw);
+    CHECK_EQ(last.free_bytes(), 128);
+}
+
+TEST_CASE("FixedSizeAllocator release is transactional and allocation-free") {
+    alignas(32) std::array<std::byte, 64> buffer{};
+    iom::FixedSizeAllocator allocator(buffer.data(), buffer.size(), 16, 8);
+    CHECK_EQ(allocator.block_count(), 4);
+    CHECK_EQ(allocator.free_count(), 4);
+
+    void* slot0 = allocator.alloc(8);
+    void* slot1 = allocator.alloc(8);
+    void* slot2 = allocator.alloc(8);
+    void* slot3 = allocator.alloc(8);
+    CHECK_EQ(slot0, buffer.data());
+    CHECK_EQ(slot1, buffer.data() + 16);
+    CHECK_EQ(slot2, buffer.data() + 32);
+    CHECK_EQ(slot3, buffer.data() + 48);
+    CHECK_EQ(allocator.free_count(), 0);
+
+    // The release path appends the index before clearing the slot, so a
+    // failed append would leave the slot in use. The free-slot vector is
+    // pre-sized to exactly block_count, so the append performs no host
+    // bookkeeping allocation at all: a host allocation failure during
+    // release cannot lose or duplicate a slot.
+    iom_test::arm_counting();
+    allocator.free(slot1);
+    const std::size_t release_allocations = iom_test::disarm();
+    REQUIRE_EQ(release_allocations, 0);
+    CHECK_EQ(allocator.free_count(), 1);
+    CHECK(allocator.free_count() <= allocator.block_count());
+
+    // A failed release (double free) leaves the slot and the free-slot
+    // count unchanged.
+    CHECK_THROWS_AS(allocator.free(slot1), std::invalid_argument);
+    CHECK_EQ(allocator.free_count(), 1);
+
+    // Reuse returns the released slot exactly once.
+    void* reused = allocator.alloc(8);
+    REQUIRE_EQ(reused, slot1);
+    CHECK_EQ(allocator.free_count(), 0);
+
+    // Invalid releases (foreign or unaligned pointer) leave the free-slot
+    // count unchanged.
+    alignas(32) std::array<std::byte, 32> foreign{};
+    CHECK_THROWS_AS(allocator.free(foreign.data()), std::invalid_argument);
+    CHECK_EQ(allocator.free_count(), 0);
+    CHECK_THROWS_AS(allocator.free(buffer.data() + 1), std::invalid_argument);
+    CHECK_EQ(allocator.free_count(), 0);
+
+    // Release every slot exactly once: no duplicate index, no lost slot.
+    allocator.free(slot0);
+    allocator.free(reused);
+    allocator.free(slot2);
+    allocator.free(slot3);
+    CHECK_EQ(allocator.free_count(), allocator.block_count());
+
+    // Recycling the full set returns each block address exactly once.
+    std::array<void*, 4> recycled{
+            allocator.alloc(8), allocator.alloc(8), allocator.alloc(8), allocator.alloc(8)};
+    const std::array<void*, 4> addresses{
+            buffer.data(), buffer.data() + 16, buffer.data() + 32, buffer.data() + 48};
+    for (void* pointer : recycled) {
+        bool found = false;
+        for (void* address : addresses) {
+            found = found || pointer == address;
+        }
+        REQUIRE(found);
+    }
+    for (std::size_t i = 0; i < recycled.size(); ++i) {
+        for (std::size_t j = i + 1; j < recycled.size(); ++j) {
+            REQUIRE_NE(recycled[i], recycled[j]);
+        }
+    }
+    CHECK_EQ(allocator.free_count(), 0);
 }
