@@ -61,7 +61,7 @@ Use these JSON fields verbatim:
 - `requested_target`, `target_kind`, `target_spec_path`, and `target_annotation_path` identify the request;
 - each `leaves[]` record supplies `task_path`, source paths, exact worktree paths, feature branch, status, resolved blockers, and `explicitly_ready`.
 
-If `target_kind` is `leaf`, the main agent owns it. If it is `container`, the main agent orchestrates general-purpose subagents, one owner per ready leaf. Skip a leaf only when its sibling annotation status is `done`.
+If `target_kind` is `leaf`, the main agent owns and implements it on the current session model; do not replace it with the `spec-run-all` implementer profile or another model-routed implementation agent. If it is `container`, the main agent orchestrates general-purpose subagents, one owner per ready leaf. Skip a leaf only when its sibling annotation status is `done`.
 
 ## 2. Complete the dependency graph
 
@@ -108,7 +108,7 @@ Use the prepared worktree as the sole project root:
 - implement every requirement and acceptance criterion without unrelated cleanup;
 - keep implementation, tests, generated repository artifacts, and annotation in the same task commit.
 
-For a container wave, provision every leaf before spawning. Launch one general-purpose subagent per leaf in one parallel Task batch. Do not use automatic isolated-agent worktrees. Give each owner the exact `repo_root`, `task_path`, `worktree`, `spec_path`, `annotation_path`, feature branch, integration branch/head, exclusive files/interfaces, sibling contracts, and focused verification still required.
+For a container wave, provision every leaf before spawning. Launch one general-purpose subagent per leaf in one parallel Task batch. Do not use automatic isolated-agent worktrees or a model-routed `spec-run-all` implementer profile. Give each owner the exact `repo_root`, `task_path`, `worktree`, `spec_path`, `annotation_path`, feature branch, integration branch/head, exclusive files/interfaces, sibling contracts, focused verification still required, and the stuck-implementation escalation below.
 
 A child must:
 
@@ -120,6 +120,14 @@ A child must:
 6. return the helper's commit, changed paths, retained risks, and verification still required.
 
 No child may issue direct Git mutation commands or edit an annotation by file operation.
+
+### Stuck implementation escalation
+
+An implementation owner that is stuck and would otherwise give up or report an implementation failure must first invoke exactly one `spec-run-debug` subagent for that leaf. This is the only permitted nested delegation. The profile requests the `@slow` model and is a read-only rescue analyst; the implementation owner remains responsible for all edits and decisions.
+
+Pass the debugger the exact worktree and specification paths, task scope, relevant repository constraints, current changes, concrete error or dead end, observations, and approaches already attempted. Use `agent: "spec-run-debug"`, do not request another isolated worktree, wait for its result, then resume implementation using the supported proposed solution or explain with evidence why it cannot work. Do not invoke the debugger for normal planning, review, verification failures owned by the parent, or an external prerequisite that makes the task `blocked`. Do not repeat the escalation for the same leaf.
+
+Before dispatch, verify that `.omp/agents/spec-run-debug.md` declares `model: "@slow"` and that effective model-role or per-agent overrides do not route it incompatibly. If the profile or model is unavailable, retain the concrete dispatch failure; never substitute another profile or silently continue to an implementation-failed result. The debugger must return root cause evidence and a proposed solution directly to the requesting implementer and must not edit, annotate, commit, rebase, integrate, or delegate.
 
 ## 5. Write state and consolidate the task commit
 
@@ -154,6 +162,8 @@ python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root
 python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
   --status failed --outcome '<concise attempted outcome>'
 ```
+
+An implementation failure status is valid only after the required `spec-run-debug` rescue attempt was completed and its proposed solution was attempted or rejected with concrete evidence. An unavailable debugger/profile is itself a concrete retained failure. External prerequisites may be marked `blocked` without invoking the debugger.
 
 Use `blocked` instead of `failed` only for an external prerequisite. Repeat `--error` when needed. The helper replaces stale generated Summary, Verification, and Errors sections, preserves unrelated sections, rejects misplaced annotations, stages the complete worktree, refuses unknown commits, and safely consolidates recognized checkpoints/task commits onto the recorded base.
 
