@@ -217,6 +217,10 @@ namespace iom {
      * Negative results are synchronous errors, positive values are accepted
      * tokens, and zero is invalid. `add`, `mul`, `sub`, and `div` each have
      * exactly three views and are the binary operation support signals.
+     * Every full tensor, view, and binary result shape must have rank two
+     * through eight; a rank outside that interval is an invalid argument
+     * and maps through OidError::InvalidArgument (OID -1) before any
+     * sequence, token, registry entry, metadata upload, or backend effect.
      * Synchronous failures never cross the facade; `wait` throws for invalid
      * tokens and retained post-acceptance failures.
      */
@@ -242,6 +246,10 @@ namespace iom {
         /**
          * Common `noexcept` OID facades for three-view binary operations.
          * Validation and lifetime ownership are shared by all operations.
+         * All three operand/output full specs and the computed broadcast
+         * result must have rank two through eight; invalid rank returns
+         * OidError::InvalidArgument with no sequence, token, registry,
+         * metadata, or backend effect.
          */
         oid copy(const TensorView& source, TensorView& destination) noexcept;
         oid add(const TensorView& lhs, const TensorView& rhs,

@@ -464,7 +464,11 @@ inline void run_binary_request_conformance(
     if (observer) observer->case_complete();
 }
 
-// Compatibility-free operation-neutral rank boundary case.
+// Compatibility-free operation-neutral rank boundary case. Rank eight is
+// the successful boundary: a real binary submission proceeds through the
+// shared owner/view mapping. Rank nine and above are invalid input: the
+// full shape cannot be formed at all, so no tensor, allocator traffic,
+// sequence, token, or queue record can exist.
 inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
     const iom::TensorSpec spec{
             iom::TensorShape{{17, 33}}, iom::DataType::U8};
@@ -473,9 +477,9 @@ inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
     auto rhs = candidate.create_tensor(spec);
     rhs->view().copy_from_host(rhs_bytes);
     auto queue = candidate.create_ops();
-    for (const std::size_t rank : {8u, 9u, 16u, 17u}) {
-        std::vector<std::size_t> dims(rank, 1);
-        dims[rank - 2] = 17; dims[rank - 1] = 33;
+    {
+        std::vector<std::size_t> dims(8u, 1);
+        dims[6] = 17; dims[7] = 33;
         const iom::TensorSpec current{iom::TensorShape{dims}, iom::DataType::U8};
         auto l = candidate.create_tensor(current);
         auto o = candidate.create_tensor(current);
@@ -487,5 +491,89 @@ inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
         CHECK_NOTHROW(queue->wait(token));
         CHECK_NOTHROW(queue->wait(token));
     }
+    for (const std::size_t rank : {9u, 16u, 17u}) {
+        std::vector<std::size_t> dims(rank, 1);
+        dims[rank - 2] = 17; dims[rank - 1] = 33;
+        CHECK_THROWS_AS((iom::TensorShape{dims}), std::invalid_argument);
+    }
+}
+
+// Rank-eight ownership, leading transforms, row/column/leading broadcasts,
+// and rank-nine plus rank-increasing-transform rejection for the
+// accelerator boundary cases. Logical bytes are verified bit-for-bit
+// against the independent host encoder; the storage-oracle copy loop stays
+// in each driver fixture because it needs backend-native seeding.
+inline void run_accelerator_rank_boundary_conformance(iom::Device& candidate) {
+    // A rank-eight broadcast add: a size-one leading axis, a size-one row
+    // axis, and a size-one column axis all broadcast to the output extent.
+    const iom::TensorSpec lhs_spec{
+            iom::TensorShape{{1, 1, 1, 1, 1, 1, 17, 1}},
+            iom::DataType::U8};
+    const iom::TensorSpec rhs_spec{
+            iom::TensorShape{{1, 1, 1, 1, 1, 2, 1, 33}},
+            iom::DataType::U8};
+    const iom::TensorSpec out_spec{
+            iom::TensorShape{{1, 1, 1, 1, 1, 2, 17, 33}},
+            iom::DataType::U8};
+    const std::vector<std::byte> lhs_bytes = encode_logical(lhs_spec, 0x1111);
+    const std::vector<std::byte> rhs_bytes = encode_logical(rhs_spec, 0x2222);
+    auto lhs = candidate.create_tensor(lhs_spec);
+    auto rhs = candidate.create_tensor(rhs_spec);
+    auto out = candidate.create_tensor(out_spec);
+    lhs->view().copy_from_host(lhs_bytes);
+    rhs->view().copy_from_host(rhs_bytes);
+    out->view().copy_from_host(std::vector<std::byte>(
+            out_spec.logical_nbytes(), std::byte{0xAA}));
+    auto queue = candidate.create_ops();
+    const auto token = queue->add(lhs->view(), rhs->view(), out->view());
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
+    std::vector<std::byte> expected(out_spec.logical_nbytes(), std::byte{0});
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+        for (std::size_t row = 0; row < 17; ++row) {
+            for (std::size_t column = 0; column < 33; ++column) {
+                // lhs carries one plane: element (0, row, 0).
+                const auto a = static_cast<unsigned>(
+                        std::to_integer<unsigned char>(
+                                lhs_bytes[row]));
+                // rhs carries plane p: element (p, 0, column).
+                const auto b = static_cast<unsigned>(
+                        std::to_integer<unsigned char>(
+                                rhs_bytes[plane * 33 + column]));
+                expected[plane * 17 * 33 + row * 33 + column] =
+                        static_cast<std::byte>((a + b) & 0xffu);
+            }
+        }
+    }
+    require_logical_bytes(
+            out->view(), expected, "rank-eight broadcast");
+
+    // Rank nine and above are rejected at full-shape formation, before any
+    // allocator traffic or native effect can exist.
+    for (const std::size_t rank : {9u, 10u, 17u}) {
+        std::vector<std::size_t> dims(rank, 1);
+        dims[rank - 2] = 17; dims[rank - 1] = 33;
+        CHECK_THROWS_AS((iom::TensorShape{dims}), std::invalid_argument);
+    }
+
+    // A rank-increasing reshape to rank nine is rejected even though the
+    // source is contiguous and the leading plane count is unchanged, and
+    // leaves the source view and owner untouched.
+    const iom::TensorSpec planar_spec{
+            iom::TensorShape{{1, 1, 1, 1, 1, 1, 16, 16}},
+            iom::DataType::U8};
+    auto planar = candidate.create_tensor(planar_spec);
+    const iom::TensorView& source = planar->view();
+    const iom::TensorView snapshot = source;
+    CHECK_THROWS_AS(
+            (void)source.reshape_leading(span_of({1, 1, 1, 1, 1, 1, 1})),
+            std::invalid_argument);
+    CHECK(source.spec() == snapshot.spec());
+    CHECK_EQ(source.plane_offset(), snapshot.plane_offset());
+    CHECK_EQ(source.plane_strides().size(), snapshot.plane_strides().size());
+    CHECK(std::equal(
+            source.plane_strides().begin(), source.plane_strides().end(),
+            snapshot.plane_strides().begin()));
+    CHECK(source.native_handle() == snapshot.native_handle());
 }
 }  // namespace iom_conformance

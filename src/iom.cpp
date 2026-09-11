@@ -20,6 +20,10 @@ namespace iom {
 
         constexpr std::size_t kTile = TensorSpec::TILE;
         constexpr std::size_t kTileSlots = kTile * kTile;
+        // Full tensor shapes span rank two through rank eight inclusive.
+        // Implementation-private: no public rank constant or query API
+        // exists, and a leading-dimension helper span is never a full shape.
+        constexpr std::size_t kMaxTensorRank = 8;
 
         std::size_t checked_add(std::size_t lhs, std::size_t rhs, const char* what) {
             if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
@@ -45,6 +49,9 @@ namespace iom {
             : dimensions_(std::move(dimensions)) {
         if (dimensions_.size() < 2) {
             throw std::invalid_argument("tensor shape requires rank of at least two");
+        }
+        if (dimensions_.size() > kMaxTensorRank) {
+            throw std::invalid_argument("tensor shape requires rank of at most eight");
         }
         for (const std::size_t dimension : dimensions_) {
             if (dimension == 0) {
@@ -82,6 +89,14 @@ namespace iom {
         }
         if (quantization != QuantizationFormat::NONE) {
             throw std::runtime_error("grouped quantization formats are not supported");
+        }
+        if (shape.rank() < 2) {
+            throw std::invalid_argument(
+                    "tensor spec requires rank of at least two");
+        }
+        if (shape.rank() > kMaxTensorRank) {
+            throw std::invalid_argument(
+                    "tensor spec requires rank of at most eight");
         }
     }
 
@@ -389,6 +404,15 @@ namespace iom {
 
     TensorView TensorView::reshape_leading(
             std::span<const std::size_t> leading_dimensions) const {
+        // The leading span is a helper, not itself a full shape; the
+        // assembled full shape (span plus the two tiled matrix axes) must
+        // stay inside the rank-two through rank-eight interval. Rank
+        // increasing reshapes to rank nine are rejected even when the
+        // source is contiguous and the leading plane count is unchanged.
+        if (leading_dimensions.size() + 2 > kMaxTensorRank) {
+            throw std::invalid_argument(
+                    "reshape result rank exceeds the rank-eight limit");
+        }
         const std::size_t leading_rank = spec_.shape.rank() - 2;
 
         std::size_t planes = 1;
@@ -561,6 +585,9 @@ namespace iom {
             }
             if (spec.shape.rank() < 2) {
                 throw std::invalid_argument("ADD requires rank at least two");
+            }
+            if (spec.shape.rank() > kMaxTensorRank) {
+                throw std::invalid_argument("ADD requires rank at most eight");
             }
             for (const std::size_t dimension : spec.shape.dimensions()) {
                 if (dimension == 0) {
@@ -748,6 +775,11 @@ namespace iom {
                                result.begin())) {
             throw std::invalid_argument("binary output shape is incorrect");
         }
+        // The computed broadcast result is itself a full tensor shape: it
+        // must be validated before any snapshot, registration, sequence
+        // reservation, token acceptance, metadata upload, or backend
+        // dispatch exists.
+        TensorShape result_shape{result};
         BinaryViewSnapshot lhs_snapshot = snapshot_binary_view(lhs, result);
         BinaryViewSnapshot rhs_snapshot = snapshot_binary_view(rhs, result);
         BinaryViewSnapshot out_snapshot = snapshot_binary_view(out, result);
@@ -779,7 +811,7 @@ namespace iom {
         }
         return BinaryRequest{operation, std::move(lhs_snapshot),
                              std::move(rhs_snapshot), std::move(out_snapshot),
-                             TensorShape{std::move(result)}};
+                             std::move(result_shape)};
     }
 
 

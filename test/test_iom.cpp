@@ -372,7 +372,7 @@ static_assert(iom::TensorSpec::TILE == 16);
 
 }  // namespace
 
-TEST_CASE("TensorShape accepts ranks of two and above and round-trips dimensions") {
+TEST_CASE("TensorShape accepts ranks two through eight and round-trips dimensions") {
     const std::vector<std::vector<std::size_t>> cases = {
         {1, 1},
         {2, 3},
@@ -380,6 +380,8 @@ TEST_CASE("TensorShape accepts ranks of two and above and round-trips dimensions
         {2, 3, 4, 5},
         {2, 3, 4, 5, 6},
         {9, 7, 5, 3, 2, 1},
+        {2, 3, 4, 5, 6, 7, 16, 16},
+        {2, 2, 2, 2, 2, 2, 17, 33},
     };
     for (const auto& dimensions : cases) {
         CAPTURE(dimensions);
@@ -402,13 +404,24 @@ TEST_CASE("TensorShape accepts ranks of two and above and round-trips dimensions
     CHECK_NE(shape, make_shape({2, 3, 4}));
 }
 
-TEST_CASE("TensorShape rejects rank below two and zero dimensions") {
+TEST_CASE("TensorShape rejects ranks outside two through eight and zero dimensions") {
     const std::vector<std::size_t> empty;
     const std::vector<std::size_t> single{5};
     CHECK_THROWS_AS(iom::TensorShape{empty}, std::invalid_argument);
     CHECK_THROWS_AS(iom::TensorShape{single}, std::invalid_argument);
 
-    for (std::size_t rank = 2; rank <= 5; ++rank) {
+    // Rank nine and above are rejected with the same invalid_argument
+    // category; no rank-nine full shape can ever be formed.
+    for (std::size_t rank = 9; rank <= 17; ++rank) {
+        std::vector<std::size_t> dimensions(rank, 1);
+        dimensions[rank - 2] = 17;
+        dimensions[rank - 1] = 33;
+        CAPTURE(rank);
+        CHECK_THROWS_AS(
+                iom::TensorShape{dimensions}, std::invalid_argument);
+    }
+
+    for (std::size_t rank = 2; rank <= 8; ++rank) {
         for (std::size_t position = 0; position < rank; ++position) {
             std::vector<std::size_t> dimensions(rank, 1);
             dimensions[position] = 0;
@@ -1379,6 +1392,139 @@ TEST_CASE("Tensor owner validates its specification") {
     CHECK_THROWS_AS(
             (FakeTensor{make_spec({16, 16}, unknown), device}),
             std::invalid_argument);
+}
+
+TEST_CASE("Rank eight owners views and broadcasts preserve addressing and mapping") {
+    FakeDevice device;
+    FakeQueue queue(device);
+
+    // Rank-eight owner: six leading axes plus the two tiled matrix axes.
+    const FakeTensor tensor =
+            make_tensor(device, {2, 3, 4, 5, 6, 7, 17, 33});
+    const iom::TensorView& full = tensor.view();
+    CHECK_EQ(full.spec().shape.rank(), 8);
+    CHECK_EQ(
+            strides_of(full),
+            std::vector<std::size_t>({2520, 840, 210, 42, 7, 1}));
+    CHECK_EQ(full.plane_offset(), 0);
+    CHECK_EQ(full.plane_strides().size(), 6);
+
+    // slice keeps rank eight and adjusts the first leading axis.
+    const iom::TensorView sliced = full.slice(0, 1, 1);
+    CHECK_EQ(sliced.spec().shape.rank(), 8);
+    CHECK(
+            leading_of(sliced)
+            == std::vector<std::size_t>({1, 3, 4, 5, 6, 7}));
+    CHECK_EQ(sliced.plane_offset(), 2520);
+
+    // select drops exactly one leading axis and stays inside the interval.
+    const iom::TensorView selected = sliced.select(3, 2);
+    CHECK_EQ(selected.spec().shape.rank(), 7);
+    CHECK(
+            leading_of(selected)
+            == std::vector<std::size_t>({1, 3, 4, 6, 7}));
+    CHECK_EQ(selected.plane_offset(), 2520 + 2 * 42);
+
+    // permute and identity reshape keep the rank and mapping exact.
+    const iom::TensorView permuted = full.permute(span_of({2, 1, 0, 3, 4, 5}));
+    CHECK_EQ(permuted.spec().shape.rank(), 8);
+    CHECK(
+            leading_of(permuted)
+            == std::vector<std::size_t>({4, 3, 2, 5, 6, 7}));
+    CHECK(
+            strides_of(permuted)
+            == std::vector<std::size_t>({210, 840, 2520, 42, 7, 1}));
+    const iom::TensorView reshaped =
+            full.reshape_leading(span_of({2, 3, 4, 5, 6, 7}));
+    CHECK_EQ(reshaped.spec().shape.rank(), 8);
+    CHECK_EQ(strides_of(reshaped), strides_of(full));
+
+    // A rank-eight broadcast add: a size-one leading axis on rhs, a
+    // size-one row axis on rhs, and a size-one column axis on lhs all
+    // broadcast to the output extent.
+    FakeTensor lhs = make_tensor(device, {2, 1, 1, 1, 1, 1, 17, 1});
+    FakeTensor rhs = make_tensor(device, {1, 1, 1, 1, 1, 1, 1, 33});
+    FakeTensor out = make_tensor(device, {2, 1, 1, 1, 1, 1, 17, 33});
+    const iom::oid token = queue.add(lhs.view(), rhs.view(), out.view());
+    REQUIRE(iom::oid_is_token(token));
+    const FakeQueue::BinaryRecord& record = queue.add_records().back();
+    CHECK_EQ(
+            record.result_shape,
+            std::vector<std::size_t>({2, 1, 1, 1, 1, 1, 17, 33}));
+    // lhs broadcast its single column; all six leading axes match the
+    // result, so every logical plane stride stays dense.
+    CHECK_EQ(
+            record.views[0].logical_plane_strides,
+            std::vector<std::size_t>({1, 1, 1, 1, 1, 1}));
+    CHECK(record.views[0].broadcast_columns);
+    CHECK_FALSE(record.views[0].broadcast_rows);
+    CHECK(record.views[0].broadcasts);
+    // rhs broadcast its leading extent and its single row.
+    CHECK_EQ(
+            record.views[1].logical_plane_strides,
+            std::vector<std::size_t>({0, 1, 1, 1, 1, 1}));
+    CHECK(record.views[1].broadcast_rows);
+    CHECK_FALSE(record.views[1].broadcast_columns);
+    CHECK(record.views[1].broadcasts);
+    CHECK_FALSE(record.views[2].broadcasts);
+    queue.finish_add(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_NOTHROW(queue.wait(token));
+}
+
+TEST_CASE("Rank nine is rejected before allocation registration or token acceptance") {
+    FakeDevice device;
+
+    // Full-shape formation rejects the rank outright, so no owner storage,
+    // registration, sequence, or token can ever exist for it.
+    std::vector<std::size_t> rank_nine(9, 1);
+    rank_nine[7] = 17;
+    rank_nine[8] = 33;
+    CHECK_THROWS_AS(iom::TensorShape{rank_nine}, std::invalid_argument);
+    CHECK_THROWS_AS(
+            (FakeTensor{make_spec(rank_nine, iom::DataType::F32), device}),
+            std::invalid_argument);
+
+    // A rank-increasing reshape to rank nine is rejected even when the
+    // source is contiguous and the leading plane count is unchanged, and
+    // leaves the source view and owner untouched.
+    const FakeTensor planar = make_tensor(device, {1, 1, 1, 1, 1, 1, 16, 16});
+    const iom::TensorView& source = planar.view();
+    const iom::TensorView snapshot = source;
+    CHECK_THROWS_AS(
+            (void)source.reshape_leading(span_of({1, 1, 1, 1, 1, 1, 1})),
+            std::invalid_argument);
+    CHECK(source.spec() == snapshot.spec());
+    CHECK_EQ(source.plane_offset(), snapshot.plane_offset());
+    CHECK_EQ(source.plane_strides().size(), snapshot.plane_strides().size());
+    CHECK(std::equal(
+            source.plane_strides().begin(), source.plane_strides().end(),
+            snapshot.plane_strides().begin()));
+    CHECK(source.native_handle() == snapshot.native_handle());
+
+    // A rank-two contiguous source reshaped to rank nine is rejected the
+    // same way; the short helper span itself is not a full shape.
+    const FakeTensor rank_two = make_tensor(device, {16, 16});
+    const iom::TensorView rank_two_snapshot = rank_two.view();
+    CHECK_THROWS_AS(
+            (void)rank_two.view().reshape_leading(
+                    span_of({1, 1, 1, 1, 1, 1, 1})),
+            std::invalid_argument);
+    CHECK(rank_two.view().spec() == rank_two_snapshot.spec());
+    CHECK_EQ(rank_two.view().plane_offset(), rank_two_snapshot.plane_offset());
+
+    // Rejection stays std::invalid_argument (never Unsupported, Overflow,
+    // ResourceExhausted, or an accepted token): doctest fails on any other
+    // exception type, and a subsequent valid submission starts at
+    // sequence one with no consumed token or queue record.
+    FakeQueue queue(device);
+    FakeTensor lhs = make_tensor(device, {2, 3, 17, 33});
+    FakeTensor rhs = make_tensor(device, {2, 3, 17, 33});
+    FakeTensor out = make_tensor(device, {2, 3, 17, 33});
+    const iom::oid token = queue.add(lhs.view(), rhs.view(), out.view());
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_EQ(token_sequence(token), 1);
+    CHECK_EQ(queue.add_records().size(), std::size_t{1});
 }
 
 TEST_CASE("TensorView accessors report owner and view state") {

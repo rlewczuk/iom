@@ -79,6 +79,15 @@ namespace iom {
         TTNN,
     };
 
+    /**
+     * Full tensor shape. Every materialized tensor, owner view, transformed
+     * view result, and computed binary result shape carries a full rank
+     * between two and eight inclusive; ranks below two and above eight are
+     * rejected with std::invalid_argument at construction. The final two
+     * dimensions are the tiled matrix axes; leading-dimension spans passed
+     * to TensorView transforms are helper spans, never full shapes
+     * themselves.
+     */
     class TensorShape {
     public:
         explicit TensorShape(std::vector<std::size_t> dimensions);
@@ -94,6 +103,12 @@ namespace iom {
         std::vector<std::size_t> dimensions_;
     };
 
+    /**
+     * Full tensor specification: a full TensorShape of rank two through
+     * eight, a leaf data type, and an optional quantization format.
+     * validate() enforces the full-rank interval together with the leaf
+     * type and quantization before any storage or metadata exists.
+     */
     struct TensorSpec {
         static constexpr std::size_t TILE = 16;
 
@@ -142,9 +157,13 @@ namespace iom {
      * a plane offset and plane strides count whole logical planes, never bytes
      * or elements. The final two dimensions are a logical matrix represented
      * by 16x16 tiles (native backends may use a different internal tile).
-     * Leading transforms preserve independent offsets and strides. Views are
-     * copyable but non-assignable; operations snapshot metadata and never
-     * retain the view object or expose broadcast zero strides.
+     * Leading transforms preserve independent offsets and strides. Every
+     * transformed view result is a full shape within rank two through
+     * eight; the leading-dimension spans reshape_leading and permute take
+     * are helper spans, not themselves full shapes, and are bounded only
+     * through the assembled result. Views are copyable but non-assignable;
+     * operations snapshot metadata and never retain the view object or
+     * expose broadcast zero strides.
      */
     class TensorView {
     public:
@@ -197,9 +216,11 @@ namespace iom {
 
     /**
      * Materialized tensor owner created through a Device. Holds one stable
-     * full-storage view. Non-copyable and non-movable so the owner and
-     * full-view addresses stay valid for asynchronous operations; the
-     * creating Device must outlive the tensor.
+     * full-storage view whose full shape has rank two through eight;
+     * construction validates the complete specification before any storage
+     * is allocated or registered. Non-copyable and non-movable so the
+     * owner and full-view addresses stay valid for asynchronous
+     * operations; the creating Device must outlive the tensor.
      */
     class Tensor {
     public:

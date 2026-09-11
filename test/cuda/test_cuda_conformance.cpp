@@ -718,15 +718,15 @@ TEST_CASE("CUDA operands destroyed after queue teardown remain quarantined") {
     CHECK_EQ(allocator.free_count(), 2);
 }
 
-TEST_CASE("CUDA conformance: inline and pooled metadata rank boundaries") {
+TEST_CASE("CUDA conformance: rank boundary covers rank-eight owners and rejects rank nine") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     iom_conformance::TrafficGate gate;
     CudaAllocator allocator(gate);
     auto device = iom::make_cuda_device(0, allocator);
     CudaStorageOracle oracle;
     const std::vector<std::vector<std::size_t>> shapes = {
-            {2, 2, 2, 2, 2, 2, 2, 2, 16, 16},
-            {2, 2, 2, 2, 2, 2, 2, 2, 2, 17, 33}};
+            {2, 2, 2, 2, 2, 2, 16, 16},
+            {2, 2, 2, 2, 2, 2, 17, 33}};
 
     for (const auto& dimensions : shapes) {
         const iom::TensorSpec spec{
@@ -749,5 +749,10 @@ TEST_CASE("CUDA conformance: inline and pooled metadata rank boundaries") {
         oracle.set_owner_spec(spec);
         CHECK_EQ(oracle.observe(destination->view()), expected);
     }
+
+    // Rank-eight owner, leading transform, and broadcast correctness plus
+    // rank-nine and rank-increasing-transform rejection, all through the
+    // real device allocator and native queue.
+    iom_conformance::run_accelerator_rank_boundary_conformance(*device);
     CHECK_FALSE(gate.armed());
 }
