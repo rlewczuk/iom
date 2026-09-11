@@ -5,7 +5,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -142,6 +144,54 @@ private:
     ContextProbe* saved_probe_;
     SyclAllocator* saved_allocator_;
 };
+
+namespace {
+
+struct AllocationProbe {
+    std::mutex mutex;
+    std::vector<iom::sycl_detail::AllocationRecord> records;
+};
+
+AllocationProbe* active_allocation_probe = nullptr;
+
+// SYCL queue metadata and binary-fallback allocations happen on the worker
+// thread while staging transfers run on the caller, so the probe guards its
+// records; the seam itself adds no synchronization.
+void capture_allocation(const iom::sycl_detail::AllocationRecord& record) {
+    if (active_allocation_probe != nullptr) {
+        std::lock_guard<std::mutex> lock(active_allocation_probe->mutex);
+        active_allocation_probe->records.push_back(record);
+    }
+}
+
+void* failing_device_alloc(
+        std::size_t, const sycl::device&, const sycl::context&) {
+    return nullptr;
+}
+
+class AllocationCallsRestore final {
+public:
+    AllocationCallsRestore()
+            : saved_calls_(iom::sycl_detail::allocation_calls),
+              saved_observer_(iom::sycl_detail::allocation_observer),
+              saved_probe_(active_allocation_probe) {}
+
+    AllocationCallsRestore(const AllocationCallsRestore&) = delete;
+    AllocationCallsRestore& operator=(const AllocationCallsRestore&) = delete;
+
+    ~AllocationCallsRestore() {
+        iom::sycl_detail::allocation_calls = saved_calls_;
+        iom::sycl_detail::allocation_observer = saved_observer_;
+        active_allocation_probe = saved_probe_;
+    }
+
+private:
+    iom::sycl_detail::AllocationCalls saved_calls_;
+    iom::sycl_detail::AllocationObserver saved_observer_;
+    AllocationProbe* saved_probe_;
+};
+
+}  // namespace
 
 std::size_t eligible_device_count_from_runtime() {
     const auto devices = sycl::device::get_devices();
@@ -336,4 +386,162 @@ TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
     std::vector<std::byte> identical_readback(identical_data.size());
     identical->view().copy_to_host(identical_readback);
     CHECK(identical_readback == identical_data);
+}
+
+TEST_CASE(
+        "SYCL native allocation seam observes metadata, staging, and "
+        "binary-fallback boundaries without caller tensor traffic") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+
+    ContextCallsRestore context_restore;
+    SyclAllocator allocator;
+    active_allocator = &allocator;
+    iom::sycl_detail::context_calls.context_ready = &capture_context;
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+
+    const iom::TensorSpec staging_spec{
+            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
+    // Two leading planes: the binary fallback stages this tensor through
+    // three temporary device-USM buffers (one per operand), each exactly
+    // one padded plane pair (2 x 1 KiB for F32).
+    const iom::TensorSpec binary_spec{
+            iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
+    {
+        auto device = iom::make_sycl_device(0, allocator);
+        REQUIRE(device != nullptr);
+        auto staging_source = device->create_tensor(staging_spec);
+        auto staging_destination = device->create_tensor(staging_spec);
+        auto lhs = device->create_tensor(binary_spec);
+        auto rhs = device->create_tensor(binary_spec);
+        auto out = device->create_tensor(binary_spec);
+        auto queue = device->create_ops();
+        REQUIRE(queue != nullptr);
+
+        // Caller-Allocator tensor traffic (malloc_shared USM) plus
+        // factory, tensor, and queue setup never route through the seam:
+        // the IOM-native record starts empty.
+        CHECK(probe.records.empty());
+
+        std::vector<std::byte> input(
+                staging_spec.logical_nbytes(), std::byte{0x3c});
+        staging_source->view().copy_from_host(input);
+        const iom::oid copy_token = queue->copy(
+                staging_source->view(), staging_destination->view());
+        REQUIRE(iom::oid_is_token(copy_token));
+        queue->wait(copy_token);
+
+        const iom::oid binary_token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(binary_token));
+        queue->wait(binary_token);
+    }  // queue and device teardown free the pooled metadata and staging
+
+    std::size_t metadata_allocations = 0;
+    std::size_t staging_allocations = 0;
+    std::size_t staging_2048 = 0;
+    std::size_t failed = 0;
+    std::map<void*, std::size_t> outstanding;
+    for (const auto& record : probe.records) {
+        CHECK(record.phase
+              == iom::sycl_detail::AllocationPhase::post_publication);
+        CHECK_FALSE(
+                record.classification
+                == iom::sycl_detail::AllocationClass::data_backing);
+        CHECK_FALSE(
+                record.classification
+                == iom::sycl_detail::AllocationClass::metadata_backing);
+        if (record.kind == iom::sycl_detail::AllocationKind::allocate) {
+            if (!record.succeeded) {
+                ++failed;
+                continue;
+            }
+            CHECK(record.address != nullptr);
+            if (record.classification
+                == iom::sycl_detail::AllocationClass::staging) {
+                ++staging_allocations;
+                if (record.bytes == 2048) {
+                    ++staging_2048;
+                }
+            }
+            if (record.classification
+                == iom::sycl_detail::AllocationClass::operation_metadata) {
+                ++metadata_allocations;
+            }
+            outstanding[record.address] = record.bytes;
+        } else {
+            CHECK(record.succeeded);
+            // A free must pair with an earlier allocation: transient churn
+            // stays visible instead of vanishing into a net-byte counter.
+            CHECK(outstanding.erase(record.address) == 1);
+        }
+    }
+    CHECK_EQ(failed, 0u);
+    CHECK_GE(metadata_allocations, 1u);  // queue copy metadata slot
+    CHECK_GE(staging_allocations, 4u);   // staging pool + binary fallback
+    CHECK_EQ(staging_2048, 3u);          // the three binary temporary buffers
+    CHECK(outstanding.empty());          // every allocation freed by teardown
+}
+
+TEST_CASE(
+        "SYCL native allocation seam retains failed attempts and cleanup "
+        "frees") {
+    REQUIRE(eligible_device_count_from_runtime() > 0);
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
+
+    const sycl::device device = first_accelerator_device();
+    const sycl::context context(device);
+    iom::sycl_detail::StagingSlotPool pool(context, device);
+
+    // A failed native allocation stays observable even though no pointer is
+    // returned; the pool surfaces the null result as bad_alloc.
+    iom::sycl_detail::allocation_calls.device_alloc = &failing_device_alloc;
+    CHECK_THROWS_AS((void)pool.acquire(4096), std::bad_alloc);
+    iom::sycl_detail::allocation_calls =
+            iom::sycl_detail::AllocationCalls{};
+
+    {
+        auto lease = pool.acquire(4096);
+        REQUIRE(lease.staging() != nullptr);
+        REQUIRE(lease.host_mirror() != nullptr);
+        // Poisoning releases the slot immediately: the cleanup free of the
+        // successful allocation is recorded as a paired staging free.
+        lease.poison();
+    }
+    pool.destroy();
+
+    std::size_t failed_attempts = 0;
+    std::size_t successful_allocations = 0;
+    std::size_t cleanup_frees = 0;
+    std::map<void*, std::size_t> outstanding;
+    for (const auto& record : probe.records) {
+        CHECK(record.classification
+              == iom::sycl_detail::AllocationClass::staging);
+        CHECK(record.phase
+              == iom::sycl_detail::AllocationPhase::post_publication);
+        if (record.kind == iom::sycl_detail::AllocationKind::allocate) {
+            if (!record.succeeded) {
+                ++failed_attempts;
+                CHECK(record.address == nullptr);
+                continue;
+            }
+            ++successful_allocations;
+            outstanding[record.address] = record.bytes;
+        } else {
+            CHECK(record.succeeded);
+            CHECK(outstanding.erase(record.address) == 1);
+            ++cleanup_frees;
+        }
+    }
+    CHECK_EQ(failed_attempts, 1u);
+    CHECK_EQ(successful_allocations, 1u);
+    CHECK_EQ(cleanup_frees, 1u);
+    CHECK(outstanding.empty());
 }

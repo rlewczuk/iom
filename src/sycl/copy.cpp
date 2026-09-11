@@ -116,8 +116,10 @@ public:
             capacity *= 2;
         }
 
-        void* replacement_device =
-                sycl::malloc_device(capacity, queue_.get_device(), context_);
+        void* replacement_device = alloc_attempt_device(
+                capacity, queue_.get_device(), context_,
+                AllocationClass::operation_metadata,
+                AllocationPhase::post_publication);
         if (replacement_device == nullptr) {
             throw std::bad_alloc();
         }
@@ -128,10 +130,12 @@ public:
                 throw std::bad_alloc();
             }
         } catch (...) {
-            try {
-                sycl::free(replacement_device, context_);
-            } catch (...) {
-            }
+            // Rollback free of the successful device allocation stays
+            // observable as an operation-metadata free.
+            free_attempt_device(
+                    replacement_device, context_,
+                    AllocationClass::operation_metadata,
+                    AllocationPhase::post_publication);
             throw;
         }
 
@@ -140,7 +144,7 @@ public:
         slot.device = replacement_device;
         slot.host = replacement_host;
         slot.capacity = capacity;
-        free_pointer_noexcept(old_device);
+        free_device_pointer_noexcept(old_device);
         free_pointer_noexcept(old_host);
     }
 
@@ -160,6 +164,15 @@ private:
         bool in_use = false;
     };
 
+    void free_device_pointer_noexcept(void* pointer) noexcept {
+        if (pointer == nullptr) {
+            return;
+        }
+        free_attempt_device(
+                pointer, context_, AllocationClass::operation_metadata,
+                AllocationPhase::post_publication);
+    }
+
     void free_pointer_noexcept(void* pointer) noexcept {
         if (pointer == nullptr) {
             return;
@@ -171,7 +184,7 @@ private:
     }
 
     void free_slot_noexcept(Slot& slot) noexcept {
-        free_pointer_noexcept(slot.device);
+        free_device_pointer_noexcept(slot.device);
         free_pointer_noexcept(slot.host);
         slot = Slot{};
     }
@@ -646,6 +659,19 @@ private:
         }
     }
 
+    // Device-USM variant: routed through the native-boundary seam so the
+    // temporary buffer's free stays paired with its allocation even on the
+    // noexcept rollback path.
+    static void free_binary_device_staging(
+            void* staging, const sycl::context& context) noexcept {
+        if (staging == nullptr) {
+            return;
+        }
+        free_attempt_device(
+                staging, context, AllocationClass::staging,
+                AllocationPhase::post_publication);
+    }
+
     void execute(Task& task) {
         if (task.binary_request.has_value()) {
             if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
@@ -695,12 +721,22 @@ private:
                 lhs_stage = sycl::malloc_host(lhs_bytes, context);
                 rhs_stage = sycl::malloc_host(rhs_bytes, context);
                 out_stage = sycl::malloc_host(out_bytes, context);
-                lhs_device = sycl::malloc_device(
-                        lhs_bytes, queue_.get_device(), context);
-                rhs_device = sycl::malloc_device(
-                        rhs_bytes, queue_.get_device(), context);
-                out_device = sycl::malloc_device(
-                        out_bytes, queue_.get_device(), context);
+                // The three temporary device-USM buffers are the current
+                // binary-fallback staging set; each is recorded at the
+                // native boundary and paired with its rollback or success
+                // free below.
+                lhs_device = alloc_attempt_device(
+                        lhs_bytes, queue_.get_device(), context,
+                        AllocationClass::staging,
+                        AllocationPhase::post_publication);
+                rhs_device = alloc_attempt_device(
+                        rhs_bytes, queue_.get_device(), context,
+                        AllocationClass::staging,
+                        AllocationPhase::post_publication);
+                out_device = alloc_attempt_device(
+                        out_bytes, queue_.get_device(), context,
+                        AllocationClass::staging,
+                        AllocationPhase::post_publication);
                 if (lhs_stage == nullptr || rhs_stage == nullptr
                         || out_stage == nullptr || lhs_device == nullptr
                         || rhs_device == nullptr || out_device == nullptr) {
@@ -773,9 +809,9 @@ private:
                 free_binary_staging(lhs_stage, context);
                 free_binary_staging(rhs_stage, context);
                 free_binary_staging(out_stage, context);
-                free_binary_staging(lhs_device, context);
-                free_binary_staging(rhs_device, context);
-                free_binary_staging(out_device, context);
+                free_binary_device_staging(lhs_device, context);
+                free_binary_device_staging(rhs_device, context);
+                free_binary_device_staging(out_device, context);
                 if (!submitted) {
                     {
                         std::lock_guard<std::mutex> lock(outcome_mutex_);
@@ -794,9 +830,9 @@ private:
             free_binary_staging(lhs_stage, context);
             free_binary_staging(rhs_stage, context);
             free_binary_staging(out_stage, context);
-            free_binary_staging(lhs_device, context);
-            free_binary_staging(rhs_device, context);
-            free_binary_staging(out_device, context);
+            free_binary_device_staging(lhs_device, context);
+            free_binary_device_staging(rhs_device, context);
+            free_binary_device_staging(out_device, context);
             return;
         }
         if (task.no_op) {

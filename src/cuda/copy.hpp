@@ -142,7 +142,13 @@ struct gpu_policy {
 
     [[nodiscard]] static void* allocate(std::size_t bytes) {
         device_pointer address = 0;
-        check_cuda("cuMemAlloc", cuMemAlloc(&address, bytes));
+        // Device-side copy metadata slots: operation metadata backing.
+        check_cuda(
+                "cuMemAlloc",
+                allocation_attempt(
+                        &address, bytes,
+                        AllocationClass::operation_metadata,
+                        AllocationPhase::post_publication));
         return reinterpret_cast<void*>(address);
     }
 
@@ -153,20 +159,29 @@ struct gpu_policy {
 
     static void free_noexcept(void* address) noexcept {
         if (address != nullptr) {
-            (void)cuMemFree(reinterpret_cast<device_pointer>(address));
+            (void)free_attempt(
+                    reinterpret_cast<device_pointer>(address),
+                    AllocationClass::operation_metadata,
+                    AllocationPhase::post_publication);
         }
     }
 
     [[nodiscard]] static device_pointer staging_allocate(
             std::size_t bytes) {
         device_pointer address = 0;
-        check_cuda("cuMemAlloc", cuMemAlloc(&address, bytes));
+        check_cuda(
+                "cuMemAlloc",
+                allocation_attempt(
+                        &address, bytes, AllocationClass::staging,
+                        AllocationPhase::post_publication));
         return address;
     }
 
     static void staging_free_noexcept(device_pointer address) noexcept {
         if (address != device_pointer{}) {
-            (void)cuMemFree(address);
+            (void)free_attempt(
+                    address, AllocationClass::staging,
+                    AllocationPhase::post_publication);
         }
     }
 

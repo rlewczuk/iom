@@ -6,6 +6,7 @@
 #include <atomic>
 #include <barrier>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <new>
@@ -43,6 +44,48 @@ public:
     std::size_t allocations = 0;
     std::size_t frees = 0;
     std::size_t resets = 0;
+};
+
+}  // namespace
+
+namespace {
+
+struct AllocationProbe {
+    std::vector<iom::rocm_detail::AllocationRecord> records;
+};
+
+AllocationProbe* active_allocation_probe = nullptr;
+
+void capture_allocation(const iom::rocm_detail::AllocationRecord& record) {
+    if (active_allocation_probe != nullptr) {
+        active_allocation_probe->records.push_back(record);
+    }
+}
+
+hipError_t failing_mem_alloc(void**, std::size_t) {
+    return hipErrorOutOfMemory;
+}
+
+class AllocationCallsRestore final {
+public:
+    AllocationCallsRestore()
+            : saved_calls_(iom::rocm_detail::allocation_calls),
+              saved_observer_(iom::rocm_detail::allocation_observer),
+              saved_probe_(active_allocation_probe) {}
+
+    AllocationCallsRestore(const AllocationCallsRestore&) = delete;
+    AllocationCallsRestore& operator=(const AllocationCallsRestore&) = delete;
+
+    ~AllocationCallsRestore() {
+        iom::rocm_detail::allocation_calls = saved_calls_;
+        iom::rocm_detail::allocation_observer = saved_observer_;
+        active_allocation_probe = saved_probe_;
+    }
+
+private:
+    iom::rocm_detail::AllocationCalls saved_calls_;
+    iom::rocm_detail::AllocationObserver saved_observer_;
+    AllocationProbe* saved_probe_;
 };
 
 }  // namespace
@@ -461,4 +504,154 @@ TEST_CASE("ROCm rejected create_tensor leaves the current device unchanged") {
     REQUIRE(hipGetDevice(&current_after) == hipSuccess);
     CHECK(current_after == current_before);
     CHECK(allocator.allocations == 0);
+}
+
+TEST_CASE(
+        "ROCm native allocation seam observes hidden staging and metadata "
+        "boundaries without caller tensor traffic") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::rocm_detail::allocation_observer.complete = &capture_allocation;
+
+    UnusedAllocator allocator;
+    const iom::TensorSpec staging_spec{
+            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
+    // The queue binary path always backs its metadata in a device-side
+    // operation-metadata slot (grown lazily from 256 bytes), so a plain
+    // rank-four tensor reliably forces the hidden native allocation.
+    const iom::TensorSpec binary_spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+    {
+        auto device = iom::make_rocm_device(0, allocator);
+        REQUIRE(device != nullptr);
+        auto staging_tensor = device->create_tensor(staging_spec);
+        auto lhs = device->create_tensor(binary_spec);
+        auto rhs = device->create_tensor(binary_spec);
+        auto out = device->create_tensor(binary_spec);
+        auto queue = device->create_ops();
+        REQUIRE(queue != nullptr);
+
+        // Caller-Allocator tensor traffic (direct hipMalloc through the
+        // allocator) plus factory, tensor, and queue setup never route
+        // through the seam: the IOM-native record starts empty.
+        CHECK(probe.records.empty());
+
+        std::vector<std::byte> input(
+                staging_spec.logical_nbytes(), std::byte{0x5a});
+        staging_tensor->view().copy_from_host(input);
+
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        queue->wait(token);
+    }  // queue and device teardown free the pooled metadata and staging
+
+    std::size_t staging_allocations = 0;
+    std::size_t metadata_allocations = 0;
+    std::size_t failed = 0;
+    std::map<void*, std::size_t> outstanding;
+    for (const auto& record : probe.records) {
+        CHECK(record.phase
+              == iom::rocm_detail::AllocationPhase::post_publication);
+        CHECK_FALSE(
+                record.classification
+                == iom::rocm_detail::AllocationClass::data_backing);
+        CHECK_FALSE(
+                record.classification
+                == iom::rocm_detail::AllocationClass::metadata_backing);
+        if (record.kind == iom::rocm_detail::AllocationKind::allocate) {
+            if (!record.succeeded) {
+                ++failed;
+                continue;
+            }
+            CHECK(record.address != nullptr);
+            if (record.classification
+                == iom::rocm_detail::AllocationClass::staging) {
+                ++staging_allocations;
+            }
+            if (record.classification
+                == iom::rocm_detail::AllocationClass::operation_metadata) {
+                ++metadata_allocations;
+            }
+            outstanding[record.address] = record.bytes;
+        } else {
+            CHECK(record.succeeded);
+            // A free must pair with an earlier allocation: transient churn
+            // stays visible instead of vanishing into a net-byte counter.
+            CHECK(outstanding.erase(record.address) == 1);
+        }
+    }
+    CHECK_EQ(failed, 0u);
+    CHECK_GE(staging_allocations, 1u);   // host-transfer staging boundary
+    CHECK_GE(metadata_allocations, 1u);  // hidden lazy metadata boundary
+    CHECK(outstanding.empty());          // every allocation freed by teardown
+}
+
+TEST_CASE(
+        "ROCm native allocation seam retains failed attempts and cleanup "
+        "frees") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count > 0);
+
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::rocm_detail::allocation_observer.complete = &capture_allocation;
+
+    UnusedAllocator allocator;
+    auto device = iom::make_rocm_device(0, allocator);
+    REQUIRE(device != nullptr);
+
+    iom::rocm_detail::StagingSlotPool pool;
+
+    // A failed native allocation stays observable even though no pointer is
+    // returned; check_hip turns the injected boundary error into the
+    // runtime failure the pool propagates.
+    iom::rocm_detail::allocation_calls.mem_alloc = &failing_mem_alloc;
+    CHECK_THROWS_AS((void)pool.acquire(4096), std::runtime_error);
+    iom::rocm_detail::allocation_calls =
+            iom::rocm_detail::AllocationCalls{};
+
+    {
+        auto lease = pool.acquire(4096);
+        REQUIRE(lease.staging() != nullptr);
+        // Poisoning releases the slot immediately: the cleanup free of the
+        // successful allocation is recorded as a paired staging free.
+        lease.poison();
+    }
+    pool.destroy();
+
+    std::size_t failed_attempts = 0;
+    std::size_t successful_allocations = 0;
+    std::size_t cleanup_frees = 0;
+    std::map<void*, std::size_t> outstanding;
+    for (const auto& record : probe.records) {
+        CHECK(record.classification
+              == iom::rocm_detail::AllocationClass::staging);
+        CHECK(record.phase
+              == iom::rocm_detail::AllocationPhase::post_publication);
+        if (record.kind == iom::rocm_detail::AllocationKind::allocate) {
+            if (!record.succeeded) {
+                ++failed_attempts;
+                CHECK(record.address == nullptr);
+                continue;
+            }
+            ++successful_allocations;
+            outstanding[record.address] = record.bytes;
+        } else {
+            CHECK(record.succeeded);
+            CHECK(outstanding.erase(record.address) == 1);
+            ++cleanup_frees;
+        }
+    }
+    CHECK_EQ(failed_attempts, 1u);
+    CHECK_EQ(successful_allocations, 1u);
+    CHECK_EQ(cleanup_frees, 1u);
+    CHECK(outstanding.empty());
 }

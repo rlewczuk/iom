@@ -196,6 +196,8 @@ if(ROCM_ENABLED)
         src/rocm/device.cpp
         src/rocm/copy.hip
         src/rocm/copy.hpp
+        src/rocm/driver.cpp
+        src/rocm/driver.hpp
         src/shared/metadata_slot_pool.hpp
         src/shared/event_ring.hpp
         src/shared/gpu_queue.hpp

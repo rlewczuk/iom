@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <map>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -141,6 +142,48 @@ public:
 private:
     iom::cuda_detail::DriverCalls saved_;
     DriverCallProbe* saved_probe_;
+};
+
+}  // namespace
+
+namespace {
+
+struct AllocationProbe {
+    std::vector<iom::cuda_detail::AllocationRecord> records;
+};
+
+AllocationProbe* active_allocation_probe = nullptr;
+
+void capture_allocation(const iom::cuda_detail::AllocationRecord& record) {
+    if (active_allocation_probe != nullptr) {
+        active_allocation_probe->records.push_back(record);
+    }
+}
+
+CUresult failing_mem_alloc(CUdeviceptr*, std::size_t) {
+    return CUDA_ERROR_OUT_OF_MEMORY;
+}
+
+class AllocationCallsRestore final {
+public:
+    AllocationCallsRestore()
+            : saved_calls_(iom::cuda_detail::allocation_calls),
+              saved_observer_(iom::cuda_detail::allocation_observer),
+              saved_probe_(active_allocation_probe) {}
+
+    AllocationCallsRestore(const AllocationCallsRestore&) = delete;
+    AllocationCallsRestore& operator=(const AllocationCallsRestore&) = delete;
+
+    ~AllocationCallsRestore() {
+        iom::cuda_detail::allocation_calls = saved_calls_;
+        iom::cuda_detail::allocation_observer = saved_observer_;
+        active_allocation_probe = saved_probe_;
+    }
+
+private:
+    iom::cuda_detail::AllocationCalls saved_calls_;
+    iom::cuda_detail::AllocationObserver saved_observer_;
+    AllocationProbe* saved_probe_;
 };
 
 }  // namespace
@@ -904,4 +947,148 @@ TEST_CASE("CUDA create_tensor validates the spec before any context activation")
     CHECK(probe.ctx_set_current_count == activation_count + 1);
     CHECK(allocator.allocations == 1);
     CHECK(allocator.frees == 0);
+}
+
+TEST_CASE(
+        "CUDA native allocation seam observes hidden staging and metadata "
+        "boundaries without caller tensor traffic") {
+    require_cuda_hardware();
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
+    CudaAllocator allocator;
+    const iom::TensorSpec staging_spec{
+            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
+    // The queue binary path always backs its metadata in a device-side
+    // operation-metadata slot (grown lazily from 256 bytes), so a plain
+    // rank-four tensor reliably forces the hidden native allocation.
+    const iom::TensorSpec binary_spec{
+            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
+    {
+        auto device = iom::make_cuda_device(0, allocator);
+        REQUIRE(device != nullptr);
+        auto staging_tensor = device->create_tensor(staging_spec);
+        auto lhs = device->create_tensor(binary_spec);
+        auto rhs = device->create_tensor(binary_spec);
+        auto out = device->create_tensor(binary_spec);
+        auto queue = device->create_ops();
+        REQUIRE(queue != nullptr);
+
+        // Caller-Allocator tensor traffic (cudaMalloc runtime API) plus
+        // factory, tensor, and queue setup never route through the seam:
+        // the IOM-native record starts empty.
+        CHECK(probe.records.empty());
+
+        std::vector<std::byte> input(
+                staging_spec.logical_nbytes(), std::byte{0x5a});
+        staging_tensor->view().copy_from_host(input);
+
+        const iom::oid token =
+                queue->add(lhs->view(), rhs->view(), out->view());
+        REQUIRE(iom::oid_is_token(token));
+        queue->wait(token);
+    }  // queue and device teardown free the pooled metadata and staging
+
+    std::size_t staging_allocations = 0;
+    std::size_t metadata_allocations = 0;
+    std::size_t failed = 0;
+    std::map<void*, std::size_t> outstanding;
+    for (const auto& record : probe.records) {
+        CHECK(record.phase
+              == iom::cuda_detail::AllocationPhase::post_publication);
+        CHECK_FALSE(
+                record.classification
+                == iom::cuda_detail::AllocationClass::data_backing);
+        CHECK_FALSE(
+                record.classification
+                == iom::cuda_detail::AllocationClass::metadata_backing);
+        if (record.kind == iom::cuda_detail::AllocationKind::allocate) {
+            if (!record.succeeded) {
+                ++failed;
+                continue;
+            }
+            CHECK(record.address != nullptr);
+            if (record.classification
+                == iom::cuda_detail::AllocationClass::staging) {
+                ++staging_allocations;
+            }
+            if (record.classification
+                == iom::cuda_detail::AllocationClass::operation_metadata) {
+                ++metadata_allocations;
+            }
+            outstanding[record.address] = record.bytes;
+        } else {
+            CHECK(record.succeeded);
+            // A free must pair with an earlier allocation: transient churn
+            // stays visible instead of vanishing into a net-byte counter.
+            CHECK(outstanding.erase(record.address) == 1);
+        }
+    }
+    CHECK_EQ(failed, 0u);
+    CHECK_GE(staging_allocations, 1u);   // host-transfer staging boundary
+    CHECK_GE(metadata_allocations, 1u);  // hidden lazy metadata boundary
+    CHECK(outstanding.empty());          // every allocation freed by teardown
+}
+
+TEST_CASE(
+        "CUDA native allocation seam retains failed attempts and cleanup "
+        "frees") {
+    require_cuda_hardware();
+    AllocationCallsRestore restore;
+    AllocationProbe probe;
+    active_allocation_probe = &probe;
+    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
+
+    UnusedAllocator allocator;
+    auto device = iom::make_cuda_device(0, allocator);
+    REQUIRE(device != nullptr);
+
+    iom::cuda_detail::StagingSlotPool pool;
+
+    // A failed native allocation stays observable even though no pointer is
+    // returned; check_cuda turns the injected boundary error into the
+    // runtime failure the pool propagates.
+    iom::cuda_detail::allocation_calls.mem_alloc = &failing_mem_alloc;
+    CHECK_THROWS_AS((void)pool.acquire(4096), std::runtime_error);
+    iom::cuda_detail::allocation_calls =
+            iom::cuda_detail::AllocationCalls{};
+
+    {
+        auto lease = pool.acquire(4096);
+        REQUIRE(lease.staging() != 0);
+        // Poisoning releases the slot immediately: the cleanup free of the
+        // successful allocation is recorded as a paired staging free.
+        lease.poison();
+    }
+    pool.destroy();
+
+    std::size_t failed_attempts = 0;
+    std::size_t successful_allocations = 0;
+    std::size_t cleanup_frees = 0;
+    std::map<void*, std::size_t> outstanding;
+    for (const auto& record : probe.records) {
+        CHECK(record.classification
+              == iom::cuda_detail::AllocationClass::staging);
+        CHECK(record.phase
+              == iom::cuda_detail::AllocationPhase::post_publication);
+        if (record.kind == iom::cuda_detail::AllocationKind::allocate) {
+            if (!record.succeeded) {
+                ++failed_attempts;
+                CHECK(record.address == nullptr);
+                continue;
+            }
+            ++successful_allocations;
+            outstanding[record.address] = record.bytes;
+        } else {
+            CHECK(record.succeeded);
+            CHECK(outstanding.erase(record.address) == 1);
+            ++cleanup_frees;
+        }
+    }
+    CHECK_EQ(failed_attempts, 1u);
+    CHECK_EQ(successful_allocations, 1u);
+    CHECK_EQ(cleanup_frees, 1u);
+    CHECK(outstanding.empty());
 }

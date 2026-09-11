@@ -3,6 +3,8 @@
 #include <new>
 #include <stdexcept>
 
+#include "runtime.hpp"
+
 namespace iom::sycl_detail {
 
 StagingSlotPool::Lease::~Lease() noexcept {
@@ -28,7 +30,9 @@ StagingSlotPool::Slot StagingSlotPool::allocate_locked(std::size_t bytes) {
     (void)fail_next_allocation_;
 #endif
 
-    void* device_staging = sycl::malloc_device(bytes, device_, context_);
+    void* device_staging = alloc_attempt_device(
+            bytes, device_, context_, AllocationClass::staging,
+            AllocationPhase::post_publication);
     if (device_staging == nullptr) {
         throw std::bad_alloc();
     }
@@ -39,10 +43,11 @@ StagingSlotPool::Slot StagingSlotPool::allocate_locked(std::size_t bytes) {
             throw std::bad_alloc();
         }
     } catch (...) {
-        try {
-            sycl::free(device_staging, context_);
-        } catch (...) {
-        }
+        // Rollback of the successful device allocation stays observable as
+        // a staging free paired with the failed attempt's completion.
+        free_attempt_device(
+                device_staging, context_, AllocationClass::staging,
+                AllocationPhase::post_publication);
         throw;
     }
     return Slot{device_staging, host_mirror, bytes, true};
@@ -62,10 +67,9 @@ std::size_t StagingSlotPool::grown_capacity(
 
 void StagingSlotPool::free_slot_noexcept(Slot& slot) noexcept {
     if (slot.device_staging != nullptr) {
-        try {
-            sycl::free(slot.device_staging, context_);
-        } catch (...) {
-        }
+        free_attempt_device(
+                slot.device_staging, context_, AllocationClass::staging,
+                AllocationPhase::post_publication);
         slot.device_staging = nullptr;
     }
     if (slot.host_mirror != nullptr) {
