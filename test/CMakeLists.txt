@@ -153,6 +153,7 @@ function(add_iom_backend_tests name)
         PRIVATE
             doctest::doctest
             ${arg_BACKEND_LIBRARY}
+            libiom
     )
     target_link_libraries(iom_${name}_conformance_tests
         PRIVATE

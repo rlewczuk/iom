@@ -12,6 +12,7 @@
 // the storage-and-copy scenarios referenced by the suite dispatcher.
 
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_memory.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -640,6 +641,7 @@ inline void run_backend_conformance(
     run_lifetime_conformance(devices.candidate, supported_types, observer);
     run_binary_request_conformance(devices, observer);
     run_binary_rank_boundary_conformance(devices.candidate);
+    run_memory_contract_conformance(devices);
     run_compute_capability_conformance(
             devices.candidate, supported_types, observer, {}, binary_supported);
 }

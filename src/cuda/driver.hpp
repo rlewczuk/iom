@@ -21,7 +21,7 @@ struct DriverCalls {
 extern DriverCalls driver_calls;
 
 // ---------------------------------------------------------------------------
-// Planned backend-local native-allocation seam. IOM call sites that know the
+// Backend-local native-allocation seam. IOM call sites that know the
 // purpose of a device allocation route their cuMemAlloc/cuMemFree boundary
 // through the wrappers below. In production builds the wrappers degrade to
 // the direct driver call and emit nothing; testing builds (IOM_ENABLE_TESTING)
@@ -29,7 +29,7 @@ extern DriverCalls driver_calls;
 // operation class, lifecycle phase, and free/allocation kind, and may replace
 // the underlying driver calls to inject boundary failure. Classification is
 // always routed at the call site and never inferred from pointers or byte
-// totals. Future factory arena reservations classify their setup calls as
+// totals. Factory arena reservations classify their setup calls as
 // data_backing/metadata_backing; current internal sites classify device-side
 // copy metadata slots (operation_metadata) and host-transfer staging
 // (staging). No synchronization, lock, ordering change, or production

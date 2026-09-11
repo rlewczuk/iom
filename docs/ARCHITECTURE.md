@@ -89,7 +89,62 @@ This flow intentionally preserves a direct mapped-file -> SafeTensors ->
 caller-created tensor -> queued-operation pipeline. IOM does not introduce a
 central weight cache, active-device registry, or hidden output allocation.
 
+## Memory ownership and conformance accounting
+
+Standard-GPU devices (CUDA, ROCm, and SYCL) reserve exactly two IOM-native
+backing allocations during factory setup: one **tensor-data backing** of the
+caller-selected `DeviceMemoryConfig::tensor_arena_bytes`, and one separate
+**metadata backing** of checked capacity `4 * C * 512` bytes, where `C` is the
+immutable `QueueConfig::max_in_flight_per_queue`. The data backing is managed
+by one device-owned, synchronized `ListAllocator`; tensors and explicit
+`RawWorkspace` owners receive stable arena subranges. The metadata backing is
+managed by one device-wide `FixedSizeAllocator` with 32-byte alignment,
+512-byte payload/stride, and exactly `4 * C` slots. Metadata descriptors lease
+those fixed slots; they never address tensor-data ranges.
+
+An accepted request has a host snapshot and a token history. A dispatched
+request additionally owns one native in-flight credit, one completion resource,
+and (when its descriptor requires it) one metadata-slot lease. A request that
+is waiting for a credit is **host parked**: it holds no native credit, metadata
+slot, completion resource, or native allocation, and the queue dispatches
+parked requests strictly FIFO. A completion resource, descriptor lease, data
+subrange, and caller workspace range become reusable only after completion is
+proved. Unknown native use retains the complete unresolved lease in
+device-owned quarantine; a queue or another device cannot make that range
+available by destruction or an unrelated drain.
+
+After successful standard-GPU setup, tensor/workspace creation and destruction,
+view transforms, transfers, submissions, waits, retirement, queue recreation,
+parking, and failure recovery issue zero additional IOM-native device
+allocation/free calls and do not resize resource arrays. This guarantee is
+about calls made by IOM at the backend allocation boundary. Vendor/SDK
+allocations (including SYCL event internals and TTNN runtime behavior) are a
+separate, potentially unavailable evidence category and are never relabeled
+as IOM calls. Host allocations for snapshots, fixed mirrors, staging, and
+caller-owned workspaces are likewise distinct from native backing allocation.
+
+CPU intentionally retains borrowed caller allocator ownership and host/reference
+storage; it has no device metadata arena or fabricated native slots. TTNN
+retains native per-plane tensor ownership and host-only scratch, and does not
+claim the standard-GPU two-backing guarantee. Its vendor-internal allocation
+behavior is reported as unproven whenever the runtime does not expose a
+comparable observation boundary.
+
+The conformance layer under `test/backend` owns backend-neutral requirement,
+rank, queue, workspace, lifetime, and FIFO observations. Backend drivers own
+factory setup, native allocation/free instrumentation, hardware context
+construction, and independent physical-storage oracles. This repository has no
+`examples/` directory; factory/tool caller audits therefore cover the
+available source and test callers without inventing an example.
+
+Two-GPU/eight-GPU isolation and first-use/warmed performance comparisons are
+environment-dependent evidence, not universal passes. They are recorded only
+when matching hardware and a matching pre-change baseline exist; otherwise the
+topology or baseline is an explicitly reported non-universal risk. Serialized
+host-transfer throughput is reported separately from compute throughput.
+
 ## Tensor representation
+
 
 ### Specification and logical values
 

@@ -932,6 +932,7 @@ TEST_CASE("TTNN quarantine action allocation failure leaks native storage") {
     REQUIRE(iom::oid_is_token(queue->copy(source->view(), destination->view())));
 
     {
+        iom::ttnn_test::fail_next_copy_finishes_for_testing(1);
         iom::ttnn_test::fail_next_quarantine_action_for_testing();
         queue.reset();
         CHECK_NOTHROW(destination.reset());

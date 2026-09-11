@@ -534,6 +534,7 @@ namespace iom {
                 return detail::FenceResult::failed(
                         std::current_exception());
             }
+        }
 class TtnnQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence;
@@ -611,11 +612,17 @@ public:
     }
 
     ~TtnnQueue() override {
-        // Drain published tasks while the native worker and device state are
-        // still alive; unresolved registrations are invalidated only after
-        // their terminal callbacks have had a chance to prove completion.
-        worker_.shutdown_and_drain();
+        // Invalidate owner fences before draining the worker. Accepted work
+        // that outlives this queue must quarantine its tensor payloads when
+        // owners are destroyed after queue teardown; the device retains the
+        // backing until a covering proof at its boundary.
         state_->registry.invalidate_entries_for_queue(registry_queue_id_);
+        // Close admission before worker drain so parked submissions cannot
+        // race teardown; the second close completes any parked tail after
+        // executing work retires.
+        close_and_drain();
+        worker_.shutdown_and_drain();
+        close_and_drain();
     }
 
     oid copy_impl(

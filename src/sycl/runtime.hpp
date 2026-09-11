@@ -33,9 +33,9 @@ namespace iom::sycl_detail {
     // success/failure, byte count, operation class, lifecycle phase, and
     // free/allocation kind, and may replace the underlying calls to inject
     // boundary failure. Classification is always routed at the call site and
-    // never inferred from pointers or byte totals. Future factory arena
-    // reservations classify their setup calls as data_backing/
-    // metadata_backing; current internal sites classify device-side copy
+    // never inferred from pointers or byte totals. Factory arena reservations
+    // classify their setup calls as data_backing/metadata_backing; current
+    // internal sites classify device-side copy
     // metadata slots (operation_metadata), host-transfer staging, and the
     // binary-fallback temporary device buffers (staging). No
     // synchronization, lock, ordering change, or production dependency is

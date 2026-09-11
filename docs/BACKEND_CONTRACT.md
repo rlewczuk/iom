@@ -303,7 +303,56 @@ Before considering a backend complete, confirm all of the following:
    equivalent native fence. If no proof is available, affected storage and
    metadata MUST be quarantined/retired rather than reused.
 
-### 6. Copy contract
+### 6. Memory, admission, and workspace contract
+
+For CUDA, ROCm, and SYCL, setup MUST reserve exactly two IOM-native backing
+allocations: the caller-selected tensor-data arena and a separate metadata
+arena with checked capacity `4 * C * 512` bytes. `C` is the immutable,
+nonzero `QueueConfig::max_in_flight_per_queue`; the metadata arena is
+device-wide and one `FixedSizeAllocator` spans exactly `4 * C` 512-byte,
+32-byte-aligned slots. The data arena uses one device-owned coalescing
+allocator. Tensor and `RawWorkspace` addresses MUST stay in the data domain;
+descriptor and metadata-slot addresses MUST stay in the metadata domain.
+
+An arena suballocation changes allocator bookkeeping only; it is not a native
+allocation. A metadata-slot lease, completion resource, host allocation,
+caller workspace range, and accepted token are separate ownership records.
+After setup, operations, transfers, views, waits, retirement, queue
+recreation, parking, and failure recovery MUST make no additional IOM-native
+device allocation/free calls and MUST NOT grow or resize fixed resource
+arrays. Vendor/SDK-internal allocations are outside that IOM boundary and
+MUST be reported separately rather than treated as IOM evidence.
+
+Every accepted request retains its immutable host snapshot, token outcome,
+owner registrations, and workspace lease. At most `C` requests per queue hold
+native credits; later requests are host parked with no native effect and are
+dispatched strictly FIFO when a completion proof returns a credit. No-op,
+inline, and no-metadata requests use the same admission order and MUST NOT
+bypass a parked head. Completion resources, metadata leases, and workspace
+ranges are reusable only after proven completion. Unknown native use MUST
+quarantine the complete unresolved lease, including the queue partition and
+queue-count reservation, until that lease's own covering proof.
+
+Positive workspace requirements MUST be queried through the pure operation or
+transfer query before submission. A missing, undersized, misaligned, stale,
+foreign, overlapping, or already-leased range is invalid or resource
+exhausted as specified by the public facade; the caller retains ownership
+through proven completion. CPU retains borrowed host/reference storage
+without a device metadata arena or fabricated native slots. TTNN retains
+native per-plane tensor ownership and host-only scratch; it MUST NOT claim the
+standard-GPU two-backing guarantee, and vendor-internal runtime allocation is
+unproven where it cannot be observed.
+
+The four-live-queue cap and quota are local to the exact `Device`; there is no
+global ordinal cap, active-backend registry, or queue selector. Two-/eight-GPU
+isolation and matched-baseline first-use/warmed performance are
+environment-dependent evidence only: record them when matching hardware and
+baseline exist, otherwise report the unavailable result as a non-universal
+risk. Report serialized host-transfer throughput separately from compute
+throughput. This repository has no `examples/` directory, so caller audits
+must record that fact rather than adding an example.
+
+### 7. Copy contract
 
 1. `copy(source, destination)` is required on every backend. It MUST call the
    equivalent of `DeviceOps::validate_copy` before reserving a sequence or
@@ -318,7 +367,7 @@ Before considering a backend complete, confirm all of the following:
    plane offsets and strides; source and destination may be full, offset,
    stepped, selected, permuted, or nested views.
 4. Same-queue copies execute in call order without an intervening host wait.
-### 7. Binary elementwise contract
+### 8. Binary elementwise contract
 
 1. `add`, `mul`, `sub`, and `div` each have exactly the common non-virtual
    signature `oid op(const TensorView&, const TensorView&, TensorView&) noexcept`.
@@ -365,19 +414,21 @@ Before considering a backend complete, confirm all of the following:
    output storage is allocated, replaced, or relocated; staging, conversion,
    workspace, and emulation are internal. Accepted failures are not retried.
 
-### 8. Other compute capabilities
+### 9. Other compute capabilities
 
 Other compute hooks (`silu`, `linear`, `rmsnorm`, and `sdpa`) remain unsupported
 and return negative `Unsupported` before submission, mutation, or token
 acceptance.
 
-### 9. Backend integration and conformance obligations
+### 10. Backend integration and conformance obligations
 
-The following source map is executable contract coverage. Shared scalar and
-common validation live in `test/backend/backend_conformance_common.hpp` and
-`backend_conformance_add.hpp`; storage, transforms, tails, padding, and copies
-live in `backend_conformance_copy_storage.hpp` and the independent
-`AcceleratorStorageOracle`. Backend-local targets are
+The following source map is executable contract coverage. Shared scalar,
+common validation, rank, queue, workspace, and memory-boundary scenarios live
+in `test/backend/backend_conformance_common.hpp`,
+`test/backend/backend_conformance_memory.hpp`, and
+`test/backend/backend_conformance_add.hpp`; storage, transforms, tails, padding,
+and copies live in `test/backend/backend_conformance_copy_storage.hpp` and the
+independent `AcceleratorStorageOracle`. Backend-local targets are
 `iom_cpu_conformance_tests`, `iom_cuda_conformance_tests`,
 `iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
 `iom_ttnn_conformance_tests`, registered by `add_iom_backend_tests`.
@@ -395,7 +446,7 @@ conformance targets. Drivers provide allocator/context setup, CPU reference,
 foreign-device identity checks, hardware gating, and native storage oracles;
 enabled hardware runs and never skips.
 
-### 10. Contract source map
+### 11. Contract source map
 
 Use these sources when changing or extending the contract:
 
@@ -409,6 +460,8 @@ Use these sources when changing or extending the contract:
 - storage, transfer, copy, and physical oracle:
   `test/backend/backend_conformance_copy_storage.hpp`,
   `test/backend/backend_conformance_oracle.hpp`;
+- native setup/allocation seams: `test/cuda`, `test/rocm`, and `test/sycl`
+  smoke/conformance drivers;
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and
