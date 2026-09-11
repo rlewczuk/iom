@@ -2,8 +2,6 @@
 
 ## Status and intent
 
-Proposed implementation specification. This change defines a deliberate breaking cutover; it does not implement the code.
-
 Replace independently growing accelerator allocation pools with two separate allocation domains: **tensor data** and **device-visible metadata**. Each domain has its own backing allocation and its own allocator. Do not interpret “metadata arena for both” as one mixed arena or as metadata prepended to tensor payloads.
 
 The caller chooses memory capacity and prepares tensors/workspaces above `DeviceOps`. The device factory performs explicit reservation after establishing the native context. `DeviceOps` consumes prepared storage and fixed metadata slots; it never reserves, grows, or frees native device memory.
@@ -15,7 +13,7 @@ This specification supersedes the current permission for internal operation-time
 ### Required
 
 - Separate, fixed-backed data and metadata allocators on CUDA, ROCm, and SYCL.
-- Maximum tensor rank eight, including the two tiled matrix axes.
+- Maximum tensor rank eight, including the two tiled matrix axes (so, six dimensions above tiled axes).
 - Bounded queues, outstanding submissions, descriptor capacity, and completion resources.
 - Removal of lazy device allocation from metadata, host-transfer staging, and SYCL binary staging paths.
 - Explicit caller preparation of payload scratch, outside operations.
