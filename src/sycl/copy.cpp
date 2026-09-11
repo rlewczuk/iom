@@ -518,6 +518,35 @@ public:
         return "SYCL";
     }
 
+    // Pure deterministic raw-workspace requirement for the binary
+    // operations: three whole-plane staging extents, each aligned up to
+    // 32, summed with checked arithmetic at alignment 32. The three
+    // slices start at offsets 0, align_up(lhs_bytes, 32), and
+    // align_up(lhs_bytes, 32) + align_up(rhs_bytes, 32). Pure: no
+    // allocation, registration, lease, token/queue resource, metadata
+    // upload, or submission, and no dependence on free data-arena
+    // capacity, queue occupancy, or completion state.
+    [[nodiscard]] WorkspaceRequirements binary_workspace_requirements(
+            const BinaryRequest& request) override {
+        const std::size_t lhs_bytes =
+                checked_binary_view_staging_bytes(request, request.lhs);
+        const std::size_t rhs_bytes =
+                checked_binary_view_staging_bytes(request, request.rhs);
+        const std::size_t out_bytes =
+                checked_binary_view_staging_bytes(request, request.out);
+        const std::size_t lhs_aligned =
+                align_up_checked(lhs_bytes, 32);
+        const std::size_t rhs_aligned =
+                align_up_checked(rhs_bytes, 32);
+        const std::size_t total = checked_add_local(
+                checked_add_local(
+                        lhs_aligned, rhs_aligned,
+                        "SYCL workspace staging sum overflows"),
+                out_bytes,
+                "SYCL workspace staging sum overflows");
+        return {total, 32};
+    }
+
 private:
     // Device-USM-safe binary staging extent: whole plane blocks up to the
     // view's highest addressed plane, so untouched planes and tile padding
@@ -545,6 +574,75 @@ private:
         const std::size_t plane_bytes =
                 plane_bits / 8 + (plane_bits % 8 != 0);
         return (max_plane + 1) * plane_bytes;
+    }
+
+    // Checked arithmetic for the pure requirement queries: identical
+    // whole-plane semantics to binary_view_staging_bytes with every step
+    // overflow-checked, so overflow surfaces as std::overflow_error
+    // instead of relying on the accepted-request bound.
+    static std::size_t checked_add_local(
+            std::size_t lhs, std::size_t rhs, const char* what) {
+        if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
+            throw std::overflow_error(what);
+        }
+        return lhs + rhs;
+    }
+
+    static std::size_t checked_mul_local(
+            std::size_t lhs, std::size_t rhs, const char* what) {
+        if (lhs != 0
+                && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
+            throw std::overflow_error(what);
+        }
+        return lhs * rhs;
+    }
+
+    static std::size_t align_up_checked(
+            std::size_t value, std::size_t alignment) {
+        const std::size_t remainder = value % alignment;
+        if (remainder == 0) {
+            return value;
+        }
+        return checked_add_local(
+                value, alignment - remainder,
+                "SYCL workspace staging alignment overflows");
+    }
+
+    static std::size_t checked_binary_view_staging_bytes(
+            const BinaryRequest& captured, const BinaryViewSnapshot& view) {
+        const std::span<const std::size_t> dims =
+                view.spec.shape.dimensions();
+        const std::size_t leading_rank = dims.size() - 2;
+        std::size_t max_plane = view.plane_offset;
+        for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+            max_plane = checked_add_local(
+                    max_plane,
+                    checked_mul_local(
+                            dims[axis] - 1, view.plane_strides[axis],
+                            "SYCL workspace staging plane walk overflows"),
+                    "SYCL workspace staging plane walk overflows");
+        }
+        const TensorShape padded_shape =
+                view.spec.standard_padded_shape();
+        const auto padded_dimensions = padded_shape.dimensions();
+        const std::size_t padded_plane_elements =
+                checked_mul_local(
+                        padded_dimensions[leading_rank],
+                        padded_dimensions[leading_rank + 1],
+                        "SYCL workspace staging plane size overflows");
+        const std::size_t plane_bits =
+                checked_mul_local(
+                        padded_plane_elements,
+                        detail::leaf_bits(captured.out.spec.data_type),
+                        "SYCL workspace staging plane bits overflows");
+        const std::size_t plane_bytes =
+                plane_bits / 8 + (plane_bits % 8 != 0);
+        return checked_mul_local(
+                checked_add_local(
+                        max_plane, 1,
+                        "SYCL workspace staging plane count overflows"),
+                plane_bytes,
+                "SYCL workspace staging extent overflows");
     }
 
     // Exact shared scalar loop over host staging buffers.

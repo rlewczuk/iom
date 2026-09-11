@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 
 #include "tensor.hpp"
@@ -10,6 +12,7 @@
 namespace iom {
 
     class DeviceOps;
+    class RawWorkspace;
 
     /**
      * Immutable per-device queue configuration. `max_in_flight_per_queue`
@@ -74,7 +77,42 @@ namespace iom {
 
         [[nodiscard]] virtual std::unique_ptr<Tensor> create_tensor(
             const TensorSpec& spec) = 0;
+        /**
+         * Creates one explicitly owned raw device workspace. Zero bytes
+         * return a valid allocation-free empty owner on every backend;
+         * positive bytes suballocate the already reserved 32-byte-aligned
+         * data arena on CUDA, ROCm, and SYCL (never a new native backing;
+         * exhaustion including fragmentation is std::bad_alloc) and are
+         * rejected as unsupported device scratch with
+         * `std::invalid_argument` on CPU and TTNN. The owner is stable,
+         * non-copyable, non-movable, and must be destroyed before its
+         * creating Device.
+         */
+        [[nodiscard]] virtual std::unique_ptr<RawWorkspace>
+                create_workspace(std::size_t bytes) = 0;
         [[nodiscard]] virtual std::unique_ptr<DeviceOps> create_ops() = 0;
+
+        /**
+         * True exactly when `workspace` is a live owner created by this
+         * Device. The pointer is used only as an opaque identity for the
+         * live-owner set, so shared validation can reject foreign and dead
+         * owners without dereferencing them.
+         */
+        [[nodiscard]] bool owns_workspace(
+                const RawWorkspace* workspace) const noexcept;
+
+    protected:
+        friend class RawWorkspace;
+
+        // RawWorkspace construction and destruction maintain the exact
+        // live-owner identity set these hooks guard.
+        void register_workspace(const RawWorkspace* workspace) const;
+        void unregister_workspace(
+                const RawWorkspace* workspace) const noexcept;
+
+    private:
+        mutable std::mutex workspace_registry_mutex_;
+        mutable std::set<const RawWorkspace*> live_workspaces_;
     };
 
 }  // namespace iom

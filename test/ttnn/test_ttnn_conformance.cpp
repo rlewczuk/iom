@@ -2225,3 +2225,63 @@ TEST_CASE("TTNN binary completion publishes one finish for every operation") {
         }
     }
 }
+
+TEST_CASE("TTNN conformance: raw workspace contract accepts only the empty owner") {
+    TtnnDevices devices;
+
+    // The empty workspace is valid on every backend and touches no
+    // native allocation.
+    const std::unique_ptr<iom::RawWorkspace> workspace =
+            devices.candidate->create_workspace(0);
+    REQUIRE(workspace != nullptr);
+    CHECK(workspace->empty());
+    CHECK_EQ(workspace->byte_size(), 0);
+    CHECK(&workspace->device() == devices.candidate.get());
+    CHECK(workspace->backend_kind() == iom::BackendKind::TTNN);
+
+    const iom::RawWorkspaceView view = workspace->view();
+    CHECK(view.owner_identity() == workspace.get());
+    CHECK(&view.device() == devices.candidate.get());
+    CHECK_EQ(view.byte_size(), 0);
+    CHECK_FALSE(view.empty());
+
+    // Positive scratch is unsupported TTNN device storage: no dummy
+    // native storage is manufactured.
+    CHECK_THROWS_AS(
+            devices.candidate->create_workspace(1), std::invalid_argument);
+    CHECK_THROWS_AS(
+            devices.candidate->create_workspace(32), std::invalid_argument);
+    CHECK_THROWS_AS(
+            devices.reference->create_workspace(4096),
+            std::invalid_argument);
+}
+
+TEST_CASE("TTNN conformance: workspace requirement queries report exact zero") {
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
+    auto lhs = devices.candidate->create_tensor(spec);
+    auto rhs = devices.candidate->create_tensor(spec);
+    auto out = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+
+    const iom::WorkspaceRequirements zero{0, 1};
+    CHECK(queue->add_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(queue->mul_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(queue->sub_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(queue->div_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(lhs->view().copy_from_host_workspace_requirements() == zero);
+    CHECK(lhs->view().copy_to_host_workspace_requirements() == zero);
+
+    // Validation matches the binary operation: foreign-device views are
+    // invalid input before any requirement is reported.
+    auto foreign = devices.foreign->create_tensor(spec);
+    CHECK_THROWS_AS(
+            queue->add_workspace_requirements(
+                    foreign->view(), rhs->view(), out->view()),
+            std::invalid_argument);
+}

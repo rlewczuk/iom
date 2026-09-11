@@ -201,6 +201,40 @@ namespace iom {
             bool shutdown_ = false;
             std::thread worker_;
         };
+    }  // namespace detail
+
+    namespace detail {
+
+        /**
+         * Shared reusable raw-workspace validation (leaf 05). Centralizes
+         * the required-capacity, base/range alignment, checked-offset,
+         * exact-Device-identity, exact-live-owner-identity, and
+         * workspace-versus-operand/output overlap rules that tasks 07 and
+         * 11 enforce on borrowed workspace arguments. Every rejection is
+         * invalid input: `std::invalid_argument`; range-end overflow
+         * reports `std::overflow_error`. Pure: no allocation, registry,
+         * lease, token/queue resource, or backend effect.
+         */
+        class WorkspaceValidation {
+        public:
+            /**
+             * Validates `workspace` as the scratch range for one operation
+             * on `device` needing `required_capacity` bytes at
+             * `required_alignment`. A zero capacity accepts any view (the
+             * facades default to the empty view exactly for this case); a
+             * positive capacity additionally requires a non-empty view of
+             * a live owner created by this exact device, sufficient
+             * capacity, a 32-byte-aligned base meeting the required
+             * alignment, and a range disjoint from every operand/output
+             * storage range. Returns the unchanged view.
+             */
+            [[nodiscard]] static RawWorkspaceView validated(
+                    const Device& device,
+                    const RawWorkspaceView& workspace,
+                    std::size_t required_capacity,
+                    std::size_t required_alignment,
+                    std::span<const TensorView> operands);
+        };
 
     }  // namespace detail
 
@@ -260,6 +294,35 @@ namespace iom {
                 TensorView& out) noexcept;
         oid div(const TensorView& lhs, const TensorView& rhs,
                 TensorView& out) noexcept;
+
+        /**
+         * Pure deterministic raw-workspace requirement queries for the
+         * three-view binary operations (leaf 05). Each runs the exact
+         * validation of its binary operation — operation, all three
+         * views, exact device identity, specifications, rank and view
+         * bounds, broadcasting, alias rules, and backend capability —
+         * and then reports, with no allocation, registration, lease,
+         * token/queue resource, metadata upload, submission, and no
+         * dependence on free data-arena capacity, fragmentation, queue
+         * occupancy, or completion state:
+         * CPU, TTNN, CUDA, and ROCm report `{0, 1}`; SYCL reports its
+         * checked whole-plane staging sum at alignment 32. Validation
+         * failures surface as the corresponding exception
+         * (`std::invalid_argument`, `std::overflow_error`, unsupported
+         * operation), never through the OID error mapping.
+         */
+        [[nodiscard]] WorkspaceRequirements add_workspace_requirements(
+                const TensorView& lhs, const TensorView& rhs,
+                const TensorView& out);
+        [[nodiscard]] WorkspaceRequirements mul_workspace_requirements(
+                const TensorView& lhs, const TensorView& rhs,
+                const TensorView& out);
+        [[nodiscard]] WorkspaceRequirements sub_workspace_requirements(
+                const TensorView& lhs, const TensorView& rhs,
+                const TensorView& out);
+        [[nodiscard]] WorkspaceRequirements div_workspace_requirements(
+                const TensorView& lhs, const TensorView& rhs,
+                const TensorView& out);
         oid silu(const TensorView& x, TensorView& y) noexcept;
         oid linear(const TensorView& x, const TensorView& w,
                    TensorView& y) noexcept;
@@ -313,6 +376,17 @@ namespace iom {
                               const TensorView& v, size_t n_heads,
                               size_t n_kv_heads, size_t head_dim,
                               TensorView& attn_out);
+
+        /**
+         * Backend hook behind the four *_workspace_requirements queries.
+         * Receives an already fully validated request snapshot and must
+         * stay pure: no allocation beyond the returned value, no
+         * registration, lease, token/queue resource, or backend effect.
+         * The base reports `{0, 1}`; SYCL overrides with its checked
+         * whole-plane staging sum.
+         */
+        [[nodiscard]] virtual WorkspaceRequirements
+                binary_workspace_requirements(const BinaryRequest& request);
 
         [[nodiscard]] const Device& queue_device() const;
         virtual void fence_through_sequence(

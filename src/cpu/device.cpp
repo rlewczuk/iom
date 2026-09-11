@@ -380,11 +380,24 @@ namespace iom {
         }
         [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                 const TensorSpec& spec) override;
+        [[nodiscard]] std::unique_ptr<RawWorkspace> create_workspace(
+                std::size_t bytes) override;
         [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override;
 
     private:
         Allocator& allocator_;
         detail::RegistryState registry_state_;
+    };
+
+    /**
+     * CPU raw-workspace owner. Only the zero-byte empty workspace exists:
+     * the base RawWorkspace registers the exact identity with the device
+     * and no allocator block is ever touched.
+     */
+    class CpuWorkspace final : public RawWorkspace {
+    public:
+        CpuWorkspace(CpuDevice& device, std::size_t bytes)
+                : RawWorkspace(device, bytes) {}
     };
 
     /**
@@ -902,6 +915,19 @@ namespace iom {
 
     std::unique_ptr<DeviceOps> CpuDevice::create_ops() {
         return std::make_unique<CpuQueue>(*this);
+    }
+
+    std::unique_ptr<RawWorkspace> CpuDevice::create_workspace(
+            std::size_t bytes) {
+        if (bytes != 0) {
+            // Positive scratch is unsupported device storage here: no
+            // dummy native storage is manufactured and no allocator block
+            // is touched.
+            throw std::invalid_argument(
+                    "CPU devices do not support positive raw workspace "
+                    "allocation");
+        }
+        return std::make_unique<CpuWorkspace>(*this, 0);
     }
 
     std::unique_ptr<Device> make_cpu_device(

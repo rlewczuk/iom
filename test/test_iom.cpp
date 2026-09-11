@@ -1093,6 +1093,24 @@ constexpr std::array kFakeShrunkDeviceSupportedDataTypes = {
         iom::DataType::F32,
 };
 
+/**
+ * Test raw-workspace owner. The address is arbitrary: the fake registers
+ * its exact identity through the RawWorkspace base like every real owner,
+ * so live/foreign/dead validation is exercised without a native arena.
+ */
+class FakeWorkspace final : public iom::RawWorkspace {
+public:
+    FakeWorkspace(iom::Device& device, void* address, std::size_t bytes)
+            : iom::RawWorkspace(device, bytes), address_(address) {}
+
+private:
+    [[nodiscard]] void* workspace_address() const noexcept override {
+        return address_;
+    }
+
+    void* address_;
+};
+
 class FakeDevice final : public iom::Device {
 
 public:
@@ -1114,11 +1132,22 @@ public:
         return std::make_unique<FakeTensor>(spec, *this);
     }
 
+    [[nodiscard]] std::unique_ptr<iom::RawWorkspace> create_workspace(
+            std::size_t bytes) override {
+        if (bytes != 0) {
+            throw std::invalid_argument(
+                    "fake CPU device does not support positive raw "
+                    "workspace allocation");
+        }
+        return std::make_unique<FakeWorkspace>(*this, nullptr, 0);
+    }
+
     // The deterministic deferred queue stands in for the concrete backends.
     [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
         return std::make_unique<FakeQueue>(*this);
     }
 };
+
 class FakeShrunkDevice final : public iom::Device {
 public:
     [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
@@ -1140,6 +1169,15 @@ public:
         return std::make_unique<FakeTensor>(spec, *this);
     }
 
+    [[nodiscard]] std::unique_ptr<iom::RawWorkspace> create_workspace(
+            std::size_t bytes) override {
+        if (bytes != 0) {
+            throw std::invalid_argument(
+                    "fake CPU device does not support positive raw "
+                    "workspace allocation");
+        }
+        return std::make_unique<FakeWorkspace>(*this, nullptr, 0);
+    }
     [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
         return std::make_unique<FakeQueue>(*this);
     }
@@ -3515,4 +3553,427 @@ TEST_CASE("Quarantine::add pins the action on growth allocation failure") {
     CHECK(healthy_ran);
     CHECK_FALSE(leaked->destructor_ran());
     CHECK_FALSE(leaked->ran());
+}
+
+// ---------------------------------------------------------------------------
+// Raw workspace ownership, views, pure queries, validation, and leases
+// (leaf 05).
+
+TEST_CASE("RawWorkspace ownership and RawWorkspaceView type traits") {
+    // The owner is explicitly created, stable, and can never be copied,
+    // moved, or default-constructed.
+    static_assert(!std::is_default_constructible_v<iom::RawWorkspace>);
+    static_assert(!std::is_copy_constructible_v<iom::RawWorkspace>);
+    static_assert(!std::is_copy_assignable_v<iom::RawWorkspace>);
+    static_assert(!std::is_move_constructible_v<iom::RawWorkspace>);
+    static_assert(!std::is_move_assignable_v<iom::RawWorkspace>);
+
+    // Views are values: defaultable and copy-constructible, never
+    // retargetable.
+    static_assert(std::is_default_constructible_v<iom::RawWorkspaceView>);
+    static_assert(std::is_copy_constructible_v<iom::RawWorkspaceView>);
+    static_assert(!std::is_copy_assignable_v<iom::RawWorkspaceView>);
+    static_assert(!std::is_move_constructible_v<iom::RawWorkspaceView>);
+    static_assert(!std::is_move_assignable_v<iom::RawWorkspaceView>);
+
+    // No view is constructible from an arbitrary pointer or handle.
+    static_assert(!std::is_constructible_v<iom::RawWorkspaceView, void*>);
+    static_assert(
+            !std::is_constructible_v<iom::RawWorkspaceView, const void*>);
+    static_assert(!std::is_constructible_v<
+                  iom::RawWorkspaceView, void*, std::size_t>);
+    static_assert(!std::is_constructible_v<
+                  iom::RawWorkspaceView, void*, std::size_t, std::size_t>);
+}
+
+TEST_CASE("Default workspace view is empty and zero-byte owners stay valid") {
+    const iom::RawWorkspaceView empty{};
+    CHECK(empty.empty());
+    CHECK_EQ(empty.byte_size(), 0);
+    CHECK_EQ(empty.offset(), 0);
+    CHECK_EQ(empty.range_begin(), 0);
+    CHECK_EQ(empty.range_end(), 0);
+    CHECK(empty.owner_identity() == nullptr);
+    CHECK_THROWS_AS((void)empty.device(), std::logic_error);
+    CHECK_THROWS_AS((void)empty.backend_kind(), std::logic_error);
+    CHECK_THROWS_AS((void)empty.subrange(0, 0), std::invalid_argument);
+
+    FakeDevice device;
+    const std::unique_ptr<iom::RawWorkspace> workspace =
+            device.create_workspace(0);
+    REQUIRE(workspace != nullptr);
+    CHECK(workspace->empty());
+    CHECK_EQ(workspace->byte_size(), 0);
+    CHECK(&workspace->device() == &device);
+    CHECK(workspace->backend_kind() == iom::BackendKind::CPU);
+    CHECK_EQ(workspace->backend_device(), 3);
+
+    const iom::RawWorkspaceView view = workspace->view();
+    CHECK_FALSE(view.empty());
+    CHECK(view.owner_identity() == workspace.get());
+    CHECK_EQ(view.byte_size(), 0);
+    CHECK_EQ(view.offset(), 0);
+    CHECK(&view.device() == &device);
+    CHECK_EQ(view.backend_device(), 3);
+    CHECK(view == workspace->view());
+
+    // Positive creation on a CPU-kind device is unsupported scratch, and
+    // it manufactures no dummy storage.
+    CHECK_THROWS_AS((void)device.create_workspace(1), std::invalid_argument);
+    CHECK_THROWS_AS((void)device.create_workspace(32), std::invalid_argument);
+}
+
+TEST_CASE("Workspace views copy exactly and subranges stay checked") {
+    FakeDevice device;
+    FakeWorkspace workspace(
+            device, reinterpret_cast<void*>(0x4200), 64);
+
+    const iom::RawWorkspaceView full = workspace.view();
+    const iom::RawWorkspaceView second_half = full.subrange(32, 32);
+    const iom::RawWorkspaceView copy = second_half;
+    CHECK(copy == second_half);
+    CHECK_FALSE(copy == full);
+    CHECK(copy.owner_identity() == &workspace);
+    CHECK(&copy.device() == &device);
+    CHECK_EQ(copy.offset(), 32);
+    CHECK_EQ(copy.byte_size(), 32);
+    CHECK_EQ(copy.range_begin(), 32);
+    CHECK_EQ(copy.range_end(), 64);
+
+    // Owner-absolute bounds: offset and extent must fit the owner.
+    CHECK_THROWS_AS((void)full.subrange(96, 0), std::out_of_range);
+    CHECK_THROWS_AS((void)full.subrange(64, 1), std::out_of_range);
+    CHECK_THROWS_AS((void)full.subrange(32, 33), std::out_of_range);
+    CHECK_EQ(full.subrange(64, 0).byte_size(), 0);
+
+    // Subranges are 32-byte aligned within the owner.
+    CHECK_THROWS_AS((void)full.subrange(16, 16), std::invalid_argument);
+    CHECK_THROWS_AS((void)full.subrange(33, 0), std::invalid_argument);
+}
+
+TEST_CASE("Binary workspace requirement queries are pure and deterministic") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    FakeTensor lhs = make_tensor(device, {2, 3, 17, 33});
+    FakeTensor rhs = make_tensor(device, {2, 3, 17, 33});
+    FakeTensor out = make_tensor(device, {2, 3, 17, 33});
+
+    const iom::WorkspaceRequirements zero{0, 1};
+    CHECK(queue.add_workspace_requirements(
+                  lhs.view(), rhs.view(), out.view()) == zero);
+    CHECK(queue.mul_workspace_requirements(
+                  lhs.view(), rhs.view(), out.view()) == zero);
+    CHECK(queue.sub_workspace_requirements(
+                  lhs.view(), rhs.view(), out.view()) == zero);
+    CHECK(queue.div_workspace_requirements(
+                  lhs.view(), rhs.view(), out.view()) == zero);
+
+    // Queries repeat identically and never depend on any queue state.
+    CHECK(queue.add_workspace_requirements(
+                  lhs.view(), rhs.view(), out.view()) == zero);
+
+    // Validation runs exactly as for the corresponding binary operation.
+    FakeTensor foreign_lhs = make_tensor(foreign, {2, 3, 17, 33});
+    CHECK_THROWS_AS((void)
+            queue.add_workspace_requirements(
+                    foreign_lhs.view(), rhs.view(), out.view()),
+            std::invalid_argument);
+    FakeTensor bool_lhs =
+            make_tensor(device, {2, 16, 16}, iom::DataType::BOOL);
+    FakeTensor bool_rhs =
+            make_tensor(device, {2, 16, 16}, iom::DataType::BOOL);
+    FakeTensor bool_out =
+            make_tensor(device, {2, 16, 16}, iom::DataType::BOOL);
+    CHECK_THROWS_AS((void)
+            queue.add_workspace_requirements(
+                    bool_lhs.view(), bool_rhs.view(), bool_out.view()),
+            std::runtime_error);
+    FakeTensor mismatched = make_tensor(device, {2, 3, 16, 16});
+    CHECK_THROWS_AS((void)
+            queue.add_workspace_requirements(
+                    lhs.view(), mismatched.view(), out.view()),
+            std::invalid_argument);
+
+    // No submission, no record, no registration, no sequence, no lease.
+    CHECK(queue.submissions.empty());
+    CHECK(queue.add_records().empty());
+    CHECK_EQ(queue.registered_at(lhs.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(rhs.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+}
+
+TEST_CASE(
+        "Host transfer workspace requirement queries are pure and "
+        "deterministic") {
+    FakeDevice device;
+    const FakeTensor tensor =
+            make_tensor(device, {2, 3, 16, 16}, iom::DataType::F32);
+    const iom::WorkspaceRequirements zero{0, 1};
+    CHECK(tensor.view().copy_from_host_workspace_requirements() == zero);
+    CHECK(tensor.view().copy_to_host_workspace_requirements() == zero);
+
+    // Checked logical-byte arithmetic propagates overflow.
+    const FakeTensor huge =
+            make_tensor(device, {1, kMax}, iom::DataType::I8);
+    CHECK_THROWS_AS(
+            (void)huge.view().copy_from_host_workspace_requirements(),
+            std::overflow_error);
+    CHECK_THROWS_AS(
+            (void)huge.view().copy_to_host_workspace_requirements(),
+            std::overflow_error);
+
+    // The queries never touch the owner or the host transfer path.
+    const void* handle = tensor.view().native_handle();
+    (void)tensor.view().copy_from_host_workspace_requirements();
+    (void)tensor.view().copy_to_host_workspace_requirements();
+    CHECK(tensor.view().native_handle() == handle);
+}
+
+TEST_CASE(
+        "Shared workspace validation rejects foreign dead undersized "
+        "misaligned and overlapping views") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeTensor operand = make_tensor(device, {2, 17, 33});
+    const std::vector<iom::TensorView> operands{operand.view()};
+
+    // A positive requirement rejects the empty default view; a zero
+    // requirement accepts any view value.
+    CHECK_THROWS_AS(
+            (void)iom::detail::WorkspaceValidation::validated(
+                    device, iom::RawWorkspaceView{}, 32, 32, {}),
+            std::invalid_argument);
+    CHECK_NOTHROW((void)iom::detail::WorkspaceValidation::validated(
+            device, iom::RawWorkspaceView{}, 0, 1, {}));
+
+    FakeWorkspace workspace(
+            device, reinterpret_cast<void*>(0x4300), 64);
+    const iom::RawWorkspaceView full = workspace.view();
+
+    // Live, correctly sized, aligned, and disjoint from every operand.
+    CHECK(iom::detail::WorkspaceValidation::validated(
+                  device, full, 64, 32, operands) == full);
+    CHECK(iom::detail::WorkspaceValidation::validated(
+                  device, full, 64, 32, {}) == full);
+
+    // Foreign device and dead owner.
+    CHECK_THROWS_AS(
+            (void)iom::detail::WorkspaceValidation::validated(
+                    foreign, full, 32, 32, {}),
+            std::invalid_argument);
+    const auto make_dead_view = [](iom::Device& owner) {
+        FakeWorkspace dead(owner, reinterpret_cast<void*>(0x4400), 32);
+        return dead.view();
+    };
+    const iom::RawWorkspaceView dead_view = make_dead_view(device);
+    CHECK_THROWS_AS(
+            (void)iom::detail::WorkspaceValidation::validated(
+                    device, dead_view, 16, 32, {}),
+            std::invalid_argument);
+
+    // Undersized and misaligned ranges.
+    FakeWorkspace small(device, reinterpret_cast<void*>(0x4500), 32);
+    CHECK_THROWS_AS(
+            (void)iom::detail::WorkspaceValidation::validated(
+                    device, small.view(), 64, 32, {}),
+            std::invalid_argument);
+    FakeWorkspace misaligned(
+            device, reinterpret_cast<void*>(0x4501), 64);
+    CHECK_THROWS_AS(
+            (void)iom::detail::WorkspaceValidation::validated(
+                    device, misaligned.view(), 64, 32, {}),
+            std::invalid_argument);
+
+    // Workspace range overlapping operand storage: the fake operand is
+    // pointed at a properly aligned buffer so the overlap branch (not the
+    // alignment gate) produces the rejection.
+    FakeTensor overlapping_operand = make_tensor(device, {2, 17, 33});
+    void* overlap_buffer = ::operator new(256, std::align_val_t(32));
+    overlapping_operand.use_storage_handle(overlap_buffer);
+    FakeWorkspace overlapping(device, overlap_buffer, 64);
+    const std::vector<iom::TensorView> overlap_operands{
+            overlapping_operand.view()};
+    CHECK_THROWS_AS(
+            (void)iom::detail::WorkspaceValidation::validated(
+                    device, overlapping.view(), 64, 32, overlap_operands),
+            std::invalid_argument);
+    CHECK_NOTHROW((void)iom::detail::WorkspaceValidation::validated(
+            device, overlapping.view(), 64, 32, {}));
+    ::operator delete(overlap_buffer, std::align_val_t(32));
+}
+
+TEST_CASE(
+        "Workspace leases are exclusive transactional and controlled by "
+        "completion proofs") {
+    iom::detail::RegistryState state;
+    const auto* owner = reinterpret_cast<const void*>(0x3100);
+    const auto* other_owner = reinterpret_cast<const void*>(0x3101);
+    void* base = reinterpret_cast<void*>(0x3200);
+    int fence_calls = 0;
+    const iom::detail::Fence fence = make_test_fence(&fence_calls);
+
+    const iom::detail::WorkspaceLease first = iom::detail::
+            acquire_workspace_lease(state, owner, base, 64, 1, 1, fence);
+    CHECK(first.entry_id != 0);
+    CHECK_EQ(first.sequence, 1);
+    REQUIRE_EQ(state.workspace_leases.leases.size(), 1);
+    REQUIRE_EQ(state.registry.snapshot_for(base).size(), 1);
+
+    // Overlapping leases on the same owner are resource exhaustion; the
+    // rejected acquisitions leave no state behind.
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 64, 2, 1, fence),
+            std::bad_alloc);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 32, 2, 1, fence),
+            std::bad_alloc);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, static_cast<char*>(base) + 32, 32, 2, 1,
+                    fence),
+            std::bad_alloc);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, static_cast<char*>(base) + 16, 32, 2, 1,
+                    fence),
+            std::invalid_argument);
+    CHECK_EQ(state.workspace_leases.leases.size(), 1);
+
+    // Disjoint aligned subranges of one owner coexist, and another
+    // owner's identical range is independent.
+    CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
+            state, owner, static_cast<char*>(base) + 64, 32, 2, 1, fence));
+    CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
+            state, other_owner, static_cast<char*>(base) + 256, 64, 3, 1,
+            fence));
+    CHECK_EQ(state.workspace_leases.leases.size(), 3);
+
+    // Malformed requests are rejected before any state is touched.
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, nullptr, base, 64, 4, 1, fence),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, nullptr, 64, 4, 1, fence),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 0, 4, 1, fence),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, static_cast<char*>(base) + 1, 64, 4, 1,
+                    fence),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 64, 0, 1, fence),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 64, 4, 0, fence),
+            std::invalid_argument);
+    const iom::detail::Fence empty_fence{};
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 64, 4, 1, empty_fence),
+            std::invalid_argument);
+    CHECK_EQ(state.workspace_leases.leases.size(), 3);
+
+    // A covering completion proof releases the lease and its registry
+    // entry, so the range can be leased again.
+    iom::detail::complete_workspace_lease(state, first, true);
+    CHECK_EQ(state.workspace_leases.leases.size(), 2);
+    CHECK(state.registry.snapshot_for(base).empty());
+    const iom::detail::WorkspaceLease reacquired = iom::detail::
+            acquire_workspace_lease(state, owner, base, 64, 5, 1, fence);
+    CHECK_EQ(state.workspace_leases.leases.size(), 3);
+
+    // Runtime failure alone is not proof: the range is quarantined, its
+    // covering entry invalidated, and no overlapping reuse is possible.
+    iom::detail::complete_workspace_lease(state, reacquired, false);
+    REQUIRE_EQ(state.registry.snapshot_for(base).size(), 1);
+    CHECK(state.registry.snapshot_for(base)[0].state
+          == iom::detail::EntryState::Invalidated);
+    CHECK_THROWS_AS(
+            (void)iom::detail::acquire_workspace_lease(
+                    state, owner, base, 64, 6, 1, fence),
+            std::bad_alloc);
+    CHECK_EQ(state.workspace_leases.leases.size(), 3);
+
+    // A later covering proof resolves the quarantine.
+    iom::detail::complete_workspace_lease(state, reacquired, true);
+    CHECK_EQ(state.workspace_leases.leases.size(), 2);
+    CHECK(state.registry.snapshot_for(base).empty());
+    CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
+            state, owner, base, 64, 7, 1, fence));
+
+    // The device-side retention query follows the same lifecycle.
+    const iom::detail::WorkspaceLease retained_lease = iom::detail::
+            acquire_workspace_lease(
+                    state, owner, static_cast<char*>(base) + 128, 64, 8, 1,
+                    fence);
+    CHECK(iom::detail::workspace_range_retained(
+            state.workspace_leases, owner,
+            static_cast<char*>(base) + 128, 64));
+    CHECK_FALSE(iom::detail::workspace_range_retained(
+            state.workspace_leases, owner,
+            static_cast<char*>(base) + 192, 64));
+    CHECK_FALSE(iom::detail::workspace_range_retained(
+            state.workspace_leases, other_owner,
+            static_cast<char*>(base) + 128, 64));
+    iom::detail::complete_workspace_lease(state, retained_lease, true);
+    CHECK_FALSE(iom::detail::workspace_range_retained(
+            state.workspace_leases, owner,
+            static_cast<char*>(base) + 128, 64));
+}
+
+TEST_CASE(
+        "Workspace lease acquisition rolls back every trace on failure") {
+    iom::detail::RegistryState state;
+    const auto* owner = reinterpret_cast<const void*>(0x3300);
+    void* base = reinterpret_cast<void*>(0x3400);
+    int fence_calls = 0;
+    const iom::detail::Fence fence = make_test_fence(&fence_calls);
+
+    iom_test::arm_counting();
+    const iom::detail::WorkspaceLease probe = iom::detail::
+            acquire_workspace_lease(state, owner, base, 64, 1, 1, fence);
+    const std::size_t allocation_count = iom_test::disarm();
+    REQUIRE(allocation_count > 0);
+    iom::detail::complete_workspace_lease(state, probe, true);
+
+    for (std::size_t ordinal = 1; ordinal <= allocation_count; ++ordinal) {
+        iom_test::arm_failure(ordinal);
+        bool threw_bad_alloc = false;
+        bool succeeded = false;
+        iom::detail::WorkspaceLease attempt;
+        try {
+            attempt = iom::detail::acquire_workspace_lease(
+                    state, owner, base, 64, 2, 1, fence);
+            succeeded = true;
+        } catch (const std::bad_alloc&) {
+            threw_bad_alloc = true;
+        }
+        (void)iom_test::disarm();
+        if (succeeded) {
+            // The injected failure landed outside this transaction
+            // (allocation counts shifted with registry growth); release
+            // the lease so the loop keeps its precondition.
+            iom::detail::complete_workspace_lease(state, attempt, true);
+            continue;
+        }
+        CHECK(threw_bad_alloc);
+        // Neither a lease record nor an owner registration survives.
+        CHECK(state.workspace_leases.leases.empty());
+        CHECK(state.registry.snapshot_for(base).empty());
+    }
+
+    // A clean acquisition still succeeds after every rolled-back attempt.
+    CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
+            state, owner, base, 64, 3, 1, fence));
 }

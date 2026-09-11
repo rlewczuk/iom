@@ -277,6 +277,9 @@ namespace iom {
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;
 
+            [[nodiscard]] std::unique_ptr<RawWorkspace> create_workspace(
+                    std::size_t bytes) override;
+
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override;
 
             [[nodiscard]] tt::tt_metal::distributed::MeshDevice& mesh()
@@ -449,6 +452,16 @@ namespace iom {
             std::unique_ptr<std::vector<ttnn::Tensor>> planes_;
         };
 
+        /**
+         * TTNN raw-workspace owner. Only the zero-byte empty workspace
+         * exists: the base RawWorkspace registers the exact identity with
+         * the device and no native allocation is ever touched.
+         */
+        class TtnnWorkspace final : public RawWorkspace {
+        public:
+            TtnnWorkspace(TtnnDevice& device, std::size_t bytes)
+                    : RawWorkspace(device, bytes) {}
+        };
         struct TtnnFenceCapture {
             TtnnDevice* device = nullptr;
         };
@@ -1095,6 +1108,19 @@ void TtnnQueue::fence_through_sequence(
         }
         std::lock_guard<std::mutex> lock(api_mutex_);
         return std::make_unique<TtnnTensor>(spec, *this);
+    }
+
+    std::unique_ptr<RawWorkspace> TtnnDevice::create_workspace(
+            std::size_t bytes) {
+        if (bytes != 0) {
+            // Positive scratch is unsupported device storage here: no
+            // dummy native storage is manufactured and no TTNN allocation
+            // is touched.
+            throw std::invalid_argument(
+                    "TTNN devices do not support positive raw workspace "
+                    "allocation");
+        }
+        return std::make_unique<TtnnWorkspace>(*this, 0);
     }
 
     std::unique_ptr<DeviceOps> TtnnDevice::create_ops() {

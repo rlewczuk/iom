@@ -131,6 +131,8 @@ namespace iom {
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;
+            [[nodiscard]] std::unique_ptr<RawWorkspace> create_workspace(
+                    std::size_t bytes) override;
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 return sycl_detail::make_queue(
                         *this, *context_, device_, registry_state_);
@@ -173,6 +175,37 @@ namespace iom {
                 data_allocator_->free(address);
             }
 
+            // Returns one raw-workspace arena range at owner destruction.
+            // A retained (live or quarantined) lease keeps the range out
+            // of the allocator: it is deferred into the device quarantine
+            // and freed only on the final drain, never reused. The lease
+            // check releases the registry allocation mutex before any
+            // allocator work.
+            void release_workspace(
+                    const RawWorkspace* owner, void* address,
+                    std::size_t bytes) noexcept {
+                bool retained = false;
+                {
+                    std::lock_guard<std::mutex> lock(
+                            registry_state_.allocation_mutex);
+                    retained = detail::workspace_range_retained(
+                            registry_state_.workspace_leases, owner,
+                            address, bytes);
+                }
+                if (retained) {
+                    try {
+                        registry_state_.quarantine
+                                .emplace<detail::AllocatorCleanupAction>(
+                                        *data_allocator_, address, bytes);
+                    } catch (...) {
+                        // Keep failed storage unavailable if quarantine
+                        // allocation itself fails.
+                    }
+                    return;
+                }
+                release_data(address);
+            }
+
             [[nodiscard]] iom::Allocator& data_allocator() noexcept {
                 return *data_allocator_;
             }
@@ -201,6 +234,40 @@ namespace iom {
 
             friend class SyclTensor;
         };
+
+        /**
+         * Owner of one raw-workspace arena suballocation. The base
+         * RawWorkspace registers the exact identity with the device
+         * before the body can fail; destruction hands the range back
+         * through the device boundary, which keeps a retained lease out
+         * of the allocator.
+         */
+        class SyclWorkspace final : public RawWorkspace {
+        public:
+            SyclWorkspace(
+                    SyclDevice& device, void* address, std::size_t bytes)
+                    : RawWorkspace(device, bytes),
+                      device_(device),
+                      address_(address) {}
+
+            ~SyclWorkspace() override {
+                if (address_ != nullptr) {
+                    device_.release_workspace(this, address_, byte_size());
+                }
+            }
+
+            SyclWorkspace(const SyclWorkspace&) = delete;
+            SyclWorkspace& operator=(const SyclWorkspace&) = delete;
+
+        private:
+            [[nodiscard]] void* workspace_address() const noexcept override {
+                return address_;
+            }
+
+            SyclDevice& device_;
+            void* address_;
+        };
+
         class SyclTensor final : public Tensor {
         public:
             SyclTensor(
@@ -295,6 +362,37 @@ namespace iom {
                 const TensorSpec& spec) {
             return std::make_unique<SyclTensor>(
                     spec, *this, registry_state_);
+        }
+
+        std::unique_ptr<RawWorkspace> SyclDevice::create_workspace(
+                std::size_t bytes) {
+            if (bytes == 0) {
+                // Valid empty owner: no arena suballocation, no native
+                // call.
+                return std::make_unique<SyclWorkspace>(
+                        *this, nullptr, 0);
+            }
+            // Positive creation suballocates the already reserved data
+            // arena under the allocator bookkeeping boundary; it never
+            // reserves a new native backing. Exhaustion, including
+            // fragmentation with no fitting contiguous range, is
+            // std::bad_alloc with no fallback.
+            void* address = allocate_data(bytes);
+            try {
+                if (sycl::get_pointer_type(address, context())
+                        == sycl::usm::alloc::unknown
+                        || sycl::get_pointer_device(address, context())
+                                != native_device()) {
+                    throw std::runtime_error(
+                            "SYCL workspace storage is incompatible with "
+                            "the owning context");
+                }
+                return std::make_unique<SyclWorkspace>(
+                        *this, address, bytes);
+            } catch (...) {
+                release_data(address);
+                throw;
+            }
         }
 
     }  // namespace

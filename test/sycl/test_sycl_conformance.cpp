@@ -26,7 +26,7 @@
 #include "copy.hpp"
 #include "staging_pool.hpp"
 #include "runtime.hpp"
-
+#include "iom/gpu_algorithm.hpp"
 namespace {
 
 
@@ -489,5 +489,163 @@ TEST_CASE("SYCL conformance: binary MUL SUB and floating DIV values through real
         iom_conformance::run_binary_value_conformance(
                 *devices.candidate, operation);
     }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+namespace {
+
+// File-scope sink for the leaf-01 allocation instrumentation, used to
+// prove raw-workspace creation, exhaustion, and the pure requirement
+// queries never reserve native device storage.
+std::vector<iom::sycl_detail::AllocationRecord>* g_workspace_records =
+        nullptr;
+
+void capture_workspace_allocations(
+        const iom::sycl_detail::AllocationRecord& record) {
+    if (g_workspace_records != nullptr) {
+        g_workspace_records->push_back(record);
+    }
+}
+
+struct WorkspaceObserverRestore final {
+    WorkspaceObserverRestore()
+            : saved_(iom::sycl_detail::allocation_observer),
+              saved_sink_(g_workspace_records) {}
+
+    WorkspaceObserverRestore(const WorkspaceObserverRestore&) = delete;
+    WorkspaceObserverRestore& operator=(const WorkspaceObserverRestore&) =
+            delete;
+
+    ~WorkspaceObserverRestore() {
+        iom::sycl_detail::allocation_observer = saved_;
+        g_workspace_records = saved_sink_;
+    }
+
+    iom::sycl_detail::AllocationObserver saved_;
+    std::vector<iom::sycl_detail::AllocationRecord>* saved_sink_ = nullptr;
+};
+
+[[nodiscard]] std::size_t succeeded_data_backing_allocations(
+        const std::vector<iom::sycl_detail::AllocationRecord>& records) {
+    std::size_t count = 0;
+    for (const auto& record : records) {
+        if (record.classification
+                == iom::sycl_detail::AllocationClass::data_backing
+                && record.kind
+                        == iom::sycl_detail::AllocationKind::allocate
+                && record.succeeded) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+}  // namespace
+
+TEST_CASE("SYCL conformance: raw workspace suballocates the reserved data arena") {
+    SyclDevices devices;
+    WorkspaceObserverRestore observer_restore;
+    std::vector<iom::sycl_detail::AllocationRecord> records;
+    g_workspace_records = &records;
+    iom::sycl_detail::allocation_observer.complete =
+            &capture_workspace_allocations;
+
+    auto& device = *devices.candidate;
+    const std::size_t backings_before =
+            succeeded_data_backing_allocations(records);
+
+    // Empty owner: valid and allocation-free.
+    auto empty = device.create_workspace(0);
+    REQUIRE(empty != nullptr);
+    CHECK(empty->empty());
+    CHECK_EQ(empty->byte_size(), 0);
+    CHECK(empty->view().owner_identity() == empty.get());
+    CHECK(&empty->view().device() == &device);
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+
+    // Positive creation suballocates the existing data arena: the range
+    // is 32-byte aligned with the required capacity, and no new native
+    // data backing appears.
+    auto workspace = device.create_workspace(4096);
+    REQUIRE(workspace != nullptr);
+    const iom::RawWorkspaceView view = workspace->view();
+    CHECK_EQ(view.byte_size(), 4096);
+    CHECK(view.owner_identity() == workspace.get());
+    CHECK_NOTHROW((void)iom::detail::WorkspaceValidation::validated(
+            device, view, 4096, 32, {}));
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+
+    // Exhaustion beyond the remaining contiguous arena range is
+    // std::bad_alloc with no fallback backing allocation.
+    CHECK_THROWS_AS((void)
+            device.create_workspace(640u * 1024 * 1024), std::bad_alloc);
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+}
+
+TEST_CASE("SYCL conformance: workspace requirement queries are pure and exact") {
+    SyclDevices devices;
+    WorkspaceObserverRestore observer_restore;
+    std::vector<iom::sycl_detail::AllocationRecord> records;
+    g_workspace_records = &records;
+    iom::sycl_detail::allocation_observer.complete =
+            &capture_workspace_allocations;
+
+    auto& device = *devices.candidate;
+    const iom::TensorSpec rank_two{
+            iom::TensorShape{{17, 33}}, iom::DataType::F32};
+    const iom::TensorSpec rank_three{
+            iom::TensorShape{{2, 3, 17, 33}}, iom::DataType::F32};
+    auto two_lhs = device.create_tensor(rank_two);
+    auto two_rhs = device.create_tensor(rank_two);
+    auto two_out = device.create_tensor(rank_two);
+    auto lhs = device.create_tensor(rank_three);
+    auto rhs = device.create_tensor(rank_three);
+    auto out = device.create_tensor(rank_three);
+    auto queue = device.create_ops();
+
+    // Whole-plane padded staging for one {17, 33} F32 plane is
+    // 32 * 48 * 4 = 6144 bytes. A rank-two view touches one plane; a
+    // rank-three {2, 3, 17, 33} view walks to the highest addressed
+    // plane 6 ((2-1)*3 + (3-1)*1 + 1), so each slice stages six planes.
+    const std::size_t plane_bytes = 32 * 48 * 4;
+    const std::size_t rank_two_total = 3 * plane_bytes;
+    const std::size_t rank_three_total =
+            3 * (2 * 3 * plane_bytes);
+    CHECK(queue->add_workspace_requirements(
+                  two_lhs->view(), two_rhs->view(), two_out->view())
+          == iom::WorkspaceRequirements{rank_two_total, 32});
+
+    const iom::WorkspaceRequirements expected_rank_three{
+            rank_three_total, 32};
+    CHECK(queue->add_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view())
+          == expected_rank_three);
+    CHECK(queue->mul_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view())
+          == expected_rank_three);
+    CHECK(queue->sub_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view())
+          == expected_rank_three);
+    CHECK(queue->div_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view())
+          == expected_rank_three);
+
+    // Host transfers stage the word-padded logical bytes.
+    const iom::WorkspaceRequirements transfer{
+            iom::gpu_algorithm::compute_staging_size(
+                    rank_three.logical_nbytes()),
+            32};
+    CHECK(lhs->view().copy_from_host_workspace_requirements() == transfer);
+    CHECK(lhs->view().copy_to_host_workspace_requirements() == transfer);
+
+    // The queries reserve no native device storage at all.
+    CHECK_EQ(succeeded_data_backing_allocations(records), 0);
+
+    // Validation matches the binary operation exactly.
+    auto foreign_tensor = devices.reference->create_tensor(rank_three);
+    CHECK_THROWS_AS((void)
+            queue->add_workspace_requirements(
+                    foreign_tensor->view(), rhs->view(), out->view()),
+            std::invalid_argument);
     CHECK_FALSE(devices.gate.armed());
 }

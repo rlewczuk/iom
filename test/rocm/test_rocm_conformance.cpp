@@ -26,10 +26,11 @@
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
-#include "iom/alloc.hpp"
-#include "iom/cpu/device.hpp"
 #include "iom/rocm/device.hpp"
 #include "rocm/copy.hpp"
+#include "iom/gpu_algorithm.hpp"
+#include "iom/alloc.hpp"
+#include "iom/cpu/device.hpp"
 extern char** environ;
 
 
@@ -809,6 +810,153 @@ TEST_CASE("ROCm conformance: rank boundary covers rank-eight owners and rejects 
     // rank-nine and rank-increasing-transform rejection, all through the
     // real device allocator and native queue.
     iom_conformance::run_accelerator_rank_boundary_conformance(*device);
+    CHECK_FALSE(gate.armed());
+}
+
+namespace {
+
+// File-scope sink for the leaf-01 allocation instrumentation, used to
+// prove raw-workspace creation and exhaustion never reserve a new native
+// data backing.
+std::vector<iom::rocm_detail::AllocationRecord>* g_workspace_records =
+        nullptr;
+
+void capture_workspace_allocations(
+        const iom::rocm_detail::AllocationRecord& record) {
+    if (g_workspace_records != nullptr) {
+        g_workspace_records->push_back(record);
+    }
+}
+
+struct WorkspaceObserverRestore final {
+    WorkspaceObserverRestore()
+            : saved_(iom::rocm_detail::allocation_observer),
+              saved_sink_(g_workspace_records) {}
+
+    WorkspaceObserverRestore(const WorkspaceObserverRestore&) = delete;
+    WorkspaceObserverRestore& operator=(const WorkspaceObserverRestore&) =
+            delete;
+
+    ~WorkspaceObserverRestore() {
+        iom::rocm_detail::allocation_observer = saved_;
+        g_workspace_records = saved_sink_;
+    }
+
+    iom::rocm_detail::AllocationObserver saved_;
+    std::vector<iom::rocm_detail::AllocationRecord>* saved_sink_ = nullptr;
+};
+
+[[nodiscard]] std::size_t succeeded_data_backing_allocations(
+        const std::vector<iom::rocm_detail::AllocationRecord>& records) {
+    std::size_t count = 0;
+    for (const auto& record : records) {
+        if (record.classification
+                == iom::rocm_detail::AllocationClass::data_backing
+                && record.kind
+                        == iom::rocm_detail::AllocationKind::allocate
+                && record.succeeded) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+}  // namespace
+
+TEST_CASE("ROCm conformance: raw workspace suballocates the reserved data arena") {
+    WorkspaceObserverRestore observer_restore;
+    std::vector<iom::rocm_detail::AllocationRecord> records;
+    g_workspace_records = &records;
+    iom::rocm_detail::allocation_observer.complete =
+            &capture_workspace_allocations;
+
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{1u * 1024 * 1024});
+    const std::size_t backings_before =
+            succeeded_data_backing_allocations(records);
+
+    // Empty owner: valid and allocation-free.
+    auto empty = device->create_workspace(0);
+    REQUIRE(empty != nullptr);
+    CHECK(empty->empty());
+    CHECK_EQ(empty->byte_size(), 0);
+    CHECK(empty->view().owner_identity() == empty.get());
+    CHECK(&empty->view().device() == device.get());
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+
+    // Positive creation suballocates the existing data arena: the range
+    // is 32-byte aligned with the required capacity, and no new native
+    // data backing appears.
+    auto workspace = device->create_workspace(4096);
+    REQUIRE(workspace != nullptr);
+    const iom::RawWorkspaceView view = workspace->view();
+    CHECK_EQ(view.byte_size(), 4096);
+    CHECK(view.owner_identity() == workspace.get());
+    CHECK_NOTHROW((void)iom::detail::WorkspaceValidation::validated(
+            *device, view, 4096, 32, {}));
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+
+    // Owner identity is stable across further device activity.
+    const iom::RawWorkspaceView view_before = workspace->view();
+    auto another = device->create_workspace(256);
+    REQUIRE(another != nullptr);
+    const iom::RawWorkspaceView view_after = workspace->view();
+    CHECK(view_after == view_before);
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+
+    // Exhaustion beyond the remaining contiguous arena range is
+    // std::bad_alloc with no fallback backing allocation.
+    CHECK_THROWS_AS((void)
+            device->create_workspace(2u * 1024 * 1024), std::bad_alloc);
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+
+    // Destroying a workspace returns its arena range for reuse.
+    another.reset();
+    auto reused = device->create_workspace(256);
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->byte_size(), 256);
+    CHECK_EQ(succeeded_data_backing_allocations(records), backings_before);
+}
+
+TEST_CASE("ROCm conformance: workspace requirement queries are pure and exact") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 17, 33}}, iom::DataType::F32};
+    auto lhs = device->create_tensor(spec);
+    auto rhs = device->create_tensor(spec);
+    auto out = device->create_tensor(spec);
+    auto queue = device->create_ops();
+
+    // ROCm binary operations need no raw workspace.
+    const iom::WorkspaceRequirements zero{0, 1};
+    CHECK(queue->add_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(queue->mul_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(queue->sub_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+    CHECK(queue->div_workspace_requirements(
+                  lhs->view(), rhs->view(), out->view()) == zero);
+
+    // Host transfers stage the whole-plane word-padded logical bytes.
+    const iom::WorkspaceRequirements transfer{
+            iom::gpu_algorithm::compute_staging_size(
+                    spec.logical_nbytes()),
+            32};
+    CHECK(lhs->view().copy_from_host_workspace_requirements() == transfer);
+    CHECK(lhs->view().copy_to_host_workspace_requirements() == transfer);
+
+    // Validation matches the binary operation exactly.
+    auto foreign_tensor = reference->create_tensor(spec);
+    CHECK_THROWS_AS((void)
+            queue->add_workspace_requirements(
+                    foreign_tensor->view(), rhs->view(), out->view()),
+            std::invalid_argument);
     CHECK_FALSE(gate.armed());
 }
 

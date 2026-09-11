@@ -147,9 +147,142 @@ namespace iom {
             const TensorSpec& spec, std::size_t plane,
             std::size_t row, std::size_t column);
 
+        // Shared raw-workspace range validation machinery. Declared here so
+        // RawWorkspaceView can grant it checked access to the owner range
+        // without exposing workspace addresses for construction; defined
+        // with the iom.hpp operation contract.
+        class WorkspaceValidation;
+
     }  // namespace detail
 
     class Device;
+    class Tensor;
+    class RawWorkspace;
+
+    /**
+     * Deterministic byte capacity and alignment requirement for one raw
+     * device workspace. Zero-byte requirements carry alignment one, and
+     * every reported requirement is independent of free data-arena
+     * capacity, queue occupancy, and completion state.
+     */
+    struct WorkspaceRequirements {
+        std::size_t bytes = 0;
+        std::size_t alignment = 1;
+
+        friend bool operator==(
+                const WorkspaceRequirements&,
+                const WorkspaceRequirements&) = default;
+    };
+
+    /**
+     * Non-owning checked byte range over one live, explicitly owned raw
+     * workspace. `RawWorkspaceView{}` is the valid empty default; views are
+     * copy-constructible and never retargetable, so every copy preserves
+     * the exact owning `RawWorkspace`, its creating `Device`, and the
+     * checked byte extent. Only a live owner can produce a view, and all
+     * subrange arithmetic is checked against the owner range. No
+     * constructor accepts an arbitrary pointer or backend handle.
+     */
+    class RawWorkspaceView {
+    public:
+        RawWorkspaceView() = default;
+        RawWorkspaceView(const RawWorkspaceView&) = default;
+        RawWorkspaceView(RawWorkspaceView&&) = delete;
+        RawWorkspaceView& operator=(const RawWorkspaceView&) = delete;
+        RawWorkspaceView& operator=(RawWorkspaceView&&) = delete;
+
+        [[nodiscard]] bool empty() const noexcept {
+            return owner_ == nullptr;
+        }
+        [[nodiscard]] std::size_t byte_size() const noexcept {
+            return bytes_;
+        }
+        [[nodiscard]] std::size_t offset() const noexcept {
+            return offset_;
+        }
+        // Checked range extents within the owning workspace: both derive
+        // from values bounded at view construction.
+        [[nodiscard]] std::size_t range_begin() const noexcept {
+            return offset_;
+        }
+        [[nodiscard]] std::size_t range_end() const noexcept {
+            return offset_ + bytes_;
+        }
+        [[nodiscard]] const RawWorkspace* owner_identity() const noexcept {
+            return owner_;
+        }
+        [[nodiscard]] const Device& device() const;
+        [[nodiscard]] BackendKind backend_kind() const;
+        [[nodiscard]] std::uint32_t backend_device() const;
+
+        // Owner-absolute checked subrange. The offset counts from the
+        // owner base and must stay 32-byte aligned; the construction
+        // invariants `offset <= owner_bytes` and
+        // `bytes <= owner_bytes - offset` are checked before any view
+        // value exists.
+        [[nodiscard]] RawWorkspaceView subrange(
+                std::size_t offset, std::size_t bytes) const;
+
+        friend bool operator==(
+                const RawWorkspaceView&,
+                const RawWorkspaceView&) = default;
+
+    private:
+        friend class RawWorkspace;
+        friend class detail::WorkspaceValidation;
+        RawWorkspaceView(const RawWorkspace& owner, std::size_t offset,
+                         std::size_t bytes);
+        [[nodiscard]] void* range_address() const noexcept;
+
+        const RawWorkspace* owner_ = nullptr;
+        std::size_t offset_ = 0;
+        std::size_t bytes_ = 0;
+    };
+
+    /**
+     * Explicitly owned raw device workspace created through
+     * Device::create_workspace. Non-copyable and non-movable so the owner
+     * and its backing range never relocate or retarget while views or
+     * accepted work exist; the creating Device must outlive the workspace.
+     * The owner registers its exact identity with the Device for the whole
+     * lifetime, which is what lets shared validation reject foreign and
+     * dead owners without dereferencing them. No CUDA, HIP, SYCL, or TTNN
+     * runtime type is exposed.
+     */
+    class RawWorkspace {
+    public:
+        virtual ~RawWorkspace();
+        RawWorkspace(const RawWorkspace&) = delete;
+        RawWorkspace& operator=(const RawWorkspace&) = delete;
+        RawWorkspace(RawWorkspace&&) = delete;
+        RawWorkspace& operator=(RawWorkspace&&) = delete;
+
+        [[nodiscard]] std::size_t byte_size() const noexcept {
+            return bytes_;
+        }
+        [[nodiscard]] bool empty() const noexcept {
+            return bytes_ == 0;
+        }
+        [[nodiscard]] const Device& device() const noexcept {
+            return *device_;
+        }
+        [[nodiscard]] BackendKind backend_kind() const noexcept;
+        [[nodiscard]] std::uint32_t backend_device() const noexcept;
+        // Full-range view of this live owner.
+        [[nodiscard]] RawWorkspaceView view() const;
+
+    protected:
+        RawWorkspace(const Device& device, std::size_t bytes);
+        // Stable base address of the owned backing range; nullptr for an
+        // empty (zero-byte) workspace. Backends report their arena
+        // suballocation here.
+        [[nodiscard]] virtual void* workspace_address() const noexcept;
+
+    private:
+        friend class RawWorkspaceView;
+        const Device* device_;
+        std::size_t bytes_;
+    };
     class Tensor;
 
     /**
@@ -202,6 +335,19 @@ namespace iom {
         // replace, or relocate storage.
         void copy_from_host(std::span<const std::byte> source);
         void copy_to_host(std::span<std::byte> destination) const;
+
+        // Pure deterministic host-transfer workspace requirements (leaf
+        // 05). Each query validates the view specification with the same
+        // checked arithmetic as the transfer itself and reports, without
+        // any allocation, registration, leasing, or native effect:
+        // CPU and TTNN `{0, 1}`, and CUDA, ROCm, and SYCL
+        // `{gpu_algorithm::compute_staging_size(logical_nbytes), 32}`.
+        // The data-dependent BOOL byte check stays with the transfer
+        // call: it is not a pure-query predicate.
+        [[nodiscard]] WorkspaceRequirements
+                copy_from_host_workspace_requirements() const;
+        [[nodiscard]] WorkspaceRequirements
+                copy_to_host_workspace_requirements() const;
 
     private:
         friend class Tensor;

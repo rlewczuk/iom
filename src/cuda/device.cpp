@@ -177,6 +177,8 @@ namespace iom {
 
             [[nodiscard]] std::unique_ptr<Tensor> create_tensor(
                     const TensorSpec& spec) override;
+            [[nodiscard]] std::unique_ptr<RawWorkspace> create_workspace(
+                    std::size_t bytes) override;
 
             [[nodiscard]] std::unique_ptr<DeviceOps> create_ops() override {
                 activate();
@@ -218,6 +220,37 @@ namespace iom {
                 data_allocator_->free(address);
             }
 
+            // Returns one raw-workspace arena range at owner destruction.
+            // A retained (live or quarantined) lease keeps the range out
+            // of the allocator: it is deferred into the device quarantine
+            // and freed only on the final drain, never reused. The lease
+            // check releases the registry allocation mutex before any
+            // allocator work.
+            void release_workspace(
+                    const RawWorkspace* owner, void* address,
+                    std::size_t bytes) noexcept {
+                bool retained = false;
+                {
+                    std::lock_guard<std::mutex> lock(
+                            registry_state_.allocation_mutex);
+                    retained = detail::workspace_range_retained(
+                            registry_state_.workspace_leases, owner,
+                            address, bytes);
+                }
+                if (retained) {
+                    try {
+                        registry_state_.quarantine
+                                .emplace<detail::AllocatorCleanupAction>(
+                                        *data_allocator_, address, bytes);
+                    } catch (...) {
+                        // Keep failed storage unavailable if quarantine
+                        // allocation itself fails.
+                    }
+                    return;
+                }
+                release_data(address);
+            }
+
             [[nodiscard]] iom::Allocator& data_allocator() noexcept {
                 return *data_allocator_;
             }
@@ -244,6 +277,39 @@ namespace iom {
             std::size_t data_backing_bytes_ = 0;
             CUdeviceptr metadata_backing_ = 0;
             friend class CudaTensor;
+        };
+
+        /**
+         * Owner of one raw-workspace arena suballocation. The base
+         * RawWorkspace registers the exact identity with the device
+         * before the body can fail; destruction hands the range back
+         * through the device boundary, which keeps a retained lease out
+         * of the allocator.
+         */
+        class CudaWorkspace final : public RawWorkspace {
+        public:
+            CudaWorkspace(
+                    CudaDevice& device, void* address, std::size_t bytes)
+                    : RawWorkspace(device, bytes),
+                      device_(device),
+                      address_(address) {}
+
+            ~CudaWorkspace() override {
+                if (address_ != nullptr) {
+                    device_.release_workspace(this, address_, byte_size());
+                }
+            }
+
+            CudaWorkspace(const CudaWorkspace&) = delete;
+            CudaWorkspace& operator=(const CudaWorkspace&) = delete;
+
+        private:
+            [[nodiscard]] void* workspace_address() const noexcept override {
+                return address_;
+            }
+
+            CudaDevice& device_;
+            void* address_;
         };
 
         class CudaTensor final : public Tensor {
@@ -338,6 +404,29 @@ namespace iom {
         // The base Tensor ctor validates the spec before any device
         // interaction; the CudaTensor ctor then suballocates the data arena.
         return std::make_unique<CudaTensor>(spec, *this);
+    }
+
+    std::unique_ptr<RawWorkspace> CudaDevice::create_workspace(
+            std::size_t bytes) {
+        if (bytes == 0) {
+            // Valid empty owner: no arena suballocation, no native call.
+            return std::make_unique<CudaWorkspace>(*this, nullptr, 0);
+        }
+        // Positive creation suballocates the already reserved data arena
+        // under the allocator bookkeeping boundary; it never reserves a
+        // new native backing. Exhaustion, including fragmentation with no
+        // fitting contiguous range, is std::bad_alloc with no fallback.
+        void* address = allocate_data(bytes);
+        try {
+            activate();
+            validate_native_storage(
+                    address, context_, ordinal_, data_backing_,
+                    data_backing_bytes_);
+            return std::make_unique<CudaWorkspace>(*this, address, bytes);
+        } catch (...) {
+            release_data(address);
+            throw;
+        }
     }
 
     namespace {

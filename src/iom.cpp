@@ -1,6 +1,7 @@
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
+#include "iom/gpu_algorithm.hpp"
 
 #include <algorithm>
 #include <bitset>
@@ -490,6 +491,44 @@ namespace iom {
         owner_->region_to_host(*this, destination);
     }
 
+    namespace {
+
+        // Shared body of the two host-transfer requirement queries: the
+        // checked logical-byte walk of the transfer itself plus the
+        // backend's staging rule. Both current transfer directions share
+        // the same preconditions; the data-dependent BOOL byte check is a
+        // transfer-time predicate and intentionally not part of a pure
+        // query. No allocation, registration, leasing, or native effect.
+        WorkspaceRequirements host_transfer_workspace_requirements(
+                const TensorView& view) {
+            const std::size_t logical_nbytes =
+                    view.spec().logical_nbytes();
+            switch (view.backend_kind()) {
+                case BackendKind::CPU:
+                case BackendKind::TTNN:
+                    return {0, 1};
+                case BackendKind::CUDA:
+                case BackendKind::ROCM:
+                case BackendKind::SYCL:
+                    return {gpu_algorithm::compute_staging_size(
+                                    logical_nbytes),
+                            32};
+            }
+            throw std::invalid_argument("tensor view has an unknown backend");
+        }
+
+    }  // namespace
+
+    WorkspaceRequirements
+            TensorView::copy_from_host_workspace_requirements() const {
+        return host_transfer_workspace_requirements(*this);
+    }
+
+    WorkspaceRequirements
+            TensorView::copy_to_host_workspace_requirements() const {
+        return host_transfer_workspace_requirements(*this);
+    }
+
     Tensor::Tensor(TensorSpec spec, Device& device)
             : device_(&device),
               full_view_(*this, spec, 0, validated_dense_plane_strides(spec)) {}
@@ -501,6 +540,108 @@ namespace iom {
 
     const TensorView& Tensor::view() const noexcept {
         return full_view_;
+    }
+
+    // ------------------------------------------------------------------
+    // Raw workspace ownership and views (leaf 05).
+
+    RawWorkspaceView::RawWorkspaceView(
+            const RawWorkspace& owner, std::size_t offset,
+            std::size_t bytes)
+            : owner_(&owner),
+              offset_(offset),
+              bytes_(bytes) {
+        const std::size_t owner_bytes = owner.byte_size();
+        if (offset > owner_bytes) {
+            throw std::out_of_range(
+                    "workspace subrange offset exceeds the owner range");
+        }
+        if (bytes > owner_bytes - offset) {
+            throw std::out_of_range(
+                    "workspace subrange exceeds the owner range");
+        }
+    }
+
+    const Device& RawWorkspaceView::device() const {
+        if (owner_ == nullptr) {
+            throw std::logic_error(
+                    "empty workspace view has no device");
+        }
+        return owner_->device();
+    }
+
+    BackendKind RawWorkspaceView::backend_kind() const {
+        return device().backend_kind();
+    }
+
+    std::uint32_t RawWorkspaceView::backend_device() const {
+        return device().backend_device();
+    }
+
+    RawWorkspaceView RawWorkspaceView::subrange(
+            std::size_t offset, std::size_t bytes) const {
+        if (owner_ == nullptr) {
+            throw std::invalid_argument(
+                    "empty workspace view has no owner to subrange");
+        }
+        if (offset % 32 != 0) {
+            throw std::invalid_argument(
+                    "workspace subrange offset is not 32-byte aligned");
+        }
+        return RawWorkspaceView{*owner_, offset, bytes};
+    }
+
+    void* RawWorkspaceView::range_address() const noexcept {
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(
+                owner_ == nullptr ? nullptr
+                                  : owner_->workspace_address());
+        return reinterpret_cast<void*>(base + offset_);
+    }
+
+    RawWorkspace::RawWorkspace(const Device& device, std::size_t bytes)
+            : device_(&device),
+              bytes_(bytes) {
+        device.register_workspace(this);
+    }
+
+    RawWorkspace::~RawWorkspace() {
+        device_->unregister_workspace(this);
+    }
+
+    BackendKind RawWorkspace::backend_kind() const noexcept {
+        return device_->backend_kind();
+    }
+
+    std::uint32_t RawWorkspace::backend_device() const noexcept {
+        return device_->backend_device();
+    }
+
+    RawWorkspaceView RawWorkspace::view() const {
+        return RawWorkspaceView{*this, 0, bytes_};
+    }
+
+    void* RawWorkspace::workspace_address() const noexcept {
+        return nullptr;
+    }
+
+    bool Device::owns_workspace(const RawWorkspace* workspace) const noexcept {
+        if (workspace == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(workspace_registry_mutex_);
+        return live_workspaces_.find(workspace)
+                != live_workspaces_.end();
+    }
+
+    void Device::register_workspace(const RawWorkspace* workspace) const {
+        std::lock_guard<std::mutex> lock(workspace_registry_mutex_);
+        live_workspaces_.insert(workspace);
+    }
+
+    void Device::unregister_workspace(
+            const RawWorkspace* workspace) const noexcept {
+        std::lock_guard<std::mutex> lock(workspace_registry_mutex_);
+        live_workspaces_.erase(workspace);
     }
 
     namespace {
@@ -982,6 +1123,107 @@ namespace iom {
         } catch (...) {
             return invoke_failure(std::current_exception());
         }
+    }
+
+    WorkspaceRequirements
+    DeviceOps::binary_workspace_requirements(const BinaryRequest&) {
+        // CPU, TTNN, CUDA, and ROCm need no raw workspace for the binary
+        // operations. SYCL overrides this hook with its checked
+        // whole-plane staging sum.
+        return {0, 1};
+    }
+
+    WorkspaceRequirements DeviceOps::add_workspace_requirements(
+            const TensorView& lhs, const TensorView& rhs,
+            const TensorView& out) {
+        const BinaryRequest request = validate_binary(
+                queue_device(), BinaryOperation::Add, lhs, rhs, out);
+        return binary_workspace_requirements(request);
+    }
+
+    WorkspaceRequirements DeviceOps::mul_workspace_requirements(
+            const TensorView& lhs, const TensorView& rhs,
+            const TensorView& out) {
+        const BinaryRequest request = validate_binary(
+                queue_device(), BinaryOperation::Mul, lhs, rhs, out);
+        return binary_workspace_requirements(request);
+    }
+
+    WorkspaceRequirements DeviceOps::sub_workspace_requirements(
+            const TensorView& lhs, const TensorView& rhs,
+            const TensorView& out) {
+        const BinaryRequest request = validate_binary(
+                queue_device(), BinaryOperation::Sub, lhs, rhs, out);
+        return binary_workspace_requirements(request);
+    }
+
+    WorkspaceRequirements DeviceOps::div_workspace_requirements(
+            const TensorView& lhs, const TensorView& rhs,
+            const TensorView& out) {
+        const BinaryRequest request = validate_binary(
+                queue_device(), BinaryOperation::Div, lhs, rhs, out);
+        return binary_workspace_requirements(request);
+    }
+
+    RawWorkspaceView detail::WorkspaceValidation::validated(
+            const Device& device, const RawWorkspaceView& workspace,
+            std::size_t required_capacity, std::size_t required_alignment,
+            std::span<const TensorView> operands) {
+        if (required_capacity == 0) {
+            // Zero-requirement operations touch no scratch: the facades
+            // default to the empty view exactly for this case, and any
+            // view value is acceptable.
+            return workspace;
+        }
+        if (workspace.empty()) {
+            throw std::invalid_argument(
+                    "positive workspace requirement needs a non-empty "
+                    "workspace view");
+        }
+        if (&workspace.device() != &device) {
+            throw std::invalid_argument(
+                    "workspace does not belong to this device");
+        }
+        if (!device.owns_workspace(workspace.owner_identity())) {
+            throw std::invalid_argument(
+                    "workspace owner is not live on this device");
+        }
+        if (workspace.byte_size() < required_capacity) {
+            throw std::invalid_argument(
+                    "workspace is smaller than the required capacity");
+        }
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(
+                workspace.range_address());
+        if (base % 32 != 0) {
+            throw std::invalid_argument(
+                    "workspace range is not 32-byte aligned");
+        }
+        if (required_alignment != 1 && base % required_alignment != 0) {
+            throw std::invalid_argument(
+                    "workspace range alignment is insufficient");
+        }
+        if (workspace.byte_size()
+                > std::numeric_limits<std::uintptr_t>::max() - base) {
+            throw std::overflow_error("workspace range end overflows");
+        }
+        const std::uintptr_t range_end = base + workspace.byte_size();
+        for (const TensorView& operand : operands) {
+            const std::uintptr_t operand_base =
+                    reinterpret_cast<std::uintptr_t>(
+                            operand.native_handle());
+            const std::size_t operand_bytes =
+                    operand.owner_identity()
+                            ->view()
+                            .spec()
+                            .tiled_storage_nbytes();
+            const std::uintptr_t operand_end = operand_base + operand_bytes;
+            if (base < operand_end && operand_base < range_end) {
+                throw std::invalid_argument(
+                        "workspace range overlaps an operand or output "
+                        "storage range");
+            }
+        }
+        return workspace;
     }
 
     oid DeviceOps::silu(
