@@ -551,8 +551,8 @@ inline void run_compute_capability_conformance(
 
     const std::vector<std::byte> y_pattern = encode_logical(spec, 41);
     const std::vector<std::byte> attn_pattern = encode_logical(spec, 42);
-    y->view().copy_from_host(y_pattern);
-    attn->view().copy_from_host(attn_pattern);
+    iom_conformance::copy_from_host(y->view(), y_pattern);
+    iom_conformance::copy_from_host(attn->view(), attn_pattern);
     auto queue = candidate.create_ops();
     (void)backend_label;
     const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);

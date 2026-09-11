@@ -335,8 +335,12 @@ namespace iom {
         // binary operations track all three owners through completion,
         // deduplicate exact aliases, snapshot metadata, and never allocate,
         // replace, or relocate storage.
-        void copy_from_host(std::span<const std::byte> source);
-        void copy_to_host(std::span<std::byte> destination) const;
+        void copy_from_host(
+                std::span<const std::byte> source,
+                RawWorkspaceView workspace = {});
+        void copy_to_host(
+                std::span<std::byte> destination,
+                RawWorkspaceView workspace = {}) const;
 
         // Pure deterministic host-transfer workspace requirements (leaf
         // 05). Each query validates the view specification with the same
@@ -385,10 +389,14 @@ namespace iom {
         Tensor(TensorSpec spec, Device& device);
 
         [[nodiscard]] virtual void* storage_handle() noexcept = 0;
-        virtual void region_from_host(const TensorView& destination,
-                                      std::span<const std::byte> source) = 0;
-        virtual void region_to_host(const TensorView& source,
-                                    std::span<std::byte> destination) const = 0;
+        virtual void region_from_host(
+                const TensorView& destination,
+                std::span<const std::byte> source,
+                RawWorkspaceView workspace) = 0;
+        virtual void region_to_host(
+                const TensorView& source,
+                std::span<std::byte> destination,
+                RawWorkspaceView workspace) const = 0;
 
     private:
         friend class TensorView;

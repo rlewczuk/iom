@@ -17,8 +17,6 @@
 #include "../shared/metadata_slot_pool.hpp"
 #include "../shared/queue_resources.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
-#include "../shared/staging_pool.hpp"
-#include "../shared/transfer_pool.hpp"
 
 #include "iom/iom.hpp"
 
@@ -198,11 +196,6 @@ struct gpu_policy {
         return reinterpret_cast<void*>(address);
     }
 
-    [[nodiscard]] static void* staging_address(
-            device_pointer address) noexcept {
-        return reinterpret_cast<void*>(address);
-    }
-
     static void free_noexcept(void* address) noexcept {
         if (address != nullptr) {
             (void)free_attempt(
@@ -210,35 +203,6 @@ struct gpu_policy {
                     AllocationClass::operation_metadata,
                     AllocationPhase::post_publication);
         }
-    }
-
-    [[nodiscard]] static device_pointer staging_allocate(
-            std::size_t bytes) {
-        device_pointer address = 0;
-        check_cuda(
-                "cuMemAlloc",
-                allocation_attempt(
-                        &address, bytes, AllocationClass::staging,
-                        AllocationPhase::post_publication));
-        return address;
-    }
-
-    static void staging_free_noexcept(device_pointer address) noexcept {
-        if (address != device_pointer{}) {
-            (void)free_attempt(
-                    address, AllocationClass::staging,
-                    AllocationPhase::post_publication);
-        }
-    }
-
-    [[nodiscard]] static std::runtime_error staging_pool_closing_error() {
-        return std::runtime_error("CUDA staging pool is closing");
-    }
-
-    [[nodiscard]] static std::runtime_error transfer_pool_closing_error() {
-        return std::runtime_error(
-                "cudaStreamCreateWithFlags failed with "
-                "cudaErrorStreamDestroyed: TransferStreamPool is closing");
     }
 
     static void copy_from_host(
@@ -305,20 +269,18 @@ struct gpu_policy {
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
 
-using StagingSlotPool = iom::detail::StagingSlotPool<gpu_policy>;
-using TransferStreamPool = iom::detail::TransferStreamPool<gpu_policy>;
-
 
 void region_from_host(
-        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
-        CUcontext context, const TensorView& destination,
-        std::span<const std::byte> source);
+        cudaStream_t transfer_stream, CUcontext context,
+        const Device& device, detail::RegistryState& registry_state,
+        const TensorView& destination, RawWorkspaceView workspace,
+        std::span<const std::byte> source, bool& resource_poisoned);
 
 void region_to_host(
-        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
-        CUcontext context, const TensorView& source,
-        std::span<std::byte> destination);
-
+        cudaStream_t transfer_stream, CUcontext context,
+        const Device& device, detail::RegistryState& registry_state,
+        const TensorView& source, RawWorkspaceView workspace,
+        std::span<std::byte> destination, bool& resource_poisoned);
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, detail::QueueResourceProvider& resource_provider,
         CUcontext context, detail::RegistryState& registry_state);

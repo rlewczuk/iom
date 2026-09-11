@@ -466,7 +466,8 @@ namespace iom {
                 std::move(strides)};
     }
 
-    void TensorView::copy_from_host(std::span<const std::byte> source) {
+    void TensorView::copy_from_host(
+            std::span<const std::byte> source, RawWorkspaceView workspace) {
         const std::size_t nbytes = spec_.logical_nbytes();
         if (source.size() != nbytes) {
             throw std::invalid_argument(
@@ -480,15 +481,17 @@ namespace iom {
                 }
             }
         }
-        owner_->region_from_host(*this, source);
+        owner_->region_from_host(*this, source, workspace);
     }
 
-    void TensorView::copy_to_host(std::span<std::byte> destination) const {
+    void TensorView::copy_to_host(
+            std::span<std::byte> destination,
+            RawWorkspaceView workspace) const {
         if (destination.size() != spec_.logical_nbytes()) {
             throw std::invalid_argument(
                 "host destination must hold exactly logical_nbytes bytes");
         }
-        owner_->region_to_host(*this, destination);
+        owner_->region_to_host(*this, destination, workspace);
     }
 
     namespace {
@@ -1213,6 +1216,10 @@ namespace iom {
             const Device& device, const RawWorkspaceView& workspace,
             std::size_t required_capacity, std::size_t required_alignment,
             std::span<const TensorView> operands) {
+        if (required_alignment == 0) {
+            throw std::invalid_argument(
+                    "workspace alignment requirement is zero");
+        }
         if (required_capacity == 0) {
             // Zero-requirement operations touch no scratch: the facades
             // default to the empty view exactly for this case, and any
@@ -1224,25 +1231,26 @@ namespace iom {
                     "positive workspace requirement needs a non-empty "
                     "workspace view");
         }
-        if (&workspace.device() != &device) {
-            throw std::invalid_argument(
-                    "workspace does not belong to this device");
-        }
-        if (!device.owns_workspace(workspace.owner_identity())) {
+        const RawWorkspace* owner = workspace.owner_identity();
+        if (owner == nullptr || !device.owns_workspace(owner)) {
             throw std::invalid_argument(
                     "workspace owner is not live on this device");
+        }
+        if (&owner->device() != &device) {
+            throw std::invalid_argument(
+                    "workspace does not belong to this device");
         }
         if (workspace.byte_size() < required_capacity) {
             throw std::invalid_argument(
                     "workspace is smaller than the required capacity");
         }
-        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(
-                workspace.range_address());
-        if (base % 32 != 0) {
-            throw std::invalid_argument(
-                    "workspace range is not 32-byte aligned");
+        const void* raw_address = workspace.range_address();
+        if (raw_address == nullptr) {
+            throw std::invalid_argument("workspace range has no address");
         }
-        if (required_alignment != 1 && base % required_alignment != 0) {
+        const std::uintptr_t base =
+                reinterpret_cast<std::uintptr_t>(raw_address);
+        if (base % required_alignment != 0) {
             throw std::invalid_argument(
                     "workspace range alignment is insufficient");
         }
@@ -1252,6 +1260,12 @@ namespace iom {
         }
         const std::uintptr_t range_end = base + workspace.byte_size();
         for (const TensorView& operand : operands) {
+            if (&operand.device() != &device
+                    || operand.owner_identity() == nullptr
+                    || operand.native_handle() == nullptr) {
+                throw std::invalid_argument(
+                        "workspace operand belongs to another device");
+            }
             const std::uintptr_t operand_base =
                     reinterpret_cast<std::uintptr_t>(
                             operand.native_handle());
@@ -1260,7 +1274,14 @@ namespace iom {
                             ->view()
                             .spec()
                             .tiled_storage_nbytes();
-            const std::uintptr_t operand_end = operand_base + operand_bytes;
+            if (operand_bytes
+                    > std::numeric_limits<std::uintptr_t>::max()
+                            - operand_base) {
+                throw std::overflow_error(
+                        "workspace operand storage range overflows");
+            }
+            const std::uintptr_t operand_end =
+                    operand_base + operand_bytes;
             if (base < operand_end && operand_base < range_end) {
                 throw std::invalid_argument(
                         "workspace range overlaps an operand or output "
@@ -1273,6 +1294,7 @@ namespace iom {
             const RawWorkspaceView& workspace) noexcept {
         return workspace.range_address();
     }
+
 
     oid DeviceOps::silu(
             const TensorView& x, TensorView& y) noexcept {

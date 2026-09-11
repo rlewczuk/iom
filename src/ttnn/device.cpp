@@ -431,7 +431,8 @@ namespace iom {
 
             void region_from_host(
                     const TensorView& destination,
-                    std::span<const std::byte> source) override {
+                    std::span<const std::byte> source,
+                    RawWorkspaceView) override {
                 std::lock_guard<std::mutex> lock(device_.api_mutex());
                 ttnn_detail::region_from_host(
                         device_.mesh(), device_.host_staging(), destination,
@@ -440,7 +441,8 @@ namespace iom {
 
             void region_to_host(
                     const TensorView& source,
-                    std::span<std::byte> destination) const override {
+                    std::span<std::byte> destination,
+                    RawWorkspaceView) const override {
                 std::lock_guard<std::mutex> lock(device_.api_mutex());
                 ttnn_detail::region_to_host(
                         device_.mesh(), device_.host_staging(), source,

@@ -742,24 +742,33 @@ public:
 
     void region_from_host(
             const iom::TensorView& destination,
-            std::span<const std::byte> source) override {
+            std::span<const std::byte> source,
+            iom::RawWorkspaceView workspace) override {
         ++from_host_calls;
         from_view_offset = destination.plane_offset();
         from_view_strides.assign(
                 destination.plane_strides().begin(),
                 destination.plane_strides().end());
+        from_workspace_owner = workspace.owner_identity();
+        from_workspace_offset = workspace.offset();
+        from_workspace_bytes = workspace.byte_size();
         from_bytes.assign(source.begin(), source.end());
     }
 
     void region_to_host(
             const iom::TensorView& source,
-            std::span<std::byte> destination) const override {
+            std::span<std::byte> destination,
+            iom::RawWorkspaceView workspace) const override {
         ++to_host_calls;
         to_view_offset = source.plane_offset();
         to_view_strides.assign(
                 source.plane_strides().begin(), source.plane_strides().end());
+        to_workspace_owner = workspace.owner_identity();
+        to_workspace_offset = workspace.offset();
+        to_workspace_bytes = workspace.byte_size();
         to_destination_size = destination.size();
     }
+
 
     int storage_ = 0;
     void use_storage_handle(void* handle) noexcept {
@@ -772,11 +781,17 @@ public:
     std::size_t from_host_calls = 0;
     std::size_t from_view_offset = 0;
     std::vector<std::size_t> from_view_strides;
+    const iom::RawWorkspace* from_workspace_owner = nullptr;
+    std::size_t from_workspace_offset = 0;
+    std::size_t from_workspace_bytes = 0;
     std::vector<std::byte> from_bytes;
 
     mutable std::size_t to_host_calls = 0;
     mutable std::size_t to_view_offset = 0;
     mutable std::vector<std::size_t> to_view_strides;
+    mutable const iom::RawWorkspace* to_workspace_owner = nullptr;
+    mutable std::size_t to_workspace_offset = 0;
+    mutable std::size_t to_workspace_bytes = 0;
     mutable std::size_t to_destination_size = 0;
 };
 
@@ -1934,11 +1949,18 @@ TEST_CASE("TensorView host transfers delegate the logical region to the owner") 
     CHECK_EQ(strides_of(derived), std::vector<std::size_t>({3}));
     const std::size_t derived_nbytes = derived.spec().logical_nbytes();
     std::vector<std::byte> small(derived_nbytes, std::byte{1});
-    derived.copy_from_host(small);
+    FakeWorkspace workspace(
+            device, reinterpret_cast<void*>(0x1000), 64);
+    const iom::RawWorkspaceView workspace_view =
+            workspace.view().subrange(32, 32);
+    derived.copy_from_host(small, workspace_view);
     CHECK_EQ(tensor.from_host_calls, 2);
     CHECK(tensor.from_bytes == small);
     CHECK_EQ(tensor.from_view_offset, 5);
     CHECK_EQ(tensor.from_view_strides, std::vector<std::size_t>({3}));
+    CHECK(tensor.from_workspace_owner == &workspace);
+    CHECK_EQ(tensor.from_workspace_offset, 32);
+    CHECK_EQ(tensor.from_workspace_bytes, 32);
 
     // Wrong byte counts are rejected before the owner hook runs.
     CHECK_THROWS_AS(
@@ -1959,13 +1981,15 @@ TEST_CASE("TensorView host transfers delegate the logical region to the owner") 
     invalid[invalid.size() - 1] = std::byte{255};
     CHECK_THROWS_AS(tensor.view().copy_from_host(invalid), std::invalid_argument);
     CHECK_EQ(tensor.from_host_calls, 2);
-
-    // Const reads delegate the same view metadata.
+    // Const reads delegate the same view metadata and workspace.
     std::vector<std::byte> sink(derived_nbytes);
-    derived.copy_to_host(sink);
+    derived.copy_to_host(sink, workspace_view);
     CHECK_EQ(tensor.to_host_calls, 1);
     CHECK_EQ(tensor.to_view_offset, 5);
     CHECK_EQ(tensor.to_view_strides, std::vector<std::size_t>({3}));
+    CHECK(tensor.to_workspace_owner == &workspace);
+    CHECK_EQ(tensor.to_workspace_offset, 32);
+    CHECK_EQ(tensor.to_workspace_bytes, 32);
     CHECK_EQ(tensor.to_destination_size, derived_nbytes);
 
     CHECK_THROWS_AS(

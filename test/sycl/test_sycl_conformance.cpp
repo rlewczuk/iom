@@ -24,7 +24,6 @@
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
 #include "copy.hpp"
-#include "staging_pool.hpp"
 #include "runtime.hpp"
 #include "iom/gpu_algorithm.hpp"
 namespace {
@@ -178,21 +177,20 @@ TEST_CASE("SYCL tensor destruction fences queued work") {
             spec.logical_nbytes(), static_cast<std::byte>(0x3c));
     const std::vector<std::byte> zero(
             spec.logical_nbytes(), static_cast<std::byte>(0));
-    source->view().copy_from_host(pattern);
-    destination->view().copy_from_host(zero);
+    iom_conformance::copy_from_host(source->view(), pattern);
+    iom_conformance::copy_from_host(destination->view(), zero);
 
     auto queue = device->create_ops();
     const iom::oid token = queue->copy(
             source->view(), destination->view());
     source.reset();
     auto fresh_source = device->create_tensor(spec);
-    fresh_source->view().copy_from_host(
-            std::vector<std::byte>(
-                    spec.logical_nbytes(), static_cast<std::byte>(0xa5)));
+    iom_conformance::copy_from_host(fresh_source->view(), std::vector<std::byte>(
+            spec.logical_nbytes(), static_cast<std::byte>(0xa5)));
 
     CHECK_NOTHROW(queue->wait(token));
     std::vector<std::byte> observed(spec.logical_nbytes());
-    destination->view().copy_to_host(observed);
+    iom_conformance::copy_to_host(destination->view(), observed);
     CHECK(observed == pattern);
 
     fresh_source.reset();
@@ -317,55 +315,6 @@ TEST_CASE("SYCL identical-window copy is a no-op") {
     CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), 0);
 }
 
-TEST_CASE("SYCL host transfers reuse pooled staging") {
-    SyclDevices devices;
-    const iom::TensorSpec odd_spec{
-            iom::TensorShape{{1, 17}}, iom::DataType::U4};
-    auto odd_tensor = devices.candidate->create_tensor(odd_spec);
-    sycl::queue transfer_queue(
-            *devices.candidate_context,
-            devices.candidate_context->get_devices().front(),
-            sycl::property_list{sycl::property::queue::in_order{}});
-    iom::sycl_detail::StagingSlotPool pool(
-            *devices.candidate_context,
-            devices.candidate_context->get_devices().front());
-
-    std::vector<std::byte> odd_source(odd_spec.logical_nbytes());
-    for (std::size_t index = 0; index < odd_source.size(); ++index) {
-        odd_source[index] = static_cast<std::byte>(index * 13 + 7);
-    }
-    odd_source.back() &= std::byte{0x0f};
-    std::vector<std::byte> odd_result(odd_source.size());
-    for (int iteration = 0; iteration < 3; ++iteration) {
-        iom::sycl_detail::region_from_host(
-                pool, transfer_queue, odd_tensor->view(),
-                odd_tensor->view().native_handle(), odd_source);
-        iom::sycl_detail::region_to_host(
-                pool, transfer_queue, odd_tensor->view(),
-                odd_tensor->view().native_handle(), odd_result);
-        CHECK(odd_result == odd_source);
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    const iom::TensorSpec aligned_spec{
-            iom::TensorShape{{1, 16}}, iom::DataType::U8};
-    auto aligned_tensor = devices.candidate->create_tensor(aligned_spec);
-    std::vector<std::byte> aligned_source(aligned_spec.logical_nbytes());
-    for (std::size_t index = 0; index < aligned_source.size(); ++index) {
-        aligned_source[index] = static_cast<std::byte>(0xa0 + index);
-    }
-    std::vector<std::byte> aligned_result(aligned_source.size());
-    iom::sycl_detail::region_from_host(
-            pool, transfer_queue, aligned_tensor->view(),
-            aligned_tensor->view().native_handle(), aligned_source);
-    iom::sycl_detail::region_to_host(
-            pool, transfer_queue, aligned_tensor->view(),
-            aligned_tensor->view().native_handle(), aligned_result);
-    CHECK(aligned_result == aligned_source);
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-}
 
 TEST_CASE("SyclFenceState::result() idempotency and snapshot-after-clear") {
     SyclDevices devices;

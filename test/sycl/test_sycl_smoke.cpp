@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include "backend/backend_conformance_common.hpp"
 
 #include <sycl/sycl.hpp>
 #include <algorithm>
@@ -20,7 +21,6 @@
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/sycl/device.hpp"
-#include "staging_pool.hpp"
 #include "iom/tensor.hpp"
 #include "copy.hpp"
 #include "runtime.hpp"
@@ -224,51 +224,6 @@ TEST_CASE("SYCL factory rejects the first unavailable ordinal") {
     CHECK(probe.destroyed == 0);
 }
 
-TEST_CASE("SYCL staging pool preserves accounting across allocation failures") {
-    const sycl::device device = first_accelerator_device();
-    const sycl::context context(device);
-    iom::sycl_detail::StagingSlotPool pool(context, device);
-
-    CHECK_THROWS_AS(
-            pool.acquire(
-                    iom::sycl_detail::StagingSlotPool::kMaxStagingBytes + 1),
-            std::invalid_argument);
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS(pool.acquire(4096), std::bad_alloc);
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    {
-        auto lease = pool.acquire(4096);
-        REQUIRE(lease.staging() != nullptr);
-        REQUIRE(lease.host_mirror() != nullptr);
-        CHECK_EQ(pool.allocation_count_for_testing(), 1);
-        CHECK_EQ(pool.idle_count_for_testing(), 0);
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    {
-        auto lease = pool.acquire(8192);
-        CHECK(lease.capacity() >= 8192);
-        CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    }
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    {
-        auto lease = pool.acquire(4096);
-        lease.poison();
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    pool.destroy();
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-}
 
 TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
     REQUIRE(eligible_device_count_from_runtime() > 0);
@@ -295,7 +250,7 @@ TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
             expected[index] = std::byte{
                     static_cast<unsigned char>((index * 13 + 7) % 251)};
         }
-        source->view().copy_from_host(expected);
+        iom_conformance::copy_from_host(source->view(), expected);
 
         probe.launches = 0;
         const iom::oid token =
@@ -304,7 +259,7 @@ TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
         const std::size_t launches = probe.launches;
 
         std::vector<std::byte> actual(expected.size());
-        destination->view().copy_to_host(actual);
+        iom_conformance::copy_to_host(destination->view(), actual);
         CHECK(actual == expected);
         return launches;
     };
@@ -325,7 +280,7 @@ TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
     REQUIRE(identical != nullptr);
     std::vector<std::byte> identical_data(
             identical->view().spec().logical_nbytes(), std::byte{0x3C});
-    identical->view().copy_from_host(identical_data);
+    iom_conformance::copy_from_host(identical->view(), identical_data);
 
     probe.launches = 0;
     const iom::oid identical_token =
@@ -334,212 +289,11 @@ TEST_CASE("SYCL queued copy submits one kernel regardless of plane count") {
     CHECK(probe.launches == 0);
 
     std::vector<std::byte> identical_readback(identical_data.size());
-    identical->view().copy_to_host(identical_readback);
+    iom_conformance::copy_to_host(identical->view(), identical_readback);
     CHECK(identical_readback == identical_data);
 }
 
-TEST_CASE(
-        "SYCL native allocation seam observes exactly two setup backings and "
-        "metadata, staging, and binary-fallback boundaries") {
-    REQUIRE(eligible_device_count_from_runtime() > 0);
 
-    AllocationCallsRestore restore;
-    AllocationProbe probe;
-    active_allocation_probe = &probe;
-    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
-
-    const iom::TensorSpec staging_spec{
-            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
-    // Three temporary host-USM buffers stage each operand through the
-    // caller-supplied raw workspace; only the separate copy path uses the
-    // device staging pool.
-    const iom::TensorSpec binary_spec{
-            iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
-    iom::sycl_detail::AllocationRecord data_backing;
-    iom::sycl_detail::AllocationRecord metadata_backing;
-    {
-        auto device = iom::make_sycl_device(
-                0, iom::DeviceMemoryConfig{kArenaBytes});
-        REQUIRE(device != nullptr);
-        auto staging_source = device->create_tensor(staging_spec);
-        auto staging_destination = device->create_tensor(staging_spec);
-        auto lhs = device->create_tensor(binary_spec);
-        auto rhs = device->create_tensor(binary_spec);
-        auto out = device->create_tensor(binary_spec);
-        auto queue = device->create_ops();
-        REQUIRE(queue != nullptr);
-
-        // Factory setup produced exactly two instrumented backing
-        // allocations; tensor and queue creation suballocate and never
-        // route through the seam.
-        std::vector<iom::sycl_detail::AllocationRecord> setup_allocations;
-        for (const auto& record : probe.records) {
-            if (record.phase == iom::sycl_detail::AllocationPhase::setup
-                    && record.kind
-                            == iom::sycl_detail::AllocationKind::allocate) {
-                setup_allocations.push_back(record);
-            }
-        }
-        REQUIRE_EQ(setup_allocations.size(), 2u);
-        CHECK_EQ(probe.records.size(), 2u);
-        std::size_t data_count = 0;
-        std::size_t metadata_count = 0;
-        for (const auto& record : setup_allocations) {
-            CHECK(record.succeeded);
-            CHECK(record.address != nullptr);
-            CHECK(reinterpret_cast<std::uintptr_t>(record.address) % 32 == 0);
-            if (record.classification
-                == iom::sycl_detail::AllocationClass::data_backing) {
-                ++data_count;
-                data_backing = record;
-            }
-            if (record.classification
-                == iom::sycl_detail::AllocationClass::metadata_backing) {
-                ++metadata_count;
-                metadata_backing = record;
-            }
-        }
-        CHECK_EQ(data_count, 1u);
-        CHECK_EQ(metadata_count, 1u);
-        CHECK_EQ(data_backing.bytes, kArenaBytes);
-        CHECK_EQ(metadata_backing.bytes, 4 * 16 * 512u);
-
-        // Disjoint data and metadata domains.
-        const std::uintptr_t data_begin =
-                reinterpret_cast<std::uintptr_t>(data_backing.address);
-        const std::uintptr_t data_end = data_begin + data_backing.bytes;
-        const std::uintptr_t metadata_begin =
-                reinterpret_cast<std::uintptr_t>(metadata_backing.address);
-        const std::uintptr_t metadata_end =
-                metadata_begin + metadata_backing.bytes;
-        const bool domains_disjoint =
-                data_end <= metadata_begin || metadata_end <= data_begin;
-        CHECK(domains_disjoint);
-
-        std::vector<std::byte> input(
-                staging_spec.logical_nbytes(), std::byte{0x3c});
-        staging_source->view().copy_from_host(input);
-        const iom::oid copy_token = queue->copy(
-                staging_source->view(), staging_destination->view());
-        REQUIRE(iom::oid_is_token(copy_token));
-        queue->wait(copy_token);
-
-        const auto requirements = queue->add_workspace_requirements(
-                lhs->view(), rhs->view(), out->view());
-        REQUIRE_EQ(requirements.alignment, std::size_t{32});
-        auto workspace_owner = device->create_workspace(requirements.bytes);
-        const iom::RawWorkspaceView workspace = workspace_owner->view();
-        const iom::oid binary_token = queue->add(
-                lhs->view(), rhs->view(), out->view(), workspace);
-        REQUIRE(iom::oid_is_token(binary_token));
-        queue->wait(binary_token);
-    }  // queue and device teardown free the pooled metadata, host staging,
-       // workspace owner, and the two arena backings
-
-    std::size_t metadata_allocations = 0;
-    std::size_t staging_allocations = 0;
-    std::size_t staging_2048 = 0;
-    std::size_t failed = 0;
-    std::map<void*, std::size_t> outstanding;
-    // Seed with the two setup backings so their post-publication teardown
-    // frees pair up with the reservation that created them.
-    outstanding[data_backing.address] = data_backing.bytes;
-    outstanding[metadata_backing.address] = metadata_backing.bytes;
-    for (const auto& record : probe.records) {
-        if (record.phase == iom::sycl_detail::AllocationPhase::setup) {
-            continue;
-        }
-        if (record.kind == iom::sycl_detail::AllocationKind::allocate) {
-            if (!record.succeeded) {
-                ++failed;
-                continue;
-            }
-            CHECK(record.address != nullptr);
-            if (record.classification
-                == iom::sycl_detail::AllocationClass::staging) {
-                ++staging_allocations;
-                if (record.bytes == 2048) {
-                    ++staging_2048;
-                }
-            }
-            if (record.classification
-                == iom::sycl_detail::AllocationClass::operation_metadata) {
-                ++metadata_allocations;
-            }
-            outstanding[record.address] = record.bytes;
-        } else {
-            CHECK(record.succeeded);
-            // A free must pair with an earlier allocation: transient churn
-            // stays visible instead of vanishing into a net-byte counter.
-            CHECK(outstanding.erase(record.address) == 1);
-        }
-    }
-    CHECK_EQ(failed, 0u);
-    CHECK_EQ(metadata_allocations, 0u);  // fixed slots; no metadata growth
-    CHECK_GE(staging_allocations, 1u);   // copy staging pool only
-    CHECK_EQ(staging_2048, 0u);          // binary staging uses workspace
-    CHECK(outstanding.empty());          // every allocation freed by teardown
-}
-
-TEST_CASE(
-        "SYCL native allocation seam retains failed attempts and cleanup "
-        "frees") {
-    REQUIRE(eligible_device_count_from_runtime() > 0);
-
-    AllocationCallsRestore restore;
-    AllocationProbe probe;
-    active_allocation_probe = &probe;
-    iom::sycl_detail::allocation_observer.complete = &capture_allocation;
-
-    const sycl::device device = first_accelerator_device();
-    const sycl::context context(device);
-    iom::sycl_detail::StagingSlotPool pool(context, device);
-
-    // A failed native allocation stays observable even though no pointer is
-    // returned; the pool surfaces the null result as bad_alloc.
-    iom::sycl_detail::allocation_calls.device_alloc = &failing_device_alloc;
-    CHECK_THROWS_AS((void)pool.acquire(4096), std::bad_alloc);
-    iom::sycl_detail::allocation_calls =
-            iom::sycl_detail::AllocationCalls{};
-
-    {
-        auto lease = pool.acquire(4096);
-        REQUIRE(lease.staging() != nullptr);
-        REQUIRE(lease.host_mirror() != nullptr);
-        // Poisoning releases the slot immediately: the cleanup free of the
-        // successful allocation is recorded as a paired staging free.
-        lease.poison();
-    }
-    pool.destroy();
-
-    std::size_t failed_attempts = 0;
-    std::size_t successful_allocations = 0;
-    std::size_t cleanup_frees = 0;
-    std::map<void*, std::size_t> outstanding;
-    for (const auto& record : probe.records) {
-        CHECK(record.classification
-              == iom::sycl_detail::AllocationClass::staging);
-        CHECK(record.phase
-              == iom::sycl_detail::AllocationPhase::post_publication);
-        if (record.kind == iom::sycl_detail::AllocationKind::allocate) {
-            if (!record.succeeded) {
-                ++failed_attempts;
-                CHECK(record.address == nullptr);
-                continue;
-            }
-            ++successful_allocations;
-            outstanding[record.address] = record.bytes;
-        } else {
-            CHECK(record.succeeded);
-            CHECK(outstanding.erase(record.address) == 1);
-            ++cleanup_frees;
-        }
-    }
-    CHECK_EQ(failed_attempts, 1u);
-    CHECK_EQ(successful_allocations, 1u);
-    CHECK_EQ(cleanup_frees, 1u);
-    CHECK(outstanding.empty());
-}
 
 namespace {
 
@@ -1035,7 +789,7 @@ TEST_CASE(
     auto destination = device->create_tensor(spec);
     std::vector<std::byte> pattern(
             spec.logical_nbytes(), static_cast<std::byte>(0x5a));
-    source->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(source->view(), pattern);
 
     auto queue = device->create_ops();
     REQUIRE(queue != nullptr);

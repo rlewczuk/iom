@@ -300,8 +300,8 @@ TEST_CASE("conformance harness detects perturbed candidate bytes") {
     auto candidate_tensor = candidate->create_tensor(spec);
 
     const std::vector<std::byte> seeded = iom_conformance::encode_logical(spec, 7);
-    reference_tensor->view().copy_from_host(seeded);
-    candidate_tensor->view().copy_from_host(seeded);
+    iom_conformance::copy_from_host(reference_tensor->view(), seeded);
+    iom_conformance::copy_from_host(candidate_tensor->view(), seeded);
     REQUIRE_FALSE(iom_conformance::first_logical_mismatch(
             candidate_tensor->view(), seeded)
                           .has_value());
@@ -327,7 +327,7 @@ TEST_CASE("conformance harness detects perturbed candidate bytes") {
             iom_conformance::encode_logical(stepped_window.spec(), 8);
     const std::vector<std::byte> earlier_pattern =
             iom_conformance::encode_logical(earlier_window.spec(), 9);
-    stepped_window.copy_from_host(stepped_pattern);
+    iom_conformance::copy_from_host(stepped_window, stepped_pattern);
     CHECK_FALSE(iom_conformance::first_logical_mismatch(
             stepped_window, stepped_pattern)
                         .has_value());
@@ -343,7 +343,7 @@ TEST_CASE("CPU conformance: tile-blocked copy preserves logical and physical win
     auto candidate = devices.candidate->create_tensor(owner_spec);
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(owner_spec, 0x1234);
-    reference->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(reference->view(), pattern);
     std::memset(
             candidate->view().native_handle(), 0,
             owner_spec.tiled_storage_nbytes());
@@ -378,7 +378,7 @@ TEST_CASE("CPU conformance: blocked byte-aligned copy matches `std::memcpy` byte
     auto candidate = devices.candidate->create_tensor(spec);
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(spec, 0x5678);
-    reference->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(reference->view(), pattern);
     std::memset(
             candidate->view().native_handle(), 0,
             spec.tiled_storage_nbytes());
@@ -415,7 +415,7 @@ TEST_CASE("CPU conformance: blocked sub-byte copy preserves LSB-first packing an
         auto candidate = devices.candidate->create_tensor(spec);
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(spec, 0x9ABC);
-        reference->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(reference->view(), pattern);
         std::memset(
                 candidate->view().native_handle(), 0,
                 spec.tiled_storage_nbytes());
@@ -447,7 +447,7 @@ TEST_CASE("CPU conformance: blocked copy walks lockstep planes without scratch a
     auto candidate = devices.candidate->create_tensor(owner_spec);
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(owner_spec, 0xDEF0);
-    reference->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(reference->view(), pattern);
     std::memset(
             candidate->view().native_handle(), 0,
             owner_spec.tiled_storage_nbytes());
@@ -500,7 +500,7 @@ TEST_CASE("CPU copy survives derived-view temporaries") {
     std::unique_ptr<iom::Tensor> u = devices.candidate->create_tensor(spec);
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(spec, 0x5A7C);
-    t->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(t->view(), pattern);
     std::memset(
             u->view().native_handle(), 0, spec.tiled_storage_nbytes());
 

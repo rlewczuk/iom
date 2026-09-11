@@ -39,11 +39,11 @@ namespace iom::detail {
         return kStandardSupportedDataTypes;
     }
 
-    template <typename Policy, typename StreamPool, typename StagingPool>
+    template <typename Policy>
     void synchronous_transfer(
-            StreamPool& transfer_pool, StagingPool& staging_pool,
+            typename Policy::stream_type stream,
             typename Policy::context_type context, const TensorView& view,
-            std::span<const std::byte> source,
+            void* staging, std::span<const std::byte> source,
             std::span<std::byte> destination, bool from_host);
 
 }  // namespace iom::detail

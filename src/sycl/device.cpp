@@ -67,7 +67,6 @@ namespace iom {
                     void* metadata_backing)
                     : device_(std::move(device)),
                       context_(std::move(context)),
-                      staging_pool_(*context_, device_),
                       transfer_queue_(
                               std::in_place, *context_, device_,
                               sycl::property_list{
@@ -121,7 +120,6 @@ namespace iom {
                             sycl_detail::AllocationPhase::post_publication);
                     metadata_backing_ = nullptr;
                 }
-                staging_pool_.destroy();
                 transfer_queue_.reset();
                 context_.reset();
                 if (sycl_detail::context_calls.context_destroyed != nullptr) {
@@ -263,10 +261,6 @@ namespace iom {
             [[nodiscard]] const sycl::device& native_device() const noexcept {
                 return device_;
             }
-            [[nodiscard]] sycl_detail::StagingSlotPool&
-                    staging_pool() noexcept {
-                return staging_pool_;
-            }
 
             [[nodiscard]] sycl::queue& transfer_queue() noexcept {
                 return *transfer_queue_;
@@ -364,10 +358,10 @@ namespace iom {
 
             sycl::device device_;
             std::optional<sycl::context> context_;
-            sycl_detail::StagingSlotPool staging_pool_;
             std::optional<sycl::queue> transfer_queue_;
             detail::RegistryState registry_state_;
             std::uint32_t ordinal_;
+            mutable std::mutex transfer_mutex_;
             std::mutex bookkeeping_mutex_;
             std::unique_ptr<ListAllocator> data_allocator_;
             std::unique_ptr<FixedSizeAllocator> metadata_allocator_;
@@ -489,18 +483,23 @@ namespace iom {
 
             void region_from_host(
                     const TensorView& destination,
-                    std::span<const std::byte> source) override {
+                    std::span<const std::byte> source,
+                    RawWorkspaceView workspace) override {
+                std::lock_guard<std::mutex> lock(device_.transfer_mutex_);
                 sycl_detail::region_from_host(
-                        device_.staging_pool(), device_.transfer_queue(),
-                        destination, address_, source);
+                        device_.transfer_queue(), device_,
+                        device_.registry_state_, destination, workspace,
+                        source);
             }
 
             void region_to_host(
                     const TensorView& source,
-                    std::span<std::byte> destination) const override {
+                    std::span<std::byte> destination,
+                    RawWorkspaceView workspace) const override {
+                std::lock_guard<std::mutex> lock(device_.transfer_mutex_);
                 sycl_detail::region_to_host(
-                        device_.staging_pool(), device_.transfer_queue(),
-                        source, address_, destination);
+                        device_.transfer_queue(), device_,
+                        device_.registry_state_, source, workspace, destination);
             }
 
             SyclDevice& device_;

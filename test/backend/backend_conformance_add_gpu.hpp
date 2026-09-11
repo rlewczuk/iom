@@ -65,9 +65,9 @@ inline void run_gpu_eltwise_conformance(
         auto l = candidate.create_tensor(spec);
         auto r = candidate.create_tensor(spec);
         auto out = candidate.create_tensor(spec);
-        l->view().copy_from_host(lhs);
-        r->view().copy_from_host(rhs);
-        out->view().copy_from_host(std::vector<std::byte>(expected.size(), std::byte{0xAA}));
+        iom_conformance::copy_from_host(l->view(), lhs);
+        iom_conformance::copy_from_host(r->view(), rhs);
+        iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(expected.size(), std::byte{0xAA}));
         const auto requirements = query_binary_workspace_requirements(
                 *queue, operation, l->view(), r->view(), out->view());
         std::unique_ptr<iom::RawWorkspace> workspace_owner;
@@ -114,11 +114,10 @@ inline void run_gpu_eltwise_mapping_conformance(
     auto lhs = candidate.create_tensor(lhs_spec);
     auto rhs = candidate.create_tensor(rhs_spec);
     auto out = candidate.create_tensor(out_spec);
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
-    out->view().copy_from_host(
-            std::vector<std::byte>(
-                    out_spec.logical_nbytes(), std::byte{0xAA}));
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            out_spec.logical_nbytes(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
     const auto requirements = query_binary_workspace_requirements(
             *queue, operation, lhs->view(), rhs->view(), out->view());
@@ -186,11 +185,10 @@ inline void run_gpu_eltwise_mapping_conformance(
         auto lhs_f32 = candidate.create_tensor(lhs_f32_spec);
         auto rhs_f32 = candidate.create_tensor(rhs_f32_spec);
         auto out_f32 = candidate.create_tensor(out_f32_spec);
-        lhs_f32->view().copy_from_host(lhs_f32_bytes);
-        rhs_f32->view().copy_from_host(rhs_f32_bytes);
-        out_f32->view().copy_from_host(
-                std::vector<std::byte>(
-                        expected_f32.size(), std::byte{0xAA}));
+        iom_conformance::copy_from_host(lhs_f32->view(), lhs_f32_bytes);
+        iom_conformance::copy_from_host(rhs_f32->view(), rhs_f32_bytes);
+        iom_conformance::copy_from_host(out_f32->view(), std::vector<std::byte>(
+                expected_f32.size(), std::byte{0xAA}));
         const auto f32_requirements =
                 query_binary_workspace_requirements(
                         *queue, operation, lhs_f32->view(), rhs_f32->view(),

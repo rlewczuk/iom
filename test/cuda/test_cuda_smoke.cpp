@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include "backend/backend_conformance_common.hpp"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -527,227 +528,7 @@ void require_cuda_hardware() {
 
 }  // namespace
 
-TEST_CASE("CUDA host transfers on independent threads do not share a stream") {
-    require_cuda_hardware();
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    const iom::TensorSpec spec{
-            iom::TensorShape{{2048, 2048}}, iom::DataType::F32};
-    auto tensor_a = device->create_tensor(spec);
-    auto tensor_b = device->create_tensor(spec);
-    const std::vector<std::byte> input(
-            spec.logical_nbytes(), static_cast<std::byte>(0x3c));
-    std::vector<std::byte> output_a(spec.logical_nbytes());
-    std::vector<std::byte> output_b(spec.logical_nbytes());
-    constexpr int transfers = 4;
 
-    const auto serial_begin = std::chrono::steady_clock::now();
-    for (int i = 0; i < transfers; ++i) {
-        tensor_a->view().copy_from_host(input);
-        tensor_a->view().copy_to_host(output_a);
-        tensor_b->view().copy_from_host(input);
-        tensor_b->view().copy_to_host(output_b);
-    }
-    const auto serial_end = std::chrono::steady_clock::now();
-    const auto serial_total = serial_end - serial_begin;
-
-    std::barrier start_gate(3);
-    std::atomic<bool> failed = false;
-    const auto concurrent_begin = std::chrono::steady_clock::now();
-    std::thread thread_a([&] {
-        try {
-            start_gate.arrive_and_wait();
-            for (int i = 0; i < transfers; ++i) {
-                tensor_a->view().copy_from_host(input);
-                tensor_a->view().copy_to_host(output_a);
-            }
-        } catch (...) {
-            failed.store(true, std::memory_order_release);
-        }
-    });
-    std::thread thread_b([&] {
-        try {
-            start_gate.arrive_and_wait();
-            for (int i = 0; i < transfers; ++i) {
-                tensor_b->view().copy_from_host(input);
-                tensor_b->view().copy_to_host(output_b);
-            }
-        } catch (...) {
-            failed.store(true, std::memory_order_release);
-        }
-    });
-    start_gate.arrive_and_wait();
-    thread_a.join();
-    thread_b.join();
-    const auto concurrent_end = std::chrono::steady_clock::now();
-
-    CHECK_FALSE(failed.load(std::memory_order_acquire));
-    CHECK(concurrent_end - concurrent_begin < 2 * serial_total);
-}
-
-TEST_CASE(
-        "CUDA host transfers from multiple queues on one device share the "
-        "transfer-stream pool") {
-    require_cuda_hardware();
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    const iom::TensorSpec spec{
-            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
-    auto tensor_a = device->create_tensor(spec);
-    auto tensor_b = device->create_tensor(spec);
-    auto tensor_c = device->create_tensor(spec);
-    auto queue_a = device->create_ops();
-    auto queue_b = device->create_ops();
-    const std::vector<std::byte> input(
-            spec.logical_nbytes(), static_cast<std::byte>(0x5a));
-    std::vector<std::byte> output(spec.logical_nbytes());
-    constexpr int transfers = 4;
-
-    const auto serial_begin = std::chrono::steady_clock::now();
-    for (int i = 0; i < transfers; ++i) {
-        tensor_a->view().copy_from_host(input);
-        tensor_a->view().copy_to_host(output);
-    }
-    const auto serial_end = std::chrono::steady_clock::now();
-    const auto serial_total = serial_end - serial_begin;
-
-    std::barrier start_gate(3);
-    std::atomic<bool> failed = false;
-    const auto concurrent_begin = std::chrono::steady_clock::now();
-    std::thread host_thread([&] {
-        try {
-            start_gate.arrive_and_wait();
-            for (int i = 0; i < transfers; ++i) {
-                tensor_a->view().copy_from_host(input);
-                tensor_a->view().copy_to_host(output);
-            }
-        } catch (...) {
-            failed.store(true, std::memory_order_release);
-        }
-    });
-    std::thread queue_thread([&] {
-        try {
-            start_gate.arrive_and_wait();
-            for (int i = 0; i < transfers; ++i) {
-                const iom::oid token =
-                        queue_b->copy(tensor_b->view(), tensor_c->view());
-                queue_b->wait(token);
-            }
-        } catch (...) {
-            failed.store(true, std::memory_order_release);
-        }
-    });
-    start_gate.arrive_and_wait();
-    host_thread.join();
-    queue_thread.join();
-    const auto concurrent_end = std::chrono::steady_clock::now();
-
-    CHECK_FALSE(failed.load(std::memory_order_acquire));
-    CHECK(concurrent_end - concurrent_begin < 2 * serial_total);
-    queue_a.reset();
-}
-
-TEST_CASE("CUDA errored host transfer drops its stream from the pool") {
-    require_cuda_hardware();
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    const iom::TensorSpec spec{
-            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
-    auto tensor = device->create_tensor(spec);
-    std::vector<std::byte> input(spec.logical_nbytes());
-    CUcontext context = nullptr;
-    REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
-    iom::cuda_detail::StagingSlotPool staging_pool;
-    iom::cuda_detail::TransferStreamPool pool;
-
-    iom::cuda_detail::inject_submission_fault_for_testing(
-            iom::cuda_detail::SubmissionFault::third_plane_launch);
-    CHECK_THROWS_AS(
-            iom::cuda_detail::region_from_host(
-                    pool, staging_pool, context, tensor->view(), input),
-            std::runtime_error);
-    iom::cuda_detail::inject_submission_fault_for_testing(
-            iom::cuda_detail::SubmissionFault::none);
-
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-    CHECK_NOTHROW(
-            iom::cuda_detail::region_from_host(
-                    pool, staging_pool, context, tensor->view(), input));
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-    pool.destroy();
-}
-
-TEST_CASE("CUDA poisoned Scope drops its stream from the pool") {
-    require_cuda_hardware();
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::cuda_detail::TransferStreamPool pool;
-    {
-        auto scope = pool.acquire();
-        scope.poison();
-    }
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-    {
-        auto scope = pool.acquire();
-    }
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-    pool.destroy();
-}
-
-TEST_CASE("CUDA staging pool preserves accounting across allocation failures") {
-    require_cuda_hardware();
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::cuda_detail::StagingSlotPool pool;
-
-    CHECK_THROWS_AS(
-            pool.acquire(iom::cuda_detail::StagingSlotPool::kMaxStagingBytes + 1),
-            std::invalid_argument);
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS(pool.acquire(4), std::bad_alloc);
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    {
-        auto lease = pool.acquire(4);
-        CHECK_EQ(lease.capacity(), 4);
-        CHECK(lease.staging() != 0);
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS(pool.acquire(8), std::bad_alloc);
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    {
-        auto lease = pool.acquire(4);
-        lease.poison();
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    for (std::size_t i = 0;
-         i < 2 * iom::cuda_detail::StagingSlotPool::kMaxSlotCount; ++i) {
-        auto lease = pool.acquire(4);
-        lease.poison();
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    {
-        auto lease = pool.acquire(4);
-        CHECK_EQ(lease.capacity(), 4);
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    pool.destroy();
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-}
 
 TEST_CASE("CUDA driver-call seam intercepts every claimed driver call") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
@@ -1110,8 +891,8 @@ TEST_CASE(
         rhs_bytes[index] = std::byte{static_cast<unsigned char>((index * 7)
                                                                % 251)};
     }
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
 
     auto queue = device->create_ops();
     REQUIRE(queue != nullptr);
@@ -1144,8 +925,8 @@ TEST_CASE(
             expected_bytes.size());
     std::vector<std::byte> first_actual(expected_bytes.size());
     std::vector<std::byte> second_actual(expected_bytes.size());
-    first_out->view().copy_to_host(first_actual);
-    second_out->view().copy_to_host(second_actual);
+    iom_conformance::copy_to_host(first_out->view(), first_actual);
+    iom_conformance::copy_to_host(second_out->view(), second_actual);
     CHECK(first_actual == expected_bytes);
     CHECK(second_actual == expected_bytes);
 
@@ -1331,14 +1112,14 @@ TEST_CASE(
 
         std::vector<std::byte> input(
                 staging_spec.logical_nbytes(), std::byte{0x5a});
-        staging_tensor->view().copy_from_host(input);
+        iom_conformance::copy_from_host(staging_tensor->view(), input);
 
         const iom::oid token =
                 queue->add(lhs->view(), rhs->view(), out->view());
         REQUIRE(iom::oid_is_token(token));
         queue->wait(token);
-    }  // queue and device teardown free the pooled metadata, staging, and
-       // the two arena backings
+    }  // queue and device teardown free pooled metadata and both arena
+       // backings; host transfers use caller-provided workspace ranges.
 
     std::size_t staging_allocations = 0;
     std::size_t metadata_allocations = 0;
@@ -1375,7 +1156,7 @@ TEST_CASE(
         }
     }
     CHECK_EQ(failed, 0u);
-    CHECK_GE(staging_allocations, 1u);   // host-transfer staging boundary
+    CHECK_EQ(staging_allocations, 0u);  // no internal transfer staging
     CHECK_EQ(metadata_allocations, 0u);  // fixed slots; no metadata growth
     CHECK(outstanding.empty());          // every allocation freed by teardown
 }
@@ -1414,68 +1195,6 @@ TEST_CASE(
     CHECK(probe.records.empty());
 }
 
-TEST_CASE(
-        "CUDA native allocation seam retains failed attempts and cleanup "
-        "frees") {
-    require_cuda_hardware();
-    auto device = iom::make_cuda_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    REQUIRE(device != nullptr);
-
-    // Arm the seam after setup so the record covers only pool traffic: the
-    // two setup backing reservations must not pollute this scenario.
-    AllocationCallsRestore restore;
-    AllocationProbe probe;
-    active_allocation_probe = &probe;
-    iom::cuda_detail::allocation_observer.complete = &capture_allocation;
-
-    iom::cuda_detail::StagingSlotPool pool;
-
-    // A failed native allocation stays observable even though no pointer is
-    // returned; check_cuda turns the injected boundary error into the
-    // runtime failure the pool propagates.
-    iom::cuda_detail::allocation_calls.mem_alloc = &failing_mem_alloc;
-    CHECK_THROWS_AS((void)pool.acquire(4096), std::runtime_error);
-    iom::cuda_detail::allocation_calls =
-            iom::cuda_detail::AllocationCalls{};
-
-    {
-        auto lease = pool.acquire(4096);
-        REQUIRE(lease.staging() != 0);
-        // Poisoning releases the slot immediately: the cleanup free of the
-        // successful allocation is recorded as a paired staging free.
-        lease.poison();
-    }
-    pool.destroy();
-
-    std::size_t failed_attempts = 0;
-    std::size_t successful_allocations = 0;
-    std::size_t cleanup_frees = 0;
-    std::map<void*, std::size_t> outstanding;
-    for (const auto& record : probe.records) {
-        CHECK(record.classification
-              == iom::cuda_detail::AllocationClass::staging);
-        CHECK(record.phase
-              == iom::cuda_detail::AllocationPhase::post_publication);
-        if (record.kind == iom::cuda_detail::AllocationKind::allocate) {
-            if (!record.succeeded) {
-                ++failed_attempts;
-                CHECK(record.address == nullptr);
-                continue;
-            }
-            ++successful_allocations;
-            outstanding[record.address] = record.bytes;
-        } else {
-            CHECK(record.succeeded);
-            CHECK(outstanding.erase(record.address) == 1);
-            ++cleanup_frees;
-        }
-    }
-    CHECK_EQ(failed_attempts, 1u);
-    CHECK_EQ(successful_allocations, 1u);
-    CHECK_EQ(cleanup_frees, 1u);
-    CHECK(outstanding.empty());
-}
 
 namespace {
 

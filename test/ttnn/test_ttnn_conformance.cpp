@@ -693,7 +693,7 @@ TEST_CASE("TTNN conformance: full-storage oracle exposes native padding mutation
 
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(spec, 0x2A);
-        view.copy_from_host(pattern);
+        iom_conformance::copy_from_host(view, pattern);
         std::vector<std::byte> expected = initial;
         iom_conformance::apply_standard_tiled_view(view, spec, pattern, expected);
         const std::vector<std::byte> restored = oracle.observe(view);
@@ -745,7 +745,7 @@ TEST_CASE("TTNN host transfers reuse retained staging after warm-up") {
     // first download the byte staging buffer exactly once.
     const std::vector<std::byte> seed =
             iom_conformance::encode_logical(spec, 0x51);
-    tensor->view().copy_from_host(seed);
+    iom_conformance::copy_from_host(tensor->view(), seed);
     iom_conformance::require_logical_bytes(
             tensor->view(), seed, "warm-up readback");
     const std::size_t warmup_allocations =
@@ -756,7 +756,7 @@ TEST_CASE("TTNN host transfers reuse retained staging after warm-up") {
     for (std::uint64_t salt = 0x60; salt < 0x64; ++salt) {
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(spec, salt);
-        tensor->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(tensor->view(), pattern);
         iom_conformance::require_logical_bytes(
                 tensor->view(), pattern, "reused staging round trip");
         CHECK_EQ(
@@ -772,7 +772,7 @@ TEST_CASE("TTNN host transfers reuse retained staging after warm-up") {
     auto big = devices.candidate->create_tensor(larger);
     const std::vector<std::byte> large_seed =
             iom_conformance::encode_logical(larger, 0x71);
-    big->view().copy_from_host(large_seed);
+    iom_conformance::copy_from_host(big->view(), large_seed);
     iom_conformance::require_logical_bytes(
             big->view(), large_seed, "grown readback");
     CHECK_EQ(
@@ -782,7 +782,7 @@ TEST_CASE("TTNN host transfers reuse retained staging after warm-up") {
     for (std::uint64_t salt = 0x72; salt < 0x75; ++salt) {
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(larger, salt);
-        big->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(big->view(), pattern);
         iom_conformance::require_logical_bytes(
                 big->view(), pattern, "grown staging round trip");
         CHECK_EQ(
@@ -806,7 +806,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
     // allocation.
     const std::vector<std::byte> seed =
             iom_conformance::encode_logical(spec, 0x81);
-    tensor->view().copy_from_host(seed);
+    iom_conformance::copy_from_host(tensor->view(), seed);
     iom_conformance::require_logical_bytes(
             tensor->view(), seed, "warm-up");
 
@@ -817,7 +817,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(spec, 0x82);
     REQUIRE_THROWS_AS(
-            tensor->view().copy_from_host(pattern), std::runtime_error);
+            iom_conformance::copy_from_host(tensor->view(), pattern), std::runtime_error);
     CHECK(iom::ttnn_test::
                   host_transfer_submission_fault_consumed_for_testing());
     const std::size_t after_upload_failure =
@@ -826,7 +826,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
 
     const std::vector<std::byte> pattern_2 =
             iom_conformance::encode_logical(spec, 0x83);
-    tensor->view().copy_from_host(pattern_2);
+    iom_conformance::copy_from_host(tensor->view(), pattern_2);
     iom_conformance::require_logical_bytes(
             tensor->view(), pattern_2, "clean upload after failure");
     CHECK_EQ(
@@ -842,7 +842,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
     std::vector<std::byte> readback(
             spec.logical_nbytes(), iom_conformance::kReadbackSentinel);
     REQUIRE_THROWS_AS(
-            tensor->view().copy_to_host(readback), std::runtime_error);
+            iom_conformance::copy_to_host(tensor->view(), readback), std::runtime_error);
     CHECK(iom::ttnn_test::
                   host_transfer_submission_fault_consumed_for_testing());
     const std::size_t after_download_failure =
@@ -865,7 +865,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
     iom::ttnn_test::
             fail_next_host_transfer_staging_allocation_for_testing();
     REQUIRE_THROWS_AS(
-            big->view().copy_from_host(large_seed), std::bad_alloc);
+            iom_conformance::copy_from_host(big->view(), large_seed), std::bad_alloc);
     CHECK(
             iom::ttnn_test::
                     host_transfer_staging_allocation_fault_consumed_for_testing());
@@ -873,7 +873,7 @@ TEST_CASE("TTNN host-transfer failures discard poisoned staging") {
             iom::ttnn_test::
                     host_transfer_staging_allocation_count_for_testing();
 
-    big->view().copy_from_host(large_seed);
+    iom_conformance::copy_from_host(big->view(), large_seed);
     iom_conformance::require_logical_bytes(
             big->view(), large_seed, "clean growth after allocation failure");
     CHECK_EQ(
@@ -983,7 +983,7 @@ TEST_CASE("TTNN copy survives derived-view temporaries") {
     std::unique_ptr<iom::Tensor> u = devices.candidate->create_tensor(spec);
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(spec, 0x5A7C);
-    t->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(t->view(), pattern);
 
     auto queue = devices.candidate->create_ops();
     const std::vector<std::size_t> dims = {4, 3, 17, 33};
@@ -1011,7 +1011,7 @@ void require_healthy_copy_after_failure(
     auto fresh_queue = device.create_ops();
     const std::vector<std::byte> pattern =
             iom_conformance::encode_logical(spec, salt);
-    fresh_source->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(fresh_source->view(), pattern);
     const iom::oid token =
             fresh_queue->copy(fresh_source->view(), fresh_destination->view());
     REQUIRE_NOTHROW(fresh_queue->wait(token));
@@ -1031,8 +1031,7 @@ TEST_CASE("TTNN failed plane submissions drain before rethrow") {
         CAPTURE(fail_plane);
         auto source = devices.candidate->create_tensor(spec);
         auto destination = devices.candidate->create_tensor(spec);
-        source->view().copy_from_host(
-                iom_conformance::encode_logical(spec, 21));
+        iom_conformance::copy_from_host(source->view(), iom_conformance::encode_logical(spec, 21));
 
         auto queue = devices.candidate->create_ops();
         iom::ttnn_test::fail_next_copy_planes_submission_for_testing(
@@ -1052,7 +1051,7 @@ TEST_CASE("TTNN failed plane submissions drain before rethrow") {
         destination = devices.candidate->create_tensor(spec);
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(spec, 22);
-        source->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(source->view(), pattern);
         const iom::oid token =
                 queue->copy(source->view(), destination->view());
         REQUIRE_NOTHROW(queue->wait(token));
@@ -1158,7 +1157,7 @@ TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
         write_padded_plane_image(out_planes[0], native_sentinel);
         out_plane.device()->mesh_command_queue(0).finish();
         std::vector<std::byte> before(spec.logical_nbytes());
-        out->view().copy_to_host(before);
+        iom_conformance::copy_to_host(out->view(), before);
 
         auto queue = devices.candidate->create_ops();
         const auto submit = [&](std::size_t index) {
@@ -1187,7 +1186,7 @@ TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
                       binary_outcome_insertion_fault_consumed_for_testing());
         std::vector<std::byte> after_outcome_failure(
                 spec.logical_nbytes());
-        out->view().copy_to_host(after_outcome_failure);
+        iom_conformance::copy_to_host(out->view(), after_outcome_failure);
         CHECK_EQ(after_outcome_failure, before);
 
         iom::ttnn_test::
@@ -1197,7 +1196,7 @@ TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
         CHECK(iom::ttnn_test::
                       host_transfer_staging_allocation_fault_consumed_for_testing());
         std::vector<std::byte> after(spec.logical_nbytes());
-        out->view().copy_to_host(after);
+        iom_conformance::copy_to_host(out->view(), after);
         CHECK_EQ(after, before);
 
         const iom::oid accepted = submit(operation);
@@ -1214,8 +1213,7 @@ TEST_CASE("TTNN un-drainable failed submission reports a repeatable failed token
             iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
     auto source = devices.candidate->create_tensor(spec);
     auto destination = devices.candidate->create_tensor(spec);
-    source->view().copy_from_host(
-            iom_conformance::encode_logical(spec, 31));
+    iom_conformance::copy_from_host(source->view(), iom_conformance::encode_logical(spec, 31));
 
     auto queue = devices.candidate->create_ops();
     // The submission fails after one plane and the synchronous drain fails,
@@ -1266,8 +1264,7 @@ TEST_CASE("TTNN native finish failure reports a repeatable failed token") {
             iom::TensorShape{{2, 3, 16, 16}}, iom::DataType::F32};
     auto source = devices.candidate->create_tensor(spec);
     auto destination = devices.candidate->create_tensor(spec);
-    source->view().copy_from_host(
-            iom_conformance::encode_logical(spec, 41));
+    iom_conformance::copy_from_host(source->view(), iom_conformance::encode_logical(spec, 41));
 
     auto queue = devices.candidate->create_ops();
     // The submission itself completes; the worker's one native finish for
@@ -1356,7 +1353,7 @@ TEST_CASE("TTNN no-wait bursts share one native finish per ready batch") {
         auto destination = devices.candidate->create_tensor(spec);
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(spec, 51);
-        source->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(source->view(), pattern);
         auto queue = devices.candidate->create_ops();
         iom::ttnn_test::reset_copy_finish_count_for_testing();
         constexpr std::size_t kSerialCopies = 4;
@@ -1383,7 +1380,7 @@ TEST_CASE("TTNN no-wait bursts share one native finish per ready batch") {
         auto source = devices.candidate->create_tensor(spec);
         const std::vector<std::byte> pattern =
                 iom_conformance::encode_logical(spec, 52);
-        source->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(source->view(), pattern);
         std::vector<std::unique_ptr<iom::Tensor>> destinations;
         for (std::size_t i = 0; i < 8; ++i) {
             destinations.push_back(
@@ -1692,8 +1689,8 @@ namespace {
             set_add_logical_value(spec, lhs_bytes, i, lhs_values[i]);
             set_add_logical_value(spec, rhs_bytes, i, rhs_values[i]);
         }
-        lhs->view().copy_from_host(lhs_bytes);
-        rhs->view().copy_from_host(rhs_bytes);
+        iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+        iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
         auto queue = device.create_ops();
         const iom::oid token =
                 queue->add(lhs->view(), rhs->view(), out->view());
@@ -1701,7 +1698,7 @@ namespace {
         REQUIRE_NOTHROW(queue->wait(token));
         std::vector<std::byte> out_bytes(
                 spec.logical_nbytes(), std::byte{0});
-        out->view().copy_to_host(out_bytes);
+        iom_conformance::copy_to_host(out->view(), out_bytes);
         for (std::size_t i = 0; i < lhs_values.size(); ++i) {
             const std::uint64_t expected =
                     iom_conformance::add_oracle::add(
@@ -1893,8 +1890,8 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
             set_add_logical_value(
                     out_spec, two, i, 0x4000 + static_cast<std::uint64_t>(i));
         }
-        lhs->view().copy_from_host(one);
-        rhs->view().copy_from_host(two);
+        iom_conformance::copy_from_host(lhs->view(), one);
+        iom_conformance::copy_from_host(rhs->view(), two);
         auto queue = devices.candidate->create_ops();
         const iom::oid token =
                 queue->add(lhs->view(), rhs->view(), out->view());
@@ -1902,7 +1899,7 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         REQUIRE_NOTHROW(queue->wait(token));
         std::vector<std::byte> observed(
                 out_spec.logical_nbytes(), std::byte{0});
-        out->view().copy_to_host(observed);
+        iom_conformance::copy_to_host(out->view(), observed);
         for (std::size_t i = 0; i < 4; ++i) {
             CHECK_EQ(get_add_logical_value(out_spec, observed, i),
                      iom_conformance::add_oracle::add(
@@ -1932,8 +1929,8 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         set_add_logical_value(col_spec, lhs_bytes, 1, 20);
         set_add_logical_value(row_spec, rhs_bytes, 0, 1);
         set_add_logical_value(row_spec, rhs_bytes, 1, 2);
-        lhs->view().copy_from_host(lhs_bytes);
-        rhs->view().copy_from_host(rhs_bytes);
+        iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+        iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
         auto queue = devices.candidate->create_ops();
         const iom::oid token =
                 queue->add(lhs->view(), rhs->view(), out->view());
@@ -1941,7 +1938,7 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         REQUIRE_NOTHROW(queue->wait(token));
         std::vector<std::byte> observed(
                 out_spec.logical_nbytes(), std::byte{0});
-        out->view().copy_to_host(observed);
+        iom_conformance::copy_to_host(out->view(), observed);
         const std::uint64_t expected[2][2] = {{11, 12}, {21, 22}};
         for (std::size_t i = 0; i < 4; ++i) {
             CHECK_EQ(get_add_logical_value(out_spec, observed, i),
@@ -1967,8 +1964,8 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
             set_add_logical_value(
                     spec, rhs_bytes, i, 0x4000 + (i % 17));
         }
-        lhs->view().copy_from_host(lhs_bytes);
-        rhs->view().copy_from_host(rhs_bytes);
+        iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+        iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
         auto queue = devices.candidate->create_ops();
         const iom::oid token =
                 queue->add(lhs->view(), rhs->view(), out->view());
@@ -1976,7 +1973,7 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         REQUIRE_NOTHROW(queue->wait(token));
         std::vector<std::byte> observed(
                 spec.logical_nbytes(), std::byte{0});
-        out->view().copy_to_host(observed);
+        iom_conformance::copy_to_host(out->view(), observed);
         for (std::size_t i = 0; i < elements; ++i) {
             const std::uint64_t a = 0x3F80 + (i % 31);
             const std::uint64_t b = 0x4000 + (i % 17);
@@ -2000,8 +1997,8 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
                     static_cast<std::uint32_t>(0x3F800000u + i);
             std::memcpy(pattern.data() + i * 4, &value, 4);
         }
-        lhs->view().copy_from_host(pattern);
-        rhs->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(lhs->view(), pattern);
+        iom_conformance::copy_from_host(rhs->view(), pattern);
         auto queue = devices.candidate->create_ops();
         iom::TensorView lhs_sliced = lhs->view().slice(0, 0, 1);
         iom::TensorView rhs_sliced = rhs->view().slice(0, 0, 1);
@@ -2012,7 +2009,7 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         REQUIRE_NOTHROW(queue->wait(token));
         std::vector<std::byte> observed(
                 out_sliced.spec().logical_nbytes(), std::byte{0});
-        out_sliced.copy_to_host(observed);
+        iom_conformance::copy_to_host(out_sliced, observed);
         for (std::size_t i = 0; i < 256; ++i) {
             std::uint32_t a = 0;
             std::uint32_t b = 0;
@@ -2044,8 +2041,8 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
             set_add_logical_value(spec, lhs_bytes, i, 200 + i);
             set_add_logical_value(spec, rhs_bytes, i, 100 + i);
         }
-        lhs->view().copy_from_host(lhs_bytes);
-        rhs->view().copy_from_host(rhs_bytes);
+        iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+        iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
         auto queue = devices.candidate->create_ops();
         const iom::oid token =
                 queue->add(lhs->view(), rhs->view(), lhs->view());
@@ -2053,7 +2050,7 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         REQUIRE_NOTHROW(queue->wait(token));
         std::vector<std::byte> observed(
                 spec.logical_nbytes(), std::byte{0});
-        lhs->view().copy_to_host(observed);
+        iom_conformance::copy_to_host(lhs->view(), observed);
         for (std::size_t i = 0; i < 4; ++i) {
             CHECK_EQ(get_add_logical_value(spec, observed, i),
                      (200 + i + 100 + i) & 0xFF);
@@ -2072,14 +2069,14 @@ TEST_CASE("TTNN ADD broadcast, tail, transformed views, and aliases") {
         for (std::size_t i = 0; i < 4; ++i) {
             set_add_logical_value(bool_spec, pattern, i, i % 2);
         }
-        lhs->view().copy_from_host(pattern);
-        rhs->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(lhs->view(), pattern);
+        iom_conformance::copy_from_host(rhs->view(), pattern);
         auto queue = devices.candidate->create_ops();
         CHECK_EQ(queue->add(lhs->view(), rhs->view(), out->view()),
                  iom::to_oid(iom::OidError::Unsupported));
         std::vector<std::byte> observed(
                 bool_spec.logical_nbytes(), std::byte{0});
-        out->view().copy_to_host(observed);
+        iom_conformance::copy_to_host(out->view(), observed);
         CHECK(observed
               == std::vector<std::byte>(
                       bool_spec.logical_nbytes(), std::byte{0}));
@@ -2100,8 +2097,8 @@ TEST_CASE("TTNN ADD retained failure repeats and staging stays reusable") {
         set_add_logical_value(spec, one, i, 0x3F80 + i);
         set_add_logical_value(spec, two, i, 0x4000 + i);
     }
-    lhs->view().copy_from_host(one);
-    rhs->view().copy_from_host(two);
+    iom_conformance::copy_from_host(lhs->view(), one);
+    iom_conformance::copy_from_host(rhs->view(), two);
     auto queue = devices.candidate->create_ops();
 
     // A retained post-acceptance finish failure: every repeated wait
@@ -2131,7 +2128,7 @@ TEST_CASE("TTNN ADD retained failure repeats and staging stays reusable") {
     // the computed sum (diagnostic, not contractual).
     std::vector<std::byte> after_failed(
             spec.logical_nbytes(), std::byte{0});
-    out->view().copy_to_host(after_failed);
+    iom_conformance::copy_to_host(out->view(), after_failed);
     CHECK_EQ(get_add_logical_value(spec, after_failed, 0),
              iom_conformance::add_oracle::add(
                      iom::DataType::BF16, 0x3F80, 0x4000));
@@ -2141,16 +2138,16 @@ TEST_CASE("TTNN ADD retained failure repeats and staging stays reusable") {
     // device-owned staging slots still serve a correct ADD: the upload
     // lease returned cleanly and the emulation path repeats.
     std::vector<std::byte> zero(spec.logical_nbytes(), std::byte{0});
-    out->view().copy_from_host(zero);
-    lhs->view().copy_from_host(one);
-    rhs->view().copy_from_host(two);
+    iom_conformance::copy_from_host(out->view(), zero);
+    iom_conformance::copy_from_host(lhs->view(), one);
+    iom_conformance::copy_from_host(rhs->view(), two);
     const iom::oid recovered =
             queue->add(lhs->view(), rhs->view(), out->view());
     REQUIRE(iom::oid_is_token(recovered));
     REQUIRE_NOTHROW(queue->wait(recovered));
     std::vector<std::byte> observed(
             spec.logical_nbytes(), std::byte{0});
-    out->view().copy_to_host(observed);
+    iom_conformance::copy_to_host(out->view(), observed);
     for (std::size_t i = 0; i < 4; ++i) {
         CHECK_EQ(get_add_logical_value(spec, observed, i),
                  iom_conformance::add_oracle::add(
@@ -2178,8 +2175,8 @@ TEST_CASE("TTNN binary completion publishes one finish for every operation") {
         std::memcpy(rhs_bytes.data() + index * sizeof(float), &right,
                     sizeof(float));
     }
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
     auto queue = devices.candidate->create_ops();
 
     struct BinaryCase {
@@ -2215,7 +2212,7 @@ TEST_CASE("TTNN binary completion publishes one finish for every operation") {
         CHECK_EQ(iom::ttnn_test::copy_finish_count_for_testing(), 1);
 
         std::vector<std::byte> observed(spec.logical_nbytes(), std::byte{0});
-        out->view().copy_to_host(observed);
+        iom_conformance::copy_to_host(out->view(), observed);
         for (std::size_t index = 0; index < 2 * 32 * 32; ++index) {
             float value = 0.0F;
             std::memcpy(&value,

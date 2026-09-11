@@ -305,7 +305,7 @@ TEST_CASE("Backend coexistence: enabled backends interleave in one process") {
     // same logical bytes.
     for (BackendParticipant* participant : participants) {
         CAPTURE(participant->name);
-        participant->source->view().copy_from_host(expected);
+        iom_conformance::copy_from_host(participant->source->view(), expected);
         iom_conformance::require_logical_bytes(
                 participant->source->view(), expected, participant->name);
     }
@@ -512,8 +512,7 @@ TEST_CASE("Backend coexistence: queue ids release, reuse, and stay unique") {
     auto device = iom::make_cpu_device(allocator);
     auto source = device->create_tensor(coexistence_spec());
     auto destination = device->create_tensor(coexistence_spec());
-    source->view().copy_from_host(
-            iom_conformance::encode_logical(coexistence_spec(), 3));
+    iom_conformance::copy_from_host(source->view(), iom_conformance::encode_logical(coexistence_spec(), 3));
 
     auto first = device->create_ops();
     auto second = device->create_ops();
@@ -596,7 +595,7 @@ void run_concurrent_queue_scenario(
 
     {
         auto source = device.create_tensor(spec);
-        source->view().copy_from_host(expected);
+        iom_conformance::copy_from_host(source->view(), expected);
         std::vector<std::unique_ptr<iom::Tensor>> destination;
         destination.reserve(kQueues);
         for (int queue = 0; queue < kQueues; ++queue) {
@@ -821,14 +820,14 @@ void run_interleaved_operations(
         item.sub_out = participant->device->create_tensor(spec);
         item.div_out = participant->device->create_tensor(spec);
         item.copied = participant->device->create_tensor(spec);
-        item.lhs->view().copy_from_host(lhs_bytes);
-        item.rhs->view().copy_from_host(rhs_bytes);
+        iom_conformance::copy_from_host(item.lhs->view(), lhs_bytes);
+        iom_conformance::copy_from_host(item.rhs->view(), rhs_bytes);
         const std::vector<std::byte> sentinel(
                 spec.logical_nbytes(), iom_conformance::kReadbackSentinel);
         for (iom::Tensor* output : {item.staged.get(), item.add_out.get(),
                                     item.mul_out.get(), item.sub_out.get(),
                                     item.div_out.get(), item.copied.get()}) {
-            output->view().copy_from_host(sentinel);
+            iom_conformance::copy_from_host(output->view(), sentinel);
         }
         item.queues.push_back(participant->device->create_ops());
         item.queues.push_back(participant->device->create_ops());
@@ -891,7 +890,7 @@ void run_interleaved_operations(
     HostAllocator foreign_allocator;
     auto foreign_device = iom::make_cpu_device(foreign_allocator);
     auto foreign_tensor = foreign_device->create_tensor(spec);
-    foreign_tensor->view().copy_from_host(lhs_bytes);
+    iom_conformance::copy_from_host(foreign_tensor->view(), lhs_bytes);
     for (std::size_t i = 0; i < work.size(); ++i) {
         CAPTURE(participants[i]->name);
         const auto before = iom_conformance::read_logical(work[i].add_out->view());

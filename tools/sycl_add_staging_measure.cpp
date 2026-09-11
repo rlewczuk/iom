@@ -152,8 +152,19 @@ Result measure(
     auto lhs = device.create_tensor(spec);
     auto rhs = device.create_tensor(spec);
     auto out = device.create_tensor(spec);
-    lhs->view().copy_from_host(lhs_data);
-    rhs->view().copy_from_host(rhs_data);
+    const auto upload = [](
+            iom::TensorView& view, const std::vector<std::byte>& bytes) {
+        const iom::WorkspaceRequirements requirements =
+                view.copy_from_host_workspace_requirements();
+        if (requirements.bytes == 0) {
+            view.copy_from_host(bytes);
+            return;
+        }
+        auto workspace = view.device().create_workspace(requirements.bytes);
+        view.copy_from_host(bytes, workspace->view());
+    };
+    upload(lhs->view(), lhs_data);
+    upload(rhs->view(), rhs_data);
     for (std::size_t i = 0; i < kWarmup; ++i) {
         const auto token = ops.add(lhs->view(), rhs->view(), out->view());
         if (!iom::oid_is_token(token)) throw std::runtime_error("SYCL ADD warm-up rejected");

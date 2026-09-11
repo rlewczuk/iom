@@ -411,48 +411,21 @@ the slot until the queue's covering drain. Compiled rank-eight copy and
 binary descriptors are compile-time asserted to fit one 512-byte slot at
 32-byte alignment, so slots never grow.
 
-### Staging pool and transfer-stream pool
+### Explicit host-transfer workspace
 
-Host transfers use a separate resource path from queued device copies.
-CUDA/ROCm standard-layout transfers combine a `TransferStreamPool` with a
-`StagingSlotPool`:
-
-- `TransferStreamPool` leases an idle runtime transfer stream or creates one
-  when the idle pool is empty. Its scope synchronizes before returning a
-  healthy stream; a poisoned stream or failed synchronization destroys it
-  instead of recycling it. Destruction closes the pool, waits for active
-  scopes, then destroys the idle streams.
-- `StagingSlotPool` leases reusable device staging storage. It creates or grows
-  slots on demand, caps an individual staging request at 8 GiB and the pool at
-  16 slots, blocks when every slot is busy, and remembers poisoned leases so
-  failed storage is not reused. Releasing a lease returns it to the free set or
-  destroys the poisoned allocation.
+Host transfers use one eagerly created transfer stream or queue per
+standard-GPU `Device`; a device-level mutex serializes public synchronous
+transfers without serializing compute queues or other devices. CUDA, ROCm,
+and SYCL take a caller-owned `RawWorkspaceView` sized by the operation's pure
+workspace-requirements query. The supplied range is used directly as device
+staging, remains exclusively leased through synchronous completion proof, and
+is quarantined with unresolved work rather than being silently replaced.
 
 The staging payload is the logical byte count padded to a 4-byte kernel word;
-overflow in that rounding is an error. Transfers are synchronous from the
-caller's perspective: the implementation stages the logical data, performs the
-runtime copies/kernel work on its leased stream, synchronizes it, then returns
-both leases. The pools amortize runtime allocation/stream creation without
-changing the `TensorView` synchronous-transfer contract.
-
-### SYCL queue and staging
-
-SYCL implements the same public queue semantics without `GpuQueue<Policy>`.
-The device owns an in-order transfer queue, a 16-slot staging pool, and the
-outstanding-work registry. Its operation queue combines `StagedWorker` with a
-16-slot metadata pool and a `SyclFenceState`. Each fence owns an optional
-`sycl::event`, a retained post-launch failure, and a cached result; it invokes
-`wait_and_throw` once, then makes that same success or failure repeatably
-available to registry and queue completion.
-
-Unlike CUDA/ROCm's inline-small-metadata path, the SYCL queue uses a metadata
-slot for every launched copy, enqueues host-to-device metadata transfer and a
-tiled `parallel_for`, and retains the resulting event. Its worker completes
-the event, releases or invalidates registry entries, and releases metadata.
-The SYCL staging pool mirrors the CUDA/ROCm bounds—16 slots and an 8 GiB
-request limit—but each slot has device and host USM allocations. Synchronous
-uploads and downloads use that pair, waiting for queue work before reusing it;
-a failed transfer poisons and vacates the slot.
+overflow in that rounding is an error. Transfers preserve tiled addressing,
+tail-word initialization, and untouched padding. CPU and TTNN keep their
+direct/native host-transfer boundaries and report zero workspace
+requirements, so their empty default view remains valid.
 
 ### TTNN queue and retained host staging
 

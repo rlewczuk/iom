@@ -153,9 +153,7 @@ if(CUDA_ENABLED)
         src/shared/metadata_slot_pool.hpp
         src/shared/event_ring.hpp
         src/shared/gpu_queue.hpp
-        src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
-        src/shared/transfer_pool.hpp
         include/iom/cuda/device.hpp
     )
 
@@ -201,9 +199,7 @@ if(ROCM_ENABLED)
         src/shared/metadata_slot_pool.hpp
         src/shared/event_ring.hpp
         src/shared/gpu_queue.hpp
-        src/shared/staging_pool.hpp
         src/shared/standard_tiled_copy.hpp
-        src/shared/transfer_pool.hpp
         include/iom/rocm/device.hpp
     )
 
@@ -238,10 +234,8 @@ if(SYCL_ENABLED)
         src/sycl/device.cpp
         src/sycl/copy.cpp
         src/sycl/add.cpp
-        src/sycl/staging_pool.cpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
-        src/sycl/staging_pool.hpp
         include/iom/sycl/device.hpp
     )
 

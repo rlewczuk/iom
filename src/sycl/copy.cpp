@@ -1,3 +1,4 @@
+#include <array>
 #include "copy.hpp"
 
 #include "iom/device.hpp"
@@ -5,7 +6,6 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -1098,71 +1098,119 @@ std::size_t fence_wait_count_for_testing() noexcept {
     return g_fence_wait_count.load(std::memory_order_acquire);
 }
 
+namespace {
+
+detail::Fence transfer_fence() noexcept {
+    detail::Fence fence;
+    fence.invoke = [](const detail::Fence&) noexcept {
+        return detail::FenceResult::success();
+    };
+    return fence;
+}
+
+struct WorkspaceAdmission {
+    detail::WorkspaceLease lease;
+    void* address = nullptr;
+};
+
+WorkspaceAdmission begin_workspace_transfer(
+        const Device& device, detail::RegistryState& registry_state,
+        const TensorView& view, RawWorkspaceView workspace,
+        bool& resource_poisoned) {
+    const WorkspaceRequirements requirements =
+            view.copy_from_host_workspace_requirements();
+    const std::array<TensorView, 1> operands{view};
+    const RawWorkspaceView checked =
+            detail::WorkspaceValidation::validated(
+                    device, workspace, requirements.bytes,
+                    requirements.alignment, operands);
+    if (resource_poisoned) {
+        throw std::bad_alloc();
+    }
+    const detail::QueueId queue_id =
+            detail::allocate_queue_id(registry_state);
+    return {
+            detail::acquire_workspace_lease(
+                    registry_state, workspace.owner_identity(),
+                    detail::WorkspaceValidation::address(checked),
+                    checked.byte_size(), queue_id, queue_id, transfer_fence()),
+            detail::WorkspaceValidation::address(checked)};
+}
+
+void finish_workspace_transfer(
+        detail::RegistryState& registry_state,
+        const detail::WorkspaceLease& lease, bool proof) noexcept {
+    detail::complete_workspace_lease(registry_state, lease, proof);
+}
+
+}  // namespace
+
 void region_from_host(
-        StagingSlotPool& staging_pool, sycl::queue& transfer_queue,
-        const TensorView& destination, void* storage,
-        std::span<const std::byte> source) {
-    const std::size_t logical_nbytes = destination.spec().logical_nbytes();
-    const std::size_t staging_nbytes =
-            gpu_algorithm::compute_staging_size(logical_nbytes);
-    auto lease = staging_pool.acquire(staging_nbytes);
+        sycl::queue& transfer_queue, const Device& device,
+        detail::RegistryState& registry_state,
+        const TensorView& destination, RawWorkspaceView workspace,
+        std::span<const std::byte> source, bool& resource_poisoned) {
+    WorkspaceAdmission admission = begin_workspace_transfer(
+            device, registry_state, destination, workspace, resource_poisoned);
     try {
-        std::memcpy(lease.host_mirror(), source.data(), logical_nbytes);
+        const std::size_t logical_nbytes =
+                destination.spec().logical_nbytes();
         transfer_queue.memcpy(
-                lease.device_staging(), lease.host_mirror(), logical_nbytes);
+                admission.address, source.data(), logical_nbytes);
         launch_view_transfer(
-                transfer_queue, destination, lease.device_staging(),
-                storage, true);
+                transfer_queue, destination, admission.address,
+                destination.native_handle(), true);
         transfer_queue.wait_and_throw();
+        finish_workspace_transfer(registry_state, admission.lease, true);
     } catch (...) {
-        const std::exception_ptr enqueue_failure =
-                std::current_exception();
+        resource_poisoned = true;
         try {
             transfer_queue.wait_and_throw();
         } catch (...) {
         }
-        lease.poison();
-        std::rethrow_exception(enqueue_failure);
+        finish_workspace_transfer(registry_state, admission.lease, false);
+        throw;
     }
 }
 
 void region_to_host(
-        StagingSlotPool& staging_pool, sycl::queue& transfer_queue,
-        const TensorView& source, const void* storage,
-        std::span<std::byte> destination) {
-    const std::size_t logical_nbytes = source.spec().logical_nbytes();
-    const std::size_t staging_nbytes =
-            gpu_algorithm::compute_staging_size(logical_nbytes);
-    const std::size_t logical_bits =
-            source.spec().shape.element_count()
-            * detail::leaf_bits(source.spec().data_type);
-    auto lease = staging_pool.acquire(staging_nbytes);
+        sycl::queue& transfer_queue, const Device& device,
+        detail::RegistryState& registry_state, const TensorView& source,
+        RawWorkspaceView workspace, std::span<std::byte> destination,
+        bool& resource_poisoned) {
+    WorkspaceAdmission admission = begin_workspace_transfer(
+            device, registry_state, source, workspace, resource_poisoned);
     try {
+        const std::size_t logical_nbytes = source.spec().logical_nbytes();
+        const std::size_t logical_bits =
+                source.spec().shape.element_count()
+                * detail::leaf_bits(source.spec().data_type);
+        const std::size_t staging_nbytes =
+                gpu_algorithm::compute_staging_size(logical_nbytes);
         const std::size_t tail_word_start =
                 (logical_bits / 32) * sizeof(std::uint32_t);
         const std::size_t tail_bytes = staging_nbytes - tail_word_start;
         if (tail_bytes != 0) {
             transfer_queue.memset(
-                    static_cast<std::byte*>(lease.device_staging())
+                    static_cast<std::byte*>(admission.address)
                             + tail_word_start,
                     0, tail_bytes);
         }
         launch_view_transfer(
-                transfer_queue, source, storage, lease.device_staging(), false);
+                transfer_queue, source, source.native_handle(),
+                admission.address, false);
         transfer_queue.memcpy(
-                lease.host_mirror(), lease.device_staging(), staging_nbytes);
+                destination.data(), admission.address, logical_nbytes);
         transfer_queue.wait_and_throw();
-        std::memcpy(
-                destination.data(), lease.host_mirror(), logical_nbytes);
+        finish_workspace_transfer(registry_state, admission.lease, true);
     } catch (...) {
-        const std::exception_ptr enqueue_failure =
-                std::current_exception();
+        resource_poisoned = true;
         try {
             transfer_queue.wait_and_throw();
         } catch (...) {
         }
-        lease.poison();
-        std::rethrow_exception(enqueue_failure);
+        finish_workspace_transfer(registry_state, admission.lease, false);
+        throw;
     }
 }
 

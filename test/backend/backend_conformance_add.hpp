@@ -275,11 +275,10 @@ inline void run_binary_value_conformance(
         auto lhs_tensor = candidate.create_tensor(spec);
         auto rhs_tensor = candidate.create_tensor(spec);
         auto out_tensor = candidate.create_tensor(spec);
-        lhs_tensor->view().copy_from_host(lhs);
-        rhs_tensor->view().copy_from_host(rhs);
-        out_tensor->view().copy_from_host(
-                std::vector<std::byte>(
-                        expected.size(), std::byte{0xAA}));
+        iom_conformance::copy_from_host(lhs_tensor->view(), lhs);
+        iom_conformance::copy_from_host(rhs_tensor->view(), rhs);
+        iom_conformance::copy_from_host(out_tensor->view(), std::vector<std::byte>(
+                expected.size(), std::byte{0xAA}));
         const auto requirements = query_binary_workspace_requirements(
                 *queue, operation, lhs_tensor->view(), rhs_tensor->view(),
                 out_tensor->view());
@@ -372,11 +371,10 @@ inline void run_binary_mapping_value_conformance(
     auto lhs = candidate.create_tensor(lhs_spec);
     auto rhs = candidate.create_tensor(rhs_spec);
     auto out = candidate.create_tensor(out_spec);
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
-    out->view().copy_from_host(
-            std::vector<std::byte>(
-                    expected.size(), std::byte{0xAA}));
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            expected.size(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
     const auto requirements = query_binary_workspace_requirements(
             *queue, operation, lhs->view(), rhs->view(), out->view());
@@ -425,14 +423,13 @@ inline void run_binary_transformed_value_conformance(
     auto lhs = candidate.create_tensor(spec);
     auto rhs = candidate.create_tensor(spec);
     auto out = candidate.create_tensor(spec);
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
     auto lhs_view = lhs->view().slice(0, 0, 1);
     auto rhs_view = rhs->view().slice(0, 0, 1);
     auto out_view = out->view().slice(0, 0, 1);
-    out_view.copy_from_host(
-            std::vector<std::byte>(
-                    out_view.spec().logical_nbytes(), std::byte{0xAA}));
+    iom_conformance::copy_from_host(out_view, std::vector<std::byte>(
+            out_view.spec().logical_nbytes(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
     const auto requirements = query_binary_workspace_requirements(
             *queue, operation, lhs_view, rhs_view, out_view);

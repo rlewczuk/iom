@@ -164,9 +164,41 @@ inline std::vector<std::byte> encode_logical(
 
 constexpr std::byte kReadbackSentinel{0xAA};
 
+
+template <typename HostBuffer>
+inline void copy_from_host(
+        iom::TensorView& view, const HostBuffer& source) {
+    const iom::WorkspaceRequirements requirements =
+            view.copy_from_host_workspace_requirements();
+    const std::span<const std::byte> bytes(source.data(), source.size());
+    if (requirements.bytes == 0) {
+        view.copy_from_host(bytes);
+        return;
+    }
+    auto workspace = const_cast<iom::Device&>(view.device())
+                             .create_workspace(requirements.bytes);
+    const iom::RawWorkspaceView workspace_view = workspace->view();
+    view.copy_from_host(bytes, workspace_view);
+}
+
+template <typename HostBuffer>
+inline void copy_to_host(
+        const iom::TensorView& view, HostBuffer& destination) {
+    const iom::WorkspaceRequirements requirements =
+            view.copy_to_host_workspace_requirements();
+    const std::span<std::byte> bytes(destination.data(), destination.size());
+    if (requirements.bytes == 0) {
+        view.copy_to_host(bytes);
+        return;
+    }
+    auto workspace = const_cast<iom::Device&>(view.device())
+                             .create_workspace(requirements.bytes);
+    const iom::RawWorkspaceView workspace_view = workspace->view();
+    view.copy_to_host(bytes, workspace_view);
+}
 inline std::vector<std::byte> read_logical(const iom::TensorView& view) {
     std::vector<std::byte> buffer(view.spec().logical_nbytes(), kReadbackSentinel);
-    view.copy_to_host(buffer);
+    copy_to_host(view, buffer);
     return buffer;
 }
 
@@ -503,7 +535,7 @@ inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
     const auto lhs_bytes = encode_logical(spec, 0x13579BDF2468ACE0ull);
     const auto rhs_bytes = encode_logical(spec, 0x0ECA8642FDB97531ull);
     auto rhs = candidate.create_tensor(spec);
-    rhs->view().copy_from_host(rhs_bytes);
+    copy_from_host(rhs->view(), rhs_bytes);
     auto queue = candidate.create_ops();
     {
         std::vector<std::size_t> dims(8u, 1);
@@ -511,9 +543,11 @@ inline void run_binary_rank_boundary_conformance(iom::Device& candidate) {
         const iom::TensorSpec current{iom::TensorShape{dims}, iom::DataType::U8};
         auto l = candidate.create_tensor(current);
         auto o = candidate.create_tensor(current);
-        l->view().copy_from_host(lhs_bytes);
-        o->view().copy_from_host(std::vector<std::byte>(
-                current.logical_nbytes(), std::byte{0}));
+        copy_from_host(l->view(), lhs_bytes);
+        copy_from_host(
+                o->view(),
+                std::vector<std::byte>(
+                        current.logical_nbytes(), std::byte{0}));
         const auto requirements = query_binary_workspace_requirements(
                 *queue, BinaryOperation::add, l->view(), rhs->view(),
                 o->view());
@@ -561,10 +595,12 @@ inline void run_accelerator_rank_boundary_conformance(iom::Device& candidate) {
     auto lhs = candidate.create_tensor(lhs_spec);
     auto rhs = candidate.create_tensor(rhs_spec);
     auto out = candidate.create_tensor(out_spec);
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
-    out->view().copy_from_host(std::vector<std::byte>(
-            out_spec.logical_nbytes(), std::byte{0xAA}));
+    copy_from_host(lhs->view(), lhs_bytes);
+    copy_from_host(rhs->view(), rhs_bytes);
+    copy_from_host(
+            out->view(),
+            std::vector<std::byte>(
+                    out_spec.logical_nbytes(), std::byte{0xAA}));
     auto queue = candidate.create_ops();
     const auto requirements = query_binary_workspace_requirements(
             *queue, BinaryOperation::add, lhs->view(), rhs->view(),

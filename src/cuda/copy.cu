@@ -1,3 +1,4 @@
+#include <array>
 #include "copy.hpp"
 
 #include "iom/device.hpp"
@@ -84,22 +85,86 @@ void inject_submission_fault_for_testing(
     g_submission_fault.store(fault, std::memory_order_release);
 }
 
+namespace {
+
+detail::Fence transfer_fence() noexcept {
+    detail::Fence fence;
+    fence.invoke = [](const detail::Fence&) noexcept {
+        return detail::FenceResult::success();
+    };
+    return fence;
+}
+
+struct WorkspaceAdmission {
+    detail::WorkspaceLease lease;
+    void* address = nullptr;
+};
+
+WorkspaceAdmission begin_workspace_transfer(
+        const Device& device, detail::RegistryState& registry_state,
+        const TensorView& view, RawWorkspaceView workspace,
+        bool& resource_poisoned) {
+    const iom::WorkspaceRequirements requirements =
+            view.copy_from_host_workspace_requirements();
+    const RawWorkspaceView checked =
+            detail::WorkspaceValidation::validated(
+                    device, workspace, requirements, view);
+    if (resource_poisoned) {
+        throw std::bad_alloc();
+    }
+    const detail::QueueId queue_id =
+            detail::allocate_queue_id(registry_state);
+    return {
+            detail::acquire_workspace_lease(
+                    registry_state, workspace.owner_identity(),
+                    detail::WorkspaceValidation::address(checked),
+                    checked.byte_size(), queue_id, queue_id, transfer_fence()),
+            detail::WorkspaceValidation::address(checked)};
+}
+void finish_workspace_transfer(
+        detail::RegistryState& registry_state,
+        const detail::WorkspaceLease& lease, bool proof) noexcept {
+    detail::complete_workspace_lease(registry_state, lease, proof);
+}
+
+}  // namespace
+
 void region_from_host(
-        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
-        CUcontext context, const TensorView& destination,
-        std::span<const std::byte> source) {
-    detail::synchronous_transfer<gpu_policy>(
-            transfer_pool, staging_pool, context, destination, source, {},
-            true);
+        cudaStream_t transfer_stream, CUcontext context,
+        const Device& device, detail::RegistryState& registry_state,
+        const TensorView& destination, RawWorkspaceView workspace,
+        std::span<const std::byte> source, bool& resource_poisoned) {
+    WorkspaceAdmission admission = begin_workspace_transfer(
+            device, registry_state, destination, workspace, resource_poisoned);
+    try {
+        detail::synchronous_transfer<gpu_policy>(
+                transfer_stream, context, destination, admission.address,
+                source, {}, true);
+        finish_workspace_transfer(registry_state, admission.lease, true);
+    } catch (...) {
+        resource_poisoned = true;
+        finish_workspace_transfer(registry_state, admission.lease, false);
+        throw;
+    }
 }
 
 void region_to_host(
-        TransferStreamPool& transfer_pool, StagingSlotPool& staging_pool,
-        CUcontext context, const TensorView& source,
-        std::span<std::byte> destination) {
-    detail::synchronous_transfer<gpu_policy>(
-            transfer_pool, staging_pool, context, source, {}, destination,
-            false);
+        cudaStream_t transfer_stream, CUcontext context,
+        const Device& device, detail::RegistryState& registry_state,
+        const TensorView& source, RawWorkspaceView workspace,
+        std::span<std::byte> destination, bool& resource_poisoned) {
+    WorkspaceAdmission admission = begin_workspace_transfer(
+            device, registry_state, source, workspace, resource_poisoned);
+    try {
+        detail::synchronous_transfer<gpu_policy>(
+                transfer_stream, context, source, admission.address,
+                {}, destination, false);
+        finish_workspace_transfer(registry_state, admission.lease, true);
+    } catch (...) {
+        resource_poisoned = true;
+        finish_workspace_transfer(registry_state, admission.lease, false);
+        throw;
+    }
 }
 
 std::unique_ptr<DeviceOps> make_queue(

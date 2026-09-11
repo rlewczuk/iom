@@ -93,8 +93,8 @@ const char* g_executable_path = nullptr;
         auto queue = device->create_ops();
         const std::vector<std::byte> pattern(
                 spec.logical_nbytes(), static_cast<std::byte>(0x3c));
-        source->view().copy_from_host(pattern);
-        destination->view().copy_from_host(pattern);
+        iom_conformance::copy_from_host(source->view(), pattern);
+        iom_conformance::copy_from_host(destination->view(), pattern);
 
         iom::rocm_detail::inject_submission_fault_for_testing(fault);
         const iom::oid token =
@@ -304,8 +304,8 @@ TEST_CASE("ROCm copy reservation failures roll back before native work") {
             spec.logical_nbytes(), static_cast<std::byte>(0x11));
     const std::vector<std::byte> destination_bytes(
             spec.logical_nbytes(), static_cast<std::byte>(0x22));
-    source->view().copy_from_host(source_bytes);
-    destination->view().copy_from_host(destination_bytes);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(destination->view(), destination_bytes);
     auto queue = device->create_ops();
 
     iom::rocm_detail::inject_submission_fault_for_testing(
@@ -314,7 +314,7 @@ TEST_CASE("ROCm copy reservation failures roll back before native work") {
             queue->copy(source->view(), destination->view()),
             iom::to_oid(iom::OidError::ResourceExhausted));
     std::vector<std::byte> observed(spec.logical_nbytes());
-    destination->view().copy_to_host(observed);
+    iom_conformance::copy_to_host(destination->view(), observed);
     CHECK(observed == destination_bytes);
 
     const iom::oid first = queue->copy(source->view(), destination->view());
@@ -376,7 +376,7 @@ TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the stag
                 spec.logical_nbytes(),
                 type == iom::DataType::I2 ? std::size_t{5} : std::size_t{13});
         auto tensor = candidate->create_tensor(spec);
-        tensor->view().copy_from_host(expected);
+        iom_conformance::copy_from_host(tensor->view(), expected);
         iom_conformance::require_logical_bytes(
                 tensor->view(), expected, "odd-length sub-byte host read");
     }
@@ -467,7 +467,7 @@ TEST_CASE("ROCm ADD retained launch failure keeps owners reusable") {
     for (std::size_t i = 0; i < pattern.size(); ++i) {
         pattern[i] = std::byte{static_cast<unsigned char>(i * 3)};
     }
-    lhs->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(lhs->view(), pattern);
     auto queue = candidate->create_ops();
 
     iom::rocm_detail::inject_submission_fault_for_testing(
@@ -483,7 +483,7 @@ TEST_CASE("ROCm ADD retained launch failure keeps owners reusable") {
     REQUIRE(iom::oid_is_token(recovered));
     CHECK_NOTHROW(queue->wait(recovered));
     std::vector<std::byte> observed(spec.logical_nbytes());
-    out->view().copy_to_host(observed);
+    iom_conformance::copy_to_host(out->view(), observed);
     for (std::size_t i = 0; i < observed.size(); ++i) {
         CHECK_EQ(
                 static_cast<unsigned>(observed[i]),
@@ -506,8 +506,8 @@ TEST_CASE("ROCm submission remains transactional across post-enqueue failures") 
     const std::vector<std::byte> logical_pattern(
             spec.logical_nbytes(), static_cast<std::byte>(0x3c));
 
-    source->view().copy_from_host(logical_pattern);
-    destination->view().copy_from_host(logical_pattern);
+    iom_conformance::copy_from_host(source->view(), logical_pattern);
+    iom_conformance::copy_from_host(destination->view(), logical_pattern);
 
     CHECK_EQ(queue->copy(source->view(), invalid_destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
 
@@ -608,8 +608,8 @@ TEST_CASE("ROCm queue destruction fences pending copies") {
     auto destination = device->create_tensor(spec);
     const std::vector<std::byte> pattern(
             spec.logical_nbytes(), static_cast<std::byte>(0x5a));
-    source->view().copy_from_host(pattern);
-    destination->view().copy_from_host(pattern);
+    iom_conformance::copy_from_host(source->view(), pattern);
+    iom_conformance::copy_from_host(destination->view(), pattern);
 
     {
         auto queue = device->create_ops();

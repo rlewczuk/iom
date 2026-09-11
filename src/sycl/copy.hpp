@@ -10,7 +10,6 @@
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "../shared/metadata_slot_pool.hpp"
 #include "../shared/queue_resources.hpp"
-#include "staging_pool.hpp"
 
 namespace iom::sycl_detail {
 
@@ -30,14 +29,16 @@ void reset_fence_wait_count_for_testing() noexcept;
 [[nodiscard]] std::size_t fence_wait_count_for_testing() noexcept;
 
 void region_from_host(
-        StagingSlotPool& staging_pool, sycl::queue& transfer_queue,
-        const TensorView& destination, void* storage,
-        std::span<const std::byte> source);
+        sycl::queue& transfer_queue, const Device& device,
+        detail::RegistryState& registry_state,
+        const TensorView& destination, RawWorkspaceView workspace,
+        std::span<const std::byte> source, bool& resource_poisoned);
 
 void region_to_host(
-        StagingSlotPool& staging_pool, sycl::queue& transfer_queue,
-        const TensorView& source, const void* storage,
-        std::span<std::byte> destination);
+        sycl::queue& transfer_queue, const Device& device,
+        detail::RegistryState& registry_state, const TensorView& source,
+        RawWorkspaceView workspace, std::span<std::byte> destination,
+        bool& resource_poisoned);
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, detail::QueueResourceProvider& resource_provider,

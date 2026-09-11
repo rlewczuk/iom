@@ -84,6 +84,27 @@ namespace iom {
             }
         }
 
+        class RocmTransferResource final {
+        public:
+            RocmTransferResource()
+                    : stream_(rocm_detail::gpu_policy::create_queue_stream()) {}
+            ~RocmTransferResource() noexcept {
+                (void)rocm_detail::gpu_policy::synchronize_stream_noexcept(
+                        stream_);
+                rocm_detail::gpu_policy::destroy_queue_stream_noexcept(stream_);
+            }
+
+            RocmTransferResource(const RocmTransferResource&) = delete;
+            RocmTransferResource& operator=(const RocmTransferResource&) = delete;
+
+            [[nodiscard]] hipStream_t stream() const noexcept {
+                return stream_;
+            }
+
+        private:
+            hipStream_t stream_ = nullptr;
+        };
+
         class RocmDevice final : public Device,
                                  public detail::QueueResourceProvider {
         public:
@@ -94,22 +115,25 @@ namespace iom {
                     void* data_backing, std::size_t data_backing_bytes,
                     void* metadata_backing)
                     : ordinal_(ordinal),
-                      transfer_pool_{},
+                      transfer_resource_(nullptr),
                       data_allocator_(std::move(data_allocator)),
                       metadata_allocator_(std::move(metadata_allocator)),
                       data_backing_(data_backing),
                       data_backing_bytes_(data_backing_bytes),
                       metadata_backing_(metadata_backing),
                       queue_slot_count_(metadata_allocator_->block_count()
-                                        / detail::kMaxLiveGpuQueues) {}
+                                        / detail::kMaxLiveGpuQueues) {
+                activate();
+                transfer_resource_ =
+                        std::make_unique<RocmTransferResource>();
+            }
 
             RocmDevice(const RocmDevice&) = delete;
             RocmDevice& operator=(const RocmDevice&) = delete;
             ~RocmDevice() override {
                 try {
                     activate();
-                    transfer_pool_.destroy();
-                    staging_pool_.destroy();
+                    transfer_resource_.reset();
                 } catch (...) {
                 }
                 registry_state_.quarantine.drain();
@@ -373,8 +397,8 @@ namespace iom {
 
             std::uint32_t ordinal_;
             detail::RegistryState registry_state_;
-            rocm_detail::TransferStreamPool transfer_pool_;
-            rocm_detail::StagingSlotPool staging_pool_;
+            std::unique_ptr<RocmTransferResource> transfer_resource_;
+            mutable std::mutex transfer_mutex_;
             std::mutex bookkeeping_mutex_;
             std::unique_ptr<ListAllocator> data_allocator_;
             std::unique_ptr<FixedSizeAllocator> metadata_allocator_;
@@ -488,20 +512,24 @@ namespace iom {
 
             void region_from_host(
                     const TensorView& destination,
-                    std::span<const std::byte> source) override {
-                device_.activate();
+                    std::span<const std::byte> source,
+                    RawWorkspaceView workspace) override {
+                std::lock_guard<std::mutex> lock(device_.transfer_mutex_);
                 rocm_detail::region_from_host(
-                        device_.transfer_pool_, device_.staging_pool_,
-                        static_cast<int>(device_.ordinal_), destination, source);
+                        device_.transfer_resource_->stream(),
+                        static_cast<int>(device_.ordinal()), device_,
+                        device_.registry_state_, destination, workspace, source);
             }
 
             void region_to_host(
                     const TensorView& source,
-                    std::span<std::byte> destination) const override {
-                device_.activate();
+                    std::span<std::byte> destination,
+                    RawWorkspaceView workspace) const override {
+                std::lock_guard<std::mutex> lock(device_.transfer_mutex_);
                 rocm_detail::region_to_host(
-                        device_.transfer_pool_, device_.staging_pool_,
-                        static_cast<int>(device_.ordinal_), source, destination);
+                        device_.transfer_resource_->stream(),
+                        static_cast<int>(device_.ordinal()), device_,
+                        device_.registry_state_, source, workspace, destination);
             }
 
             RocmDevice& device_;

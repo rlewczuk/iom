@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include "backend/backend_conformance_common.hpp"
 
 #include <hip/hip_runtime_api.h>
 
@@ -125,99 +126,6 @@ TEST_CASE("ROCm factory rejects the first unavailable ordinal") {
     CHECK(probe.records.empty());
 }
 
-TEST_CASE("ROCm staging pool preserves accounting across allocation failures") {
-    int device_count = 0;
-    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
-    REQUIRE(device_count > 0);
-
-    auto device = iom::make_rocm_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    iom::rocm_detail::StagingSlotPool pool;
-
-    CHECK_THROWS_AS(
-            (void)pool.acquire(
-                    iom::rocm_detail::StagingSlotPool::kMaxStagingBytes + 1),
-            std::invalid_argument);
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS((void)pool.acquire(4), std::bad_alloc);
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    {
-        auto lease = pool.acquire(4);
-        CHECK_EQ(lease.capacity(), 4);
-        CHECK(lease.staging() != nullptr);
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    pool.fail_next_allocation_for_testing();
-    CHECK_THROWS_AS((void)pool.acquire(8), std::bad_alloc);
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    CHECK_EQ(pool.idle_count_for_testing(), 1);
-
-    {
-        auto lease = pool.acquire(4);
-        lease.poison();
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    for (std::size_t i = 0;
-         i < 2 * iom::rocm_detail::StagingSlotPool::kMaxSlotCount; ++i) {
-        auto lease = pool.acquire(4);
-        lease.poison();
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-
-    {
-        auto lease = pool.acquire(4);
-        CHECK_EQ(lease.capacity(), 4);
-    }
-    CHECK_EQ(pool.allocation_count_for_testing(), 1);
-    pool.destroy();
-    CHECK_EQ(pool.allocation_count_for_testing(), 0);
-    CHECK_EQ(pool.idle_count_for_testing(), 0);
-}
-
-TEST_CASE("ROCm transfer streams and odd-tail staging are reusable") {
-    int device_count = 0;
-    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
-    REQUIRE(device_count > 0);
-
-    iom::rocm_detail::TransferStreamPool streams;
-    {
-        auto scope = streams.acquire();
-        scope.poison();
-    }
-    CHECK_EQ(streams.idle_count_for_testing(), 0);
-    {
-        auto scope = streams.acquire();
-    }
-    CHECK_EQ(streams.idle_count_for_testing(), 1);
-    streams.destroy();
-
-    auto device = iom::make_rocm_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    const iom::TensorSpec spec{
-            iom::TensorShape{{1, 17}}, iom::DataType::I2};
-    auto tensor = device->create_tensor(spec);
-    const std::vector<std::byte> input(
-            spec.logical_nbytes(), static_cast<std::byte>(0xA5));
-    std::vector<std::byte> expected = input;
-    expected.back() = static_cast<std::byte>(0x01);
-    std::vector<std::byte> output(spec.logical_nbytes());
-    for (int iteration = 0; iteration < 3; ++iteration) {
-        tensor->view().copy_from_host(input);
-        tensor->view().copy_to_host(output);
-        CHECK_EQ(output, expected);
-        CHECK((static_cast<unsigned int>(output.back()) & 0xFCu) == 0);
-    }
-}
 
 TEST_CASE("ROCm concurrent host transfers acquire independent resources") {
     int device_count = 0;
@@ -240,8 +148,8 @@ TEST_CASE("ROCm concurrent host transfers acquire independent resources") {
     std::thread thread_a([&] {
         try {
             start_gate.arrive_and_wait();
-            tensor_a->view().copy_from_host(input);
-            tensor_a->view().copy_to_host(output_a);
+            iom_conformance::copy_from_host(tensor_a->view(), input);
+            iom_conformance::copy_to_host(tensor_a->view(), output_a);
         } catch (...) {
             failed.store(true, std::memory_order_release);
         }
@@ -249,8 +157,8 @@ TEST_CASE("ROCm concurrent host transfers acquire independent resources") {
     std::thread thread_b([&] {
         try {
             start_gate.arrive_and_wait();
-            tensor_b->view().copy_from_host(input);
-            tensor_b->view().copy_to_host(output_b);
+            iom_conformance::copy_from_host(tensor_b->view(), input);
+            iom_conformance::copy_to_host(tensor_b->view(), output_b);
         } catch (...) {
             failed.store(true, std::memory_order_release);
         }
@@ -609,8 +517,8 @@ TEST_CASE(
         rhs_bytes[index] = std::byte{static_cast<unsigned char>((index * 7)
                                                                % 251)};
     }
-    lhs->view().copy_from_host(lhs_bytes);
-    rhs->view().copy_from_host(rhs_bytes);
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
 
     auto queue = device->create_ops();
     REQUIRE(queue != nullptr);
@@ -643,8 +551,8 @@ TEST_CASE(
             expected_bytes.size());
     std::vector<std::byte> first_actual(expected_bytes.size());
     std::vector<std::byte> second_actual(expected_bytes.size());
-    first_out->view().copy_to_host(first_actual);
-    second_out->view().copy_to_host(second_actual);
+    iom_conformance::copy_to_host(first_out->view(), first_actual);
+    iom_conformance::copy_to_host(second_out->view(), second_actual);
     CHECK(first_actual == expected_bytes);
     CHECK(second_actual == expected_bytes);
 
@@ -704,201 +612,6 @@ TEST_CASE("ROCm rejected create_tensor leaves the current device unchanged") {
     CHECK(current_after == current_before);
 }
 
-TEST_CASE(
-        "ROCm native allocation seam observes exactly two setup backings and "
-        "post-publication staging and metadata boundaries") {
-    int device_count = 0;
-    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
-    REQUIRE(device_count > 0);
-
-    AllocationCallsRestore restore;
-    AllocationProbe probe;
-    active_allocation_probe = &probe;
-    iom::rocm_detail::allocation_observer.complete = &capture_allocation;
-
-    const iom::TensorSpec staging_spec{
-            iom::TensorShape{{1024, 1024}}, iom::DataType::F32};
-    // The queue binary path backs its descriptor in one fixed 512-byte slot
-    // of the queue's reserved partition, so a plain rank-four tensor
-    // exercises the fixed-slot path without any native allocation.
-    const iom::TensorSpec binary_spec{
-            iom::TensorShape{{2, 2, 16, 16}}, iom::DataType::F32};
-    iom::rocm_detail::AllocationRecord data_backing;
-    iom::rocm_detail::AllocationRecord metadata_backing;
-    {
-        auto device = iom::make_rocm_device(
-                0, iom::DeviceMemoryConfig{kArenaBytes});
-        REQUIRE(device != nullptr);
-        auto staging_tensor = device->create_tensor(staging_spec);
-        auto lhs = device->create_tensor(binary_spec);
-        auto rhs = device->create_tensor(binary_spec);
-        auto out = device->create_tensor(binary_spec);
-        auto queue = device->create_ops();
-        REQUIRE(queue != nullptr);
-
-        // Factory setup produced exactly two instrumented backing
-        // allocations; tensor and queue creation suballocate and never
-        // route through the seam.
-        std::vector<iom::rocm_detail::AllocationRecord> setup_allocations;
-        for (const auto& record : probe.records) {
-            if (record.phase == iom::rocm_detail::AllocationPhase::setup
-                    && record.kind
-                            == iom::rocm_detail::AllocationKind::allocate) {
-                setup_allocations.push_back(record);
-            }
-        }
-        REQUIRE_EQ(setup_allocations.size(), 2u);
-        CHECK_EQ(probe.records.size(), 2u);
-        std::size_t data_count = 0;
-        std::size_t metadata_count = 0;
-        for (const auto& record : setup_allocations) {
-            CHECK(record.succeeded);
-            CHECK(record.address != nullptr);
-            CHECK(reinterpret_cast<std::uintptr_t>(record.address) % 32 == 0);
-            if (record.classification
-                == iom::rocm_detail::AllocationClass::data_backing) {
-                ++data_count;
-                data_backing = record;
-            }
-            if (record.classification
-                == iom::rocm_detail::AllocationClass::metadata_backing) {
-                ++metadata_count;
-                metadata_backing = record;
-            }
-        }
-        CHECK_EQ(data_count, 1u);
-        CHECK_EQ(metadata_count, 1u);
-        CHECK_EQ(data_backing.bytes, kArenaBytes);
-        CHECK_EQ(metadata_backing.bytes, 4 * 16 * 512u);
-
-        // Disjoint data and metadata domains.
-        const std::uintptr_t data_begin =
-                reinterpret_cast<std::uintptr_t>(data_backing.address);
-        const std::uintptr_t data_end = data_begin + data_backing.bytes;
-        const std::uintptr_t metadata_begin =
-                reinterpret_cast<std::uintptr_t>(metadata_backing.address);
-        const std::uintptr_t metadata_end =
-                metadata_begin + metadata_backing.bytes;
-        const bool domains_disjoint =
-                data_end <= metadata_begin || metadata_end <= data_begin;
-        CHECK(domains_disjoint);
-
-        std::vector<std::byte> input(
-                staging_spec.logical_nbytes(), std::byte{0x5a});
-        staging_tensor->view().copy_from_host(input);
-
-        const iom::oid token =
-                queue->add(lhs->view(), rhs->view(), out->view());
-        REQUIRE(iom::oid_is_token(token));
-        queue->wait(token);
-    }  // queue and device teardown free the pooled metadata, staging, and
-       // the two arena backings
-
-    std::size_t staging_allocations = 0;
-    std::size_t metadata_allocations = 0;
-    std::size_t failed = 0;
-    std::map<void*, std::size_t> outstanding;
-    // Seed with the two setup backings so their post-publication teardown
-    // frees pair up with the reservation that created them.
-    outstanding[data_backing.address] = data_backing.bytes;
-    outstanding[metadata_backing.address] = metadata_backing.bytes;
-    for (const auto& record : probe.records) {
-        if (record.phase == iom::rocm_detail::AllocationPhase::setup) {
-            continue;
-        }
-        if (record.kind == iom::rocm_detail::AllocationKind::allocate) {
-            if (!record.succeeded) {
-                ++failed;
-                continue;
-            }
-            CHECK(record.address != nullptr);
-            if (record.classification
-                == iom::rocm_detail::AllocationClass::staging) {
-                ++staging_allocations;
-            }
-            if (record.classification
-                == iom::rocm_detail::AllocationClass::operation_metadata) {
-                ++metadata_allocations;
-            }
-            outstanding[record.address] = record.bytes;
-        } else {
-            CHECK(record.succeeded);
-            // A free must pair with an earlier allocation: transient churn
-            // stays visible instead of vanishing into a net-byte counter.
-            CHECK(outstanding.erase(record.address) == 1);
-        }
-    }
-    CHECK_EQ(failed, 0u);
-    CHECK_GE(staging_allocations, 1u);   // host-transfer staging boundary
-    CHECK_EQ(metadata_allocations, 0u);  // fixed slots; no metadata growth
-    CHECK(outstanding.empty());          // every allocation freed by teardown
-}
-
-TEST_CASE(
-        "ROCm native allocation seam retains failed attempts and cleanup "
-        "frees") {
-    int device_count = 0;
-    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
-    REQUIRE(device_count > 0);
-
-    auto device = iom::make_rocm_device(
-            0, iom::DeviceMemoryConfig{kArenaBytes});
-    REQUIRE(device != nullptr);
-
-    // Arm the seam after setup so the record covers only pool traffic: the
-    // two setup backing reservations must not pollute this scenario.
-    AllocationCallsRestore restore;
-    AllocationProbe probe;
-    active_allocation_probe = &probe;
-    iom::rocm_detail::allocation_observer.complete = &capture_allocation;
-
-    iom::rocm_detail::StagingSlotPool pool;
-
-    // A failed native allocation stays observable even though no pointer is
-    // returned; check_hip turns the injected boundary error into the
-    // runtime failure the pool propagates.
-    iom::rocm_detail::allocation_calls.mem_alloc = &failing_mem_alloc;
-    CHECK_THROWS_AS((void)pool.acquire(4096), std::runtime_error);
-    iom::rocm_detail::allocation_calls =
-            iom::rocm_detail::AllocationCalls{};
-
-    {
-        auto lease = pool.acquire(4096);
-        REQUIRE(lease.staging() != nullptr);
-        // Poisoning releases the slot immediately: the cleanup free of the
-        // successful allocation is recorded as a paired staging free.
-        lease.poison();
-    }
-    pool.destroy();
-
-    std::size_t failed_attempts = 0;
-    std::size_t successful_allocations = 0;
-    std::size_t cleanup_frees = 0;
-    std::map<void*, std::size_t> outstanding;
-    for (const auto& record : probe.records) {
-        CHECK(record.classification
-              == iom::rocm_detail::AllocationClass::staging);
-        CHECK(record.phase
-              == iom::rocm_detail::AllocationPhase::post_publication);
-        if (record.kind == iom::rocm_detail::AllocationKind::allocate) {
-            if (!record.succeeded) {
-                ++failed_attempts;
-                CHECK(record.address == nullptr);
-                continue;
-            }
-            ++successful_allocations;
-            outstanding[record.address] = record.bytes;
-        } else {
-            CHECK(record.succeeded);
-            CHECK(outstanding.erase(record.address) == 1);
-            ++cleanup_frees;
-        }
-    }
-    CHECK_EQ(failed_attempts, 1u);
-    CHECK_EQ(successful_allocations, 1u);
-    CHECK_EQ(cleanup_frees, 1u);
-    CHECK(outstanding.empty());
-}
 
 namespace {
 

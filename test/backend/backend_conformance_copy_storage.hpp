@@ -412,7 +412,7 @@ inline bool run_storage_oracle_conformance(
                 const std::vector<std::byte> pattern =
                         encode_logical(candidate_view.spec(), salt);
                 ++salt;
-                candidate_view.copy_from_host(pattern);
+                iom_conformance::copy_from_host(candidate_view, pattern);
 
                 std::vector<std::byte> expected = initial;
                 apply_standard_tiled_view(
@@ -466,8 +466,8 @@ inline void run_storage_and_transfer_conformance(
             }
 
             const std::vector<std::byte> seeded = encode_logical(spec, 0xABCD);
-            reference->view().copy_from_host(seeded);
-            candidate->view().copy_from_host(seeded);
+            iom_conformance::copy_from_host(reference->view(), seeded);
+            iom_conformance::copy_from_host(candidate->view(), seeded);
             require_logical_bytes(
                     reference->view(), seeded, "reference full view");
             require_logical_bytes(
@@ -485,8 +485,8 @@ inline void run_storage_and_transfer_conformance(
                 const std::vector<std::byte> pattern =
                         encode_logical(reference_view.spec(), salt);
                 ++salt;
-                reference_view.copy_from_host(pattern);
-                candidate_view.copy_from_host(pattern);
+                iom_conformance::copy_from_host(reference_view, pattern);
+                iom_conformance::copy_from_host(candidate_view, pattern);
                 require_logical_bytes(
                         reference_view, pattern,
                         std::string("reference ") + view_case.label);
@@ -533,8 +533,8 @@ inline void run_async_copy_conformance(
                     encode_logical(spec, 11);
             const std::vector<std::byte> second_pattern =
                     encode_logical(spec, 12);
-            first->view().copy_from_host(first_pattern);
-            second->view().copy_from_host(second_pattern);
+            iom_conformance::copy_from_host(first->view(), first_pattern);
+            iom_conformance::copy_from_host(second->view(), second_pattern);
 
             auto queue = devices.candidate.create_ops();
             const iom::oid one =
@@ -596,7 +596,7 @@ inline void run_async_copy_conformance(
                 const std::vector<std::byte> pattern =
                         encode_logical(candidate_source_view.spec(), salt);
                 ++salt;
-                reference_source_view.copy_from_host(pattern);
+                iom_conformance::copy_from_host(reference_source_view, pattern);
 
                 std::vector<std::byte> initial_source;
                 std::vector<std::byte> initial_destination;
@@ -630,7 +630,7 @@ inline void run_async_copy_conformance(
                                     + copy_case.label,
                             true);
                 } else {
-                    candidate_source_view.copy_from_host(pattern);
+                    iom_conformance::copy_from_host(candidate_source_view, pattern);
                 }
 
                 const iom::oid reference_token = reference_queue->copy(
@@ -715,8 +715,8 @@ inline void run_copy_error_conformance(
                 encode_logical(spec, 21);
         const std::vector<std::byte> destination_pattern =
                 encode_logical(spec, 22);
-        source->view().copy_from_host(source_pattern);
-        destination->view().copy_from_host(destination_pattern);
+        iom_conformance::copy_from_host(source->view(), source_pattern);
+        iom_conformance::copy_from_host(destination->view(), destination_pattern);
 
         CHECK_EQ(queue->copy(other_shape->view(), destination->view()), iom::to_oid(iom::OidError::InvalidArgument));
         CHECK_EQ(queue->copy(destination->view(), other_shape->view()), iom::to_oid(iom::OidError::InvalidArgument));
@@ -775,7 +775,7 @@ inline void run_transfer_error_conformance(
 
             const std::vector<std::byte> seeded =
                     encode_logical(spec, static_cast<std::uint64_t>(31));
-            view.copy_from_host(seeded);
+            iom_conformance::copy_from_host(view, seeded);
 
             const iom::TensorSpec spec_before = view.spec();
             const std::size_t offset_before = view.plane_offset();
@@ -786,23 +786,23 @@ inline void run_transfer_error_conformance(
 
             std::vector<std::byte> short_write(seeded);
             short_write.pop_back();
-            CHECK_THROWS_AS(view.copy_from_host(short_write),
+            CHECK_THROWS_AS(iom_conformance::copy_from_host(view, short_write),
                             std::invalid_argument);
             std::vector<std::byte> long_write(seeded);
             long_write.push_back(std::byte{0});
-            CHECK_THROWS_AS(view.copy_from_host(long_write),
+            CHECK_THROWS_AS(iom_conformance::copy_from_host(view, long_write),
                             std::invalid_argument);
 
             std::vector<std::byte> short_read(
                     spec.logical_nbytes() - 1, kReadbackSentinel);
-            CHECK_THROWS_AS(view.copy_to_host(short_read),
+            CHECK_THROWS_AS(iom_conformance::copy_to_host(view, short_read),
                             std::invalid_argument);
             CHECK(std::all_of(
                     short_read.begin(), short_read.end(),
                     [](std::byte value) { return value == kReadbackSentinel; }));
             std::vector<std::byte> long_read(
                     spec.logical_nbytes() + 1, kReadbackSentinel);
-            CHECK_THROWS_AS(view.copy_to_host(long_read),
+            CHECK_THROWS_AS(iom_conformance::copy_to_host(view, long_read),
                             std::invalid_argument);
             CHECK(std::all_of(
                     long_read.begin(), long_read.end(),
@@ -814,7 +814,7 @@ inline void run_transfer_error_conformance(
                     std::vector<std::byte> invalid = seeded;
                     invalid[position] = std::byte{2};
                     CAPTURE(position);
-                    CHECK_THROWS_AS(view.copy_from_host(invalid),
+                    CHECK_THROWS_AS(iom_conformance::copy_from_host(view, invalid),
                                     std::invalid_argument);
                 }
                 // Canonical zero and one bytes round-trip; non-canonical

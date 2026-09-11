@@ -663,77 +663,59 @@ void launch_view_transfer(
     }
 }
 
-template <typename Policy, typename StreamPool, typename StagingPool>
+template <typename Policy>
 void synchronous_transfer_impl(
-        StreamPool& transfer_pool, StagingPool& staging_pool,
+        typename Policy::stream_type stream,
         typename Policy::context_type context, const TensorView& view,
-        std::span<const std::byte> source, std::span<std::byte> destination,
-        bool from_host) {
+        void* staging, std::span<const std::byte> source,
+        std::span<std::byte> destination, bool from_host) {
     const std::size_t logical_nbytes = view.spec().logical_nbytes();
     const std::size_t staging_nbytes =
             gpu_algorithm::compute_staging_size(logical_nbytes);
     const std::size_t logical_bits =
             view.spec().shape.element_count()
             * leaf_bits(view.spec().data_type);
+    if (staging == nullptr || staging_nbytes == 0) {
+        throw std::invalid_argument("host transfer staging range is empty");
+    }
     Policy::activate(context);
-
-    auto staging_lease = staging_pool.acquire(staging_nbytes);
-    try {
-        auto stream_scope = transfer_pool.acquire();
-        const typename Policy::stream_type stream = stream_scope.stream();
-        void* staging = Policy::staging_address(staging_lease.staging());
-        try {
-            if (from_host) {
-                Policy::copy_from_host(
-                        stream, staging, source.data(), source.size());
-                launch_view_transfer<Policy>(
-                        stream, view, staging,
-                        const_cast<void*>(view.native_handle()), true);
-                Policy::after_copy_plane_launch(2);
-            } else {
-                const std::size_t tail_word_start =
-                        (logical_bits / 32) * sizeof(std::uint32_t);
-                const std::size_t tail_bytes =
-                        staging_nbytes - tail_word_start;
-                if (tail_bytes != 0) {
-                    Policy::memset(
-                            stream,
-                            static_cast<std::byte*>(staging) + tail_word_start,
-                            tail_bytes);
-                }
-                launch_view_transfer<Policy>(
-                        stream, view, view.native_handle(), staging, false);
-                Policy::after_copy_plane_launch(2);
-            }
-            Policy::synchronize_stream(stream);
-            stream_scope.mark_synchronized();
-            if (!from_host) {
-                Policy::copy_to_host(
-                        stream, destination.data(), staging,
-                        destination.size());
-            }
-        } catch (...) {
-            stream_scope.poison();
-            staging_lease.poison();
-            throw;
+    if (from_host) {
+        Policy::copy_from_host(
+                stream, staging, source.data(), source.size());
+        launch_view_transfer<Policy>(
+                stream, view, staging,
+                const_cast<void*>(view.native_handle()), true);
+        Policy::after_copy_plane_launch(2);
+    } else {
+        const std::size_t tail_word_start =
+                (logical_bits / 32) * sizeof(std::uint32_t);
+        const std::size_t tail_bytes = staging_nbytes - tail_word_start;
+        if (tail_bytes != 0) {
+            Policy::memset(
+                    stream, static_cast<std::byte*>(staging) + tail_word_start,
+                    tail_bytes);
         }
-    } catch (...) {
-        staging_lease.poison();
-        throw;
+        launch_view_transfer<Policy>(
+                stream, view, view.native_handle(), staging, false);
+        Policy::after_copy_plane_launch(2);
+    }
+    Policy::synchronize_stream(stream);
+    if (!from_host) {
+        Policy::copy_to_host(
+                stream, destination.data(), staging, destination.size());
     }
 }
 
 }  // namespace
 
-template <typename Policy, typename StreamPool, typename StagingPool>
+template <typename Policy>
 void synchronous_transfer(
-        StreamPool& transfer_pool, StagingPool& staging_pool,
+        typename Policy::stream_type stream,
         typename Policy::context_type context, const TensorView& view,
-        std::span<const std::byte> source, std::span<std::byte> destination,
-        bool from_host) {
+        void* staging, std::span<const std::byte> source,
+        std::span<std::byte> destination, bool from_host) {
     synchronous_transfer_impl<Policy>(
-            transfer_pool, staging_pool, context, view, source, destination,
-            from_host);
+            stream, context, view, staging, source, destination, from_host);
 }
 
 }  // namespace iom::detail

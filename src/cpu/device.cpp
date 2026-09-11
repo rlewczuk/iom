@@ -439,7 +439,8 @@ namespace iom {
 
         void region_from_host(
                 const TensorView& destination,
-                std::span<const std::byte> source) override {
+                std::span<const std::byte> source,
+                RawWorkspaceView) override {
             unsigned char* storage =
                     static_cast<unsigned char*>(address_);
             const auto* host = reinterpret_cast<const unsigned char*>(
@@ -523,7 +524,8 @@ namespace iom {
 
         void region_to_host(
                 const TensorView& source,
-                std::span<std::byte> destination) const override {
+                std::span<std::byte> destination,
+                RawWorkspaceView) const override {
             unsigned char* host =
                     reinterpret_cast<unsigned char*>(destination.data());
             const unsigned char* storage =
