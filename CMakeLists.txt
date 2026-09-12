@@ -201,10 +201,12 @@ if(ROCM_ENABLED)
 
     add_library(iom_rocm STATIC
         src/rocm/device.cpp
+        src/rocm/device_tensor.cpp
         src/rocm/copy.hip
         src/rocm/copy.hpp
         src/rocm/driver.cpp
         src/rocm/driver.hpp
+        src/rocm/device_internal.hpp
         src/shared/metadata_slot_pool.hpp
         src/shared/event_ring.hpp
         src/shared/gpu_queue.hpp
