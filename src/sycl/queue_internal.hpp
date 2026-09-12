@@ -72,8 +72,6 @@ private:
     void complete_task(
             std::uint64_t sequence, std::exception_ptr callback_failure);
 
-    // Device-USM-safe binary staging extent and checked arithmetic remain
-    // private members until task 15 extracts binary execution.
     static std::size_t binary_view_staging_bytes(
             const BinaryRequest& captured, const BinaryViewSnapshot& view);
     static std::size_t checked_add_local(
