@@ -262,10 +262,13 @@ if(SYCL_ENABLED)
         src/sycl/device.cpp
         src/sycl/device_tensor.cpp
         src/sycl/copy.cpp
+        src/sycl/queue.cpp
         src/sycl/add.cpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
         src/sycl/device_internal.hpp
+        src/sycl/queue_support.hpp
+        src/sycl/queue_internal.hpp
         include/iom/sycl/device.hpp
         src/shared/standard_tiled_copy.inl
         src/shared/standard_tiled_copy_metadata.inl
