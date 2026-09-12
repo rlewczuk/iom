@@ -130,6 +130,7 @@ if(TTNN_ENABLED)
     add_library(iom_ttnn STATIC
         src/ttnn/device.cpp
         src/ttnn/queue.cpp
+        src/ttnn/queue_copy.cpp
         src/ttnn/device_types.cpp
         src/ttnn/device_internal.hpp
         src/ttnn/queue_internal.hpp
