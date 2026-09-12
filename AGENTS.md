@@ -35,9 +35,13 @@ IOM is an inference-only C++20 engine for sparse, oversized language models. Com
 - After each non-trivial change, run the backend conformance suite for all backends
 - Treat applicable change specifications as acceptance criteria.
 
+## TTNN Remote Verification
+
+TTNN device sometimes hangs. Remember to set timeouts on TTNN test runs. To reset device, run `/home/rlew/bin/ttnn_reset` script on TTNN host.
+
 ## SYCL Remote Verification
 
-- The configured SYCL host setup sources `/opt/intel/oneapi/setvars.sh`; it must be sourced with nounset disabled because `compiler/latest/env/vars.sh` reads `OCL_ICD_FILENAMES` before defining it.
+- The configured SYCL host setup sources `/opt/intel/oneapi/setvars.sh`; it must be sourced with nounset disabled because `compiler/latest/env/vars.sh` reads `OCL_ICD_FILENAMES` before defining it. As you are working on remote host via SSH and each command issues new SSH connection, you need to source this script before every remote call.
 - For `remote-exec`, use a profile override without `REMOTE_SETUP`, then initialize the toolchain inside the command:
   `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-setvars.log 2>&1; set -u;`
 - Preserve the runtime environment for `sycl-ls`, CMake, and CTest. `sycl-ls` should enumerate the Level Zero GPU devices before running `iom_sycl_smoke_tests`.
