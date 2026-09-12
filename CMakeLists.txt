@@ -127,6 +127,8 @@ if(TTNN_ENABLED)
 
     add_library(iom_ttnn STATIC
         src/ttnn/device.cpp
+        src/ttnn/device_types.cpp
+        src/ttnn/device_internal.hpp
         src/ttnn/copy.cpp
         src/ttnn/copy.hpp
         src/ttnn/registry_state.hpp
