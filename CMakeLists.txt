@@ -78,6 +78,8 @@ set(IOM_SOURCES
         src/tensor.cpp
         src/tensor_view.cpp
         src/cpu/device.cpp
+        src/cpu/tensor.cpp
+        src/cpu/queue.cpp
         src/mmap.cpp
         src/safetensors.cpp
         src/alloc.cpp
