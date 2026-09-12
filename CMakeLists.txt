@@ -166,6 +166,8 @@ if(CUDA_ENABLED)
         src/shared/metadata_slot_pool.hpp
         src/shared/event_ring.hpp
         src/shared/gpu_queue.hpp
+        src/shared/gpu_queue_lifecycle.inl
+        src/shared/gpu_queue_operations.inl
         src/shared/standard_tiled_copy.hpp
         include/iom/cuda/device.hpp
     )
@@ -214,6 +216,8 @@ if(ROCM_ENABLED)
         src/shared/metadata_slot_pool.hpp
         src/shared/event_ring.hpp
         src/shared/gpu_queue.hpp
+        src/shared/gpu_queue_lifecycle.inl
+        src/shared/gpu_queue_operations.inl
         src/shared/standard_tiled_copy.hpp
         include/iom/rocm/device.hpp
     )
