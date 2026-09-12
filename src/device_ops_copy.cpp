@@ -6,6 +6,13 @@
 namespace iom {
 
     using detail::UnsupportedOperation;
+    DeviceOps::CopyViewSnapshot DeviceOps::snapshot_copy_view(
+            const TensorView& view) {
+        return DeviceOps::CopyViewSnapshot{
+                view.spec(), &view.device(), view.owner_identity(),
+                const_cast<void*>(view.native_handle()), view.plane_offset(),
+                {view.plane_strides().begin(), view.plane_strides().end()}};
+    }
 
     void DeviceOps::validate_copy(
             const Device& device, const TensorView& source,
