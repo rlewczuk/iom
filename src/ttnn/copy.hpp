@@ -19,6 +19,10 @@ struct CopySnapshot {
     std::vector<std::size_t> plane_strides;
 };
 void copy_planes(const CopySnapshot&, const ttnn::Tensor*, const CopySnapshot&, ttnn::Tensor*, bool&);
+std::size_t carrier_bytes(tt::tt_metal::DataType);
+std::size_t upload_slot_index(tt::tt_metal::DataType);
+std::size_t padded_cell_index(
+        std::size_t row, std::size_t column, std::size_t num_tile_cols);
 struct BinarySnapshot {
     TensorSpec spec;
     void* native_handle;
