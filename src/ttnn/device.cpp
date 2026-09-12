@@ -28,6 +28,7 @@
 #include "copy.hpp"
 #include "registry_state.hpp"
 #include "staging.hpp"
+#include "testing_internal.hpp"
 #include "iom/iom.hpp"
 
 namespace iom {
@@ -38,86 +39,6 @@ namespace iom {
         using ttnn_detail::checked_to_uint32;
         using ttnn_detail::is_supported;
         using ttnn_detail::native_dtype;
-#ifdef IOM_ENABLE_TESTING
-        std::atomic<bool> g_fail_next_quarantine_action{false};
-        bool g_quarantine_action_fault_consumed = false;
-
-        void consume_quarantine_action_fault_locked() noexcept(false) {
-            if (g_fail_next_quarantine_action.exchange(
-                        false, std::memory_order_acquire)
-                    && !g_quarantine_action_fault_consumed) {
-                g_quarantine_action_fault_consumed = true;
-                throw std::bad_alloc();
-            }
-        }
-
-        // Test seams for copy ownership transaction failure injection. Each
-        // arming is consumed by exactly one operation; the atomic state keeps
-        // arming and consumption race-free across the submit and worker
-        // threads. The copy-plane seam itself lives with copy_planes in
-        // copy.cpp; registration, outcome-insertion, and finish-failure seams
-        // are consumed here where the transaction runs.
-        std::atomic<bool> g_fail_next_copy_registration{false};
-        std::atomic<bool> g_fail_next_copy_outcome_insertion{false};
-        std::atomic<bool> g_fail_next_binary_outcome_insertion{false};
-        std::atomic<bool> g_copy_registration_fault_consumed{false};
-        std::atomic<bool> g_copy_outcome_insertion_fault_consumed{false};
-        std::atomic<bool> g_binary_outcome_insertion_fault_consumed{false};
-
-        // Remaining mesh-finish attempts that must fail. Count semantics let
-        // a test fail both drain attempts of one failed submission (the
-        // synchronous drain in execute and the completion retry) while every
-        // later finish, including quarantine drains, succeeds.
-        std::atomic<std::size_t> g_fail_copy_mesh_finishes{0};
-
-        // Mesh-finish attempts routed through finish_locked for the
-        // copy-drain paths, counted under IOM_ENABLE_TESTING.
-        // Batch-completion tests assert one native finish per ready batch
-        // through this counter.
-        std::atomic<std::uint64_t> g_copy_mesh_finish_count{0};
-
-        void consume_copy_registration_fault() noexcept(false) {
-            if (g_fail_next_copy_registration.exchange(
-                        false, std::memory_order_acquire)) {
-                g_copy_registration_fault_consumed.store(
-                        true, std::memory_order_release);
-                throw std::bad_alloc();
-            }
-        }
-
-        void consume_copy_outcome_insertion_fault() noexcept(false) {
-            if (g_fail_next_copy_outcome_insertion.exchange(
-                        false, std::memory_order_acquire)) {
-                g_copy_outcome_insertion_fault_consumed.store(
-                        true, std::memory_order_release);
-                throw std::bad_alloc();
-            }
-        }
-        void consume_binary_outcome_insertion_fault() noexcept(false) {
-            if (g_fail_next_binary_outcome_insertion.exchange(
-                        false, std::memory_order_acquire)) {
-                g_binary_outcome_insertion_fault_consumed.store(
-                        true, std::memory_order_release);
-                throw std::bad_alloc();
-            }
-        }
-
-        bool consume_copy_finish_fault() noexcept {
-            std::size_t remaining = g_fail_copy_mesh_finishes.load(
-                    std::memory_order_acquire);
-            for (;;) {
-                if (remaining == 0) {
-                    return false;
-                }
-                if (g_fail_copy_mesh_finishes.compare_exchange_weak(
-                            remaining, remaining - 1,
-                            std::memory_order_acq_rel,
-                            std::memory_order_acquire)) {
-                    return true;
-                }
-            }
-        }
-#endif
 
 
 
@@ -204,7 +125,7 @@ namespace iom {
                     }
                     try {
 #ifdef IOM_ENABLE_TESTING
-                        consume_quarantine_action_fault_locked();
+                        ttnn_detail::consume_quarantine_action_fault_locked();
 #endif
                         auto action = std::unique_ptr<
                                 ttnn_detail::TtnnNativeCleanupAction>(
@@ -319,8 +240,7 @@ namespace iom {
         void finish_locked_mesh(
                 tt::tt_metal::distributed::MeshDevice& device) {
 #ifdef IOM_ENABLE_TESTING
-            g_copy_mesh_finish_count.fetch_add(1, std::memory_order_relaxed);
-            if (consume_copy_finish_fault()) {
+            if (ttnn_detail::consume_copy_finish_fault()) {
                 throw std::runtime_error(
                         "injected TTNN copy finish failure");
             }
@@ -438,7 +358,7 @@ public:
         std::lock_guard<std::mutex> submission_lock(
                 submission_order_mutex_);
 #ifdef IOM_ENABLE_TESTING
-        consume_copy_registration_fault();
+        ttnn_detail::consume_copy_registration_fault();
 #endif
         detail::Fence fence = build_ttnn_fence(*device_);
         return submit_copy(
@@ -500,7 +420,7 @@ public:
                 {
                     std::lock_guard<std::mutex> lock(outcome_mutex_);
 #ifdef IOM_ENABLE_TESTING
-                    consume_binary_outcome_insertion_fault();
+                    ttnn_detail::consume_binary_outcome_insertion_fault();
 #endif
                     const auto [it, inserted] = binary_outcomes_.emplace(
                             task.sequence,
@@ -608,7 +528,7 @@ public:
             {
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
 #ifdef IOM_ENABLE_TESTING
-                consume_copy_outcome_insertion_fault();
+                ttnn_detail::consume_copy_outcome_insertion_fault();
 #endif
                 const auto [it, inserted] = outcomes_.emplace(
                         task.sequence,
@@ -835,7 +755,11 @@ public:
             } else {
                 completion_failure = fence_result.failure;
             }
-            complete(seq, std::move(completion_failure));
+            if (index == 0) {
+                complete(seq, std::move(completion_failure));
+            } else if (completion_failure) {
+                commit_failure(seq, std::move(completion_failure));
+            }
         }
     }
 
@@ -916,66 +840,6 @@ void TtnnQueue::fence_through_sequence(
         return registry_state_;
     }
 
-#ifdef IOM_ENABLE_TESTING
-    namespace ttnn_test {
-        void fail_next_quarantine_action_for_testing() noexcept {
-            g_fail_next_quarantine_action.store(
-                    true, std::memory_order_release);
-        }
-
-        bool quarantine_action_fault_consumed_for_testing() noexcept {
-            return g_quarantine_action_fault_consumed;
-        }
-
-        void fail_next_binary_outcome_insertion_for_testing() noexcept {
-            g_fail_next_binary_outcome_insertion.store(
-                    true, std::memory_order_release);
-        }
-
-        bool binary_outcome_insertion_fault_consumed_for_testing() noexcept {
-            return g_binary_outcome_insertion_fault_consumed.load(
-                    std::memory_order_acquire);
-        }
-        void fail_next_copy_registration_for_testing() noexcept {
-            g_fail_next_copy_registration.store(
-                    true, std::memory_order_release);
-        }
-
-        bool copy_registration_fault_consumed_for_testing() noexcept {
-            return g_copy_registration_fault_consumed.load(
-                    std::memory_order_acquire);
-        }
-
-        void fail_next_copy_outcome_insertion_for_testing() noexcept {
-            g_fail_next_copy_outcome_insertion.store(
-                    true, std::memory_order_release);
-        }
-
-        bool copy_outcome_insertion_fault_consumed_for_testing() noexcept {
-            return g_copy_outcome_insertion_fault_consumed.load(
-                    std::memory_order_acquire);
-        }
-
-        void fail_next_copy_finishes_for_testing(
-                std::size_t count) noexcept {
-            g_fail_copy_mesh_finishes.store(count, std::memory_order_release);
-        }
-
-        bool copy_finish_fault_pending_for_testing() noexcept {
-            return g_fail_copy_mesh_finishes.load(
-                           std::memory_order_acquire)
-                   != 0;
-        }
-
-        void reset_copy_finish_count_for_testing() noexcept {
-            g_copy_mesh_finish_count.store(0, std::memory_order_release);
-        }
-
-        std::uint64_t copy_finish_count_for_testing() noexcept {
-            return g_copy_mesh_finish_count.load(std::memory_order_acquire);
-        }
-    }  // namespace ttnn_test
-#endif
 
 
     std::unique_ptr<Tensor> TtnnDevice::create_tensor(const TensorSpec& spec) {

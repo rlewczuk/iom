@@ -132,8 +132,10 @@ if(TTNN_ENABLED)
         src/ttnn/device_types.cpp
         src/ttnn/device_internal.hpp
         src/ttnn/copy.cpp
+        src/ttnn/testing.cpp
         src/ttnn/copy.hpp
         src/ttnn/registry_state.hpp
+        src/ttnn/testing_internal.hpp
         src/ttnn/staging.hpp
         include/iom/ttnn/device.hpp
     )
