@@ -256,10 +256,12 @@ endif()
 if(SYCL_ENABLED)
     add_library(iom_sycl STATIC
         src/sycl/device.cpp
+        src/sycl/device_tensor.cpp
         src/sycl/copy.cpp
         src/sycl/add.cpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
+        src/sycl/device_internal.hpp
         include/iom/sycl/device.hpp
     )
 
