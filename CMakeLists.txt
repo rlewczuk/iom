@@ -74,6 +74,8 @@ option(TTNN_ENABLED "Build with TTNN support" OFF)
 set(IOM_SOURCES
         src/iom.cpp
         src/workspace.cpp
+        src/tensor.cpp
+        src/tensor_view.cpp
         src/cpu/device.cpp
         src/mmap.cpp
         src/safetensors.cpp
