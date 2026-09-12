@@ -129,8 +129,10 @@ if(TTNN_ENABLED)
 
     add_library(iom_ttnn STATIC
         src/ttnn/device.cpp
+        src/ttnn/queue.cpp
         src/ttnn/device_types.cpp
         src/ttnn/device_internal.hpp
+        src/ttnn/queue_internal.hpp
         src/ttnn/copy.cpp
         src/ttnn/testing.cpp
         src/ttnn/binary.cpp
