@@ -84,6 +84,7 @@ set(IOM_SOURCES
 
 set(IOM_HEADERS
         include/iom/iom.hpp
+        include/iom/detail/staged_worker.hpp
         include/iom/oid.hpp
         include/iom/cpu/device.hpp
         include/iom/mmap.hpp

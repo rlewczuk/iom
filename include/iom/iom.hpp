@@ -21,10 +21,8 @@
 #include <span>
 
 #include "detail/outstanding_work_registry.hpp"
-
-
+#include "detail/staged_worker.hpp"
 #include "oid.hpp"
-
 #include "tensor.hpp"
 
 namespace iom {
@@ -39,185 +37,9 @@ namespace iom {
                 return "fixed admission resource is unavailable";
             }
         };
-
-
-        /**
-         * One backend-neutral staged submission worker. Tasks are executed
-         * after staging and completed in submission order.
-         */
-        template <typename Task>
-        class StagedWorker {
-        public:
-            using Execute = std::function<void(Task&)>;
-            using FenceComplete = std::function<void(void*)>;
-            using FenceDestroy = std::function<void(void*)>;
-            using Complete =
-                    std::function<void(std::uint64_t, std::exception_ptr)>;
-
-            enum class PublishPolicy { Splice, CompleteOnThrow };
-
-            struct Callbacks {
-                Execute execute;
-                FenceComplete fence_complete;
-                FenceDestroy fence_destroy;
-                Complete complete;
-            };
-
-            explicit StagedWorker(
-                    Callbacks callbacks, PublishPolicy publish_policy)
-                    : callbacks_(std::move(callbacks)),
-                      publish_policy_(publish_policy) {}
-
-            ~StagedWorker() { shutdown_and_drain(); }
-
-            StagedWorker(const StagedWorker&) = delete;
-            StagedWorker& operator=(const StagedWorker&) = delete;
-            StagedWorker(StagedWorker&&) = delete;
-            StagedWorker& operator=(StagedWorker&&) = delete;
-
-            void start() {
-                if (worker_.joinable()) {
-                    throw std::logic_error(
-                            "staged worker has already started");
-                }
-                worker_ = std::thread([this] { run(); });
-            }
-
-            void submit_copy(Task task) {
-                typename std::list<Task>::iterator staged;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (shutdown_) {
-                        throw std::logic_error(
-                                "staged worker is shut down");
-                    }
-                    staged_.push_back(std::move(task));
-                    staged = staged_.end();
-                    --staged;
-                }
-
-
-                try {
-                    callbacks_.execute(*staged);
-                } catch (...) {
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        staged_.erase(staged);
-                    }
-                    throw;
-                }
-
-                std::exception_ptr publish_failure;
-                std::uint64_t publish_failure_sequence = 0;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (publish_policy_ == PublishPolicy::Splice) {
-                        tasks_.splice(tasks_.end(), staged_, staged);
-                    } else {
-                        publish_failure_sequence = staged->sequence;
-                        try {
-                            tasks_.push_back(std::move(*staged));
-                            staged_.erase(staged);
-                        } catch (...) {
-                            staged_.erase(staged);
-                            publish_failure = std::current_exception();
-                        }
-                    }
-                }
-                if (publish_failure) {
-                    callbacks_.complete(
-                            publish_failure_sequence, publish_failure);
-                    std::rethrow_exception(publish_failure);
-                }
-                completion_.notify_one();
-            }
-
-            void shutdown_and_drain() {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    shutdown_ = true;
-                }
-                completion_.notify_all();
-                if (worker_.joinable()) {
-                    worker_.join();
-                }
-                std::list<Task> staged;
-                std::list<Task> tasks;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    staged.splice(staged.end(), staged_);
-                    tasks.splice(tasks.end(), tasks_);
-                }
-                drain_list(staged);
-                drain_list(tasks);
-            }
-
-        private:
-            void process(Task&& task, bool wait_for_fence) {
-                std::exception_ptr failure;
-                if (wait_for_fence && task.fence != nullptr) {
-                    try {
-                        callbacks_.fence_complete(task.fence);
-                    } catch (...) {
-                        failure = std::current_exception();
-                    }
-                }
-                if (task.fence != nullptr) {
-                    try {
-                        callbacks_.fence_destroy(task.fence);
-                    } catch (...) {
-                        if (!failure) {
-                            failure = std::current_exception();
-                        }
-                    }
-                }
-                callbacks_.complete(task.sequence, std::move(failure));
-            }
-
-            void drain_list(std::list<Task>& list) {
-                while (!list.empty()) {
-                    Task current(std::move(list.front()));
-                    list.pop_front();
-                    process(std::move(current), false);
-                }
-            }
-
-            void run() {
-                for (;;) {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    completion_.wait(lock, [this] {
-                        return shutdown_ || !tasks_.empty();
-                    });
-                    if (shutdown_) {
-                        while (!tasks_.empty()) {
-                            Task current(std::move(tasks_.front()));
-                            tasks_.pop_front();
-                            lock.unlock();
-                            process(std::move(current), false);
-                            lock.lock();
-                        }
-                        return;
-                    }
-                    Task current(std::move(tasks_.front()));
-                    tasks_.pop_front();
-                    lock.unlock();
-                    process(std::move(current), true);
-                }
-            }
-
-            Callbacks callbacks_;
-            PublishPolicy publish_policy_;
-            std::mutex mutex_;
-            std::condition_variable completion_;
-            std::list<Task> staged_;
-            std::list<Task> tasks_;
-            bool shutdown_ = false;
-            std::thread worker_;
-        };
     }  // namespace detail
 
     namespace detail {
-
         /**
          * Shared reusable raw-workspace validation (leaf 05). Centralizes
          * the required-capacity, base/range alignment, checked-offset,
@@ -252,8 +74,6 @@ namespace iom {
         };
 
     }  // namespace detail
-
-
     /**
      * One in-order asynchronous operation queue over caller-created tensor
      * views. Every OID-returning operation is a common `noexcept` facade:
@@ -279,9 +99,7 @@ namespace iom {
         DeviceOps& operator=(const DeviceOps&) = delete;
         DeviceOps(DeviceOps&&) = delete;
         DeviceOps& operator=(DeviceOps&&) = delete;
-
         virtual ~DeviceOps();
-
         /**
          * Observe accepted work in queue order. A negative, zero, foreign,
          * future, skipped/reserved-but-never-submitted, or otherwise
@@ -291,7 +109,6 @@ namespace iom {
          * rethrown by every wait.
          */
         void wait(oid token);
-
         /**
          * Common `noexcept` OID facades for three-view binary operations.
          * Validation and lifetime ownership are shared by all operations.
@@ -313,7 +130,6 @@ namespace iom {
         oid div(const TensorView& lhs, const TensorView& rhs,
                 TensorView& out,
                 RawWorkspaceView workspace = {}) noexcept;
-
         /**
          * Pure deterministic raw-workspace requirement queries for the
          * three-view binary operations (leaf 05). Each runs the exact
@@ -358,7 +174,6 @@ namespace iom {
          * queue ordering, and lifetime registration.
          */
         enum class BinaryOperation { Add, Mul, Sub, Div };
-
         struct BinaryViewSnapshot {
             TensorSpec spec;
             const Device* device_identity;
@@ -371,7 +186,6 @@ namespace iom {
             bool broadcast_columns;
             bool broadcasts;
         };
-
         struct CopyViewSnapshot {
             TensorSpec spec;
             const Device* device_identity;
@@ -380,10 +194,8 @@ namespace iom {
             std::size_t plane_offset;
             std::vector<std::size_t> plane_strides;
         };
-
         [[nodiscard]] static CopyViewSnapshot snapshot_copy_view(
                 const TensorView& view);
-
         struct BinaryRequest {
             BinaryOperation operation;
             BinaryViewSnapshot lhs;
@@ -393,7 +205,6 @@ namespace iom {
             RawWorkspaceView workspace;
             WorkspaceRequirements workspace_requirements;
             detail::WorkspaceLease workspace_lease;
-
             BinaryRequest(
                     BinaryOperation operation_,
                     BinaryViewSnapshot lhs_, BinaryViewSnapshot rhs_,
@@ -407,7 +218,6 @@ namespace iom {
                   workspace(workspace_),
                   workspace_requirements(workspace_requirements_),
                   workspace_lease(workspace_lease_) {}
-
             BinaryRequest(const BinaryRequest&) = default;
             BinaryRequest& operator=(const BinaryRequest&) = delete;
             BinaryRequest(BinaryRequest&& other) noexcept
@@ -426,7 +236,6 @@ namespace iom {
             CopyViewSnapshot source;
             CopyViewSnapshot destination;
             bool no_op = false;
-
             CopyRequest(
                     const TensorView& source_, const TensorView& destination_,
                     bool no_op_)
@@ -437,7 +246,6 @@ namespace iom {
 
         DeviceOps();
         explicit DeviceOps(const Device& device);
-
         virtual oid copy_impl(
                 const TensorView& source, TensorView& destination);
         virtual oid binary_impl(const BinaryRequest& request);
@@ -450,7 +258,6 @@ namespace iom {
                               const TensorView& v, size_t n_heads,
                               size_t n_kv_heads, size_t head_dim,
                               TensorView& attn_out);
-
         /**
          * Backend hook behind the four *_workspace_requirements queries.
          * Receives an already fully validated request snapshot and must
@@ -459,7 +266,6 @@ namespace iom {
          */
         [[nodiscard]] virtual WorkspaceRequirements
                 binary_workspace_requirements(const BinaryRequest& request);
-
         [[nodiscard]] const Device& queue_device() const;
         virtual void fence_through_sequence(
                 std::uint64_t sequence) noexcept;
@@ -477,7 +283,6 @@ namespace iom {
                 const TensorView& destination);
         static void validate_views(const Device& device,
                                    std::initializer_list<const TensorView*> views);
-
         [[nodiscard]] static bool identical_window(
                 const TensorView& source, const TensorView& destination);
         [[nodiscard]] virtual std::string_view backend_label() const noexcept {
@@ -492,7 +297,6 @@ namespace iom {
                 std::function<void(std::uint64_t)> prepare,
                 std::function<void(std::uint64_t)> dispatch,
                 std::function<void()> rollback = {});
-
         template <typename QueueWork>
         oid submit(QueueWork queue_work) {
             auto work = std::make_shared<QueueWork>(std::move(queue_work));
@@ -501,7 +305,6 @@ namespace iom {
                         (*work)(sequence);
                     });
         }
-
         template <typename QueueWork>
         oid submit_copy(
                 const TensorView& source, const TensorView& destination,
@@ -513,7 +316,6 @@ namespace iom {
                 std::function<void(
                         std::uint64_t, const CopyRequest&,
                         detail::EntryRegistration)> work;
-
                 Prepared(
                         const TensorView& source_,
                         const TensorView& destination_, bool no_op_,
@@ -564,7 +366,6 @@ namespace iom {
                 std::function<void(
                         std::uint64_t, const BinaryRequest&,
                         detail::BinaryEntryRegistration)> work;
-
                 Prepared(
                         const BinaryRequest& request_, QueueWork work_)
                     : request(request_), work(std::move(work_)) {}
@@ -645,7 +446,6 @@ namespace iom {
         void commit_failure(std::uint64_t sequence,
                             std::exception_ptr failure);
         void seek_next_sequence(std::uint64_t next_sequence);
-
         // Backend destructors call this before their worker/native members
         // disappear. It closes acceptance and drains accepted FIFO nodes.
         void close_and_drain() noexcept;
@@ -658,7 +458,6 @@ namespace iom {
         [[nodiscard]] static std::uint8_t lease_queue_id();
         static void release_queue_id(std::uint8_t queue_id) noexcept;
         [[nodiscard]] oid encode_token(std::uint64_t sequence) const noexcept;
-
         const Device* device_ = nullptr;
         std::uint8_t queue_id_ = 0;
         static constexpr std::uint64_t kSequenceBits = 55;
@@ -679,12 +478,10 @@ namespace iom {
             std::function<void()> rollback;
             bool executing = false;
         };
-
         void pump_admission(
                 std::exception_ptr* synchronous_failure = nullptr,
                 std::uint64_t synchronous_sequence = 0) noexcept;
         void abandon_sequence(std::uint64_t sequence) noexcept;
-
         std::map<std::uint64_t, AdmissionNode> admission_nodes_;
         std::deque<std::uint64_t> admission_fifo_;
         std::size_t admission_credits_ = 0;
