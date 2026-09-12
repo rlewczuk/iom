@@ -153,6 +153,8 @@ if(CUDA_ENABLED)
     enable_language(CUDA)
     add_library(iom_cuda STATIC
         src/cuda/device.cpp
+        src/cuda/device_tensor.cpp
+        src/cuda/device_internal.hpp
         src/cuda/copy.cu
         src/cuda/copy.hpp
         src/cuda/driver.cpp
