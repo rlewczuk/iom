@@ -175,6 +175,8 @@ if(CUDA_ENABLED)
         src/shared/gpu_queue_lifecycle.inl
         src/shared/gpu_queue_operations.inl
         src/shared/standard_tiled_copy.hpp
+        src/shared/standard_tiled_copy.inl
+        src/shared/standard_tiled_copy_metadata.inl
         include/iom/cuda/device.hpp
     )
 
@@ -225,6 +227,8 @@ if(ROCM_ENABLED)
         src/shared/gpu_queue_lifecycle.inl
         src/shared/gpu_queue_operations.inl
         src/shared/standard_tiled_copy.hpp
+        src/shared/standard_tiled_copy.inl
+        src/shared/standard_tiled_copy_metadata.inl
         include/iom/rocm/device.hpp
     )
 
@@ -263,6 +267,8 @@ if(SYCL_ENABLED)
         src/sycl/copy.hpp
         src/sycl/device_internal.hpp
         include/iom/sycl/device.hpp
+        src/shared/standard_tiled_copy.inl
+        src/shared/standard_tiled_copy_metadata.inl
     )
 
     target_include_directories(iom_sycl
