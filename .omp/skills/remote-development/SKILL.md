@@ -42,14 +42,14 @@ For a `spec-run-task` task, run from its exact `.work/<task-path>` worktree:
 
 ```bash
 cd .work/<task-path>
-.agents/skills/remote-development/scripts/remote-sync rocm task-123
+.omp/skills/remote-development/scripts/remote-sync rocm task-123
 ```
 
 Alternatively, select it explicitly from the primary checkout:
 
 ```bash
 REMOTE_DEV_WORKSPACE=.work/<task-path> \
-  .agents/skills/remote-development/scripts/remote-sync rocm task-123
+  .omp/skills/remote-development/scripts/remote-sync rocm task-123
 ```
 
 Never sync a `spec-run-task` task from the primary checkout. Confirm that the `remote-sync` output names the exact assigned worktree before remote execution.
@@ -62,14 +62,14 @@ Assume the selected workspace is the local task/worktree root.
 2. Sync the local workspace:
 
 ```bash
-.agents/skills/remote-development/scripts/remote-sync rocm task-123
+.omp/skills/remote-development/scripts/remote-sync rocm task-123
 ```
 
 3. Build or test remotely:
 
 ```bash
-.agents/skills/remote-development/scripts/remote-exec rocm task-123 'cmake -S . -B build && cmake --build build -j'
-.agents/skills/remote-development/scripts/remote-exec rocm task-123 'ctest --test-dir build --output-on-failure'
+.omp/skills/remote-development/scripts/remote-exec rocm task-123 'cmake -S . -B build && cmake --build build -j'
+.omp/skills/remote-development/scripts/remote-exec rocm task-123 'ctest --test-dir build --output-on-failure'
 ```
 
 4. Continue editing locally and repeat sync + remote execution as needed.
@@ -77,7 +77,7 @@ Assume the selected workspace is the local task/worktree root.
 6. Remove the remote mirror when done:
 
 ```bash
-.agents/skills/remote-development/scripts/remote-clean rocm task-123
+.omp/skills/remote-development/scripts/remote-clean rocm task-123
 ```
 
 ## Parallel work
@@ -91,7 +91,7 @@ For concurrent tasks:
 - if tests require exclusive GPU access, wrap the remote command with `flock`, for example:
 
 ```bash
-.agents/skills/remote-development/scripts/remote-exec rocm task-123 \
+.omp/skills/remote-development/scripts/remote-exec rocm task-123 \
   'flock /tmp/agent-gpu0.lock ./build/tests/gpu_test'
 ```
 
@@ -100,7 +100,7 @@ For concurrent tasks:
 Use `tmux` or the site's scheduler on the remote host when a job should survive the SSH session, for example:
 
 ```bash
-.agents/skills/remote-development/scripts/remote-exec cuda task-9 \
+.omp/skills/remote-development/scripts/remote-exec cuda task-9 \
   "tmux new-session -d -s agent-task-9 'cmake --build build -j && ctest --test-dir build'"
 ```
 
