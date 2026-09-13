@@ -324,13 +324,13 @@ namespace iom {
         throw UnsupportedOperation();
     }
 
-    oid DeviceOps::add(
-            const TensorView& lhs, const TensorView& rhs,
-            TensorView& out, RawWorkspaceView workspace) noexcept {
+    oid DeviceOps::submit_binary_operation(
+            BinaryOperation operation, const TensorView& lhs,
+            const TensorView& rhs, TensorView& out,
+            RawWorkspaceView workspace) noexcept {
         try {
             BinaryRequest request =
-                    validate_binary(queue_device(), BinaryOperation::Add,
-                                    lhs, rhs, out);
+                    validate_binary(queue_device(), operation, lhs, rhs, out);
             const WorkspaceRequirements requirements =
                     binary_workspace_requirements(request);
             const std::array<TensorView, 3> operands{lhs, rhs, out};
@@ -346,78 +346,34 @@ namespace iom {
         } catch (...) {
             return invoke_failure(std::current_exception());
         }
+    }
+
+    oid DeviceOps::add(
+            const TensorView& lhs, const TensorView& rhs,
+            TensorView& out, RawWorkspaceView workspace) noexcept {
+        return submit_binary_operation(
+                BinaryOperation::Add, lhs, rhs, out, workspace);
     }
 
     oid DeviceOps::mul(
             const TensorView& lhs, const TensorView& rhs,
             TensorView& out, RawWorkspaceView workspace) noexcept {
-        try {
-            BinaryRequest request =
-                    validate_binary(queue_device(), BinaryOperation::Mul,
-                                    lhs, rhs, out);
-            const WorkspaceRequirements requirements =
-                    binary_workspace_requirements(request);
-            const std::array<TensorView, 3> operands{lhs, rhs, out};
-            const RawWorkspaceView validated_workspace =
-                    detail::WorkspaceValidation::validated(
-                            queue_device(), workspace,
-                            requirements.bytes, requirements.alignment,
-                            operands);
-            return invoke(binary_impl(BinaryRequest{
-                    request.operation, request.lhs, request.rhs, request.out,
-                    request.result_shape, validated_workspace, requirements,
-                    {}}));
-        } catch (...) {
-            return invoke_failure(std::current_exception());
-        }
+        return submit_binary_operation(
+                BinaryOperation::Mul, lhs, rhs, out, workspace);
     }
 
     oid DeviceOps::sub(
             const TensorView& lhs, const TensorView& rhs,
             TensorView& out, RawWorkspaceView workspace) noexcept {
-        try {
-            BinaryRequest request =
-                    validate_binary(queue_device(), BinaryOperation::Sub,
-                                    lhs, rhs, out);
-            const WorkspaceRequirements requirements =
-                    binary_workspace_requirements(request);
-            const std::array<TensorView, 3> operands{lhs, rhs, out};
-            const RawWorkspaceView validated_workspace =
-                    detail::WorkspaceValidation::validated(
-                            queue_device(), workspace,
-                            requirements.bytes, requirements.alignment,
-                            operands);
-            return invoke(binary_impl(BinaryRequest{
-                    request.operation, request.lhs, request.rhs, request.out,
-                    request.result_shape, validated_workspace, requirements,
-                    {}}));
-        } catch (...) {
-            return invoke_failure(std::current_exception());
-        }
+        return submit_binary_operation(
+                BinaryOperation::Sub, lhs, rhs, out, workspace);
     }
 
     oid DeviceOps::div(
             const TensorView& lhs, const TensorView& rhs,
             TensorView& out, RawWorkspaceView workspace) noexcept {
-        try {
-            BinaryRequest request =
-                    validate_binary(queue_device(), BinaryOperation::Div,
-                                    lhs, rhs, out);
-            const WorkspaceRequirements requirements =
-                    binary_workspace_requirements(request);
-            const std::array<TensorView, 3> operands{lhs, rhs, out};
-            const RawWorkspaceView validated_workspace =
-                    detail::WorkspaceValidation::validated(
-                            queue_device(), workspace,
-                            requirements.bytes, requirements.alignment,
-                            operands);
-            return invoke(binary_impl(BinaryRequest{
-                    request.operation, request.lhs, request.rhs, request.out,
-                    request.result_shape, validated_workspace, requirements,
-                    {}}));
-        } catch (...) {
-            return invoke_failure(std::current_exception());
-        }
+        return submit_binary_operation(
+                BinaryOperation::Div, lhs, rhs, out, workspace);
     }
 
     WorkspaceRequirements

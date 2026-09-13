@@ -451,6 +451,10 @@ namespace iom {
         void close_and_drain() noexcept;
 
     private:
+        [[nodiscard]] oid submit_binary_operation(
+                BinaryOperation operation, const TensorView& lhs,
+                const TensorView& rhs, TensorView& out,
+                RawWorkspaceView workspace) noexcept;
         [[nodiscard]] oid invoke(oid result) noexcept;
         [[nodiscard]] oid invoke_failure(std::exception_ptr failure) noexcept;
         [[nodiscard]] static oid map_failure(
