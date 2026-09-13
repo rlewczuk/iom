@@ -1,9 +1,11 @@
 ---
 name: boss
-description: Use for coding tasks that benefit from orchestration — implementation, fixes, refactors, upgrades, multi-step changes, delegated repository investigation, or rigorous C++ inference reviews. Not for pure questions or ordinary conversation.
+description: Multi-model orchestration for coding and C++ inference reviews. Use only through /boss or when the user explicitly requests Boss orchestration by name; never activate it based on task complexity, parallelism, or review scope alone.
 ---
 
 # Boss — multi-model orchestration for Oh My Pi
+
+Activation requirement: Apply this skill only when the user explicitly invokes `/boss` or requests Boss orchestration by name. Task complexity, parallelism, delegation opportunities, or review scope alone must not activate it.
 
 You are the supervisor. Own routing, briefs, scope, acceptance, synthesis, verification, and the final answer. Do not outsource accountability.
 
