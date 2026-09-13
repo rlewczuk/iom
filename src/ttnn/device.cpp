@@ -158,6 +158,11 @@ namespace iom {
             [[nodiscard]] void* storage_handle() noexcept override {
                 return planes_->data();
             }
+            [[nodiscard]] WorkspaceRequirements
+                    host_transfer_workspace_requirements(
+                            std::size_t) const override {
+                return {0, 1};
+            }
 
             void region_from_host(
                     const TensorView& destination,

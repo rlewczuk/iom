@@ -735,6 +735,10 @@ class FakeTensor final : public iom::Tensor {
 public:
     FakeTensor(iom::TensorSpec spec, iom::Device& device)
             : iom::Tensor(std::move(spec), device) {}
+    [[nodiscard]] iom::WorkspaceRequirements
+            host_transfer_workspace_requirements(std::size_t) const override {
+        return {123, 7};
+    }
 
     [[nodiscard]] void* storage_handle() noexcept override {
         return handle_;
@@ -3742,9 +3746,11 @@ TEST_CASE(
     FakeDevice device;
     const FakeTensor tensor =
             make_tensor(device, {2, 3, 16, 16}, iom::DataType::F32);
-    const iom::WorkspaceRequirements zero{0, 1};
-    CHECK(tensor.view().copy_from_host_workspace_requirements() == zero);
-    CHECK(tensor.view().copy_to_host_workspace_requirements() == zero);
+    // The fake owner reports a value unlike every production backend policy,
+    // proving both public queries delegate to the owner hook.
+    const iom::WorkspaceRequirements owner_policy{123, 7};
+    CHECK(tensor.view().copy_from_host_workspace_requirements() == owner_policy);
+    CHECK(tensor.view().copy_to_host_workspace_requirements() == owner_policy);
 
     // Checked logical-byte arithmetic propagates overflow.
     const FakeTensor huge =

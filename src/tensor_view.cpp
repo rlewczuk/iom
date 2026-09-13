@@ -1,6 +1,5 @@
 #include "iom/device.hpp"
 #include "iom/tensor.hpp"
-#include "iom/gpu_algorithm.hpp"
 
 #include "iom_internal.hpp"
 
@@ -284,42 +283,16 @@ namespace iom {
         owner_->region_to_host(*this, destination, workspace);
     }
 
-    namespace {
-
-        // Shared body of the two host-transfer requirement queries: the
-        // checked logical-byte walk of the transfer itself plus the
-        // backend's staging rule. Both current transfer directions share
-        // the same preconditions; the data-dependent BOOL byte check is a
-        // transfer-time predicate and intentionally not part of a pure
-        // query. No allocation, registration, leasing, or native effect.
-        WorkspaceRequirements host_transfer_workspace_requirements(
-                const TensorView& view) {
-            const std::size_t logical_nbytes =
-                    view.spec().logical_nbytes();
-            switch (view.backend_kind()) {
-                case BackendKind::CPU:
-                case BackendKind::TTNN:
-                    return {0, 1};
-                case BackendKind::CUDA:
-                case BackendKind::ROCM:
-                case BackendKind::SYCL:
-                    return {gpu_algorithm::compute_staging_size(
-                                    logical_nbytes),
-                            32};
-            }
-            throw std::invalid_argument("tensor view has an unknown backend");
-        }
-
-    }  // namespace
-
     WorkspaceRequirements
             TensorView::copy_from_host_workspace_requirements() const {
-        return host_transfer_workspace_requirements(*this);
+        const std::size_t logical_nbytes = spec_.logical_nbytes();
+        return owner_->host_transfer_workspace_requirements(logical_nbytes);
     }
 
     WorkspaceRequirements
             TensorView::copy_to_host_workspace_requirements() const {
-        return host_transfer_workspace_requirements(*this);
+        const std::size_t logical_nbytes = spec_.logical_nbytes();
+        return owner_->host_transfer_workspace_requirements(logical_nbytes);
     }
 
     Tensor::Tensor(TensorSpec spec, Device& device)

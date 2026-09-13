@@ -71,6 +71,10 @@ public:
 
 private:
     [[nodiscard]] void* storage_handle() noexcept override { return address_; }
+    [[nodiscard]] WorkspaceRequirements host_transfer_workspace_requirements(
+            std::size_t) const override {
+        return {0, 1};
+    }
 
     void region_from_host(
             const TensorView& destination, std::span<const std::byte> source,

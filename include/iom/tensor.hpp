@@ -388,6 +388,13 @@ namespace iom {
     protected:
         Tensor(TensorSpec spec, Device& device);
 
+        // Computes the owner-specific host-transfer workspace policy from
+        // checked logical bytes. This pure hook never allocates, registers,
+        // leases, synchronizes, or otherwise affects backend state.
+        [[nodiscard]] virtual WorkspaceRequirements
+                host_transfer_workspace_requirements(
+                        std::size_t checked_logical_nbytes) const = 0;
+
         [[nodiscard]] virtual void* storage_handle() noexcept = 0;
         virtual void region_from_host(
                 const TensorView& destination,

@@ -1,4 +1,5 @@
 #include "device_internal.hpp"
+#include "iom/gpu_algorithm.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -131,6 +132,14 @@ namespace iom {
     private:
         [[nodiscard]] void* storage_handle() noexcept override {
             return address_;
+        }
+        [[nodiscard]] WorkspaceRequirements
+                host_transfer_workspace_requirements(
+                        std::size_t checked_logical_nbytes) const override {
+            return {
+                    gpu_algorithm::compute_staging_size(
+                            checked_logical_nbytes),
+                    32};
         }
 
         void region_from_host(
