@@ -38,7 +38,7 @@ The numeric prefix is part of the task directory name and records dependency ord
 
 ## Boss orchestration contract
 
-This seven-step workflow is one Boss process. Before starting it, the root MUST read `skill://boss`, then apply this skill's explicit override: substantive repository fact-gathering uses the read-only `spec-tasks-facts` profile at `@task`, rather than Boss's default cheap exploration lane. The root MUST already resolve to `@slow`; it MUST inspect effective `modelRoles`, `task.agentModelOverrides`, `task.agentAdvisor`, and each dispatched profile's tool restrictions before dispatch. Report missing or conflicting setup and stop; never switch models, inherit an expensive parent, or silently fall back.
+This seven-step workflow is one Boss process. Before starting it, the root MUST read `skill://boss`, run and preserve its deterministic preflight, then apply this skill's explicit override: substantive repository fact-gathering uses the read-only `spec-tasks-facts` profile at `@task`, rather than Boss's default cheap exploration lane. The root MUST already match the preflight-resolved `@slow` model. Use only the preflight's `roles`, `models`, and required `agents` entries for model routing, overrides, advisor state, availability, and profile tool restrictions; do not manually inspect or reconstruct them. Report a failed preflight and stop; never switch models, inherit an expensive parent, or silently fall back.
 
 The `@slow` root owns intake, complete requirement accounting, decomposition, priorities, the dependency DAG, architectural and ambiguity decisions, the frozen complete assignment table, verification, and final output:
 

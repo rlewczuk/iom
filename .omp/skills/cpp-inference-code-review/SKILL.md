@@ -68,8 +68,8 @@ Use when the user requests the current repository/system/architecture or gives n
 
 `[ROOT @slow]`:
 
-- Review the checked-out working tree as a system and record `HEAD` plus working-tree changes.
-- Establish the scope identity and affected build/backends; do not imply a clean tree if it is not clean.
+- Use the preserved Boss preflight's `git.head` and `git.status` as the checked-out system identity; do not rediscover them.
+- Establish the scope identity and affected build/backends; do not imply a clean tree when preflight reports changes.
 - Give the broad source search, risk ranking, and full source map to the shared `scout @smol` phase.
 
 `[SCOUT scout @smol]` (in one shared phase, using bounded shards when useful):

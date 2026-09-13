@@ -10,6 +10,8 @@ This document is the canonical protocol for the five review areas and their synt
 
 The visible/root session is the accountable supervisor and MUST run as `@slow`. A skill cannot switch the model of an already-running session: use the user's role configuration or model override to select `@slow`, and never claim that a skill auto-switched it.
 
+Every root invocation first follows `skill://boss`'s deterministic preflight. Its preserved `git`, `roles`, `models`, and `agents` values are the sole environment evidence for this process; do not repeat Git/OMP/profile discovery in this reference or a specialist skill. A failed preflight stops dispatch.
+
 | Lane | Profile and role | Allowed work | Prohibited work |
 |---|---|---|---|
 | Root supervisor | visible session, `@slow` | resolve scope, route work, adjudicate invariants and candidates, freeze the assignment table, materialize/validate the final set, and report coverage | silently delegating accountability or claiming unrun validation |
@@ -86,7 +88,7 @@ The root verifies the resolved path remains beneath `docs/changes/` and passes t
 
 After scope resolution, the root starts one shared read-only reconnaissance phase/map. Independent bounded `scout @smol` shards MAY be batched and merged once; they cover broad source, callers, tests, backend counterparts, capability/dispatch/fallback paths, build/backend configuration, whole-codebase risk ranking, and specification mapping. For selected commits, an `[ERRAND boss-errand @smol]` worker first retrieves the complete diff (including rename/copy metadata) with a named read-only git command/artifact; the scouts and relevant area leaves then inspect that artifact and the exact source ranges it identifies. The scout phase reports a compact map with exact `path:line`/symbol anchors, exhaustive versus sampled search coverage, and uninspected areas. It MUST not turn raw logs or a repository dump into the packet.
 
-For whole-codebase reviews, `[ROOT @slow]` records `HEAD` and working-tree state, while `[SCOUT scout @smol]` shards risk-rank before deep reading. Use this order unless an explicit scope requires otherwise:
+For whole-codebase reviews, `[ROOT @slow]` uses the preserved preflight's `git.head` and `git.status` as the reviewed-state baseline, while `[SCOUT scout @smol]` shards risk-rank before deep reading. Use this order unless an explicit scope requires otherwise:
 
 1. backend-neutral interfaces and scheduling/partitioning;
 2. tensor/buffer ownership and allocation;
@@ -154,7 +156,7 @@ A candidate must identify baseline-v-target provenance. Do not report an unrelat
 
 ## Whole-codebase discipline
 
-Review the checked-out working tree as a system. Use the risk order in reconnaissance before bounded area analysis. Record the reviewed `HEAD`, working-tree state, sampled versus exhaustive coverage, search paths/patterns where material, and explicitly uninspected areas. Never imply every file was inspected when it was not.
+Review the checked-out working tree as a system. Use the risk order in reconnaissance before bounded area analysis. Record the preserved preflight's `git.head` and `git.status`, sampled versus exhaustive coverage, search paths/patterns where material, and explicitly uninspected areas. Never imply every file was inspected when it was not.
 
 ## Mandatory simplification pass
 

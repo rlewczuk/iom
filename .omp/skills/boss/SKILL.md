@@ -11,6 +11,17 @@ You are the supervisor. Own routing, briefs, scope, acceptance, synthesis, verif
 
 The intended deployment is asymmetric: use the visible/root OMP session on the strongest model appropriate for the job; use cheaper role-routed agents for bounded exploration and routine implementation; escalate only when the expected total cost of rework exceeds the stronger worker's premium.
 
+### Deterministic preflight
+
+Immediately after loading this skill and before inspecting repository state, Git metadata, OMP configuration, models, or agent profiles, run exactly once:
+
+```text
+.omp/csw/bin/csw_preflight --repo . --workflow boss --pretty
+```
+
+Preserve the complete JSON result as the invocation's environment evidence. This executable is the sole source for the Git baseline, effective OMP settings and role resolution, model availability, and bundled Boss-agent profile contracts. Exit status `0` means `ok: true`; exit status `2` or `ok: false` is a concrete blocker to Boss dispatch. Report its `errors` and stop before dispatch; do not bypass it, inspect OMP configuration files or databases, invoke `omp config`/`omp models`, read agent frontmatter for discovery, or reconstruct Git state with ad-hoc commands. A skill cannot switch the already-running root model; where `@slow` is required, compare the running session identity supplied by OMP with the preflight's resolved `@slow` model without performing additional environment discovery.
+
+
 ## 1. Triage
 
 Work inline for coding only when ALL are true:
@@ -43,9 +54,7 @@ OMP task dispatch selects an agent profile; that profile resolves its model thro
 | debate | `boss-advocate` | `@task` | workhorse advocate |
 | debate-strong | `boss-advocate-strong` | `@slow` | strongest advocate |
 
-The profile's `model` alias is a routing request, not an automatic model switch. Model settings and per-agent overrides may take precedence; review deployment requires the root/supervisor session to be configured for `@slow` before it starts. Boss cannot switch an already-running model, and must never claim that it did. Do not silently replace an unavailable cheap lane with an expensive one. If plan mode rewrites a child tool allowlist, do not use it for a packet-only advisor or read-only review leaf unless the effective allowlist remains explicit and safe.
-
-Before review dispatch, check effective `modelRoles`, `task.agentModelOverrides`, and `task.agentAdvisor`: confirm the root uses the configured `@slow` model, cheap lanes resolve to the intended cheap models, and cheap workers have no unintended passive advisor. Do not change the user's model configuration; report conflicting overrides or unavailable roles rather than inheriting an expensive parent silently.
+The profile's `model` alias is a routing request, not an automatic model switch. Use the preserved preflight result's `agents`, `roles`, and `models` values for routing. Review deployment requires the root/supervisor session to match the model resolved for `@slow` before it starts. Boss cannot switch an already-running model and must never claim that it did. Do not silently replace an unavailable cheap lane with an expensive one. The preflight validates the bundled profiles' declared tool boundaries, including packet-only advisors and read-only review leaves; if the harness later rewrites an effective allowlist, do not dispatch the affected profile unless that runtime allowlist remains explicit and safe.
 
 ## 3. Effort and cost control
 
@@ -129,7 +138,7 @@ For a genuine coding design fork:
 
 ## 7. Dispatch coding implementation
 
-Before dispatch, establish a baseline with `git status --short` and note pre-existing changes.
+Before dispatch, use the preserved preflight result's `git.status` as the baseline and note its pre-existing changes.
 
 Parallelize only independent work with disjoint files. Never ask workers to run verification while sibling mutations could affect the result.
 
