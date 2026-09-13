@@ -13,7 +13,7 @@ Implement the requested specification completely. Each executable leaf owns one 
 Use the bundled helper for every repeatable path, annotation, worktree, and Git-history operation:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo <integration-checkout> --pretty <command> ...
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo <integration-checkout> --pretty <command> ...
 ```
 
 The script is authoritative for:
@@ -50,7 +50,7 @@ Exit status `2` means a validation or safety invariant failed. Exit status `3` m
 Require exactly one target argument relative to `docs/changes/`, then run:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo . --pretty inspect '<target>'
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo . --pretty inspect '<target>'
 ```
 
 Do this before reading task contents or provisioning worktrees. The helper rejects absolute paths, file names, traversal, malformed annotations or blockers, detached or dirty integration checkouts, unsafe branch components, unignored `.work/`, missing specs, and explicit dependency cycles.
@@ -74,7 +74,7 @@ Reject unresolved semantic ambiguity before edits. Topologically schedule unfini
 For every ready leaf, invoke `prepare` with values copied from the same `inspect` result:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty prepare '<task_path>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty prepare '<task_path>' \
   --run-target '<requested_target>' \
   --integration-branch '<integration_branch>' \
   --integration-base '<integration_head>'
@@ -87,13 +87,13 @@ Treat returned `worktree`, `spec_path`, and `annotation_path` as opaque exact pa
 For a reused worktree, inspect `status_entries` and `task_commits` returned by `prepare`, or refresh them mechanically:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty show '<task_path>'
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty show '<task_path>'
 ```
 
 Determine whether every retained change belongs to this exact task. If ownership is uncertain, stop rather than rewriting it. If coherent reusable state is dirty and must be protected, invoke:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty checkpoint '<task_path>'
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty checkpoint '<task_path>'
 ```
 
 Do not checkpoint a path merely to make an error disappear. The helper never stashes or discards work. A checkpoint is temporary and must later be consolidated by `commit` before rebase, terminal status, or integration.
@@ -136,19 +136,19 @@ The helper computes the annotation as the sibling of the owned `spec.md`. Never 
 Provisional success:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
   --status ready --summary '<factual provisional summary>'
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
   --status ready --outcome '<concise behavioral outcome>'
 ```
 
 Observed completion:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
   --status done --summary '<delivered behavior>' \
   --verification '<exact command or scenario> — <observed result>'
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' --status done
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' --status done
 ```
 
 Repeat `--verification` for distinct checks. Once a final task commit exists, omit `--outcome` to preserve its subject automatically.
@@ -156,10 +156,10 @@ Repeat `--verification` for distinct checks. Once a final task commit exists, om
 Failure or blocker:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
   --status failed --summary '<reachable retained work>' \
   --error '<operation or prerequisite> — <concrete failure>'
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
   --status failed --outcome '<concise attempted outcome>'
 ```
 
@@ -172,7 +172,7 @@ Use `blocked` instead of `failed` only for an external prerequisite. Repeat `--e
 Before verification/integration, refresh the integration head with `inspect`. Rebase one finalized task commit onto that head or the current wave-train commit:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty rebase '<task_path>' --onto '<commit>'
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty rebase '<task_path>' --onto '<commit>'
 ```
 
 The helper replays only the recorded task commit and updates its persisted base. It refuses multiple commits, dirty worktrees, unknown history, and replay cycles. A clean branch with no task commit may only move forward to a descendant base.
@@ -180,7 +180,7 @@ The helper replays only the recorded task commit and updates its persisted base.
 On exit `3`, edit conflict contents only in the returned owning worktree, then invoke:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty continue-rebase '<task_path>'
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty continue-rebase '<task_path>'
 ```
 
 Repeat if another conflict is reported. Use `abort-rebase` only when the attempted replay must be abandoned. Never stage or continue manually. After any conflict resolution, rerun affected verification and reconsolidate with `commit` if annotation evidence or implementation changed.
@@ -188,7 +188,7 @@ Repeat if another conflict is reported. Use `abort-rebase` only when the attempt
 Validate the result mechanically:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty check '<task_path>' --status ready
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty check '<task_path>' --status ready
 ```
 
 `check` proves the worktree is clean, the recorded base is valid, exactly one non-merge task commit exists, its subject names the exact full task path, its diff contains the sibling annotation, annotation changes are owned, and the requested status matches.
@@ -212,7 +212,7 @@ This rebuild ensures every final annotation is inside its own one-commit leaf ch
 When every executable leaf beneath the requested container is `done` in the finalized train, the final leaf owner writes roll-ups before its final `commit` invocation. Work bottom-up through every container spec at or below the requested target:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<final-leaf-task>' \
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<final-leaf-task>' \
   --for-task '<container-task-path>' --status done \
   --summary '<all leaf subtasks completed>' \
   --verification '<combined command or scenario> — <observed result>'
@@ -229,7 +229,7 @@ Do not mark a container `done` while any leaf is failed, blocked, or unfinished.
 For a single leaf, finalize it as `done`, run `check --status done`, then integrate that branch. For a container, use the final task branch in the fully verified train:
 
 ```text
-python3 .agents/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty integrate '<final-task-path>'
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty integrate '<final-task-path>'
 ```
 
 `integrate` rechecks the integration branch and cleanliness, requires the train to fast-forward the current integration tip, rejects merges/non-task/duplicate task commits, requires every commit to contain its own `done` sibling annotation, validates container annotation ownership, then performs the fast-forward.
