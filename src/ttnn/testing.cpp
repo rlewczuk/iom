@@ -3,8 +3,10 @@
 #include "testing_internal.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 
@@ -30,6 +32,11 @@ static std::atomic<bool> g_copy_planes_fault_consumed{false};
 static std::atomic<bool> g_host_transfer_fault_armed{false};
 static std::atomic<std::size_t> g_host_transfer_fault_at{0};
 static std::atomic<bool> g_host_transfer_fault_consumed{false};
+
+static std::mutex g_binary_execution_mutex;
+static std::condition_variable g_binary_execution_cv;
+static bool g_binary_execution_armed = false;
+static bool g_binary_execution_reached = false;
 
 void consume_quarantine_action_fault_locked() noexcept(false) {
     if (g_fail_next_quarantine_action.exchange(
@@ -112,9 +119,45 @@ void fail_host_transfer_submission_at(std::size_t index) noexcept(false) {
     }
 }
 
+void wait_binary_execution_barrier() noexcept(false) {
+    std::unique_lock<std::mutex> lock(g_binary_execution_mutex);
+    if (!g_binary_execution_armed) {
+        return;
+    }
+    g_binary_execution_reached = true;
+    g_binary_execution_cv.notify_all();
+    g_binary_execution_cv.wait(lock, [] {
+        return !g_binary_execution_armed;
+    });
+}
+
 }  // namespace iom::ttnn_detail
 
 namespace iom::ttnn_test {
+void hold_binary_execution_barrier_for_testing() noexcept {
+    std::lock_guard<std::mutex> lock(
+            ttnn_detail::g_binary_execution_mutex);
+    ttnn_detail::g_binary_execution_reached = false;
+    ttnn_detail::g_binary_execution_armed = true;
+}
+
+void wait_binary_execution_barrier_for_testing() noexcept {
+    std::unique_lock<std::mutex> lock(
+            ttnn_detail::g_binary_execution_mutex);
+    ttnn_detail::g_binary_execution_cv.wait(lock, [] {
+        return ttnn_detail::g_binary_execution_reached;
+    });
+}
+
+void release_binary_execution_barrier_for_testing() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(
+                ttnn_detail::g_binary_execution_mutex);
+        ttnn_detail::g_binary_execution_armed = false;
+    }
+    ttnn_detail::g_binary_execution_cv.notify_all();
+}
+
 
 void fail_next_quarantine_action_for_testing() noexcept {
     ttnn_detail::g_fail_next_quarantine_action.store(

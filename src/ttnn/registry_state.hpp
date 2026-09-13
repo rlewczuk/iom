@@ -11,6 +11,10 @@
 #include "testing_internal.hpp"
 
 namespace iom::ttnn_test {
+    // Deterministically pause worker-side binary execution after publication.
+    void hold_binary_execution_barrier_for_testing() noexcept;
+    void wait_binary_execution_barrier_for_testing() noexcept;
+    void release_binary_execution_barrier_for_testing() noexcept;
     void fail_next_quarantine_action_for_testing() noexcept;
     bool quarantine_action_fault_consumed_for_testing() noexcept;
 

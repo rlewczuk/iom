@@ -160,15 +160,40 @@ oid TtnnQueue::binary_impl(const BinaryRequest& request) {
                              captured.out.plane_offset,
                              captured.out.logical_plane_strides},
                             captured.result_shape};
-                    worker_.submit_copy(
-                            Task(sequence, captured.operation, internal,
-                                 entries, captured.workspace_lease));
+                    Task task(
+                            sequence, captured.operation, internal, entries,
+                            captured.workspace_lease);
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+#ifdef IOM_ENABLE_TESTING
+                        ttnn_detail::consume_binary_outcome_insertion_fault();
+#endif
+                        const auto [it, inserted] = binary_outcomes_.emplace(
+                                sequence,
+                                BinaryOutcome{
+                                        task.binary_entries,
+                                        task.workspace_lease});
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    "duplicate TTNN binary sequence");
+                        }
+                    }
+                    worker_.submit_after_publish(std::move(task));
                 } catch (...) {
-                    state_->registry.remove_entries(
-                            std::span<const detail::EntryId>(
-                                    entries.entries.data(), entries.count));
-                    detail::complete_workspace_lease(
-                            *state_, captured.workspace_lease, true);
+                    bool rollback_outcome = false;
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        rollback_outcome =
+                                binary_outcomes_.erase(sequence) != 0;
+                    }
+                    if (rollback_outcome) {
+                        state_->registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(),
+                                        entries.count));
+                        detail::complete_workspace_lease(
+                                *state_, captured.workspace_lease, true);
+                    }
                     std::rethrow_exception(std::current_exception());
                 }
             });
@@ -180,21 +205,10 @@ void TtnnQueue::execute(Task& task) {
         bool completion_proven = false;
         try {
             {
-                std::lock_guard<std::mutex> lock(outcome_mutex_);
-#ifdef IOM_ENABLE_TESTING
-                ttnn_detail::consume_binary_outcome_insertion_fault();
-#endif
-                const auto [it, inserted] = binary_outcomes_.emplace(
-                        task.sequence,
-                        BinaryOutcome{
-                                task.binary_entries,
-                                task.workspace_lease});
-                if (!inserted) {
-                    throw std::logic_error("duplicate TTNN binary sequence");
-                }
-            }
-            {
                 std::lock_guard<std::mutex> api_lock(device_->api_mutex());
+#ifdef IOM_ENABLE_TESTING
+                ttnn_detail::wait_binary_execution_barrier();
+#endif
                 auto* lhs = static_cast<ttnn::Tensor*>(
                         task.binary_request.lhs.native_handle);
                 auto* rhs = static_cast<ttnn::Tensor*>(
@@ -243,19 +257,11 @@ void TtnnQueue::execute(Task& task) {
         } catch (...) {
             const std::exception_ptr submission_failure =
                     std::current_exception();
-            if (!submitted) {
-                // No output upload reached the mesh. The common
-                // submit_binary transaction owns both registry rollback
-                // and sequence rollback; only discard this provisional
-                // backend outcome before propagating the failure.
-                std::lock_guard<std::mutex> lock(outcome_mutex_);
-                binary_outcomes_.erase(task.sequence);
-                std::rethrow_exception(submission_failure);
-            }
-            // Native work was accepted. Keep the outcome, owner
-            // registrations, and staging leases under the normal
-            // completion/quarantine path so the public token remains
-            // a waitable retained submission failure.
+            // Native work may have been accepted, or the worker may have
+            // failed before its first upload. In both cases the published
+            // outcome retains the failure for complete_task and repeatable
+            // waits; the accepted registry and workspace leases stay owned
+            // until that completion path runs.
             {
                 std::lock_guard<std::mutex> lock(outcome_mutex_);
                 auto it = binary_outcomes_.find(task.sequence);
@@ -274,6 +280,7 @@ void TtnnQueue::execute(Task& task) {
     }
     execute_copy(task);
 }
+
 
 void TtnnQueue::publish_native_completion(std::uint64_t sequence) noexcept {
     std::lock_guard<std::mutex> fence_lock(fence_mutex_);
@@ -300,6 +307,12 @@ void TtnnQueue::complete_task(
     if (is_binary) {
         detail::FenceResult fence_result = detail::FenceResult::success();
         bool completion_proven = binary_outcome.native_completion_proven;
+        // A post-publication failure before the first native upload has no
+        // outstanding device work to fence. Treat that empty path as proven
+        // so accepted owners and workspace leases remain reusable.
+        if (!binary_outcome.native_work_submitted) {
+            completion_proven = true;
+        }
         if (binary_outcome.native_work_submitted && !completion_proven) {
             fence_result = ttnn_detail::finish_native(*device_);
             completion_proven =

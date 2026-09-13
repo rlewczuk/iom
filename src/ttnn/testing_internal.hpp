@@ -12,6 +12,7 @@ void consume_binary_outcome_insertion_fault() noexcept(false);
 [[nodiscard]] bool consume_copy_finish_fault() noexcept;
 void fail_copy_planes_submission_at(std::size_t index) noexcept(false);
 void fail_host_transfer_submission_at(std::size_t index) noexcept(false);
+void wait_binary_execution_barrier() noexcept(false);
 
 }  // namespace iom::ttnn_detail
 #endif

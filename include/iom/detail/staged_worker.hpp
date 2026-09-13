@@ -57,21 +57,64 @@ namespace iom {
             }
 
             void submit_copy(Task task) {
-                typename std::list<Task>::iterator staged;
+                submit(std::move(task), false);
+            }
+
+            // Backend-specific callers may publish a task before its execute
+            // callback runs. Existing submit_copy users retain their
+            // synchronous callback and publication behavior.
+            void submit_after_publish(Task task) {
+                submit(std::move(task), true);
+            }
+
+            void shutdown_and_drain() {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    shutdown_ = true;
+                }
+                completion_.notify_all();
+                if (worker_.joinable()) {
+                    worker_.join();
+                }
+                std::list<QueuedTask> staged;
+                std::list<QueuedTask> tasks;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    staged.splice(staged.end(), staged_);
+                    tasks.splice(tasks.end(), tasks_);
+                }
+                drain_list(staged);
+                drain_list(tasks);
+            }
+
+        private:
+            struct QueuedTask {
+                Task task;
+                bool execute_after_publish = false;
+
+                QueuedTask(Task task_, bool execute_after_publish_)
+                    : task(std::move(task_)),
+                      execute_after_publish(execute_after_publish_) {}
+            };
+
+            void submit(Task task, bool execute_after_publish) {
+                typename std::list<QueuedTask>::iterator staged;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (shutdown_) {
                         throw std::logic_error(
                                 "staged worker is shut down");
                     }
-                    staged_.push_back(std::move(task));
+                    staged_.emplace_back(
+                            std::move(task), execute_after_publish);
                     staged = staged_.end();
                     --staged;
                 }
 
-
                 try {
-                    callbacks_.execute(*staged);
+                    if (!execute_after_publish) {
+                        callbacks_.execute(staged->task);
+                    }
                 } catch (...) {
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
@@ -87,7 +130,7 @@ namespace iom {
                     if (publish_policy_ == PublishPolicy::Splice) {
                         tasks_.splice(tasks_.end(), staged_, staged);
                     } else {
-                        publish_failure_sequence = staged->sequence;
+                        publish_failure_sequence = staged->task.sequence;
                         try {
                             tasks_.push_back(std::move(*staged));
                             staged_.erase(staged);
@@ -105,51 +148,39 @@ namespace iom {
                 completion_.notify_one();
             }
 
-            void shutdown_and_drain() {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    shutdown_ = true;
-                }
-                completion_.notify_all();
-                if (worker_.joinable()) {
-                    worker_.join();
-                }
-                std::list<Task> staged;
-                std::list<Task> tasks;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    staged.splice(staged.end(), staged_);
-                    tasks.splice(tasks.end(), tasks_);
-                }
-                drain_list(staged);
-                drain_list(tasks);
-            }
-
-        private:
-            void process(Task&& task, bool wait_for_fence) {
+            void process(QueuedTask&& queued, bool wait_for_fence) {
                 std::exception_ptr failure;
-                if (wait_for_fence && task.fence != nullptr) {
+                if (queued.execute_after_publish) {
                     try {
-                        callbacks_.fence_complete(task.fence);
+                        callbacks_.execute(queued.task);
                     } catch (...) {
                         failure = std::current_exception();
                     }
                 }
-                if (task.fence != nullptr) {
+                if (wait_for_fence && queued.task.fence != nullptr) {
                     try {
-                        callbacks_.fence_destroy(task.fence);
+                        callbacks_.fence_complete(queued.task.fence);
                     } catch (...) {
                         if (!failure) {
                             failure = std::current_exception();
                         }
                     }
                 }
-                callbacks_.complete(task.sequence, std::move(failure));
+                if (queued.task.fence != nullptr) {
+                    try {
+                        callbacks_.fence_destroy(queued.task.fence);
+                    } catch (...) {
+                        if (!failure) {
+                            failure = std::current_exception();
+                        }
+                    }
+                }
+                callbacks_.complete(queued.task.sequence, std::move(failure));
             }
 
-            void drain_list(std::list<Task>& list) {
+            void drain_list(std::list<QueuedTask>& list) {
                 while (!list.empty()) {
-                    Task current(std::move(list.front()));
+                    QueuedTask current(std::move(list.front()));
                     list.pop_front();
                     process(std::move(current), false);
                 }
@@ -163,7 +194,7 @@ namespace iom {
                     });
                     if (shutdown_) {
                         while (!tasks_.empty()) {
-                            Task current(std::move(tasks_.front()));
+                            QueuedTask current(std::move(tasks_.front()));
                             tasks_.pop_front();
                             lock.unlock();
                             process(std::move(current), false);
@@ -171,19 +202,20 @@ namespace iom {
                         }
                         return;
                     }
-                    Task current(std::move(tasks_.front()));
+                    QueuedTask current(std::move(tasks_.front()));
                     tasks_.pop_front();
                     lock.unlock();
                     process(std::move(current), true);
                 }
             }
 
+
             Callbacks callbacks_;
             PublishPolicy publish_policy_;
             std::mutex mutex_;
             std::condition_variable completion_;
-            std::list<Task> staged_;
-            std::list<Task> tasks_;
+            std::list<QueuedTask> staged_;
+            std::list<QueuedTask> tasks_;
             bool shutdown_ = false;
             std::thread worker_;
         };

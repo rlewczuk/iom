@@ -1113,7 +1113,7 @@ TEST_CASE("TTNN registration and outcome insertion failures roll back ownership"
     }
 }
 
-TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
+TEST_CASE("TTNN binary pre-native failures roll back or retain correctly") {
     require_hardware();
     TtnnDevices devices;
     const std::size_t output_rows[] = {33, 65, 129, 257};
@@ -1192,8 +1192,22 @@ TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
 
         iom::ttnn_test::
                 fail_next_host_transfer_staging_allocation_for_testing();
-        const iom::oid rejected = submit(operation);
-        CHECK_EQ(rejected, iom::to_oid(iom::OidError::ResourceExhausted));
+        const iom::oid retained = submit(operation);
+        REQUIRE(iom::oid_is_token(retained));
+        bool first_wait_threw = false;
+        bool second_wait_threw = false;
+        try {
+            queue->wait(retained);
+        } catch (const std::bad_alloc&) {
+            first_wait_threw = true;
+        }
+        try {
+            queue->wait(retained);
+        } catch (const std::bad_alloc&) {
+            second_wait_threw = true;
+        }
+        CHECK(first_wait_threw);
+        CHECK(second_wait_threw);
         CHECK(iom::ttnn_test::
                       host_transfer_staging_allocation_fault_consumed_for_testing());
         std::vector<std::byte> after(spec.logical_nbytes());
@@ -1202,7 +1216,7 @@ TEST_CASE("TTNN binary pre-native staging failures roll back submission") {
 
         const iom::oid accepted = submit(operation);
         REQUIRE(iom::oid_is_token(accepted));
-        CHECK_EQ(iom_conformance::token_sequence(accepted), 1);
+        CHECK_EQ(iom_conformance::token_sequence(accepted), 2);
         REQUIRE_NOTHROW(queue->wait(accepted));
     }
 }
@@ -2222,6 +2236,129 @@ TEST_CASE("TTNN binary completion publishes one finish for every operation") {
             CHECK_EQ(value, test.expected);
         }
     }
+}
+
+TEST_CASE("TTNN binary publication precedes deferred worker execution") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{1, 2, 2}}, iom::DataType::F32};
+
+    struct BinaryCase {
+        enum class Kind { add, mul, sub, div };
+        Kind kind;
+        float expected;
+    };
+    const BinaryCase cases[] = {
+            {BinaryCase::Kind::add, 6.0F},
+            {BinaryCase::Kind::mul, 8.0F},
+            {BinaryCase::Kind::sub, -2.0F},
+            {BinaryCase::Kind::div, 0.5F}};
+
+    for (const BinaryCase test : cases) {
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto first_out = devices.candidate->create_tensor(spec);
+        auto second_out = devices.candidate->create_tensor(spec);
+        std::vector<std::byte> lhs_bytes(spec.logical_nbytes(), std::byte{0});
+        std::vector<std::byte> rhs_bytes(spec.logical_nbytes(), std::byte{0});
+        for (std::size_t index = 0; index < 4; ++index) {
+            const float left = 2.0F;
+            const float right = 4.0F;
+            std::memcpy(
+                    lhs_bytes.data() + index * sizeof(float), &left,
+                    sizeof(float));
+            std::memcpy(
+                    rhs_bytes.data() + index * sizeof(float), &right,
+                    sizeof(float));
+        }
+        iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+        iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
+        auto queue = devices.candidate->create_ops();
+        const auto submit = [&](iom::TensorView& out) {
+            switch (test.kind) {
+                case BinaryCase::Kind::add:
+                    return queue->add(lhs->view(), rhs->view(), out);
+                case BinaryCase::Kind::mul:
+                    return queue->mul(lhs->view(), rhs->view(), out);
+                case BinaryCase::Kind::sub:
+                    return queue->sub(lhs->view(), rhs->view(), out);
+                case BinaryCase::Kind::div:
+                    return queue->div(lhs->view(), rhs->view(), out);
+            }
+            return iom::to_oid(iom::OidError::InternalError);
+        };
+
+        iom::ttnn_test::hold_binary_execution_barrier_for_testing();
+        const iom::oid first = submit(first_out->view());
+        iom::ttnn_test::wait_binary_execution_barrier_for_testing();
+        const iom::oid second = submit(second_out->view());
+        CHECK(iom::oid_is_token(first));
+        CHECK(iom::oid_is_token(second));
+        iom::ttnn_test::release_binary_execution_barrier_for_testing();
+        if (iom::oid_is_token(first)) {
+            CHECK_NOTHROW(queue->wait(first));
+            CHECK_NOTHROW(queue->wait(first));
+        }
+        if (iom::oid_is_token(second)) {
+            CHECK_NOTHROW(queue->wait(second));
+            CHECK_NOTHROW(queue->wait(second));
+        }
+
+        for (iom::Tensor* output : {first_out.get(), second_out.get()}) {
+            std::vector<std::byte> observed(
+                    spec.logical_nbytes(), std::byte{0});
+            iom_conformance::copy_to_host(output->view(), observed);
+            for (std::size_t index = 0; index < 4; ++index) {
+                float value = 0.0F;
+                std::memcpy(
+                        &value, observed.data() + index * sizeof(float),
+                        sizeof(float));
+                CHECK_EQ(value, test.expected);
+            }
+        }
+    }
+}
+
+TEST_CASE("TTNN deferred binary failures remain repeatable after release") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{1, 2, 2}}, iom::DataType::BF16};
+    auto lhs = devices.candidate->create_tensor(spec);
+    auto rhs = devices.candidate->create_tensor(spec);
+    auto out = devices.candidate->create_tensor(spec);
+    std::vector<std::byte> lhs_bytes(spec.logical_nbytes(), std::byte{0});
+    std::vector<std::byte> rhs_bytes(spec.logical_nbytes(), std::byte{0});
+    for (std::size_t index = 0; index < 4; ++index) {
+        set_add_logical_value(spec, lhs_bytes, index, 0x3F80 + index);
+        set_add_logical_value(spec, rhs_bytes, index, 0x4000 + index);
+    }
+    iom_conformance::copy_from_host(lhs->view(), lhs_bytes);
+    iom_conformance::copy_from_host(rhs->view(), rhs_bytes);
+    auto queue = devices.candidate->create_ops();
+
+    iom::ttnn_test::hold_binary_execution_barrier_for_testing();
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(1);
+    const iom::oid token = queue->add(lhs->view(), rhs->view(), out->view());
+    iom::ttnn_test::wait_binary_execution_barrier_for_testing();
+    CHECK(iom::oid_is_token(token));
+    iom::ttnn_test::release_binary_execution_barrier_for_testing();
+    bool first_threw = false;
+    bool second_threw = false;
+    try {
+        queue->wait(token);
+    } catch (const std::runtime_error&) {
+        first_threw = true;
+    }
+    try {
+        queue->wait(token);
+    } catch (const std::runtime_error&) {
+        second_threw = true;
+    }
+    CHECK(first_threw);
+    CHECK(second_threw);
+    iom::ttnn_test::fail_next_copy_finishes_for_testing(0);
 }
 
 TEST_CASE("TTNN conformance: raw workspace contract accepts only the empty owner") {
