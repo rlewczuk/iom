@@ -423,6 +423,8 @@ TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
                 *candidate, operation);
         iom_conformance::run_gpu_eltwise_mapping_conformance(
                 *candidate, operation);
+        iom_conformance::run_gpu_exact_alias_conformance(
+                *candidate, operation);
     }
     CHECK_FALSE(gate.armed());
 }

@@ -29,6 +29,13 @@
 #error "IOM_LAUNCH_KERNEL must be defined before including standard_tiled_add.inl"
 #endif
 
+#ifndef IOM_GPU_SHARED
+#error "IOM_GPU_SHARED must be defined before including standard_tiled_add.inl"
+#endif
+#ifndef IOM_GPU_BARRIER
+#error "IOM_GPU_BARRIER must be defined before including standard_tiled_add.inl"
+#endif
+
 namespace iom::detail {
 namespace {
 
@@ -279,6 +286,160 @@ IOM_GPU_DEVICE void binary_body(
         add_store_word(out, word, acc);
     }
 }
+
+// Exact aliases are executed one tile per block. Each thread first snapshots
+// the complete source fields for its tile into shared memory, then a block
+// barrier makes that snapshot visible before any output word is stored. Words
+// remain exclusively owned by one thread, so packed fields crossing a word
+// boundary cannot observe a partially updated source word. A grid-stride over
+// tiles keeps the launch bounded while the barrier between tiles prevents a
+// block's next snapshot from racing its previous stores.
+template <DeviceBinaryOp Op>
+IOM_GPU_GLOBAL void alias_safe_binary_kernel(
+        const unsigned char* lhs, const unsigned char* rhs,
+        unsigned char* out, BinaryMetadata m) {
+    IOM_GPU_SHARED std::uint64_t lhs_snapshot[kTileSlots];
+    IOM_GPU_SHARED std::uint64_t rhs_snapshot[kTileSlots];
+
+    const std::uint64_t global = IOM_GPU_GLOBAL_INDEX;
+    const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
+    const std::uint64_t tiles_per_plane =
+            (m.rows + kTile - 1) / kTile
+            * ((m.columns + kTile - 1) / kTile);
+    const std::uint64_t padded_rows =
+            (m.rows + kTile - 1) / kTile * kTile;
+    const std::uint64_t padded_columns =
+            (m.columns + kTile - 1) / kTile * kTile;
+    const std::uint64_t words_per_plane =
+            (padded_rows * padded_columns * m.bits + 31) / 32;
+    const std::uint64_t tiles =
+            m.total_words / words_per_plane * tiles_per_plane;
+    const std::uint64_t tile_stride = stride / kTileSlots;
+    const unsigned int slot =
+            static_cast<unsigned int>(global % kTileSlots);
+
+    for (std::uint64_t tile = global / kTileSlots; tile < tiles;
+         tile += tile_stride) {
+        const std::uint64_t plane = tile / tiles_per_plane;
+        const std::uint64_t tile_index = tile % tiles_per_plane;
+        const std::uint64_t tile_row =
+                tile_index / ((m.columns + kTile - 1) / kTile);
+        const std::uint64_t tile_column =
+                tile_index % ((m.columns + kTile - 1) / kTile);
+        const PhysicalCoordinate coordinate = physical_coordinate(
+                tile_index * kTileSlots + slot, m.rows, m.columns);
+
+        std::uint64_t lhs_plane = m.lhs_offset;
+        std::uint64_t rhs_plane = m.rhs_offset;
+        std::uint64_t out_plane = m.out_offset;
+        std::uint64_t rest = plane;
+        for (std::uint32_t axis = m.rank - 2; axis-- > 0;) {
+            const std::uint64_t axis_coordinate = rest % m.dims[axis];
+            rest /= m.dims[axis];
+            lhs_plane += axis_coordinate * m.lhs_strides[axis];
+            rhs_plane += axis_coordinate * m.rhs_strides[axis];
+            out_plane += axis_coordinate * m.out_strides[axis];
+        }
+
+        if (coordinate.row < m.rows && coordinate.column < m.columns) {
+            const std::uint64_t lhs_row = m.lhs_brow ? 0 : coordinate.row;
+            const std::uint64_t lhs_column =
+                    m.lhs_bcol ? 0 : coordinate.column;
+            const std::uint64_t rhs_row = m.rhs_brow ? 0 : coordinate.row;
+            const std::uint64_t rhs_column =
+                    m.rhs_bcol ? 0 : coordinate.column;
+            const std::uint64_t lhs_slot = plane_slot(
+                    lhs_plane, lhs_row, lhs_column, m.lhs_rows,
+                    m.lhs_columns);
+            const std::uint64_t rhs_slot = plane_slot(
+                    rhs_plane, rhs_row, rhs_column, m.rhs_rows,
+                    m.rhs_columns);
+            lhs_snapshot[slot] =
+                    add_load_bits(lhs, lhs_slot * m.bits, m.bits);
+            rhs_snapshot[slot] =
+                    add_load_bits(rhs, rhs_slot * m.bits, m.bits);
+        } else {
+            lhs_snapshot[slot] = 0;
+            rhs_snapshot[slot] = 0;
+        }
+        IOM_GPU_BARRIER;
+
+        const std::uint64_t tile_base_slot = plane_slot(
+                out_plane, tile_row * kTile, tile_column * kTile,
+                m.rows, m.columns);
+        const std::uint64_t tile_base_word =
+                tile_base_slot * m.bits / 32;
+        const std::uint64_t words_per_tile = kTileSlots * m.bits / 32;
+        for (std::uint64_t word_in_tile = slot;
+             word_in_tile < words_per_tile;
+             word_in_tile += kTileSlots) {
+            const std::uint64_t base = word_in_tile * 32;
+            std::uint32_t acc = add_load_word(
+                    out, tile_base_word + word_in_tile);
+            const std::uint64_t first_slot = base / m.bits;
+            const std::uint64_t last_slot = (base + 31) / m.bits;
+            for (std::uint64_t local_slot = first_slot;
+                 local_slot <= last_slot && local_slot < kTileSlots;
+                 ++local_slot) {
+                const std::uint64_t slot_bit = local_slot * m.bits;
+                if (slot_bit + m.bits <= base || slot_bit >= base + 32) {
+                    continue;
+                }
+                const PhysicalCoordinate local_coordinate =
+                        physical_coordinate(
+                                tile_index * kTileSlots + local_slot,
+                                m.rows, m.columns);
+                if (local_coordinate.row >= m.rows
+                        || local_coordinate.column >= m.columns) {
+                    continue;
+                }
+                const std::uint64_t value = DeviceCodec::binary<Op>(
+                        static_cast<DataType>(m.type),
+                        lhs_snapshot[local_slot],
+                        rhs_snapshot[local_slot]);
+                const std::uint64_t lo =
+                        slot_bit > base ? slot_bit : base;
+                const std::uint64_t hi =
+                        slot_bit + m.bits < base + 32
+                        ? slot_bit + m.bits : base + 32;
+                const unsigned count = static_cast<unsigned>(hi - lo);
+                const unsigned position =
+                        static_cast<unsigned>(lo - base);
+                const unsigned shift =
+                        static_cast<unsigned>(lo - slot_bit);
+                const std::uint32_t segment = static_cast<std::uint32_t>(
+                        value >> shift) & add_field_mask(count);
+                acc = (acc & ~(add_field_mask(count) << position))
+                        | (segment << position);
+            }
+            add_store_word(out, tile_base_word + word_in_tile, acc);
+        }
+        IOM_GPU_BARRIER;
+    }
+}
+
+template <typename Policy, DeviceBinaryOp Op>
+void launch_alias_safe_binary(
+        typename Policy::stream_type stream, const unsigned char* lhs,
+        const unsigned char* rhs, unsigned char* out,
+        const BinaryMetadata& metadata) {
+    const std::uint64_t padded_rows =
+            (metadata.rows + kTile - 1) / kTile * kTile;
+    const std::uint64_t padded_columns =
+            (metadata.columns + kTile - 1) / kTile * kTile;
+    const std::uint64_t words_per_plane =
+            (padded_rows * padded_columns * metadata.bits + 31) / 32;
+    const std::uint64_t tiles_per_plane =
+            (padded_rows / kTile) * (padded_columns / kTile);
+    const std::uint64_t tile_count =
+            metadata.total_words / words_per_plane * tiles_per_plane;
+    const unsigned int blocks = static_cast<unsigned int>(
+            tile_count < 65535 ? tile_count : 65535);
+    IOM_LAUNCH_KERNEL(
+            alias_safe_binary_kernel<Op>, blocks, kTileSlots, stream, lhs, rhs,
+            out, metadata);
+}
+
 
 template <DeviceBinaryOp Op>
 IOM_GPU_GLOBAL void grid_stride_binary_kernel(

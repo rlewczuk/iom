@@ -60,12 +60,16 @@ bool consume_submission_fault(
 
 #define IOM_GPU_DEVICE __device__
 #define IOM_GPU_GLOBAL __global__
+#define IOM_GPU_SHARED __shared__
+#define IOM_GPU_BARRIER __syncthreads()
 #define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     hipLaunchKernelGGL( \
             kernel, dim3(blocks), dim3(threads), 0, stream, __VA_ARGS__)
 #include "../shared/standard_tiled_copy.inl"
 #include "../shared/standard_tiled_add.inl"
+#undef IOM_GPU_BARRIER
+#undef IOM_GPU_SHARED
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_GLOBAL
 #undef IOM_GPU_DEVICE

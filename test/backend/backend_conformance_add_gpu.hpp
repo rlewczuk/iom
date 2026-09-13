@@ -100,6 +100,145 @@ inline void run_gpu_eltwise_conformance(
     }
 }
 
+inline void run_gpu_exact_alias_conformance(
+        iom::Device& candidate, BinaryOperation operation) {
+    enum class AliasCase { lhs, rhs, both };
+    const iom::TensorShape full_shape{{1, 17, 33}};
+    const iom::TensorShape broadcast_shape{{1, 1, 33}};
+    const iom::DataType types[] = {
+            iom::DataType::F64, iom::DataType::F6_E2M3,
+            iom::DataType::F6_E3M2};
+    auto queue = candidate.create_ops();
+
+    for (const auto type : types) {
+        const iom::TensorSpec full_spec{full_shape, type};
+        const std::size_t bits = iom::detail::leaf_bits(type);
+        const std::size_t full_count = full_shape.element_count();
+
+        const auto make_values = [type, bits](
+                                          const iom::TensorShape& shape,
+                                          bool lhs_values) {
+            const iom::TensorSpec spec{shape, type};
+            std::vector<std::byte> result(spec.logical_nbytes());
+            const std::size_t count = shape.element_count();
+            for (std::size_t i = 0; i < count; ++i) {
+                std::uint64_t value = type == iom::DataType::F64
+                        ? (lhs_values ? 0x3ff0000000000000ull
+                                      : 0x4000000000000000ull)
+                        : (lhs_values ? std::uint64_t{8}
+                                       : std::uint64_t{16});
+                if (i == 5) {
+                    // Corrected cross-word witnesses: slot 5 starts at bit
+                    // 30 for both six-bit formats, while F64 exercises the
+                    // low-word store/high-word reread witness.
+                    value = type == iom::DataType::F64
+                            ? (lhs_values ? 0x3ff0000000000000ull
+                                          : 0x3feffffffffffffcull)
+                            : (lhs_values ? std::uint64_t{8}
+                                          : std::uint64_t{14});
+                }
+                gpu_write_bits(result, i, bits, value);
+            }
+            return result;
+        };
+
+        const auto source_index = [](const iom::TensorSpec& spec,
+                                     std::size_t output_index) {
+            const auto dimensions = spec.shape.dimensions();
+            const std::size_t row = (output_index / 33) % 17;
+            const std::size_t column = output_index % 33;
+            const std::size_t source_row =
+                    dimensions[dimensions.size() - 2] == 1 ? 0 : row;
+            const std::size_t source_column =
+                    dimensions.back() == 1 ? 0 : column;
+            return source_row * dimensions.back() + source_column;
+        };
+
+        const auto run_case = [&](AliasCase alias_case, bool broadcast) {
+            const bool lhs_alias = alias_case == AliasCase::lhs
+                    || alias_case == AliasCase::both;
+            const bool rhs_alias = alias_case == AliasCase::rhs
+                    || alias_case == AliasCase::both;
+            const iom::TensorShape other_shape =
+                    broadcast ? broadcast_shape : full_shape;
+            const iom::TensorSpec lhs_spec{
+                    lhs_alias ? full_shape : other_shape, type};
+            const iom::TensorSpec rhs_spec{
+                    rhs_alias ? full_shape : other_shape, type};
+            const iom::TensorSpec out_spec{full_shape, type};
+            auto lhs_owner = candidate.create_tensor(lhs_spec);
+            std::unique_ptr<iom::Tensor> rhs_owner;
+            if (!rhs_alias || alias_case != AliasCase::both) {
+                rhs_owner = candidate.create_tensor(rhs_spec);
+            }
+            std::unique_ptr<iom::Tensor> out_owner;
+            if (!lhs_alias && !rhs_alias) {
+                out_owner = candidate.create_tensor(out_spec);
+            }
+            iom::TensorView* lhs_view = &lhs_owner->view();
+            iom::TensorView* rhs_view = alias_case == AliasCase::both
+                    ? lhs_view : &rhs_owner->view();
+            iom::TensorView* out_view = lhs_alias
+                    ? lhs_view
+                    : (rhs_alias ? rhs_view : &out_owner->view());
+
+            const auto lhs_bytes = make_values(lhs_spec.shape, true);
+            const auto rhs_bytes = alias_case == AliasCase::both
+                    ? lhs_bytes : make_values(rhs_spec.shape, false);
+            std::vector<std::byte> expected(out_spec.logical_nbytes());
+            for (std::size_t i = 0; i < full_count; ++i) {
+                const std::size_t lhs_index = source_index(lhs_spec, i);
+                const std::size_t rhs_index = source_index(rhs_spec, i);
+                const std::uint64_t a = gpu_read_bits(
+                        lhs_bytes, lhs_index, bits);
+                const std::uint64_t b = gpu_read_bits(
+                        rhs_bytes, rhs_index, bits);
+                gpu_write_bits(
+                        expected, i, bits,
+                        add_oracle::binary(
+                                type, a, b,
+                                static_cast<add_oracle::operation>(
+                                        operation)));
+            }
+
+            iom_conformance::copy_from_host(*lhs_view, lhs_bytes);
+            if (alias_case != AliasCase::both) {
+                iom_conformance::copy_from_host(*rhs_view, rhs_bytes);
+            }
+            if (!lhs_alias && !rhs_alias) {
+                iom_conformance::copy_from_host(
+                        *out_view,
+                        std::vector<std::byte>(
+                                expected.size(), std::byte{0xAA}));
+            }
+            const auto requirements = query_binary_workspace_requirements(
+                    *queue, operation, *lhs_view, *rhs_view, *out_view);
+            CHECK_EQ(requirements.bytes, std::size_t{0});
+            CHECK_EQ(requirements.alignment, std::size_t{1});
+            const iom::oid token = submit_binary_operation(
+                    *queue, operation, *lhs_view, *rhs_view, *out_view);
+            REQUIRE(iom::oid_is_token(token));
+            CHECK_NOTHROW(queue->wait(token));
+            const auto actual = read_logical(*out_view);
+            for (std::size_t i = 0; i < full_count; ++i) {
+                CAPTURE(static_cast<int>(type));
+                CAPTURE(static_cast<int>(operation));
+                CAPTURE(static_cast<std::size_t>(i));
+                CHECK_EQ(
+                        gpu_read_bits(actual, i, bits),
+                        gpu_read_bits(expected, i, bits));
+            }
+        };
+
+        run_case(AliasCase::lhs, false);
+        run_case(AliasCase::rhs, false);
+        run_case(AliasCase::both, false);
+        run_case(AliasCase::lhs, true);
+        run_case(AliasCase::rhs, true);
+    }
+}
+
+
 inline void run_gpu_eltwise_mapping_conformance(
         iom::Device& candidate, BinaryOperation operation) {
     // The mapping fixture intentionally uses U8 operands; integer division

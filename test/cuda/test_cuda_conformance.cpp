@@ -273,6 +273,8 @@ TEST_CASE("CUDA binary conformance: ADD MUL SUB DIV real queue") {
                 *devices.candidate, operation);
         iom_conformance::run_gpu_eltwise_mapping_conformance(
                 *devices.candidate, operation);
+        iom_conformance::run_gpu_exact_alias_conformance(
+                *devices.candidate, operation);
     }
     CHECK_FALSE(devices.gate.armed());
 }

@@ -151,15 +151,29 @@ void GpuQueue<Policy>::execute(Task& task) {
             const detail::BinaryMetadata metadata =
                     *reinterpret_cast<const detail::BinaryMetadata*>(
                             metadata_pool_->host_data(metadata_slot));
+            const bool exact_alias =
+                    request.lhs.owner_identity == request.out.owner_identity
+                    || request.rhs.owner_identity
+                            == request.out.owner_identity;
             const auto launch = [&]<DeviceBinaryOp Op>() {
-                detail::launch_grid_stride_binary<Policy, Op>(
-                        stream_,
-                        static_cast<const unsigned char*>(
-                                request.lhs.native_handle),
-                        static_cast<const unsigned char*>(
-                                request.rhs.native_handle),
-                        static_cast<unsigned char*>(
-                                request.out.native_handle), metadata);
+                const auto lhs = static_cast<const unsigned char*>(
+                        request.lhs.native_handle);
+                const auto rhs = static_cast<const unsigned char*>(
+                        request.rhs.native_handle);
+                auto* out = static_cast<unsigned char*>(
+                        request.out.native_handle);
+                // Common validation rejects every same-owner non-exact
+                // window, so owner identity is the established exact-alias
+                // predicate here. Alias dispatch snapshots each tile before
+                // any overlapping output word is written; disjoint requests
+                // retain the word-grid fast path.
+                if (exact_alias) {
+                    detail::launch_alias_safe_binary<Policy, Op>(
+                            stream_, lhs, rhs, out, metadata);
+                } else {
+                    detail::launch_grid_stride_binary<Policy, Op>(
+                            stream_, lhs, rhs, out, metadata);
+                }
             };
             switch (request.operation) {
                 case DeviceOps::BinaryOperation::Add:
