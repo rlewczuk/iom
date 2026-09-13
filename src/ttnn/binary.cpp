@@ -10,7 +10,7 @@
 #include <tt_stl/span.hpp>
 #include <ttnn/operations/data_movement/copy/copy.hpp>
 #include <ttnn/tensor/tensor_ops.hpp>
-#include <cstring>
+#include <array>
 #include <unordered_map>
 #include "../shared/scalar_add.hpp"
 
@@ -89,9 +89,33 @@ void binary_planes(
         plane_combos *= dims[i];
     }
     const std::size_t total = plane_combos * rows * columns;
+
+    // Tensor validation limits ranks to eight, so six leading coordinates
+    // cover every binary request. Keep these buffers outside the hot loop:
+    // coordinate and broadcast mapping state is request-local and reused for
+    // every element instead of allocating vectors per element.
+    constexpr std::size_t kMaxLeadingRank = 6;
+    std::array<std::size_t, kMaxLeadingRank> coordinates{};
+    std::array<std::size_t, kMaxLeadingRank> lhs_coordinates{};
+    std::array<std::size_t, kMaxLeadingRank> rhs_coordinates{};
+    const std::span<const std::size_t> coordinate_span(
+            coordinates.data(), leading_rank);
+    auto operand_coord = [&](const BinarySnapshot& view,
+                             std::array<std::size_t, kMaxLeadingRank>& mapped) {
+        mapped.fill(0);
+        const auto vdims = view.spec.shape.dimensions();
+        const std::size_t leading_operand_rank = vdims.size() - 2;
+        const std::size_t offset = leading_rank - leading_operand_rank;
+        for (std::size_t i = 0; i < leading_operand_rank; ++i) {
+            mapped[offset + i] =
+                    vdims[i] == 1 ? 0 : coordinates[offset + i];
+        }
+        return std::span<const std::size_t>(
+                mapped.data(), leading_rank);
+    };
+
     for (std::size_t flat = 0; flat < total; ++flat) {
         std::size_t rem = flat;
-        std::vector<std::size_t> coordinates(leading_rank);
         for (std::size_t i = leading_rank; i-- > 0;) {
             coordinates[i] = rem % dims[i];
             rem /= dims[i];
@@ -99,19 +123,8 @@ void binary_planes(
         const std::size_t matrix = rem;
         const std::size_t row = matrix / columns;
         const std::size_t column = matrix % columns;
-        auto operand_coord = [&](const BinarySnapshot& view) {
-            std::vector<std::size_t> mapped(leading_rank, 0);
-            const auto vdims = view.spec.shape.dimensions();
-            const std::size_t leading_operand_rank = vdims.size() - 2;
-            const std::size_t offset = leading_rank - leading_operand_rank;
-            for (std::size_t i = 0; i < leading_operand_rank; ++i) {
-                mapped[offset + i] =
-                        vdims[i] == 1 ? 0 : coordinates[offset + i];
-            }
-            return mapped;
-        };
-        const auto lc = operand_coord(request.lhs);
-        const auto rc = operand_coord(request.rhs);
+        const auto lc = operand_coord(request.lhs, lhs_coordinates);
+        const auto rc = operand_coord(request.rhs, rhs_coordinates);
         const std::size_t lr = request.lhs.spec.shape.dimension(
                 request.lhs.spec.shape.rank() - 2) == 1 ? 0 : row;
         const std::size_t rr = request.rhs.spec.shape.dimension(
@@ -126,7 +139,7 @@ void binary_planes(
                 read(request.rhs, rhs_planes, rhs_cache, rc, rr, rcol);
         const std::uint64_t value = detail::scalar_binary<Op>(
                 request.out.spec.data_type, left, right);
-        const std::size_t plane = plane_at(request.out, coordinates);
+        const std::size_t plane = plane_at(request.out, coordinate_span);
         auto& raw = load(out_planes, plane, out_cache);
         const std::size_t padded_columns =
                 static_cast<std::size_t>(out_planes[plane].padded_shape()[-1]);
