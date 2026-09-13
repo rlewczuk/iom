@@ -8,7 +8,7 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [b
 
 Treat asynchronous accelerator execution as a first-class correctness model. C++ lexical scope does not prove device work completed.
 
-Before any repository work, read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/cpp-gpu-stability.md`, `.agents/cpp-review/checklists/common.md`, and every affected backend checklist.
+Before any repository work, read `skill://boss` first. Then read `.omp/cpp-review/references/review-process.md`, `.omp/cpp-review/references/finding-rubric.md`, `.omp/cpp-review/references/cpp-gpu-stability.md`, `.omp/cpp-review/checklists/common.md`, and every affected backend checklist.
 
 ## Invocation modes
 

@@ -8,9 +8,9 @@ argument-hint: "[candidate packets] [review scope] [spec docs/changes/... option
 
 Read `skill://boss` **first**, before reading any repository file, reference, or other skill. The visible/root session MUST run as `@slow`; role configuration or a model override selects that role, and this skill cannot switch an already-running model. Then read:
 
-- `.agents/cpp-review/references/finding-rubric.md`
-- `.agents/cpp-review/references/review-process.md`
-- `.agents/cpp-review/templates/remediation-task.md`
+- `.omp/cpp-review/references/finding-rubric.md`
+- `.omp/cpp-review/references/review-process.md`
+- `.omp/cpp-review/templates/remediation-task.md`
 
 The shared review process is canonical. This skill is the mandatory final pass for both the full orchestrator and every independently invoked specialist. It owns complete synthesis without spawning a nested supervisor, creating `review.md`, or deferring task generation to another skill.
 
@@ -41,7 +41,7 @@ Require:
 - optional destination beneath `docs/changes/`;
 - zero or more candidate packets using the common rubric.
 
-The packet contract extends `.agents/cpp-review/references/finding-rubric.md`; it does not replace any rubric field. Every packet must preserve reviewed state/scope, exact path:line/symbol and decisive minimal excerpts, source facts separated from inference, relevant callers/guards/counterparts/negative evidence, search coverage and uninspected areas, baseline-v-target provenance for commit findings, actual validation and gaps, a falsifier, and a full remediation seed. Reference internal artifacts for workers when useful, but place compact packet CONTENT in any advisor request; an advisor must never need to open a URI/path. Bound output, split work rather than dump repository/raw logs, and never truncate away evidence or coverage.
+The packet contract extends `.omp/cpp-review/references/finding-rubric.md`; it does not replace any rubric field. Every packet must preserve reviewed state/scope, exact path:line/symbol and decisive minimal excerpts, source facts separated from inference, relevant callers/guards/counterparts/negative evidence, search coverage and uninspected areas, baseline-v-target provenance for commit findings, actual validation and gaps, a falsifier, and a full remediation seed. Reference internal artifacts for workers when useful, but place compact packet CONTENT in any advisor request; an advisor must never need to open a URI/path. Bound output, split work rather than dump repository/raw logs, and never truncate away evidence or coverage.
 
 When called independently, do not invent candidates from vague prose. Ask for missing candidate fields only when they cannot be recovered from the supplied scope and repository evidence. A standalone finalizer owns the complete finalization of the supplied area, not an unassigned repository frontier.
 
@@ -140,7 +140,7 @@ The root preserves the distinction between actual root-run validation and propos
 For a supplied destination, `[ROOT @slow]` resolves it with:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
+python3 .omp/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
 ```
 
 The root verifies the destination remains beneath `docs/changes/`. `[PATH boss-errand @smol]` then inspects direct child directories whose names start with digits followed by `-`, checks current paths/symbols, and searches existing `spec.md` files for equivalent tasks. It returns existence, collision, and equivalence evidence only; it does not decide acceptance.
@@ -186,7 +186,7 @@ After the table is frozen, the root gives the drafting worker exact destinations
 
 ## 7. Write one self-contained task per accepted root cause
 
-`[DRAFT boss-builder-fast @smol]` (or the explicitly selected `boss-builder @task`) uses `.agents/cpp-review/templates/remediation-task.md`. Each task must stand alone; an implementer must not need review prose, parent conversation, or sibling tasks to learn its contract.
+`[DRAFT boss-builder-fast @smol]` (or the explicitly selected `boss-builder @task`) uses `.omp/cpp-review/templates/remediation-task.md`. Each task must stand alone; an implementer must not need review prose, parent conversation, or sibling tasks to learn its contract.
 
 Required content:
 
@@ -225,7 +225,7 @@ After writing, `[ROOT @slow]` reads every new `spec.md` and checks:
 Then the root runs one command over the exact new files:
 
 ```bash
-python3 .agents/cpp-review/scripts/validate_review_tasks.py \
+python3 .omp/cpp-review/scripts/validate_review_tasks.py \
   --spec-dir '<spec-dir>' \
   --task-file '<first-task>/spec.md' \
   --task-file '<next-task>/spec.md'

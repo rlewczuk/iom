@@ -8,11 +8,11 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [w
 
 Performance is a correctness-like requirement for inference engines, but claims require workload relevance and evidence.
 
-Read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/performance.md`, and applicable backend checklists. Follow the common routing, evidence-packet, synthesis, and verification contract in `review-process.md`.
+Read `skill://boss` first. Then read `.omp/cpp-review/references/review-process.md`, `.omp/cpp-review/references/finding-rubric.md`, `.omp/cpp-review/references/performance.md`, and applicable backend checklists. Follow the common routing, evidence-packet, synthesis, and verification contract in `review-process.md`.
 
 ## Boss routing contract
 
-The canonical routing, evidence, scope, synthesis, and verification contract is `.agents/cpp-review/references/review-process.md`; this skill adds only performance-specific routing and evidence jobs. The visible/root session must be configured as `@slow` because a skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
+The canonical routing, evidence, scope, synthesis, and verification contract is `.omp/cpp-review/references/review-process.md`; this skill adds only performance-specific routing and evidence jobs. The visible/root session must be configured as `@slow` because a skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
 
 One `@slow` root schedules one shared `scout (project read-only) @smol`, atomic `boss-errand @smol` follow-ups, and bounded read-only `boss-reviewer @task` analysis/falsification. Area leaves do not delegate, invoke orchestration or synthesis, write tasks, or run gates. Dispatch independent work in one batch, use exact known ranges when cheaper than another dispatch, and do not make gratuitous calls.
 

@@ -10,7 +10,7 @@ Optimize **concept count, responsibility count, and sources of truth**, not line
 
 Do not simplify away correctness, debuggability, real backend differences, asynchronous lifetime, or measured performance.
 
-Before any repository work, read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/backend-architecture.md`, `.agents/cpp-review/references/finding-rubric.md`, and `.agents/cpp-review/checklists/common.md`.
+Before any repository work, read `skill://boss` first. Then read `.omp/cpp-review/references/review-process.md`, `.omp/cpp-review/references/backend-architecture.md`, `.omp/cpp-review/references/finding-rubric.md`, and `.omp/cpp-review/checklists/common.md`.
 
 ## Invocation modes
 

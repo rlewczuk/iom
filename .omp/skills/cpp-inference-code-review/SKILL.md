@@ -6,7 +6,7 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec docs/changes/... 
 
 # C++ Inference Engine Code Review — Orchestrator
 
-Read `skill://boss` **first**, before reading any repository file, reference, or other skill. The visible/root session MUST run as `@slow`; role configuration or a model override selects that role, and this skill cannot switch an already-running model. Then read `.agents/cpp-review/references/review-process.md` and `.agents/cpp-review/references/finding-rubric.md`. The shared process is canonical; this file supplies the full-review workflow and area routing.
+Read `skill://boss` **first**, before reading any repository file, reference, or other skill. The visible/root session MUST run as `@slow`; role configuration or a model override selects that role, and this skill cannot switch an already-running model. Then read `.omp/cpp-review/references/review-process.md` and `.omp/cpp-review/references/finding-rubric.md`. The shared process is canonical; this file supplies the full-review workflow and area routing.
 
 Review a C++ inference engine with CPU and accelerator backends. Optimize for **semantic correctness, stability, low conceptual complexity, cross-backend integrity, and measured performance**.
 
@@ -23,7 +23,7 @@ Run these five area leaves, plus the mandatory synthesis finalizer:
 5. `cpp-inference-performance`
 6. `cpp-inference-review-synthesis` — mandatory final adversarial check, deduplication, prioritization, and task materialization
 
-Shared guidance is under `.agents/cpp-review/references/`, backend checklists are under `.agents/cpp-review/checklists/`, helper scripts are under `.agents/cpp-review/scripts/`, and the remediation template is `.agents/cpp-review/templates/remediation-task.md`.
+Shared guidance is under `.omp/cpp-review/references/`, backend checklists are under `.omp/cpp-review/checklists/`, helper scripts are under `.omp/cpp-review/scripts/`, and the remediation template is `.omp/cpp-review/templates/remediation-task.md`.
 
 ## Non-negotiable principles
 
@@ -94,13 +94,13 @@ Use this risk order for the shared map:
 Use when the user supplies a commit hash or commit message. `[ROOT @slow]` resolves without changing checkout state:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
+python3 .omp/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
 ```
 
 or:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
+python3 .omp/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
 ```
 
 Rules:
@@ -119,7 +119,7 @@ Capture the target hash/subject, baseline, changed and renamed/copied files, aff
 For a supplied `docs/changes/<change>[/<subchange>]` directory, `[ROOT @slow]` resolves the destination:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<path>'
+python3 .omp/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<path>'
 ```
 
 Then:
@@ -162,7 +162,7 @@ After the shared reconnaissance phase/map (including any required diff artifact)
 
 If delegation is unavailable, stop the missing lane from being silently substituted: report which areas, map, or synthesis checks cannot be covered and request explicit permission for a materially costlier fallback. Do not run the five areas sequentially as if that preserved the canonical route.
 
-Each candidate must satisfy `.agents/cpp-review/references/finding-rubric.md`, including a complete remediation seed and the extended evidence packet in `.agents/cpp-review/references/review-process.md`. This packet is what eliminates a second repository-wide conversion pass.
+Each candidate must satisfy `.omp/cpp-review/references/finding-rubric.md`, including a complete remediation seed and the extended evidence packet in `.omp/cpp-review/references/review-process.md`. This packet is what eliminates a second repository-wide conversion pass.
 
 ### Area 1 — Contract & correctness
 
@@ -188,7 +188,7 @@ Every specialist also performs the mandatory simplification pass from the shared
 
 ## Step 5 — Verify candidate hypotheses
 
-Area workers consult `.agents/cpp-review/references/tooling.md` and applicable backend checklists to propose decisive verification. They do not execute gates. The root runs focused checks only after all candidate packets are collected, using the actual repository state and the remote-development procedure for accelerators.
+Area workers consult `.omp/cpp-review/references/tooling.md` and applicable backend checklists to propose decisive verification. They do not execute gates. The root runs focused checks only after all candidate packets are collected, using the actual repository state and the remote-development procedure for accelerators.
 
 Possible root-run evidence includes:
 

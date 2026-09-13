@@ -71,8 +71,8 @@ If the user has separately installed/configured an external reviewer or coding a
 
 This section routes reviews; the shared review contract remains canonical. Before any review, read:
 
-- `.agents/cpp-review/references/review-process.md`;
-- `.agents/cpp-review/references/finding-rubric.md`.
+- `.omp/cpp-review/references/review-process.md`;
+- `.omp/cpp-review/references/finding-rubric.md`.
 
 Do not duplicate those files' domain checklists here. Preserve their exact-commit scoping, whole-codebase coverage accounting, mandatory simplification pass, candidate rubric, synthesis requirements, task template, numbering, collision, duplicate, and no-intermediate-`review.md` rules.
 The five substantive areas are `cpp-inference-contract-correctness`, `cpp-inference-gpu-stability`, `cpp-inference-backend-simplicity`, `cpp-inference-numerical-testing`, and `cpp-inference-performance`; `cpp-inference-review-synthesis` is always the final pass. Use these exact skill names when routing review work.

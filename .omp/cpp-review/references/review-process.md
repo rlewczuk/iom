@@ -65,13 +65,13 @@ The root resolves exactly one review scope and records its identity before area 
 For selected commits, `[ROOT @slow]` runs without changing checkout state:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
+python3 .omp/cpp-review/scripts/resolve_review_scope.py --repo . --commit-hash '<hash>'
 ```
 
 or:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
+python3 .omp/cpp-review/scripts/resolve_review_scope.py --repo . --commit-message '<message>'
 ```
 
 The root resolves hashes to exactly one commit, matches complete messages (then exact subjects), never chooses among multiple matches or fuzzy matches, and uses the empty tree for a root commit. The root captures target hash/subject, parent/baseline, changed and renamed/copied files, affected builds/backends, and supplied specification path.
@@ -79,7 +79,7 @@ The root resolves hashes to exactly one commit, matches complete messages (then 
 For an optional specification directory, `[ROOT @slow]` runs:
 
 ```bash
-python3 .agents/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
+python3 .omp/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
 ```
 
 The root verifies the resolved path remains beneath `docs/changes/` and passes the resolved destination to reconnaissance and synthesis. No specification directory is invented.
@@ -171,7 +171,7 @@ Preserve backend differences that change correctness or performance. Net concept
 
 ## Candidate packet and evidence handoff
 
-For every material candidate, return the complete packet required by `.agents/cpp-review/references/finding-rubric.md`, including an implementation-ready remediation seed. The packet contract is extended with the following evidence fields; these fields do not replace any rubric field:
+For every material candidate, return the complete packet required by `.omp/cpp-review/references/finding-rubric.md`, including an implementation-ready remediation seed. The packet contract is extended with the following evidence fields; these fields do not replace any rubric field:
 
 - reviewed state and exact scope identity;
 - exact `path:line`/symbol location and decisive minimal excerpts (not a raw repository dump);
@@ -194,7 +194,7 @@ Synthesis is an adversarial final pass, not a second broad review. `[ROOT @slow]
 2. `[ADVISOR boss-advisor @advisor]` is used only for genuinely hard semantic/lifetime/numerical questions, disputed evidence, or key/high-risk acceptance/remediation choices. It receives a compact self-contained packet CONTENT, with facts, inference, alternatives, and the precise question. It has no tools and cannot open paths. If it returns `NEED EVIDENCE`, `[ROOT @slow]` asks `[ERRAND boss-errand @smol]` one exact source question, appends only the evidence delta, and may return that delta to the same advisor. Agreement is not verification.
 3. `[PATH boss-errand @smol]` checks existence, current path/symbol validity, destination shape, collisions, and equivalent existing task specs using exact known paths. It does not perform routine semantic review or broad scans.
 4. `[ROOT @slow]` adjudicates acceptance/rejection, merges same-root symptoms, preserves separate roots, assigns final IDs/severity/confidence/priority/order/blockers/slugs, and freezes the complete assignment table before any file is written.
-5. `[DRAFT boss-builder-fast @smol]` (or explicitly selected `boss-builder @task`) mechanically writes one self-contained task per accepted root cause to the exact table destinations using `.agents/cpp-review/templates/remediation-task.md`. It has no design authority and cannot allocate numbers concurrently. The root may perform equivalent deterministic drafting only when no builder lane exists and must report that routing limit.
+5. `[DRAFT boss-builder-fast @smol]` (or explicitly selected `boss-builder @task`) mechanically writes one self-contained task per accepted root cause to the exact table destinations using `.omp/cpp-review/templates/remediation-task.md`. It has no design authority and cannot allocate numbers concurrently. The root may perform equivalent deterministic drafting only when no builder lane exists and must report that routing limit.
 6. `[ROOT @slow]` reads every generated `spec.md`, checks the entire generated set against the table and synthesis gates, and runs the validator over exactly the new files. This is document validation, not an implementation gate.
 
 No candidate is accepted solely because an advisor agrees with it. No task is written before the root freezes the table. If evidence is insufficient, reject or retain a hypothesis with its decisive falsification outcome; do not upgrade uncertainty by repetition.

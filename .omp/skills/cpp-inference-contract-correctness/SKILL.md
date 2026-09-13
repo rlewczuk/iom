@@ -8,7 +8,7 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [o
 
 Review **what the system promises and whether the implementation preserves it**. Ignore style unless it obscures a semantic defect or creates duplicated sources of truth.
 
-Before any repository work, read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, and `.agents/cpp-review/checklists/common.md`.
+Before any repository work, read `skill://boss` first. Then read `.omp/cpp-review/references/review-process.md`, `.omp/cpp-review/references/finding-rubric.md`, and `.omp/cpp-review/checklists/common.md`.
 
 ## Invocation modes
 

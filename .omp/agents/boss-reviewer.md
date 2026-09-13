@@ -16,7 +16,7 @@ Rules:
 - Review only the assigned area and supplied scope. For selected commits, accept only defects introduced or materially exposed/worsened by the target against its stated baseline.
 - Read source as needed to falsify hypotheses, but return compact decisive `file:line` or symbol excerpts, not raw logs or a broad repository dump.
 - Separate SOURCE FACTS from INFERENCE. Include callers, guards, counterparts, negative evidence, search coverage, uninspected areas, and a concrete falsifier.
-- Return candidate packets that extend `.agents/cpp-review/references/finding-rubric.md`; do not replace its required fields or make final cross-area decisions.
+- Return candidate packets that extend `.omp/cpp-review/references/finding-rubric.md`; do not replace its required fields or make final cross-area decisions.
 - Do not run builds, tests, benchmarks, sanitizers, or other verification gates. Propose exact commands or scenarios for the supervisor to run after candidate collection.
 - This is orchestrated candidate-only mode: never invoke `cpp-inference-review-synthesis`, another review skill, or any orchestration/delegation. Do not write task specifications or `review.md`.
 - Always perform the assigned area's mandatory simplification pass from the shared review protocol, preserving real backend differences.

@@ -8,11 +8,11 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec path optional] [o
 
 The oracle must be stronger than “passes on one GPU.” Prefer independent reference/differential checks with an explicit numerical policy.
 
-Read `skill://boss` first. Then read `.agents/cpp-review/references/review-process.md`, `.agents/cpp-review/references/finding-rubric.md`, `.agents/cpp-review/references/numerical-testing.md`, and applicable backend checklists. Follow the common routing, evidence-packet, synthesis, and verification contract in `review-process.md`.
+Read `skill://boss` first. Then read `.omp/cpp-review/references/review-process.md`, `.omp/cpp-review/references/finding-rubric.md`, `.omp/cpp-review/references/numerical-testing.md`, and applicable backend checklists. Follow the common routing, evidence-packet, synthesis, and verification contract in `review-process.md`.
 
 ## Boss routing contract
 
-The canonical routing, evidence, scope, synthesis, and verification contract is `.agents/cpp-review/references/review-process.md`; this skill adds only numerical-specific routing and evidence jobs. The visible/root session must be configured as `@slow` because a skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
+The canonical routing, evidence, scope, synthesis, and verification contract is `.omp/cpp-review/references/review-process.md`; this skill adds only numerical-specific routing and evidence jobs. The visible/root session must be configured as `@slow` because a skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
 
 One `@slow` root schedules one shared `scout (project read-only) @smol`, atomic `boss-errand @smol` follow-ups, and bounded read-only `boss-reviewer @task` analysis/falsification. Area leaves do not delegate, invoke orchestration or synthesis, write tasks, or run gates. Dispatch independent work in one batch, use exact known ranges when cheaper than another dispatch, and do not make gratuitous calls.
 
