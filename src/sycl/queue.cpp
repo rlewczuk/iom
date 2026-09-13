@@ -320,23 +320,30 @@ void SyclQueue::execute(Task& task) {
                     "injected SYCL first-submit failure");
         }
 
-        const std::size_t completion_slot = completion_pool_->acquire();
+        const auto completion_slot = completion_pool_->try_acquire();
+        if (!completion_slot.has_value()) {
+            throw detail::AdmissionResourceUnavailable{};
+        }
         task.state->set_completion_slot(
-                *completion_pool_, completion_slot);
+                *completion_pool_, *completion_slot);
         // One fixed 512-byte slot from this queue's partition carries
         // the immutable pointer-copy descriptor; no growth, replacement,
         // or native allocation ever happens here.
-        const std::size_t metadata_slot = metadata_pool_->acquire();
-        task.state->set_metadata_slot(*metadata_pool_, metadata_slot);
+        const auto metadata_slot = metadata_pool_->try_acquire();
+        if (!metadata_slot.has_value()) {
+            throw detail::AdmissionResourceUnavailable{};
+        }
+        const std::size_t metadata_index = *metadata_slot;
+        task.state->set_metadata_slot(*metadata_pool_, metadata_index);
         const detail::CopyMetadataLayout layout =
                 copy_metadata_layout_snapshot(*task.copy_request);
         write_copy_metadata_snapshot(
-                metadata_pool_->host_data(metadata_slot),
+                metadata_pool_->host_data(metadata_index),
                 *task.copy_request);
         native_attempted = true;
         queue_.memcpy(
-                metadata_pool_->device_data(metadata_slot),
-                metadata_pool_->host_data(metadata_slot), layout.bytes);
+                metadata_pool_->device_data(metadata_index),
+                metadata_pool_->host_data(metadata_index), layout.bytes);
         metadata_enqueued = true;
 
         const auto* source_handle = static_cast<const unsigned char*>(
@@ -345,7 +352,7 @@ void SyclQueue::execute(Task& task) {
                 task.copy_request->destination.native_handle);
         const auto* metadata = static_cast<
                 const detail::CopyMetadataHeader*>(
-                metadata_pool_->device_data(metadata_slot));
+                metadata_pool_->device_data(metadata_index));
         sycl::event event = queue_.parallel_for(
                 sycl::range<1>(layout.total_words),
                 [=](sycl::id<1> item) {

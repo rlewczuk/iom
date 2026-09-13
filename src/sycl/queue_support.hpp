@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <exception>
 #include <functional>
@@ -37,24 +36,17 @@ public:
 
     [[nodiscard]] std::size_t count() const noexcept { return count_; }
 
-    [[nodiscard]] std::size_t acquire() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        completion_.wait(lock, [this] {
-            for (std::size_t index = 0; index < count_; ++index) {
-                if (!slots_[index].in_use) {
-                    return true;
-                }
-            }
-            return false;
-        });
+    // Dispatch runs on the submitting thread or the completion worker, so
+    // resource exhaustion must be reported without waiting for a slot.
+    [[nodiscard]] std::optional<std::size_t> try_acquire() {
+        std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t index = 0; index < count_; ++index) {
             if (!slots_[index].in_use) {
                 slots_[index].in_use = true;
                 return index;
             }
         }
-        throw std::logic_error(
-                "SYCL completion pool lost a free slot");
+        return std::nullopt;
     }
 
     void set_event(std::size_t index, sycl::event event) noexcept {
@@ -89,10 +81,8 @@ public:
             slots_[index].has_event = false;
             slots_[index].protected_ = false;
             slots_[index].in_use = false;
-            completion_.notify_one();
         }
     }
-
     void release_all_protected() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t index = 0; index < count_; ++index) {
@@ -101,7 +91,6 @@ public:
                 slots_[index].has_event = false;
                 slots_[index].protected_ = false;
                 slots_[index].in_use = false;
-                completion_.notify_one();
             }
         }
     }
@@ -145,7 +134,6 @@ private:
     std::unique_ptr<Slot[]> slots_;
     std::size_t count_ = 0;
     std::mutex mutex_;
-    std::condition_variable completion_;
 };
 
 class SyclQueue;

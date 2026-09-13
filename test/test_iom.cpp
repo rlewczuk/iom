@@ -854,6 +854,10 @@ public:
         next_add_failure_ = failure;
     }
 
+    void set_admission_unavailable(bool unavailable) noexcept {
+        admission_unavailable_ = unavailable;
+    }
+
     [[nodiscard]] const std::vector<BinaryRecord>& add_records() const noexcept {
         return add_records_;
     }
@@ -884,7 +888,10 @@ public:
     // A view-less submission used to observe queue identity and sequence
     // allocation directly.
     iom::oid probe() {
-        return submit([&](std::uint64_t sequence) {
+        return submit([this](std::uint64_t sequence) {
+            if (admission_unavailable_) {
+                throw iom::detail::AdmissionResourceUnavailable{};
+            }
             submissions.push_back({sequence, "probe"});
         });
     }
@@ -995,6 +1002,8 @@ private:
             iom::detail::allocate_queue_id(registry_state_);
     std::vector<BinaryRecord> add_records_;
     AddFailure next_add_failure_ = AddFailure::none;
+    bool admission_unavailable_ = false;
+
 };
 
 class InlineQueue final : public iom::DeviceOps {
@@ -1134,8 +1143,9 @@ private:
 };
 
 class FakeDevice final : public iom::Device {
-
 public:
+    using iom::Device::Device;
+
     [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
         return iom::BackendKind::CPU;
     }
@@ -1169,6 +1179,30 @@ public:
         return std::make_unique<FakeQueue>(*this);
     }
 };
+TEST_CASE("DeviceOps parks unavailable admission without recursive retry") {
+    FakeDevice device{iom::QueueConfig{2}};
+    FakeQueue queue{device};
+
+    queue.set_admission_unavailable(true);
+    const iom::oid parked = queue.probe();
+    CHECK(iom::oid_is_token(parked));
+    CHECK_EQ(token_sequence(parked), 1);
+    CHECK(queue.submissions.empty());
+
+    queue.set_admission_unavailable(false);
+    const iom::oid dispatched = queue.probe();
+    CHECK(iom::oid_is_token(dispatched));
+    CHECK_EQ(token_sequence(dispatched), 2);
+    REQUIRE(queue.submissions.size() == 2);
+    CHECK_EQ(queue.submissions[0].sequence, 1);
+    CHECK_EQ(queue.submissions[1].sequence, 2);
+
+    queue.complete(1);
+    queue.complete(2);
+    CHECK_NOTHROW(queue.wait(parked));
+    CHECK_NOTHROW(queue.wait(dispatched));
+}
+
 
 class FakeShrunkDevice final : public iom::Device {
 public:

@@ -127,7 +127,7 @@ namespace iom {
             std::uint64_t synchronous_sequence) noexcept {
         {
             std::lock_guard<std::mutex> lock(completion_mutex_);
-            if (admission_pumping_) return;
+            if (admission_pumping_ || admission_closing_) return;
             admission_pumping_ = true;
         }
         for (;;) {
@@ -135,7 +135,8 @@ namespace iom {
             std::function<void(std::uint64_t)> dispatch;
             {
                 std::lock_guard<std::mutex> lock(completion_mutex_);
-                if (admission_credits_ >= admission_capacity_
+                if (admission_closing_
+                        || admission_credits_ >= admission_capacity_
                         || admission_fifo_.empty()) {
                     admission_pumping_ = false;
                     return;
@@ -167,7 +168,6 @@ namespace iom {
             try {
                 dispatch(sequence);
             } catch (const detail::AdmissionResourceUnavailable&) {
-                bool retry = false;
                 {
                     std::lock_guard<std::mutex> lock(completion_mutex_);
                     const auto node = admission_nodes_.find(sequence);
@@ -175,13 +175,14 @@ namespace iom {
                         node->second.dispatch = std::move(dispatch);
                         node->second.executing = false;
                         if (admission_credits_ != 0) --admission_credits_;
-                        retry = true;
                     }
+                    // Resource exhaustion is a nonterminal parked state. The
+                    // completion/release path owns the next retry; never
+                    // recurse from this dispatch path while no resource
+                    // state changed.
                     admission_pumping_ = false;
                     completion_cv_.notify_all();
                 }
-                if (retry) pump_admission(
-                        synchronous_failure, synchronous_sequence);
                 return;
             } catch (...) {
                 const std::exception_ptr failure = std::current_exception();

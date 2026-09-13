@@ -275,10 +275,12 @@ void SyclQueue::execute_binary(Task& task) {
         free_binary_host_staging(out_stage, context);
     };
     try {
-        const std::size_t completion_slot =
-                completion_pool_->acquire();
+        const auto completion_slot = completion_pool_->try_acquire();
+        if (!completion_slot.has_value()) {
+            throw detail::AdmissionResourceUnavailable{};
+        }
         task.state->set_completion_slot(
-                *completion_pool_, completion_slot);
+                *completion_pool_, *completion_slot);
         lhs_stage = sycl::malloc_host(lhs_bytes, context);
         rhs_stage = sycl::malloc_host(rhs_bytes, context);
         out_stage = sycl::malloc_host(out_bytes, context);
