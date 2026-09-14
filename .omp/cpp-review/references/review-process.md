@@ -8,13 +8,13 @@ This document is the canonical protocol for the five review areas and their synt
 
 ## Roles, routing, and permissions
 
-The visible/root session is the accountable supervisor and MUST run as `@slow`. A skill cannot switch the model of an already-running session: use the user's role configuration or model override to select `@slow`, and never claim that a skill auto-switched it.
+The visible/root session is the accountable supervisor and should run as `@slow`. A skill cannot switch the model of an already-running session: prefer the user's role configuration or model override to select `@slow`, never claim that a skill auto-switched it, and apply `skill://boss`'s warning-and-consent gate when the running model differs. In this document, root `@slow` labels include a current-model deviation explicitly accepted through that gate.
 
 Every root invocation first follows `skill://boss`'s deterministic preflight. Its preserved `git`, `roles`, `models`, and `agents` values are the sole environment evidence for this process; do not repeat Git/OMP/profile discovery in this reference or a specialist skill. A failed preflight stops dispatch.
 
 | Lane | Profile and role | Allowed work | Prohibited work |
 |---|---|---|---|
-| Root supervisor | visible session, `@slow` | resolve scope, route work, adjudicate invariants and candidates, freeze the assignment table, materialize/validate the final set, and report coverage | silently delegating accountability or claiming unrun validation |
+| Root supervisor | visible session; prefer `@slow`, with accepted mismatch allowed | resolve scope, route work, adjudicate invariants and candidates, freeze the assignment table, materialize/validate the final set, and report coverage | silently delegating accountability or claiming unrun validation |
 | Shared reconnaissance / bounded discovery | `scout`, `@smol` | read-only broad source discovery, search, specification mapping, backend/build map, and compact coverage mapping; this profile intentionally has no bash | design judgments, task drafting, broad repeated scans, or implementation changes |
 | Atomic lookup / named command | `boss-errand`, `@smol` | read-only atomic factual lookups, named read-only git/script commands and artifacts, exact followups, and path/collision/equivalence checks | broad source/spec discovery, frontier scans, design judgments, task drafting, or implementation changes |
 | Area review | `boss-reviewer`, `@task` | read-only bounded substantive analysis and independent falsification for exactly one area; return candidate packets | delegation, nested orchestration, task-file writes, or build/test/benchmark gates |
@@ -31,7 +31,7 @@ Workers never run build, test, sanitizer, profiler, benchmark, or other verifica
 
 ### Full orchestrated review
 
-The code-review orchestrator is a complete workflow. It reads `skill://boss` before any other skill or repository material, runs as the `@slow` root, resolves one scope, performs one shared cheap reconnaissance phase/map (using one batched set of bounded `scout @smol` shards when useful), retrieves any complete selected diff through a named read-only `boss-errand @smol` command/artifact for those scouts and area leaves to inspect, dispatches all five area leaves concurrently, collects narrow errand followups as needed, and invokes synthesis once. It owns final acceptance, assignment ordering, task writing, generated-set validation, and the response.
+The code-review orchestrator is a complete workflow. It reads `skill://boss` before any other skill or repository material, applies its root-model consent policy, resolves one scope, performs one shared cheap reconnaissance phase/map (using one batched set of bounded `scout @smol` shards when useful), retrieves any complete selected diff through a named read-only `boss-errand @smol` command/artifact for those scouts and area leaves to inspect, dispatches all five area leaves concurrently, collects narrow errand followups as needed, and invokes synthesis once. It owns final acceptance, assignment ordering, task writing, generated-set validation, and the response.
 
 The root supplies every area leaf with the same resolved scope, reviewed-state identity, specification map, affected backend list, reconnaissance map, search coverage, and candidate packet contract. Area leaves review only their assigned area and return candidate packets; they do not invoke another review skill, synthesis, or supervisor.
 
@@ -41,11 +41,11 @@ The orchestrator supplies one resolved scope, reviewed-state identity, specifica
 
 ### Standalone specialist pass
 
-When a specialist skill is invoked directly, its running `@slow` session owns the complete selected area: read `skill://boss` first, resolve scope/specification, establish coverage, perform the area review, record validation gaps, and invoke `cpp-inference-review-synthesis` as its mandatory final pass. It MUST NOT spawn a nested supervisor, widen to an unbounded whole-repository `@slow` fallback, or pretend that another area was reviewed. The standalone finalizer receives that area's complete candidate packets and emits tasks directly. Preserve the same selected-commit and whole-codebase rules and disclose area-only coverage.
+When a specialist skill is invoked directly, its running root session owns the complete selected area after applying `skill://boss`'s root-model consent policy: resolve scope/specification, establish coverage, perform the area review, record validation gaps, and invoke `cpp-inference-review-synthesis` as its mandatory final pass. It MUST NOT spawn a nested supervisor, widen to an unbounded whole-repository `@slow` fallback, or pretend that another area was reviewed. The standalone finalizer receives that area's complete candidate packets and emits tasks directly. Preserve the same selected-commit and whole-codebase rules and disclose area-only coverage.
 
 ### Shared finalizer
 
-`cpp-inference-review-synthesis` is mandatory after either mode. It rejects weak candidates, reconciles roots, and emits self-contained tasks. It MUST NOT create `review.md`, invoke a separate conversion skill, or recursively invoke the full orchestrator. In standalone synthesis mode, its `@slow` root owns the finalizer workflow and may dispatch only bounded evidence-check, advisor, existence/collision, and drafting lanes described below.
+`cpp-inference-review-synthesis` is mandatory after either mode. It rejects weak candidates, reconciles roots, and emits self-contained tasks. It MUST NOT create `review.md`, invoke a separate conversion skill, or recursively invoke the full orchestrator. In standalone synthesis mode, the root owns the finalizer workflow under Boss's root-model consent policy and may dispatch only bounded evidence-check, advisor, existence/collision, and drafting lanes described below.
 
 ## Evidence hierarchy
 

@@ -13,13 +13,13 @@ Before any repository work, read `skill://boss` first. Then read `.omp/cpp-revie
 ## Invocation modes
 
 - **Orchestrated:** use the supplied resolved scope/specification map; return only `CC-###` candidate packets to the orchestrator. This is candidate-only `boss-reviewer` execution at `@task`: do not resolve a new frontier, delegate recursively, invoke synthesis, write task files, or run validation gates.
-- **Standalone:** run as the root `@slow` orchestration for this area. Resolve scope and the optional `docs/changes/...` destination using the shared process, own the complete area review and acceptance, then invoke `cpp-inference-review-synthesis`. The final deliverable is direct remediation subtasks, not a review report. The skill cannot switch an already-running model; require the intended role configuration before invocation.
+- **Standalone:** run as the root orchestration for this area after applying Boss's root-model warning-and-consent gate. Resolve scope and the optional `docs/changes/...` destination using the shared process, own the complete area review and acceptance, then invoke `cpp-inference-review-synthesis`. The final deliverable is direct remediation subtasks, not a review report. The skill cannot switch an already-running model; `@slow` remains preferred, while an explicitly accepted mismatch may continue.
 
 In selected-commit mode, inspect necessary surrounding code and backend counterparts but accept only defects introduced or materially exposed/worsened by the target commit.
 
 ## Boss routing for this area
 
-Follow the canonical review process rather than restating it. The standalone invocation is owned by the running `@slow` root, which resolves scope, accepts candidates, freezes the assignment table, and invokes synthesis; the orchestrated invocation is a candidate-only `boss-reviewer` leaf at `@task`. Neither mode may claim an already-running model was switched, and the leaf may not delegate, recurse, write tasks, or broaden discovery.
+Follow the canonical review process rather than restating it. The standalone invocation is owned by the running root under Boss's root-model consent policy, which resolves scope, accepts candidates, freezes the assignment table, and invokes synthesis; the orchestrated invocation is a candidate-only `boss-reviewer` leaf at `@task`. Neither mode may claim an already-running model was switched, and the leaf may not delegate, recurse, write tasks, or broaden discovery.
 
 - Project agent `scout` at `@smol` handles broad specification inventory, changed-interface/callsite/counterpart search, capability/dispatch tracing, and test/error-path discovery. Use `boss-errand` at `@smol` only for atomic factual followups. Return exact `path:line`/symbol evidence, source facts versus inference, negative evidence, search coverage, and uninspected areas.
 - `boss-reviewer` may inspect the bounded assigned source ranges and callpaths directly, alongside the scout evidence, to perform semantic reasoning and independent falsification; it returns candidate packets only.

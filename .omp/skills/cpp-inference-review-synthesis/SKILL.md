@@ -6,7 +6,7 @@ argument-hint: "[candidate packets] [review scope] [spec docs/changes/... option
 
 # Review Synthesis & Direct Task Materialization
 
-Read `skill://boss` **first**, before reading any repository file, reference, or other skill. The visible/root session MUST run as `@slow`; role configuration or a model override selects that role, and this skill cannot switch an already-running model. Then read:
+Read `skill://boss` **first**, before reading any repository file, reference, or other skill, and apply its root-model warning-and-consent gate. The visible/root session should run as `@slow`, but an explicitly accepted mismatch may continue on the current model; this skill cannot switch an already-running model. Then read:
 
 - `.omp/cpp-review/references/finding-rubric.md`
 - `.omp/cpp-review/references/review-process.md`
@@ -16,7 +16,7 @@ The shared review process is canonical. This skill is the mandatory final pass f
 
 ## Synthesis routing
 
-The root `@slow` session owns packet intake, scope/coverage accountability, candidate acceptance, root-cause reconciliation, the complete assignment table, task materialization, generated-set validation, and the completion response. Synthesis is not a second broad repository review.
+The root session, preferably running as `@slow` under Boss's consent policy, owns packet intake, scope/coverage accountability, candidate acceptance, root-cause reconciliation, the complete assignment table, task materialization, generated-set validation, and the completion response. Synthesis is not a second broad repository review.
 
 Use separate, bounded lanes:
 
@@ -29,7 +29,7 @@ Run independent evidence/path checks in one batch when possible. A hard-decision
 
 Workers never run compiler, build, test, sanitizer, profiler, benchmark, or other gates. They may identify a focused command and expected observation. The root runs actual validation after candidate collection and records the command, environment, and result. Accelerator checks follow `remote-development` rules and execute on the selected remote Linux host over SSH; local inspection is not represented as a remote accelerator result.
 
-When called from the full orchestrator, synthesis receives all five area packets from one concurrent batch. When called from a standalone specialist, the specialist's running `@slow` root supplies its complete area packets and resolved scope. In neither mode may synthesis invoke another orchestrator, specialist review, or synthesis pass. In standalone mode, unavailable lanes do not authorize widening the assigned area into an unbounded whole-repository `@slow` review; report the area-only routing and coverage limit. If a required lane is unavailable, request explicit permission before a materially costlier fallback; do not silently substitute an expensive frontier review or claim missing checks ran.
+When called from the full orchestrator, synthesis receives all five area packets from one concurrent batch. When called from a standalone specialist, the specialist's running root supplies its complete area packets and resolved scope under Boss's root-model consent policy. In neither mode may synthesis invoke another orchestrator, specialist review, or synthesis pass. In standalone mode, unavailable lanes do not authorize widening the assigned area into an unbounded whole-repository `@slow` review; report the area-only routing and coverage limit. If a required lane is unavailable, request explicit permission before a materially costlier fallback; do not silently substitute an expensive frontier review or claim missing checks ran.
 
 ## Inputs
 
