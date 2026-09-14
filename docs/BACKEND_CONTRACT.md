@@ -863,6 +863,143 @@ numerical conformance. Future all-five conformance covers success, runs
 `1/15/16/17`, non-tile features, independent planes, padding isolation,
 rejections, and repeatable accepted failures. Only after SDPA closes may the
 session assemble and verify the complete layer from these boundaries.
+#### TinyLlama forward layout — Positions and cache boundaries
+
+The following RoPE and cache-append interfaces are planned ABIs, not currently
+declared or supported facades:
+
+```cpp
+oid rope(
+        const TensorView& x, TensorView& out, size_t a, double theta,
+        RawWorkspaceView workspace = {}) noexcept;
+WorkspaceRequirements rope_workspace_requirements(
+        const TensorView& x, const TensorView& out, size_t a, double theta);
+
+oid cache_append(
+        const TensorView& source, TensorView& destination, size_t a,
+        RawWorkspaceView workspace = {}) noexcept;
+WorkspaceRequirements cache_append_workspace_requirements(
+        const TensorView& source, const TensorView& destination, size_t a);
+```
+
+Their operation siblings MUST add these declarations and implementations before
+reporting support. Each requirements query mirrors all semantic arguments,
+accepts no workspace argument, and MUST be pure: it performs no allocation,
+registration, submission, sequence reservation, or state mutation.
+
+For RoPE, `x` and `out` MUST have identical logical shape `[...,H,R,D]` and
+rank three through eight. `H` and `R` are nonzero, `D` is positive and even,
+and the views have identical leading tuples, dtype, device, quantization, and
+mapping-compatible final axes. Every logical output element MUST be written
+from its corresponding input element, honoring the independent leading offset
+and strides of both views and the logical mapping of partial final tiles. If
+`b` denotes the complete leading-coordinate tuple, then for every `j < D/2`
+
+```text
+angle(a,r,j)       = (a+r) * theta^(-2*j/D)
+y[b,h,r,j]         = x[b,h,r,j] * cos(angle(a,r,j))
+                     - x[b,h,r,j+D/2] * sin(angle(a,r,j))
+y[b,h,r,j+D/2]     = x[b,h,r,j] * sin(angle(a,r,j))
+                     + x[b,h,r,j+D/2] * cos(angle(a,r,j))
+```
+
+These are exactly first-half/second-half pairs, never adjacent pairs. The
+operation MUST use the explicit absolute position `a+r`; it has no hidden
+cursor, state broadcast, subtraction artifact, scaling parameter, or alternate
+angle convention. `theta` MUST be finite and greater than zero. Admission MUST
+compute `a+(R-1)` with checked arithmetic and enforce the representable
+position/conversion bound fixed by the RoPE numerical contract before any
+kernel effect. The session's bounded per-layer capacity `C` supplies the model
+positions and model-position bound; RoPE does not own `C`. The ABI's `double`
+scalar does not require FP64 device trigonometry. The RoPE operation's
+numerical sibling MUST define applicable dtypes, reference and fixture
+provenance, special-value behavior, tolerances, BF16 operation-boundary
+rounding, and backend feasibility.
+
+Q and K MUST be submitted to RoPE independently, so `Hq != Hkv` is valid.
+Independent Q and K calls are each admitted under their own operation alias
+contract; an exact alias relationship between operands read by those separate
+calls MUST NOT be rejected merely because it is a Q/K alias category.
+Repeated one-row calls use continuous absolute positions: calls with `R=1`
+and `a=1`, `a=15`, `a=16`, or `a=17` rotate positions 1, 15, 16, and 17
+respectively, with no reset or discontinuity at the 16-row tile boundary. A
+multi-row call starting at any such `a` uses the consecutive positions
+`a` through `a+R-1`.
+Consecutive calls MUST pass the next `a` as the preceding `a+R`; for example,
+successive one-row calls at 15, 16, and 17 cross the tile boundary without
+reusing or skipping a position.
+
+For cache append, `source` MUST have shape `[...,H,R,D]` and `destination`
+shape `[...,H,C,D]`, each of rank three through eight and with every extent
+nonzero. Their leading tuples, `H`, `D`, dtype, quantization, and exact device
+MUST match; `R` is the independent source length and `C` is cache capacity.
+Admission MUST check `a <= C`, then `R <= C-a`, along with all byte,
+stride, address, and range arithmetic before effects. For every logical
+coordinate it writes
+
+```text
+destination[b,h,a+r,d] = source[b,h,r,d]
+```
+
+for `0 <= r < R` and MUST leave every other logical destination row unchanged.
+The copy is bit-preserving: it performs no numerical conversion or rounding
+and is semantically valid for every payload leaf that the exact device supports
+for storage. Unused tile padding MUST remain unchanged and, like the
+uninitialized cache tail, is not logical data and MUST NOT be read as an
+initialized value. Transformed leading offsets and strides of source and
+destination MUST be honored independently, including partial final tiles.
+
+The boundary cases are normative. With exact-end capacity `C=a+R`, the cases
+`(a,R,C)=(1,1,2)`, `(15,15,30)`, `(16,16,32)`, and `(17,17,34)` write exactly
+rows `[a,C)` and preserve every row `[0,a)`; there is no special behavior at
+`R=1`, `R=15`, `R=16`, or `R=17`, nor at positions 15, 16, and 17. With
+capacity larger than `a+R`, rows `[0,a)` and `[a+R,C)` likewise remain
+untouched. `a>C`, `R>C-a`, or overflow while evaluating a position or storage
+range MUST be rejected before mutation. Exact-end append is valid, while
+padding after a partial tile and every uninitialized logical row remain
+excluded from initialized length.
+
+K and V MUST use separate `cache_append` submissions with distinct cache
+owners; there is no atomic two-cache operation. Neither RoPE nor cache append
+owns initialized length `L`, reset, clearing, growth, or session failure
+policy. The session MAY publish `L=a+R` only after both K and V append OIDs
+have been successfully waited. Positive admission alone is insufficient, and
+the session MUST NOT submit a dependent consumer of a failed producer.
+Attention receives the initialized length explicitly and MUST NOT infer it
+from capacity or padding.
+
+New output and workspace storage MUST be disjoint from every input and from
+each other. Cache source and destination overlap MUST be rejected. Read/read
+overlap is harmless where all shape rules hold. No operand, output, or
+temporary tensor may be allocated, relocated, or silently converted, and
+neither operation may introduce a host round trip. Workspace is caller-owned
+through proven completion; a supplied range is checked only at submission for
+the exact device, the query's exact required size and alignment, overlap,
+freshness, and lease availability.
+
+Both facades MUST validate malformed views, rank and dimensions, leading
+tuples, dtype, device, quantization, aliases, scalar finiteness, ranges,
+workspace, and checked arithmetic before effects. Host-checkable invalid input
+maps to `InvalidArgument`, arithmetic overflow to `Overflow`, and a recognized
+but unsupported leaf to `Unsupported` only after earlier validation.
+In particular, an odd `D` for RoPE is `InvalidArgument`.
+Pre-acceptance resource or runtime failures use the established OID error
+categories. A pre-submit failure mutates no output, registers no owner, and
+consumes no sequence. Each operation snapshots required metadata without
+retaining borrowed views. Once accepted, a positive OID is never replaced by a
+negative result: completion failure is retained and rethrown on every wait.
+
+Future delivery order is contract, independent reference, and all-five
+feasibility, followed by CPU, CUDA, ROCm, SYCL, and TTNN closure for RoPE; only
+then does cache append follow the same sequence. Each operation's five-backend
+gate MUST close before the next operation begins. CPU feasibility is scalar or
+wide arithmetic over existing tiled storage; this planned contract makes no
+native accelerator or profiler claim. The operation-specific RoPE and Cache
+row append siblings own detailed support, numerical, snapshot/hook, and
+conformance rules. Their shared regression coverage MUST extend the existing
+copy/storage suite and independent physical oracle for applicable payload
+leaves, transformed leading mappings, partial tiles and padding, aliases,
+overflow, accepted failures and repeat waits, and the `1/15/16/17` cases.
 
 ### 10. Backend integration and conformance obligations
 
