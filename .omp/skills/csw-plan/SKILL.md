@@ -19,9 +19,10 @@ For target `<target>`, resolve paths and metadata through `.omp/csw/bin/task_ctl
 - canonical task ID: `.cswd/tasks/<target>`;
 - parent specification: `task_ctl get '<task-id>' --spec`;
 - user remarks, optional: sibling `spec-fixme.md`;
-- generated children: `.cswd/tasks/<target>/<NN>-<task-slug>/spec.md`, with sibling `task.yml`.
+- generated children: `.cswd/tasks/<target>/<NN>-<task-slug>/spec.md`, with sibling `task.yml`;
+- final planning summary: `.cswd/tasks/<target>/summary.md`, beside the parent `spec.md`.
 
-`task.yml` is the only task metadata authority. Never read, create, edit, or parse it directly; use `task_ctl` for every metadata operation. `spec.md` contains the task contract, not control fields. The numeric directory prefix remains a human-readable order label; `order` in the control file is authoritative. The ordered directories plus the completion response remain the task list; do not create a TODO or index file.
+`task.yml` is the only task metadata authority. Never read, create, edit, or parse it directly; use `task_ctl` for every metadata operation. `spec.md` contains the task contract, not control fields. The numeric directory prefix remains a human-readable order label; `order` in the control file is authoritative. `summary.md` is a derived, human-readable planning report, not a metadata authority or lifecycle tracker. Do not create any additional TODO or index file.
 
 Below, `task_ctl` always means `.omp/csw/bin/task_ctl --repo '<project-root>'`; use that executable, not an assumed PATH installation. It requires Python 3 and PyYAML; its module docstring and `--help` contain the complete CLI contract.
 
@@ -61,7 +62,7 @@ Generate only the immediate children for this invocation, not a nested task tree
 - Do not invent functionality to make a task feel complete. Every requirement in every mini-spec must trace to the parent spec, the fixme remarks, a direct user instruction, or a repository constraint necessary to implement them correctly.
 - Do not split work merely to produce more tasks. If the specification is already one cohesive, leaf-ready unit, create one `impl` task in any mode.
 - Do not create tasks for work that is already complete and conforms to the specification.
-- Do not implement the change. The deliverables are task mini-specifications, their script-managed controls, and the concise ordered list in the completion response.
+- Do not implement the change. The deliverables are task mini-specifications, their script-managed controls, the parent-directory `summary.md`, and the concise ordered list in the completion response.
 
 ## Boss orchestration contract
 
@@ -144,7 +145,7 @@ Create a prerequisite refactor task only when the current structure makes the re
 
 Split independent outcomes, unrelated file groups, and different blockers when they form useful boundaries. In Implementation mode also split any candidate that fails leaf readiness; in Automatic or Design mode preserve a cohesive complex component as `hld` for later planning. Merge candidates when one only scaffolds another, neither is useful alone, or separating them duplicates substantial context.
 
-If no implementation work remains, create no task directories and report that the specification is already satisfied, with the repository evidence that supports that conclusion.
+If no implementation work remains, create no task directories and report that the specification is already satisfied, with the repository evidence that supports that conclusion. Still write the final `summary.md` described in stage 7, with an empty generated-task table and the supporting evidence; leave the parent status unchanged.
 
 ### 4. Build and prioritize the task graph
 
@@ -253,13 +254,30 @@ Before completing:
 - remove duplicated work, scaffolding-only tasks, speculative improvements, and optional extras;
 - confirm acceptance criteria collectively cover delivery of the parent specification and applicable fixme remarks, while distinguishing design completion from implemented behavior.
 
-After all generated children and their contracts pass the consistency check, run `task_ctl set '<parent-task-id>' --status planned`. Do not mark the parent planned when no children were generated or when generation remains incomplete. Planning never marks implementation done or satisfies a dependency.
+After all generated children and their contracts pass the consistency check, write or refresh `summary.md` beside the resolved parent `spec.md` as the final generated artifact. Summarize the effective task goal and scope, the generation mode and granularity rationale, and any material decisions, collisions, or residual risks. Include this table, with exactly one row per immediate child generated or revised by this invocation, in the verified script-returned order:
+
+```markdown
+# <Parent task title> — planning summary
+
+<Brief task goal, scope, effective mode, and decomposition rationale.>
+
+## Generated tasks
+
+| Order | Task | Type | Priority | Dependencies | Description |
+| --- | --- | --- | --- | --- | --- |
+| <order> | [<NN>-<task-slug>](<NN>-<task-slug>/spec.md) | <impl or hld> | <P0, P1, or P2> | <canonical blocker IDs and required outputs, or None> | <One-line outcome of this task.> |
+```
+
+Derive order, task IDs, types, priorities, and dependencies from the verified `task_ctl` output, and descriptions from the final mini-specs; never parse `task.yml` or invent new requirements for the summary. Preserve exact canonical blocker IDs, including external prerequisites, and summarize their required outputs from blocker remarks or the established dependency rationale. Link each task to its mini-spec relative to `summary.md`. Do not include unrelated existing children or ungenerated descendants. On a successful replan, refresh the summary to describe the current invocation rather than appending stale rows. When no work remains, retain the table headers without a placeholder task row and explain why no tasks were generated, with repository evidence.
+
+Verify that `summary.md` exists at the resolved target, its rows and dependencies match the verified generated set, its task links resolve, and its descriptions agree with the mini-spec outcomes. Do not publish a success summary for incomplete generation. Only after the generated children and summary pass these checks, run `task_ctl set '<parent-task-id>' --status planned`. Do not mark the parent planned when no children were generated or when generation remains incomplete. Planning never marks implementation done or satisfies a dependency.
 
 ## Completion response
 
 Report only:
 
 - the ordered task list with order, type, priority, directory path, and blockers;
+- the path to the generated `summary.md`;
 - one sentence explaining the effective mode and chosen granularity/type rationale, especially when the spec remained one task;
 - any material ambiguity, collision, or residual risk.
 

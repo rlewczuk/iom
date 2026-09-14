@@ -202,6 +202,56 @@ class TaskCtlTests(unittest.TestCase):
         self.assertEqual(cleared.returncode, 0, cleared.stderr)
         self.assertEqual(yaml.safe_load(cleared.stdout)["blocked-by"], [])
 
+    def test_cli_edits_repository_blockers_atomically(self) -> None:
+        control = self.repo / ".cswd/blockers.yml"
+        added = self.run_cli(
+            "blockers",
+            "--add",
+            "cuda-host-down",
+            "CUDA verification host is unavailable",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(
+            yaml.safe_load(added.stdout),
+            [
+                {
+                    "name": "cuda-host-down",
+                    "description": "CUDA verification host is unavailable",
+                }
+            ],
+        )
+        self.assertEqual(yaml.safe_load(control.read_text(encoding="utf-8")), yaml.safe_load(added.stdout))
+
+        second = self.run_cli(
+            "blockers",
+            "--add",
+            "missing-sdk",
+            "Required SDK is not installed",
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(
+            [item["name"] for item in yaml.safe_load(second.stdout)],
+            ["cuda-host-down", "missing-sdk"],
+        )
+
+        before = control.read_bytes()
+        duplicate = self.run_cli("blockers", "--add", "missing-sdk", "Different description")
+        self.assertEqual(duplicate.returncode, 2)
+        self.assertIn("blocker already exists", duplicate.stderr)
+        self.assertEqual(control.read_bytes(), before)
+
+        deleted = self.run_cli("blockers", "--del", "cuda-host-down")
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        self.assertEqual(
+            yaml.safe_load(deleted.stdout),
+            [{"name": "missing-sdk", "description": "Required SDK is not installed"}],
+        )
+        before = control.read_bytes()
+        missing = self.run_cli("blockers", "--del", "unknown")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("blocker not found", missing.stderr)
+        self.assertEqual(control.read_bytes(), before)
+
     def test_get_recreates_missing_control_only_for_task_directories(self) -> None:
         directory = self.make_dir("docs/changes/review/item")
         result = self.run_cli("get", "docs/changes/review/item", "--spec")

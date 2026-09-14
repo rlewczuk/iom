@@ -10,13 +10,14 @@ public API despite having no ``.py`` suffix::
 
 The public API is ``TaskCtlError``, ``task_dir(repo, task_id)``,
 ``get_task(repo, task_id)``, ``set_task(repo, task_id, updates,
-replace=False)``, ``list_tasks(repo, task_id, impl=False)``,
-``parse_config(text)``, ``detect_cycle(edges)``, and ``scan_tasks(repo,
-task_id)``. ``scan_tasks`` returns the same direct-child records as ``list_tasks``
-but represents a malformed child's control as ``{task-id: ..., error: ...}``,
-so execution can retain that blocker while continuing independent tasks.
-Container/path errors still raise. ``plan_tasks`` is also available for callers
-that want the CLI's mechanical planning operation.
+replace=False)``, ``edit_blockers(repo, add=None, delete=None)``,
+``list_tasks(repo, task_id, impl=False)``, ``parse_config(text)``,
+``detect_cycle(edges)``, and ``scan_tasks(repo, task_id)``. ``scan_tasks``
+returns the same direct-child records as ``list_tasks`` but represents a
+malformed child's control as ``{task-id: ..., error: ...}``, so execution can
+retain that blocker while continuing independent tasks. Container/path errors
+still raise. ``plan_tasks`` is also available for callers that want the CLI's
+mechanical planning operation.
 
 Schema
 ------
@@ -93,6 +94,13 @@ absent, only its immediate directory is created and only when its parent
 already exists; parent trees are never invented.  A directory that exists
 without a control is a new control.
 
+``blockers --add NAME DESCRIPTION`` and ``blockers --del NAME`` edit the
+repository-wide ``.cswd/blockers.yml`` list.  Each record has exactly ``name``
+and ``description``; both are nonempty strings and names are unique.  Add
+appends without replacing an existing name, delete requires the named blocker
+to exist, and both operations emit the resulting list as YAML.  The file is
+created atomically on the first successful add.
+
 Shell quoting examples::
 
     task_ctl --repo "$PWD" get docs/changes/parser/03-errors --status
@@ -103,6 +111,8 @@ Shell quoting examples::
       '[{task-id: .cswd/tasks/parser/01-contract}]'
     task_ctl set parser/leaf --all $'type: impl\nstatus: ready\nblocked-by: []'
     task_ctl set parser/leaf $'type: impl\nstatus: ready'
+    task_ctl blockers --add cuda-host-down "CUDA verification host is unavailable"
+    task_ctl blockers --del cuda-host-down
 
 Use flow-style YAML for option arguments that might otherwise begin with a
 hyphen.  For a positional block sequence, terminate option parsing explicitly,
@@ -170,6 +180,7 @@ import yaml
 
 ROOTS = (".cswd/tasks", "docs/changes")
 CONFIG_KEYS = ("type", "status", "order", "priority", "blocked-by", "source")
+BLOCKERS_FILE = ".cswd/blockers.yml"
 CONFIG_KEY_SET = frozenset(CONFIG_KEYS)
 TYPES = frozenset(("impl", "hld"))
 STATUSES = frozenset(("new", "critic", "planned", "ready", "verified", "done"))
@@ -457,6 +468,80 @@ def _atomic_write(path: Path, text: str, *, mode: int | None = None) -> None:
                 os.unlink(temporary)
             except OSError:
                 pass
+
+
+def _validate_blocker_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise TaskCtlError(f"{label} must be a nonempty string")
+    if value != value.strip():
+        raise TaskCtlError(f"{label} must not contain surrounding whitespace: {value!r}")
+    return value
+
+
+def _validate_blockers(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise TaskCtlError("blockers control must be a YAML list")
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise TaskCtlError(f"blockers[{index}] must be a mapping")
+        unknown = set(item) - {"name", "description"}
+        if unknown:
+            raise TaskCtlError(
+                f"blockers[{index}] has unknown key(s): {', '.join(sorted(map(str, unknown)))}"
+            )
+        missing = [key for key in ("name", "description") if key not in item]
+        if missing:
+            raise TaskCtlError(f"blockers[{index}] is missing key(s): {', '.join(missing)}")
+        name = _validate_blocker_text(item["name"], f"blockers[{index}].name")
+        description = _validate_blocker_text(
+            item["description"], f"blockers[{index}].description"
+        )
+        if name in seen:
+            raise TaskCtlError(f"blockers contains duplicate name: {name}")
+        seen.add(name)
+        result.append({"name": name, "description": description})
+    return result
+
+
+def _read_blockers(repo: Path) -> tuple[Path, list[dict[str, str]]]:
+    control = _resolved_inside(repo, BLOCKERS_FILE, "blockers control")
+    if not control.is_file():
+        if control.exists() or control.is_symlink():
+            raise TaskCtlError(f"blockers control is not a file: {control}")
+        return control, []
+    return control, _validate_blockers(
+        _load_yaml(_read_text(control, "blockers control"), "blockers control")
+    )
+
+
+def edit_blockers(
+    repo: Path,
+    *,
+    add: tuple[str, str] | None = None,
+    delete: str | None = None,
+) -> list[dict[str, str]]:
+    """Atomically add or delete one repository-wide named blocker."""
+    if (add is None) == (delete is None):
+        raise TaskCtlError("exactly one blocker add or delete operation is required")
+    root = _normalize_repo(repo)
+    control, blockers = _read_blockers(root)
+    if add is not None:
+        if not isinstance(add, tuple) or len(add) != 2:
+            raise TaskCtlError("add must be a (name, description) tuple")
+        record = _validate_blockers([{"name": add[0], "description": add[1]}])[0]
+        if any(item["name"] == record["name"] for item in blockers):
+            raise TaskCtlError(f"blocker already exists: {record['name']}")
+        blockers.append(record)
+    else:
+        name = _validate_blocker_text(delete, "blocker name")
+        updated = [item for item in blockers if item["name"] != name]
+        if len(updated) == len(blockers):
+            raise TaskCtlError(f"blocker not found: {name}")
+        blockers = updated
+    _atomic_write(control, _yaml_text(blockers))
+    return blockers
 
 
 def set_task(repo: Path, task_id: str, updates: dict[str, Any], replace: bool = False) -> dict[str, Any]:
@@ -888,6 +973,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=".", help="repository/worktree root (default: cwd)")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    blockers_parser = commands.add_parser("blockers", help="edit repository-wide blockers")
+    blocker_action = blockers_parser.add_mutually_exclusive_group(required=True)
+    blocker_action.add_argument(
+        "--add",
+        nargs=2,
+        metavar=("BLOCKER_NAME", "DESCRIPTION"),
+        help="append a named blocker and its description",
+    )
+    blocker_action.add_argument(
+        "--del",
+        dest="delete",
+        metavar="BLOCKER_NAME",
+        help="delete an existing named blocker",
+    )
+
     get_parser = commands.add_parser("get", help="read one control value or sibling spec path")
     get_parser.add_argument("task")
     get_selectors = get_parser.add_mutually_exclusive_group()
@@ -932,6 +1032,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo = Path(args.repo)
     try:
+        if args.command == "blockers":
+            add = tuple(args.add) if args.add is not None else None
+            _print_yaml(edit_blockers(repo, add=add, delete=args.delete))
+            return 0
         if args.command == "get":
             canonical = _cli_task_id(args.task)
             if args.selector == "spec":
