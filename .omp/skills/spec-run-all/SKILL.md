@@ -1,16 +1,16 @@
 ---
 name: spec-run-all
-description: Execute all eligible direct executable subtasks of docs/changes/<task-name> in continuous dependency-aware parallel execution, using spec-run-task's worktree and Git control plane.
+description: Execute all eligible direct implementation children under docs/changes continuously in dependency-aware parallel worktrees.
 hide: true
 ---
 
 # Spec Run All
 
-Run all unfinished **direct child** tasks below `docs/changes/<task-name>`. Read `skill://spec-run-task` first: this is an orchestration wrapper around that workflow, not a second implementation workflow. The target directory itself does not need a `spec.md`, and nested specifications are not enumerated as additional direct tasks. Run only the user's requested target; `01-review` is an example, not an implicit invocation.
+Run all unfinished **direct child** tasks below `docs/changes/<task-name>`. Read `skill://spec-run-task` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
 
-## Scope and mechanical control plane
+## Mechanical control plane
 
-The bundled script is the only source of truth for discovery, metadata, queueing, and preparation:
+Use only the bundled scripts and shared preflight:
 
 ```text
 python3 .omp/skills/spec-run-all/scripts/spec_run_all.py --repo <repo> --pretty scan <task-name>
@@ -20,84 +20,74 @@ python3 .omp/skills/spec-run-all/scripts/spec_run_all.py --repo <repo> --pretty 
 .omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-all --pretty
 ```
 
-Run the shared preflight exactly once per invocation, before the first `prepare`. It is the sole Git and OMP environment check: it records the integration checkout's Git identity and status, invokes `omp config list --json` and `omp models --json` from `<repo>`, reads only the workflow's two project-owned agent profiles, and returns deterministic JSON. Preserve that JSON verbatim. Exit status `0` means `ok: true`; exit status `2` is a concrete blocked outcome/final blocker and must not be bypassed. Do not inspect OMP configuration files, SQLite databases, or agent frontmatter, reconstruct Git state, or separately invoke `omp config`/`omp models` for this purpose.
+The script loads `task_ctl` through spec-run-task's public API. `task_ctl` alone discovers, validates, and orders direct canonical `task.yml` controls. The script does not parse task metadata from `spec.md` or `task.md`. It preserves task_ctl's numeric-order/canonical-ID order and never guesses basenames. PyYAML 6.0.3 is the supported runtime dependency used by `task_ctl`.
 
-`--state` is accepted only by `queue` and `prepare`. Use the integration checkout as `<repo>` and preserve the script's JSON values verbatim. Do not duplicate its directory, annotation, dependency, or status logic in instructions or ad-hoc shell/Python.
+Missing or malformed direct controls are retained as per-task blockers through `task_ctl.scan_tasks`; independent valid tasks continue. `task.md` contains only execution Outcome, Summary, Verification, and Errors evidence.
 
-`scan` reads metadata only. It does not require a clean Git checkout and returns `repo_root`, `target`, and alphabetically sorted `tasks[]`. Each task contains its child basename `name`, `task_path` relative to `docs/changes`, `spec_path`, `annotation_path`, `status`, `annotation_exists`, and raw `blocked_by`. Only immediate child directories containing `spec.md` are tasks. A parent `spec.md` is neither required nor executed.
+Run `csw_preflight` exactly once per invocation before the first `prepare`. Preserve its JSON verbatim. Exit `2` or `ok: false` is a concrete blocked result; never repeat or bypass its Git, OMP, profile, model, tool, spawn, or recursion validation.
 
-`queue` reads the same direct children and returns:
+`scan` returns immediate task children in task_ctl order. Valid records contain `name`, canonical `task_id`, relative `task_path`, exact spec/control/evidence paths, type, lifecycle status, order/priority, and canonical blocker records. Invalid controls retain the exact task identity and a concrete error instead of stopping sibling discovery. A missing spec is a blocker. A direct HLD/nested container is unsupported for this command.
 
-- `ready`: all eligible canonical names, alphabetically ordered, with no skill-imposed concurrency cap;
-- `waiting`: names and concrete dependency causes or retained `running`/`ready` outcomes awaiting owner completion or parent integration;
-- `blocked`: names and concrete nondependency or invalid-metadata reasons;
-- `already_done`: names whose canonical sibling `task.md` is done;
-- `finished`: true only when all discovered tasks are done (including an empty target); stalled or blocked work is not success.
+`queue` returns:
 
-`prepare` selects all currently eligible tasks, validates the integration control plane, and sequentially calls the existing `spec-run-task` `prepare_task` helper with `run_target=task_path` for each leaf. It creates or reuses each task's deterministic worktree/branch and returns `integration_branch`, `integration_head`, and `prepared[]`. Each prepared record includes the exact `prepare_task` output; use its opaque `worktree`, `spec_path`, `annotation_path`, branch, and task identifiers without deriving alternatives. A preparation error is retained as that leaf's blocked diagnostic while independent leaves remain reachable. If an immediate child has descendant `spec.md` files, treat it as an explicitly unsupported nested-container blocker for this command; do not silently run its container implementation or skip its descendants.
+- `ready`: every dependency-satisfied direct implementation child in `new`, `critic`, `planned`, or resumable `ready` state, with no skill concurrency cap;
+- `waiting`: lifecycle/dependency waits and retained running/ready owner outcomes;
+- `blocked`: invalid task inputs, unsupported containers, and failed/blocked execution outcomes;
+- `already_done`: direct tasks whose canonical integrated lifecycle is done;
+- `finished`: true only when all discovered direct tasks are done, including an empty target.
 
-`control` validates the integration checkout and returns its current `repo_root`, `integration_branch`, and `integration_head` without discovering tasks or preparing worktrees. It takes neither a target nor `--state`. Use it to refresh the head before each completed leaf's rebase/integration; never re-prepare a running or completed leaf merely to refresh the control plane.
+`prepare` provisions or reuses all currently ready worktrees and preserves independent preparation failures. `control` refreshes the validated integration branch/head without target discovery or preparation.
 
-## State file and dependency policy
+## Local invocation state
 
-Create one temporary state JSON outside the checkout and make the parent the only writer. Initialize it with `{}` (not an empty file), or use this structure:
+Create one parent-owned temporary JSON file outside the checkout, initialized to `{}`:
 
 ```json
 {
-  "dependencies": {"child-name": ["canonical-sibling-name"]},
-  "outcomes": {"child-name": {"status": "running|blocked|failed|ready", "reason": "nonempty explanation"}}
+  "dependencies": {
+    "child-name": ["docs/changes/target/other-child"]
+  },
+  "outcomes": {
+    "child-name": {
+      "status": "running|blocked|failed|ready",
+      "reason": "nonempty explanation"
+    }
+  }
 }
 ```
 
-Never store orchestration state in `docs/changes` or a task worktree. Preserve the state for the whole invocation and remove it only as ordinary temporary-file cleanup after the final report; never alter user files to do so.
+`dependencies` contains only supplemental semantic prerequisites and every value is an exact canonical `.cswd/tasks/...` or `docs/changes/...` ID. They augment, never erase, the canonical `blocked-by` records returned by task_ctl. Preserve actual prerequisites; missing canonical dependencies wait. Numeric order and priority are scheduling order, not dependencies.
 
-Dependency interpretation is conservative. The script accepts `None`, comma-separated names, backtick-quoted names, and explicit task paths, while preserving the raw field. External task paths are checked for completion but never added to the execution scope. Unsupported or ambiguous syntax fails closed until the parent interprets it: write an explicit `dependencies` entry with canonical sibling names, then rerun `queue`. Preserve every actual prerequisite; never replace an unresolved dependency with an empty list merely to unblock work. Missing dependencies remain waiting with the missing name. Only the dependency's canonical sibling `task.md` status `done` satisfies an edge; `ready`, a child claim, an existing commit, or an unintegrated branch does not.
+`outcomes` prevents duplicate dispatch/retry within this invocation. Record prepared leaves as running before dispatch. Change to ready only after the owner ends with a provisional commit; use failed for a concrete implementation/runtime failure and blocked for an external prerequisite. Running/ready suppress redispatch but never satisfy dependencies. Canonical integrated done overrides a stale local outcome.
 
-`outcomes` prevents duplicate dispatch and automatic retry. After preparation and before dispatch, record every selected leaf as `running`; retain that status through any debugger rescue or owner repair. Record a nonempty, concrete reason for every transition. Replace `running` with `ready` only when that owner and its debugger have ended and the task is awaiting parent verification/integration; use `failed` or `blocked` for concrete failures. Both `running` and `ready` suppress redispatch without satisfying dependencies. An outcome suppresses reattempt in this invocation unless the canonical task annotation is now `done` (for example, after the parent completes recovery); never loop on a failed leaf. Dependency cycles and stalled prerequisites are diagnosed by `queue`; continue independent work and report the cycle/stall separately from nondependency blockers.
+Only canonical `done` in the integration checkout unlocks an edge. Ready, verified, a private branch, child report, or existing commit does not. Failed/blocked/running are local execution outcomes, never lifecycle statuses.
 
-## Continuous dependency-aware orchestration
+## Continuous orchestration
 
-This section replaces spec-run-task's container-wave scheduling and global implementation barrier for this command only. Keep its assigned-worktree, single-task-commit, verification, rebase, and integration safety rules. Independent owners may keep implementing in their isolated worktrees while the parent verifies and integrates a completed leaf. Only the parent mutates the integration checkout, one leaf at a time.
+1. Run `scan`, create the outside-checkout state, and run `queue`. Do not parse, rewrite, or sort controls. Do not prepare an empty selection.
+2. Before any preparation or child dispatch, run the shared preflight exactly once. Stop on failure.
+3. Run `prepare`. Record preparation failures as blocked. Mark every successful prepared leaf running, then dispatch one task per record in returned order with `agent: "spec-run-all-implementer"`. Submit every eligible leaf, including a single leaf, without a skill-level cap. Harness admission limits may queue work; queued owners stay running and are never redispatched.
+4. Give each child exact `repo_root`, `task_id`, `task_path`, worktree/spec/control/evidence paths, feature branch/base, integration branch/head, exclusive scope, known interface contracts, and required verification. The child uses assigned-worktree mode, skips validation, and never integrates/rebases or edits task files directly.
+5. Consume individual owner completions continuously. Retain the owner/job identity and prepared record until settled. Record crashes/dispatch failures as failed, external prerequisites as blocked, and provisional success as ready. An owner may report implementation failure only after the required one-time `spec-run-debug` rescue attempt.
+6. As soon as one leaf is ready, serialize parent takeover for that leaf. Run `control`, rebase its one ready commit onto the current canonical head, and run focused plus repository-required combined verification in that exact worktree. Do not wait for unrelated owners. Route a recoverable failure back to the same owner after marking it running; preserve its worktree and one commit.
+7. After observed success, use spec-run-task `annotate --outcome verified` with exact evidence, `commit --status verified`, and `check --status verified`. Then call `integrate`. Do not write done yourself. `integrate` validates the historical verified control using `task_ctl.parse_config`, rebuilds the same task commit with task_ctl's verified-to-done update, rechecks the canonical head, and fast-forwards. Failure restores the private verified commit, so dependencies remain locked and no completion commit exists.
+8. Immediately after successful integration, rerun `queue` on the canonical tree, then prepare and dispatch **all** newly eligible children before processing another completion or waiting. If A integrates while B runs, start every direct child now unlocked by A; B is not a barrier. Rescan after every settled outcome. Stop only at `finished` or a true stall with no eligible, running/queued, or completed owner.
 
-1. Run `scan` once for target metadata, then initialize the outside-checkout state file and a parent-owned map of dispatched leaf names to agent/job identities and exact prepared records. Run `queue`. Interpret unresolved dependency fields into state where possible and rerun `queue`; never hand-sort or truncate `ready`. If `ready` is empty, finish only when `finished` is true; otherwise wait for active owners or process completed leaves before declaring a stall. Do not prepare an empty selection.
-2. Before any child starts or any leaf is prepared, invoke `.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-all --pretty` exactly once and preserve its JSON result verbatim. The helper validates Git state, both project profiles, exact `@implementer`/`@slow` requests, tools and spawn contracts, effective role-alias chains and model availability, overrides, `task.agentAdvisor`, `task.agentPrewalk`, `task.disabledAgents`, and recursion depth for root → implementer → debugger. If it exits `2` or returns `ok: false`, record the helper's concrete `errors` as one blocked outcome/final blocker and stop before `prepare`; never fall back or repeat any Git, OMP, model, or profile discovery. Only a successful `ok: true` result permits `prepare`.
-3. Run `prepare` with the current state. Record every preparation failure in `outcomes` as `blocked`, including failures without a worktree. Record all successfully prepared leaves as `running` before calling `task`, then submit one item per prepared leaf in alphabetical order, setting **`agent: "spec-run-all-implementer"`** on every item. This profile requests **`model: "@implementer"`**; do not substitute a generic agent or a prompt asking another model to act as an implementer. Dispatch all eligible leaves, including a single leaf, without a five-agent cap or fixed cohort. Respect actual harness admission limits without adding a skill-level limit: submit all eligible items, retain queued submissions as `running`, and never redispatch them. Disable automatic isolated-agent worktrees: the helper already prepared them.
-4. Pass each child the exact `repo_root`, prepared paths and task identity, integration branch/head, exclusive task scope, known cross-task interface contracts, and the stuck-implementation rescue contract below. The child must use assigned-worktree mode below. It must not delegate except to one `spec-run-debug` rescue agent when stuck, implement nested descendants, integrate, or perform validation.
-5. Drive a continuous event loop, consuming individual owner completions rather than waiting for all dispatched children. Keep each leaf's agent/job identity and prepared record until its outcome is settled. Record child runtime or dispatch failures as `failed`, external prerequisites as `blocked`, and provisional successes as `ready`. Wait only for that leaf's owner and any debugger it invokes to end before taking over its worktree. An owner about to report an implementation failure must first complete the required debugger rescue; crashes and dispatch failures remain concrete runtime failures. Retain reasons, debugger findings when used, and returned worktree/commit evidence. An empty `ready` list is not a stall while any owner is queued/running or any completed leaf awaits parent processing.
-6. As soon as a leaf becomes `ready`, the parent runs `control` to refresh the validated integration branch/head, rebases that leaf's finalized task commit onto the current head with spec-run-task's helper, then performs focused and repository-required combined verification in that exact prepared worktree. Do not wait for unrelated owners. Serialize parent verification/integration and use isolated build/runtime resources so it cannot touch live owners' worktrees. Resolve conflicts only in the named worktree through `continue-rebase`, rerunning affected checks. Attribute failures to that leaf; retain failed or blocked work without integrating it. If returning a recoverable failure to the same owner, set `running` before the handoff and do not inspect, verify, or mutate its worktree until it returns. Never automatically redispatch failed work through `queue`.
-7. After observed focused and combined success, the parent uses the helper to `annotate --status done` with grounded evidence, `commit --status done`, `check --status done`, and `integrate` that single leaf. This is a one-leaf integration unit, not a train that waits for unfinished siblings. If the integration head advanced, refresh it through `control`, rebase and rerun affected focused/combined verification, update evidence, and retry through the helper. Never use the head captured at dispatch as the current integration head. Do not use `spec-run-task inspect` for this orchestration target (it requires a root spec and can misresolve a selected leaf), re-prepare active leaves, or run direct Git mutation commands. No container rollup is created unless the actual specifications and existing helper ownership require one.
-8. Immediately after each successful integration, rerun `queue` against the canonical tree and current state, then `prepare` and dispatch **all** newly eligible leaves before processing another completed leaf or waiting for another owner. For example, if A is integrated while unrelated B is still running, start both X and Y that depend on A immediately; B is neither a barrier nor eligible for redispatch. Also rescan eligibility after any other settled outcome. Continue consuming individual completions and refilling until `finished`, or until there are no eligible tasks, queued/running owners, or completed leaves left to process; only then report the remaining blockers.
+If the integration head advances before integration, refresh through `control`, rebase, rerun affected verification, update evidence, and retry. Never use the head captured at dispatch. Never reprepare active work merely to refresh control state.
 
-The parent must observe canonical `task.md` status `done` after integration before scheduling dependents. A child claim, a `done` annotation in an unintegrated worktree, or an existing branch does not unlock an edge. If verification, rebase, integration, or dispatch failure cannot be recovered, retain it in state and continue independent work; descendants remain dependency-waiting. Never wait for unrelated owners merely to form a verification, integration, or dispatch batch.
+## Child ownership and rescue
 
-## Child brief and existing worktree behavior
+The assigned child reads `skill://spec-run-task`, calls `show` first, works only in its exact worktree, reads complete requirements, implements the leaf, and uses:
 
-The child receives the exact `repo_root`, `worktree`, `task_path`, `spec_path`, `annotation_path`, feature branch, integration branch/head, exclusive task scope, and known interface contracts. It reads `skill://spec-run-task` explicitly and follows section 4's assigned-worktree child mode, including its stuck-implementation escalation. Invoke the existing helper with `--repo '<repo_root>'` from the assigned worktree; never reinterpret that worktree as the integration checkout:
+```text
+spec_run_task.py ... annotate '<task_path>' --outcome ready --summary '<summary>'
+spec_run_task.py ... commit '<task_path>' --status ready --outcome '<behavior>'
+```
 
-- use `show` first and work only under the exact prepared worktree;
-- read the complete spec, applicable repository guidance, relevant source, and skills;
-- implement the complete leaf and include owned artifacts/annotation in the same task commit;
-- skip builds, tests, linters, formatters, and all validation during the parallel pass;
-- use the helper's `annotate --status ready` and `commit --status ready --outcome ...` operations;
-- never use direct Git mutation, manually edit `task.md`, integrate, or rebase; never delegate or run a nested task except for the one permitted `spec-run-debug` rescue when stuck;
-- return the helper commit, changed paths, retained risks, and verification still required.
+It skips builds/tests/linters/formatters during the parallel pass and reports exact parent verification still required. It never directly edits `task.yml` or `task.md`, mutates Git, integrates, rebases, expands nested tasks, or delegates except to one `spec-run-debug` when genuinely stuck.
 
-An existing registered worktree is resumable state. The child must inspect `show` and preserve coherent owned changes; it must not stash, clean, recreate, or overwrite uncertain state. Helper checkpoint/annotate/commit operations are allowed and required where applicable. The child agent profile intentionally permits these helper invocations; the generic builder prohibition on commits is not inherited here.
-
-### Stuck implementation rescue
-
-When an `@implementer` owner is stuck and would otherwise give up or return `failed`, it must invoke exactly one task with `agent: "spec-run-debug"` and wait for the result. It supplies the exact assigned worktree/specification, task scope and constraints, current changes, concrete error or dead end, observations, and attempted approaches. It does not request an isolated worktree. The `@slow` debugger performs read-only root-cause analysis and returns evidence plus a proposed solution directly to that owner; it does not edit, annotate, commit, validate, rebase, integrate, or delegate.
-
-The same `@implementer` owner then resumes implementation and owns every edit and judgment. It may give up only after attempting the proposed solution or rejecting it with concrete evidence. Do not spawn the debugger for ordinary planning, review, parent-owned verification, or an external prerequisite, and do not repeat the rescue for a leaf. A missing or incompatible debugger profile/model is a concrete retained dispatch failure, not permission to substitute another agent.
+The debugger receives exact worktree/spec paths, constraints, current changes, error/dead end, observations, and attempted approaches. It is read-only and returns root cause evidence plus a concrete proposal to the same owner. The owner retains all implementation decisions and edits.
 
 ## Reporting
 
-The final report must separately list, with concrete reasons:
-
-- already done;
-- done and integrated (including integrated commit and observed verification);
-- failed (runtime or verification failure, with retained outcome);
-- nondependency blocked (invalid metadata, unsupported nested container, unavailable profile/model, preparation/rebase/train/integration failure, or other concrete prerequisite);
-- dependency waiting (the exact unresolved sibling, cycle, or stalled cause).
-
-Report only observed results. Do not call work complete when `finished` is false or any task remains blocked/waiting. Include the target, integration branch/head as returned by helpers, prepared worktrees/commits for attempted leaves, and residual risks. Validation/build/lint/test/formatter commands are intentionally skipped by child owners; the parent runs the focused and combined verification demanded by spec-run-task in each completed leaf's worktree before integrating it, without a global implementation barrier.
+Report separately: already done; done and integrated with final rewritten commit and observed verification; failed with retained local outcome; nondependency blocked; and dependency waiting with exact canonical cause. Include target, integration branch/head, prepared worktrees/commits, and residual risk. `finished: false` is not completion.

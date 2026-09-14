@@ -19,6 +19,10 @@ Before any repository work, read `skill://boss` first. Then read `.omp/cpp-revie
 
 A request such as “find redundant code,” “remove overengineering,” or “simplify backend architecture” is a valid standalone invocation. In selected-commit mode, only accept complexity introduced or materially worsened/exposed by that commit.
 
+## Task metadata
+
+When a destination is supplied, task lifecycle controls belong exclusively to task_ctl-managed `task.yml`: generated remediation records use `type: impl`, `status: new`, assigned `order`, P0–P2 `priority`, canonical `blocked-by` IDs, and the parent `spec.md` as `source`. Use `.omp/csw/bin/task_ctl` CLI/API (`task_dir`, `get_task`, `set_task`, `list_tasks`) for paths, ordering, metadata, and dependencies; never parse or hand-write YAML. Keep all review evidence in `spec.md`.
+
 ## Boss routing for this area
 
 Follow the canonical review process rather than restating it. The standalone invocation is owned by the running root under Boss's root-model consent policy, which resolves scope, accepts candidates, freezes the assignment table, and invokes synthesis; the orchestrated invocation is a candidate-only `boss-reviewer` leaf at `@task`. Neither mode may claim an already-running model was switched, and the leaf may not delegate, recurse, write tasks, or broaden discovery.

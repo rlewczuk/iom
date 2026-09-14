@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Validate remediation task specs emitted directly by cpp-inference review skills."""
+"""Validate remediation evidence and task_ctl lifecycle metadata."""
 
 from __future__ import annotations
 
 import argparse
 import re
+import runpy
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 
 TASK_DIR_RE = re.compile(r"^(\d+)-((?:CC|ST|AR|NT|PF)-\d{3})-[a-z0-9]+(?:-[a-z0-9]+)*$")
-FIELD_RE = re.compile(r"^\*\*(?P<name>[^*]+):\*\*\s*(?P<value>.*)$", re.M)
-REQUIRED_FIELDS = [
-    "Order",
-    "Priority",
-    "Blocked by",
-    "Review source",
+EVIDENCE_FIELDS = [
     "Finding",
     "Review area",
     "Review severity",
@@ -23,7 +20,15 @@ REQUIRED_FIELDS = [
     "Review scope",
     "Backend scope",
     "Location",
+    "Review source",
 ]
+FORBIDDEN_METADATA_FIELDS = {
+    "Order",
+    "Type",
+    "Priority",
+    "Blocked by",
+    "Source",
+}
 REQUIRED_SECTIONS = [
     "## Outcome",
     "## Current problem",
@@ -36,17 +41,44 @@ REQUIRED_SECTIONS = [
 ]
 
 
-
-
 def parse_fields(text: str) -> dict[str, str]:
-    return {match.group("name"): match.group("value").strip() for match in FIELD_RE.finditer(text)}
+    field_re = re.compile(r"^\*\*(?P<name>[^*]+):\*\*\s*(?P<value>.*)$", re.M)
+    return {match.group("name"): match.group("value").strip() for match in field_re.finditer(text)}
 
 
-def validate_task(path: Path, spec_dir: Path) -> tuple[list[str], int | None, str | None, list[str]]:
+def task_api(repo: Path) -> tuple[Callable[..., dict[str, Any]], Callable[..., list[dict[str, Any]]]]:
+    try:
+        helper_root = Path(__file__).resolve().parents[3]
+        namespace = runpy.run_path(
+            str(helper_root / ".omp" / "csw" / "bin" / "task_ctl"),
+            run_name="task_ctl_validator",
+        )
+        return namespace["get_task"], namespace["list_tasks"]
+    except (OSError, KeyError, RuntimeError) as exc:
+        raise RuntimeError(f"unable to load task_ctl API: {exc}") from exc
+
+
+def repo_root_for_spec(spec_dir: Path) -> Path:
+    for parent in (spec_dir, *spec_dir.parents):
+        if parent.name == "changes" and parent.parent.name == "docs":
+            return parent.parent.parent
+    raise RuntimeError("spec-dir must be beneath docs/changes/")
+
+
+def canonical_task_id(repo: Path, path: Path) -> str:
+    return path.resolve().relative_to(repo.resolve()).as_posix()
+
+
+def validate_task(
+    path: Path,
+    spec_dir: Path,
+    repo: Path,
+    get_task: Callable[..., dict[str, Any]],
+) -> tuple[list[str], int | None, str | None, dict[str, Any] | None]:
     errors: list[str] = []
     resolved = path.resolve()
     if not resolved.is_file():
-        return [f"file not found: {path}"], None, None, []
+        return [f"file not found: {path}"], None, None, None
     if resolved.name != "spec.md" or resolved.parent.parent != spec_dir:
         errors.append("task-file must be <spec-dir>/<task-directory>/spec.md")
 
@@ -67,9 +99,12 @@ def validate_task(path: Path, spec_dir: Path) -> tuple[list[str], int | None, st
     if not text.startswith("# "):
         errors.append("missing action-oriented level-one title")
     fields = parse_fields(text)
-    for field in REQUIRED_FIELDS:
+    for field in EVIDENCE_FIELDS:
         if not fields.get(field):
             errors.append(f"missing field: {field}")
+    for field in FORBIDDEN_METADATA_FIELDS:
+        if field in fields:
+            errors.append(f"lifecycle metadata must be stored in task.yml, not spec.md: {field}")
 
     last = -1
     for section in REQUIRED_SECTIONS:
@@ -89,20 +124,11 @@ def validate_task(path: Path, spec_dir: Path) -> tuple[list[str], int | None, st
     if verification_start >= 0 and not re.search(r"^- `[^`\n]+`", text[verification_start:], re.M):
         errors.append("Verification must contain a focused command")
 
-    order_value = fields.get("Order", "")
-    if not order_value.isdigit():
-        errors.append("Order must be a numeric value for a written task")
-    elif directory_order is not None and int(order_value) != directory_order:
-        errors.append(f"Order {order_value} does not match directory prefix {directory_order}")
-
     finding = fields.get("Finding", "").strip("`")
     if not re.fullmatch(r"(?:CC|ST|AR|NT|PF)-\d{3}", finding):
         errors.append(f"invalid Finding value: {fields.get('Finding', '')}")
     elif directory_id is not None and finding != directory_id:
         errors.append(f"Finding {finding} does not match directory ID {directory_id}")
-
-    if not re.match(r"P[012]\b", fields.get("Priority", "")):
-        errors.append("Priority must start with P0, P1, or P2")
     if fields.get("Review severity") not in {"critical", "high", "medium", "low"}:
         errors.append("Review severity must be critical, high, medium, or low")
     verification = fields.get("Review verification", "")
@@ -118,9 +144,44 @@ def validate_task(path: Path, spec_dir: Path) -> tuple[list[str], int | None, st
     }:
         errors.append("invalid Review scope value")
 
-    blockers_value = fields.get("Blocked by", "")
-    blockers = [] if blockers_value == "None" else [value.strip(" `") for value in blockers_value.split(",") if value.strip()]
-    return errors, directory_order, directory_id, blockers
+    metadata: dict[str, Any] | None = None
+    if resolved.parent.parent == spec_dir:
+        try:
+            metadata = get_task(repo, canonical_task_id(repo, resolved.parent))
+        except Exception as exc:  # task_ctl owns the precise fail-closed diagnostic
+            errors.append(f"task_ctl metadata error: {exc}")
+    if metadata is not None:
+        if metadata.get("type") != "impl":
+            errors.append(f"task type must be impl, got {metadata.get('type', '')!r}")
+        if metadata.get("status") != "new":
+            errors.append(f"generated task status must be new, got {metadata.get('status', '')!r}")
+        order = metadata.get("order")
+        if not isinstance(order, int) or isinstance(order, bool):
+            errors.append("task_ctl order must be numeric for a written task")
+        elif directory_order is not None and order != directory_order:
+            errors.append(f"task_ctl order {order} does not match directory prefix {directory_order}")
+        priority = metadata.get("priority")
+        if not isinstance(priority, str) or not re.fullmatch(r"P[012]", priority):
+            errors.append("task_ctl priority must be P0, P1, or P2")
+        source = metadata.get("source")
+        expected_source = (spec_dir.relative_to(repo).as_posix() + "/spec.md")
+        if source != expected_source:
+            errors.append(f"task source must be parent spec.md: {expected_source}")
+        blocked = metadata.get("blocked-by", [])
+        if blocked is None:
+            blocked = []
+        if not isinstance(blocked, list):
+            errors.append("task_ctl blocked-by must be a list of dependency records")
+            blocker_ids: list[str] = []
+        else:
+            blocker_ids = []
+            for record in blocked:
+                if not isinstance(record, dict) or not isinstance(record.get("task-id"), str):
+                    errors.append("task_ctl blocked-by entries must contain canonical task-id records")
+                    continue
+                blocker_ids.append(record["task-id"])
+            metadata["_blocker-ids"] = blocker_ids
+    return errors, directory_order, directory_id, metadata
 
 
 def main() -> int:
@@ -131,17 +192,20 @@ def main() -> int:
 
     spec_dir = Path(args.spec_dir).resolve()
     errors: list[str] = []
-    parts = spec_dir.parts
     try:
-        docs_index = parts.index("docs")
-    except ValueError:
-        docs_index = -1
-    if docs_index < 0 or docs_index + 1 >= len(parts) or parts[docs_index + 1] != "changes":
-        errors.append("spec-dir must be beneath docs/changes/")
+        repo = repo_root_for_spec(spec_dir)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        repo = spec_dir
     if not spec_dir.is_dir():
         errors.append(f"spec-dir not found: {spec_dir}")
+    try:
+        get_task, list_tasks = task_api(repo)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        get_task = list_tasks = None  # type: ignore[assignment]
 
-    records = []
+    records: list[tuple[Path, int | None, str | None, dict[str, Any] | None]] = []
     seen_paths: set[Path] = set()
     for supplied in args.task_file:
         path = Path(supplied).resolve()
@@ -149,11 +213,32 @@ def main() -> int:
             errors.append(f"duplicate --task-file: {supplied}")
             continue
         seen_paths.add(path)
-        task_errors, order, finding, blockers = validate_task(path, spec_dir)
+        if get_task is None:
+            task_errors, order, finding, metadata = (["task_ctl API unavailable"], None, None, None)
+        else:
+            task_errors, order, finding, metadata = validate_task(path, spec_dir, repo, get_task)
         errors.extend(f"{path}: {error}" for error in task_errors)
-        records.append((path, order, finding, blockers))
+        records.append((path, order, finding, metadata))
 
-    numeric_orders = sorted(order for _, order, _, _ in records if order is not None)
+    all_task_records: list[dict[str, Any]] = []
+    known_task_ids: set[str] = set()
+    if list_tasks is not None and spec_dir.is_dir():
+        try:
+            parent_id = spec_dir.relative_to(repo).as_posix()
+            all_task_records = list_tasks(repo, parent_id, impl=False)
+            known_task_ids = {
+                record["task-id"]
+                for record in all_task_records
+                if isinstance(record.get("task-id"), str)
+            }
+        except Exception as exc:
+            errors.append(f"task_ctl list error: {exc}")
+
+    numeric_orders = sorted(
+        metadata["order"]
+        for _, _, _, metadata in records
+        if metadata and isinstance(metadata.get("order"), int) and not isinstance(metadata.get("order"), bool)
+    )
     if len(numeric_orders) != len(set(numeric_orders)):
         errors.append("generated task orders must be unique")
     if numeric_orders and numeric_orders != list(range(numeric_orders[0], numeric_orders[0] + len(numeric_orders))):
@@ -163,33 +248,57 @@ def main() -> int:
     if len(findings) != len(set(findings)):
         errors.append("generated task finding IDs must be unique")
 
-    known_dirs = {child.name for child in spec_dir.iterdir() if child.is_dir()} if spec_dir.is_dir() else set()
+    existing_dirs = {child.name for child in spec_dir.iterdir() if child.is_dir()} if spec_dir.is_dir() else set()
     generated_dirs = {path.parent.name for path, _, _, _ in records}
     prior_prefixes = []
-    for directory in known_dirs - generated_dirs:
+    for directory in existing_dirs - generated_dirs:
         match = re.match(r"^(\d+)-", directory)
         if match:
             prior_prefixes.append(match.group(1))
+    generated_ids = {
+        canonical_task_id(repo, path.parent)
+        for path, _, _, _ in records
+        if path.parent.parent == spec_dir
+    }
+    prior_metadata_orders = [
+        record["order"]
+        for record in all_task_records
+        if record.get("task-id") not in generated_ids
+        and isinstance(record.get("order"), int)
+        and not isinstance(record.get("order"), bool)
+    ]
     if numeric_orders:
-        prior_maximum = max((int(prefix) for prefix in prior_prefixes), default=0)
+        prior_maximum = max(
+            max((int(prefix) for prefix in prior_prefixes), default=0),
+            max(prior_metadata_orders, default=0),
+        )
         if numeric_orders[0] != prior_maximum + 1:
             errors.append(f"generated task orders must start at {prior_maximum + 1}")
-        required_width = max(2, len(str(numeric_orders[-1])), *(len(prefix) for prefix in prior_prefixes))
-        for path, _, _, _ in records:
-            if len(path.parent.name.split("-", 1)[0]) < required_width:
+        required_width = max(
+            2,
+            len(str(numeric_orders[-1])),
+            *(len(prefix) for prefix in prior_prefixes),
+            *(len(str(order)) for order in prior_metadata_orders),
+        )
+        for path, _, _, metadata in records:
+            if metadata and len(path.parent.name.split("-", 1)[0]) < required_width:
                 errors.append(f"{path}: task order prefix must use width {required_width}")
 
-    order_by_dir = {path.parent.name: order for path, order, _, _ in records if order is not None}
-    for path, order, _, blockers in records:
-        for blocker in blockers:
-            if blocker not in known_dirs:
-                errors.append(f"{path}: blocker does not name a task directory: {blocker}")
+    for path, order, _, metadata in records:
+        if not metadata:
+            continue
+        for blocker in metadata.get("_blocker-ids", []):
+            if blocker not in known_task_ids:
+                errors.append(f"{path}: blocker does not name a canonical task: {blocker}")
                 continue
-            blocker_match = re.match(r"^(\d+)-", blocker)
-            if order is not None and blocker_match and int(blocker_match.group(1)) >= order:
+            blocker_order = None
+            try:
+                blocker_record = get_task(repo, blocker) if get_task is not None else {}
+                blocker_order = blocker_record.get("order")
+            except Exception as exc:
+                errors.append(f"{path}: unable to read blocker {blocker}: {exc}")
+            if isinstance(order, int) and isinstance(blocker_order, int) and blocker_order >= order:
                 errors.append(f"{path}: blocker must point to an earlier task: {blocker}")
-            if blocker in order_by_dir and order is not None and order_by_dir[blocker] >= order:
-                errors.append(f"{path}: generated blocker edge points forward: {blocker}")
 
     if errors:
         for error in errors:

@@ -43,6 +43,10 @@ Shared guidance is under `.omp/cpp-review/references/`, backend checklists are u
 14. Do not modify implementation files or existing specifications during a review. Only create new remediation task specifications when a destination specification directory is supplied.
 15. Workers are read-only evidence gatherers or bounded packet drafters. They never run verification gates; the root runs actual verification after collection and records what ran.
 
+## Task metadata
+
+Task lifecycle controls are canonical in task_ctl-managed `task.yml`, never in generated `spec.md`: remediation records use `type: impl`, `status: new`, assigned `order`, P0–P2 `priority`, canonical `blocked-by` IDs, and the supplied parent `spec.md` as `source`. The root and all drafting agents use `.omp/csw/bin/task_ctl` CLI/API (`task_dir`, `get_task`, `set_task`, `list_tasks`) for paths, ordering, metadata, and dependencies; they do not hand-write YAML or infer controls from prose. Review-specific evidence headers remain in `spec.md`.
+
 ## Root and worker routing
 
 The root session, preferably running as `@slow` under Boss's consent policy, owns scope resolution, one shared reconnaissance map, invariant decisions, routing, candidate acceptance, the final assignment table, task materialization, generated-set validation, and the final response. It does not broad-scan the source or ingest unbounded raw logs.

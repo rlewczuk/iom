@@ -1,77 +1,59 @@
 ---
 name: spec-run-task
-description: Implement one change task or its unfinished leaf subtasks from docs/changes in isolated reusable worktrees, using the bundled deterministic helper for discovery, paths, annotations, Git history, rebases, and fast-forward integration. Use only through /spec-run-task <change-name>[/subpath] or when explicitly requested.
+description: Implement one docs/changes task or its unfinished implementation descendants in isolated reusable worktrees, using task_ctl-backed lifecycle controls and deterministic Git integration.
 hide: true
 ---
 
 # Spec Run Task
 
-Implement the requested specification completely. Each executable leaf owns one deterministic feature branch, one registered worktree under `.work/`, one sibling `task.md`, and exactly one final task commit. A target with descendant specifications is a container: execute its unfinished leaf specifications, never the container's own implementation.
+Implement the requested specification completely. Each executable implementation task owns one deterministic feature branch, one registered worktree under `.work/`, sibling `spec.md`, `task.yml`, and `task.md`, and exactly one final task commit. A target with implementation descendants is a container: execute those leaves, never the container as implementation.
 
-## Mandatory mechanical control plane
+## Mandatory control plane
 
-Use the bundled helper for every repeatable path, annotation, worktree, and Git-history operation:
+Use the bundled helper for every repeatable task, evidence, worktree, and Git-history operation:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo <integration-checkout> --pretty <command> ...
 ```
 
-The script is authoritative for:
+The helper loads `.omp/csw/bin/task_ctl` through its public `runpy.run_path` API. `task_ctl` alone discovers and validates canonical task metadata in `task.yml`: type, lifecycle status, numeric order, priority, canonical `blocked-by` records, and source. The helper owns execution evidence in `task.md`, local worktree state, and Git mechanics. PyYAML is therefore a runtime dependency of `task_ctl`; the supported environment provides PyYAML 6.0.3.
 
-- validating the invocation, repository, named integration branch, clean checkout, and ignored `.work/`;
-- resolving `spec.md`, sibling `task.md`, executable leaves, statuses, explicit blockers, dependency cycles, feature branches, and worktree paths;
-- creating or conservatively reusing worktrees and persisting each task's exact replay base in its Git administrative directory;
-- reporting reusable worktree state;
-- writing annotations at computed sibling paths while preserving unrelated sections;
-- checkpointing dirty reusable state, consolidating all owned work into one task commit, rebasing that commit, validating it, and fast-forwarding the integration branch.
+Never read metadata from Markdown. Never parse, sort, create, or edit `task.yml` yourself, and never ask a child agent to do so. Use helper JSON in its returned order. `task.md` is implementation evidence only: `**Outcome:**`, Summary, Verification, and Errors are not lifecycle metadata.
 
-Do not replace a failed helper operation with hand-written Git plumbing or a manually reconstructed path. Correct the reported input or owned file state, then rerun the helper. In particular, never directly run `git worktree add`, `git add`, `git commit`, `git reset`, `git rebase`, `git merge`, or `git update-ref` for this workflow. Never manually create or edit a `task.md`; use `annotate`.
+Missing or malformed `task.yml` is a hard error.
 
-The model remains responsible only for work that requires judgment: reading specifications and source, adding genuine semantic dependency edges, implementing behavior, running verification, attributing failures, and resolving the contents of rebase-conflicted files. The helper stages conflict resolutions and continues the rebase.
+Do not replace a failed helper operation with hand-written Git plumbing or reconstructed paths. Never directly run `git worktree add`, `git add`, `git commit`, `git reset`, `git rebase`, `git merge`, or `git update-ref`. The helper is authoritative for prepare/reuse, checkpoint, one-commit consolidation, rebase conflict continuation, historical control validation, verified-to-done finalization, and fast-forward integration.
 
-Exit status `2` means a validation or safety invariant failed. Exit status `3` means a rebase stopped for conflicts; resolve only the named files in the owning worktree and invoke `continue-rebase`.
+Exit status `2` is a validation or safety failure. Exit status `3` is a helper-managed rebase conflict; resolve only the named files in the owning worktree and call `continue-rebase`.
 
 ## Invariants
 
-- The integration checkout is a read-only control plane. Use it only to invoke the helper and for read-only discovery. Never edit, build, test, format, or run task code there.
-- Capture the integration branch and head from `inspect`. Every later path, branch, worktree, and commit identifier comes from helper JSON; do not derive substitutes.
-- All task Read, Edit, Write, and LSP paths use the exact worktree-prefixed paths returned by `prepare`. Every task Bash command sets `cwd` to that worktree.
-- The exact feature branch is `run-task/<path-components-joined-by-->`; the exact worktree is `.work/<task-path>`. The helper validates rather than slugifies invalid components.
-- Reuse registered state. Never stash, clean, remove, or recreate an existing task worktree or branch.
-- Each attempted leaf retains exactly one final non-merge commit with subject `spec-run-task(<full-task-path>): <outcome>`. Failed and blocked attempts also retain their state in that one commit, but are not integrated.
-- Rebase task commits; never merge branches together. The integration checkout advances only through the helper's verified fast-forward.
-- Only `done` is complete. `ready` means implementation and focused evidence may exist but combined verification or integration is pending.
-- Do not integrate failed, blocked, partial, dirty, conflicted, or unverified work.
-- Keep worktrees and feature branches after completion as resumable task state.
-- Treat repository guidance and applicable change specifications as acceptance criteria. Read any additionally applicable skill before implementation or verification, including `remote-development` for accelerator work.
+- The integration checkout is the canonical control plane. Do not edit, build, test, format, or run task code there.
+- Only canonical `done` in the integrated tree satisfies a dependency. Missing dependencies wait. `ready`, `verified`, a child claim, or a private branch never unlocks an edge.
+- Lifecycle values are `new`, `critic`, `planned`, `ready`, `verified`, and `done`. `running`, `failed`, and `blocked` are execution outcomes only.
+- Execution can start from `new`, `critic`, or `planned`, or resume from `ready`, once blockers are done. Successful implementation advances to `ready`; observed verification advances to `verified`; only `integrate` may advance it to `done`.
+- Failed and blocked attempts retain evidence and their one task commit without changing the current lifecycle; they are never integrated and never satisfy dependencies.
+- Each attempted leaf retains exactly one non-merge commit with subject `spec-run-task(<full-task-path>): <outcome>`.
+- Rebase task commits; never merge task branches. Keep worktrees and feature branches as resumable state.
+- Reuse registered state. Never stash, clean, remove, or recreate an existing task worktree.
 
-## 1. Inspect the requested target
+## 1. Inspect
 
-Require exactly one target argument relative to `docs/changes/`, then run:
+Require one target relative to `docs/changes/`, then run before reading task contents or preparing worktrees:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo . --pretty inspect '<target>'
 ```
 
-Do this before reading task contents or provisioning worktrees. The helper rejects absolute paths, file names, traversal, malformed annotations or blockers, detached or dirty integration checkouts, unsafe branch components, unignored `.work/`, missing specs, and explicit dependency cycles.
+`inspect` requires canonical controls, uses task types to distinguish an implementation leaf from a container, recursively discovers through the `task_ctl` API, preserves its numeric-order/canonical-ID ordering, resolves exact canonical blockers, detects selected dependency cycles, and validates the integration checkout.
 
-Use these JSON fields verbatim:
+Use `repo_root`, `integration_branch`, `integration_head`, `requested_target`, `target_kind`, target paths, and every `leaves[]` path and identifier verbatim. Each leaf includes `task_id`, `task_path`, `spec_path`, `control_path`, evidence path, exact worktree paths, branch, lifecycle status, canonical blocker records, and `explicitly_ready`.
 
-- `repo_root`, `integration_branch`, and `integration_head` identify the control plane;
-- `requested_target`, `target_kind`, `target_spec_path`, and `target_annotation_path` identify the request;
-- each `leaves[]` record supplies `task_path`, source paths, exact worktree paths, feature branch, status, resolved blockers, and `explicitly_ready`.
+If the target is a leaf, the main agent implements it. For a container, schedule every unfinished implementation leaf whose `explicitly_ready` is true. Skip only lifecycle `done`. A missing dependency remains waiting; only its canonical integrated `done` status satisfies it. Numeric order and priority are scheduling order, never inferred dependencies. Do not add an LLM-side sort or parse controls.
 
-If `target_kind` is `leaf`, the main agent owns and implements it on the current session model; do not replace it with the `spec-run-all` implementer profile or another model-routed implementation agent. If it is `container`, the main agent orchestrates general-purpose subagents, one owner per ready leaf. Skip a leaf only when its sibling annotation status is `done`.
+## 2. Prepare
 
-## 2. Complete the dependency graph
-
-The helper resolves the mechanical graph from `**Blocked by:**` fields. Read every unfinished executable leaf spec from the returned `spec_path` before provisioning. Add a semantic edge only when a leaf consumes an interface, artifact, migration, or repository state produced by another leaf. Numeric prefixes, order, and priority are stable scheduling tie-breakers, not dependencies.
-
-Reject unresolved semantic ambiguity before edits. Topologically schedule unfinished leaves in stable dependency/priority/path order. A wave contains leaves whose explicit and semantic blockers are satisfied by the integration branch and which have no dependency edges between one another. Continue independent work when another leaf fails; do not run its descendants.
-
-## 3. Prepare an executable leaf
-
-For every ready leaf, invoke `prepare` with values copied from the same `inspect` result:
+For each eligible leaf, copy values from the same inspection result:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty prepare '<task_path>' \
@@ -80,172 +62,113 @@ python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' 
   --integration-base '<integration_head>'
 ```
 
-`prepare` creates or reuses only the exact deterministic branch/worktree, verifies repository identity and branch attachment, and records the task base. It stops on path/ref collisions or an unregistered non-empty destination.
+`prepare` rechecks type `impl`, canonical dependencies, branch/head, repository identity, and deterministic worktree ownership. Scheduled implementation starts at `ready`. The helper also permits an explicit worktree for `new`, `critic`, or `planned` solely so an early failed/blocked attempt can be retained without falsifying lifecycle. It refuses `verified` and `done`.
 
-Treat returned `worktree`, `spec_path`, and `annotation_path` as opaque exact paths. Before any implementation action, read the complete returned worktree `spec_path`, repository guidance, relevant implementation/tests, and applicable skills.
-
-For a reused worktree, inspect `status_entries` and `task_commits` returned by `prepare`, or refresh them mechanically:
+Treat `worktree`, `spec_path`, `control_path`, and `annotation_path` as opaque. On reuse, inspect `status_entries` and `task_commits`, or call:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty show '<task_path>'
 ```
 
-Determine whether every retained change belongs to this exact task. If ownership is uncertain, stop rather than rewriting it. If coherent reusable state is dirty and must be protected, invoke:
+If coherent dirty state must be preserved, use `checkpoint`; never checkpoint merely to dismiss an ownership error:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty checkpoint '<task_path>'
 ```
 
-Do not checkpoint a path merely to make an error disappear. The helper never stashes or discards work. A checkpoint is temporary and must later be consolidated by `commit` before rebase, terminal status, or integration.
+## 3. Implement in the assigned worktree
 
-## 4. Implement only in the assigned worktree
+Prefix every Read/Edit/Write path with the returned worktree and set every Bash `cwd` to it. Read the complete spec, repository guidance, relevant code/tests, and applicable skills. Implement only that leaf.
 
-Use the prepared worktree as the sole project root:
+For a container wave, provision each ready leaf before dispatch and give one owner its exact repo root, task IDs/paths, worktree paths, branch/base, exclusive scope, canonical dependency contracts, and verification still required. Children skip all validation during the parallel pass. They never edit controls or evidence directly and never mutate Git except through this helper.
 
-- prefix every Read, Edit, Write, and LSP path with the returned `worktree`;
-- set every Bash `cwd` to the returned `worktree`;
-- reproduce bugs there when required and reachable;
-- implement every requirement and acceptance criterion without unrelated cleanup;
-- keep implementation, tests, generated repository artifacts, and annotation in the same task commit.
+A stuck implementation owner must invoke exactly one `spec-run-debug` rescue agent before reporting an implementation failure. Pass exact worktree/spec paths, constraints, current changes, concrete error, observations, and attempted approaches. The debugger is read-only; the owner resumes and applies or rejects its proposed solution with evidence. External prerequisites may be blocked without debugger escalation.
 
-For a container wave, provision every leaf before spawning. Launch one general-purpose subagent per leaf in one parallel Task batch. Do not use automatic isolated-agent worktrees or a model-routed `spec-run-all` implementer profile. Give each owner the exact `repo_root`, `task_path`, `worktree`, `spec_path`, `annotation_path`, feature branch, integration branch/head, exclusive files/interfaces, sibling contracts, focused verification still required, and the stuck-implementation escalation below.
+For `spec-run-all`, reuse the parent's successful preflight record. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-task --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
 
-A child must:
+## 4. Record evidence and consolidate
 
-1. verify state with `show`;
-2. work only in the assigned worktree;
-3. implement the complete leaf;
-4. skip formatters, builds, tests, and project-wide validation during the parallel implementation pass;
-5. use `annotate --status ready` and `commit --status ready --outcome '<behavioral outcome>'`;
-6. return the helper's commit, changed paths, retained risks, and verification still required.
-
-No child may issue direct Git mutation commands or edit an annotation by file operation.
-
-### Stuck implementation escalation
-
-An implementation owner that is stuck and would otherwise give up or report an implementation failure must first invoke exactly one `spec-run-debug` subagent for that leaf. This is the only permitted nested delegation. The profile requests the `@slow` model and is a read-only rescue analyst; the implementation owner remains responsible for all edits and decisions.
-
-Pass the debugger the exact worktree and specification paths, task scope, relevant repository constraints, current changes, concrete error or dead end, observations, and approaches already attempted. Use `agent: "spec-run-debug"`, do not request another isolated worktree, wait for its result, then resume implementation using the supported proposed solution or explain with evidence why it cannot work. Do not invoke the debugger for normal planning, review, verification failures owned by the parent, or an external prerequisite that makes the task `blocked`. Do not repeat the escalation for the same leaf.
-
-For a `spec-run-all` assigned worktree, use the parent's preserved successful preflight record for `spec-run-debug` and do not repeat profile, model, or OMP discovery. Otherwise, before container dispatch, run `.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-task --pretty` once and use its `spec-run-debug` record; a failed preflight is a concrete retained dispatch failure. Never substitute another profile or silently continue to an implementation-failed result. The debugger must return root cause evidence and a proposed solution directly to the requesting implementer and must not edit, annotate, commit, rebase, integrate, or delegate.
-
-## 5. Write state and consolidate the task commit
-
-The helper computes the annotation as the sibling of the owned `spec.md`. Never pass a `task.md` path.
+Never edit `task.md` or `task.yml` directly. `annotate` preserves unrelated task prose and replaces generated Outcome/Summary/Verification/Errors. For `ready` and `verified`, it delegates the lifecycle write to `task_ctl.set_task`; failed/blocked affect evidence only.
 
 Provisional success:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
-  --status ready --summary '<factual provisional summary>'
+  --outcome ready --summary '<factual provisional summary>'
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
   --status ready --outcome '<concise behavioral outcome>'
 ```
 
-Observed completion:
+Observed verification:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
-  --status done --summary '<delivered behavior>' \
+  --outcome verified --summary '<delivered behavior>' \
   --verification '<exact command or scenario> — <observed result>'
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' --status done
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' --status verified
 ```
 
-Repeat `--verification` for distinct checks. Once a final task commit exists, omit `--outcome` to preserve its subject automatically.
+Repeat `--verification` for distinct observations. Once the final task subject exists, omit the commit `--outcome` to preserve it.
 
-Failure or blocker:
+Failure or external blocker uses the unchanged `lifecycle_status` returned by `show`/`prepare`:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
-  --status failed --summary '<reachable retained work>' \
-  --error '<operation or prerequisite> — <concrete failure>'
+  --outcome failed --summary '<reachable retained work>' \
+  --error '<operation — concrete failure>'
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
-  --status failed --outcome '<concise attempted outcome>'
+  --status '<unchanged-lifecycle-status>' --outcome '<concise attempted outcome>'
 ```
 
-An implementation failure status is valid only after the required `spec-run-debug` rescue attempt was completed and its proposed solution was attempted or rejected with concrete evidence. An unavailable debugger/profile is itself a concrete retained failure. External prerequisites may be marked `blocked` without invoking the debugger.
+Use `--outcome blocked` only for an external prerequisite. The unchanged status may be `new`, `critic`, `planned`, or `ready`. The one failed/blocked task commit is retained but cannot integrate, and the orchestrator records its local execution outcome.
 
-Use `blocked` instead of `failed` only for an external prerequisite. Repeat `--error` when needed. The helper replaces stale generated Summary, Verification, and Errors sections, preserves unrelated sections, rejects misplaced annotations, stages the complete worktree, refuses unknown commits, and safely consolidates recognized checkpoints/task commits onto the recorded base.
+## 5. Rebase and verify
 
-## 6. Rebase with the helper
-
-Before verification/integration, refresh the integration head with `inspect`. Rebase one finalized task commit onto that head or the current wave-train commit:
+Refresh the integration head with `inspect` or the orchestration helper, then rebase through the helper:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty rebase '<task_path>' --onto '<commit>'
 ```
 
-The helper replays only the recorded task commit and updates its persisted base. It refuses multiple commits, dirty worktrees, unknown history, and replay cycles. A clean branch with no task commit may only move forward to a descendant base.
+On exit `3`, resolve only returned conflicts and call `continue-rebase`; use `abort-rebase` only to abandon that replay. If conflict resolution changes behavior, rerun affected verification and reconsolidate.
 
-On exit `3`, edit conflict contents only in the returned owning worktree, then invoke:
-
-```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty continue-rebase '<task_path>'
-```
-
-Repeat if another conflict is reported. Use `abort-rebase` only when the attempted replay must be abandoned. Never stage or continue manually. After any conflict resolution, rerun affected verification and reconsolidate with `commit` if annotation evidence or implementation changed.
-
-Validate the result mechanically:
+Children stop at lifecycle `ready`. The parent performs focused behavioral verification and repository-required combined verification from the exact task worktree. On failure, return concrete evidence to the same owner, amend its one commit, and rerun. On success, annotate `verified`, commit `--status verified`, and mechanically check:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty check '<task_path>' --status ready
+python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty check '<task_path>' --status verified
 ```
 
-`check` proves the worktree is clean, the recorded base is valid, exactly one non-merge task commit exists, its subject names the exact full task path, its diff contains the sibling annotation, annotation changes are owned, and the requested status matches.
+For a container train, rebase verified commits in helper order. Combined verification runs from the final train worktree. If an earlier task changes, rebuild every later replay. Every final train commit must contain its own verified `task.yml` transition and task evidence.
 
-## 7. Verify and assemble a container wave
+## 6. Container roll-up
 
-After the implementation barrier:
-
-1. Run each leaf's focused behavioral verification from its assigned worktree. Use the actual runtime surface, hardware, sanitizer, or remote procedure required by the spec. A compile is not runtime proof.
-2. Route a concrete failure to the same owner. The owner fixes only its worktree, updates its annotation, and invokes `commit` to amend the one task commit. Rerun the failed check.
-3. Keep successful leaves `ready` until repository-required combined verification passes. Mark irrecoverable leaves `failed` or `blocked`; retain but do not integrate them.
-4. Assemble ready commits in stable order. Rebase the first onto the current integration head. For every next owner, rebase its task onto the preceding helper-returned `commit`. The last branch is the provisional wave train.
-5. Run repository-required combined verification once from the final train worktree, including applicable backend conformance suites. On failure, send evidence to the responsible owner, amend that owner's one commit, rebuild every later replay with `rebase`, and rerun affected checks.
-6. After combined success, rebuild the finalized train in the same order. For each owner: rebase onto the latest finalized commit, `annotate --status done` with grounded focused and combined evidence, then `commit --status done`. Use each returned `commit` as the next base.
-7. If rebase conflict resolution changes implementation, rerun affected focused and combined verification before integration.
-
-This rebuild ensures every final annotation is inside its own one-commit leaf change without separate completion or fix commits.
-
-## 8. Roll up container annotations
-
-When every executable leaf beneath the requested container is `done` in the finalized train, the final leaf owner writes roll-ups before its final `commit` invocation. Work bottom-up through every container spec at or below the requested target:
+When every implementation leaf beneath a requested container is either done in the canonical tree or verified in the final train, the final leaf owner records each ancestor roll-up as verified before its final commit:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<final-leaf-task>' \
-  --for-task '<container-task-path>' --status done \
-  --summary '<all leaf subtasks completed>' \
+  --for-task '<container-task-path>' --outcome verified \
+  --summary '<all implementation leaves verified>' \
   --verification '<combined command or scenario> — <observed result>'
 ```
 
-The helper permits only true ancestor containers within the requested run target and requires their sibling specs. It folds these roll-ups into the final leaf's task commit; no separate roll-up commit.
+The helper allows only true ancestor containers inside the run target. Their verified controls and evidence are folded into the final leaf's single commit. Integration finalizes those controls to done in that same commit. Never create a separate roll-up/completion commit.
 
-If all leaves were already `done` but a container roll-up is stale or missing, choose the stable last completed leaf as owner, prepare/rebase its normal branch, use `annotate --for-task`, and create one annotation-only task commit through `commit`. Do not create a container worktree that collides with descendant worktrees.
+If all implementation leaves are already done but a container roll-up is missing or stale, choose the stable last completed leaf as owner and invoke normal `prepare` with the container as `--run-target`. The helper permits only this completion repair, requires all descendants done, and returns `rollup_only: true`; it preserves dirty or unintegrated state rather than overwriting it. Do not implement anything. Record verified evidence for the owner and each stale ancestor with `annotate`, then `commit --status verified --outcome '<container completion outcome>'`, check, and integrate the single annotation-only task commit. No new implementation task or container worktree is needed.
 
-Do not mark a container `done` while any leaf is failed, blocked, or unfinished.
+## 7. Integrate
 
-## 9. Integrate mechanically
-
-For a single leaf, finalize it as `done`, run `check --status done`, then integrate that branch. For a container, use the final task branch in the fully verified train:
+For a leaf or the final branch of a verified train:
 
 ```text
 python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty integrate '<final-task-path>'
 ```
 
-`integrate` rechecks the integration branch and cleanliness, requires the train to fast-forward the current integration tip, rejects merges/non-task/duplicate task commits, requires every commit to contain its own `done` sibling annotation, validates container annotation ownership, then performs the fast-forward.
+`integrate` requires a clean fast-forward verified train. It validates each historical `task.yml` blob with `task_ctl.parse_config`, requires every task commit to contain its own verified control and successful verified evidence, validates ancestor roll-up ownership, and rejects merges, duplicate/non-task commits, malformed controls, failed evidence, or non-verified status.
 
-If the integration branch advanced, do not work around the refusal. Rebuild the train from the new integration head with `rebase`, rerun affected focused and combined verification, refresh annotation evidence when it changed, and retry `integrate`.
+Only inside this operation, the helper rebuilds the train in the same order, changes every verified control owned by each commit to done through `task_ctl.set_task`, and recreates that same one commit—no completion commit. It then rechecks the integration head and fast-forwards. If finalization or fast-forward fails, it restores the private branch to the verified train; canonical status remains unchanged. Thus dependencies can observe done only after successful integration.
 
-After each integrated wave, rerun `inspect` and schedule the next newly ready wave from the new integration head.
+If the integration branch advanced, refresh/rebase, rerun affected verification, refresh evidence, and retry. After an integrated wave, inspect again and schedule newly eligible work from the canonical tree.
 
 ## Completion response
 
-Report concisely:
-
-- requested target and integration branch;
-- each leaf as `already done`, `done and integrated`, `failed`, `blocked`, or `not run because <blocker>`;
-- for attempted leaves, exact helper-returned worktree, feature branch, single final task commit, and observed verification;
-- container roll-up and final integration commit;
-- retained error state or residual blockers.
-
-Do not call partial work complete or claim unobserved verification.
+Report the target and integration branch; every leaf as already done, done/integrated, failed, blocked, or dependency-waiting; exact prepared worktree/branch/final commit for attempted leaves; observed verification; roll-up and integrated head; and retained errors or blockers. Never claim unobserved validation or partial completion.

@@ -23,6 +23,10 @@ One root supervisor schedules one shared `scout (project read-only) @smol`, atom
 
 Workers may propose exact differential tests, benchmarks, or scenarios, but only the root runs gates after collection and records actual results and gaps. If a lane is unavailable, report routing/coverage limits and request permission before a materially costlier fallback; never silently replace cheap profiles or run an unbounded frontier review.
 
+## Task metadata
+
+When a destination is supplied, task lifecycle controls belong exclusively to task_ctl-managed `task.yml`: generated remediation records use `type: impl`, `status: new`, assigned `order`, P0–P2 `priority`, canonical `blocked-by` IDs, and the parent `spec.md` as `source`. Use `.omp/csw/bin/task_ctl` CLI/API (`task_dir`, `get_task`, `set_task`, `list_tasks`) for paths, ordering, metadata, and dependencies; never parse or hand-write YAML. Keep all review evidence in `spec.md`.
+
 ## Concrete evidence jobs
 
 ### Cheap `@smol` jobs

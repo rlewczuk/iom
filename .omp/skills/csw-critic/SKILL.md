@@ -8,18 +8,20 @@ hide: true
 
 Review one change specification until it is accurate, focused, testable, and mutually understood, then edit the specification in place.
 
-The command supplies a **task name**. Work from the project root and use exactly these paths:
+The command supplies a **task name** relative to `.cswd/tasks`, including nested task directories such as `0123-some-changes/03-cleanups`. Work from the project root.
 
-`<task-name>` may refer either to a directory directly in `.cswd/tasks` or to any nested task directory, for example `0123-some-changes/03-cleanups`.
+- Canonical task ID: `.cswd/tasks/<task-name>`.
+- Resolve the specification through `.omp/csw/bin/task_ctl get '<task-id>' --spec`.
+- User remarks, optional: sibling `spec-fixme.md`.
+- Read task metadata only through `.omp/csw/bin/task_ctl get '<task-id>' --all`.
 
-- Specification: `.cswd/tasks/<task-name>/spec.md`
-- User remarks, optional: `.cswd/tasks/<task-name>/spec-fixme.md`
+Modify specification prose only in `spec.md`. Task metadata belongs exclusively to sibling `task.yml` and is manipulated only by `task_ctl`; never read, parse, write, or edit that file directly. Never modify or delete `spec-fixme.md`. The final `critic` status update is the only additional workflow change.
 
-Modify only `spec.md` unless the user explicitly requests another file change. Never modify or delete `spec-fixme.md`.
+Below, `task_ctl` means `.omp/csw/bin/task_ctl --repo '<project-root>'`; do not assume it is on PATH. Python 3 and PyYAML are required; the script's docstring and `--help` document its complete interface.
 
 ## Guardrails
 
-- Treat `<task-name>` as a repository-relative task path beneath `.cswd/tasks`. Reject an empty name, absolute paths, empty path components, `.` or `..` components, backslashes, and any path that escapes `.cswd/tasks`.
+- Use `task_ctl` for task-ID/path validation and resolution; do not reconstruct paths or bypass its rejection of empty names, absolute paths, traversal, malformed components, or containment escapes.
 - If `spec.md` does not exist, report the expected path and stop.
 - Read the whole specification and the whole fixme file when present.
 - The repository is authoritative for claims about current behavior. Inspect code instead of relying on the specification's description of it.
@@ -29,7 +31,7 @@ Modify only `spec.md` unless the user explicitly requests another file change. N
 - Keep the design minimal. Remove or challenge speculative abstractions, future-proofing, generic frameworks, optional extras, unrelated cleanup, and complementary features not required by the stated change.
 - Do not broaden scope merely because another improvement would be useful. Mention an adjacent issue only when it blocks correctness of this specification.
 - Apply clear factual and editorial corrections directly. Use questions for genuine decisions, not for permission to fix obvious errors.
-- Do not implement the change. The output of this workflow is the revised `spec.md` and a concise review summary.
+- Do not implement the change. The output is the revised `spec.md`, the script-managed `critic` lifecycle status after completed review, and a concise review summary.
 - Ignore previous changes to `spec.md` and `spec-fixme.md` (if visible in git history), focus on current version. 
 
 ## Boss orchestration protocol
@@ -47,7 +49,7 @@ Every substantive packet labels `SOURCE FACTS` separately from `INFERENCE`, give
 
 Advisor `CONTENT` must inline the goals and non-goals, verified relevant excerpts, alternatives, constraints, trade-offs, and the exact decision requested; an artifact path alone is invalid. The advisor reasons only over that content. On missing material facts it returns `NEED EVIDENCE` with one exact missing-fact question; the root gets substantive answers from `boss-builder` (`@task`) and only mechanical lookups from `boss-errand` (`@smol`), then supplies the advisor an evidence delta. The root remains accountable for the decision.
 
-Only `spec.md` is materialized as workflow output; the completion response carries its concise review summary. `spec-fixme.md` is immutable. Workers skip build, test, lint, and format gates; the root verifies the spec artifact and its consistency, never an implementation.
+`spec.md` remains the substantive workflow output; `task_ctl` alone updates control metadata. The completion response carries the concise review summary. `spec-fixme.md` is immutable. Workers skip build, test, lint, and format gates; the root verifies the spec artifact and its consistency, never an implementation.
 
 ## Workflow
 
@@ -57,7 +59,7 @@ The eight substantive stages below are one Boss-owned workflow; delegation never
 
 The `@slow` root performs the complete intake before decomposition. It may batch independent, purely mechanical path checks through `boss-errand` (`@smol`), but does not delegate known trivial facts gratuitously.
 
-Resolve the two paths from the supplied task name. Read `spec.md`; read `spec-fixme.md` if it exists. Treat fixme content as user-provided remarks and additional constraints, but reconcile it with the codebase and ask when it conflicts with repository reality or with another remark.
+Resolve the specification with `task_ctl get '<task-id>' --spec`. Read the complete returned file and its sibling `spec-fixme.md` when present. Read metadata with `get --all`; stop on missing or invalid control metadata. Treat fixme content as user-provided remarks and additional constraints, but reconcile it with the codebase and ask when it conflicts with repository reality or another remark.
 
 While reading, extract:
 
@@ -190,6 +192,8 @@ The final specification should contain, as appropriate to the change:
 
 The `@slow` root integrates all approved edits and performs the final whole-spec consistency review against the repository, fixme remarks, user decisions, scope, and testability requirements. Workers skip validation gates; the root verifies the resulting `spec.md` artifact, not an implementation, and may use only exact editorial edits or batched mechanical checks to close findings.
 Do not leave `TBD`, contradictory alternatives, or unresolved questions unless the user explicitly accepts them as a documented blocker. In that case, label the specification as blocked and do not claim it is implementation-ready.
+
+After the review and final consistency pass complete, invoke `.omp/csw/bin/task_ctl set '<task-id>' --status critic`. Never write a Status header in either Markdown file. `critic` records that this review ran; it does not claim implementation, verification, or integration. If the review is interrupted or remains awaiting a user decision, leave the lifecycle unchanged.
 
 ## Completion response
 

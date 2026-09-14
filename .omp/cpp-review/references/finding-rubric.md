@@ -99,6 +99,8 @@ Do not accept an abstraction that only relocates code or future-proofs hypotheti
 
 ## Task materialization contract
 
-Every accepted root cause becomes one remediation task using `templates/remediation-task.md`. The task must preserve the candidate's invariant, mechanism, evidence, backend scope, error/compatibility behavior, and verification burden while replacing review language with normative implementation requirements.
+Every accepted root cause becomes one evidence-only remediation `spec.md` using `templates/remediation-task.md`, plus a sibling lifecycle record written by `.omp/csw/bin/task_ctl`. The record uses `type: impl`, `status: new`, the assigned `order`, review `priority`, canonical `blocked-by` IDs, and the supplied parent `spec.md` as `source`. `Order`, `Type`, `Priority`, `Blocked by`, and `Source` must not be embedded in `spec.md`; use task_ctl's API/CLI for all path, metadata, ordering, and dependency operations.
+
+A task must preserve the candidate's invariant, mechanism, evidence, backend scope, error/compatibility behavior, and verification burden while replacing review language with normative implementation requirements.
 
 A task is not complete if it says to investigate, choose among designs, update relevant files, handle cases “as needed,” or read the review for missing context.

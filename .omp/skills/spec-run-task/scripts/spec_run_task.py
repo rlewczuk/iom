@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -14,14 +15,25 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+_TASK_CTL_PATH = Path(__file__).resolve().parents[3] / "csw" / "bin" / "task_ctl"
+_TASK_CTL = runpy.run_path(str(_TASK_CTL_PATH))
+TaskCtlError = _TASK_CTL["TaskCtlError"]
+task_ctl_task_dir = _TASK_CTL["task_dir"]
+task_ctl_get_task = _TASK_CTL["get_task"]
+task_ctl_set_task = _TASK_CTL["set_task"]
+task_ctl_list_tasks = _TASK_CTL["list_tasks"]
+task_ctl_scan_tasks = _TASK_CTL["scan_tasks"]
+task_ctl_parse_config = _TASK_CTL["parse_config"]
+task_ctl_detect_cycle = _TASK_CTL["detect_cycle"]
+
+
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
-STATUS_RE = re.compile(r"^\s*\*\*Status:\*\*\s*(.*?)\s*$", re.IGNORECASE)
-BLOCKED_RE = re.compile(r"^\s*\*\*Blocked by:\*\*\s*(.*?)\s*$", re.IGNORECASE)
+OUTCOME_RE = re.compile(r"^\s*\*\*Outcome:\*\*\s*(.*?)\s*$", re.IGNORECASE)
 GENERATED_HEADING_RE = re.compile(r"^##\s+(Summary|Verification|Errors)\s*$", re.IGNORECASE)
 SECTION_BOUNDARY_RE = re.compile(r"^#{1,2}\s+")
 FINAL_SUBJECT_RE = re.compile(r"^spec-run-task\(([^)]+)\): (.+)$")
 STATE_FILE = "spec-run-task-state.json"
-TERMINAL_STATUSES = {"ready", "done", "failed", "blocked"}
+EXECUTION_OUTCOMES = {"ready", "verified", "failed", "blocked"}
 
 
 class TaskError(RuntimeError):
@@ -119,8 +131,8 @@ def validate_target(raw: str, *, branch_safe: bool = False) -> str:
         raise TaskError("target must not contain surrounding whitespace")
     if target.startswith("/") or "\\" in target:
         raise TaskError(f"target must be a relative POSIX directory path: {raw}")
-    if target.endswith("spec.md") or target.endswith("task.md"):
-        raise TaskError("target names a directory, not spec.md or task.md")
+    if target.endswith(("spec.md", "task.md", "task.yml")):
+        raise TaskError("target names a file, not a task directory")
     components = target.split("/")
     if any(component in {"", ".", ".."} for component in components):
         raise TaskError(f"target contains an empty, '.' or '..' component: {raw}")
@@ -142,29 +154,38 @@ def is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def changes_root(repo: Path) -> Path:
-    return (repo / "docs" / "changes").resolve()
+def canonical_task(task: str) -> str:
+    return "docs/changes/" + validate_target(task)
+
+
+def relative_task_id(task_id: str) -> str:
+    prefix = "docs/changes/"
+    if not task_id.startswith(prefix):
+        raise TaskError(f"execution task is outside docs/changes: {task_id}")
+    return validate_target(task_id[len(prefix) :])
+
+
+def task_directory(repo: Path, task: str) -> Path:
+    return Path(task_ctl_task_dir(repo, canonical_task(task))).resolve()
+
+
+def task_config(repo: Path, task: str) -> dict[str, Any]:
+    return task_ctl_get_task(repo, canonical_task(task))
 
 
 def spec_path(repo: Path, task: str) -> Path:
-    root = changes_root(repo)
-    candidate = (root / task / "spec.md").resolve()
-    if not is_relative_to(candidate, root):
-        raise TaskError(f"spec path escapes docs/changes: {task}")
+    candidate = task_directory(repo, task) / "spec.md"
     if not candidate.is_file():
-        raise TaskError(f"specification not found: {repo / 'docs' / 'changes' / task / 'spec.md'}")
+        raise TaskError(f"specification not found: {candidate}")
     return candidate
 
 
-def annotation_path(repo: Path, task: str, *, require_spec: bool = True) -> Path:
-    if require_spec:
-        spec = spec_path(repo, task)
-    else:
-        spec = (changes_root(repo) / task / "spec.md").resolve()
-    annotation = spec.with_name("task.md")
-    if annotation.parent != spec.parent or not is_relative_to(annotation, changes_root(repo)):
-        raise TaskError(f"invalid sibling annotation path for: {spec}")
-    return annotation
+def annotation_path(repo: Path, task: str) -> Path:
+    return spec_path(repo, task).with_name("task.md")
+
+
+def control_path(repo: Path, task: str) -> Path:
+    return task_directory(repo, task) / "task.yml"
 
 
 def deterministic_branch(task: str) -> str:
@@ -206,165 +227,95 @@ def validate_control(repo: Path, *, require_status_clean: bool = True) -> tuple[
     return branch, head(repo)
 
 
-def parse_annotation(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {"exists": False, "status": None}
-    text = path.read_text(encoding="utf-8")
-    statuses = [match.group(1).strip().lower() for line in text.splitlines() if (match := STATUS_RE.match(line))]
-    if len(statuses) > 1:
-        raise TaskError(f"multiple Status fields in annotation: {path}")
-    return {"exists": True, "status": statuses[0] if statuses else None}
-
-
-def blocked_tokens(spec: Path) -> list[str]:
-    fields = [match.group(1).strip() for line in spec.read_text(encoding="utf-8").splitlines() if (match := BLOCKED_RE.match(line))]
-    if len(fields) > 1:
-        raise TaskError(f"multiple Blocked by fields in specification: {spec}")
-    if not fields or fields[0].lower() in {"", "none"}:
-        return []
-    tokens = []
-    for value in fields[0].split(","):
-        token = value.strip().strip("`").strip()
-        if not token:
-            raise TaskError(f"empty blocker in specification: {spec}")
-        tokens.append(token)
-    return tokens
-
-
-
-
-def specs_below(repo: Path, target: str) -> list[Path]:
-    root = changes_root(repo)
-    target_dir = spec_path(repo, target).parent
-    specs = []
-    for candidate in target_dir.rglob("spec.md"):
-        resolved = candidate.resolve()
-        if not is_relative_to(resolved, root):
-            raise TaskError(f"specification resolves outside docs/changes: {candidate}")
-        specs.append(resolved)
-    return sorted(set(specs))
-
-
-def relative_task(repo: Path, spec: Path) -> str:
-    return spec.parent.relative_to(changes_root(repo)).as_posix()
-
-
-def leaf_specs(repo: Path, target: str) -> tuple[str, list[Path], list[Path]]:
-    specs = specs_below(repo, target)
-    target_spec = spec_path(repo, target)
-    descendants = [spec for spec in specs if spec != target_spec]
-    if not descendants:
-        return "leaf", [target_spec], specs
-    leaves = []
-    for candidate in descendants:
-        directory = candidate.parent
-        if not any(other != candidate and is_relative_to(other.parent, directory) for other in descendants):
-            leaves.append(candidate)
-    return "container", sorted(leaves), specs
-
-
-def resolve_blocker(
-    repo: Path,
-    requested_target: str,
-    token: str,
-    selected_specs: list[Path],
-    repository_specs: list[Path],
-) -> str:
-    normalized = token
-    if normalized.startswith("docs/changes/"):
-        normalized = normalized[len("docs/changes/") :]
-    if normalized.endswith("/spec.md"):
-        normalized = normalized[: -len("/spec.md")]
-    by_task = {relative_task(repo, spec): spec for spec in repository_specs}
-    direct = [normalized, f"{requested_target}/{normalized}"]
-    for candidate in direct:
-        if candidate in by_task:
-            return candidate
-    selected_tasks = [relative_task(repo, spec) for spec in selected_specs]
-    basename_matches = [task for task in selected_tasks if task.rsplit("/", 1)[-1] == normalized]
-    if len(basename_matches) == 1:
-        return basename_matches[0]
-    if len(basename_matches) > 1:
-        raise TaskError(f"ambiguous blocker '{token}': {', '.join(basename_matches)}")
-    raise TaskError(f"unknown blocker '{token}' beneath target {requested_target}")
+def task_records(repo: Path, target: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for record in task_ctl_list_tasks(repo, canonical_task(target), impl=False):
+        child = relative_task_id(record["task-id"])
+        records.append(record)
+        if record["type"] == "hld":
+            records.extend(task_records(repo, child))
+        elif task_ctl_list_tasks(repo, record["task-id"], impl=False):
+            raise TaskError(f"implementation task contains controlled descendants: {record['task-id']}")
+    return records
 
 
 def detect_cycle(edges: dict[str, list[str]]) -> None:
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(node: str, stack: list[str]) -> None:
-        if node in visiting:
-            start = stack.index(node)
-            raise TaskError("dependency cycle: " + " -> ".join(stack[start:] + [node]))
-        if node in visited:
-            return
-        visiting.add(node)
-        stack.append(node)
-        for dependency in edges.get(node, []):
-            if dependency in edges:
-                visit(dependency, stack)
-        stack.pop()
-        visiting.remove(node)
-        visited.add(node)
-
-    for node in edges:
-        visit(node, [])
+    task_ctl_detect_cycle(edges)
 
 
 def inspect_target(repo: Path, target: str) -> dict[str, Any]:
     target = validate_target(target)
     integration_branch, integration_head = validate_control(repo)
-    kind, leaves, selected_specs = leaf_specs(repo, target)
-    repository_specs = []
-    root = changes_root(repo)
-    if root.is_dir():
-        for candidate in root.rglob("spec.md"):
-            resolved = candidate.resolve()
-            if not is_relative_to(resolved, root):
-                raise TaskError(f"specification resolves outside docs/changes: {candidate}")
-            repository_specs.append(resolved)
-    repository_specs = sorted(set(repository_specs))
+    target_config = task_config(repo, target)
+    listed = task_records(repo, target)
+    if target_config["type"] == "impl":
+        if listed:
+            raise TaskError(f"implementation task contains controlled descendants: {canonical_task(target)}")
+        selected = [{"task-id": canonical_task(target), **target_config}]
+        kind = "leaf"
+    else:
+        selected = [record for record in listed if record["type"] == "impl"]
+        kind = "container"
+    if not selected:
+        raise TaskError(f"container has no implementation tasks: {canonical_task(target)}")
 
-    leaf_tasks = {relative_task(repo, spec) for spec in leaves}
-    records = []
+    selected_ids = {record["task-id"] for record in selected}
+    records: list[dict[str, Any]] = []
     edges: dict[str, list[str]] = {}
-    for leaf in leaves:
-        task = relative_task(repo, leaf)
+    for config in selected:
+        task_id = config["task-id"]
+        task = relative_task_id(task_id)
         branch = deterministic_branch(task)
-        annotation = annotation_path(repo, task)
-        parsed = parse_annotation(annotation)
-        dependencies = [
-            resolve_blocker(repo, target, token, selected_specs, repository_specs)
-            for token in blocked_tokens(leaf)
-        ]
-        edges[task] = [dependency for dependency in dependencies if dependency in leaf_tasks]
+        dependencies = config.get("blocked-by", [])
+        edges[task_id] = (
+            [
+                dependency["task-id"]
+                for dependency in dependencies
+                if dependency["task-id"] in selected_ids
+            ]
+            if config["status"] != "done"
+            else []
+        )
         dependency_records = []
         for dependency in dependencies:
-            dependency_annotation = annotation_path(repo, dependency)
-            dependency_state = parse_annotation(dependency_annotation)
+            dependency_id = dependency["task-id"]
+            try:
+                dependency_config = task_ctl_get_task(repo, dependency_id)
+                dependency_status = dependency_config["status"]
+                error = None
+            except TaskCtlError as exc:
+                dependency_status = None
+                error = str(exc)
             dependency_records.append(
                 {
-                    "task_path": dependency,
-                    "status": dependency_state["status"],
-                    "selected_leaf": dependency in leaf_tasks,
-                    "satisfied": dependency_state["status"] == "done",
+                    "task-id": dependency_id,
+                    "status": dependency_status,
+                    "selected_leaf": dependency_id in selected_ids,
+                    "satisfied": dependency_status == "done",
+                    **({"remarks": dependency["remarks"]} if "remarks" in dependency else {}),
+                    **({"error": error} if error else {}),
                 }
             )
         wt = worktree_path(repo, task)
         records.append(
             {
+                "task_id": task_id,
                 "task_path": task,
-                "spec_path": str(leaf),
-                "annotation_path": str(annotation),
+                "spec_path": str(spec_path(repo, task)),
+                "control_path": str(control_path(repo, task)),
+                "annotation_path": str(annotation_path(repo, task)),
                 "worktree": str(wt),
-                "worktree_spec_path": str(wt / "docs" / "changes" / task / "spec.md"),
-                "worktree_annotation_path": str(wt / "docs" / "changes" / task / "task.md"),
+                "worktree_spec_path": str(wt / task_id / "spec.md"),
+                "worktree_control_path": str(wt / task_id / "task.yml"),
+                "worktree_annotation_path": str(wt / task_id / "task.md"),
                 "feature_branch": branch,
-                "status": parsed["status"],
-                "annotation_exists": parsed["exists"],
+                "type": config["type"],
+                "status": config["status"],
+                "source": config.get("source"),
+                "order": config.get("order"),
+                "priority": config.get("priority"),
                 "blocked_by": dependency_records,
-                "explicitly_ready": parsed["status"] != "done"
+                "explicitly_ready": config["status"] in {"new", "critic", "planned", "ready"}
                 and all(dependency["satisfied"] for dependency in dependency_records),
             }
         )
@@ -374,8 +325,10 @@ def inspect_target(repo: Path, target: str) -> dict[str, Any]:
         "integration_branch": integration_branch,
         "integration_head": integration_head,
         "requested_target": target,
+        "requested_task_id": canonical_task(target),
         "target_kind": kind,
         "target_spec_path": str(spec_path(repo, target)),
+        "target_control_path": str(control_path(repo, target)),
         "target_annotation_path": str(annotation_path(repo, target)),
         "leaves": records,
     }
@@ -484,6 +437,31 @@ def prepare_task(
     task = validate_target(task, branch_safe=True)
     run_target = validate_target(run_target)
     spec_path(repo, task)
+    config = task_config(repo, task)
+    if config["type"] != "impl":
+        raise TaskError(f"task is not an implementation leaf: {canonical_task(task)}")
+    rollup_only = config["status"] == "done"
+    if rollup_only:
+        if run_target == task or not task_is_ancestor(run_target, task):
+            raise TaskError("a completed leaf may only prepare an ancestor container roll-up")
+        containers = [{"task-id": canonical_task(run_target), **task_config(repo, run_target)}]
+        descendants = task_records(repo, run_target)
+        containers.extend(record for record in descendants if record["type"] == "hld")
+        if any(record["status"] != "done" for record in descendants if record["type"] == "impl"):
+            raise TaskError("container roll-up requires every implementation leaf to be done")
+        if not any(record["status"] != "done" for record in containers):
+            raise TaskError("container roll-ups are already done")
+    unsatisfied = []
+    for dependency in config.get("blocked-by", []):
+        dependency_id = dependency["task-id"]
+        try:
+            dependency_status = task_ctl_get_task(repo, dependency_id)["status"]
+        except TaskCtlError:
+            dependency_status = "missing"
+        if dependency_status != "done":
+            unsatisfied.append(f"{dependency_id} is {dependency_status}")
+    if unsatisfied:
+        raise TaskError("task dependencies are not done: " + "; ".join(unsatisfied))
     actual_branch, actual_head = validate_control(repo)
     if actual_branch != integration_branch:
         raise TaskError(f"integration branch changed: expected {integration_branch}, found {actual_branch}")
@@ -531,6 +509,15 @@ def prepare_task(
         base = merge_base.stdout.strip()
         state = {}
 
+    if rollup_only:
+        require_no_rebase(wt)
+        require_clean(wt, "completed task worktree")
+        if not is_ancestor(wt, head(wt), integration_base):
+            raise TaskError("completed roll-up owner has unintegrated work; preserve it and use the final integrated owner")
+        git(wt, "reset", "--hard", integration_base)
+        base = integration_base
+        state.pop("final_commit", None)
+
     state.update(
         {
             "version": 1,
@@ -545,14 +532,19 @@ def prepare_task(
         }
     )
     save_state(wt, state)
+    task_id = canonical_task(task)
     output = {
+        "task_id": task_id,
         "task_path": task,
         "created": created,
         "reused": not created,
         "feature_branch": branch,
         "worktree": str(wt),
-        "spec_path": str(wt / "docs" / "changes" / task / "spec.md"),
-        "annotation_path": str(wt / "docs" / "changes" / task / "task.md"),
+        "spec_path": str(wt / task_id / "spec.md"),
+        "control_path": str(wt / task_id / "task.yml"),
+        "annotation_path": str(wt / task_id / "task.md"),
+        "lifecycle_status": config["status"],
+        "rollup_only": rollup_only,
         "base": base,
         "head": head(wt),
         "pending_rebase_onto": state.get("pending_rebase_onto"),
@@ -578,7 +570,7 @@ def strip_generated_sections(text: str) -> list[str]:
     kept: list[str] = []
     index = 0
     while index < len(lines):
-        if STATUS_RE.match(lines[index]):
+        if OUTCOME_RE.match(lines[index]):
             index += 1
             continue
         if GENERATED_HEADING_RE.match(lines[index]):
@@ -606,7 +598,7 @@ def annotate_task(
     repo: Path,
     owner: str,
     annotated: str,
-    status: str,
+    outcome: str,
     summary: str,
     verification: list[str],
     errors: list[str],
@@ -616,23 +608,23 @@ def annotate_task(
     wt, state = load_state(repo, owner)
     validate_integration(state)
     validate_annotation_owner(state, owner, annotated)
-    status = status.lower()
-    if status not in TERMINAL_STATUSES:
-        raise TaskError(f"unsupported persistent status: {status}")
+    outcome = outcome.lower()
+    if outcome not in EXECUTION_OUTCOMES:
+        raise TaskError(f"unsupported execution outcome: {outcome}")
     summary = single_line(summary, "summary")
     verification = [single_line(item, "verification entry") for item in verification]
     errors = [single_line(item, "error entry") for item in errors]
-    if status == "done" and not verification:
-        raise TaskError("done annotation requires at least one observed verification entry")
-    if status in {"failed", "blocked"} and not errors:
-        raise TaskError(f"{status} annotation requires at least one concrete error entry")
-    if status in {"ready", "done"} and errors:
-        raise TaskError(f"{status} annotation cannot retain error entries")
+    if outcome == "verified" and not verification:
+        raise TaskError("verified outcome requires at least one observed verification entry")
+    if outcome in {"failed", "blocked"} and not errors:
+        raise TaskError(f"{outcome} outcome requires at least one concrete error entry")
+    if outcome in {"ready", "verified"} and errors:
+        raise TaskError(f"{outcome} outcome cannot retain error entries")
 
     annotation = annotation_path(wt, annotated)
     existing = annotation.read_text(encoding="utf-8") if annotation.is_file() else ""
     body = strip_generated_sections(existing)
-    output = [f"**Status:** {status}"]
+    output = [f"**Outcome:** {outcome}"]
     if body:
         output.extend(["", *body])
     output.extend(["", "## Summary", "", summary])
@@ -642,13 +634,16 @@ def annotate_task(
     if errors:
         output.extend(["", "## Errors", ""])
         output.extend(f"- {entry}" for entry in errors)
+    if outcome in {"ready", "verified"}:
+        task_ctl_set_task(wt, canonical_task(annotated), {"status": outcome})
     annotation.write_text("\n".join(output) + "\n", encoding="utf-8")
-    parsed = parse_annotation(annotation)
     return {
         "owner_task": owner,
         "annotated_task": annotated,
         "annotation_path": str(annotation),
-        "status": parsed["status"],
+        "control_path": str(control_path(wt, annotated)),
+        "outcome": outcome,
+        "lifecycle_status": task_config(wt, annotated)["status"],
     }
 
 
@@ -662,57 +657,60 @@ def changed_paths(repo: Path, base: str, revision: str | None = None) -> list[st
     return [item.decode(errors="surrogateescape") for item in raw.split(b"\0") if item]
 
 
-def annotation_task_from_path(path: str) -> str | None:
+def task_from_path(path: str, filename: str) -> str | None:
     prefix = "docs/changes/"
-    suffix = "/task.md"
+    suffix = "/" + filename
     if not path.startswith(prefix) or not path.endswith(suffix):
         return None
     task = path[len(prefix) : -len(suffix)]
     return task or None
 
 
-def annotation_status_at_base(worktree: Path, base: str, task: str) -> str | None:
-    process = git(
-        worktree,
-        "show",
-        f"{base}:docs/changes/{task}/task.md",
-        check=False,
-    )
-    if process.returncode != 0:
-        return None
-    statuses = [m.group(1).strip().lower() for line in process.stdout.splitlines() if (m := STATUS_RE.match(line))]
-    return statuses[0] if statuses else None
-
-
-def validate_annotation_changes(
+def validate_task_file_changes(
     worktree: Path,
     state: dict[str, Any],
     paths: Iterable[str],
-    owner_status: str | None,
+    lifecycle_status: str,
     *,
     require_owner: bool,
 ) -> None:
     owner = state["task_path"]
-    annotation_tasks = []
+    annotations: set[str] = set()
+    controls: set[str] = set()
     for path in paths:
-        if Path(path).name != "task.md":
+        filename = Path(path).name
+        if filename not in {"task.md", "task.yml"}:
             continue
-        annotated = annotation_task_from_path(path)
+        annotated = task_from_path(path, filename)
         if annotated is None:
-            raise TaskError(f"misplaced task.md change: {path}")
+            raise TaskError(f"misplaced {filename} change: {path}")
         validate_annotation_owner(state, owner, annotated)
-        if annotated != owner and owner_status != "done":
-            raise TaskError(f"container annotation cannot be committed before leaf is done: {path}")
-        associated_spec = worktree / "docs" / "changes" / annotated / "spec.md"
-        if not associated_spec.is_file():
-            raise TaskError(f"annotation has no sibling spec.md: {path}")
-        annotation_tasks.append(annotated)
-    if require_owner and owner not in annotation_tasks:
-        # An annotation-only container roll-up may leave the owner's own leaf
-        # annotation unchanged when it already carries the expected status at base.
-        if annotation_status_at_base(worktree, state["base"], owner) != owner_status:
-            expected = f"docs/changes/{owner}/task.md"
-            raise TaskError(f"task commit does not contain its required sibling annotation: {expected}")
+        if not spec_path(worktree, annotated).is_file():
+            raise TaskError(f"{filename} has no sibling spec.md: {path}")
+        if filename == "task.md":
+            annotations.add(annotated)
+        else:
+            config = task_config(worktree, annotated)
+            expected_type = "impl" if annotated == owner else "hld"
+            if config["type"] != expected_type:
+                raise TaskError(
+                    f"control type mismatch at {path}: expected {expected_type}, found {config['type']}"
+                )
+            status = config["status"]
+            if status != lifecycle_status:
+                raise TaskError(
+                    f"control status mismatch at {path}: expected {lifecycle_status}, found {status}"
+                )
+            controls.add(annotated)
+    if lifecycle_status == "verified" and not controls.issubset(annotations):
+        missing = ", ".join(sorted(controls - annotations))
+        raise TaskError(f"verified control changes lack sibling evidence changes: {missing}")
+    if require_owner and owner not in annotations:
+        expected = f"docs/changes/{owner}/task.md"
+        raise TaskError(f"task commit does not contain its required sibling evidence: {expected}")
+    if lifecycle_status == "verified" and owner not in controls:
+        expected = f"docs/changes/{owner}/task.yml"
+        raise TaskError(f"verified task commit does not contain its lifecycle transition: {expected}")
 
 
 def commits_since(repo: Path, base: str) -> list[str]:
@@ -780,12 +778,16 @@ def show_task(repo: Path, task: str) -> dict[str, Any]:
     task = validate_target(task, branch_safe=True)
     worktree, state = load_state(repo, task)
     validate_integration(state)
+    task_id = canonical_task(task)
     return {
+        "task_id": task_id,
         "task_path": task,
         "feature_branch": state["feature_branch"],
         "worktree": str(worktree),
-        "spec_path": str(worktree / "docs" / "changes" / task / "spec.md"),
-        "annotation_path": str(worktree / "docs" / "changes" / task / "task.md"),
+        "spec_path": str(worktree / task_id / "spec.md"),
+        "control_path": str(worktree / task_id / "task.yml"),
+        "annotation_path": str(worktree / task_id / "task.md"),
+        "lifecycle_status": task_config(worktree, task)["status"],
         "base": state["base"],
         "head": head(worktree),
         "pending_rebase_onto": state.get("pending_rebase_onto"),
@@ -804,8 +806,8 @@ def checkpoint_task(repo: Path, task: str) -> dict[str, Any]:
         return {"task_path": task, "checkpoint": None, "no_change": True}
     git(wt, "add", "-A")
     paths = changed_paths(wt, state["base"])
-    owner_state = parse_annotation(annotation_path(wt, task))["status"]
-    validate_annotation_changes(wt, state, paths, owner_state, require_owner=False)
+    lifecycle_status = task_config(wt, task)["status"]
+    validate_task_file_changes(wt, state, paths, lifecycle_status, require_owner=False)
     git(wt, "commit", "-m", f"spec-run-task checkpoint({task}): preserve reusable work")
     commit = head(wt)
     return {"task_path": task, "checkpoint": commit, "no_change": False}
@@ -814,8 +816,8 @@ def checkpoint_task(repo: Path, task: str) -> dict[str, Any]:
 def commit_task(repo: Path, task: str, expected_status: str, outcome: str | None) -> dict[str, Any]:
     task = validate_target(task, branch_safe=True)
     expected_status = expected_status.lower()
-    if expected_status not in TERMINAL_STATUSES:
-        raise TaskError(f"unsupported commit status: {expected_status}")
+    if expected_status not in {"new", "critic", "planned", "ready", "verified"}:
+        raise TaskError("task commits require an unintegrated lifecycle status")
     wt, state = load_state(repo, task)
     validate_integration(state)
     require_no_rebase(wt)
@@ -829,16 +831,16 @@ def commit_task(repo: Path, task: str, expected_status: str, outcome: str | None
             raise TaskError("outcome is required because the existing commit has no final task subject")
         outcome = match.group(2)
     outcome = single_line(outcome, "outcome")
-    annotation = annotation_path(wt, task)
-    parsed = parse_annotation(annotation)
-    if parsed["status"] != expected_status:
+    actual_status = task_config(wt, task)["status"]
+    if actual_status != expected_status:
         raise TaskError(
-            f"annotation status mismatch at {annotation}: expected {expected_status}, found {parsed['status']}"
+            f"control status mismatch at {control_path(wt, task)}: "
+            f"expected {expected_status}, found {actual_status}"
         )
 
     git(wt, "add", "-A")
     paths = changed_paths(wt, state["base"])
-    validate_annotation_changes(wt, state, paths, parsed["status"], require_owner=True)
+    validate_task_file_changes(wt, state, paths, actual_status, require_owner=True)
     if not paths:
         raise TaskError("task has no changes relative to its recorded base")
 
@@ -866,23 +868,25 @@ def check_task(repo: Path, task: str, expected_status: str | None) -> dict[str, 
     match = FINAL_SUBJECT_RE.fullmatch(subject)
     if not match or match.group(1) != task:
         raise TaskError(f"task commit subject is invalid: {subject}")
-    annotation = annotation_path(wt, task)
-    parsed = parse_annotation(annotation)
-    if expected_status and parsed["status"] != expected_status.lower():
+    status = task_config(wt, task)["status"]
+    if expected_status and status != expected_status.lower():
         raise TaskError(
-            f"annotation status mismatch at {annotation}: expected {expected_status.lower()}, found {parsed['status']}"
+            f"control status mismatch at {control_path(wt, task)}: "
+            f"expected {expected_status.lower()}, found {status}"
         )
     paths = changed_paths(wt, state["base"], "HEAD")
-    validate_annotation_changes(wt, state, paths, parsed["status"], require_owner=True)
+    validate_task_file_changes(wt, state, paths, status, require_owner=True)
     return {
+        "task_id": canonical_task(task),
         "task_path": task,
         "worktree": str(wt),
         "feature_branch": state["feature_branch"],
         "base": state["base"],
         "commit": commit,
         "subject": subject,
-        "status": parsed["status"],
-        "annotation_path": str(annotation),
+        "status": status,
+        "control_path": str(control_path(wt, task)),
+        "annotation_path": str(annotation_path(wt, task)),
         "changed_paths": paths,
     }
 
@@ -995,12 +999,130 @@ def blob_at_commit(repo: Path, commit: str, path: str) -> str | None:
     return process.stdout
 
 
-def annotation_status_in_commit(repo: Path, commit: str, task: str) -> str | None:
-    text = blob_at_commit(repo, commit, f"docs/changes/{task}/task.md")
+def control_config_in_commit(repo: Path, commit: str, task: str) -> dict[str, Any]:
+    path = f"docs/changes/{task}/task.yml"
+    text = blob_at_commit(repo, commit, path)
     if text is None:
-        return None
-    statuses = [m.group(1).strip().lower() for line in text.splitlines() if (m := STATUS_RE.match(line))]
-    return statuses[0] if statuses else None
+        raise TaskError(f"task commit lacks canonical control: {commit} {path}")
+    try:
+        return task_ctl_parse_config(text)
+    except TaskCtlError as exc:
+        raise TaskError(f"invalid historical task control at {commit} {path}: {exc}") from exc
+
+
+def validate_verified_train(
+    repo: Path,
+    state: dict[str, Any],
+    commits: list[str],
+) -> list[dict[str, Any]]:
+    seen_tasks: set[str] = set()
+    details: list[dict[str, Any]] = []
+    for commit in commits:
+        if len(commit_parents(repo, commit)) != 1:
+            raise TaskError(f"feature train contains a merge or root commit: {commit}")
+        subject = commit_subject(repo, commit)
+        match = FINAL_SUBJECT_RE.fullmatch(subject)
+        if not match:
+            raise TaskError(f"feature train contains a non-task commit: {commit} {subject}")
+        commit_task_path = validate_target(match.group(1), branch_safe=True)
+        if commit_task_path in seen_tasks:
+            raise TaskError(f"feature train contains multiple commits for task: {commit_task_path}")
+        seen_tasks.add(commit_task_path)
+        paths = commit_changed_paths(repo, commit)
+        own_control = f"docs/changes/{commit_task_path}/task.yml"
+        own_evidence = f"docs/changes/{commit_task_path}/task.md"
+        if own_control not in paths:
+            raise TaskError(f"verified task commit lacks its lifecycle transition: {commit} {own_control}")
+        if own_evidence not in paths:
+            raise TaskError(f"verified task commit lacks its implementation evidence: {commit} {own_evidence}")
+        finalized: list[str] = []
+        evidence_tasks: set[str] = set()
+        for path in paths:
+            filename = Path(path).name
+            if filename not in {"task.md", "task.yml"}:
+                continue
+            annotated = task_from_path(path, filename)
+            if annotated is None:
+                raise TaskError(f"feature train changes misplaced {filename}: {path}")
+            if annotated != commit_task_path:
+                if not task_is_ancestor(annotated, commit_task_path) or not task_is_ancestor(
+                    state["run_target"], annotated
+                ):
+                    raise TaskError(f"task commit changes an unowned task file: {commit} {path}")
+            if blob_at_commit(repo, commit, f"docs/changes/{annotated}/spec.md") is None:
+                raise TaskError(f"feature train task file lacks sibling spec.md: {path}")
+            if filename == "task.md":
+                evidence = blob_at_commit(repo, commit, path) or ""
+                outcomes = [
+                    match.group(1).strip().lower()
+                    for line in evidence.splitlines()
+                    if (match := OUTCOME_RE.match(line))
+                ]
+                if outcomes != ["verified"]:
+                    raise TaskError(f"task evidence does not record successful verification: {commit} {path}")
+                evidence_tasks.add(annotated)
+            else:
+                config = control_config_in_commit(repo, commit, annotated)
+                expected_type = "impl" if annotated == commit_task_path else "hld"
+                if config["type"] != expected_type:
+                    raise TaskError(
+                        f"task control has wrong type before integration: {commit} {path} "
+                        f"is {config['type']}, expected {expected_type}"
+                    )
+                if config["status"] != "verified":
+                    raise TaskError(
+                        f"task control is not verified before integration: {commit} {path} "
+                        f"is {config['status']}"
+                    )
+                finalized.append(annotated)
+        missing_evidence = set(finalized) - evidence_tasks
+        if missing_evidence:
+            raise TaskError(
+                "verified controls lack evidence in the same task commit: "
+                + ", ".join(sorted(missing_evidence))
+            )
+        details.append(
+            {
+                "task_path": commit_task_path,
+                "original_commit": commit,
+                "subject": subject,
+                "finalized_tasks": finalized,
+            }
+        )
+    return details
+
+
+def finalize_train(worktree: Path, base: str, details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    original_head = head(worktree)
+    rewritten: list[dict[str, Any]] = []
+    try:
+        git(worktree, "reset", "--hard", base)
+        for detail in details:
+            original_commit = detail["original_commit"]
+            git(worktree, "cherry-pick", "--no-commit", original_commit)
+            for annotated in detail["finalized_tasks"]:
+                task_ctl_set_task(worktree, canonical_task(annotated), {"status": "done"})
+            git(worktree, "add", "-A")
+            git(worktree, "commit", "-C", original_commit)
+            require_clean(worktree, "finalized task worktree")
+            final_commit = head(worktree)
+            for annotated in detail["finalized_tasks"]:
+                if control_config_in_commit(worktree, final_commit, annotated)["status"] != "done":
+                    raise TaskError(f"failed to finalize task control in commit: {final_commit} {annotated}")
+            rewritten.append(
+                {
+                    "task_path": detail["task_path"],
+                    "original_commit": original_commit,
+                    "commit": final_commit,
+                    "subject": detail["subject"],
+                    "finalized_tasks": detail["finalized_tasks"],
+                }
+            )
+        return rewritten
+    except Exception:
+        git(worktree, "cherry-pick", "--abort", check=False)
+        git(worktree, "reset", "--hard", original_head)
+        raise
 
 
 def integrate_task(repo: Path, task: str) -> dict[str, Any]:
@@ -1017,55 +1139,34 @@ def integrate_task(repo: Path, task: str) -> dict[str, Any]:
         raise TaskError(
             f"feature train is not a fast-forward of current integration tip {integration_head}; rebase it first"
         )
-    commits = [line for line in git(integration, "rev-list", "--reverse", f"{integration_head}..{feature_head}").stdout.splitlines() if line]
+    commits = [
+        line
+        for line in git(integration, "rev-list", "--reverse", f"{integration_head}..{feature_head}").stdout.splitlines()
+        if line
+    ]
     if not commits:
         raise TaskError("feature branch has no commits to integrate")
-    seen_tasks: set[str] = set()
-    details = []
-    for commit in commits:
-        if len(commit_parents(integration, commit)) != 1:
-            raise TaskError(f"feature train contains a merge or root commit: {commit}")
-        subject = commit_subject(integration, commit)
-        match = FINAL_SUBJECT_RE.fullmatch(subject)
-        if not match:
-            raise TaskError(f"feature train contains a non-task commit: {commit} {subject}")
-        commit_task_path = validate_target(match.group(1), branch_safe=True)
-        if commit_task_path in seen_tasks:
-            raise TaskError(f"feature train contains multiple commits for task: {commit_task_path}")
-        seen_tasks.add(commit_task_path)
-        paths = commit_changed_paths(integration, commit)
-        # The leaf's own annotation must be done in this commit's tree, whether or
-        # not this particular commit modified it (an annotation-only roll-up does not).
-        if annotation_status_in_commit(integration, commit, commit_task_path) != "done":
-            raise TaskError(
-                f"task commit lacks a done sibling annotation: {commit} docs/changes/{commit_task_path}/task.md"
-            )
-        for path in paths:
-            if Path(path).name != "task.md":
-                continue
-            annotated = annotation_task_from_path(path)
-            if annotated is None:
-                raise TaskError(f"feature train changes misplaced task.md: {path}")
-            if annotated != commit_task_path:
-                if not task_is_ancestor(annotated, commit_task_path) or not task_is_ancestor(
-                    state["run_target"], annotated
-                ):
-                    raise TaskError(f"task commit changes an unowned annotation: {commit} {path}")
-            associated_spec = blob_at_commit(integration, commit, f"docs/changes/{annotated}/spec.md")
-            if associated_spec is None:
-                raise TaskError(f"feature train annotation lacks sibling spec.md: {path}")
-            if annotation_status_in_commit(integration, commit, annotated) != "done":
-                raise TaskError(f"feature train annotation is not done: {path}")
-        details.append({"task_path": commit_task_path, "commit": commit, "subject": subject})
-
-    git(integration, "merge", "--ff-only", state["feature_branch"])
+    details = validate_verified_train(integration, state, commits)
+    rewritten = finalize_train(wt, integration_head, details)
+    try:
+        if head(integration) != integration_head:
+            raise TaskError("integration branch advanced while finalizing; verified train was restored")
+        git(integration, "merge", "--ff-only", state["feature_branch"])
+    except Exception:
+        git(wt, "reset", "--hard", feature_head)
+        state["final_commit"] = feature_head
+        save_state(wt, state)
+        raise
     require_clean(integration, "integration checkout")
+    state["base"] = rewritten[-2]["commit"] if len(rewritten) > 1 else integration_head
+    state["final_commit"] = head(wt)
+    save_state(wt, state)
     return {
         "integration_branch": state["integration_branch"],
         "previous_head": integration_head,
         "integration_head": head(integration),
         "feature_branch": state["feature_branch"],
-        "commits": details,
+        "commits": rewritten,
     }
 
 
@@ -1087,10 +1188,10 @@ def parser() -> argparse.ArgumentParser:
     show = commands.add_parser("show", help="Report reusable worktree state without mutation")
     show.add_argument("task")
 
-    annotate = commands.add_parser("annotate", help="Write an annotation at its computed sibling path")
+    annotate = commands.add_parser("annotate", help="Write task evidence and lifecycle progress")
     annotate.add_argument("task", help="Owning executable leaf")
     annotate.add_argument("--for-task", dest="annotated")
-    annotate.add_argument("--status", required=True, choices=sorted(TERMINAL_STATUSES))
+    annotate.add_argument("--outcome", required=True, choices=sorted(EXECUTION_OUTCOMES))
     annotate.add_argument("--summary", required=True)
     annotate.add_argument("--verification", action="append", default=[])
     annotate.add_argument("--error", action="append", default=[])
@@ -1100,12 +1201,16 @@ def parser() -> argparse.ArgumentParser:
 
     commit = commands.add_parser("commit", help="Consolidate all task-owned work into one commit")
     commit.add_argument("task")
-    commit.add_argument("--status", required=True, choices=sorted(TERMINAL_STATUSES))
+    commit.add_argument(
+        "--status",
+        required=True,
+        choices=["new", "critic", "planned", "ready", "verified"],
+    )
     commit.add_argument("--outcome")
 
-    check = commands.add_parser("check", help="Validate the single task commit and annotation")
+    check = commands.add_parser("check", help="Validate the single task commit and control")
     check.add_argument("task")
-    check.add_argument("--status", choices=sorted(TERMINAL_STATUSES))
+    check.add_argument("--status", choices=["new", "critic", "planned", "ready", "verified", "done"])
 
     rebase = commands.add_parser("rebase", help="Replay the single task commit onto a new base")
     rebase.add_argument("task")
@@ -1143,7 +1248,7 @@ def main() -> int:
                 repo,
                 args.task,
                 args.annotated or args.task,
-                args.status,
+                args.outcome,
                 args.summary,
                 args.verification,
                 args.error,
@@ -1169,7 +1274,7 @@ def main() -> int:
     except RebaseConflict as exc:
         print(f"spec-run-task conflict: {exc}", file=sys.stderr)
         return 3
-    except (TaskError, OSError, json.JSONDecodeError) as exc:
+    except (TaskError, TaskCtlError, OSError, json.JSONDecodeError) as exc:
         print(f"spec-run-task: {exc}", file=sys.stderr)
         return 2
 

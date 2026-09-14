@@ -143,9 +143,9 @@ For a supplied destination, `[ROOT @slow]` resolves it with:
 python3 .omp/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
 ```
 
-The root verifies the destination remains beneath `docs/changes/`. `[PATH boss-errand @smol]` then inspects direct child directories whose names start with digits followed by `-`, checks current paths/symbols, and searches existing `spec.md` files for equivalent tasks. It returns existence, collision, and equivalence evidence only; it does not decide acceptance.
+The root verifies the destination remains beneath `docs/changes/`. The resolver consumes `task_ctl.list_tasks` for existing lifecycle order and reports canonical records, while independently reserving every occupied numbered child directory, including directories without `task.yml` or `spec.md`. `[PATH boss-errand @smol]` checks current paths/symbols and searches existing `spec.md` files for equivalent tasks. It returns existence, collision, and equivalence evidence only; it does not decide acceptance.
 
-- First new order is one greater than the largest existing numeric prefix; start at `01` if none exist.
+- First new order is one greater than the largest order from task_ctl metadata or occupied numeric directory; start at `01` if none exist.
 - Never fill an earlier gap.
 - Width is at least two and no narrower than existing/new order width.
 - Assign consecutive orders to accepted, not-already-materialized tasks.
@@ -158,7 +158,7 @@ Detect an existing equivalent task by matching the reviewed scope, root cause, a
 
 ### Inline output
 
-Without a specification directory, do not invent one. Return each task using the remediation template. Use stable finding IDs and priority/blocker metadata; filesystem order may be omitted or shown as `unassigned`.
+Without a specification directory, do not invent one. Return each task using the remediation template and identify lifecycle metadata as task_ctl fields (`type: impl`, `status: new`, `priority`, canonical `blocked-by`, and `source`); filesystem order may be omitted or shown as `unassigned`. Do not provide handwritten YAML.
 
 ## 6. Assign priority and blockers
 
@@ -168,9 +168,12 @@ Without a specification directory, do not invent one. Return each task using the
 - source area and candidate order;
 - final directory/order;
 - priority with reason;
-- blocker list;
+- canonical blocker task IDs;
+- source parent `spec.md`;
 - duplicate/collision decision;
 - exact root-cause boundary.
+
+The table is an in-memory planning record, not a second metadata format. After freezing it, write evidence to `spec.md` from the template, then invoke `.omp/csw/bin/task_ctl` (or its runpy-loaded API) with `set_task(..., {"type": "impl", "status": "new", "order": ..., "priority": ..., "blocked-by": [...], "source": "<parent>/spec.md"})` for each generated task. All lifecycle validation and writes belong to task_ctl; do not hand-edit `task.yml`, infer dependencies from prose, or embed these controls in `spec.md`.
 
 Use the task contract, not blind severity conversion:
 
@@ -180,17 +183,19 @@ Use the task contract, not blind severity conversion:
 
 Critical/high correctness and stability findings normally map to P0. A medium finding can be P0 when it protects a public ownership or compatibility invariant. Purely structural simplification normally maps to P1 unless it is prerequisite to another accepted task.
 
-A blocker exists only when a task requires an interface, invariant, or mechanism from another task. Thematic similarity is not a dependency. Blockers must name existing task directories or earlier newly assigned directories; no forward edges or cycles.
+A blocker exists only when a task requires an interface, invariant, or mechanism from another task. Thematic similarity is not a dependency. Blockers must be canonical repository-relative task IDs naming existing tasks or earlier newly assigned tasks; no forward edges or cycles. Only `done` satisfies a dependency.
 
 After the table is frozen, the root gives the drafting worker exact destinations, table values, candidate packet content, template, and any evidence deltas. The worker has no design authority and writes no task not present in the table. There is no concurrent order allocation.
 
 ## 7. Write one self-contained task per accepted root cause
 
-`[DRAFT boss-builder-fast @smol]` (or the explicitly selected `boss-builder @task`) uses `.omp/cpp-review/templates/remediation-task.md`. Each task must stand alone; an implementer must not need review prose, parent conversation, or sibling tasks to learn its contract.
+`[DRAFT boss-builder-fast @smol]` (or the explicitly selected `boss-builder @task`) uses `.omp/cpp-review/templates/remediation-task.md` for evidence-only `spec.md`, then uses task_ctl to create/update the sibling `task.yml`. Each task must stand alone; an implementer must not need review prose, parent conversation, or sibling tasks to learn its contract. The builder receives exact task IDs and metadata from the frozen table, has no design authority, does not allocate numbers, and never writes YAML directly.
+
+Use canonical repository-relative IDs for every `blocked-by` entry, with no forward edges or cycles.
 
 Required content:
 
-- reviewed scope and specialist/orchestrator source;
+- reviewed scope and specialist/orchestrator evidence provenance in `spec.md`; lifecycle `source` is written to task.yml as the supplied parent `spec.md`;
 - finding ID, area, severity, verification state, confidence, backend scope, and smallest useful location;
 - observable corrected outcome;
 - invariant, current failure or objective complexity mechanism, evidence, and impact;
@@ -204,7 +209,7 @@ Translate the candidate's remediation seed directly. Recheck paths/symbols that 
 
 For structural tasks, name concrete deletions/consolidations and the single mechanism that remains. For hypotheses, make measurement/falsification the task outcome and do not state the suspected effect as fact.
 
-Do not modify implementation, tests, parent specs, existing task specs, or unrelated files. If a destination is supplied, write only newly assigned task directories and `spec.md` files; never write `review.md`, indexes, manifests, or TODO files.
+Do not modify implementation, tests, parent specs, existing task specs, or unrelated files. If a destination is supplied, write only newly assigned task directories, evidence-only `spec.md`, and task_ctl-managed `task.yml`; never write `review.md`, indexes, manifests, or TODO files.
 
 ## 8. Validate the generated set
 
@@ -212,10 +217,11 @@ After writing, `[ROOT @slow]` reads every new `spec.md` and checks:
 
 - every accepted non-duplicate root cause has exactly one task;
 - no rejected candidate, residual observation, or validation note became a task;
-- order values are consecutive and match directory prefixes;
+- task_ctl order values are consecutive and match directory prefixes;
 - IDs and slugs match directories;
-- priorities and backward-only blockers match the assignment table;
-- reviewed scope and source metadata are present;
+- task_ctl priorities and canonical backward-only blockers match the assignment table;
+- task_ctl source points to the supplied parent `spec.md`, with `type: impl` and `status: new`;
+- no lifecycle controls are embedded in `spec.md`;
 - invariant/failure/evidence and affected backends are preserved;
 - paths and important symbols are current;
 - acceptance criteria are observable and verification is focused;

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 
 TASK_DIR_RE = re.compile(r"^(\d+)-")
@@ -34,15 +36,26 @@ def is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def task_orders(spec_dir: Path) -> list[tuple[int, str]]:
-    orders = []
+def load_task_ctl(repo: Path) -> Any:
+    try:
+        helper_root = Path(__file__).resolve().parents[3]
+        namespace = runpy.run_path(
+            str(helper_root / ".omp" / "csw" / "bin" / "task_ctl"),
+            run_name="resolve_spec_path",
+        )
+        return namespace["list_tasks"]
+    except (OSError, KeyError, RuntimeError) as exc:
+        raise RuntimeError(f"unable to load task_ctl API: {exc}") from exc
+
+
+def occupied_task_dirs(spec_dir: Path) -> list[tuple[int, str]]:
+    occupied: list[tuple[int, str]] = []
     for child in spec_dir.iterdir():
-        if not child.is_dir():
-            continue
-        match = TASK_DIR_RE.match(child.name)
-        if match:
-            orders.append((int(match.group(1)), child.name))
-    return sorted(orders)
+        if child.is_dir():
+            match = TASK_DIR_RE.match(child.name)
+            if match:
+                occupied.append((int(match.group(1)), child.name))
+    return sorted(occupied, key=lambda item: (item[0], item[1]))
 
 
 def main() -> int:
@@ -64,21 +77,50 @@ def main() -> int:
             raise RuntimeError(f"spec directory does not exist: {candidate}")
 
         relative = candidate.relative_to(root)
-        existing = task_orders(candidate)
-        maximum = max((order for order, _ in existing), default=0)
+        list_tasks = load_task_ctl(root)
+        task_records = list_tasks(root, relative.as_posix(), impl=False)
+        occupied = occupied_task_dirs(candidate)
+        metadata_orders: dict[str, int] = {}
+        for record in task_records:
+            task_id = record.get("task-id")
+            order = record.get("order")
+            if (
+                not isinstance(task_id, str)
+                or Path(task_id).parent.as_posix() != relative.as_posix()
+                or not isinstance(order, int)
+                or isinstance(order, bool)
+            ):
+                continue
+            metadata_orders[Path(task_id).name] = order
+
+        # The filesystem remains part of collision safety: a numbered directory
+        # without task.yml/spec.md still reserves its numeric prefix.
+        existing = sorted(
+            {(metadata_orders.get(name, order), name) for order, name in occupied},
+            key=lambda item: (item[0], item[1]),
+        )
+        metadata_maximum = max((order for order, _ in existing), default=0)
+        occupied_maximum = max((order for order, _ in occupied), default=0)
+        maximum = max(metadata_maximum, occupied_maximum)
         next_order = maximum + 1
-        width = max(2, len(str(next_order)), *(len(name.split("-", 1)[0]) for _, name in existing))
-        result = {
+        width = max(
+            2,
+            len(str(next_order)),
+            *(len(name.split("-", 1)[0]) for _, name in occupied),
+            *(len(name.split("-", 1)[0]) for _, name in existing),
+        )
+        result: dict[str, Any] = {
             "repo_root": str(root),
             "spec_dir": relative.as_posix(),
             "task_root": relative.as_posix(),
             "existing_task_dirs": [name for _, name in existing],
+            "existing_tasks": task_records,
             "next_task_order": next_order,
             "order_width": width,
         }
         print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=True))
         return 0
-    except RuntimeError as exc:
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
         print(f"spec-error: {exc}", file=sys.stderr)
         return 2
 

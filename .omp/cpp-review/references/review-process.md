@@ -84,7 +84,11 @@ For an optional specification directory, `[ROOT @slow]` runs:
 python3 .omp/cpp-review/scripts/resolve_spec_path.py --repo . --spec '<spec-dir>'
 ```
 
-The root verifies the resolved path remains beneath `docs/changes/` and passes the resolved destination to reconnaissance and synthesis. No specification directory is invented.
+The root verifies the resolved path remains beneath `docs/changes/` and passes the resolved destination to reconnaissance and synthesis. No specification directory is invented. The resolver obtains existing task order from the shared `.omp/csw/bin/task_ctl` API and also reserves every occupied numbered child directory, including directories without `task.yml` or `spec.md`.
+
+Task lifecycle metadata is canonical in sibling `task.yml` files and is managed only by `.omp/csw/bin/task_ctl`. Review evidence remains in `spec.md`; generated remediation tasks use `type: impl`, `status: new`, the assigned `order`, review `priority`, canonical `blocked-by` task IDs, and the supplied parent `spec.md` as `source`. Agents must use the importable task_ctl API (`task_dir`, `get_task`, `set_task`, `list_tasks`, and `parse_config`) or its CLI for paths, metadata, ordering, and dependencies; they must not hand-edit YAML or parse task metadata themselves. Missing metadata is always fail-closed.
+
+The task_ctl API is loaded from the extensionless executable with `runpy.run_path` when a helper needs direct access. Its canonical IDs are repository-relative paths rooted at `.cswd/tasks/` or `docs/changes/`; shorthand paths mean `.cswd/tasks/` only. Dependencies are canonical IDs, and only `done` satisfies a dependency.
 
 After scope resolution, the root starts one shared read-only reconnaissance phase/map. Independent bounded `scout @smol` shards MAY be batched and merged once; they cover broad source, callers, tests, backend counterparts, capability/dispatch/fallback paths, build/backend configuration, whole-codebase risk ranking, and specification mapping. For selected commits, an `[ERRAND boss-errand @smol]` worker first retrieves the complete diff (including rename/copy metadata) with a named read-only git command/artifact; the scouts and relevant area leaves then inspect that artifact and the exact source ranges it identifies. The scout phase reports a compact map with exact `path:line`/symbol anchors, exhaustive versus sampled search coverage, and uninspected areas. It MUST not turn raw logs or a repository dump into the packet.
 
@@ -103,8 +107,6 @@ For selected commits, full-diff review still occurs in the shared scout map and 
 
 If the reconnaissance map has a factual gap, `[ROOT @slow]` sends a narrow, atomic `[ERRAND boss-errand @smol]` followup naming the exact question, paths/symbols, and desired `path:line` evidence. Followups do not repeat the frontier review and their evidence is merged into the shared map before invariant decisions. Area leaves may request a followup through the root; they do not dispatch it themselves.
 
-## Specification mapping
-
 For a supplied `docs/changes/...` directory:
 
 [SCOUT scout @smol] performs these specification-map reads:
@@ -114,7 +116,7 @@ For a supplied `docs/changes/...` directory:
 3. distinguish requirements from suggested implementation details;
 4. map requirements to implementation and tests using exact anchors;
 5. identify requirements without evidence;
-6. inspect existing numbered task specs for established contracts, numbering, dependencies, and equivalent remediations.
+6. inspect existing task records with `task_ctl list_tasks` and read `spec.md` only for review evidence, established contracts, and equivalent remediations.
 
 The root supplies this compact map to every area leaf and synthesis. Prior review prose is not authoritative evidence unless the user explicitly requests its re-verification. Never create or update `review.md`. If the map omits a needed fact, request a narrow followup rather than asking an advisor to read a path.
 

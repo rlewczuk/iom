@@ -1,5 +1,5 @@
 ---
-description: Implement docs/changes/<change-name>[/subpath]/spec.md or its unfinished subtasks in isolated worktrees
+description: Implement one task.yml-controlled docs/changes task or its unfinished implementation descendants in isolated worktrees
 ---
 
 Read `skill://spec-run-task` with the read tool and follow it exactly.

@@ -14,31 +14,34 @@ The command supplies a path relative to `.cswd/tasks/` and an optional generatio
 <task-name>[/subdirectory...] [--impl|--hld]
 ```
 
-For target `<target>`, use exactly:
+For target `<target>`, resolve paths and metadata through `.omp/csw/bin/task_ctl`:
 
-- parent specification: `.cswd/tasks/<target>/spec.md`;
-- user remarks, optional: `.cswd/tasks/<target>/spec-fixme.md`;
-- generated task specifications: `.cswd/tasks/<target>/<NN>-<task-slug>/spec.md`.
+- canonical task ID: `.cswd/tasks/<target>`;
+- parent specification: `task_ctl get '<task-id>' --spec`;
+- user remarks, optional: sibling `spec-fixme.md`;
+- generated children: `.cswd/tasks/<target>/<NN>-<task-slug>/spec.md`, with sibling `task.yml`.
 
-The numeric prefix is part of the task directory name and records dependency order. The ordered directories plus the completion response are the task list; do not create a separate TODO or index file unless the user requests one.
+`task.yml` is the only task metadata authority. Never read, create, edit, or parse it directly; use `task_ctl` for every metadata operation. `spec.md` contains the task contract, not control fields. The numeric directory prefix remains a human-readable order label; `order` in the control file is authoritative. The ordered directories plus the completion response remain the task list; do not create a TODO or index file.
+
+Below, `task_ctl` always means `.omp/csw/bin/task_ctl --repo '<project-root>'`; use that executable, not an assumed PATH installation. It requires Python 3 and PyYAML; its module docstring and `--help` contain the complete CLI contract.
 
 ## Task types and generation modes
 
-Every generated `spec.md` MUST contain exactly one header field `**Type:** impl` or `**Type:** hld`:
+Every generated task MUST have `type: impl` or `type: hld` in its control file, set through `task_ctl`:
 
 - `impl` — a leaf task ready for direct implementation by an implementer agent, without further design or decomposition.
 - `hld` — a high-level design for a cohesive component that must be split into subtasks before implementation. Its children may be `impl` or `hld`; plan it again with `/csw-plan <target>/<NN>-<task-slug>`.
 
 Resolve the mode after applying conversation and fixme precedence:
 
-| Invocation / effective parent header | Generation mode |
+| Invocation / effective parent control type | Generation mode |
 | --- | --- |
 | Explicit `--hld`, regardless of parent type | Design |
 | Explicit `--impl`, regardless of parent type | Implementation |
-| No flag, parent `**Type:** hld` | Design |
-| No flag, parent `**Type:** impl` or no Type header | Automatic |
+| No flag, parent `type: hld` | Design |
+| No flag, parent `type: impl` | Automatic |
 
-An explicit flag overrides the parent type; a parent marked `impl` does not force implementation mode. Older parent specs without Type remain valid. Reject an unsupported or duplicate parent Type header instead of guessing.
+An explicit flag overrides the parent type; a parent marked `impl` does not force implementation mode. Use `task_ctl get '<task-id>' --type`. New controls created with `set` default to `hld` and `new`. Missing or invalid controls are script errors; correct the reported input through `task_ctl` rather than guessing.
 
 - **Design:** treat the input as high-level design and split along component, responsibility, or contract boundaries. Generate mostly lower-level `hld` tasks; do not exhaustively flatten components into implementation leaves. A naturally small, fully decided component may be `impl` if it passes the leaf-readiness check below. Do not force a type quota or wrap an already leaf-ready input in a redundant `hld` task.
 - **Implementation:** keep decomposing until every generated task passes the leaf-readiness check and is `impl`. Resolve necessary design decisions in this planning pass; never relabel complex work as `impl` just to satisfy the flag. If a material decision cannot be resolved, follow the ambiguity workflow before writing affected tasks; do not silently fall back to design mode.
@@ -48,17 +51,17 @@ Generate only the immediate children for this invocation, not a nested task tree
 
 ## Guardrails
 
-- Require one non-empty target argument and at most one mode flag, `--impl` or `--hld`, in either position. Reject conflicting or repeated flags, unknown flags, and extra positional arguments before writing. Parse flags separately from the target; never include them in a task path. Reject absolute paths, `.` or `..` components, empty path components, backslashes, and any target that escapes `.cswd/tasks/`.
+- Require one non-empty target argument and at most one mode flag, `--impl` or `--hld`, in either position. Reject conflicting or repeated flags, unknown flags, and extra positional arguments before writing. Parse flags separately from the target; never include them in a task path. Use `task_ctl` for task path validation and resolution; do not reconstruct or bypass its traversal and containment checks.
 - Allow safe nested targets such as `allocator/gpu-layout`; the argument names the exact directory containing the parent `spec.md`.
 - If the parent `spec.md` does not exist, report its expected path and stop. A missing `spec-fixme.md` is normal.
 - Read the complete parent specification and complete fixme file when present.
 - Treat direct conversation instructions as highest priority, then `spec-fixme.md` as user corrections or additions, then `spec.md`. For claims about current repository behavior, the repository is authoritative. Ask only when a material intent or policy conflict remains.
-- Do not modify the parent `spec.md`, `spec-fixme.md`, implementation files, or unrelated task directories.
+- Do not modify parent requirements, `spec-fixme.md`, implementation files, or unrelated task directories. The only parent metadata change is `status: planned` after successful child generation.
 - Keep the design minimal. Exclude speculative abstractions, future-proofing, generic frameworks, optional extras, unrelated cleanup, and complementary features not required by the source specification.
 - Do not invent functionality to make a task feel complete. Every requirement in every mini-spec must trace to the parent spec, the fixme remarks, a direct user instruction, or a repository constraint necessary to implement them correctly.
 - Do not split work merely to produce more tasks. If the specification is already one cohesive, leaf-ready unit, create one `impl` task in any mode.
 - Do not create tasks for work that is already complete and conforms to the specification.
-- Do not implement the change. The deliverables are the task mini-specifications and the concise ordered list in the completion response.
+- Do not implement the change. The deliverables are task mini-specifications, their script-managed controls, and the concise ordered list in the completion response.
 
 ## Boss orchestration contract
 
@@ -68,7 +71,7 @@ The `@slow` root owns intake, mode resolution, complete requirement accounting, 
 
 - `[FACTS csw-plan-facts @task]` performs scoped, parallel, read-only factual discovery using exactly the profile's `read`, `grep`, `glob`, `lsp`, and `ast_grep` tools (`advisor: false`, `spawns: []`). It has no design authority, writing, delegation, or gates.
 - `[DRAFT boss-builder-fast @smol]` writes frozen mini-specs and performs simple mechanical edits only after the root fixes destinations, types, order, blockers, requirements, and acceptance criteria. It has no design, type-classification, or numbering authority.
-- `[PATH boss-errand @smol]` may perform mechanical metadata, path, existence, and collision checks against exact known paths; it MUST NOT perform substantive source discovery or design work.
+- `[PATH boss-errand @smol]` may invoke `task_ctl` for mechanical metadata, path, existence, and collision checks against exact known paths; it MUST NOT parse control files, duplicate script logic, perform substantive source discovery, or make design decisions.
 - `[ADVISOR boss-advisor @advisor]` handles only genuinely key architectural decisions from supplied facts. It is tool-free and packet-only: it cannot search, fetch artifacts, edit, delegate, or run gates.
 
 Fact packets MUST provide exact `file:line` and symbol evidence, decisive minimal excerpts, a `done`/`partial`/`missing`/`discrepant` mapping, relevant conventions and focused test commands, inspected and uninspected areas, gaps, and separate `SOURCE FACTS` from `INFERENCE`. Batch truly independent discovery and disjoint writers, collect each phase before consuming its output, and do not split output tasks merely for parallelism. No worker delegates recursively; workers skip gates, tests, linters, builds, and formatters.
@@ -84,7 +87,7 @@ The seven stages below are Boss-owned; role dispatch supplements the stage and d
 ### 1. Read and normalize the requested change
 The `@slow` root completes argument parsing, intake, precedence and mode resolution before any delegation, including all requirements, non-goals, assumptions, and unresolved decisions.
 
-Read `spec.md`, then `spec-fixme.md` if present. Extract:
+Resolve the parent with `task_ctl get '<task-id>' --spec` and read its complete output file, then `spec-fixme.md` if present. Read metadata with `task_ctl get '<task-id>' --all`; stop on missing or invalid control metadata. Extract:
 
 - required outcomes and observable behavior;
 - explicit scope and non-goals;
@@ -92,7 +95,7 @@ Read `spec.md`, then `spec-fixme.md` if present. Extract:
 - named files, symbols, commands, tests, examples, and external or local references;
 - every actionable fixme remark;
 - unresolved decisions and assumptions.
-- the parent Type header, if present, and the effective generation mode.
+- the parent control type returned by the script and the effective generation mode.
 
 Build one coherent requirement set using the precedence rules above. A fixme correction replaces the conflicting parent requirement; do not preserve both alternatives. Do not propagate brainstorming, rejected alternatives, or editorial commentary as implementation work.
 
@@ -145,7 +148,7 @@ If no implementation work remains, create no task directories and report that th
 
 ### 4. Build and prioritize the task graph
 
-The root owns priorities, the dependency DAG, and numbering. `boss-errand` may check exact destination metadata, paths, and collisions mechanically; it does not discover substantive source facts.
+The root owns priorities and genuine dependency edges. `task_ctl plan` performs the topological sort, numbering, exact blocker-ID substitution, and collision checks. `boss-errand` may invoke it against root-approved candidates; it does not discover substantive source facts.
 
 For every candidate task, identify only genuine blocking edges. A blocker is work whose output is required before the task can be planned, implemented, or verified; conceptual similarity is not a dependency. State which output is needed. Writing or decomposing an `hld` spec does not satisfy a blocker that requires its implemented behavior; that blocker remains until the required descendants are implemented and verified.
 
@@ -155,28 +158,24 @@ Assign a priority:
 - **P1** — required feature behavior on the normal implementation path;
 - **P2** — required finishing work such as cross-cutting verification or documentation that does not gate implementation.
 
-All generated tasks are required; P2 never means optional. Order tasks with a stable topological sort: blockers first, then higher priority, then the order requirements appear in the parent specification. When tasks are independent, say so instead of adding a false edge.
+All generated tasks are required; P2 never means optional. The control schema also accepts P3, but this workflow's priority policy remains P0–P2. Supply root-approved candidates to `task_ctl plan '<task-id>' '<candidate-list-as-yaml>'` in parent requirement order. Each candidate supplies a precise lowercase kebab-case `slug`, `type`, `priority`, and `blocked-by` records. For an edge to another proposed candidate, use its slug as the planning input's `task-id`; the script replaces it with the exact generated task ID. Use canonical IDs for existing external prerequisites. Put the required prerequisite output in optional `remarks`, not in an ambiguous free-form blocker field.
 
-Number the sorted tasks from `01`. Use short lowercase kebab-case slugs that describe the delivered behavior, for example `01-load-manifest`. Avoid generic slugs such as `setup`, `misc`, `changes`, or `cleanup`.
+The script returns dependency-first order, breaking ties by priority and then input order, assigns orders starting at 1 and `<NN>-<slug>` destinations, and reports occupied destinations. Preserve its returned IDs, orders, source paths, and blocker records verbatim. Do not hand-sort, allocate numbers, or infer dependencies from prefixes. When tasks are independent, supply an empty blocker list.
 
-Before writing, check every destination. Never silently overwrite an unrelated file or user-authored task specification. If a destination already contains a task for the same source and outcome, revise it carefully; otherwise choose a distinct precise slug and report the collision.
+Use short slugs describing delivered behavior, not `setup`, `misc`, `changes`, or `cleanup`. Never silently overwrite an occupied destination. If it is the same source and outcome, revise carefully; otherwise choose a distinct precise slug, rerun `plan`, and report the collision. Equivalence is a root judgment; collision detection is script-owned.
 
 ### 5. Write one self-contained mini-spec per task
 
-Only after the root freezes destinations, types and their readiness rationale, order, blockers, requirements, and acceptance does `boss-builder-fast` (`@smol`) mechanically write the mini-specs. The writer cannot redesign tasks, change types, or allocate numbers.
+Only after the root freezes the complete script-returned assignment table, type-readiness rationale, requirements, and acceptance does `boss-builder-fast` (`@smol`) write mini-spec prose and invoke `task_ctl set` for each task's control. The writer cannot redesign tasks, change types, allocate numbers, or directly write `task.yml`.
 
 Each mini-spec is either a direct implementation contract (`impl`) or a bounded input to a later design/decomposition pass (`hld`). It must be understandable without reading the parent specification, fixme file, conversation, or sibling task specs. Repeat the few shared decisions needed by the task instead of saying “follow the parent spec” or “same as the previous task.” References to blockers provide sequencing, not missing requirements.
 
-Use this shared structure. All header fields, including Type, are mandatory; omit only body sections that truly do not apply. Apply the type-specific rules below.
+Create or update each child's control with `task_ctl set '<exact-child-id>' --type '<impl|hld>' --status new --order '<integer>' --priority '<P0|P1|P2>' --blocked '<YAML-list-of-task-id-and-optional-remarks-records>' --source '<parent-spec-path>'`. Use the frozen table's values verbatim. Preserve a revised existing task's lifecycle unless the root explicitly determines the revision invalidates that state; never reset completion incidentally. A whole configuration may instead be passed to `set --all`; this is script input, never file content written by the model.
+
+Use this shared Markdown structure; omit only body sections that truly do not apply. Do not duplicate type, status, order, priority, blockers, or source as Markdown control headers. Keep any substantive priority rationale in relevant requirements, not a second metadata field. Apply the type-specific rules below.
 
 ```markdown
 # <Task title>
-
-**Order:** <NN>
-**Type:** <impl|hld>
-**Priority:** <P0|P1|P2> — <brief reason>
-**Blocked by:** <task directory names, or “None”>
-**Source:** `.cswd/tasks/<target>/spec.md`
 
 ## Outcome
 
@@ -247,13 +246,14 @@ Before completing:
 
 - account for every required source behavior exactly once, except intentional repetition needed to keep mini-specs self-contained;
 - confirm completed behavior has no task and every remaining requirement has one;
-- verify each blocker points to an earlier generated task and no dependency cycle exists;
-- verify numeric directory order matches the dependency and priority order;
-- verify every generated header has exactly one Type with value `impl` or `hld`, and every classification satisfies the selected mode and leaf-readiness check;
+- use `task_ctl plan` output and `task_ctl list '<task-id>' --full` to verify the generated set matches the frozen dependency/priority order; the script validates types, records, paths, and cycles rather than the model parsing metadata;
+- confirm each script-returned type satisfies the selected mode and leaf-readiness check;
 - in Implementation mode, confirm all tasks are `impl`; in Design mode, confirm useful lower-level decomposition rather than forced flattening or unchanged wrappers; in Automatic mode, confirm complexity was assessed independently after the logical split;
 - verify each mini-spec contains sufficient repository references and type-appropriate acceptance/verification; each `hld` has actionable decomposition requirements and preserves eventual implementation acceptance;
 - remove duplicated work, scaffolding-only tasks, speculative improvements, and optional extras;
 - confirm acceptance criteria collectively cover delivery of the parent specification and applicable fixme remarks, while distinguishing design completion from implemented behavior.
+
+After all generated children and their contracts pass the consistency check, run `task_ctl set '<parent-task-id>' --status planned`. Do not mark the parent planned when no children were generated or when generation remains incomplete. Planning never marks implementation done or satisfies a dependency.
 
 ## Completion response
 

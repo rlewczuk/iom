@@ -1,9 +1,5 @@
 # <Action-oriented remediation title>
 
-**Order:** <NN | unassigned>
-**Priority:** <P0|P1|P2> — <brief reason>
-**Blocked by:** <earlier task directory names, or None>
-**Review source:** `<cpp-inference skill>` — `<exact selected commit or whole-codebase reviewed-state identity>`
 **Finding:** `<CC|ST|AR|NT|PF>-###`
 **Review area:** <Contract & correctness | C++/GPU stability | Backend architecture & simplicity | Numerical correctness & tests | Performance>
 **Review severity:** <critical|high|medium|low>
@@ -11,6 +7,7 @@
 **Review scope:** <introduced by selected commit | materially exposed by selected commit | whole-codebase>
 **Backend scope:** <common/backend list>
 **Location:** `<smallest useful current path and symbol>`
+**Review source:** `<cpp-inference skill>` — `<exact selected commit or whole-codebase reviewed-state identity>`
 
 ## Outcome
 
