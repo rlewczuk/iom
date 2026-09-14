@@ -11,20 +11,21 @@ public API despite having no ``.py`` suffix::
 The public API is ``TaskCtlError``, ``task_dir(repo, task_id)``,
 ``get_task(repo, task_id)``, ``set_task(repo, task_id, updates,
 replace=False)``, ``edit_blockers(repo, add=None, delete=None)``,
-``list_tasks(repo, task_id, impl=False)``, ``parse_config(text)``,
-``detect_cycle(edges)``, and ``scan_tasks(repo, task_id)``. ``scan_tasks``
-returns the same direct-child records as ``list_tasks`` but represents a
-malformed child's control as ``{task-id: ..., error: ...}``, so execution can
-retain that blocker while continuing independent tasks. Container/path errors
-still raise. ``plan_tasks`` is also available for callers that want the CLI's
-mechanical planning operation.
+``list_tasks(repo, task_id, impl=False, recursive=False, plan=False)``,
+``parse_config(text)``, ``detect_cycle(edges)``, and
+``scan_tasks(repo, task_id)``. ``scan_tasks`` returns the same direct-child
+records as ``list_tasks`` but represents a malformed child's control as
+``{task-id: ..., error: ...}``, so execution can retain that blocker while
+continuing independent tasks. Container/path errors still raise.
+``plan_tasks`` is also available for callers that want the CLI's mechanical
+planning operation.
 
 Schema
 ------
 A control is a YAML mapping containing only these keys, in this form::
 
     type: impl                    # impl or hld
-    status: ready                 # new, critic, planned, ready, verified, done
+    status: ready                 # new, critic, planned, ready, verified, done, cancelled
     order: 2                      # optional nonnegative integer; bool is invalid
     priority: P1                  # optional P0, P1, P2, or P3
     blocked-by:                   # optional; unique exact task IDs
@@ -40,11 +41,12 @@ dependency.
 ``new`` is newly recorded, ``critic`` means its specification critique is
 complete, ``planned`` means its required decomposition is complete, ``ready``
 means an implementation result is awaiting parent verification, ``verified``
-means verification passed but integration is pending, and ``done`` is
-integrated completion.  Only ``done`` in the repository tree being queried
-satisfies a dependency.  ``running``, ``blocked``, and ``failed`` are execution
-outcomes, not lifecycle statuses; they belong in ``task.md`` evidence (under
-``**Outcome:**``), never in ``task.yml``.
+means verification passed but integration is pending, ``done`` is integrated
+completion, and ``cancelled`` is terminal without completion.  Only ``done``
+in the repository tree being queried satisfies a dependency.  ``running``,
+``blocked``, and ``failed`` are execution outcomes, not lifecycle statuses;
+they belong in ``task.md`` evidence (under ``**Outcome:**``), never in
+``task.yml``.
 
 New controls default only ``type: hld`` and ``status: new``.  Optional fields
 stay absent until supplied.  A whole replacement of an existing control must
@@ -118,21 +120,28 @@ Use flow-style YAML for option arguments that might otherwise begin with a
 hyphen.  For a positional block sequence, terminate option parsing explicitly,
 for example ``task_ctl plan parser -- $'- slug: api\n  type: impl\n  priority: P0'``.
 
-``list TASK [--impl] [--full]`` examines the TASK directory's direct-child
-controls.  It does not require a control on TASK itself, so both canonical
-roots are useful containers.  An immediate child is a task candidate when it
+``list TASK [--recursive] [--impl | --plan] [--full]`` examines the TASK
+directory's direct-child controls.  ``--recursive`` includes every controlled
+descendant in depth-first order while preserving the normal sibling ordering.
+The command does not require a control on TASK itself, so both canonical roots
+are useful containers.  An immediate child is a task candidate when it
 contains ``task.yml``, ``task.md``, or ``spec.md``.  A candidate with Markdown
 but no control receives a recreated default control; unrelated directories and
 empty collision reservations are ignored.  Results are ordered by numeric
 ``order`` then canonical ID, with missing orders last.  The default output is
 raw canonical IDs, one per line (and no output for an empty result).
 ``--full`` instead emits a YAML list of records shaped
-``{task-id: CANONICAL_ID, ...full stored config...}``.  ``--impl`` filters
-either representation to unfinished (``status != done``) ``impl`` leaves,
-excludes a direct child that is itself a container of controlled descendants,
-and keeps a leaf only when every exact dependency exists and is ``done``.
-Missing dependencies wait rather than satisfy.  Existing dependency cycles
-among unfinished tasks are errors; completed tasks are satisfied terminals.
+``{task-id: CANONICAL_ID, ...full stored config...}``.  ``--plan`` filters
+either representation to ``hld`` tasks whose status is neither ``planned`` nor
+``cancelled``.  ``--impl`` filters to unfinished, non-cancelled ``impl``
+leaves and keeps a leaf only when every exact dependency exists and is
+``done``.  It excludes a task that is itself a container of controlled
+descendants.  With ``--recursive``, every candidate also requires all ancestor
+``hld`` tasks, including TASK when it has a control, to have no unmet
+dependencies; a cancelled ancestor is not ready.  Missing dependencies wait
+rather than satisfy.  Existing dependency cycles among nonterminal tasks are
+errors; completed and cancelled tasks are terminals, but only completed tasks
+satisfy dependents.
 
 ``plan PARENT YAML`` is read-only mechanical planning.  PARENT must have a
 safe existing task-local ``spec.md``.  YAML is a list in requirement order;
@@ -183,7 +192,7 @@ CONFIG_KEYS = ("type", "status", "order", "priority", "blocked-by", "source")
 BLOCKERS_FILE = ".cswd/blockers.yml"
 CONFIG_KEY_SET = frozenset(CONFIG_KEYS)
 TYPES = frozenset(("impl", "hld"))
-STATUSES = frozenset(("new", "critic", "planned", "ready", "verified", "done"))
+STATUSES = frozenset(("new", "critic", "planned", "ready", "verified", "done", "cancelled"))
 PRIORITIES = frozenset(("P0", "P1", "P2", "P3"))
 SLUG_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
@@ -364,7 +373,7 @@ def _validate_config(value: Any) -> dict[str, Any]:
         raise TaskCtlError("type must be impl or hld")
     if not isinstance(candidate["status"], str) or candidate["status"] not in STATUSES:
         raise TaskCtlError(
-            "status must be new, critic, planned, ready, verified, or done"
+            "status must be new, critic, planned, ready, verified, done, or cancelled"
         )
     if "order" in candidate:
         order = candidate["order"]
@@ -703,7 +712,7 @@ def _dependency_configs(
     pending = list(configs)
     while pending:
         task_id = pending.pop()
-        if configs[task_id]["status"] == "done":
+        if configs[task_id]["status"] in ("done", "cancelled"):
             continue
         for blocker in configs[task_id].get("blocked-by", []):
             dependency = blocker["task-id"]
@@ -721,7 +730,7 @@ def _dependency_configs(
             for blocker in config.get("blocked-by", [])
             if blocker["task-id"] in configs
         ]
-        if config["status"] != "done"
+        if config["status"] not in ("done", "cancelled")
         else []
         for task_id, config in configs.items()
     }
@@ -733,27 +742,116 @@ def _has_descendant_control(repo: Path, task_id: str) -> bool:
     return bool(_direct_records(repo, task_id))
 
 
-def list_tasks(repo: Path, task_id: str, impl: bool = False) -> list[dict[str, Any]]:
-    """List direct-child controls, optionally filtering runnable impl leaves."""
+def _recursive_records(
+    repo: Path,
+    canonical: str,
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, ...]], set[str]]:
+    records: list[dict[str, Any]] = []
+    ancestors: dict[str, tuple[str, ...]] = {}
+    containers: set[str] = set()
+    active_directories: set[Path] = set()
+
+    def visit(parent: str, hld_ancestors: tuple[str, ...]) -> None:
+        directory = _task_dir(repo, parent, allow_root=True).resolve()
+        if directory in active_directories:
+            raise TaskCtlError(f"recursive task directory cycle at {parent}")
+        active_directories.add(directory)
+        try:
+            children = _direct_records(repo, parent)
+            if children:
+                containers.add(parent)
+            for record in children:
+                current = record["task-id"]
+                records.append(record)
+                ancestors[current] = hld_ancestors
+                child_ancestors = hld_ancestors
+                if record["type"] == "hld":
+                    child_ancestors += (current,)
+                visit(current, child_ancestors)
+        finally:
+            active_directories.remove(directory)
+
+    visit(canonical, ())
+    return records, ancestors, containers
+
+
+def _controlled_hld(repo: Path, canonical: str) -> dict[str, Any] | None:
+    if canonical in ROOTS:
+        return None
+    control = _task_dir(repo, canonical, allow_root=False) / "task.yml"
+    if not control.is_file():
+        return None
+    config = get_task(repo, canonical)
+    if config["type"] != "hld":
+        return None
+    return {"task-id": canonical, **config}
+
+
+def _dependencies_done(
+    record: Mapping[str, Any],
+    configs: Mapping[str, Mapping[str, Any]],
+    missing: set[str],
+) -> bool:
+    if record["status"] == "done":
+        return True
+    if record["status"] == "cancelled":
+        return False
+    dependencies = [item["task-id"] for item in record.get("blocked-by", [])]
+    return not any(dependency in missing for dependency in dependencies) and all(
+        configs[dependency]["status"] == "done" for dependency in dependencies
+    )
+
+
+def list_tasks(
+    repo: Path,
+    task_id: str,
+    impl: bool = False,
+    recursive: bool = False,
+    plan: bool = False,
+) -> list[dict[str, Any]]:
+    """List task controls, optionally recursively or by actionable mode."""
+    if impl and plan:
+        raise TaskCtlError("impl and plan filters are mutually exclusive")
     root = _normalize_repo(repo)
     canonical = _canonical_id(task_id, allow_root=True)
-    records = _direct_records(root, canonical)
-    configs, missing = _dependency_configs(root, records)
+    if recursive:
+        records, ancestors, containers = _recursive_records(root, canonical)
+    else:
+        records = _direct_records(root, canonical)
+        ancestors = {}
+        containers = {
+            record["task-id"]
+            for record in records
+            if _has_descendant_control(root, record["task-id"])
+        } if impl else set()
+
+    root_hld = _controlled_hld(root, canonical) if recursive and impl else None
+    dependency_records = records + ([root_hld] if root_hld is not None else [])
+    configs, missing = _dependency_configs(root, dependency_records)
+    if plan:
+        return [
+            record
+            for record in records
+            if record["type"] == "hld" and record["status"] not in ("planned", "cancelled")
+        ]
     if not impl:
         return records
+
     result: list[dict[str, Any]] = []
     for record in records:
         current = record["task-id"]
-        if record["type"] != "impl" or record["status"] == "done":
+        if (
+            record["type"] != "impl"
+            or record["status"] in ("done", "cancelled")
+            or current in containers
+            or not _dependencies_done(record, configs, missing)
+        ):
             continue
-        if _has_descendant_control(root, current):
-            continue
-        dependencies = [item["task-id"] for item in record.get("blocked-by", [])]
-        if any(dependency in missing for dependency in dependencies):
-            continue
-        if not all(configs[dependency]["status"] == "done" for dependency in dependencies):
-            continue
-        result.append(record)
+        ancestor_ids = ancestors.get(current, ())
+        if root_hld is not None:
+            ancestor_ids = (canonical,) + ancestor_ids
+        if all(_dependencies_done(configs[ancestor], configs, missing) for ancestor in ancestor_ids):
+            result.append(record)
     return result
 
 
@@ -1015,9 +1113,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="YAML blocker mapping/list; repeat, or pass [] to clear",
     )
 
-    list_parser = commands.add_parser("list", help="list direct-child controls")
+    list_parser = commands.add_parser("list", help="list task controls")
     list_parser.add_argument("task")
-    list_parser.add_argument("--impl", action="store_true", help="only dependency-ready unfinished impl leaves")
+    list_mode = list_parser.add_mutually_exclusive_group()
+    list_mode.add_argument("--impl", action="store_true", help="only dependency-ready unfinished impl leaves")
+    list_mode.add_argument("--plan", action="store_true", help="only HLD tasks still requiring planning")
+    list_parser.add_argument("--recursive", action="store_true", help="include the whole descendant task tree")
     list_parser.add_argument("--full", action="store_true", help="emit complete records instead of task IDs")
 
     plan_parser = commands.add_parser("plan", help="propose deterministic numbered direct children")
@@ -1061,7 +1162,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "list":
             canonical = _cli_task_id(args.task, allow_root=True)
-            records = list_tasks(repo, canonical, impl=args.impl)
+            records = list_tasks(
+                repo,
+                canonical,
+                impl=args.impl,
+                recursive=args.recursive,
+                plan=args.plan,
+            )
             if args.full:
                 _print_yaml(records)
             elif records:

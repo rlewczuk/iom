@@ -340,6 +340,249 @@ class TaskCtlTests(unittest.TestCase):
             {"type": "hld", "status": "new"},
         )
 
+    def test_recursive_list_walks_the_complete_tree_in_sibling_order(self) -> None:
+        self.make_dir(".cswd/tasks/tree")
+        controls = (
+            ("10-later", {"type": "impl", "status": "new", "order": 10}),
+            ("02-first", {"type": "hld", "status": "planned", "order": 2}),
+            ("02-first/20-child", {"type": "impl", "status": "new", "order": 20}),
+            ("02-first/01-child", {"type": "hld", "status": "planned", "order": 1}),
+            (
+                "02-first/01-child/leaf",
+                {"type": "impl", "status": "ready"},
+            ),
+        )
+        for relative, config in controls:
+            task_id = f".cswd/tasks/tree/{relative}"
+            self.make_dir(task_id)
+            self.set_task(task_id, config)
+
+        records = self.api["list_tasks"](
+            self.repo,
+            ".cswd/tasks/tree",
+            recursive=True,
+        )
+        self.assertEqual(
+            [record["task-id"] for record in records],
+            [
+                ".cswd/tasks/tree/02-first",
+                ".cswd/tasks/tree/02-first/01-child",
+                ".cswd/tasks/tree/02-first/01-child/leaf",
+                ".cswd/tasks/tree/02-first/20-child",
+                ".cswd/tasks/tree/10-later",
+            ],
+        )
+        direct = self.api["list_tasks"](self.repo, ".cswd/tasks/tree")
+        self.assertEqual(
+            [record["task-id"] for record in direct],
+            [".cswd/tasks/tree/02-first", ".cswd/tasks/tree/10-later"],
+        )
+
+        listed = self.run_cli("list", "tree", "--recursive", "--full")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(yaml.safe_load(listed.stdout), records)
+
+    def test_plan_list_selects_only_hld_tasks_not_planned_or_cancelled(self) -> None:
+        self.make_dir(".cswd/tasks/to-plan")
+        controls = (
+            ("01-new", {"type": "hld", "status": "new", "order": 1}),
+            ("02-planned", {"type": "hld", "status": "planned", "order": 2}),
+            (
+                "02-planned/child",
+                {"type": "hld", "status": "critic", "order": 1},
+            ),
+            ("03-cancelled", {"type": "hld", "status": "cancelled", "order": 3}),
+            ("04-impl", {"type": "impl", "status": "new", "order": 4}),
+            ("05-done", {"type": "hld", "status": "done", "order": 5}),
+        )
+        for relative, config in controls:
+            task_id = f".cswd/tasks/to-plan/{relative}"
+            self.make_dir(task_id)
+            self.set_task(task_id, config)
+
+        direct = self.api["list_tasks"](
+            self.repo,
+            ".cswd/tasks/to-plan",
+            plan=True,
+        )
+        self.assertEqual(
+            [record["task-id"] for record in direct],
+            [".cswd/tasks/to-plan/01-new", ".cswd/tasks/to-plan/05-done"],
+        )
+        recursive = self.api["list_tasks"](
+            self.repo,
+            ".cswd/tasks/to-plan",
+            recursive=True,
+            plan=True,
+        )
+        self.assertEqual(
+            [record["task-id"] for record in recursive],
+            [
+                ".cswd/tasks/to-plan/01-new",
+                ".cswd/tasks/to-plan/02-planned/child",
+                ".cswd/tasks/to-plan/05-done",
+            ],
+        )
+
+        listed = self.run_cli("list", "to-plan", "--recursive", "--plan")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(
+            listed.stdout.splitlines(),
+            [record["task-id"] for record in recursive],
+        )
+        conflict = self.run_cli("list", "to-plan", "--impl", "--plan")
+        self.assertEqual(conflict.returncode, 2)
+        with self.assertRaisesRegex(self.TaskCtlError, "mutually exclusive"):
+            self.api["list_tasks"](
+                self.repo,
+                ".cswd/tasks/to-plan",
+                impl=True,
+                plan=True,
+            )
+
+    def test_recursive_impl_requires_leaf_and_every_hld_ancestor_ready(self) -> None:
+        self.make_dir(".cswd/tasks/dependencies")
+        for name, status in (
+            ("root-gate", "new"),
+            ("done", "done"),
+            ("waiting", "ready"),
+        ):
+            task_id = f".cswd/tasks/dependencies/{name}"
+            self.make_dir(task_id)
+            self.set_task(task_id, {"type": "impl", "status": status})
+
+        root = ".cswd/tasks/implementation-tree"
+        self.make_dir(root)
+        self.set_task(
+            root,
+            {
+                "type": "hld",
+                "status": "planned",
+                "blocked-by": [{"task-id": ".cswd/tasks/dependencies/root-gate"}],
+            },
+        )
+        controls = (
+            ("01-direct", {"type": "impl", "status": "new"}),
+            (
+                "02-open-parent",
+                {
+                    "type": "hld",
+                    "status": "planned",
+                    "blocked-by": [{"task-id": ".cswd/tasks/dependencies/done"}],
+                },
+            ),
+            ("02-open-parent/leaf", {"type": "impl", "status": "ready"}),
+            (
+                "03-blocked-parent",
+                {
+                    "type": "hld",
+                    "status": "planned",
+                    "blocked-by": [{"task-id": ".cswd/tasks/dependencies/waiting"}],
+                },
+            ),
+            ("03-blocked-parent/leaf", {"type": "impl", "status": "new"}),
+            ("04-cancelled-parent", {"type": "hld", "status": "cancelled"}),
+            ("04-cancelled-parent/leaf", {"type": "impl", "status": "new"}),
+            (
+                "05-done-parent",
+                {
+                    "type": "hld",
+                    "status": "done",
+                    "blocked-by": [{"task-id": ".cswd/tasks/dependencies/missing"}],
+                },
+            ),
+            ("05-done-parent/leaf", {"type": "impl", "status": "verified"}),
+            (
+                "06-own-blocker",
+                {
+                    "type": "impl",
+                    "status": "new",
+                    "blocked-by": [{"task-id": ".cswd/tasks/dependencies/missing"}],
+                },
+            ),
+            ("07-cancelled-leaf", {"type": "impl", "status": "cancelled"}),
+            ("08-impl-container", {"type": "impl", "status": "new"}),
+            ("08-impl-container/leaf", {"type": "impl", "status": "new"}),
+        )
+        for relative, config in controls:
+            task_id = f"{root}/{relative}"
+            self.make_dir(task_id)
+            self.set_task(task_id, config)
+
+        blocked = self.api["list_tasks"](
+            self.repo,
+            root,
+            impl=True,
+            recursive=True,
+        )
+        self.assertEqual(blocked, [])
+
+        self.api["set_task"](
+            self.repo,
+            ".cswd/tasks/dependencies/root-gate",
+            {"status": "done"},
+        )
+        ready = self.api["list_tasks"](
+            self.repo,
+            root,
+            impl=True,
+            recursive=True,
+        )
+        self.assertEqual(
+            [record["task-id"] for record in ready],
+            [
+                f"{root}/01-direct",
+                f"{root}/02-open-parent/leaf",
+                f"{root}/05-done-parent/leaf",
+                f"{root}/08-impl-container/leaf",
+            ],
+        )
+
+        listed = self.run_cli(
+            "list",
+            "implementation-tree",
+            "--recursive",
+            "--impl",
+        )
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(
+            listed.stdout.splitlines(),
+            [record["task-id"] for record in ready],
+        )
+
+    def test_recursive_list_detects_cycles_between_separate_subtrees(self) -> None:
+        root = ".cswd/tasks/nested-cycle"
+        self.make_dir(root)
+        for branch in ("a", "b"):
+            parent = f"{root}/{branch}"
+            self.make_dir(parent)
+            self.set_task(parent, {"type": "hld", "status": "planned"})
+            self.make_dir(f"{parent}/leaf")
+        self.set_task(
+            f"{root}/a/leaf",
+            {
+                "type": "impl",
+                "status": "new",
+                "blocked-by": [{"task-id": f"{root}/b/leaf"}],
+            },
+        )
+        self.set_task(
+            f"{root}/b/leaf",
+            {
+                "type": "impl",
+                "status": "new",
+                "blocked-by": [{"task-id": f"{root}/a/leaf"}],
+            },
+        )
+
+        direct = self.api["list_tasks"](self.repo, root)
+        self.assertEqual(
+            [record["task-id"] for record in direct],
+            [f"{root}/a", f"{root}/b"],
+        )
+        with self.assertRaisesRegex(self.TaskCtlError, "dependency cycle"):
+            self.api["list_tasks"](self.repo, root, recursive=True)
+
     def test_impl_list_checks_done_dependencies_missing_dependencies_and_containers(self) -> None:
         self.make_dir("docs/changes/work")
         for name in ("01-provider", "02-consumer", "03-waiting", "04-container"):
