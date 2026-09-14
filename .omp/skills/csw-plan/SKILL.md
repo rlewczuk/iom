@@ -1,30 +1,30 @@
 ---
-name: spec-tasks
-description: Split a change specification into dependency-ordered, prioritized, self-contained mini-specifications for small implementer models. Use only through /spec-tasks <spec-name>[/subdirectory] or when explicitly requested.
+name: csw-plan
+description: Split a change specification into dependency-ordered, prioritized, self-contained mini-specifications for small implementer models. Use only through /csw-plan <task-name>[/subdirectory] or when explicitly requested.
 hide: true
 ---
 
-# Spec Tasks
+# CSW Plan
 
 Turn one change specification into the smallest set of implementation tasks needed to deliver it. Write one focused mini-specification per task; do not implement the change.
 
-The command supplies a path relative to `docs/changes/`:
+The command supplies a path relative to `.cswd/tasks/`:
 
 ```text
-<spec-name>[/subdirectory...]
+<task-name>[/subdirectory...]
 ```
 
 For target `<target>`, use exactly:
 
-- parent specification: `docs/changes/<target>/spec.md`;
-- user remarks, optional: `docs/changes/<target>/spec-fixme.md`;
-- generated task specifications: `docs/changes/<target>/<NN>-<task-slug>/spec.md`.
+- parent specification: `.cswd/tasks/<target>/spec.md`;
+- user remarks, optional: `.cswd/tasks/<target>/spec-fixme.md`;
+- generated task specifications: `.cswd/tasks/<target>/<NN>-<task-slug>/spec.md`.
 
 The numeric prefix is part of the task directory name and records dependency order. The ordered directories plus the completion response are the task list; do not create a separate TODO or index file unless the user requests one.
 
 ## Guardrails
 
-- Require one non-empty target argument. Reject absolute paths, `.` or `..` components, empty path components, backslashes, and any target that escapes `docs/changes/`.
+- Require one non-empty target argument. Reject absolute paths, `.` or `..` components, empty path components, backslashes, and any target that escapes `.cswd/tasks/`.
 - Allow safe nested targets such as `allocator/gpu-layout`; the argument names the exact directory containing the parent `spec.md`.
 - If the parent `spec.md` does not exist, report its expected path and stop. A missing `spec-fixme.md` is normal.
 - Read the complete parent specification and complete fixme file when present.
@@ -38,18 +38,18 @@ The numeric prefix is part of the task directory name and records dependency ord
 
 ## Boss orchestration contract
 
-This seven-step workflow is one Boss process. Before starting it, the root MUST read `skill://boss`, run and preserve its deterministic preflight, then apply this skill's explicit override: substantive repository fact-gathering uses the read-only `spec-tasks-facts` profile at `@task`, rather than Boss's default cheap exploration lane. The root MUST already match the preflight-resolved `@slow` model. Use only the preflight's `roles`, `models`, and required `agents` entries for model routing, overrides, advisor state, availability, and profile tool restrictions; do not manually inspect or reconstruct them. Report a failed preflight and stop; never switch models, inherit an expensive parent, or silently fall back.
+This seven-step workflow is one Boss process. Before starting it, the root MUST read `skill://boss`, run and preserve its deterministic preflight, then apply this skill's explicit override: substantive repository fact-gathering uses the read-only `csw-plan-facts` profile at `@task`, rather than Boss's default cheap exploration lane. The root MUST already match the preflight-resolved `@slow` model. Use only the preflight's `roles`, `models`, and required `agents` entries for model routing, overrides, advisor state, availability, and profile tool restrictions; do not manually inspect or reconstruct them. Report a failed preflight and stop; never switch models, inherit an expensive parent, or silently fall back.
 
 The `@slow` root owns intake, complete requirement accounting, decomposition, priorities, the dependency DAG, architectural and ambiguity decisions, the frozen complete assignment table, verification, and final output:
 
-- `[FACTS spec-tasks-facts @task]` performs scoped, parallel, read-only factual discovery using exactly the profile's `read`, `grep`, `glob`, `lsp`, and `ast_grep` tools (`advisor: false`, `spawns: []`). It has no design authority, writing, delegation, or gates.
+- `[FACTS csw-plan-facts @task]` performs scoped, parallel, read-only factual discovery using exactly the profile's `read`, `grep`, `glob`, `lsp`, and `ast_grep` tools (`advisor: false`, `spawns: []`). It has no design authority, writing, delegation, or gates.
 - `[DRAFT boss-builder-fast @smol]` writes frozen mini-specs and performs simple mechanical edits only after the root fixes destinations, order, blockers, requirements, and acceptance criteria. It has no design or numbering authority.
 - `[PATH boss-errand @smol]` may perform mechanical metadata, path, existence, and collision checks against exact known paths; it MUST NOT perform substantive source discovery or design work.
 - `[ADVISOR boss-advisor @advisor]` handles only genuinely key architectural decisions from supplied facts. It is tool-free and packet-only: it cannot search, fetch artifacts, edit, delegate, or run gates.
 
 Fact packets MUST provide exact `file:line` and symbol evidence, decisive minimal excerpts, a `done`/`partial`/`missing`/`discrepant` mapping, relevant conventions and focused test commands, inspected and uninspected areas, gaps, and separate `SOURCE FACTS` from `INFERENCE`. Batch truly independent discovery and disjoint writers, collect each phase before consuming its output, and do not split output tasks merely for parallelism. No worker delegates recursively; workers skip gates, tests, linters, builds, and formatters.
 
-Every brief is self-contained: it states exact scope and files, established facts and decisions, required output, non-goals, acceptance criteria, and any blockers. Advisor `CONTENT` must inline the requirements and non-goals, decisive excerpts and facts, constraints, alternatives with trade-offs, and one exact question; a path or URI alone is invalid. If the advisor returns `NEED EVIDENCE`, route the exact factual question back to `spec-tasks-facts`, append only the evidence delta, and keep the final decision at the root.
+Every brief is self-contained: it states exact scope and files, established facts and decisions, required output, non-goals, acceptance criteria, and any blockers. Advisor `CONTENT` must inline the requirements and non-goals, decisive excerpts and facts, constraints, alternatives with trade-offs, and one exact question; a path or URI alone is invalid. If the advisor returns `NEED EVIDENCE`, route the exact factual question back to `csw-plan-facts`, append only the evidence delta, and keep the final decision at the root.
 
 This contract preserves the existing generation contract: precedence and path guards, minimal scope, omission of completed work, the task template, collision protection, self-contained mini-specs, ambiguity handling, and the concise completion response remain authoritative.
 
@@ -72,7 +72,7 @@ Read `spec.md`, then `spec-fixme.md` if present. Extract:
 Build one coherent requirement set using the precedence rules above. A fixme correction replaces the conflicting parent requirement; do not preserve both alternatives. Do not propagate brainstorming, rejected alternatives, or editorial commentary as implementation work.
 
 ### 2. Ground the work in the repository
-The root dispatches the exact `spec-tasks-facts` (`@task`) profile for scoped parallel repository facts, then reconciles its evidence rather than delegating requirement or design authority.
+The root dispatches the exact `csw-plan-facts` (`@task`) profile for scoped parallel repository facts, then reconciles its evidence rather than delegating requirement or design authority.
 
 Explore only the project areas needed to decompose and anchor the change. Read referenced files and enough surrounding implementation, call sites, tests, configuration, schemas, and project design documentation to establish:
 
@@ -139,7 +139,7 @@ Use this structure, omitting only sections that truly do not apply:
 **Order:** <NN>
 **Priority:** <P0|P1|P2> — <brief reason>
 **Blocked by:** <task directory names, or “None”>
-**Source:** `docs/changes/<target>/spec.md`
+**Source:** `.cswd/tasks/<target>/spec.md`
 
 ## Outcome
 
@@ -192,7 +192,7 @@ Mini-spec writing rules:
 
 ### 6. Resolve only blocking ambiguity
 
-The root resolves material ambiguity. For a key architectural choice it may use packet-only `boss-advisor`; a `NEED EVIDENCE` response routes one exact question to `spec-tasks-facts`, after which the root decides.
+The root resolves material ambiguity. For a key architectural choice it may use packet-only `boss-advisor`; a `NEED EVIDENCE` response routes one exact question to `csw-plan-facts`, after which the root decides.
 
 Use repository evidence and established project conventions for factual and low-risk implementation details. If a source ambiguity materially changes behavior, task boundaries, or dependency order and cannot be resolved from the repository, ask one focused question at a time with a recommended minimal answer. Wait for the answer before writing affected mini-specs.
 

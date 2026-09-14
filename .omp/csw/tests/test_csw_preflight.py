@@ -29,7 +29,7 @@ BOSS_PROFILES = {
     "boss-advocate-fast": ("@smol", LOOKUP),
     "boss-advocate": ("@task", LOOKUP),
     "boss-advocate-strong": ("@slow", LOOKUP),
-    "spec-tasks-facts": ("@task", f"[{READ_ONLY}]"),
+    "csw-plan-facts": ("@task", f"[{READ_ONLY}]"),
 }
 
 
@@ -73,8 +73,8 @@ class CswPreflightTests(unittest.TestCase):
 
     def write_boss_profiles(self) -> None:
         for name, (model, tools) in BOSS_PROFILES.items():
-            advisor = False if name in ("scout", "boss-reviewer", "spec-tasks-facts") else None
-            spawns = "[]" if name in ("scout", "boss-reviewer", "boss-advisor", "spec-tasks-facts") else None
+            advisor = False if name in ("scout", "boss-reviewer", "csw-plan-facts") else None
+            spawns = "[]" if name in ("scout", "boss-reviewer", "boss-advisor", "csw-plan-facts") else None
             self.write_profile(name, model, tools, spawns, advisor=advisor)
 
     def write_omp(self, config: dict, models: list[dict], *, exit_status: int = 0) -> None:
@@ -182,7 +182,7 @@ class CswPreflightTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(set(payload["agents"]), set(BOSS_PROFILES))
         self.assertEqual(payload["agents"]["boss-advisor"]["tools"], [])
-        self.assertEqual(payload["agents"]["spec-tasks-facts"]["resolved"], "openai/task")
+        self.assertEqual(payload["agents"]["csw-plan-facts"]["resolved"], "openai/task")
 
     def test_role_alias_chain_preserves_thinking_suffix(self):
         self.write_omp(
