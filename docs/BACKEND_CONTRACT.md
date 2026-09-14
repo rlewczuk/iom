@@ -1732,6 +1732,279 @@ both QK and PV at logical `R=1/15/16/17`, non-tile I/O/D/L, independent
 leading planes, GQA, tails, aliases, checked failures, in-order OIDs, and
 repeated waits. None of those production gates or profiler runs was run by
 this assessment.
+#### TinyLlama forward layout — CUDA matrix feasibility
+
+This is a bounded capability record for the planned interfaces above, not a
+CUDA neural implementation or a support claim. The current CUDA neural probes
+remain `Unsupported` before submission. On the inventoried device the native
+CUDA Toolkit route is **supported for implementation feasibility** for
+ordinary and head-planar linear, QK, and PV at every required row count.
+Production status is nevertheless **blocked** until the operation-owning CUDA
+ports supply runtime numerical, conformance, and profiler evidence. A device
+below compute capability 8.0 is **unsupported** for this BF16 WMMA route; it
+does not earn a fallback pass.
+
+##### Evidence boundary and installed capability
+
+The following evidence was collected on 2026-09-14 through the configured
+`cuda` remote-development profile in the unique
+`forward-layout-cuda-feasibility` workspace:
+
+- `nvcc --version` reported CUDA compilation tools 13.2,
+  `V13.2.78`; `/usr/local/cuda` resolved to `/usr/local/cuda-13.2`.
+  Installed package inventory reported `cuda-compiler-13-2` 13.2.1-1,
+  `cuda-nvcc-13-2` 13.2.78-1, and `cuda-cudart-dev-13-2` 13.2.75-1.
+  `dpkg-query -S` assigned both `mma.h` and `cuda_bf16.h` under the
+  13.2 target include directory to `cuda-cudart-dev-13-2`.
+- `nvidia-smi` reported driver 595.71.05, driver-supported CUDA 13.2,
+  and one NVIDIA GeForce RTX 5090. A bounded Runtime API inventory executable
+  reported header `CUDA_VERSION=13020`, `CUDART_VERSION=13020`, runtime
+  13020, driver API 13020, compute capability 12.0, warp size 32, and
+  33,670,758,400 bytes of global memory.
+- A temporary installed-header translation unit instantiated
+  `<mma.h>` BF16/FP32 fragments for `16x16x16` with all four
+  row-major/column-major A/B combinations, and `32x8x16` and `8x32x16`
+  with row-major A and column-major B. It used `__nv_bfloat16`
+  multiplicands, `float` accumulators, `load_matrix_sync`, `mma_sync`, and
+  row-major `store_matrix_sync`. It compiled successfully with
+  `nvcc -std=c++20 -arch=sm_120`; its executable performed only the device
+  inventory above. The translation unit was removed after the bounded sample.
+  This is installed SDK/header and target-code-generation evidence, **not**
+  a matrix launch, numerical result, throughput result, or profiler result.
+
+The [CUDA 12.8 Warp Matrix Functions documentation][cuda-wmma] defines WMMA
+as warp-cooperative `D=A*B+C`, permits `row_major` and `col_major`
+multiplicands, and permits a row- or column-major accumulator store. Its
+[alternate-floating-point section][cuda-wmma-alt] requires compute capability
+8.0 or newer for BF16 Tensor Core use and requires `__nv_bfloat16` fragments
+to use `float` accumulators. Its
+[element-type and matrix-size table][cuda-wmma-sizes] lists BF16/FP32
+`16x16x16`, `32x8x16`, and `8x32x16`. The canonical route below uses only
+`16x16x16`; the other shapes are optional tuning choices, not semantic
+requirements.
+
+`load_matrix_sync` and `store_matrix_sync` require a 256-bit (32-byte)
+aligned base. `ldm` is in elements and describes the distance between
+successive rows or columns. The guide requires a 16-byte stride for the
+listed 16-bit and FP32 cases, and states that BF16 has the same shapes and
+operations as FP16. This route therefore uses BF16 leading dimensions
+divisible by 8 and FP32 leading dimensions divisible by 4; padding every
+native dimension to 16 satisfies both. Each warp sees identical fragment
+parameters and participates unconditionally. Fragments never cross a
+translation-unit or external ABI boundary; the guide explicitly calls their
+register layout architecture-specific.
+
+These installed and documented facts establish that the primitives needed by
+a direct port exist on the sampled host. They do not establish current IOM
+support. The repository currently links the CUDA target only to
+`CUDA::cuda_driver` and `CUDA::cudart`, allocates exact-context standard-tiled
+storage, uses one in-order CUDA stream per queue, and leaves the neural
+capability probes unsupported. No CUDA linear, QK, PV, end-to-end
+conformance, sanitizer, or profiler command was run for this assessment.
+The repository facts above are bounded by `CMakeLists.txt`'s CUDA target,
+`src/cuda/device_tensor.cpp`'s exact-context standard-tiled allocation,
+`src/cuda/copy.cu`'s shared queue factory, device enumeration in
+`test/cuda/test_cuda_smoke.cpp`, and the still-unsupported neural probes in
+`test/cuda/test_cuda_conformance.cpp`.
+
+##### Fixed ABI and native lowering
+
+This route changes none of the preceding ABI. Calls return `oid`, are
+`noexcept`, take const input views, a mutable caller output, `std::size_t`
+positions and extents, and an optional final `RawWorkspaceView`. Their
+workspace queries have the same semantic arguments, a const output, and no
+workspace. A query validates shapes, aliases, capability, and every checked
+size but never allocates, registers, submits, consumes an OID, inspects a
+handle, or depends on arena capacity. Submission additionally validates the
+workspace's exact device, capacity, 32-byte alignment, nonoverlap, and lease.
+Negative OIDs report pre-acceptance failure; an accepted device failure
+remains attached to its positive OID on every repeated wait.
+Only `QuantizationFormat::NONE` is admitted. Valid read/read aliases remain
+explicitly supported; output/read and workspace/operand/output overlap remain
+invalid.
+
+Let `P` be the checked product of the complete leading tuple (one when it is
+empty), and define, with checked addition and multiplication,
+
+```text
+pad16(x) = checked_add(x, 15) / 16 * 16
+A32(n)   = checked_align_up(n, 32)
+Rp=pad16(R), Ip=pad16(I), Op=pad16(O),
+Dp=pad16(D), Lp=pad16(L).
+```
+
+All runtime ranks remain 2 through 8 and dimensions are nonzero. A CUDA kernel
+maps each transformed leading coordinate through its snapshotted owner offset
+and strides; it never collapses or broadcasts independent planes. Standard
+IOM storage is tile-major, with row-major values inside each 16x16 tile.
+That is not one globally contiguous WMMA matrix, and an arbitrary `s` or
+transformed plane is not a legal aligned WMMA base. Each warp therefore
+copies only its current logical tile into an `alignas(32)` kernel-local shared
+tile, writes zero to out-of-range physical cells, synchronizes, and loads the
+WMMA fragment with leading dimension 16. This bounded on-chip tile is not an
+allocation, persistent weight copy, or caller workspace. It also prevents
+perturbed owner padding, uninitialized cache capacity, and excluded keys from
+being read as multiplicands.
+
+For linear, A is selected `x[b,s+r,i]` in row-major order. A rank-two
+HF `w[O,I]` tile is staged without transposing checkpoint storage and is
+interpreted as column-major B, so `B[i,o]=w[o,i]`. The result fragment is
+stored to an aligned FP32 shared tile, converted once with RNE, and scattered
+directly to ordinary `out[b,r,o]` or head-planar
+`out[b,h,r,d]`, `o=h*D+d`. There is no bias, hidden row extraction, complete
+weight pack, duplicate checkpoint allocation, or host work.
+
+For QK, A is row-major Q `[R,D]`; the selected
+`K[g(h),0:L,D]` tile is column-major B representing `K` transposed, where
+`g(h)=floor(h/(Hq/Hkv))`. Only `t<L` and `t<=a+r` survives the separate
+FP32 scale/mask step. For PV, rounded BF16 P is row-major A and the selected
+V `[L,D]` tile is row-major B. K and V are addressed at their one owning
+`Hkv` head for every query head; no buffer materializes `Hq/Hkv` copies.
+QK and PV accumulate FP32. Stable max-subtracted softmax, exact zero for
+masked P, RNE FP32-to-BF16 probability preparation, final RNE conversion, and
+head merge all remain CUDA kernels on the same queue stream.
+
+The logical/physical row mapping and status are:
+
+| Logical `R` | Physical WMMA M | Ordinary linear | Head-planar linear | QK | PV |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 16 | supported feasibility | supported feasibility | supported feasibility | supported feasibility |
+| 15 | 16 | supported feasibility | supported feasibility | supported feasibility | supported feasibility |
+| 16 | 16 | supported feasibility | supported feasibility | supported feasibility | supported feasibility |
+| 17 | 32 | supported feasibility | supported feasibility | supported feasibility | supported feasibility |
+
+The same 16-padding applies independently to non-tile `I`, `O`, `D`, and
+`L`. In linear the native problem is `(Rp,Op,Ip)`; in QK it is
+`(Rp,Lp,Dp)`; in PV it is `(Rp,Dp,Lp)`. For `R=1/15`, physical rows through
+15 are neutral staging only; for `R=17`, rows 17 through 31 are neutral.
+They are never logical token rows, never enter a softmax reduction, and never
+reach output. The analogous column and reduction tails are zero
+multiplicands or discarded FP32 results. Public K/V owners remain
+`[P,Hkv,C,D]`; packing never changes them to public `[P,Hkv,L,D]` views.
+All four modes still require `Hq%Hkv=0`, `0<L<=C`, `a<C`, and
+`R<=C-a`, and only `0<=t<L,t<=a+r` contributes.
+
+##### Checked data flow and scratch
+
+Every expression in this table is evaluated with checked products before
+bytes are formed. `logical bytes` accounts for the required payload even when
+the data stays in an existing owner. `segment` names caller workspace only;
+kernel-local 16x16 shared tiles have a fixed launch-time size and lifetime.
+
+| Product | Existing owner and logical bytes | Caller-owned temporary / checked segment | Native invocation and caller-owned result |
+| --- | --- | --- | --- |
+| Ordinary linear | selected BF16 X is `P*R*I*2`; persistent BF16 W is `O*I*2` logical bytes and is never scratch | none; tile-local staging handles `s`, strides, and neutral tails; query may return zero bytes | BF16/FP32 WMMA `(Rp,Op,Ip)`; RNE directly to standard-tiled `out[P,R,O]`, `P*R*O*2` logical bytes |
+| Head-planar linear | the same X and persistent W; `O=H*D` is checked | none; no complete weight or output pack | the same WMMA product; RNE/scatter to `out[P,H,R,D]`, checked `P*H*R*D*2 = P*R*O*2` |
+| QK | BF16 Q logical bytes `P*Hq*R*D*2`; K owner remains `P*Hkv*C*D*2`, while only its initialized causal prefix is staged tile-by-tile | `scores`: `A32(P*Hq*Rp*Lp*4)` bytes, 32-byte aligned; FP32 QK/scale/mask, alive from QK through probability preparation | BF16/FP32 WMMA `(Rp,Lp,Dp)` per query head and `g(h)`; logical FP32 scores account for `P*Hq*R*L*4`; excluded/padded cells are masked and are not tokens |
+| Softmax / P preparation | logical FP32 scores are `P*Hq*R*L*4` | `probability`: `A32(P*Hq*Rp*Lp*2)` bytes after `scores`; stable FP32 row reduction writes exact-zero masked, RNE BF16 P; alive until PV completion | no matrix substitute: a device reduction/conversion kernel produces the observable BF16 boundary, whose logical payload is `P*Hq*R*L*2` |
+| PV and merge | probability segment plus BF16 V owner `P*Hkv*C*D*2`; only mapped initialized V tiles are read | no KV-head expansion and no full PV buffer; an FP32 accumulator tile is kernel-local | BF16/FP32 WMMA `(Rp,Dp,Lp)`; the logical planar PV payload is `P*Hq*R*D*2` after RNE and is scattered directly, without duplicating it, to merged `out[P,R,Hq*D]`, also `P*R*Hq*D*2` |
+
+The deterministic SDPA query therefore returns
+
+```text
+alignment = 32
+score_bytes = A32(P*Hq*Rp*Lp*4)
+probability_bytes = A32(P*Hq*Rp*Lp*2)
+bytes = checked_add(score_bytes, probability_bytes)
+```
+
+with `probability` beginning at checked offset `score_bytes`. Both segments
+belong to one live `RawWorkspace` on the queue's exact CUDA device and are
+disjoint from Q, K, V, and output. Valid Q/K/V read/read overlap, including
+exact aliases that independently satisfy their shape contracts, remains
+allowed; output/read, scratch/read, scratch/output, and conflicting scratch
+lease overlap is rejected. Linear needs no global temporary in this route,
+so an empty workspace is valid exactly when its query reports zero.
+
+Scores and P are per query head because those values differ under GQA; K and V
+are not copied per query head. The score and probability segments coexist
+while P is prepared. Once QK scores are no longer needed the score segment
+may be reused only after the queued phase proves that lifetime transition;
+the probability segment and all owners remain live through PV and its
+completion event. Across submissions, neither segment is reusable before the
+accepted OID completes successfully or fails terminally. Unknown completion
+retains or quarantines the lease. Queue submission uses the existing stream,
+snapshots metadata instead of retaining borrowed views, records completion
+after all packing/matrix/reduction/merge kernels, preserves in-order OIDs,
+and does not hide a stream synchronization. Sessions must still wait every
+producer individually before submitting its consumer and drain every accepted
+OID after a failure.
+
+##### Seven-operation fit and incompatibilities
+
+| Interface operation | CUDA assessment |
+| --- | --- |
+| gather | Contract-compatible device kernel for integral index payloads and bit-preserving BF16 table values; a device-discovered bad index must become an accepted retained failure. WMMA is irrelevant. A host index scan or round trip is forbidden. Current implementation remains blocked. |
+| matmul | Supported feasibility on the sampled CC 12.0 device by direct BF16/FP32 WMMA with tile-local standard-layout staging. Global owner layout, arbitrary `s`, transformed leading strides, and physical tails are incompatible with direct unguarded `load_matrix_sync`; the bounded staging above is required. |
+| reduction | Contract-compatible FP32 CUDA block/warp reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions must exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. Current kernels remain blocked. |
+| trig | Contract-compatible CUDA device FP32/wide-domain sine and cosine with finite positive `theta`; it neither uses nor is evidenced by WMMA. A host math substitute is forbidden. Current RoPE kernel remains blocked. |
+| partial-tile copy | Existing CUDA standard-tiled copy machinery establishes device-local tile addressing, but not neural matrix support. A native port must use guarded logical loads/stores and neutral shared cells so owner padding, cache capacity tail, and rows outside `R` are unobservable. |
+| unary | Contract-compatible CUDA device FP32/wide-domain SiLU and BF16 RNE output. It is elementwise by design and is not an invalid matrix substitute. Current kernel remains blocked. |
+| attention | Supported matrix feasibility for both QK and PV, including GQA and every required `R`, only as the complete device-local flow above. FP32 masking/softmax and explicit P-to-BF16 preparation are mandatory. Elementwise QK/PV, repeated KV heads, host work, hidden allocation, or treating physical rows as tokens is incompatible. Current SDPA port and evidence remain blocked. |
+
+This matrix result says nothing about the other applicable dtype leaves; their
+kernel selection, numerics, and tolerances remain with the operation-owned
+specifications. In particular this record neither adds nor narrows any F64
+path.
+
+##### Dependency decision and remaining gates
+
+**Decision: no added matrix library.** The installed `<mma.h>`,
+`cuda_bf16.h`, compiler, driver, and runtime provide the required direct
+primitive, orientation combinations, target code generation, and queue-local
+kernel launch route. The project already discovers the CUDA Toolkit and links
+the CUDA backend privately to the driver and runtime. The only identified
+layout mismatch is solved by bounded device shared-memory tiles and checked
+caller scratch; it is not a reason to add a BLAS dependency. Absence of
+cuBLAS linkage is therefore not a gap, cuBLAS is not a default fallback, and
+the first CUDA linear/SDPA ports must reuse this backend-private direct route.
+
+This decision also avoids a concrete lifecycle conflict. The
+[cuBLAS `cublasCreate`/`cublasDestroy` documentation][cublas-create] says
+creation allocates host and device resources and destruction implicitly calls
+`cudaDeviceSynchronize`. [`cublasSetStream`][cublas-stream] unconditionally
+resets a user workspace to the default pool.
+[`cublasSetWorkspace`][cublas-workspace] binds user-owned device memory only
+for the current stream, requires 256-byte alignment, and warns that calls must
+be serialized while kernels retain it. Those handle allocations, default-pool
+fallback, stream rebinding, and destruction synchronization are not
+allocation-neutral conveniences and cannot override caller-owned scratch,
+exact-stream lifetime, or asynchronous teardown rules. If a future consuming
+port finds a direct-WMMA blocker, it must first document that concrete blocker
+and reject any library route that cannot write caller output, bind
+deterministic caller scratch, initialize per-context bookkeeping before
+submission, rebind after every stream change, and retain resources through
+completion. No such blocker is evidenced here.
+
+The following are exact reproducibility and future production commands, run
+from the assigned local worktree through the same unique remote workspace:
+
+```sh
+.omp/skills/remote-development/scripts/remote-sync cuda forward-layout-cuda-feasibility
+.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility 'nvcc --version && nvidia-smi'
+.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility 'nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader'
+.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility "dpkg-query -W 'cuda-*'"
+.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility 'cmake --build build --target iom_cuda_conformance_tests'
+.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility "ctest --test-dir build --output-on-failure -R '^iom_cuda_conformance_tests$'"
+.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility "ncu --set full --target-processes all --kernel-name regex:'.*(linear|qk|pv).*' ./build/test/iom_cuda_conformance_tests --test-case='CUDA TinyLlama BF16 matrix paths cover R=1,15,16,17'"
+```
+
+The first four inventory/capability steps were run for this assessment; the
+last three are deliberately unrun production-port gates. The future
+conformance case must cover ordinary and head-planar linear plus both QK and
+PV at logical `R=1,15,16,17`, non-tile `I/O/D/L`, independent transformed
+planes, GQA, perturbed physical padding and excluded K/V rows, exact
+BF16/FP32/RNE boundaries, every scratch rejection, accepted failure with
+repeat waits, and no host traffic or hidden allocation. The profiler must
+show the direct matrix kernels for both decode and prefill; inventory,
+successful compilation, or one GEMM cannot substitute for that evidence.
+
+[cuda-wmma]: https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#warp-matrix-functions
+[cuda-wmma-alt]: https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#alternate-floating-point
+[cuda-wmma-sizes]: https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#element-types-and-matrix-sizes
+[cublas-create]: https://docs.nvidia.com/cuda/cublas/index.html#cublascreate
+[cublas-stream]: https://docs.nvidia.com/cuda/cublas/index.html#cublassetstream
+[cublas-workspace]: https://docs.nvidia.com/cuda/cublas/index.html#cublassetworkspace
 
 ### 10. Backend integration and conformance obligations
 
