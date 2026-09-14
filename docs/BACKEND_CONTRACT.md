@@ -1477,6 +1477,261 @@ kernel, or current-support claim, and it does not migrate the existing neural
 hooks from `Unsupported`. The future selector sibling owns the concrete
 greedy implementation, deterministic oracle, and any exact reusable scratch
 requirement.
+#### TinyLlama forward layout — TTNN matrix feasibility
+
+This is a bounded feasibility record for the planned BF16 TinyLlama
+operations, not a declaration of current support. TTNN still returns
+`Unsupported` for the neural facades before accepting an OID, and no result
+below is production conformance or profiler evidence. In particular, the
+host-computed implementation in `src/ttnn/binary.cpp` and the existing smoke,
+native-storage, copy, and unsupported-capability tests are not matrix
+evidence.
+
+##### Evidence and installed target
+
+The assessment used the configured `ttnn` host and the isolated remote
+workspace `forward-layout-ttnn-feasibility`. Installed facts, source facts,
+documented capability, and runtime evidence are deliberately separated:
+
+- **Installed package and source.** `TT_METAL_HOME` was
+  `/home/rlew/tt/src/tt-metal`. A clean `main` checkout reported commit
+  `06994d4afdaa61e89753d73a59d7fd241187f37b`, description
+  `v0.76.0-dev20260801-268-g06994d4afda`, and the generated TT-NN and Metalium
+  CMake package-version files both report `0.76.0`. The source's own configured
+  version is `0.76.0-dev20260801+268.06994d4afd`. IOM already requires
+  `find_package(tt-nn CONFIG REQUIRED)` and privately links
+  `TT::Metalium` and `TTNN::TTNN`; it has no TTNN version bound.
+- **Installed device and storage.** A standalone inventory program, compiled
+  against those two imported targets and then removed, observed one initialized
+  Blackhole device: device 0, one hardware command queue, eight DRAM channels,
+  1,572,864 bytes L1 per core, 4,278,190,080 bytes per DRAM channel, a
+  1,350 MHz clock, physical grid `17x12`, logical grid `12x10`,
+  compute/storage grid `11x10`, and DRAM grid `8x1`. The runtime logged firmware
+  bundle `19.13.1`, KMD `2.8.0`, and IOMMU disabled. This proves installed
+  runtime availability and device identity, not a matrix result.
+- **IOM source-declared storage.** `src/ttnn/device.cpp` creates one TILE-layout
+  `ttnn::Tensor` per logical leading plane. BF16 is native
+  `DataType::BFLOAT16`; rows and columns are physically rounded to 32 and each
+  plane is capped at 1 GiB. `src/ttnn/copy.cpp` identifies the physical order
+  as row-major 32x32 tiles, each tile containing four row-major 16x16 faces.
+  `src/ttnn/device_types.cpp` checks each native extent against `uint32_t`.
+  These facts establish native32 storage only.
+- **Installed high-level API.** At the installed commit,
+  [`matmul.hpp`](https://github.com/tenstorrent/tt-metal/blob/06994d4afdaa61e89753d73a59d7fd241187f37b/ttnn/cpp/ttnn/operations/matmul/matmul.hpp)
+  declares BF16-capable `ttnn::matmul`/`linear`, transpose flags, compute
+  configuration, and an `optional_output_tensor`.
+  [`matmul_device_operation.cpp`](https://github.com/tenstorrent/tt-metal/blob/06994d4afdaa61e89753d73a59d7fd241187f37b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp)
+  requires allocated, same-device, tiled floating inputs; a 32-wide inner tile;
+  matching logical and padded K; and positive M/K/N. Its optional-output path
+  requires exact computed logical shape, selected dtype, and memory
+  configuration, and reuses that tensor; the absent-output path calls
+  `create_device_tensor`.
+- **High-level rejection and allocation cases.**
+  [`matmul.cpp`](https://github.com/tenstorrent/tt-metal/blob/06994d4afdaa61e89753d73a59d7fd241187f37b/ttnn/cpp/ttnn/operations/matmul/matmul.cpp)
+  rejects optional-output volume mismatch. `matmul_batched_weights` rejects
+  both transpose flags, activation, output-tile selection, and every optional
+  output, so it cannot satisfy caller-owned projection or QK/PV output.
+  Depending on its chosen program, ordinary `matmul` may call allocating
+  transpose wrappers; its bias and unary post-processing can also become
+  separate operations. TinyLlama uses no linear bias or fused activation, but
+  the HF `[out,in]` weight still requires either a program that consumes
+  transposed B without an allocating wrapper or a checked caller-owned pack.
+  Therefore an optional output is only a candidate, never proof of the IOM
+  ownership contract.
+- **Documented lower-level capability.** The
+  [Metalium single-core matmul](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/matmul_single_core.html)
+  uses explicit source and destination DRAM buffers, a selected mesh command
+  queue, 32x32 BF16 tiles, reader/compute/writer kernels,
+  `matmul_init`/`matmul_tiles`, and `pack_tile`. This demonstrates a route
+  whose writer can target a pre-existing buffer. The
+  [Tensix compute/dataflow documentation](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html)
+  documents the FPU/SFPU, circular-buffer synchronization, and the distinction
+  between storage format and compute registers. It also explicitly warns that
+  `fp32_dest_acc_en=true` only makes each destination element 32 bits and does
+  not prove FP32 computation; the matrix engine's stated maximum is TF32.
+- **Runtime matrix evidence.** Parent verification configured and built the
+  existing IOM TTNN smoke target, then observed its single device test pass in
+  1.50 seconds on the installed Blackhole. That establishes availability only:
+  no project neural test, logical `R=1/15/16/17` matmul sample, QK/PV sample,
+  production conformance run, or profiler run was executed for this record. An
+  attempted build of the installed upstream single-core example produced no
+  binary because that SDK build tree was configured with programming examples
+  disabled and its regeneration stopped at a missing `AMDDeviceLibs` package.
+
+The repeatable inventory commands are
+`git -C "$TT_METAL_HOME" rev-parse HEAD`,
+`git -C "$TT_METAL_HOME" describe --tags --always --dirty`, and inspection of
+`build_RelWithDebInfo/lib/cmake/{tt-nn,tt-metalium}/*-config-version.cmake`.
+Every TTNN execution uses a 300-second timeout. Parent verification synchronized
+this exact worktree and ran:
+
+```text
+cmake -S . -B build/ttnn -DBUILD_TESTING=ON -DTTNN_ENABLED=ON -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF -DSYCL_ENABLED=OFF
+cmake --build build/ttnn --target iom_ttnn_smoke_tests -j2
+ctest --test-dir build/ttnn --output-on-failure -R "^iom_ttnn_smoke_tests$" --timeout 300
+```
+
+Smoke can establish device availability only. It cannot change a matrix cell
+below from blocked to supported.
+
+##### Contract fit and matrix decision
+
+Let `B` be the checked product of all independent leading dimensions and let
+`P32(n)=checked_mul(checked_ceil_div(n,32),32)`. Every public dimension is
+nonzero and remains `size_t` through common validation. Before constructing a
+TTNN shape or a `uint32_t` runtime argument, the backend checks the conversion
+against `UINT32_MAX`; all plane, tile, element, byte, stride, and address
+products and additions are checked first. Ranks remain 2 through 8,
+`QuantizationFormat::NONE` is required, transformed leading offsets and
+strides select independent native planes, and neither 16x16 logical nor 32x32
+physical padding creates a logical row, feature, head, key, or token.
+
+The preferred route is one bounded backend-private Metalium program family,
+not a public matrix layer. Its dataflow readers consume existing IOM native32
+owners, mask the logical tails, select linear row window `s..s+R`, read HF
+weights `[O,I]` in transposed orientation, and map GQA head `h` directly to
+`g(h)=floor(h/(Hq/Hkv))`. Its writer targets the supplied IOM output or a
+caller-workspace subrange. Any padding placed in workspace is explicitly
+initialized to neutral values. It does not materialize repeated KV heads,
+transpose or copy persistent weights, read K/V capacity tail `L..C`, expose a
+TTNN type publicly, or use a host/staging/elementwise substitute.
+
+For the table, **blocked/native route present** means that installed TTNN and
+Metalium expose the necessary matrix mechanism on the observed Blackhole, but
+the current IOM port correctly remains `Unsupported` until the operation
+implements that route, proves its precision, ownership, queue, and lifetime
+behavior, and passes its native gates.
+
+| Product | Logical `R=1` | `R=15` | `R=16` | `R=17` | Required native mapping and present blocker |
+| --- | --- | --- | --- | --- | --- |
+| ordinary linear | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | Per `b`, multiply selected `x[b,s:s+R,I]` by transposed shared `w[O,I]` and write exactly `out[b,R,O]`. Non-tile I/O and every leading plane are valid only with tail-masked readers. High-level transpose/no-temporary behavior and full accumulation fidelity are unproved. |
+| head-planar linear | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | The same product writes `out[b,h,R,d]` from weight row `h*D+d`, after checked `O=H*D`; no padded-column head shuffle is permitted. A custom writer or caller-owned checked rearrangement is required because IOM stores each head plane separately. |
+| SDPA QK | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | For each `b,h`, BF16 `q[b,h,R,D]` multiplies the logical transpose of `k[b,g(h),0:L,D]` into FP32 scores `[R,L]`, followed by FP32 scale and causal/prefix mask. Non-tile D/L and GQA require custom address generation; TTNN's high-level output and FP32-accumulation contract are unproved. |
+| SDPA PV | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | Explicit RNE-rounded BF16 `P[b,h,R,L]` multiplies `v[b,g(h),0:L,D]` with FP32 accumulation and writes or merges exactly `out[b,R,h*D+d]`. It may not fuse away the probability store, read masked V, or create repeated KV heads; the current positive-workspace and numerical paths are absent. |
+
+These four row cases are shape-generic tile counts, not special kernels:
+`P32(R)` is 32 for `R=1/15/16/17`, while logical readers and writers admit
+exactly 1, 15, 16, or 17 rows. Physical padding is masked independently of the
+SDPA condition `0<=t<L && t<=a+r`. The SDPA route also requires
+`Hq%Hkv=0`, `0<L<=C`, `a<C`, and `R<=C-a`; K/V public owners remain
+`[B...,Hkv,C,D]`, even when internal readers address only prefix `L`.
+
+For BF16 linear, QK, and PV, configure a candidate kernel with
+`math_approx_mode=false`, high fidelity, and 32-bit destination accumulation,
+but do not infer conformance from those knobs. BF16 products must be accumulated
+with the contract's FP32 behavior and stored with RNE. QK scale, maximum,
+subtraction, exponentiation, and denominator remain FP32; masked probability is
+exactly zero; the probability is then explicitly RNE-rounded to BF16 before PV;
+PV accumulates in FP32 and the merged result is RNE-rounded to BF16. Installed
+headers and the inventory run do not prove those mathematical properties.
+Numerical comparison against the independent references, including cancellation
+and long-K cases that distinguish partial BF16/TF32 accumulation, is therefore a
+hard support gate. This BF16 assessment makes no additional F64 claim.
+
+##### Checked dataflow, output, and scratch
+
+The following table freezes the admissible data flow. `logical bytes` account
+for caller data; `native capacity` accounts for 32x32 storage. Each
+multiplication and the final sum of aligned subranges is checked. BF16 tiles
+are 2,048 bytes and FP32 tiles are 4,096 bytes, so a Metalium buffer-backed
+workspace route uses 4,096-byte alignment (which also satisfies the common
+32-byte minimum). The operation query is pure: it computes these bounds from
+validated values without allocating, registering, submitting, consulting
+queue occupancy or allocator capacity, or depending on a native handle state.
+
+| Purpose | Existing owner and logical traffic | Caller-owned temporary, if required | Native invocation and destination | Lifetime and checked capacity |
+| --- | --- | --- | --- | --- |
+| linear A/window | `x[B...,T,I]`; `checked(B*R*I*2)` bytes read | none for an offset/tail-aware reader; otherwise BF16 packed A of `checked(B*P32(R)*P32(I)*2)` | reader supplies `[R,I]` tiles to Metalium matmul | x and any packed A remain registered through native completion |
+| linear B/orientation | shared persistent `w[O,I]`; logical weight bytes are not scratch | none for a transpose-aware reader; otherwise one BF16 packed `[I,O]` region of `checked(P32(I)*P32(O)*2)`, not one per plane | `matmul_init`/`matmul_tiles`; never an allocating `ttnn::transpose` | w and any pack remain live through every submitted plane; no duplicate persistent checkpoint copy |
+| ordinary/head-planar result | ordinary output traffic `checked(B*R*O*2)`; head-planar is the equal checked value `B*H*R*D*2` | none when the writer maps result columns directly; otherwise BF16 product region `checked(B*P32(R)*P32(O)*2)` | writer stores into caller output `[B...,R,O]` or scatters `o=h*D+d` to `[B...,H,R,D]` | output and any product region remain leased until completion; result padding is not logical |
+| QK operands | q traffic `checked(B*Hq*R*D*2)`; K initialized-prefix traffic `checked(B*Hkv*L*D*2)` from capacity owners `[B...,Hkv,C,D]` | no repeated K heads; optional tail-neutral BF16 pack is at most `checked(B*(Hq*P32(R)*P32(D)+Hkv*P32(L)*P32(D))*2)` | per-head native QK, with K read in transposed orientation and `g(h)` address mapping | Q/K and any pack live through QK; bytes for `L..C` are neither scratch nor logical input |
+| QK scale/mask/scores | logical FP32 score requirement `checked(B*Hq*R*L*4)` | FP32 native32 scores `checked(B*Hq*P32(R)*P32(L)*4)` | matrix writer targets the score subrange; device-local scale, causal/prefix mask, max and sum operate there | score range remains exclusive through probability production |
+| probability preparation | logical BF16 probability requirement `checked(B*Hq*R*L*2)` | distinct BF16 native32 P region `checked(B*Hq*P32(R)*P32(L)*2)` so the RNE boundary is observable | device-local FP32 softmax writes RNE BF16 P; masked cells and physical padding are initialized zero | scores and P may not overlap while score values are live; P remains through PV |
+| PV and merge | V prefix traffic `checked(B*Hkv*L*D*2)`; PV logical result `checked(B*Hq*R*D*2)`; merged caller output `checked(B*R*Hq*D*2)` | no PV temporary when the writer maps `(h,d)` directly; otherwise BF16 native32 PV region `checked(B*Hq*P32(R)*P32(D)*2)` | native BF16 P/V matmul writes caller output at `h*D+d`, or writes the checked PV region followed by device-local merge | V, P, output, and any PV region remain live until the final native completion |
+
+The query reports zero linear workspace only when direct readers and writers
+eliminate every DRAM pack/product temporary. Otherwise it returns the aligned
+sum of only the live packed regions for the chosen path. SDPA requires at least
+nonoverlapping native32 score and P regions, plus a PV region only if direct
+merge is unavailable; optional Q/K packs are added only when direct native32
+readers cannot express the installed layout. Scratch never includes persistent
+weights, Q/K/V owners, output, or duplicate caches. The scheduler may reuse
+nonoverlapping-lifetime subranges only after their native completion is proven.
+
+Current TTNN `create_workspace(bytes)` rejects every positive size, so the
+score/P route is a concrete blocker rather than permission for a hidden tensor
+allocation. The first TTNN operation that actually requires positive scratch
+owns minimal TTNN-private `RawWorkspace` buffer support: the TTNN leaf under
+`.cswd/tasks/006-tinyllama/04-linear-projections` if its selected linear route
+packs, otherwise the TTNN SDPA leaf under
+`.cswd/tasks/006-tinyllama/08-causal-grouped-attention`. Creation, rebind,
+subrange addressability, exact-device checks, and destruction/reset must be
+implemented before queued use. Workspace and output are disjoint from all
+operands and each other; new output/read and scratch/operand overlap are
+rejected, while valid read/read overlap, including exact Q/K/V aliases, is
+accepted.
+
+One facade submission must enqueue the bounded program on the exact
+`TtnnDevice` mesh command queue used by that `DeviceOps`, in call order and
+without an internal host wait. It snapshots specs, native handles, plane
+mappings, scalar values, and workspace ranges; registers each distinct owner;
+and retains the workspace lease until the existing native fence proves
+completion. A pre-admission failure consumes no sequence and mutates nothing.
+After a positive OID, device failure is retained and rethrown by every repeated
+wait. Workspace reset/destruction must wait for proven use or quarantine the
+range; device destruction must drain or retain unresolved work. The high-level
+matmul signature does not select an IOM queue or establish these lifetime
+facts, which is another reason its optional output is not yet adopted.
+
+##### Fit of all seven operations
+
+| Planned facade | Installed facility and contract disposition |
+| --- | --- |
+| embedding | `ttnn::embedding` declares an optional output, but installed evidence does not verify every integral index carrier, bit-preserving BF16 payload, independent IOM planes, transformed mappings, no hidden temporary, or IOM queue/lifetime behavior. A bounded device-local gather can use the same owner/writer rules; current support is blocked, not replaced by a host index scan. |
+| linear | Native matrix hardware and lower-level destination buffers make the route feasible as specified above. Current support is blocked on implementation, proven accumulation/RNE, optional-output or direct-writer ownership, and any required positive workspace. |
+| rmsnorm | Installed `sum`/`mean`/`max` reductions return tensors and do not expose caller output, while unary `rsqrt` has an optional output. Composing them would allocate intermediates and does not prove logical-tail exclusion or wide reduction. A backend-private fused row reduction is required; current support is blocked. |
+| rope | Installed unary `sin` and `cos` accept optional outputs, but composing transpose/arithmetic wrappers can allocate and does not prove FP32 angle/trig behavior or split-half pairing. A device-local kernel must write caller output, mask tails, and use `a+r`; current support is blocked. |
+| cache append | Installed slice/data-movement APIs expose optional outputs, and Metalium readers/writers can address tiles, but partial native32 updates must preserve every cell outside `[a,a+R)`, including other logical rows and physical padding, without host staging. Exact destination-window, queue, and alias behavior is unproved; current support is blocked. |
+| silu | Installed `ttnn::silu` declares an optional output and is a plausible direct route only after exact shape/dtype/memory configuration, no-hidden-temporary, stable wide evaluation, RNE, queue, and lifetime behavior are verified. Until then a backend-private unary kernel is required and support remains blocked. |
+| sdpa | Installed `scaled_dot_product_attention` returns a new tensor and has no optional output; its public mask/layout and fused numerical boundaries do not establish IOM's GQA, capacity-owner, explicit BF16-P, caller-scratch, or merged-output contract. Use the bounded QK/softmax/PV flow above; current support is blocked. |
+
+Allocating wrappers are never repaired by copying their result into the caller
+output: that still violates the no-hidden-allocation rule. Likewise, current
+host transfer/staging and elementwise binary paths prove none of gather,
+reduction, trig, partial-tile mutation, unary numerics, linear, QK, or PV.
+
+##### Dependency decision and remaining gates
+
+**Decision: add no matrix library.** The already-required
+`TTNN::TTNN`/`TT::Metalium` pair provides high-level matmul and the lower-level
+Blackhole matrix/dataflow primitives. A BLAS package or umbrella dispatcher
+would add discovery, link, redistribution, handle, and workspace lifecycle
+without solving native32 addressing, BF16/FP32 fidelity, IOM queue retention,
+or caller-owned output/scratch. Prefer the single bounded TTNN-private
+Metalium program family above when the high-level optional-output path cannot
+be proven exact. Do not add a plugin layer, a second handle system, or separate
+matrix facilities for linear, QK, and PV. Absence of BLAS linkage is not a
+capability gap, and unavailable hardware remains `Unsupported`.
+
+The eventual TTNN linear and SDPA leaves must first recheck the exact installed
+commit/API and fail TTNN-enabled configuration explicitly if their required
+TTNN/Metalium features are absent; TTNN-disabled and CPU-only builds acquire no
+new dependency. If later evidence shows even lower-level Metalium cannot meet
+the contract, that operation leaf must document the precise failure before
+proposing a minimal alternative with an exact package, minimum version,
+imported target, private linkage, redistribution terms, runtime footprint,
+context/handle initialization, caller-workspace binding, queue integration,
+and reset/destruction synchronization. No such need is evidenced here.
+
+Parent verification observed the configured TTNN smoke gate pass as recorded
+above. Production ports later owe
+`cmake --build build --target iom_ttnn_conformance_tests` and
+`ctest --test-dir build --output-on-failure -R '^iom_ttnn_conformance_tests$' --timeout 300`,
+plus native runtime/profiler evidence for ordinary and head-planar linear and
+both QK and PV at logical `R=1/15/16/17`, non-tile I/O/D/L, independent
+leading planes, GQA, tails, aliases, checked failures, in-order OIDs, and
+repeated waits. None of those production gates or profiler runs was run by
+this assessment.
 
 ### 10. Backend integration and conformance obligations
 
