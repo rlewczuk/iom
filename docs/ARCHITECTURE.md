@@ -311,6 +311,165 @@ conversion, workspace, and emulation are permitted, and accepted failures are
 not retried. This additive SUB/DIV API and MUL behavioral cutover require
 rebuilding consumers; no mixed-version ABI is promised.
 
+## Planned TinyLlama single-sequence model flow
+
+TinyLlama composition is a parameterized, imperative sequence of caller-owned
+operations; it is not a graph, fused decoder kernel, or currently shipped
+model API. Embedding, linear, RMSNorm, RoPE, cache append, SiLU, and SDPA are
+planned operation boundaries. The current neural methods remain
+`Unsupported` until their operation-specific ports land, so this section
+describes neither an available model runner nor successful kernel, build,
+profiler, or hardware evidence. Existing `add` and `mul` provide the two
+residual additions and the SwiGLU product without changing their contracts.
+
+### Runtime dimensions and loading boundary
+
+Runtime configuration and loaded parameter shapes determine:
+
+| Symbol | Meaning |
+| --- | --- |
+| `R` | Rows in the current prompt/decode run. |
+| `F` | Hidden width, constrained by `F = Hq * D`. |
+| `M` | MLP intermediate width. |
+| `Hq` / `Hkv` | Query-head and key/value-head counts. |
+| `D` | Per-head width. |
+| `V` | Vocabulary size. |
+| `C` | Bounded cache capacity per layer. |
+
+Layer count, current absolute position/cache length, epsilon, and RoPE
+parameters are likewise configuration. They are not inferred from one
+checkpoint's constants. The loader validates and owns persistent weights.
+Only the loader adapts checkpoint normalization vectors from `[H]` to `[1,H]`
+while materializing them; RMSNorm remains rank 2 through 8 and never gains
+rank-one input or implicit hidden-state broadcasting. Persistent checkpoint
+weights are not copied into a second session-owned weight bank.
+
+This flow describes one sequence session, not request batching or serving.
+Leading planes supported by individual operations remain independent logical
+planes: no hidden state, normalization reduction, cache row, or workspace is
+broadcast between them. A normal single-session spelling below omits a leading
+plane index.
+
+### Forward sequence
+
+Input token indices `[1,R]` are embedded once into the first BF16 residual
+`X [R,F]`. For every configured decoder layer, in order:
+
+1. **Attention normalization.** RMSNorm stores `N [R,F]` from `X` and that
+   layer's `[1,F]` attention-normalization scale.
+2. **Q/K/V projections.** Three distinct head-planar linears consume `N` and
+   store Q `[Hq,R,D]`, K `[Hkv,R,D]`, and V `[Hkv,R,D]`.
+3. **Positions.** Independent RoPE operations store rotated Q and K results;
+   neither operation modifies or aliases its input.
+4. **Caches.** Separate cache-append calls write the rotated K rows and V rows
+   into that layer's distinct bounded K and V cache owners. Initialized cache
+   length and capacity are explicit session state.
+5. **Attention.** Causal grouped-query SDPA reads rotated Q and only the
+   initialized, causally permitted K/V cache rows. It stores merged attention
+   `A [R,Hq*D]`, which is `[R,F]` because `F=Hq*D`.
+6. **Attention projection and first residual.** An ordinary output linear
+   stores `B [R,F]`. Existing `add(X,B,X2)` then stores the first residual
+   `X2 [R,F]`.
+7. **MLP normalization and projections.** RMSNorm stores `N2 [R,F]` from
+   `X2` and the layer's `[1,F]` post-attention scale. Separate ordinary
+   linears store `Gate [R,M]` and `Up [R,M]`.
+8. **SwiGLU and down projection.** SiLU stores `ActivatedGate [R,M]`.
+   Existing `mul(ActivatedGate,Up,Product)` stores `Product [R,M]` in exactly
+   that operand order; there is no fused SiLU-times-multiply operation. The
+   down linear stores `Down [R,F]`.
+9. **Second residual.** Existing `add(X2,Down,NextX)` stores the second
+   residual. `NextX [R,F]` becomes the following layer's `X`.
+
+After all configured layers, final RMSNorm stores `FinalN [R,F]` using the
+loaded final `[1,F]` scale. The untied LM-head weights are a distinct
+`[V,F]` parameter. An ordinary linear selects the final logical input row
+through its row-window arguments and stores logits `[1,V]`. It does not make a
+final-axis `TensorView` slice, compute logits for omitted rows, or reuse the
+embedding table as a tied head.
+
+Each listed operation produces a distinct logical BF16 store before its
+consumer begins. BF16 arithmetic operations round at every operation boundary:
+projection outputs, each normalization, Q/K RoPE, SDPA output, both residuals,
+SiLU, the existing multiply, down projection, final normalization, and logits.
+Embedding and cache append preserve BF16 payload bits at their own stores.
+No fusion may erase residual/normalization or SiLU/multiply rounding
+boundaries. Q, K, V, rotated Q/K, `A`, `B`, `X2`, `N2`, `Gate`, `Up`,
+`ActivatedGate`, `Product`, `Down`, `NextX`, `FinalN`, and logits name
+different produced values; a neural output is disjoint from inputs and
+scratch. These names do not require a persistent activation-bank allocation
+for every layer. A physical bank may be reused only after every reader and
+accepted queue operation that references it has completed.
+
+### Worked shape propagation
+
+For `F=8`, `M=12`, `Hq=4`, `Hkv=2`, and `D=2`, the consumer shapes for all
+four required run lengths are:
+
+| `R` | Hidden/norm/residual | Q | K and V | Merged attention | Gate/up/SiLU/product | Final logits |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 1 | `[1,8]` | `[4,1,2]` | `[2,1,2]` | `[1,8]` | `[1,12]` | `[1,V]` |
+| 15 | `[15,8]` | `[4,15,2]` | `[2,15,2]` | `[15,8]` | `[15,12]` | `[1,V]` |
+| 16 | `[16,8]` | `[4,16,2]` | `[2,16,2]` | `[16,8]` | `[16,12]` | `[1,V]` |
+| 17 | `[17,8]` | `[4,17,2]` | `[2,17,2]` | `[17,8]` | `[17,12]` | `[1,V]` |
+
+In every row, attention output projection consumes `[R,8]`, both residuals
+consume matching `[R,8]` operands, the MLP down projection consumes `[R,12]`,
+and the final normalization consumes the last `[R,8]` result. Logical
+`R=15` and `R=17` do not expose or compute padded rows. `F=8`, `M=12`, and
+`D=2` are non-tile widths whose padding never enters a reduction or consumer
+shape. A conformance fixture with leading extent `P` independently maps
+hidden `[P,R,8]` to Q `[P,4,R,2]`, K/V `[P,2,R,2]`, merged attention
+`[P,R,8]`, and MLP intermediates `[P,R,12]`; no plane supplies another
+plane's norm or cache. Neither that fixture nor final-row selection slices,
+selects, permutes, or reshapes either final tensor axis.
+
+### Setup, scheduling, and delivery
+
+Session setup computes exact element, stride, tiled-byte, cache, and workspace
+products with checked arithmetic in a deterministic order:
+
+1. token-index and embedding output capacity;
+2. per-layer normalization and Q/K/V projection outputs;
+3. Q/K RoPE outputs, separate bounded K/V cache owners, SDPA scratch/output,
+   and the maximum queried operation workspace;
+4. attention output projection and first-residual stores;
+5. second normalization, gate/up, activated-gate, product, down-projection,
+   and second-residual stores; and
+6. final normalization plus one-row `[1,V]` logits.
+
+This sizing keeps cache capacity and the maximum caller-owned workspace
+explicit, does not duplicate persistent weights, and provides every operand
+and result before submission. No operation allocates or relocates an operand
+or result. The session owns actual allocation, initialized cache length,
+reset/growth/failure policy, producer-success waits, and selector invocation;
+each operation owns its exact minimum workspace requirement. Storage is not
+reused until all readers complete, including independent K and V cache
+lifetimes for every layer.
+
+Before admission, each operation validates rank 2 through 8, nonzero
+dimensions, leading-plane tuples, device and dtype/quantization compatibility,
+aliases, exact workspace device/size/alignment/nonoverlap, finite scalars where
+required, and checked shape/range/byte arithmetic. Rejection occurs before
+work, owner registration, sequence use, or output mutation and returns the
+common negative OID from a `noexcept` facade. Accepted device-data failures
+remain observable on every repeated wait. Submission snapshots metadata and
+registers owners/workspace rather than retaining borrowed `TensorView`
+objects.
+
+Implementation order is deliberately different from forward order. Complete
+embedding, linear, RMSNorm, RoPE, cache append, SiLU, and finally SDPA; for
+each operation, settle the contract, independent reference, and all-five
+feasibility, then close CPU, CUDA, ROCm, SYCL, and TTNN before advancing.
+The CPU scalar/wide tiled-storage baseline is not an accelerator claim.
+CUDA/ROCm/SYCL/TTNN must separately evidence native BF16 matrix execution for
+linear and SDPA prefill and logical `R=1`; host computation, round trips,
+elementwise substitutes, and padded extra tokens are not that evidence.
+Unavailable ports remain unsupported and do not count as conformance. Future
+all-five coverage includes success, boundary, rejection, accepted failure,
+`R=1/15/16/17`, non-tile widths, independent leading planes, and padding
+isolation. Only after the final SDPA gate closes can the session component
+assemble and verify this complete layer.
+
 ## Public API guide
 
 The library is intentionally small. The following are the user-facing entry
