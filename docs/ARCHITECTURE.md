@@ -328,14 +328,15 @@ Runtime configuration and loaded parameter shapes determine:
 
 | Symbol | Meaning |
 | --- | --- |
-| `R` | Rows in the current prompt/decode run. |
-| `F` | Hidden width, constrained by `F = Hq * D`. |
+| `Nlayers` | Number of configured decoder layers. |
+| `R` | Exact logical rows in the current prefill or decode run. |
+| `F` | Hidden width, constrained by the checked equality `F = Hq * D`. |
 | `M` | MLP intermediate width. |
 | `Hq` / `Hkv` | Query-head and key/value-head counts. |
 | `D` | Per-head width. |
 | `V` | Vocabulary size. |
-| `C` | Bounded cache capacity per layer. |
-
+| `C` | Bounded context and per-layer K/V cache capacity. |
+| `Qcap` | Independent queue admission capacity; it does not size context or cache storage. |
 Layer count, current absolute position/cache length, epsilon, and RoPE
 parameters are likewise configuration. They are not inferred from one
 checkpoint's constants. The loader validates and owns persistent weights.
@@ -425,50 +426,212 @@ selects, permutes, or reshapes either final tensor axis.
 
 ### Setup, scheduling, and delivery
 
-Session setup computes exact element, stride, tiled-byte, cache, and workspace
-products with checked arithmetic in a deterministic order:
+Setup has two allocation stages. Every `Nlayers,F,M,Hq,Hkv,D,V,C,R` value
+used by a stage is nonzero, `F=Hq*D` is checked rather than assumed, and
+`Qcap` is the separately configured nonzero queue admission bound. `C` limits
+logical model positions and K/V rows; `Qcap` only limits accepted in-flight
+work and never multiplies a tensor, cache, or activation-bank allocation.
+Every shape, inserted or leading axis, and transformed view remains within the
+standard rank interval 2 through 8.
 
-1. token-index and embedding output capacity;
-2. per-layer normalization and Q/K/V projection outputs;
-3. Q/K RoPE outputs, separate bounded K/V cache owners, SDPA scratch/output,
-   and the maximum queried operation workspace;
-4. attention output projection and first-residual stores;
-5. second normalization, gate/up, activated-gate, product, down-projection,
-   and second-residual stores; and
-6. final normalization plus one-row `[1,V]` logits.
+#### Session setup and persistent storage
 
-This sizing keeps cache capacity and the maximum caller-owned workspace
-explicit, does not duplicate persistent weights, and provides every operand
-and result before submission. No operation allocates or relocates an operand
-or result. The session owns actual allocation, initialized cache length,
-reset/growth/failure policy, producer-success waits, and selector invocation;
-each operation owns its exact minimum workspace requirement. Storage is not
-reused until all readers complete, including independent K and V cache
-lifetimes for every layer.
+Session setup occurs before any request. It validates the configuration and
+loaded shapes, establishes the mapped-weight ownership flow, creates all
+persistent BF16 weight tensors on the caller-selected device, and allocates
+bounded per-layer caches and fixed logical-run-one decode banks. Those owners
+remain at stable addresses and are not recreated merely because a later prompt
+has a different `R`.
 
-Before admission, each operation validates rank 2 through 8, nonzero
-dimensions, leading-plane tuples, device and dtype/quantization compatibility,
-aliases, exact workspace device/size/alignment/nonoverlap, finite scalars where
-required, and checked shape/range/byte arithmetic. Rejection occurs before
-work, owner registration, sequence use, or output mutation and returns the
-common negative OID from a `noexcept` facade. Accepted device-data failures
-remain observable on every repeated wait. Submission snapshots metadata and
-registers owners/workspace rather than retaining borrowed `TensorView`
-objects.
+The only weight flow is mapped source -> `SafeTensors` borrowed bytes ->
+caller-created device tensors. The loader owns configuration/shape validation
+and the adaptation of rank-one normalization scales to `[1,F]`; it does not
+retain a second full checkpoint image. Runtime weight shapes are:
 
-Implementation order is deliberately different from forward order. Complete
-embedding, linear, RMSNorm, RoPE, cache append, SiLU, and finally SDPA; for
-each operation, settle the contract, independent reference, and all-five
-feasibility, then close CPU, CUDA, ROCm, SYCL, and TTNN before advancing.
-The CPU scalar/wide tiled-storage baseline is not an accelerator claim.
-CUDA/ROCm/SYCL/TTNN must separately evidence native BF16 matrix execution for
-linear and SDPA prefill and logical `R=1`; host computation, round trips,
-elementwise substitutes, and padded extra tokens are not that evidence.
-Unavailable ports remain unsupported and do not count as conformance. Future
-all-five coverage includes success, boundary, rejection, accepted failure,
-`R=1/15/16/17`, non-tile widths, independent leading planes, and padding
-isolation. Only after the final SDPA gate closes can the session component
-assemble and verify this complete layer.
+| Weight | Logical BF16 shape |
+| --- | --- |
+| token embedding | `[V,F]` |
+| each layer's two normalization scales | two distinct `[1,F]` tensors |
+| Q projection | `[F,F]` |
+| K and V projections | two distinct `[Hkv*D,F]` tensors |
+| attention output projection | `[F,F]` |
+| gate and up projections | two distinct `[M,F]` tensors |
+| down projection | `[F,M]` |
+| final normalization scale | `[1,F]` |
+| untied LM head | `[V,F]` |
+
+Each of the `Nlayers` layers owns distinct K and V BF16 tensors with exact
+logical shape `[Hkv,C,D]`. There is no leading-plane or state broadcast, and
+physical capacity is never exposed as initialized logical length. The checked
+logical total is
+
+```text
+cache_logical_bytes =
+    2 (K and V) * Nlayers * Hkv * C * D * 2 (BF16 bytes).
+```
+
+For the standard 16x16 tiled backends, independently pad the final two axes:
+
+```text
+per_cache_standard_bytes =
+    Hkv * ceil(C / 16) * ceil(D / 16) * 256 * 2
+all_standard_cache_bytes =
+    2 * Nlayers * per_cache_standard_bytes.
+```
+
+The `256` factor is the number of BF16 elements in one tile. TTNN does not use
+that byte formula: its assessment uses one native 32x32 allocation per leading
+plane, checks every native extent and `uint32_t` conversion, and obtains the
+carrier or runtime-owned allocation size from backend evidence. An illustrative
+BF16 assessment is
+
+```text
+per_cache_native32_bytes =
+    Hkv * ceil(C / 32) * ceil(D / 32) * 1024 * carrier_bytes.
+```
+
+It is not permission to invent a carrier byte count or other native allocation
+constant when the backend cannot report it. Existing device arena and queue
+metadata overhead is accounted separately from tensor bytes.
+
+#### Request setup and immutable run banks
+
+Request setup follows tokenization, validates exact `R>0` and `R<=C`, and
+finishes before the first request submission. Overflow or an excessive prompt
+is rejected without truncation. A request allocates exact-`R` prefill banks,
+retains the fixed logical-`R1=1` decode banks from session setup, and provisions
+enough reusable workspace for the actual prefill, decode, host-transfer, and
+selector paths. A new request with a different `R` first drains every accepted
+OID from the old request, including failures, and only then replaces its
+prefill banks or workspace.
+
+There is no family containing one bank for every possible `R`, no
+capacity-row logical-padding trick, no final-axis slice, no retargeted
+owner/view, and no per-token allocation. Final axes are fixed when each owner
+is created. The exact-R and fixed-R1 owners may be reused only for the matching
+logical run shape after all leases and readers complete.
+
+For `Nlayers=2,F=8,M=12,Hq=4,Hkv=2,D=2,V=19,C=17`, checked logical K+V
+cache storage is `2*2*2*17*2*2 = 544` bytes. Standard storage is
+`2*ceil(17/16)*ceil(2/16)*256*2 = 2048` bytes per cache and
+`2*2*2048 = 8192` bytes for both caches in both layers. A native32 assessment
+instead evaluates
+`Hkv*ceil(C/32)*ceil(D/32)*1024*carrier_bytes`: with an evidenced two-byte
+BF16 carrier this is `4096` bytes per cache and `16384` bytes total. If the
+backend reports another carrier or runtime-owned size, that evidenced result
+replaces the illustration; every native extent and conversion remains checked.
+
+The same case intentionally uses non-tile-aligned `F=8`. An exact `[R,F]`
+BF16 bank has logical byte counts `R*8*2`, so `R=1,15,16,17` requires
+`16,240,256,272` logical bytes. Its standard tiled storage is
+`ceil(R/16)*ceil(8/16)*256*2`, respectively `512,512,512,1024` bytes.
+An `[R,M]` bank with `M=12` has the same standard sequence, and a fixed decode
+bank is the `R1=1` entry. Exact-capacity `R=17` is valid; `R=18` is rejected
+before allocation. These are independent sizing checks, not capacity-sized
+logical storage or a view-retargeting scheme.
+
+All tensor operands and outputs are allocated before asking an operation or
+host-transfer requirement query about those actual views. For each actual
+prefill and decode call, including the CUDA, ROCm, SYCL, and TTNN
+matrix-staging paths described in the backend contract, reusable operation and
+transfer scratch is:
+
+```text
+scratch_bytes =
+    max(each actual operation or host-transfer requirement in bytes)
+scratch_alignment =
+    max(32, each actual required power-of-two alignment).
+```
+
+The maximum uses checked align-up, subrange addition, byte, and address
+arithmetic. Mutually exclusive live ranges are not summed. Independent
+submissions either use disjoint aligned subranges or the existing lease
+serialization. Synchronous selector scratch is provisioned separately from the
+selector's actual requirement and is never allocated during selection. If a
+backend requirement is capability-blocked, setup records the missing evidence
+instead of guessing bytes; CPU and TTNN positive workspace remains rejected
+until the first owning operation closes its minimal factory gap.
+
+#### Storage live ranges
+
+Every listed operation operand and result is BF16 except integer token indices
+and wide caller scratch. Read/read weight reuse is explicit; every output/read
+pair is disjoint. An owner remains immovable, and a physical bank or scratch
+range is reused only after every direct reader and workspace lease is terminal.
+
+| Value/resource | Shape/storage | Lifetime and reuse rule |
+| --- | --- | --- |
+| `X`, `X2`, next residual | exact prefill `[R,F]`, decode `[1,F]`, BF16 | Each bank lives through all direct readers; reuse only after their accepted OIDs complete. |
+| Norm outputs | `[R,F]` or `[1,F]`, BF16 | Output and input/read owners are distinct; these paths use no in-place alias. |
+| Q/K/V projections | `[Hq,R,D]` / `[Hkv,R,D]`, BF16 | Q and K live through RoPE; K and V live through their separate cache appends. |
+| Rotated Q/K | matching head-planar shapes, BF16 | Rotated Q lives through SDPA and rotated K through append; neither is a retargeted view. |
+| K/V caches | per-layer `[Hkv,C,D]`, BF16 | Persistent for the request; only the initialized prefix is readable, and reset/destruction follows a safe drain. |
+| Attention merged/output projection | `[R,Hq*D]` then `[R,F]`, BF16 | Output/read storage does not overlap; reuse waits for every reader. |
+| Gate/up, SiLU, product, down | `[R,M]`, `[R,M]`, `[R,M]`, `[R,F]`, BF16 | Gate/up may enqueue independently; SiLU, product, and down wait for all direct producers. |
+| Final norm/logits | `[R,F]`, then final row `[1,V]`, BF16 | The ordinary LM-head row window produces logits directly; the selector borrows them only synchronously. |
+| Token-index input | rank-two integer `[1,R]` or explicit independent planes | Caller-owned, validated before embedding, and retained through embedding completion. |
+| Host transfer/staging | caller-owned wide scratch plus backend staging | Sized from actual transfer requirements; never a hidden persistent checkpoint duplicate. |
+| Selector resources | caller-owned synchronous scratch | Separately provisioned once per request requirement; no selection allocation or async selector task. |
+
+No memory reduction is claimed unless these actual live ranges and completion
+boundaries prove it. In particular, allocator reset is forbidden while live
+owners or queued uses remain.
+
+#### Cache publication, abort, and request replacement
+
+The producer-success order follows the operation contract. Embedding and each
+normalization complete before their consumers. Q, K, and V projections may
+enqueue as independent branches, as may gate and up, but every consumer waits
+successfully for every direct producer. Q and K RoPE are separate branches.
+K and V append have distinct cache owners and distinct OIDs.
+
+Both append OIDs are waited independently and successfully before publishing
+checked `initializedL=a+R` or submitting SDPA. A positive OID proves admission,
+not initialized cache data. SDPA maps
+`g(h)=floor(h/(Hq/Hkv))`, reads only `0<=t<initializedL` and `t<=a+r`, and
+never reads an uninitialized cache row. The LM head uses the ordinary linear
+window `s=run-1,R=1` and writes `[1,V]` directly.
+
+Queues do not propagate predecessor errors, so a later successful OID and a
+final-OID wait cannot stand in for an earlier producer wait. Token commit is
+separate from physical cache initialization. If any admission or completion
+failure occurs, the session stops new dependent submissions, becomes poisoned,
+and attempts a wait on every accepted OID even after an individual wait throws.
+There is no cache rollback, retry, or reuse of that state: a completed append
+may have changed physical cache while the logical token remains uncommitted.
+Unproven-terminal storage is retained or quarantined. Valid length may return
+to zero, owners may be reset/destroyed, and changed request banks may be
+installed only after a safe full drain; a prior request's cache is never read
+by its replacement.
+
+#### Phase and operation attribution seam
+
+Attribution is caller-owned correlation, not a telemetry implementation. For
+each phase `load`, `tokenization`, `prefill`, `decode`, or `selection`, the
+caller may associate the phase, decoder layer where applicable, absolute
+row/token position, operation name, positive OID, host-enqueue boundary, and
+completion-observation boundary. Host enqueue elapsed time,
+completion-observed elapsed time, and genuine backend device timestamps are
+different quantities and must be labeled as such.
+
+This seam adds no event allocation, timing API, async selector task, or
+per-operation correctness wait solely for disabled tracing. Required
+producer-success waits remain mandatory regardless of attribution. Complete
+mathematical layer assembly remains gated until SDPA closes its all-five
+backend gate; incremental session integration belongs to its separate
+component and is not claimed here.
+
+Implementation delivery remains operation-first and deliberately differs from
+the mathematical forward order: embedding, linear, RMSNorm, RoPE, cache
+append, SiLU, and finally SDPA. For each operation, settle the contract,
+independent reference, and all-five feasibility, then close CPU, CUDA, ROCm,
+SYCL, and TTNN before advancing. The CPU scalar/wide tiled-storage baseline is
+not accelerator evidence. Native BF16 matrix evidence for linear and both
+SDPA products must cover prefill and logical `R=1`; host computation, round
+trips, elementwise substitutes, and padded extra tokens do not count.
+Unavailable ports remain unsupported. Future all-five coverage includes
+success, boundary, rejection, accepted failure, exact `R=1/15/16/17`,
+non-tile widths, independent leading planes, and padding isolation.
 
 ## Public API guide
 
