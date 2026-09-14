@@ -1347,6 +1347,137 @@ The existing neural hooks remain `Unsupported` until their real operation
 ports land; this subsection changes no facade, kernel, queue, session, or
 selector implementation.
 
+#### TinyLlama forward layout — Final-logits selection and ownership
+
+This subsection freezes the planned synchronous selection boundary for the
+final untied LM-head result described by
+[Embedding and projection boundaries](#tinyllama-forward-layout--embedding-and-projection-boundaries).
+It does not declare or implement the interface. The exact target ABI is:
+
+```cpp
+class TokenSelector {
+public:
+    virtual ~TokenSelector() = default;
+    virtual std::size_t select(
+            DeviceOps& queue,
+            const TensorView& logits,
+            std::size_t valid_vocabulary,
+            oid producer,
+            std::span<const std::size_t> history) = 0;
+};
+```
+
+`select` is deliberately not `noexcept`. Invalid input, readiness, runtime,
+and device-data failures are delivered with standard exceptions. The method
+returns one token ID only after the producing work and all selector work have
+completed successfully; it exposes no asynchronous selection result or
+selector OID.
+
+`logits` MUST be a borrowed const BF16 view with exact logical rank-two shape
+`[1,V]`, where both dimensions are nonzero. The view and its live storage
+owner MUST belong to the exact device served by `queue`. `valid_vocabulary`
+MUST be nonzero and exactly equal the logical `V`; the only selectable IDs are
+`[0,V)`. Physical 16x16 tile padding, and any physical row or feature outside
+that logical extent, MUST NOT be read as a candidate or included in validation
+of logit values.
+
+`producer` MUST be positive and MUST identify work actually submitted by this
+same live `DeviceOps` queue. An OID from a different queue is invalid even when
+both queues serve the same backend device; zero, negative, foreign, future,
+skipped, reserved-but-never-submitted, and otherwise unsubmitted values remain
+invalid under the existing queue contract. The session MUST successfully wait
+for every direct prerequisite before submitting a dependent final projection.
+Selection itself MUST then successfully observe `queue.wait(producer)` before
+using the logits. Positive admission alone is not readiness. An already
+successful wait does not remove this requirement because successful waits are
+repeatable. If the producer has a retained completion failure, this call
+rethrows it, and every later wait for that OID rethrows the same failure.
+
+The queue, logits view, logits storage owner, and the storage owner's exact
+device identity MUST remain live and unchanged throughout the call. `history`
+is likewise borrowed only for the call. The selector MUST NOT retain the
+queue, either borrowed view, either span, or any referenced storage after
+return. Selection MUST NOT mutate logits, history, KV storage, or any owner
+identity. A concrete selector that needs scratch MAY write only
+caller-provisioned reusable setup storage; that implementation sibling owns
+the scratch size, alignment, placement, and lifetime contract.
+
+No full-vocabulary host transfer is required by this seam. Backend-neutral
+`DeviceOps` and `TensorView` access is sufficient, and the concrete selector
+chooses a permitted device-local or host-transfer strategy. This boundary
+mandates neither a hidden transfer nor a vendor API or vendor type.
+
+`history` MUST contain the entire prompt/input sequence, including every
+policy-added special token, followed in order by every successfully committed
+generated ID. It therefore includes the latest committed token even when that
+token has not yet been appended to KV for a later decode step. The selector
+neither appends nor removes history and owns no session state.
+
+After a successful selector return, the session MUST independently validate
+the returned ID against `[0,V)` before committing it. Only then does the
+session append it to history, increment the committed generated-token count,
+apply its EOS/new-token/context precedence, and decide whether another model
+step and KV append are needed. EOS inclusion, simultaneous-stop precedence,
+capacity, absolute positions, initialized cache length, cache mutation,
+failure/poisoning, draining, and reset remain exclusively session-owned. The
+selector MUST NOT interpret an ID as EOS or mutate those policies.
+
+The following prompt and decode transitions are normative:
+
+1. After successful prefill of prompt IDs `[p0,p1,p2]`, the session has
+   `history=[p0,p1,p2]`, committed generated-token count zero, and
+   `initializedL=3`. The first selector call borrows that complete history and
+   the final `[1,V]` logits plus their producing queue/OID.
+2. If it returns valid `t0`, the session commits
+   `history=[p0,p1,p2,t0]` and generated-token count one. If EOS or an
+   applicable new-token/context limit ends the request, `t0` remains included
+   in committed output while `initializedL` remains three: no subsequent KV
+   append is needed merely to record an already committed terminal token.
+3. If generation continues instead, the session processes committed `t0` at
+   absolute position three. Only after both K and V append OIDs succeed may it
+   publish `initializedL=4`. The following selector call then receives
+   `history=[p0,p1,p2,t0]`; history is not reconstructed from cache length.
+
+Committed generated-token count and initialized cache length are therefore
+distinct state. Selection cannot publish a cache prefix, and committing a
+terminal token cannot imply a physical KV write.
+
+The production selector sibling owns exactly greedy behavior. It MUST examine
+every logical logit in `[0,V)` and establish that each is finite, including
+values that cannot win. It MUST throw on any NaN, positive infinity, or
+negative infinity; a nonwinning NaN is still a data failure. For an all-finite
+input it returns the ID of the maximum value and resolves an exact tie by the
+lowest ID. There is no stochastic path, RNG, temperature, top-k, top-p, beam
+search, or hidden fallback.
+
+Failure ownership and no-mutation behavior are normative:
+
+- An invalid logits shape, extent, owner/device relationship, or producer OID
+  is rejected by the selector boundary with a standard exception and no
+  returned ID.
+- A producer readiness/completion failure, selector runtime failure, or
+  nonfinite logical logit is a selector-call failure. It returns no ID; the
+  session commits no token and does not change history or initialized cache
+  state. Session poisoning and draining of already accepted OIDs remain the
+  session's responsibility.
+- A deterministic injected selector may replace greedy behavior only in
+  tests. If it returns an ID outside `[0,V)`, the session rejects that result
+  before history, generated count, or cache mutation. Injection cannot bypass
+  producing-OID readiness, ID-range validation, history ownership, or cache
+  rules.
+
+Thus a failed or out-of-range selection consumes no invalid token. Selector
+scratch may contain partial private work after a failure, but logits, history,
+KV contents, owner identities, committed-token count, and initialized cache
+length remain unmodified by selection.
+
+This is a planned-only contract. It adds no public selector header, source,
+test target, session implementation, transfer strategy, allocation, facade,
+kernel, or current-support claim, and it does not migrate the existing neural
+hooks from `Unsupported`. The future selector sibling owns the concrete
+greedy implementation, deterministic oracle, and any exact reusable scratch
+requirement.
+
 ### 10. Backend integration and conformance obligations
 
 The following source map is executable contract coverage. Shared scalar,
