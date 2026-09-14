@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral checks for the spec-run-all CLI; all mutations use temporary repos."""
+"""Behavioral checks for the csw-run CLI; all mutations use temporary repos."""
 
 from __future__ import annotations
 
@@ -8,14 +8,13 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
-import sys
 import tempfile
 import unittest
 
 
-RUNNER = Path(__file__).with_name("spec_run_all.py")
-TASK_HELPER = RUNNER.parents[2] / "spec-run-task" / "scripts" / "spec_run_task.py"
-TASK_CTL_PATH = RUNNER.parents[3] / "csw" / "bin" / "task_ctl"
+RUNNER = Path(__file__).resolve().parents[1] / "bin" / "csw_run"
+TASK_HELPER = RUNNER.with_name("csw_run_worker")
+TASK_CTL_PATH = RUNNER.with_name("task_ctl")
 TASK_CTL = runpy.run_path(str(TASK_CTL_PATH))
 get_task = TASK_CTL["get_task"]
 set_task = TASK_CTL["set_task"]
@@ -23,7 +22,7 @@ set_task = TASK_CTL["set_task"]
 
 class RunnerTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="spec-run-all-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="csw-run-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.repo = self.root / "repo"
@@ -70,7 +69,7 @@ class RunnerTests(unittest.TestCase):
         return directory
 
     def run_cli(self, command, *, target="example", state=None, success=True):
-        args = [sys.executable, str(RUNNER), "--repo", str(self.repo), command]
+        args = [str(RUNNER), "--repo", str(self.repo), command]
         if command != "control":
             args.append(target)
         if state is not None:
@@ -85,7 +84,7 @@ class RunnerTests(unittest.TestCase):
 
     def helper(self, command, task, *args):
         result = subprocess.run(
-            [sys.executable, str(TASK_HELPER), "--repo", str(self.repo),
+            [str(TASK_HELPER), "--repo", str(self.repo),
              command, task, *args], env=self.env, text=True, capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -293,7 +292,6 @@ class RunnerTests(unittest.TestCase):
         )
         integration = subprocess.run(
             [
-                sys.executable,
                 str(TASK_HELPER),
                 "--repo",
                 str(self.repo),
@@ -382,7 +380,7 @@ class RunnerTests(unittest.TestCase):
         )
         self.helper("commit", task_path, "--status", "verified")
         rejected = subprocess.run(
-            [sys.executable, str(TASK_HELPER), "--repo", str(self.repo), "integrate", task_path],
+            [str(TASK_HELPER), "--repo", str(self.repo), "integrate", task_path],
             env=self.env, text=True, capture_output=True,
         )
         self.assertEqual(rejected.returncode, 2, rejected.stdout)

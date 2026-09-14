@@ -133,7 +133,7 @@ class CswPreflightTests(unittest.TestCase):
             result.append({"selector": "openai/slow", "provider": "openai", "id": "slow", "thinking": ["high"]})
         return result
 
-    def run_helper(self, workflow="spec-run-all"):
+    def run_helper(self, workflow="csw-run"):
         return subprocess.run(
             [str(HELPER), "--repo", str(self.repo), "--workflow", workflow, "--omp", str(self.omp)],
             text=True,
@@ -147,7 +147,7 @@ class CswPreflightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["workflow"], "spec-run-all")
+        self.assertEqual(payload["workflow"], "csw-run")
         self.assertEqual(payload["git"]["repo_root"], str(self.repo.resolve()))
         self.assertTrue(payload["git"]["head"])
         self.assertFalse(payload["git"]["clean"])

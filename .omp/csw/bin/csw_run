@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Scan, queue, and prepare direct spec-run-task children."""
+"""Scan, queue, and prepare direct csw-run implementation children."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import runpy
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-# spec-run-task owns Git/worktree mechanics and loads task_ctl's public API.
-sys.dont_write_bytecode = True
-_HELPER_DIR = Path(__file__).resolve().parents[2] / "spec-run-task" / "scripts"
-sys.path.insert(0, str(_HELPER_DIR))
-import spec_run_task as helper
+# csw_run_worker owns Git/worktree mechanics and loads task_ctl's public API.
+helper = SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().with_name("csw_run_worker"))))
 
 
 class QueueError(RuntimeError):
@@ -315,7 +314,7 @@ def main() -> int:
         UnicodeError,
         json.JSONDecodeError,
     ) as exc:
-        print(f"spec-run-all: {exc}", file=sys.stderr)
+        print(f"csw-run: {exc}", file=sys.stderr)
         return 2
 
 

@@ -10,10 +10,10 @@ Implement the requested specification completely. Each executable implementation
 
 ## Mandatory control plane
 
-Use the bundled helper for every repeatable task, evidence, worktree, and Git-history operation:
+Use the shared helper for every repeatable task, evidence, worktree, and Git-history operation:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo <integration-checkout> --pretty <command> ...
+.omp/csw/bin/csw_run_worker --repo <integration-checkout> --pretty <command> ...
 ```
 
 The helper loads `.omp/csw/bin/task_ctl` through its public `runpy.run_path` API. `task_ctl` alone discovers and validates canonical task metadata in `task.yml`: type, lifecycle status, numeric order, priority, canonical `blocked-by` records, and source. The helper owns execution evidence in `task.md`, local worktree state, and Git mechanics. PyYAML is therefore a runtime dependency of `task_ctl`; the supported environment provides PyYAML 6.0.3.
@@ -42,7 +42,7 @@ Exit status `2` is a validation or safety failure. Exit status `3` is a helper-m
 Require one target relative to `docs/changes/`, then run before reading task contents or preparing worktrees:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo . --pretty inspect '<target>'
+.omp/csw/bin/csw_run_worker --repo . --pretty inspect '<target>'
 ```
 
 `inspect` requires canonical controls, uses task types to distinguish an implementation leaf from a container, recursively discovers through the `task_ctl` API, preserves its numeric-order/canonical-ID ordering, resolves exact canonical blockers, detects selected dependency cycles, and validates the integration checkout.
@@ -56,7 +56,7 @@ If the target is a leaf, the main agent implements it. For a container, schedule
 For each eligible leaf, copy values from the same inspection result:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty prepare '<task_path>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty prepare '<task_path>' \
   --run-target '<requested_target>' \
   --integration-branch '<integration_branch>' \
   --integration-base '<integration_head>'
@@ -67,13 +67,13 @@ python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' 
 Treat `worktree`, `spec_path`, `control_path`, and `annotation_path` as opaque. On reuse, inspect `status_entries` and `task_commits`, or call:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty show '<task_path>'
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty show '<task_path>'
 ```
 
 If coherent dirty state must be preserved, use `checkpoint`; never checkpoint merely to dismiss an ownership error:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty checkpoint '<task_path>'
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty checkpoint '<task_path>'
 ```
 
 ## 3. Implement in the assigned worktree
@@ -84,7 +84,7 @@ For a container wave, provision each ready leaf before dispatch and give one own
 
 A stuck implementation owner must invoke exactly one `spec-run-debug` rescue agent before reporting an implementation failure. Pass exact worktree/spec paths, constraints, current changes, concrete error, observations, and attempted approaches. The debugger is read-only; the owner resumes and applies or rejects its proposed solution with evidence. External prerequisites may be blocked without debugger escalation.
 
-For `spec-run-all`, reuse the parent's successful preflight record. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-task --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
+For `csw-run`, reuse the parent's successful preflight record. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-task --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
 
 ## 4. Record evidence and consolidate
 
@@ -93,19 +93,19 @@ Never edit `task.md` or `task.yml` directly. `annotate` preserves unrelated task
 Provisional success:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<task_path>' \
   --outcome ready --summary '<factual provisional summary>'
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty commit '<task_path>' \
   --status ready --outcome '<concise behavioral outcome>'
 ```
 
 Observed verification:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<task_path>' \
   --outcome verified --summary '<delivered behavior>' \
   --verification '<exact command or scenario> — <observed result>'
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' --status verified
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty commit '<task_path>' --status verified
 ```
 
 Repeat `--verification` for distinct observations. Once the final task subject exists, omit the commit `--outcome` to preserve it.
@@ -113,10 +113,10 @@ Repeat `--verification` for distinct observations. Once the final task subject e
 Failure or external blocker uses the unchanged `lifecycle_status` returned by `show`/`prepare`:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<task_path>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<task_path>' \
   --outcome failed --summary '<reachable retained work>' \
   --error '<operation — concrete failure>'
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty commit '<task_path>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty commit '<task_path>' \
   --status '<unchanged-lifecycle-status>' --outcome '<concise attempted outcome>'
 ```
 
@@ -127,7 +127,7 @@ Use `--outcome blocked` only for an external prerequisite. The unchanged status 
 Refresh the integration head with `inspect` or the orchestration helper, then rebase through the helper:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty rebase '<task_path>' --onto '<commit>'
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty rebase '<task_path>' --onto '<commit>'
 ```
 
 On exit `3`, resolve only returned conflicts and call `continue-rebase`; use `abort-rebase` only to abandon that replay. If conflict resolution changes behavior, rerun affected verification and reconsolidate.
@@ -135,7 +135,7 @@ On exit `3`, resolve only returned conflicts and call `continue-rebase`; use `ab
 Children stop at lifecycle `ready`. The parent performs focused behavioral verification and repository-required combined verification from the exact task worktree. On failure, return concrete evidence to the same owner, amend its one commit, and rerun. On success, annotate `verified`, commit `--status verified`, and mechanically check:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty check '<task_path>' --status verified
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty check '<task_path>' --status verified
 ```
 
 For a container train, rebase verified commits in helper order. Combined verification runs from the final train worktree. If an earlier task changes, rebuild every later replay. Every final train commit must contain its own verified `task.yml` transition and task evidence.
@@ -145,7 +145,7 @@ For a container train, rebase verified commits in helper order. Combined verific
 When every implementation leaf beneath a requested container is either done in the canonical tree or verified in the final train, the final leaf owner records each ancestor roll-up as verified before its final commit:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty annotate '<final-leaf-task>' \
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<final-leaf-task>' \
   --for-task '<container-task-path>' --outcome verified \
   --summary '<all implementation leaves verified>' \
   --verification '<combined command or scenario> — <observed result>'
@@ -160,7 +160,7 @@ If all implementation leaves are already done but a container roll-up is missing
 For a leaf or the final branch of a verified train:
 
 ```text
-python3 .omp/skills/spec-run-task/scripts/spec_run_task.py --repo '<repo_root>' --pretty integrate '<final-task-path>'
+.omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty integrate '<task_path>'
 ```
 
 `integrate` requires a clean fast-forward verified train. It validates each historical `task.yml` blob with `task_ctl.parse_config`, requires every task commit to contain its own verified control and successful verified evidence, validates ancestor roll-up ownership, and rejects merges, duplicate/non-task commits, malformed controls, failed evidence, or non-verified status.

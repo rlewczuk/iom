@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Perform deterministic Git and path operations for the spec-run-task skill."""
+"""Perform deterministic Git and path operations for csw-run-worker."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-_TASK_CTL_PATH = Path(__file__).resolve().parents[3] / "csw" / "bin" / "task_ctl"
+_TASK_CTL_PATH = Path(__file__).resolve().with_name("task_ctl")
 _TASK_CTL = runpy.run_path(str(_TASK_CTL_PATH))
 TaskCtlError = _TASK_CTL["TaskCtlError"]
 task_ctl_task_dir = _TASK_CTL["task_dir"]
@@ -1272,10 +1272,10 @@ def main() -> int:
         print(json.dumps(output, indent=2 if args.pretty else None, sort_keys=True))
         return 0
     except RebaseConflict as exc:
-        print(f"spec-run-task conflict: {exc}", file=sys.stderr)
+        print(f"csw-run-worker conflict: {exc}", file=sys.stderr)
         return 3
     except (TaskError, TaskCtlError, OSError, json.JSONDecodeError) as exc:
-        print(f"spec-run-task: {exc}", file=sys.stderr)
+        print(f"csw-run-worker: {exc}", file=sys.stderr)
         return 2
 
 

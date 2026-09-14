@@ -1,23 +1,23 @@
 ---
-name: spec-run-all
+name: csw-run
 description: Execute all eligible direct implementation children under docs/changes continuously in dependency-aware parallel worktrees.
 hide: true
 ---
 
-# Spec Run All
+# CSW Run
 
 Run all unfinished **direct child** tasks below `docs/changes/<task-name>`. Read `skill://spec-run-task` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
 
 ## Mechanical control plane
 
-Use only the bundled scripts and shared preflight:
+Use only the shared helpers and preflight:
 
 ```text
-python3 .omp/skills/spec-run-all/scripts/spec_run_all.py --repo <repo> --pretty scan <task-name>
-python3 .omp/skills/spec-run-all/scripts/spec_run_all.py --repo <repo> --pretty queue <task-name> [--state <temporary-json-path>]
-python3 .omp/skills/spec-run-all/scripts/spec_run_all.py --repo <repo> --pretty prepare <task-name> [--state <temporary-json-path>]
-python3 .omp/skills/spec-run-all/scripts/spec_run_all.py --repo <repo> --pretty control
-.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-all --pretty
+.omp/csw/bin/csw_run --repo <repo> --pretty scan <task-name>
+.omp/csw/bin/csw_run --repo <repo> --pretty queue <task-name> [--state <temporary-json-path>]
+.omp/csw/bin/csw_run --repo <repo> --pretty prepare <task-name> [--state <temporary-json-path>]
+.omp/csw/bin/csw_run --repo <repo> --pretty control
+.omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run --pretty
 ```
 
 The script loads `task_ctl` through spec-run-task's public API. `task_ctl` alone discovers, validates, and orders direct canonical `task.yml` controls. The script does not parse task metadata from `spec.md` or `task.md`. It preserves task_ctl's numeric-order/canonical-ID order and never guesses basenames. PyYAML 6.0.3 is the supported runtime dependency used by `task_ctl`.
@@ -80,8 +80,8 @@ If the integration head advances before integration, refresh through `control`, 
 The assigned child reads `skill://spec-run-task`, calls `show` first, works only in its exact worktree, reads complete requirements, implements the leaf, and uses:
 
 ```text
-spec_run_task.py ... annotate '<task_path>' --outcome ready --summary '<summary>'
-spec_run_task.py ... commit '<task_path>' --status ready --outcome '<behavior>'
+.omp/csw/bin/csw_run_worker ... annotate '<task_path>' --outcome ready --summary '<summary>'
+.omp/csw/bin/csw_run_worker ... commit '<task_path>' --status ready --outcome '<behavior>'
 ```
 
 It skips builds/tests/linters/formatters during the parallel pass and reports exact parent verification still required. It never directly edits `task.yml` or `task.md`, mutates Git, integrates, rebases, expands nested tasks, or delegates except to one `spec-run-debug` when genuinely stuck.
