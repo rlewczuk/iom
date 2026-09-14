@@ -1,25 +1,25 @@
 ---
-name: spec-critic
-description: Review and refine a change specification against the current repository, user remarks, project conventions, edge cases, non-functional concerns, and automated testability. Use only through /spec-critic <spec-name> or when explicitly requested.
+name: csw-critic
+description: Review and refine a task specification against the current repository, user remarks, project conventions, edge cases, non-functional concerns, and automated testability. Use only through /csw-critic <task-name> or when explicitly requested.
 hide: true
 ---
 
-# Spec Critic
+# CSW Critic
 
 Review one change specification until it is accurate, focused, testable, and mutually understood, then edit the specification in place.
 
-The command supplies a **spec name**. Work from the project root and use exactly these paths:
+The command supplies a **task name**. Work from the project root and use exactly these paths:
 
-Note that `<spec-name>` may refer either to directory directly in `doc/changes` or any subdirectory, for example `0123-some-changes/03-cleanups`.
+`<task-name>` may refer either to a directory directly in `.cswd/tasks` or to any nested task directory, for example `0123-some-changes/03-cleanups`.
 
-- Specification: `docs/changes/<spec-name>/spec.md`
-- User remarks, optional: `docs/changes/<spec-name>/spec-fixme.md`
+- Specification: `.cswd/tasks/<task-name>/spec.md`
+- User remarks, optional: `.cswd/tasks/<task-name>/spec-fixme.md`
 
 Modify only `spec.md` unless the user explicitly requests another file change. Never modify or delete `spec-fixme.md`.
 
 ## Guardrails
 
-- Treat `<spec-name>` as one directory name. Reject an empty name, `.` or `..`, path separators, or path traversal.
+- Treat `<task-name>` as a repository-relative task path beneath `.cswd/tasks`. Reject an empty name, absolute paths, empty path components, `.` or `..` components, backslashes, and any path that escapes `.cswd/tasks`.
 - If `spec.md` does not exist, report the expected path and stop.
 - Read the whole specification and the whole fixme file when present.
 - The repository is authoritative for claims about current behavior. Inspect code instead of relying on the specification's description of it.
@@ -34,7 +34,7 @@ Modify only `spec.md` unless the user explicitly requests another file change. N
 
 ## Boss orchestration protocol
 
-Before this workflow, the root MUST read `skill://boss` and follow Boss's canonical preflight, dispatch, brief, and verification rules. This skill adds only spec-critic routing and does not import any C++ review protocol. The root supervisor MUST already match the preflight-resolved `@slow` model; the skill MUST NOT switch models, edit model configuration, silently fall back, or inherit an expensive parent when a requested lane is unavailable. Use only the preserved Boss preflight's `roles`, `models`, and required `agents` entries to establish the `@slow`, `@task`, `@smol`, and `@advisor` routes, profile tool restrictions, and passive-advisor state. Do not repeat or manually reconstruct that discovery. A failed preflight is reported and dispatch stops.
+Before this workflow, the root MUST read `skill://boss` and follow Boss's canonical preflight, dispatch, brief, and verification rules. This skill adds only csw-critic routing and does not import any C++ review protocol. The root supervisor MUST already match the preflight-resolved `@slow` model; the skill MUST NOT switch models, edit model configuration, silently fall back, or inherit an expensive parent when a requested lane is unavailable. Use only the preserved Boss preflight's `roles`, `models`, and required `agents` entries to establish the `@slow`, `@task`, `@smol`, and `@advisor` routes, profile tool restrictions, and passive-advisor state. Do not repeat or manually reconstruct that discovery. A failed preflight is reported and dispatch stops.
 
 The `@slow` root owns scope, complete `spec.md`/`spec-fixme.md` intake, decomposition, evidence synthesis, user questions, architectural and final decisions, integration, and verification. It asks the user only about intent, policy, product behavior, or trade-offs that evidence cannot settle.
 
@@ -57,7 +57,7 @@ The eight substantive stages below are one Boss-owned workflow; delegation never
 
 The `@slow` root performs the complete intake before decomposition. It may batch independent, purely mechanical path checks through `boss-errand` (`@smol`), but does not delegate known trivial facts gratuitously.
 
-Resolve the two paths from the supplied spec name. Read `spec.md`; read `spec-fixme.md` if it exists. Treat fixme content as user-provided remarks and additional constraints, but reconcile it with the codebase and ask when it conflicts with repository reality or with another remark.
+Resolve the two paths from the supplied task name. Read `spec.md`; read `spec-fixme.md` if it exists. Treat fixme content as user-provided remarks and additional constraints, but reconcile it with the codebase and ask when it conflicts with repository reality or with another remark.
 
 While reading, extract:
 
