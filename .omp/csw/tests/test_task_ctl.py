@@ -202,7 +202,7 @@ class TaskCtlTests(unittest.TestCase):
         self.assertEqual(cleared.returncode, 0, cleared.stderr)
         self.assertEqual(yaml.safe_load(cleared.stdout)["blocked-by"], [])
 
-    def test_get_spec_is_safe_absolute_and_does_not_require_control_or_file(self) -> None:
+    def test_get_recreates_missing_control_only_for_task_directories(self) -> None:
         directory = self.make_dir("docs/changes/review/item")
         result = self.run_cli("get", "docs/changes/review/item", "--spec")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -211,10 +211,21 @@ class TaskCtlTests(unittest.TestCase):
         evidence = directory / "task.md"
         evidence.write_text("**Outcome:** done\n", encoding="utf-8")
         result = self.run_cli("get", "docs/changes/review/item", "--status")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("task control not found", result.stderr)
+        self.assertEqual((result.returncode, result.stdout), (0, "new\n"))
+        self.assertEqual(
+            yaml.safe_load((directory / "task.yml").read_text(encoding="utf-8")),
+            {"type": "hld", "status": "new"},
+        )
 
-    def test_list_is_direct_fail_closed_and_sorted(self) -> None:
+        self.make_dir("docs/changes/review/empty")
+        empty = self.run_cli("get", "docs/changes/review/empty", "--status")
+        self.assertEqual(empty.returncode, 2)
+        self.assertIn("task Markdown not found", empty.stderr)
+        missing = self.run_cli("get", "docs/changes/review/missing", "--status")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("task directory not found", missing.stderr)
+
+    def test_list_is_direct_recreates_defaults_and_sorted(self) -> None:
         parent = self.make_dir(".cswd/tasks/parent")
         self.make_dir(".cswd/tasks/parent/20-late")
         self.set_task(
@@ -269,8 +280,15 @@ class TaskCtlTests(unittest.TestCase):
         partial = parent / "partial"
         partial.mkdir()
         (partial / "spec.md").write_text("# Partial\n", encoding="utf-8")
-        with self.assertRaisesRegex(self.TaskCtlError, "direct child task control not found"):
-            self.api["list_tasks"](self.repo, ".cswd/tasks/parent")
+        updated = self.api["list_tasks"](self.repo, ".cswd/tasks/parent")
+        self.assertEqual(
+            updated[-1],
+            {"task-id": ".cswd/tasks/parent/partial", "type": "hld", "status": "new"},
+        )
+        self.assertEqual(
+            yaml.safe_load((partial / "task.yml").read_text(encoding="utf-8")),
+            {"type": "hld", "status": "new"},
+        )
 
     def test_impl_list_checks_done_dependencies_missing_dependencies_and_containers(self) -> None:
         self.make_dir("docs/changes/work")

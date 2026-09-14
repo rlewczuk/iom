@@ -75,9 +75,10 @@ the current directory and may name an explicit worktree.
 ``--source``, and ``--spec`` may be supplied.  No selector and ``--all`` both
 emit the stored mapping as block YAML.  Scalar selectors emit their plain
 scalar value; a missing optional scalar emits an empty line.  ``--blocked``
-always emits YAML and defaults to ``[]`` when absent.  ``--spec`` prints the
-absolute task-local sibling ``spec.md`` path without reading Markdown or
-requiring either ``task.yml`` or ``spec.md`` to exist.
+always emits YAML and defaults to ``[]`` when absent.  When a task directory
+contains ``task.md`` or ``spec.md`` but no control, querying it recreates a
+default control.  ``--spec`` only prints the safe absolute task-local sibling
+``spec.md`` path; it does not read the task or recreate a missing control.
 
 ``set TASK [field options]`` merges ``--type``, ``--status``, ``--order``,
 ``--priority``, ``--source``, and repeatable ``--blocked YAML`` updates.
@@ -109,10 +110,10 @@ for example ``task_ctl plan parser -- $'- slug: api\n  type: impl\n  priority: P
 
 ``list TASK [--impl] [--full]`` examines the TASK directory's direct-child
 controls.  It does not require a control on TASK itself, so both canonical
-roots are useful containers.  An immediate child is a task candidate only
-when it contains ``spec.md`` or ``task.yml``.  A candidate with a
-specification but no control fails closed; unrelated directories and empty
-collision reservations are ignored.  Results are ordered by numeric
+roots are useful containers.  An immediate child is a task candidate when it
+contains ``task.yml``, ``task.md``, or ``spec.md``.  A candidate with Markdown
+but no control receives a recreated default control; unrelated directories and
+empty collision reservations are ignored.  Results are ordered by numeric
 ``order`` then canonical ID, with missing orders last.  The default output is
 raw canonical IDs, one per line (and no output for an empty result).
 ``--full`` instead emits a YAML list of records shaped
@@ -136,9 +137,10 @@ records with a ``collision`` boolean.  It never creates or changes files;
 the caller resolves semantic equivalence and collisions and reruns.
 
 Controls are authoritative.  Commands never inspect lifecycle metadata in
-Markdown and never fall back when ``task.yml`` is missing.  ``task.md`` is
-implementation evidence only; current execution outcomes may be recorded
-there under ``**Outcome:**`` by the execution workflow.
+Markdown.  ``task.md`` is implementation evidence only; current execution
+outcomes may be recorded there under ``**Outcome:**`` by the execution
+workflow.  Missing controls are recreated with new-task defaults only when a
+task-local ``task.md`` or ``spec.md`` proves that the task directory exists.
 
 Writes use a temporary file plus ``os.replace`` so each control-file change is
 atomic, and all CLI, schema, and path validation happens before mutation.
@@ -389,15 +391,35 @@ def _read_text(path: Path, label: str) -> str:
         raise TaskCtlError(f"cannot read {label} {path}: {exc}") from exc
 
 
+def _has_task_markdown(repo: Path, directory: Path) -> bool:
+    for name in ("task.md", "spec.md"):
+        path = directory / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        _resolved_inside(repo, path.relative_to(repo).as_posix(), f"task {name}")
+        if path.is_file():
+            return True
+    return False
+
+
+
 def get_task(repo: Path, task_id: str) -> dict[str, Any]:
-    """Read and validate one exact canonical task control."""
+    """Read one control, recreating defaults for a recognized task if absent."""
     root = _normalize_repo(repo)
     canonical = _canonical_id(task_id, allow_root=False)
     directory = task_dir(root, canonical)
     control = directory / "task.yml"
     _resolved_inside(root, control.relative_to(root).as_posix(), "task control")
     if not control.is_file():
-        raise TaskCtlError(f"task control not found: {control}")
+        if control.exists() or control.is_symlink():
+            raise TaskCtlError(f"task control is not a file: {control}")
+        if not directory.is_dir():
+            raise TaskCtlError(f"task directory not found: {directory}")
+        if not _has_task_markdown(root, directory):
+            raise TaskCtlError(
+                f"task Markdown not found (expected task.md or spec.md): {directory}"
+            )
+        return set_task(root, canonical, {})
     config = parse_config(_read_text(control, "task control"))
     _validate_repo_config_paths(root, config)
     return config
@@ -511,10 +533,12 @@ def _direct_records(repo: Path, canonical: str, *, diagnostics: bool = False) ->
         if not child.is_dir() and not child.is_symlink():
             continue
         control = child / "task.yml"
+        task = child / "task.md"
         spec = child / "spec.md"
         has_control = control.exists() or control.is_symlink()
+        has_task = task.exists() or task.is_symlink()
         has_spec = spec.exists() or spec.is_symlink()
-        if not has_control and not has_spec:
+        if not has_control and not has_task and not has_spec:
             continue
         task_id = _canonical_from_directory(repo, child)
         try:
@@ -522,10 +546,10 @@ def _direct_records(repo: Path, canonical: str, *, diagnostics: bool = False) ->
             if not child.is_dir():
                 raise TaskCtlError(f"child task path is not a directory: {child}")
             _resolved_inside(repo, control.relative_to(repo).as_posix(), "task control")
+            if has_task:
+                _resolved_inside(repo, task.relative_to(repo).as_posix(), "task evidence")
             if has_spec:
                 _resolved_inside(repo, spec.relative_to(repo).as_posix(), "task specification")
-            if not control.is_file():
-                raise TaskCtlError(f"direct child task control not found: {control}")
             config = get_task(repo, task_id)
             records.append({"task-id": task_id, **config})
         except TaskCtlError as exc:
