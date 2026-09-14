@@ -15,7 +15,7 @@ The selected local Git workspace is authoritative.
 - Before every remote build, test, benchmark, or execution, sync that exact workspace to a unique remote task directory.
 - Run builds/tests/programs only through SSH on the selected remote host.
 - Do not edit the shared remote checkout directly unless explicitly required.
-- Do not sync `.git`, `.work`, or `.worktrees` to the remote mirror.
+- Do not sync `.git`, `.work`, `.worktrees`, or `.cswd` to the remote mirror.
 - Keep one remote directory per concurrent task.
 
 ## Host configuration
@@ -53,6 +53,8 @@ REMOTE_DEV_WORKSPACE=.work/<task-path> \
 ```
 
 Never sync a `spec-run-task` task from the primary checkout. Confirm that the `remote-sync` output names the exact assigned worktree before remote execution.
+
+The worktree's `.cswd` link exposes local task specifications, lifecycle controls, and evidence only. Read specifications and update task status locally through the task helpers. Never run task-control helpers remotely, resolve remote paths through `.cswd`, or require task metadata in a remote build/test command. Pass the needed code paths and command arguments explicitly.
 
 ## Typical workflow
 
@@ -108,8 +110,8 @@ Use `tmux` or the site's scheduler on the remote host when a job should survive 
 
 - `remote-sync` uses `rsync --delete-delay`; files removed locally are removed from the remote mirror.
 - Only tracked files are synchronized. Untracked and ignored paths are excluded using Git's ignore rules, including nested `.gitignore` files. Stage a new project file before remote validation so it becomes part of the synchronized workspace.
-- `_local/` is the sole non-versioned exception. Its contents are synchronized so agents can create and remotely run temporary helper programs and scripts.
-- `.git`, `.work`, and `.worktrees` are always excluded. The `.work/` container is therefore never copied when the primary checkout is selected, while selecting one of its worktrees still synchronizes that worktree's root.
+- `_local/` is the sole non-versioned exception. Its contents are synchronized so agents can create and remotely run temporary helper programs and scripts, except that `.cswd` remains excluded even beneath `_local/`.
+- `.git`, `.work`, `.worktrees`, and `.cswd` are always excluded. `.cswd` is excluded whether it is a directory or symbolic link, even if tracked; it is never copied or followed. The `.work/` container is therefore never copied when the primary checkout is selected, while selecting one of its worktrees still synchronizes that worktree's root.
 - The remote path is derived from the configured base directory plus the task id. The base directory is relative to the SSH user's home directory.
 - Task ids must contain only letters, digits, `.`, `_`, and `-`.
 - Host aliases must exist in the config.

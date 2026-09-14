@@ -26,6 +26,8 @@ def _target(target: str) -> tuple[str, str]:
 
 def scan(repo: Path, target: str) -> dict[str, Any]:
     target, target_id = _target(target)
+    helper.ensure_metadata_excluded(repo)
+    helper.canonical_metadata_dir(repo)
     direct = helper.task_ctl_scan_tasks(repo, target_id)
     tasks: list[dict[str, Any]] = []
     for config in direct:
@@ -110,7 +112,7 @@ def _load_state(
         unique = list(dict.fromkeys(values))
         invalid = []
         for value in unique:
-            if value in {".cswd/tasks", "docs/changes"}:
+            if value == ".cswd/tasks":
                 invalid.append(value)
                 continue
             try:

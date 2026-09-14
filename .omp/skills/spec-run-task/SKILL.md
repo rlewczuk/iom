@@ -1,12 +1,12 @@
 ---
 name: spec-run-task
-description: Implement one docs/changes task or its unfinished implementation descendants in isolated reusable worktrees, using task_ctl-backed lifecycle controls and deterministic Git integration.
+description: Implement one .cswd/tasks task or its unfinished implementation descendants in isolated reusable worktrees, using task_ctl-backed lifecycle controls and deterministic Git integration.
 hide: true
 ---
 
 # Spec Run Task
 
-Implement the requested specification completely. Each executable implementation task owns one deterministic feature branch, one registered worktree under `.work/`, sibling `spec.md`, `task.yml`, and `task.md`, and exactly one final task commit. A target with implementation descendants is a container: execute those leaves, never the container as implementation.
+Implement the requested specification completely. Each executable implementation task owns one deterministic feature branch, one registered worktree under `.work/`, sibling `spec.md`, `task.yml`, and `task.md` under `.cswd/tasks/`, and exactly one final code commit. A target with implementation descendants is a container: execute those leaves, never the container as implementation.
 
 ## Mandatory control plane
 
@@ -22,24 +22,26 @@ Never read metadata from Markdown. Never parse, sort, create, or edit `task.yml`
 
 Missing or malformed `task.yml` is a hard error.
 
-Do not replace a failed helper operation with hand-written Git plumbing or reconstructed paths. Never directly run `git worktree add`, `git add`, `git commit`, `git reset`, `git rebase`, `git merge`, or `git update-ref`. The helper is authoritative for prepare/reuse, checkpoint, one-commit consolidation, rebase conflict continuation, historical control validation, verified-to-done finalization, and fast-forward integration.
+Do not replace a failed helper operation with hand-written Git plumbing or reconstructed paths. Never directly run `git worktree add`, `git add`, `git commit`, `git reset`, `git rebase`, `git merge`, or `git update-ref`. The helper is authoritative for prepare/reuse, checkpoint, one-commit consolidation, rebase conflict continuation, commit-bound local evidence validation, verified-to-done finalization, and fast-forward integration.
 
 Exit status `2` is a validation or safety failure. Exit status `3` is a helper-managed rebase conflict; resolve only the named files in the owning worktree and call `continue-rebase`.
 
 ## Invariants
 
 - The integration checkout is the canonical control plane. Do not edit, build, test, format, or run task code there.
-- Only canonical `done` in the integrated tree satisfies a dependency. Missing dependencies wait. `ready`, `verified`, a child claim, or a private branch never unlocks an edge.
+- Only canonical `done` in the shared local task store satisfies a dependency. Missing dependencies wait. `ready`, `verified`, a child claim, or a private branch never unlocks an edge; the helper writes done only after successful integration.
 - Lifecycle values are `new`, `critic`, `planned`, `ready`, `verified`, and `done`. `running`, `failed`, and `blocked` are execution outcomes only.
 - Execution can start from `new`, `critic`, or `planned`, or resume from `ready`, once blockers are done. Successful implementation advances to `ready`; observed verification advances to `verified`; only `integrate` may advance it to `done`.
 - Failed and blocked attempts retain evidence and their one task commit without changing the current lifecycle; they are never integrated and never satisfy dependencies.
 - Each attempted leaf retains exactly one non-merge commit with subject `spec-run-task(<full-task-path>): <outcome>`.
 - Rebase task commits; never merge task branches. Keep worktrees and feature branches as resumable state.
 - Reuse registered state. Never stash, clean, remove, or recreate an existing task worktree.
+- `.cswd` is local, shared, and unversioned. Every prepared worktree links to the integration checkout's `.cswd`; task status and evidence changes are immediately visible across worktrees. Never stage the link or its contents, copy metadata into code commits, or use it on a remote host.
+- The helper keeps commit-bound task controls and evidence in local worktree Git state. Retain that state together with the worktrees; code history alone does not contain task specifications or verification records.
 
 ## 1. Inspect
 
-Require one target relative to `docs/changes/`, then run before reading task contents or preparing worktrees:
+Require one target relative to `.cswd/tasks/`, then run before reading task contents or preparing worktrees:
 
 ```text
 .omp/csw/bin/csw_run_worker --repo . --pretty inspect '<target>'
@@ -62,7 +64,7 @@ For each eligible leaf, copy values from the same inspection result:
   --integration-base '<integration_head>'
 ```
 
-`prepare` rechecks type `impl`, canonical dependencies, branch/head, repository identity, and deterministic worktree ownership. Scheduled implementation starts at `ready`. The helper also permits an explicit worktree for `new`, `critic`, or `planned` solely so an early failed/blocked attempt can be retained without falsifying lifecycle. It refuses `verified` and `done`.
+`prepare` rechecks type `impl`, canonical dependencies, branch/head, repository identity, and deterministic worktree ownership. It links the worktree's `.cswd` to the integration checkout's local metadata directory and preserves the current lifecycle. Reuse validates the existing link; conflicting directories or links are blockers, never overwritten. Task metadata must be untracked. Scheduled execution starts from `new`, `critic`, `planned`, or resumable `ready`; verified work awaits parent integration, and completed work is eligible only for the container repair below.
 
 Treat `worktree`, `spec_path`, `control_path`, and `annotation_path` as opaque. On reuse, inspect `status_entries` and `task_commits`, or call:
 
@@ -88,7 +90,7 @@ For `csw-run`, reuse the parent's successful preflight record. Otherwise run `.o
 
 ## 4. Record evidence and consolidate
 
-Never edit `task.md` or `task.yml` directly. `annotate` preserves unrelated task prose and replaces generated Outcome/Summary/Verification/Errors. For `ready` and `verified`, it delegates the lifecycle write to `task_ctl.set_task`; failed/blocked affect evidence only.
+Never edit `task.md` or `task.yml` directly. `annotate` preserves unrelated task prose and replaces generated Outcome/Summary/Verification/Errors in the shared `.cswd/tasks/` store. For `ready` and `verified`, it delegates the lifecycle write to `task_ctl.set_task`; failed/blocked affect evidence only. `commit` records the code and binds local metadata to that commit without staging `.cswd`. Metadata-only attempts retain an empty code commit.
 
 Provisional success:
 
@@ -120,7 +122,7 @@ Failure or external blocker uses the unchanged `lifecycle_status` returned by `s
   --status '<unchanged-lifecycle-status>' --outcome '<concise attempted outcome>'
 ```
 
-Use `--outcome blocked` only for an external prerequisite. The unchanged status may be `new`, `critic`, `planned`, or `ready`. The one failed/blocked task commit is retained but cannot integrate, and the orchestrator records its local execution outcome.
+Use `--outcome blocked` only for an external prerequisite. The unchanged status may be `new`, `critic`, `planned`, `ready`, or `verified`. A later failure can therefore be retained without falsifying an existing lifecycle, but failed/blocked evidence always prevents integration. The orchestrator records the local execution outcome.
 
 ## 5. Rebase and verify
 
@@ -138,11 +140,11 @@ Children stop at lifecycle `ready`. The parent performs focused behavioral verif
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty check '<task_path>' --status verified
 ```
 
-For a container train, rebase verified commits in helper order. Combined verification runs from the final train worktree. If an earlier task changes, rebuild every later replay. Every final train commit must contain its own verified `task.yml` transition and task evidence.
+For a container train, rebase task commits in helper order and refresh verification after replay. Combined verification runs from the final train worktree. If an earlier task changes, rebuild every later replay. Every final train commit must have matching verified controls and evidence in its owner's local helper state; task metadata is not stored in Git commits.
 
 ## 6. Container roll-up
 
-When every implementation leaf beneath a requested container is either done in the canonical tree or verified in the final train, the final leaf owner records each ancestor roll-up as verified before its final commit:
+When every implementation leaf beneath a requested container is either done in the shared task store or verified in the final train, the final leaf owner records each ancestor roll-up as verified before its final commit:
 
 ```text
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<final-leaf-task>' \
@@ -151,9 +153,9 @@ When every implementation leaf beneath a requested container is either done in t
   --verification '<combined command or scenario> — <observed result>'
 ```
 
-The helper allows only true ancestor containers inside the run target. Their verified controls and evidence are folded into the final leaf's single commit. Integration finalizes those controls to done in that same commit. Never create a separate roll-up/completion commit.
+The helper allows only true ancestor containers inside the run target. Their verified controls and evidence are bound to the final leaf's single commit in local helper state. Integration advances those shared controls to done after the code fast-forward. Never create a separate roll-up/completion commit or stage task metadata.
 
-If all implementation leaves are already done but a container roll-up is missing or stale, choose the stable last completed leaf as owner and invoke normal `prepare` with the container as `--run-target`. The helper permits only this completion repair, requires all descendants done, and returns `rollup_only: true`; it preserves dirty or unintegrated state rather than overwriting it. Do not implement anything. Record verified evidence for the owner and each stale ancestor with `annotate`, then `commit --status verified --outcome '<container completion outcome>'`, check, and integrate the single annotation-only task commit. No new implementation task or container worktree is needed.
+If all implementation leaves are already done but a container roll-up is missing or stale, choose the stable last completed leaf as owner and invoke normal `prepare` with the container as `--run-target`. The helper permits only this completion repair, requires all descendants done, and returns `rollup_only: true`; it preserves dirty or unintegrated state rather than overwriting it. Do not implement anything. Record verified evidence for the owner and each stale ancestor with `annotate`, then `commit --status verified --outcome '<container completion outcome>'`, check, and integrate the single metadata-only task commit. The completed owner's lifecycle remains done throughout repair; `verified` describes its new evidence, not a regression of its shared status. No new implementation task or container worktree is needed.
 
 ## 7. Integrate
 
@@ -163,9 +165,9 @@ For a leaf or the final branch of a verified train:
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty integrate '<task_path>'
 ```
 
-`integrate` requires a clean fast-forward verified train. It validates each historical `task.yml` blob with `task_ctl.parse_config`, requires every task commit to contain its own verified control and successful verified evidence, validates ancestor roll-up ownership, and rejects merges, duplicate/non-task commits, malformed controls, failed evidence, or non-verified status.
+`integrate` requires a clean fast-forward verified train. It validates each task commit's local metadata record against the shared controls and successful verified evidence, validates ancestor roll-up ownership, and rejects merges, duplicate/non-task commits, stale metadata, malformed controls, failed evidence, or non-verified status.
 
-Only inside this operation, the helper rebuilds the train in the same order, changes every verified control owned by each commit to done through `task_ctl.set_task`, and recreates that same one commit—no completion commit. It then rechecks the integration head and fast-forwards. If finalization or fast-forward fails, it restores the private branch to the verified train; canonical status remains unchanged. Thus dependencies can observe done only after successful integration.
+The helper rechecks the integration head and fast-forwards the existing code commits before advancing the shared controls to done through `task_ctl.set_task`. It neither rewrites code commits to embed lifecycle changes nor creates a completion commit. A failed fast-forward leaves lifecycle unchanged, so dependencies remain locked. Keep the local helper state and report any metadata finalization failure; do not repair lifecycle by hand.
 
 If the integration branch advanced, refresh/rebase, rerun affected verification, refresh evidence, and retry. After an integrated wave, inspect again and schedule newly eligible work from the canonical tree.
 

@@ -20,7 +20,6 @@ class TaskCtlTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="task-ctl-")
         self.repo = Path(self.temporary.name) / "repo"
         (self.repo / ".cswd" / "tasks").mkdir(parents=True)
-        (self.repo / "docs" / "changes").mkdir(parents=True)
         self.api = runpy.run_path(str(TASK_CTL))
         self.TaskCtlError = self.api["TaskCtlError"]
 
@@ -187,7 +186,7 @@ class TaskCtlTests(unittest.TestCase):
             "--blocked",
             "{task-id: .cswd/tasks/provider, remarks: public API}",
             "--blocked",
-            "[{task-id: docs/changes/external/provider}]",
+            "[{task-id: .cswd/tasks/external/provider}]",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         config = yaml.safe_load(result.stdout)
@@ -195,7 +194,7 @@ class TaskCtlTests(unittest.TestCase):
             config["blocked-by"],
             [
                 {"task-id": ".cswd/tasks/provider", "remarks": "public API"},
-                {"task-id": "docs/changes/external/provider"},
+                {"task-id": ".cswd/tasks/external/provider"},
             ],
         )
         cleared = self.run_cli("set", "parent/leaf", "--blocked", "[]")
@@ -253,25 +252,25 @@ class TaskCtlTests(unittest.TestCase):
         self.assertEqual(control.read_bytes(), before)
 
     def test_get_recreates_missing_control_only_for_task_directories(self) -> None:
-        directory = self.make_dir("docs/changes/review/item")
-        result = self.run_cli("get", "docs/changes/review/item", "--spec")
+        directory = self.make_dir(".cswd/tasks/review/item")
+        result = self.run_cli("get", ".cswd/tasks/review/item", "--spec")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), str((directory / "spec.md").resolve()))
 
         evidence = directory / "task.md"
         evidence.write_text("**Outcome:** done\n", encoding="utf-8")
-        result = self.run_cli("get", "docs/changes/review/item", "--status")
+        result = self.run_cli("get", ".cswd/tasks/review/item", "--status")
         self.assertEqual((result.returncode, result.stdout), (0, "new\n"))
         self.assertEqual(
             yaml.safe_load((directory / "task.yml").read_text(encoding="utf-8")),
             {"type": "hld", "status": "new"},
         )
 
-        self.make_dir("docs/changes/review/empty")
-        empty = self.run_cli("get", "docs/changes/review/empty", "--status")
+        self.make_dir(".cswd/tasks/review/empty")
+        empty = self.run_cli("get", ".cswd/tasks/review/empty", "--status")
         self.assertEqual(empty.returncode, 2)
         self.assertIn("task Markdown not found", empty.stderr)
-        missing = self.run_cli("get", "docs/changes/review/missing", "--status")
+        missing = self.run_cli("get", ".cswd/tasks/review/missing", "--status")
         self.assertEqual(missing.returncode, 2)
         self.assertIn("task directory not found", missing.stderr)
 
@@ -584,45 +583,45 @@ class TaskCtlTests(unittest.TestCase):
             self.api["list_tasks"](self.repo, root, recursive=True)
 
     def test_impl_list_checks_done_dependencies_missing_dependencies_and_containers(self) -> None:
-        self.make_dir("docs/changes/work")
+        self.make_dir(".cswd/tasks/work")
         for name in ("01-provider", "02-consumer", "03-waiting", "04-container"):
-            self.make_dir(f"docs/changes/work/{name}")
+            self.make_dir(f".cswd/tasks/work/{name}")
         self.set_task(
-            "docs/changes/work/01-provider",
+            ".cswd/tasks/work/01-provider",
             {"type": "impl", "status": "done", "order": 1},
         )
         self.set_task(
-            "docs/changes/work/02-consumer",
+            ".cswd/tasks/work/02-consumer",
             {
                 "type": "impl",
                 "status": "ready",
                 "order": 2,
-                "blocked-by": [{"task-id": "docs/changes/work/01-provider"}],
+                "blocked-by": [{"task-id": ".cswd/tasks/work/01-provider"}],
             },
         )
         self.set_task(
-            "docs/changes/work/03-waiting",
+            ".cswd/tasks/work/03-waiting",
             {
                 "type": "impl",
                 "status": "ready",
                 "order": 3,
-                "blocked-by": [{"task-id": "docs/changes/missing"}],
+                "blocked-by": [{"task-id": ".cswd/tasks/missing"}],
             },
         )
         self.set_task(
-            "docs/changes/work/04-container",
+            ".cswd/tasks/work/04-container",
             {"type": "impl", "status": "ready", "order": 4},
         )
-        self.make_dir("docs/changes/work/04-container/01-leaf")
+        self.make_dir(".cswd/tasks/work/04-container/01-leaf")
         self.set_task(
-            "docs/changes/work/04-container/01-leaf",
+            ".cswd/tasks/work/04-container/01-leaf",
             {"type": "impl", "status": "ready", "order": 1},
         )
 
-        ready = self.api["list_tasks"](self.repo, "docs/changes/work", True)
+        ready = self.api["list_tasks"](self.repo, ".cswd/tasks/work", True)
         self.assertEqual(
             [record["task-id"] for record in ready],
-            ["docs/changes/work/02-consumer"],
+            [".cswd/tasks/work/02-consumer"],
         )
 
     def test_impl_list_rejects_existing_dependency_cycle(self) -> None:
@@ -658,14 +657,14 @@ class TaskCtlTests(unittest.TestCase):
         ready = self.api["list_tasks"](self.repo, ".cswd/tasks/cycle", True)
         self.assertEqual([record["task-id"] for record in ready], [".cswd/tasks/cycle/a"])
 
-    def test_both_canonical_roots_are_list_containers(self) -> None:
-        self.make_dir("docs/changes/review")
+    def test_task_root_is_a_list_container(self) -> None:
+        self.make_dir(".cswd/tasks/review")
         self.set_task(
-            "docs/changes/review",
+            ".cswd/tasks/review",
             {"type": "hld", "status": "critic", "order": 1},
         )
-        records = self.api["list_tasks"](self.repo, "docs/changes")
-        self.assertEqual(records[0]["task-id"], "docs/changes/review")
+        records = self.api["list_tasks"](self.repo, ".cswd/tasks")
+        self.assertEqual(records[0]["task-id"], ".cswd/tasks/review")
         self.assertEqual(records[0]["status"], "critic")
 
     def test_plan_is_stable_topological_read_only_and_reports_collisions(self) -> None:
@@ -717,6 +716,70 @@ class TaskCtlTests(unittest.TestCase):
         result = self.run_cli("plan", "parent", "--", candidates)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(yaml.safe_load(result.stdout)[0]["order"], 1)
+
+
+    def test_registered_worktree_shares_authoritative_cswd_only(self) -> None:
+        git_root = Path(self.temporary.name) / "git-root"
+        git_root.mkdir()
+        subprocess.run(["git", "init", "-q", str(git_root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(git_root), "config", "user.email", "task-ctl@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_root), "config", "user.name", "Task Ctl"],
+            check=True,
+        )
+        (git_root / ".cswd" / "tasks").mkdir(parents=True)
+        (git_root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(git_root), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(git_root), "commit", "-qm", "initial"], check=True)
+
+        linked = Path(self.temporary.name) / "linked"
+        subprocess.run(
+            ["git", "-C", str(git_root), "worktree", "add", "-q", "-b", "integration", str(linked)],
+            check=True,
+        )
+        (linked / ".cswd").symlink_to(git_root / ".cswd", target_is_directory=True)
+        shared = self.api["set_task"](
+            linked,
+            ".cswd/tasks/shared",
+            {"type": "impl", "status": "ready"},
+        )
+        self.assertEqual(shared["status"], "ready")
+        self.assertEqual(
+            self.api["get_task"](git_root, ".cswd/tasks/shared"),
+            shared,
+        )
+
+        external = Path(self.temporary.name) / "external"
+        (external / ".cswd" / "tasks").mkdir(parents=True)
+        (linked / ".cswd").unlink()
+        (linked / ".cswd").symlink_to(external / ".cswd", target_is_directory=True)
+        with self.assertRaisesRegex(self.TaskCtlError, "authoritative"):
+            self.api["task_dir"](linked, ".cswd/tasks/shared")
+
+        (linked / ".cswd").unlink()
+        (linked / ".cswd").symlink_to(git_root / ".cswd", target_is_directory=True)
+        escape = external / "escape"
+        escape.mkdir()
+        (git_root / ".cswd" / "tasks" / "nested-escape").symlink_to(
+            escape,
+            target_is_directory=True,
+        )
+        with self.assertRaisesRegex(self.TaskCtlError, "escapes shared"):
+            self.api["task_dir"](linked, ".cswd/tasks/nested-escape")
+
+        item = git_root / ".cswd" / "tasks" / "item"
+        item.mkdir()
+        (item / "spec.md").symlink_to(escape / "spec.md")
+        with self.assertRaisesRegex(self.TaskCtlError, "source escapes"):
+            self.api["set_task"](
+                linked,
+                ".cswd/tasks/item",
+                {"type": "impl", "status": "new", "source": ".cswd/tasks/item/spec.md"},
+                True,
+            )
 
 
     def test_path_traversal_and_symlink_escape_are_rejected(self) -> None:

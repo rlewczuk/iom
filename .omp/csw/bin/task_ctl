@@ -58,15 +58,15 @@ duplicate blockers, and unsafe paths are errors.
 IDs and paths
 -------------
 Exact canonical task IDs are POSIX repository-relative directory paths below
-``.cswd/tasks`` or ``docs/changes``, for example
-``docs/changes/parser/03-errors``.  API calls and ``blocked-by.task-id`` always
-require that exact form.  CLI task arguments additionally accept ``parser``
-as shorthand for ``.cswd/tasks/parser``; there is no basename search or
-``docs/changes`` shorthand.  ``.cswd/tasks`` and ``docs/changes`` themselves
-are accepted only as ``list`` containers.  Absolute paths, backslashes,
+``.cswd/tasks``, for example ``.cswd/tasks/parser/03-errors``.  API calls and
+``blocked-by.task-id`` always require that exact form.  CLI task arguments
+additionally accept ``parser`` as shorthand for ``.cswd/tasks/parser``; there
+is no basename search or legacy root shorthand.  ``.cswd/tasks`` itself is
+accepted only as a ``list`` container.  Absolute paths, backslashes,
 empty/``.``/``..`` components, surrounding whitespace, and paths whose
-symlinks escape the repository are rejected.  ``source`` follows the same
-safe repo-relative rules and its final component must be ``spec.md``.
+symlinks escape the repository (other than an authorized shared ``.cswd``
+root) are rejected.  ``source`` follows the same safe repo-relative rules and
+its final component must be ``spec.md``.
 
 Commands
 --------
@@ -105,7 +105,7 @@ created atomically on the first successful add.
 
 Shell quoting examples::
 
-    task_ctl --repo "$PWD" get docs/changes/parser/03-errors --status
+    task_ctl --repo "$PWD" get .cswd/tasks/parser/03-errors --status
     task_ctl set parser --status planned --priority P1
     task_ctl set parser/leaf --blocked \
       '{task-id: .cswd/tasks/parser/01-contract, remarks: needs API}'
@@ -123,9 +123,9 @@ for example ``task_ctl plan parser -- $'- slug: api\n  type: impl\n  priority: P
 ``list TASK [--recursive] [--impl | --plan] [--full]`` examines the TASK
 directory's direct-child controls.  ``--recursive`` includes every controlled
 descendant in depth-first order while preserving the normal sibling ordering.
-The command does not require a control on TASK itself, so both canonical roots
-are useful containers.  An immediate child is a task candidate when it
-contains ``task.yml``, ``task.md``, or ``spec.md``.  A candidate with Markdown
+The command does not require a control on TASK itself, so ``.cswd/tasks`` is a
+useful container.  An immediate child is a task candidate when it contains
+``task.yml``, ``task.md``, or ``spec.md``.  A candidate with Markdown
 but no control receives a recreated default control; unrelated directories and
 empty collision reservations are ignored.  Results are ordered by numeric
 ``order`` then canonical ID, with missing orders last.  The default output is
@@ -180,6 +180,7 @@ from collections.abc import Iterable, Mapping
 import os
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 import sys
 import tempfile
 from typing import Any
@@ -187,7 +188,7 @@ from typing import Any
 import yaml
 
 
-ROOTS = (".cswd/tasks", "docs/changes")
+ROOTS = (".cswd/tasks",)
 CONFIG_KEYS = ("type", "status", "order", "priority", "blocked-by", "source")
 BLOCKERS_FILE = ".cswd/blockers.yml"
 CONFIG_KEY_SET = frozenset(CONFIG_KEYS)
@@ -263,6 +264,52 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
+def _registered_worktree_roots(repo: Path) -> set[Path]:
+    """Return registered worktree roots for the repository containing repo."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return set()
+    if result.returncode != 0:
+        return set()
+    roots: set[Path] = set()
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            try:
+                roots.add(Path(line[len("worktree ") :]).resolve())
+            except (OSError, RuntimeError):
+                continue
+    return roots
+
+
+def _metadata_root(repo: Path) -> Path:
+    """Return the authoritative metadata directory visible from repo."""
+    metadata = repo / ".cswd"
+    if not metadata.is_symlink():
+        return metadata
+    try:
+        target = metadata.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise TaskCtlError(f"cannot resolve shared .cswd root: {exc}") from exc
+    if not target.is_dir() or target.name != ".cswd":
+        raise TaskCtlError(f"shared .cswd root is not a directory: {metadata}")
+    worktree_root = target.parent
+    registered = _registered_worktree_roots(repo)
+    if repo not in registered or worktree_root not in registered:
+        raise TaskCtlError(
+            "shared .cswd root is not the authoritative metadata of a registered worktree"
+        )
+    authoritative = worktree_root / ".cswd"
+    if authoritative.is_symlink() or authoritative.resolve() != target:
+        raise TaskCtlError("shared .cswd root must target an authoritative .cswd directory")
+    return target
+
+
 def _safe_relative(value: str, label: str) -> PurePosixPath:
     if not isinstance(value, str) or not value:
         raise TaskCtlError(f"{label} must be a nonempty string")
@@ -287,7 +334,7 @@ def _canonical_id(task_id: str, *, allow_root: bool) -> str:
         if value.startswith(root + "/"):
             return value
     raise TaskCtlError(
-        f"task-id must be an exact path below .cswd/tasks or docs/changes: {task_id!r}"
+        f"task-id must be an exact path below .cswd/tasks: {task_id!r}"
     )
 
 
@@ -304,15 +351,25 @@ def _resolved_inside(repo: Path, relative: str, label: str) -> Path:
         resolved = lexical.resolve()
     except (OSError, RuntimeError) as exc:
         raise TaskCtlError(f"cannot resolve {label} {relative!r}: {exc}") from exc
-    if not _is_relative_to(resolved, repo):
-        raise TaskCtlError(f"{label} escapes repository through a symlink: {relative}")
-    return lexical
+    under_metadata = relative == ".cswd" or relative.startswith(".cswd/")
+    if under_metadata and (repo / ".cswd").is_symlink():
+        metadata = _metadata_root(repo)
+        if not _is_relative_to(resolved, metadata):
+            raise TaskCtlError(f"{label} escapes shared .cswd metadata: {relative}")
+        return lexical
+    if _is_relative_to(resolved, repo):
+        return lexical
+    raise TaskCtlError(f"{label} escapes repository through a symlink: {relative}")
 
 
 def _task_dir(repo: Path, task_id: str, *, allow_root: bool) -> Path:
     root = _normalize_repo(repo)
     canonical = _canonical_id(task_id, allow_root=allow_root)
-    return _resolved_inside(root, canonical, "task-id")
+    directory = _resolved_inside(root, canonical, "task-id")
+    tasks_root = (_metadata_root(root) / "tasks").resolve()
+    if not _is_relative_to(directory.resolve(), tasks_root):
+        raise TaskCtlError(f"task-id escapes .cswd/tasks through a symlink: {task_id}")
+    return directory
 
 
 def task_dir(repo: Path, task_id: str) -> Path:

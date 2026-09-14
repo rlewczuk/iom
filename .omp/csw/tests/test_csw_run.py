@@ -27,8 +27,7 @@ class RunnerTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
-        self.target = self.repo / "docs" / "changes" / "example"
-        self.target.mkdir(parents=True)
+        self.target = self.repo / ".cswd" / "tasks" / "example"
         self.state = self.root / "state.json"
         self.env = os.environ | {
             "GIT_CONFIG_GLOBAL": os.devnull,
@@ -41,6 +40,9 @@ class RunnerTests(unittest.TestCase):
         }
         self.git("init", "-b", "main")
         (self.repo / ".gitignore").write_text(".work/\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "initial")
+        self.target.mkdir(parents=True)
 
     def git(self, *args):
         return subprocess.run(
@@ -54,8 +56,8 @@ class RunnerTests(unittest.TestCase):
         (directory / "spec.md").write_text(f"# {name}\n", encoding="utf-8")
         dependencies = []
         for dependency in blocked or []:
-            task_id = dependency if dependency.startswith((".cswd/tasks/", "docs/changes/")) else (
-                f"docs/changes/example/{dependency}"
+            task_id = dependency if dependency.startswith(".cswd/tasks/") else (
+                f".cswd/tasks/example/{dependency}"
             )
             dependencies.append({"task-id": task_id})
         updates = {
@@ -65,7 +67,7 @@ class RunnerTests(unittest.TestCase):
         }
         if order is not None:
             updates["order"] = order
-        set_task(self.repo, f"docs/changes/example/{name}", updates)
+        set_task(self.repo, f".cswd/tasks/example/{name}", updates)
         return directory
 
     def run_cli(self, command, *, target="example", state=None, success=True):
@@ -105,8 +107,6 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(queue["already_done"], ["00-done"])
         self.assertEqual(queue["ready"], names[1:])
         self.assertFalse(queue["finished"])
-        self.git("add", ".")
-        self.git("commit", "-m", "fixture")
         prepared = self.run_cli("prepare")
         self.assertEqual([entry["name"] for entry in prepared["prepared"]], names[1:])
 
@@ -201,19 +201,19 @@ class RunnerTests(unittest.TestCase):
         self.task("02-provider")
         state = {
             "dependencies": {
-                "01-consumer": ["docs/changes/example/02-provider"],
+                "01-consumer": [".cswd/tasks/example/02-provider"],
             },
         }
         self.assertEqual(self.run_cli("queue", state=state)["ready"], ["02-provider"])
         self.task("02-provider", status="done")
         self.assertEqual(self.run_cli("queue", state=state)["ready"], ["01-consumer"])
-        self.task("03-external", ["docs/changes/other/provider"])
-        external = self.repo / "docs" / "changes" / "other" / "provider"
+        self.task("03-external", [".cswd/tasks/other/provider"])
+        external = self.repo / ".cswd" / "tasks" / "other" / "provider"
         external.mkdir(parents=True)
         (external / "spec.md").write_text("# Provider\n", encoding="utf-8")
         set_task(
             self.repo,
-            "docs/changes/other/provider",
+            ".cswd/tasks/other/provider",
             {"type": "impl", "status": "done"},
         )
         self.assertEqual(self.run_cli("queue", state=state)["ready"], ["01-consumer", "03-external"])
@@ -227,7 +227,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([task["name"] for task in queue["blocked"]], ["01-invalid"])
         set_task(
             self.repo,
-            "docs/changes/example/01-invalid",
+            ".cswd/tasks/example/01-invalid",
             {"type": "impl", "status": "ready"},
             replace=True,
         )
@@ -251,8 +251,6 @@ class RunnerTests(unittest.TestCase):
 
     def test_failed_new_task_retains_one_commit_and_cannot_integrate(self):
         self.task("01-new", status="new")
-        self.git("add", ".")
-        self.git("commit", "-m", "fixture")
         inspection = self.helper("inspect", "example/01-new")
         self.assertTrue(inspection["leaves"][0]["explicitly_ready"])
         base = self.git("rev-parse", "HEAD")
@@ -285,9 +283,10 @@ class RunnerTests(unittest.TestCase):
             "retain failed attempt",
         )
         self.assertEqual(retained["status"], "new")
+        self.assertEqual(retained["changed_paths"], [])
         self.assertEqual(len(self.helper("show", "example/01-new")["task_commits"]), 1)
         self.assertEqual(
-            get_task(Path(prepared["worktree"]), "docs/changes/example/01-new")["status"],
+            get_task(Path(prepared["worktree"]), ".cswd/tasks/example/01-new")["status"],
             "new",
         )
         integration = subprocess.run(
@@ -303,7 +302,7 @@ class RunnerTests(unittest.TestCase):
             capture_output=True,
         )
         self.assertNotEqual(integration.returncode, 0)
-        self.assertEqual(get_task(self.repo, "docs/changes/example/01-new")["status"], "new")
+        self.assertEqual(get_task(self.repo, ".cswd/tasks/example/01-new")["status"], "new")
 
     def test_empty_and_completed_targets_are_terminal(self):
         self.assertTrue(self.run_cli("queue")["finished"])
@@ -317,8 +316,6 @@ class RunnerTests(unittest.TestCase):
         self.task("02-provider")
         self.task("03-slow")
         self.task("04-second-consumer", ["02-provider"])
-        self.git("add", ".")
-        self.git("commit", "-m", "fixture")
         initial = self.run_cli("prepare")["prepared"]
         self.assertEqual([entry["name"] for entry in initial], ["02-provider", "03-slow"])
         provider = initial[0]
@@ -327,6 +324,11 @@ class RunnerTests(unittest.TestCase):
         slow_worktree = Path(slow["worktree"])
         self.assertNotEqual(provider_worktree, self.repo)
         self.assertTrue(Path(provider["spec_path"]).is_file())
+        self.assertTrue((provider_worktree / ".cswd").is_symlink())
+        self.assertEqual(
+            (provider_worktree / ".cswd").resolve(),
+            (self.repo / ".cswd").resolve(),
+        )
         preserved = slow_worktree / "owned.txt"
         preserved.write_text("slow owner work", encoding="utf-8")
         state = {"outcomes": {"03-slow": {"status": "running", "reason": "slow owner active"}}}
@@ -366,12 +368,12 @@ class RunnerTests(unittest.TestCase):
         verified_commit = self.helper("commit", task_path, "--status", "verified")["commit"]
         self.assertEqual(verified["lifecycle_status"], "verified")
         self.assertEqual(
-            get_task(provider_worktree, "docs/changes/example/02-provider")["status"],
+            get_task(provider_worktree, ".cswd/tasks/example/02-provider")["status"],
             "verified",
         )
         self.assertEqual(
-            get_task(self.repo, "docs/changes/example/02-provider")["status"],
-            "new",
+            get_task(self.repo, ".cswd/tasks/example/02-provider")["status"],
+            "verified",
         )
         self.assertEqual(self.run_cli("queue", state=state)["ready"], [])
         self.helper(
@@ -384,7 +386,7 @@ class RunnerTests(unittest.TestCase):
             env=self.env, text=True, capture_output=True,
         )
         self.assertEqual(rejected.returncode, 2, rejected.stdout)
-        self.assertEqual(get_task(self.repo, "docs/changes/example/02-provider")["status"], "new")
+        self.assertEqual(get_task(self.repo, ".cswd/tasks/example/02-provider")["status"], "verified")
         self.helper(
             "annotate", task_path, "--outcome", "verified", "--summary", "Verification rerun succeeded",
             "--verification", "Fixture verification rerun passed",
@@ -393,16 +395,17 @@ class RunnerTests(unittest.TestCase):
         integrated = self.helper("integrate", task_path)
         self.assertEqual(len(integrated["commits"]), 1)
         self.assertEqual(integrated["commits"][0]["original_commit"], verified_commit)
-        self.assertNotEqual(integrated["commits"][0]["commit"], verified_commit)
+        self.assertEqual(integrated["commits"][0]["commit"], verified_commit)
         integration_head = integrated["integration_head"]
         self.assertEqual(
             len(self.git("rev-list", f"{integrated['previous_head']}..{integration_head}").splitlines()),
             1,
         )
         self.assertEqual(
-            get_task(self.repo, "docs/changes/example/02-provider")["status"],
+            get_task(self.repo, ".cswd/tasks/example/02-provider")["status"],
             "done",
         )
+        self.assertEqual(self.git("ls-files", "--", ".cswd"), "")
         control = self.run_cli("control")
         self.assertEqual(control["integration_head"], integration_head)
         self.assertEqual(preserved.read_text(encoding="utf-8"), "slow owner work")
@@ -426,10 +429,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_stale_container_rollup_needs_no_new_implementation_task(self):
         (self.target / "spec.md").write_text("# Container\n", encoding="utf-8")
-        set_task(self.repo, "docs/changes/example", {"type": "hld", "status": "planned"})
+        set_task(self.repo, ".cswd/tasks/example", {"type": "hld", "status": "planned"})
         self.task("01-completed", status="done")
-        self.git("add", ".")
-        self.git("commit", "-m", "completed leaves with pending container rollup")
         base = self.git("rev-parse", "HEAD")
         task = "example/01-completed"
         prepared = self.helper(
@@ -445,21 +446,19 @@ class RunnerTests(unittest.TestCase):
             )
         self.helper("commit", task, "--status", "verified", "--outcome", "complete container rollup")
         self.helper("integrate", task)
-        self.assertEqual(get_task(self.repo, "docs/changes/example")["status"], "done")
-        self.assertEqual(get_task(self.repo, "docs/changes/" + task)["status"], "done")
+        self.assertEqual(get_task(self.repo, ".cswd/tasks/example")["status"], "done")
+        self.assertEqual(get_task(self.repo, ".cswd/tasks/" + task)["status"], "done")
         self.assertEqual(self.git("rev-list", "--count", f"{base}..HEAD"), "1")
 
     def test_verified_train_and_rollup_finalize_without_completion_commits(self):
         (self.target / "spec.md").write_text("# Example container\n", encoding="utf-8")
         set_task(
             self.repo,
-            "docs/changes/example",
+            ".cswd/tasks/example",
             {"type": "hld", "status": "ready"},
         )
         self.task("01-first")
         self.task("02-second")
-        self.git("add", ".")
-        self.git("commit", "-m", "fixture")
         base = self.git("rev-parse", "HEAD")
 
         for task in ("example/01-first", "example/02-second"):
@@ -488,7 +487,9 @@ class RunnerTests(unittest.TestCase):
             self.helper("commit", task, "--status", "verified")
 
         first_commit = self.helper("show", "example/01-first")["task_commits"][0]["commit"]
-        self.helper("rebase", "example/02-second", "--onto", first_commit)
+        second_before_rebase = self.helper("show", "example/02-second")["task_commits"][0]["commit"]
+        rebased = self.helper("rebase", "example/02-second", "--onto", first_commit)
+        self.assertNotEqual(rebased["commit"], second_before_rebase)
         self.helper(
             "annotate",
             "example/02-second",
@@ -510,16 +511,14 @@ class RunnerTests(unittest.TestCase):
             2,
         )
         for task_id in (
-            "docs/changes/example",
-            "docs/changes/example/01-first",
-            "docs/changes/example/02-second",
+            ".cswd/tasks/example",
+            ".cswd/tasks/example/01-first",
+            ".cswd/tasks/example/02-second",
         ):
             self.assertEqual(get_task(self.repo, task_id)["status"], "done")
 
     def test_control_refreshes_head_without_target_or_root_spec(self):
         self.target.rmdir()
-        self.git("add", ".")
-        self.git("commit", "-m", "initial")
         tracked = self.repo / "tracked.txt"
         tracked.write_text("advance integration", encoding="utf-8")
         self.git("add", "tracked.txt")
@@ -534,8 +533,6 @@ class RunnerTests(unittest.TestCase):
     def test_preparation_failure_does_not_abort_independent_owner(self):
         self.task("01-collision")
         self.task("02-independent")
-        self.git("add", ".")
-        self.git("commit", "-m", "fixture")
         collision = self.repo / ".work" / "example" / "01-collision"
         collision.mkdir(parents=True)
         retained = collision / "owned.txt"
@@ -544,6 +541,119 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([entry["name"] for entry in result["prepared"]], ["02-independent"])
         self.assertIn("01-collision", [entry["name"] for entry in result["blocked"]])
         self.assertEqual(retained.read_text(encoding="utf-8"), "preserve this state")
+
+    def test_reuse_rejects_conflicting_metadata_directory_and_link(self):
+        self.task("01-owner")
+        prepared = self.run_cli("prepare")["prepared"][0]
+        worktree = Path(prepared["worktree"])
+        shared = worktree / ".cswd"
+        self.assertEqual(self.git("check-ignore", "--no-index", ".cswd"), ".cswd")
+        ignored_link = subprocess.run(
+            ["git", "-C", str(worktree), "check-ignore", "--no-index", ".cswd"],
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(ignored_link.stdout.strip(), ".cswd")
+        shared.unlink()
+        shared.mkdir()
+        marker = shared / "owned.txt"
+        marker.write_text("preserve", encoding="utf-8")
+        blocked = self.run_cli("prepare")
+        self.assertEqual(blocked["prepared"], [])
+        self.assertIn("01-owner", {item["name"] for item in blocked["blocked"]})
+        self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
+        marker.unlink()
+        shared.rmdir()
+        wrong_target = self.root / "other-metadata"
+        wrong_target.mkdir()
+        shared.symlink_to(wrong_target, target_is_directory=True)
+        blocked = self.run_cli("prepare")
+        self.assertEqual(blocked["prepared"], [])
+        self.assertEqual(shared.resolve(), wrong_target.resolve())
+
+    def test_tracked_metadata_is_rejected_without_deleting_it(self):
+        task = self.task("01-tracked")
+        self.git("add", "-f", ".cswd/tasks/example/01-tracked/spec.md")
+        result = self.run_cli("control", success=False)
+        self.assertIn("must not be tracked", result.stderr)
+        self.assertTrue((task / "spec.md").is_file())
+        self.assertEqual(
+            self.git("ls-files", "--", ".cswd"),
+            ".cswd/tasks/example/01-tracked/spec.md",
+        )
+
+    def test_failed_fast_forward_does_not_unlock_dependency(self):
+        self.task("01-provider")
+        self.task("02-consumer", ["01-provider"])
+        prepared = self.run_cli("prepare")["prepared"][0]
+        task = prepared["task_path"]
+        self.helper(
+            "annotate",
+            task,
+            "--outcome",
+            "verified",
+            "--summary",
+            "Provider verified",
+            "--verification",
+            "Provider scenario passed",
+        )
+        self.helper("commit", task, "--status", "verified", "--outcome", "implement provider")
+        advance = self.repo / "advance.txt"
+        advance.write_text("integration advanced\n", encoding="utf-8")
+        self.git("add", "advance.txt")
+        self.git("commit", "-m", "advance integration")
+
+        result = subprocess.run(
+            [str(TASK_HELPER), "--repo", str(self.repo), "integrate", task],
+            env=self.env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(
+            get_task(self.repo, ".cswd/tasks/example/01-provider")["status"],
+            "verified",
+        )
+        queue = self.run_cli("queue")
+        self.assertEqual(queue["ready"], [])
+        self.assertIn("02-consumer", {item["name"] for item in queue["waiting"]})
+
+    def test_stale_verification_binding_blocks_integration(self):
+        self.task("01-stale")
+        prepared = self.run_cli("prepare")["prepared"][0]
+        task = prepared["task_path"]
+        self.helper(
+            "annotate",
+            task,
+            "--outcome",
+            "verified",
+            "--summary",
+            "Initial verification",
+            "--verification",
+            "Initial scenario passed",
+        )
+        self.helper("commit", task, "--status", "verified", "--outcome", "implement stale fixture")
+        annotation = self.target / "01-stale" / "task.md"
+        annotation.write_text(
+            annotation.read_text(encoding="utf-8") + "\nEvidence changed after binding.\n",
+            encoding="utf-8",
+        )
+        before = self.git("rev-parse", "HEAD")
+        result = subprocess.run(
+            [str(TASK_HELPER), "--repo", str(self.repo), "integrate", task],
+            env=self.env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(
+            get_task(self.repo, ".cswd/tasks/example/01-stale")["status"],
+            "verified",
+        )
 
 
 if __name__ == "__main__":

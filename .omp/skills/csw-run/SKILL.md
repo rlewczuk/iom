@@ -1,12 +1,12 @@
 ---
 name: csw-run
-description: Execute all eligible direct implementation children under docs/changes continuously in dependency-aware parallel worktrees.
+description: Execute all eligible direct implementation children under .cswd/tasks continuously in dependency-aware parallel worktrees.
 hide: true
 ---
 
 # CSW Run
 
-Run all unfinished **direct child** tasks below `docs/changes/<task-name>`. Read `skill://spec-run-task` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
+Run all unfinished **direct child** tasks below `.cswd/tasks/<task-name>`. Read `skill://spec-run-task` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
 
 ## Mechanical control plane
 
@@ -36,7 +36,7 @@ Run `csw_preflight` exactly once per invocation before the first `prepare`. Pres
 - `already_done`: direct tasks whose canonical integrated lifecycle is done;
 - `finished`: true only when all discovered direct tasks are done, including an empty target.
 
-`prepare` provisions or reuses all currently ready worktrees and preserves independent preparation failures. `control` refreshes the validated integration branch/head without target discovery or preparation.
+`prepare` provisions or reuses all currently ready worktrees and preserves independent preparation failures. Each worktree's `.cswd` is a symbolic link to the integration checkout's shared local metadata directory. Specifications, controls, and evidence remain unversioned; updates are immediately visible to every owner. Never stage or remotely synchronize `.cswd`. `control` refreshes the validated integration branch/head without target discovery or preparation.
 
 ## Local invocation state
 
@@ -45,7 +45,7 @@ Create one parent-owned temporary JSON file outside the checkout, initialized to
 ```json
 {
   "dependencies": {
-    "child-name": ["docs/changes/target/other-child"]
+    "child-name": [".cswd/tasks/target/other-child"]
   },
   "outcomes": {
     "child-name": {
@@ -56,11 +56,11 @@ Create one parent-owned temporary JSON file outside the checkout, initialized to
 }
 ```
 
-`dependencies` contains only supplemental semantic prerequisites and every value is an exact canonical `.cswd/tasks/...` or `docs/changes/...` ID. They augment, never erase, the canonical `blocked-by` records returned by task_ctl. Preserve actual prerequisites; missing canonical dependencies wait. Numeric order and priority are scheduling order, not dependencies.
+`dependencies` contains only supplemental semantic prerequisites and every value is an exact canonical `.cswd/tasks/...` ID. They augment, never erase, the canonical `blocked-by` records returned by task_ctl. Preserve actual prerequisites; missing canonical dependencies wait. Numeric order and priority are scheduling order, not dependencies.
 
 `outcomes` prevents duplicate dispatch/retry within this invocation. Record prepared leaves as running before dispatch. Change to ready only after the owner ends with a provisional commit; use failed for a concrete implementation/runtime failure and blocked for an external prerequisite. Running/ready suppress redispatch but never satisfy dependencies. Canonical integrated done overrides a stale local outcome.
 
-Only canonical `done` in the integration checkout unlocks an edge. Ready, verified, a private branch, child report, or existing commit does not. Failed/blocked/running are local execution outcomes, never lifecycle statuses.
+Only canonical `done` in the shared local task store unlocks an edge. The helper writes it only after successful integration. Ready, verified, a private branch, child report, or existing commit does not unlock an edge. Failed/blocked/running are local execution outcomes, never lifecycle statuses.
 
 ## Continuous orchestration
 
@@ -70,7 +70,7 @@ Only canonical `done` in the integration checkout unlocks an edge. Ready, verifi
 4. Give each child exact `repo_root`, `task_id`, `task_path`, worktree/spec/control/evidence paths, feature branch/base, integration branch/head, exclusive scope, known interface contracts, and required verification. The child uses assigned-worktree mode, skips validation, and never integrates/rebases or edits task files directly.
 5. Consume individual owner completions continuously. Retain the owner/job identity and prepared record until settled. Record crashes/dispatch failures as failed, external prerequisites as blocked, and provisional success as ready. An owner may report implementation failure only after the required one-time `spec-run-debug` rescue attempt.
 6. As soon as one leaf is ready, serialize parent takeover for that leaf. Run `control`, rebase its one ready commit onto the current canonical head, and run focused plus repository-required combined verification in that exact worktree. Do not wait for unrelated owners. Route a recoverable failure back to the same owner after marking it running; preserve its worktree and one commit.
-7. After observed success, use spec-run-task `annotate --outcome verified` with exact evidence, `commit --status verified`, and `check --status verified`. Then call `integrate`. Do not write done yourself. `integrate` validates the historical verified control using `task_ctl.parse_config`, rebuilds the same task commit with task_ctl's verified-to-done update, rechecks the canonical head, and fast-forwards. Failure restores the private verified commit, so dependencies remain locked and no completion commit exists.
+7. After observed success, use spec-run-task `annotate --outcome verified` with exact evidence, `commit --status verified`, and `check --status verified`. Then call `integrate`. Do not write done yourself. The helper validates commit-bound local controls and evidence against the shared task store, rechecks the canonical head, and fast-forwards before advancing lifecycle to done through task_ctl. A rejected integration leaves dependencies locked. No task metadata or completion commit is added to Git history.
 8. Immediately after successful integration, rerun `queue` on the canonical tree, then prepare and dispatch **all** newly eligible children before processing another completion or waiting. If A integrates while B runs, start every direct child now unlocked by A; B is not a barrier. Rescan after every settled outcome. Stop only at `finished` or a true stall with no eligible, running/queued, or completed owner.
 
 If the integration head advances before integration, refresh through `control`, rebase, rerun affected verification, update evidence, and retry. Never use the head captured at dispatch. Never reprepare active work merely to refresh control state.
@@ -90,4 +90,4 @@ The debugger receives exact worktree/spec paths, constraints, current changes, e
 
 ## Reporting
 
-Report separately: already done; done and integrated with final rewritten commit and observed verification; failed with retained local outcome; nondependency blocked; and dependency waiting with exact canonical cause. Include target, integration branch/head, prepared worktrees/commits, and residual risk. `finished: false` is not completion.
+Report separately: already done; done and integrated with final commit and observed verification; failed with retained local outcome; nondependency blocked; and dependency waiting with exact canonical cause. Include target, integration branch/head, prepared worktrees/commits, and residual risk. `finished: false` is not completion.

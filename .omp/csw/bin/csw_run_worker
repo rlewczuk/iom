@@ -23,10 +23,12 @@ task_ctl_get_task = _TASK_CTL["get_task"]
 task_ctl_set_task = _TASK_CTL["set_task"]
 task_ctl_list_tasks = _TASK_CTL["list_tasks"]
 task_ctl_scan_tasks = _TASK_CTL["scan_tasks"]
-task_ctl_parse_config = _TASK_CTL["parse_config"]
 task_ctl_detect_cycle = _TASK_CTL["detect_cycle"]
 
 
+TASK_ROOT = ".cswd/tasks"
+METADATA_NAME = ".cswd"
+METADATA_EXCLUDE = "/.cswd"
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 OUTCOME_RE = re.compile(r"^\s*\*\*Outcome:\*\*\s*(.*?)\s*$", re.IGNORECASE)
 GENERATED_HEADING_RE = re.compile(r"^##\s+(Summary|Verification|Errors)\s*$", re.IGNORECASE)
@@ -80,6 +82,64 @@ def common_git_dir(repo: Path) -> Path:
     if not path.is_absolute():
         path = repo / path
     return path.resolve()
+
+
+def tracked_metadata_paths(repo: Path) -> list[str]:
+    process = git(repo, "ls-files", "-z", "--", METADATA_NAME, binary=True)
+    raw = process.stdout
+    assert isinstance(raw, bytes)
+    return [item.decode(errors="surrogateescape") for item in raw.split(b"\0") if item]
+
+
+def ensure_metadata_excluded(repo: Path) -> None:
+    tracked = tracked_metadata_paths(repo)
+    if tracked:
+        preview = ", ".join(tracked[:8])
+        raise TaskError(f"shared task metadata must not be tracked by Git: {preview}")
+    exclude = common_git_dir(repo) / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+    if METADATA_EXCLUDE not in existing.splitlines():
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        exclude.write_text(existing + separator + METADATA_EXCLUDE + "\n", encoding="utf-8")
+    for probe in (METADATA_NAME, f"{METADATA_NAME}/tasks/.csw-run-ignore-probe"):
+        process = git(repo, "check-ignore", "--quiet", "--no-index", "--", probe, check=False)
+        if process.returncode != 0:
+            raise TaskError(f"{METADATA_NAME} is not ignored by Git: {probe}")
+
+
+def canonical_metadata_dir(repo: Path) -> Path:
+    path = repo / METADATA_NAME
+    if path.is_symlink():
+        raise TaskError(f"integration checkout metadata must be a real directory, not a symlink: {path}")
+    if not path.is_dir():
+        raise TaskError(f"integration checkout metadata directory not found: {path}")
+    return path.resolve()
+
+
+def verify_shared_metadata_link(integration: Path, worktree: Path) -> Path:
+    canonical = canonical_metadata_dir(integration)
+    link = worktree / METADATA_NAME
+    if not link.is_symlink():
+        kind = "path" if os.path.lexists(link) else "link"
+        raise TaskError(f"worktree metadata {kind} is not the shared metadata link: {link}")
+    try:
+        target = link.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise TaskError(f"cannot resolve worktree metadata link {link}: {exc}") from exc
+    if target != canonical:
+        raise TaskError(f"worktree metadata link targets {target}, expected {canonical}")
+    return link
+
+
+def ensure_shared_metadata_link(integration: Path, worktree: Path) -> Path:
+    ensure_metadata_excluded(integration)
+    canonical = canonical_metadata_dir(integration)
+    link = worktree / METADATA_NAME
+    if os.path.lexists(link):
+        return verify_shared_metadata_link(integration, worktree)
+    link.symlink_to(canonical, target_is_directory=True)
+    return verify_shared_metadata_link(integration, worktree)
 
 
 def absolute_git_dir(repo: Path) -> Path:
@@ -155,13 +215,13 @@ def is_relative_to(path: Path, parent: Path) -> bool:
 
 
 def canonical_task(task: str) -> str:
-    return "docs/changes/" + validate_target(task)
+    return TASK_ROOT + "/" + validate_target(task)
 
 
 def relative_task_id(task_id: str) -> str:
-    prefix = "docs/changes/"
+    prefix = TASK_ROOT + "/"
     if not task_id.startswith(prefix):
-        raise TaskError(f"execution task is outside docs/changes: {task_id}")
+        raise TaskError(f"execution task is outside {TASK_ROOT}: {task_id}")
     return validate_target(task_id[len(prefix) :])
 
 
@@ -221,6 +281,8 @@ def require_work_ignored(repo: Path) -> None:
 
 def validate_control(repo: Path, *, require_status_clean: bool = True) -> tuple[str, str]:
     branch = current_branch(repo)
+    ensure_metadata_excluded(repo)
+    canonical_metadata_dir(repo)
     if require_status_clean:
         require_clean(repo, "integration checkout")
     require_work_ignored(repo)
@@ -400,6 +462,11 @@ def load_state(repo: Path, task: str) -> tuple[Path, dict[str, Any]]:
     state = json.loads(path.read_text(encoding="utf-8"))
     if state.get("task_path") != task or state.get("feature_branch") != branch:
         raise TaskError(f"task worktree state does not match {task}: {path}")
+    integration = Path(state.get("integration_checkout", "")).resolve()
+    if integration != repo.resolve():
+        raise TaskError(f"task worktree state belongs to integration checkout {integration}, not {repo.resolve()}")
+    ensure_metadata_excluded(repo)
+    verify_shared_metadata_link(integration, wt)
     return wt, state
 
 
@@ -423,6 +490,8 @@ def validate_integration(state: dict[str, Any]) -> Path:
         raise TaskError(
             f"integration checkout changed branch: expected {state['integration_branch']}, found {current_branch(checkout)}"
         )
+    ensure_metadata_excluded(checkout)
+    canonical_metadata_dir(checkout)
     require_clean(checkout, "integration checkout")
     return checkout
 
@@ -496,6 +565,15 @@ def prepare_task(
     wt, branch = verify_worktree(repo, task)
     path = state_path(wt)
     if path.is_file():
+        existing_state = json.loads(path.read_text(encoding="utf-8"))
+        recorded_integration = Path(existing_state.get("integration_checkout", "")).resolve()
+        if recorded_integration != repo.resolve():
+            raise TaskError(
+                f"existing worktree state belongs to integration checkout {recorded_integration}, not {repo.resolve()}"
+            )
+    ensure_shared_metadata_link(repo, wt)
+    path = state_path(wt)
+    if path.is_file():
         state = json.loads(path.read_text(encoding="utf-8"))
         if state.get("task_path") != task or state.get("feature_branch") != branch:
             raise TaskError(f"existing worktree state belongs to another task: {path}")
@@ -517,6 +595,8 @@ def prepare_task(
         git(wt, "reset", "--hard", integration_base)
         base = integration_base
         state.pop("final_commit", None)
+        state.pop("metadata_snapshot", None)
+        state.pop("annotations", None)
 
     state.update(
         {
@@ -529,6 +609,7 @@ def prepare_task(
             "integration_branch": integration_branch,
             "integration_start": integration_base,
             "base": base,
+            "rollup_only": rollup_only,
         }
     )
     save_state(wt, state)
@@ -621,7 +702,7 @@ def annotate_task(
     if outcome in {"ready", "verified"} and errors:
         raise TaskError(f"{outcome} outcome cannot retain error entries")
 
-    annotation = annotation_path(wt, annotated)
+    annotation = annotation_path(repo, annotated)
     existing = annotation.read_text(encoding="utf-8") if annotation.is_file() else ""
     body = strip_generated_sections(existing)
     output = [f"**Outcome:** {outcome}"]
@@ -634,16 +715,21 @@ def annotate_task(
     if errors:
         output.extend(["", "## Errors", ""])
         output.extend(f"- {entry}" for entry in errors)
-    if outcome in {"ready", "verified"}:
-        task_ctl_set_task(wt, canonical_task(annotated), {"status": outcome})
+    current_status = task_config(repo, annotated)["status"]
+    preserve_done = outcome in {"ready", "verified"} and current_status == "done"
+    if outcome in {"ready", "verified"} and not preserve_done:
+        task_ctl_set_task(repo, canonical_task(annotated), {"status": outcome})
     annotation.write_text("\n".join(output) + "\n", encoding="utf-8")
+    annotations = state.setdefault("annotations", {})
+    annotations[annotated] = outcome
+    save_state(wt, state)
     return {
         "owner_task": owner,
         "annotated_task": annotated,
         "annotation_path": str(annotation),
-        "control_path": str(control_path(wt, annotated)),
+        "control_path": str(control_path(repo, annotated)),
         "outcome": outcome,
-        "lifecycle_status": task_config(wt, annotated)["status"],
+        "lifecycle_status": task_config(repo, annotated)["status"],
     }
 
 
@@ -657,60 +743,127 @@ def changed_paths(repo: Path, base: str, revision: str | None = None) -> list[st
     return [item.decode(errors="surrogateescape") for item in raw.split(b"\0") if item]
 
 
-def task_from_path(path: str, filename: str) -> str | None:
-    prefix = "docs/changes/"
-    suffix = "/" + filename
-    if not path.startswith(prefix) or not path.endswith(suffix):
-        return None
-    task = path[len(prefix) : -len(suffix)]
-    return task or None
+def annotation_outcome(text: str, task: str) -> str:
+    outcomes = [
+        match.group(1).strip().lower()
+        for line in text.splitlines()
+        if (match := OUTCOME_RE.match(line))
+    ]
+    if len(outcomes) != 1 or outcomes[0] not in EXECUTION_OUTCOMES:
+        raise TaskError(f"task evidence has no single valid execution outcome: {canonical_task(task)}/task.md")
+    return outcomes[0]
 
 
-def validate_task_file_changes(
-    worktree: Path,
+def metadata_record(repo: Path, task: str) -> dict[str, Any]:
+    control = control_path(repo, task)
+    annotation = annotation_path(repo, task)
+    if not annotation.is_file():
+        raise TaskError(f"task evidence not found: {annotation}")
+    control_text = control.read_text(encoding="utf-8")
+    annotation_text = annotation.read_text(encoding="utf-8")
+    config = task_config(repo, task)
+    return {
+        "control": control_text,
+        "annotation": annotation_text,
+        "outcome": annotation_outcome(annotation_text, task),
+        "status": config["status"],
+        "type": config["type"],
+    }
+
+
+def capture_metadata_snapshot(
+    repo: Path,
     state: dict[str, Any],
-    paths: Iterable[str],
-    lifecycle_status: str,
-    *,
-    require_owner: bool,
-) -> None:
+    expected_status: str,
+) -> dict[str, Any]:
     owner = state["task_path"]
-    annotations: set[str] = set()
-    controls: set[str] = set()
-    for path in paths:
-        filename = Path(path).name
-        if filename not in {"task.md", "task.yml"}:
-            continue
-        annotated = task_from_path(path, filename)
-        if annotated is None:
-            raise TaskError(f"misplaced {filename} change: {path}")
+    annotations = state.get("annotations", {})
+    if owner not in annotations:
+        raise TaskError(f"task commit requires canonical evidence for {canonical_task(owner)}")
+    records: dict[str, dict[str, Any]] = {}
+    for annotated, expected_outcome in sorted(annotations.items()):
         validate_annotation_owner(state, owner, annotated)
-        if not spec_path(worktree, annotated).is_file():
-            raise TaskError(f"{filename} has no sibling spec.md: {path}")
-        if filename == "task.md":
-            annotations.add(annotated)
-        else:
-            config = task_config(worktree, annotated)
-            expected_type = "impl" if annotated == owner else "hld"
-            if config["type"] != expected_type:
+        record = metadata_record(repo, annotated)
+        if record["outcome"] != expected_outcome:
+            raise TaskError(
+                f"task evidence changed since annotation for {canonical_task(annotated)}: "
+                f"expected {expected_outcome}, found {record['outcome']}"
+            )
+        expected_type = "impl" if annotated == owner else "hld"
+        if record["type"] != expected_type:
+            raise TaskError(
+                f"task control type mismatch for {canonical_task(annotated)}: "
+                f"expected {expected_type}, found {record['type']}"
+            )
+        if expected_status == "verified":
+            if record["outcome"] not in {"verified", "failed", "blocked"}:
+                raise TaskError(f"verified lifecycle has incompatible evidence: {canonical_task(annotated)}")
+            allowed_status = (
+                {"done"}
+                if annotated == owner and state.get("rollup_only")
+                else {"verified"}
+            )
+            if record["status"] not in allowed_status:
                 raise TaskError(
-                    f"control type mismatch at {path}: expected {expected_type}, found {config['type']}"
+                    f"verified task control has status {record['status']}: {canonical_task(annotated)}"
                 )
-            status = config["status"]
-            if status != lifecycle_status:
+        records[annotated] = record
+    owner_status = records[owner]["status"]
+    allowed_owner_status = (
+        {"done"} if expected_status == "verified" and state.get("rollup_only") else {expected_status}
+    )
+    if owner_status not in allowed_owner_status:
+        raise TaskError(
+            f"control status mismatch at {control_path(repo, owner)}: "
+            f"expected {expected_status}, found {owner_status}"
+        )
+    return {
+        "commit": None,
+        "requested_status": expected_status,
+        "owner_status": owner_status,
+        "tasks": records,
+    }
+
+
+def validate_metadata_snapshot(
+    repo: Path,
+    state: dict[str, Any],
+    commit: str,
+    *,
+    require_verified: bool,
+) -> list[str]:
+    snapshot = state.get("metadata_snapshot")
+    if not isinstance(snapshot, dict) or snapshot.get("commit") != commit:
+        raise TaskError(f"task commit has no matching metadata snapshot: {commit}")
+    records = snapshot.get("tasks")
+    owner = state["task_path"]
+    if not isinstance(records, dict) or owner not in records:
+        raise TaskError(f"task metadata snapshot lacks owner evidence: {commit} {canonical_task(owner)}")
+    finalized: list[str] = []
+    for annotated, recorded in sorted(records.items()):
+        validate_annotation_owner(state, owner, annotated)
+        if not isinstance(recorded, dict):
+            raise TaskError(f"invalid task metadata snapshot for {canonical_task(annotated)}")
+        current = metadata_record(repo, annotated)
+        if current != recorded:
+            raise TaskError(
+                f"shared task metadata changed after commit {commit}: {canonical_task(annotated)}"
+            )
+        if require_verified:
+            if recorded["outcome"] != "verified":
                 raise TaskError(
-                    f"control status mismatch at {path}: expected {lifecycle_status}, found {status}"
+                    f"task evidence does not record successful verification: {commit} {canonical_task(annotated)}"
                 )
-            controls.add(annotated)
-    if lifecycle_status == "verified" and not controls.issubset(annotations):
-        missing = ", ".join(sorted(controls - annotations))
-        raise TaskError(f"verified control changes lack sibling evidence changes: {missing}")
-    if require_owner and owner not in annotations:
-        expected = f"docs/changes/{owner}/task.md"
-        raise TaskError(f"task commit does not contain its required sibling evidence: {expected}")
-    if lifecycle_status == "verified" and owner not in controls:
-        expected = f"docs/changes/{owner}/task.yml"
-        raise TaskError(f"verified task commit does not contain its lifecycle transition: {expected}")
+            if recorded["status"] == "verified":
+                finalized.append(annotated)
+            elif annotated == owner and state.get("rollup_only") and recorded["status"] == "done":
+                finalized.append(annotated)
+            else:
+                raise TaskError(
+                    f"task control is not verified before integration: "
+                    f"{commit} {canonical_task(annotated)} is {recorded['status']}"
+                )
+    return finalized
 
 
 def commits_since(repo: Path, base: str) -> list[str]:
@@ -805,9 +958,6 @@ def checkpoint_task(repo: Path, task: str) -> dict[str, Any]:
     if not status_entries(wt):
         return {"task_path": task, "checkpoint": None, "no_change": True}
     git(wt, "add", "-A")
-    paths = changed_paths(wt, state["base"])
-    lifecycle_status = task_config(wt, task)["status"]
-    validate_task_file_changes(wt, state, paths, lifecycle_status, require_owner=False)
     git(wt, "commit", "-m", f"spec-run-task checkpoint({task}): preserve reusable work")
     commit = head(wt)
     return {"task_path": task, "checkpoint": commit, "no_change": False}
@@ -819,7 +969,7 @@ def commit_task(repo: Path, task: str, expected_status: str, outcome: str | None
     if expected_status not in {"new", "critic", "planned", "ready", "verified"}:
         raise TaskError("task commits require an unintegrated lifecycle status")
     wt, state = load_state(repo, task)
-    validate_integration(state)
+    integration = validate_integration(state)
     require_no_rebase(wt)
     prior_commits = validate_prior_task_commits(wt, state)
     if outcome is None:
@@ -831,25 +981,24 @@ def commit_task(repo: Path, task: str, expected_status: str, outcome: str | None
             raise TaskError("outcome is required because the existing commit has no final task subject")
         outcome = match.group(2)
     outcome = single_line(outcome, "outcome")
-    actual_status = task_config(wt, task)["status"]
-    if actual_status != expected_status:
-        raise TaskError(
-            f"control status mismatch at {control_path(wt, task)}: "
-            f"expected {expected_status}, found {actual_status}"
-        )
+    snapshot = capture_metadata_snapshot(integration, state, expected_status)
 
     git(wt, "add", "-A")
     paths = changed_paths(wt, state["base"])
-    validate_task_file_changes(wt, state, paths, actual_status, require_owner=True)
-    if not paths:
-        raise TaskError("task has no changes relative to its recorded base")
-
+    metadata_paths = [
+        path for path in paths if path == METADATA_NAME or path.startswith(METADATA_NAME + "/")
+    ]
+    if metadata_paths:
+        raise TaskError("task commit must not contain shared metadata: " + ", ".join(metadata_paths))
     git(wt, "reset", "--soft", state["base"])
     git(wt, "add", "-A")
     subject = f"spec-run-task({task}): {outcome}"
-    git(wt, "commit", "-m", subject)
+    git(wt, "commit", "--allow-empty", "-m", subject)
     require_clean(wt, "task worktree")
-    state["final_commit"] = head(wt)
+    commit = head(wt)
+    snapshot["commit"] = commit
+    state["final_commit"] = commit
+    state["metadata_snapshot"] = snapshot
     save_state(wt, state)
     return check_task(repo, task, expected_status)
 
@@ -857,7 +1006,7 @@ def commit_task(repo: Path, task: str, expected_status: str, outcome: str | None
 def check_task(repo: Path, task: str, expected_status: str | None) -> dict[str, Any]:
     task = validate_target(task, branch_safe=True)
     wt, state = load_state(repo, task)
-    validate_integration(state)
+    integration = validate_integration(state)
     require_no_rebase(wt)
     require_clean(wt, "task worktree")
     commits = validate_prior_task_commits(wt, state)
@@ -868,14 +1017,21 @@ def check_task(repo: Path, task: str, expected_status: str | None) -> dict[str, 
     match = FINAL_SUBJECT_RE.fullmatch(subject)
     if not match or match.group(1) != task:
         raise TaskError(f"task commit subject is invalid: {subject}")
-    status = task_config(wt, task)["status"]
-    if expected_status and status != expected_status.lower():
+    validate_metadata_snapshot(integration, state, commit, require_verified=False)
+    snapshot = state["metadata_snapshot"]
+    status = snapshot["owner_status"]
+    requested_status = snapshot["requested_status"]
+    if expected_status and requested_status != expected_status.lower():
         raise TaskError(
-            f"control status mismatch at {control_path(wt, task)}: "
-            f"expected {expected_status.lower()}, found {status}"
+            f"metadata snapshot status mismatch for {commit}: "
+            f"expected {expected_status.lower()}, found {requested_status}"
         )
     paths = changed_paths(wt, state["base"], "HEAD")
-    validate_task_file_changes(wt, state, paths, status, require_owner=True)
+    metadata_paths = [
+        path for path in paths if path == METADATA_NAME or path.startswith(METADATA_NAME + "/")
+    ]
+    if metadata_paths:
+        raise TaskError("task commit contains shared metadata: " + ", ".join(metadata_paths))
     return {
         "task_id": canonical_task(task),
         "task_path": task,
@@ -885,10 +1041,17 @@ def check_task(repo: Path, task: str, expected_status: str | None) -> dict[str, 
         "commit": commit,
         "subject": subject,
         "status": status,
-        "control_path": str(control_path(wt, task)),
-        "annotation_path": str(annotation_path(wt, task)),
+        "control_path": str(control_path(integration, task)),
+        "annotation_path": str(annotation_path(integration, task)),
         "changed_paths": paths,
     }
+
+
+def rebind_metadata_snapshot(state: dict[str, Any], commit: str) -> None:
+    snapshot = state.get("metadata_snapshot")
+    if not isinstance(snapshot, dict):
+        raise TaskError("task commit has no metadata snapshot to rebind after rebase")
+    snapshot["commit"] = commit
 
 
 def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
@@ -909,6 +1072,7 @@ def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
         git(wt, "reset", "--hard", onto)
         state["base"] = onto
         state.pop("final_commit", None)
+        state.pop("metadata_snapshot", None)
         save_state(wt, state)
         return {"task_path": task, "base": onto, "commit": None, "no_task_commit": True}
     subject = commit_subject(wt, commits[0])
@@ -925,6 +1089,7 @@ def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
     process = git(
         wt,
         "rebase",
+        "--keep-empty",
         "--onto",
         onto,
         state["base"],
@@ -940,6 +1105,7 @@ def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
     state["base"] = onto
     state.pop("pending_rebase_onto", None)
     state["final_commit"] = head(wt)
+    rebind_metadata_snapshot(state, state["final_commit"])
     save_state(wt, state)
     return check_task(repo, task, None) | {"rebased": True}
 
@@ -961,6 +1127,7 @@ def continue_rebase(repo: Path, task: str) -> dict[str, Any]:
     state["base"] = onto
     state.pop("pending_rebase_onto", None)
     state["final_commit"] = head(wt)
+    rebind_metadata_snapshot(state, state["final_commit"])
     save_state(wt, state)
     return check_task(repo, task, None) | {"rebased": True}
 
@@ -992,27 +1159,9 @@ def commit_changed_paths(repo: Path, commit: str) -> list[str]:
     assert isinstance(raw, bytes)
     return [item.decode(errors="surrogateescape") for item in raw.split(b"\0") if item]
 
-def blob_at_commit(repo: Path, commit: str, path: str) -> str | None:
-    process = git(repo, "show", f"{commit}:{path}", check=False)
-    if process.returncode != 0:
-        return None
-    return process.stdout
-
-
-def control_config_in_commit(repo: Path, commit: str, task: str) -> dict[str, Any]:
-    path = f"docs/changes/{task}/task.yml"
-    text = blob_at_commit(repo, commit, path)
-    if text is None:
-        raise TaskError(f"task commit lacks canonical control: {commit} {path}")
-    try:
-        return task_ctl_parse_config(text)
-    except TaskCtlError as exc:
-        raise TaskError(f"invalid historical task control at {commit} {path}: {exc}") from exc
-
-
 def validate_verified_train(
     repo: Path,
-    state: dict[str, Any],
+    final_state: dict[str, Any],
     commits: list[str],
 ) -> list[dict[str, Any]]:
     seen_tasks: set[str] = set()
@@ -1029,62 +1178,32 @@ def validate_verified_train(
             raise TaskError(f"feature train contains multiple commits for task: {commit_task_path}")
         seen_tasks.add(commit_task_path)
         paths = commit_changed_paths(repo, commit)
-        own_control = f"docs/changes/{commit_task_path}/task.yml"
-        own_evidence = f"docs/changes/{commit_task_path}/task.md"
-        if own_control not in paths:
-            raise TaskError(f"verified task commit lacks its lifecycle transition: {commit} {own_control}")
-        if own_evidence not in paths:
-            raise TaskError(f"verified task commit lacks its implementation evidence: {commit} {own_evidence}")
-        finalized: list[str] = []
-        evidence_tasks: set[str] = set()
-        for path in paths:
-            filename = Path(path).name
-            if filename not in {"task.md", "task.yml"}:
-                continue
-            annotated = task_from_path(path, filename)
-            if annotated is None:
-                raise TaskError(f"feature train changes misplaced {filename}: {path}")
-            if annotated != commit_task_path:
-                if not task_is_ancestor(annotated, commit_task_path) or not task_is_ancestor(
-                    state["run_target"], annotated
-                ):
-                    raise TaskError(f"task commit changes an unowned task file: {commit} {path}")
-            if blob_at_commit(repo, commit, f"docs/changes/{annotated}/spec.md") is None:
-                raise TaskError(f"feature train task file lacks sibling spec.md: {path}")
-            if filename == "task.md":
-                evidence = blob_at_commit(repo, commit, path) or ""
-                outcomes = [
-                    match.group(1).strip().lower()
-                    for line in evidence.splitlines()
-                    if (match := OUTCOME_RE.match(line))
-                ]
-                if outcomes != ["verified"]:
-                    raise TaskError(f"task evidence does not record successful verification: {commit} {path}")
-                evidence_tasks.add(annotated)
-            else:
-                config = control_config_in_commit(repo, commit, annotated)
-                expected_type = "impl" if annotated == commit_task_path else "hld"
-                if config["type"] != expected_type:
-                    raise TaskError(
-                        f"task control has wrong type before integration: {commit} {path} "
-                        f"is {config['type']}, expected {expected_type}"
-                    )
-                if config["status"] != "verified":
-                    raise TaskError(
-                        f"task control is not verified before integration: {commit} {path} "
-                        f"is {config['status']}"
-                    )
-                finalized.append(annotated)
-        missing_evidence = set(finalized) - evidence_tasks
-        if missing_evidence:
+        metadata_paths = [
+            path for path in paths if path == METADATA_NAME or path.startswith(METADATA_NAME + "/")
+        ]
+        if metadata_paths:
             raise TaskError(
-                "verified controls lack evidence in the same task commit: "
-                + ", ".join(sorted(missing_evidence))
+                f"feature train commit contains shared metadata: {commit} {', '.join(metadata_paths)}"
             )
+        task_worktree, commit_state = load_state(repo, commit_task_path)
+        if commit_state.get("run_target") != final_state.get("run_target"):
+            raise TaskError(
+                f"feature train mixes run targets: {commit_task_path} belongs to "
+                f"{commit_state.get('run_target')}, expected {final_state.get('run_target')}"
+            )
+        if head(task_worktree) != commit or commit_state.get("final_commit") != commit:
+            raise TaskError(f"feature train commit is not the current bound task commit: {commit}")
+        finalized = validate_metadata_snapshot(
+            repo,
+            commit_state,
+            commit,
+            require_verified=True,
+        )
         details.append(
             {
                 "task_path": commit_task_path,
                 "original_commit": commit,
+                "commit": commit,
                 "subject": subject,
                 "finalized_tasks": finalized,
             }
@@ -1092,36 +1211,22 @@ def validate_verified_train(
     return details
 
 
-def finalize_train(worktree: Path, base: str, details: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    original_head = head(worktree)
-    rewritten: list[dict[str, Any]] = []
+def mark_tasks_done(repo: Path, tasks: Iterable[str]) -> None:
+    unique = list(dict.fromkeys(tasks))
+    originals = {
+        task: control_path(repo, task).read_text(encoding="utf-8")
+        for task in unique
+    }
+    changed: list[str] = []
     try:
-        git(worktree, "reset", "--hard", base)
-        for detail in details:
-            original_commit = detail["original_commit"]
-            git(worktree, "cherry-pick", "--no-commit", original_commit)
-            for annotated in detail["finalized_tasks"]:
-                task_ctl_set_task(worktree, canonical_task(annotated), {"status": "done"})
-            git(worktree, "add", "-A")
-            git(worktree, "commit", "-C", original_commit)
-            require_clean(worktree, "finalized task worktree")
-            final_commit = head(worktree)
-            for annotated in detail["finalized_tasks"]:
-                if control_config_in_commit(worktree, final_commit, annotated)["status"] != "done":
-                    raise TaskError(f"failed to finalize task control in commit: {final_commit} {annotated}")
-            rewritten.append(
-                {
-                    "task_path": detail["task_path"],
-                    "original_commit": original_commit,
-                    "commit": final_commit,
-                    "subject": detail["subject"],
-                    "finalized_tasks": detail["finalized_tasks"],
-                }
-            )
-        return rewritten
+        for task in unique:
+            if task_config(repo, task)["status"] == "done":
+                continue
+            task_ctl_set_task(repo, canonical_task(task), {"status": "done"})
+            changed.append(task)
     except Exception:
-        git(worktree, "cherry-pick", "--abort", check=False)
-        git(worktree, "reset", "--hard", original_head)
+        for task in reversed(changed):
+            control_path(repo, task).write_text(originals[task], encoding="utf-8")
         raise
 
 
@@ -1147,26 +1252,25 @@ def integrate_task(repo: Path, task: str) -> dict[str, Any]:
     if not commits:
         raise TaskError("feature branch has no commits to integrate")
     details = validate_verified_train(integration, state, commits)
-    rewritten = finalize_train(wt, integration_head, details)
-    try:
-        if head(integration) != integration_head:
-            raise TaskError("integration branch advanced while finalizing; verified train was restored")
-        git(integration, "merge", "--ff-only", state["feature_branch"])
-    except Exception:
-        git(wt, "reset", "--hard", feature_head)
-        state["final_commit"] = feature_head
-        save_state(wt, state)
-        raise
+    if head(integration) != integration_head:
+        raise TaskError("integration branch advanced while validating the verified train")
+    git(integration, "merge", "--ff-only", feature_head)
     require_clean(integration, "integration checkout")
-    state["base"] = rewritten[-2]["commit"] if len(rewritten) > 1 else integration_head
-    state["final_commit"] = head(wt)
+    finalized = [
+        annotated
+        for detail in details
+        for annotated in detail["finalized_tasks"]
+    ]
+    mark_tasks_done(integration, finalized)
+    state["base"] = commits[-2] if len(commits) > 1 else integration_head
+    state["final_commit"] = feature_head
     save_state(wt, state)
     return {
         "integration_branch": state["integration_branch"],
         "previous_head": integration_head,
         "integration_head": head(integration),
         "feature_branch": state["feature_branch"],
-        "commits": rewritten,
+        "commits": details,
     }
 
 
@@ -1199,7 +1303,7 @@ def parser() -> argparse.ArgumentParser:
     checkpoint = commands.add_parser("checkpoint", help="Preserve dirty reusable task state")
     checkpoint.add_argument("task")
 
-    commit = commands.add_parser("commit", help="Consolidate all task-owned work into one commit")
+    commit = commands.add_parser("commit", help="Consolidate task-owned code into one commit")
     commit.add_argument("task")
     commit.add_argument(
         "--status",
@@ -1208,9 +1312,9 @@ def parser() -> argparse.ArgumentParser:
     )
     commit.add_argument("--outcome")
 
-    check = commands.add_parser("check", help="Validate the single task commit and control")
+    check = commands.add_parser("check", help="Validate the task commit and metadata binding")
     check.add_argument("task")
-    check.add_argument("--status", choices=["new", "critic", "planned", "ready", "verified", "done"])
+    check.add_argument("--status", choices=["new", "critic", "planned", "ready", "verified"])
 
     rebase = commands.add_parser("rebase", help="Replay the single task commit onto a new base")
     rebase.add_argument("task")

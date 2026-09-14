@@ -50,6 +50,8 @@ done <"$UNVERSIONED_PATHS"
 ssh "$SSH_HOST" "mkdir -p $(quote_single "$REMOTE_DIR")"
 
 rsync -a --delete-delay --human-readable --prune-empty-dirs \
+  --exclude='/.cswd' \
+  --exclude='*/.cswd' \
   --include='/_local/' \
   --include='/_local/***' \
   --exclude='/.git' \
