@@ -6,7 +6,7 @@ hide: true
 
 # CSW Run
 
-Run all unfinished **direct child** tasks below `.cswd/tasks/<task-name>`. Read `skill://spec-run-task` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
+Run all unfinished **direct child** tasks below `.cswd/tasks/<task-name>`. Read `skill://csw-run-worker` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
 
 ## Mechanical control plane
 
@@ -20,7 +20,7 @@ Use only the shared helpers and preflight:
 .omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run --pretty
 ```
 
-The script loads `task_ctl` through spec-run-task's public API. `task_ctl` alone discovers, validates, and orders direct canonical `task.yml` controls. The script does not parse task metadata from `spec.md` or `task.md`. It preserves task_ctl's numeric-order/canonical-ID order and never guesses basenames. PyYAML 6.0.3 is the supported runtime dependency used by `task_ctl`.
+The script loads `task_ctl` through csw-run-worker's public API. `task_ctl` alone discovers, validates, and orders direct canonical `task.yml` controls. The script does not parse task metadata from `spec.md` or `task.md`. It preserves task_ctl's numeric-order/canonical-ID order and never guesses basenames. PyYAML 6.0.3 is the supported runtime dependency used by `task_ctl`.
 
 Missing or malformed direct controls are retained as per-task blockers through `task_ctl.scan_tasks`; independent valid tasks continue. `task.md` contains only execution Outcome, Summary, Verification, and Errors evidence.
 
@@ -70,14 +70,14 @@ Only canonical `done` in the shared local task store unlocks an edge. The helper
 4. Give each child exact `repo_root`, `task_id`, `task_path`, worktree/spec/control/evidence paths, feature branch/base, integration branch/head, exclusive scope, known interface contracts, and required verification. The child uses assigned-worktree mode, skips validation, and never integrates/rebases or edits task files directly.
 5. Consume individual owner completions continuously. Retain the owner/job identity and prepared record until settled. Record crashes/dispatch failures as failed, external prerequisites as blocked, and provisional success as ready. An owner may report implementation failure only after the required one-time `spec-run-debug` rescue attempt.
 6. As soon as one leaf is ready, serialize parent takeover for that leaf. Run `control`, rebase its one ready commit onto the current canonical head, and run focused plus repository-required combined verification in that exact worktree. Do not wait for unrelated owners. Route a recoverable failure back to the same owner after marking it running; preserve its worktree and one commit.
-7. After observed success, use spec-run-task `annotate --outcome verified` with exact evidence, `commit --status verified`, and `check --status verified`. Then call `integrate`. Do not write done yourself. The helper validates commit-bound local controls and evidence against the shared task store, rechecks the canonical head, and fast-forwards before advancing lifecycle to done through task_ctl. A rejected integration leaves dependencies locked. No task metadata or completion commit is added to Git history.
+7. After observed success, use csw-run-worker `annotate --outcome verified` with exact evidence, `commit --status verified`, and `check --status verified`. Then call `integrate`. Do not write done yourself. The helper validates commit-bound local controls and evidence against the shared task store, rechecks the canonical head, and fast-forwards before advancing lifecycle to done through task_ctl. A rejected integration leaves dependencies locked. No task metadata or completion commit is added to Git history.
 8. Immediately after successful integration, rerun `queue` on the canonical tree, then prepare and dispatch **all** newly eligible children before processing another completion or waiting. If A integrates while B runs, start every direct child now unlocked by A; B is not a barrier. Rescan after every settled outcome. Stop only at `finished` or a true stall with no eligible, running/queued, or completed owner.
 
 If the integration head advances before integration, refresh through `control`, rebase, rerun affected verification, update evidence, and retry. Never use the head captured at dispatch. Never reprepare active work merely to refresh control state.
 
 ## Child ownership and rescue
 
-The assigned child reads `skill://spec-run-task`, calls `show` first, works only in its exact worktree, reads complete requirements, implements the leaf, and uses:
+The assigned child reads `skill://csw-run-worker`, calls `show` first, works only in its exact worktree, reads complete requirements, implements the leaf, and uses:
 
 ```text
 .omp/csw/bin/csw_run_worker ... annotate '<task_path>' --outcome ready --summary '<summary>'

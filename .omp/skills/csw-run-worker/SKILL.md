@@ -1,10 +1,10 @@
 ---
-name: spec-run-task
+name: csw-run-worker
 description: Implement one .cswd/tasks task or its unfinished implementation descendants in isolated reusable worktrees, using task_ctl-backed lifecycle controls and deterministic Git integration.
 hide: true
 ---
 
-# Spec Run Task
+# CSW Run Worker
 
 Implement the requested specification completely. Each executable implementation task owns one deterministic feature branch, one registered worktree under `.work/`, sibling `spec.md`, `task.yml`, and `task.md` under `.cswd/tasks/`, and exactly one final code commit. A target with implementation descendants is a container: execute those leaves, never the container as implementation.
 
@@ -33,7 +33,7 @@ Exit status `2` is a validation or safety failure. Exit status `3` is a helper-m
 - Lifecycle values are `new`, `critic`, `planned`, `ready`, `verified`, and `done`. `running`, `failed`, and `blocked` are execution outcomes only.
 - Execution can start from `new`, `critic`, or `planned`, or resume from `ready`, once blockers are done. Successful implementation advances to `ready`; observed verification advances to `verified`; only `integrate` may advance it to `done`.
 - Failed and blocked attempts retain evidence and their one task commit without changing the current lifecycle; they are never integrated and never satisfy dependencies.
-- Each attempted leaf retains exactly one non-merge commit with subject `spec-run-task(<full-task-path>): <outcome>`.
+- Each attempted leaf retains exactly one non-merge commit with subject `csw-run-worker(<full-task-path>): <outcome>`.
 - Rebase task commits; never merge task branches. Keep worktrees and feature branches as resumable state.
 - Reuse registered state. Never stash, clean, remove, or recreate an existing task worktree.
 - `.cswd` is local, shared, and unversioned. Every prepared worktree links to the integration checkout's `.cswd`; task status and evidence changes are immediately visible across worktrees. Never stage the link or its contents, copy metadata into code commits, or use it on a remote host.
@@ -86,7 +86,7 @@ For a container wave, provision each ready leaf before dispatch and give one own
 
 A stuck implementation owner must invoke exactly one `spec-run-debug` rescue agent before reporting an implementation failure. Pass exact worktree/spec paths, constraints, current changes, concrete error, observations, and attempted approaches. The debugger is read-only; the owner resumes and applies or rejects its proposed solution with evidence. External prerequisites may be blocked without debugger escalation.
 
-For `csw-run`, reuse the parent's successful preflight record. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow spec-run-task --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
+For `csw-run`, reuse the parent's successful preflight record. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run-worker --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
 
 ## 4. Record evidence and consolidate
 

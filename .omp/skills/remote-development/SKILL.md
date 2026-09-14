@@ -38,7 +38,7 @@ The scripts resolve the selected workspace with Git:
 - Set `REMOTE_DEV_WORKSPACE` to a path inside the intended checkout or worktree when invoking a script from elsewhere.
 - They compare the worktree Git directory with the common Git directory and report `checkout` or `worktree` in `remote-sync` output.
 
-For a `spec-run-task` task, run from its exact `.work/<task-path>` worktree:
+For a `csw-run-worker` task, run from its exact `.work/<task-path>` worktree:
 
 ```bash
 cd .work/<task-path>
@@ -52,7 +52,7 @@ REMOTE_DEV_WORKSPACE=.work/<task-path> \
   .omp/skills/remote-development/scripts/remote-sync rocm task-123
 ```
 
-Never sync a `spec-run-task` task from the primary checkout. Confirm that the `remote-sync` output names the exact assigned worktree before remote execution.
+Never sync a `csw-run-worker` task from the primary checkout. Confirm that the `remote-sync` output names the exact assigned worktree before remote execution.
 
 The worktree's `.cswd` link exposes local task specifications, lifecycle controls, and evidence only. Read specifications and update task status locally through the task helpers. Never run task-control helpers remotely, resolve remote paths through `.cswd`, or require task metadata in a remote build/test command. Pass the needed code paths and command arguments explicitly.
 

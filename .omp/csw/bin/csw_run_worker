@@ -33,8 +33,8 @@ COMPONENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 OUTCOME_RE = re.compile(r"^\s*\*\*Outcome:\*\*\s*(.*?)\s*$", re.IGNORECASE)
 GENERATED_HEADING_RE = re.compile(r"^##\s+(Summary|Verification|Errors)\s*$", re.IGNORECASE)
 SECTION_BOUNDARY_RE = re.compile(r"^#{1,2}\s+")
-FINAL_SUBJECT_RE = re.compile(r"^spec-run-task\(([^)]+)\): (.+)$")
-STATE_FILE = "spec-run-task-state.json"
+FINAL_SUBJECT_RE = re.compile(r"^csw-run-worker\(([^)]+)\): (.+)$")
+STATE_FILE = "csw-run-worker-state.json"
 EXECUTION_OUTCOMES = {"ready", "verified", "failed", "blocked"}
 
 
@@ -273,7 +273,7 @@ def worktree_path(repo: Path, task: str) -> Path:
 
 
 def require_work_ignored(repo: Path) -> None:
-    probe = ".work/.spec-run-task-ignore-probe"
+    probe = ".work/.csw-run-worker-ignore-probe"
     process = git(repo, "check-ignore", "--quiet", "--no-index", "--", probe, check=False)
     if process.returncode != 0:
         raise TaskError(".work/ is not ignored by Git")
@@ -880,8 +880,8 @@ def commit_parents(repo: Path, commit: str) -> list[str]:
 
 
 def recognized_task_subject(subject: str, task: str) -> bool:
-    return subject.startswith(f"spec-run-task({task}): ") or subject.startswith(
-        f"spec-run-task checkpoint({task}): "
+    return subject.startswith(f"csw-run-worker({task}): ") or subject.startswith(
+        f"csw-run-worker checkpoint({task}): "
     )
 
 
@@ -958,7 +958,7 @@ def checkpoint_task(repo: Path, task: str) -> dict[str, Any]:
     if not status_entries(wt):
         return {"task_path": task, "checkpoint": None, "no_change": True}
     git(wt, "add", "-A")
-    git(wt, "commit", "-m", f"spec-run-task checkpoint({task}): preserve reusable work")
+    git(wt, "commit", "-m", f"csw-run-worker checkpoint({task}): preserve reusable work")
     commit = head(wt)
     return {"task_path": task, "checkpoint": commit, "no_change": False}
 
@@ -992,7 +992,7 @@ def commit_task(repo: Path, task: str, expected_status: str, outcome: str | None
         raise TaskError("task commit must not contain shared metadata: " + ", ".join(metadata_paths))
     git(wt, "reset", "--soft", state["base"])
     git(wt, "add", "-A")
-    subject = f"spec-run-task({task}): {outcome}"
+    subject = f"csw-run-worker({task}): {outcome}"
     git(wt, "commit", "--allow-empty", "-m", subject)
     require_clean(wt, "task worktree")
     commit = head(wt)

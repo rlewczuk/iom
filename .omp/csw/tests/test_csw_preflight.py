@@ -165,10 +165,10 @@ class CswPreflightTests(unittest.TestCase):
         self.assertTrue(payload["git"]["detached"])
         self.assertIsNone(payload["git"]["branch"])
 
-    def test_spec_run_task_checks_only_debugger_profile(self):
+    def test_csw_run_worker_checks_only_debugger_profile(self):
         (self.repo / ".omp" / "agents" / "spec-run-all-implementer.md").unlink()
         self.write_omp(self.config(), self.models())
-        result = self.run_helper("spec-run-task")
+        result = self.run_helper("csw-run-worker")
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(set(payload["agents"]), {"spec-run-debug"})

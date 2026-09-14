@@ -3,7 +3,7 @@
 
 Usage:
     .omp/csw/bin/csw_preflight [--repo PATH]
-        [--workflow boss|csw-run|spec-run-task]
+        [--workflow boss|csw-run|csw-run-worker]
         [--omp PROGRAM] [--pretty]
 
 The program resolves PATH to its Git worktree root, records HEAD, branch, and
@@ -84,11 +84,11 @@ SPEC_RUN_ALL_AGENTS = (
     AgentContract("spec-run-all-implementer", "@implementer", BUILDER_TOOLS, ("spec-run-debug",)),
     AgentContract("spec-run-debug", "@slow", (*READ_ONLY_TOOLS, "bash")),
 )
-SPEC_RUN_TASK_AGENTS = (SPEC_RUN_ALL_AGENTS[1],)
+CSW_RUN_WORKER_AGENTS = (SPEC_RUN_ALL_AGENTS[1],)
 WORKFLOWS = {
     "boss": (BOSS_AGENTS, 1),
     "csw-run": (SPEC_RUN_ALL_AGENTS, 2),
-    "spec-run-task": (SPEC_RUN_TASK_AGENTS, 2),
+    "csw-run-worker": (CSW_RUN_WORKER_AGENTS, 2),
 }
 
 
