@@ -31,7 +31,7 @@ IOM is an inference-only C++20 engine for sparse, oversized language models. Com
 ## Workflow
 
 - Build with CMake and test with CTest. There is no separate lint or formatter target; preserve existing style.
-- CPU work may run locally. For accelerator build, test, or execution, follow the `remote-development` skill; do not duplicate its procedure here.
+- CPU work may run locally. For accelerator build, test, or execution, follow the `csw-remote` skill; do not duplicate its procedure here.
 - After each non-trivial change, run the backend conformance suite for all backends
 - Treat applicable change specifications as acceptance criteria.
 

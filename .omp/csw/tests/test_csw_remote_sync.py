@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 
-REMOTE_SYNC = Path(__file__).parents[1].parent / "skills" / "remote-development" / "scripts" / "remote-sync"
+REMOTE_SYNC = Path(__file__).parents[1] / "bin" / "csw-remote-sync"
 
 
 class RemoteSyncTests(unittest.TestCase):
@@ -85,8 +85,8 @@ class RemoteSyncTests(unittest.TestCase):
                     config.write_text(f"local|test-host|{remote_base}|\n", encoding="utf-8")
                     environment = os.environ.copy()
                     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
-                    environment["REMOTE_DEV_CONFIG"] = str(config)
-                    environment["REMOTE_DEV_WORKSPACE"] = str(workspace)
+                    environment["CSW_REMOTE_CONFIG"] = str(config)
+                    environment["CSW_REMOTE_WORKSPACE"] = str(workspace)
                     environment["RSYNC_RSH"] = str(fake_bin / "ssh")
                     result = subprocess.run(
                         [str(REMOTE_SYNC), "local", f"filter-{mode}"],

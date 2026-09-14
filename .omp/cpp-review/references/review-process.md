@@ -25,7 +25,7 @@ The root MUST make the routing and coverage decision. There are no five expensiv
 
 If delegation is unavailable, report the routing and coverage limitation and request explicit permission before any materially costlier fallback. Do not silently run a sequential five-frontier review, replace missing cheap profiles with expensive work, or imply equivalent coverage. In standalone mode, a specialist may complete only its already assigned area and mandatory synthesis; it MUST NOT widen into an unbounded `@slow` whole-repository review or silently substitute missing lanes, and it MUST disclose unavailable lanes and uninspected areas.
 
-Workers never run build, test, sanitizer, profiler, benchmark, or other verification gates. They may propose exact commands, hardware, workloads, and expected observations in packets. The root runs actual verification after candidate collection and records the command and result. Any accelerator build/test/benchmark must follow `remote-development` rules: the selected remote Linux host is the execution environment, local source edits remain in the local workspace, and no local accelerator result is represented as remote evidence.
+Workers never run build, test, sanitizer, profiler, benchmark, or other verification gates. They may propose exact commands, hardware, workloads, and expected observations in packets. The root runs actual verification after candidate collection and records the command and result. Any accelerator build/test/benchmark must follow `csw-remote` rules: the selected remote Linux host is the execution environment, local source edits remain in the local workspace, and no local accelerator result is represented as remote evidence.
 
 ## Invocation modes
 

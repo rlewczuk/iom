@@ -56,7 +56,7 @@ Expected execution:
 1. The `@slow` root records the reviewed state and resolves the optional destination.
 2. Batched `scout @smol` workers build one shared, risk-ranked source/specification map.
 3. Five `boss-reviewer @task` leaves run concurrently, one per specialist area.
-4. The root runs focused verification proposed by the leaves. Accelerator checks use the `remote-development` workflow.
+4. The root runs focused verification proposed by the leaves. Accelerator checks use the `csw-remote` workflow.
 5. `cpp-inference-review-synthesis` rejects weak findings, deduplicates by root cause, freezes ordering and blockers, and emits the final tasks.
 
 A clean result is valid and is reported as `No material findings; no remediation tasks generated.` together with coverage and validation limits.

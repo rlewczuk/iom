@@ -60,7 +60,7 @@ Use these lanes exactly as defined by the shared protocol:
 
 The advisor is tool-free and receives compact packet **content**, never a URI/path it must open. If effective plan-mode tools would broaden an advisor's tools beyond that contract, do not dispatch the advisor; surface the routing limitation and let the root decide whether explicit permission for a materially costlier fallback exists. Model agreement never verifies a fact. If any delegation lane is unavailable, report the exact routing/coverage limitation and request explicit permission before a costlier fallback; never silently run five expensive passes sequentially or replace cheap lanes with expensive ones.
 
-All independent area work is one dispatch batch. Workers may propose focused build/test/sanitizer/profiler/benchmark commands and expected observations in candidate packets, but do not execute them. After packet collection, the root runs actual verification. Accelerator checks follow `remote-development`: run on the selected remote Linux host over SSH, and distinguish remote results from local source inspection.
+All independent area work is one dispatch batch. Workers may propose focused build/test/sanitizer/profiler/benchmark commands and expected observations in candidate packets, but do not execute them. After packet collection, the root runs actual verification. Accelerator checks follow `csw-remote`: run on the selected remote Linux host over SSH, and distinguish remote results from local source inspection.
 
 ## Step 1 — Resolve exactly one review scope
 
@@ -192,7 +192,7 @@ Every specialist also performs the mandatory simplification pass from the shared
 
 ## Step 5 — Verify candidate hypotheses
 
-Area workers consult `.omp/cpp-review/references/tooling.md` and applicable backend checklists to propose decisive verification. They do not execute gates. The root runs focused checks only after all candidate packets are collected, using the actual repository state and the remote-development procedure for accelerators.
+Area workers consult `.omp/cpp-review/references/tooling.md` and applicable backend checklists to propose decisive verification. They do not execute gates. The root runs focused checks only after all candidate packets are collected, using the actual repository state and the `csw-remote` procedure for accelerators.
 
 Possible root-run evidence includes:
 

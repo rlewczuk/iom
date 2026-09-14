@@ -7,7 +7,7 @@ PRIMARY_WORKTREE_ROOT=
 WORKSPACE_KIND=
 
 fail() {
-  printf 'remote-development: %s\n' "$*" >&2
+  printf 'csw-remote: %s\n' "$*" >&2
   exit 1
 }
 
@@ -18,7 +18,7 @@ require_cmd() {
 resolve_workspace() {
   require_cmd git
 
-  local requested="${REMOTE_DEV_WORKSPACE:-$PWD}"
+  local requested="${CSW_REMOTE_WORKSPACE:-$PWD}"
   [[ -d "$requested" ]] || fail "workspace path is not a directory: $requested"
 
   local root git_dir common_git_dir
@@ -40,8 +40,8 @@ resolve_workspace() {
     WORKSPACE_KIND=worktree
   fi
 
-  if [[ -n "${REMOTE_DEV_CONFIG:-}" ]]; then
-    CONFIG_FILE="$REMOTE_DEV_CONFIG"
+  if [[ -n "${CSW_REMOTE_CONFIG:-}" ]]; then
+    CONFIG_FILE="$CSW_REMOTE_CONFIG"
   elif [[ -f "$WORKSPACE_ROOT/.remote-hosts.conf" ]]; then
     CONFIG_FILE="$WORKSPACE_ROOT/.remote-hosts.conf"
   elif [[ "$WORKSPACE_KIND" == worktree &&

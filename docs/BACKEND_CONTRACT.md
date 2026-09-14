@@ -98,7 +98,7 @@ logical results or a later valid transfer.
    they do not skip.
 9. **Run the complete backend gate.** Run the backend smoke and conformance
    tests plus coexistence with the intended option combinations. Accelerator
-   build/test execution follows the repository remote-development procedure.
+   build/test execution follows the repository `csw-remote` procedure.
 
 ### Minimal conformance-driver shape
 
@@ -2029,7 +2029,7 @@ does not earn a fallback pass.
 ##### Evidence boundary and installed capability
 
 The following evidence was collected on 2026-09-14 through the configured
-`cuda` remote-development profile in the unique
+`cuda` `csw-remote` profile in the unique
 `forward-layout-cuda-feasibility` workspace:
 
 - `nvcc --version` reported CUDA compilation tools 13.2,
@@ -2262,13 +2262,13 @@ The following are exact reproducibility and future production commands, run
 from the assigned local worktree through the same unique remote workspace:
 
 ```sh
-.omp/skills/remote-development/scripts/remote-sync cuda forward-layout-cuda-feasibility
-.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility 'nvcc --version && nvidia-smi'
-.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility 'nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader'
-.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility "dpkg-query -W 'cuda-*'"
-.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility 'cmake --build build --target iom_cuda_conformance_tests'
-.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility "ctest --test-dir build --output-on-failure -R '^iom_cuda_conformance_tests$'"
-.omp/skills/remote-development/scripts/remote-exec cuda forward-layout-cuda-feasibility "ncu --set full --target-processes all --kernel-name regex:'.*(linear|qk|pv).*' ./build/test/iom_cuda_conformance_tests --test-case='CUDA TinyLlama BF16 matrix paths cover R=1,15,16,17'"
+.omp/csw/bin/csw-remote-sync cuda forward-layout-cuda-feasibility
+.omp/csw/bin/csw-remote-exec cuda forward-layout-cuda-feasibility 'nvcc --version && nvidia-smi'
+.omp/csw/bin/csw-remote-exec cuda forward-layout-cuda-feasibility 'nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader'
+.omp/csw/bin/csw-remote-exec cuda forward-layout-cuda-feasibility "dpkg-query -W 'cuda-*'"
+.omp/csw/bin/csw-remote-exec cuda forward-layout-cuda-feasibility 'cmake --build build --target iom_cuda_conformance_tests'
+.omp/csw/bin/csw-remote-exec cuda forward-layout-cuda-feasibility "ctest --test-dir build --output-on-failure -R '^iom_cuda_conformance_tests$'"
+.omp/csw/bin/csw-remote-exec cuda forward-layout-cuda-feasibility "ncu --set full --target-processes all --kernel-name regex:'.*(linear|qk|pv).*' ./build/test/iom_cuda_conformance_tests --test-case='CUDA TinyLlama BF16 matrix paths cover R=1,15,16,17'"
 ```
 
 The first four inventory/capability steps were run for this assessment; the
@@ -2316,7 +2316,7 @@ separate:
 The exact inventory command was:
 
 ```text
-.omp/skills/remote-development/scripts/remote-exec rocm \
+.omp/csw/bin/csw-remote-exec rocm \
   forward-layout-rocm-feasibility 'hipcc --version && rocminfo'
 ```
 
