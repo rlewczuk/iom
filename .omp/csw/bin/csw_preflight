@@ -54,7 +54,9 @@ CONFIG_PATHS = (
 READ_ONLY_TOOLS = ("ast_grep", "glob", "grep", "lsp", "read")
 LOOKUP_TOOLS = (*READ_ONLY_TOOLS, "bash", "web_search")
 BUILDER_TOOLS = (*READ_ONLY_TOOLS, "ast_edit", "bash", "edit", "write")
-
+VERIFIER_TOOLS = (*READ_ONLY_TOOLS, "bash", "write", "hub")
+REVIEW_TOOLS = (*READ_ONLY_TOOLS, "bash")
+DISCOVERY_TIMEOUT_SECONDS = 60
 
 @dataclass(frozen=True)
 class AgentContract:
@@ -62,6 +64,8 @@ class AgentContract:
     model: str
     tools: tuple[str, ...]
     spawns: tuple[str, ...] = ()
+    required_fields: tuple[str, ...] = ()
+    fixed_settings: tuple[tuple[str, Any], ...] = ()
 
 
 BOSS_AGENTS = (
@@ -83,6 +87,30 @@ BOSS_AGENTS = (
 SPEC_RUN_ALL_AGENTS = (
     AgentContract("spec-run-all-implementer", "@implementer", BUILDER_TOOLS, ("spec-run-debug",)),
     AgentContract("spec-run-debug", "@slow", (*READ_ONLY_TOOLS, "bash")),
+    AgentContract(
+        "csw-verifier",
+        "@csw-verifier",
+        VERIFIER_TOOLS,
+        (),
+        ("spawns", "advisor", "prewalk"),
+        (("advisor", False), ("prewalk", False)),
+    ),
+    AgentContract(
+        "csw-review",
+        "@csw-review",
+        REVIEW_TOOLS,
+        (),
+        ("spawns", "advisor", "prewalk"),
+        (("advisor", False), ("prewalk", False)),
+    ),
+    AgentContract(
+        "csw-review-2",
+        "@csw-review-2",
+        REVIEW_TOOLS,
+        (),
+        ("spawns", "advisor", "prewalk"),
+        (("advisor", False), ("prewalk", False)),
+    ),
 )
 CSW_RUN_WORKER_AGENTS = (SPEC_RUN_ALL_AGENTS[1],)
 WORKFLOWS = {
@@ -124,7 +152,13 @@ class Preflight:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=DISCOVERY_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired:
+            self.errors.append(
+                f"{label} command timed out after {DISCOVERY_TIMEOUT_SECONDS}s: {' '.join(command)}"
+            )
+            return None
         except OSError as exc:
             self.errors.append(f"{label} command failed: {' '.join(command)}: {exc}")
             return None
@@ -436,6 +470,13 @@ class Preflight:
                 spawns = self._list_field(profile.get("spawns"))
                 if spawns is None or tuple(spawns) != contract.spawns:
                     agent_errors.append(f"profile must spawn exactly {list(contract.spawns)!r}; got {spawns!r}")
+                for field in contract.required_fields:
+                    if field not in profile:
+                        agent_errors.append(f"profile must declare {field}")
+                for setting, expected in contract.fixed_settings:
+                    valid = not self._enabled(profile.get(setting)) if expected is False else profile.get(setting) == expected
+                    if not valid:
+                        agent_errors.append(f"profile {setting} must be {expected!r}")
                 for setting in ("advisor", "prewalk"):
                     if setting in profile and self._enabled(profile[setting]):
                         agent_errors.append(f"profile enables {setting}; fixed dispatch requires it off")
@@ -470,6 +511,14 @@ class Preflight:
                     ]
                     if thinking is not None and thinking != "off":
                         matches = [model for model in matches if thinking in (self._thinking_levels(model) or set())]
+                    identities = sorted({f"{model['provider']}/{model['id']}" for model in matches})
+                    detail["effective_identities"] = identities
+                    if len(identities) == 1:
+                        detail["effective_identity"] = identities[0]
+                    elif len(identities) > 1:
+                        agent_errors.append(
+                            f"resolved model {resolved!r} maps to multiple catalog identities: {identities!r}"
+                        )
                     detail["available"] = bool(matches)
                     detail["available_models"] = [self._model_summary(model) for model in matches]
                     if not matches:
@@ -478,6 +527,18 @@ class Preflight:
             if agent_errors:
                 self.errors.extend(f"agent {contract.name!r}: {error}" for error in agent_errors)
             agents[contract.name] = detail
+        if self.workflow == "csw-run":
+            review_names = ("csw-review", "csw-review-2")
+            first_identity = agents.get(review_names[0], {}).get("effective_identity")
+            second_identity = agents.get(review_names[1], {}).get("effective_identity")
+            if first_identity and first_identity == second_identity:
+                message = (
+                    "reviewers must resolve to distinct effective provider/model identities; "
+                    f"both resolve to {first_identity!r}"
+                )
+                for name in review_names:
+                    agents[name]["errors"].append(message)
+                self.errors.extend(f"agent {name!r}: {message}" for name in review_names)
         return agents
 
     def relevant_roles(self) -> dict[str, str]:

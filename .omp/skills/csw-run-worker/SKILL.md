@@ -8,6 +8,8 @@ hide: true
 
 Implement the requested specification completely. Each executable implementation task owns one deterministic feature branch, one registered worktree under `.work/`, sibling `spec.md`, `task.yml`, and `task.md` under `.cswd/tasks/`, and exactly one final code commit. A target with implementation descendants is a container: execute those leaves, never the container as implementation.
 
+When invoked by `csw-run`, that skill's role boundaries take precedence: the root only orchestrates, its control-mode `csw-verifier` owns discovery/preparation, and one dedicated leaf `csw-verifier` owns rebase, verification, review evidence, and integration. The original implementer still owns code edits and the unchanged ready-result contract. Standalone `csw-run-worker` execution retains the workflow below.
+
 ## Mandatory control plane
 
 Use the shared helper for every repeatable task, evidence, worktree, and Git-history operation:
@@ -64,7 +66,7 @@ For each eligible leaf, copy values from the same inspection result:
   --integration-base '<integration_head>'
 ```
 
-`prepare` rechecks type `impl`, canonical dependencies, branch/head, repository identity, and deterministic worktree ownership. It links the worktree's `.cswd` to the integration checkout's local metadata directory and preserves the current lifecycle. Reuse validates the existing link; conflicting directories or links are blockers, never overwritten. Task metadata must be untracked. Scheduled execution starts from `new`, `critic`, `planned`, or resumable `ready`; verified work awaits parent integration, and completed work is eligible only for the container repair below.
+`prepare` rechecks type `impl`, canonical dependencies, branch/head, repository identity, and deterministic worktree ownership. It links the worktree's `.cswd` to the integration checkout's local metadata directory and preserves the current lifecycle. Reuse validates the existing link; conflicting directories or links are blockers, never overwritten. Task metadata must be untracked. Scheduled execution starts from `new`, `critic`, `planned`, or resumable `ready`; verified work awaits the integration owner (`csw-verifier` under `csw-run`), and completed work is eligible only for the container repair below.
 
 Treat `worktree`, `spec_path`, `control_path`, and `annotation_path` as opaque. On reuse, inspect `status_entries` and `task_commits`, or call:
 
@@ -82,11 +84,11 @@ If coherent dirty state must be preserved, use `checkpoint`; never checkpoint me
 
 Prefix every Read/Edit/Write path with the returned worktree and set every Bash `cwd` to it. Read the complete spec, repository guidance, relevant code/tests, and applicable skills. Implement only that leaf.
 
-For a container wave, provision each ready leaf before dispatch and give one owner its exact repo root, task IDs/paths, worktree paths, branch/base, exclusive scope, canonical dependency contracts, and verification still required. Children skip all validation during the parallel pass. They never edit controls or evidence directly and never mutate Git except through this helper.
+For container execution, provision each ready leaf before dispatch and give one owner its exact repo root, task IDs/paths, worktree paths, branch/base, exclusive scope, canonical dependency contracts, and verification still required. Children skip all validation during the parallel pass. They never edit controls or evidence directly and never mutate Git except through this helper. `csw-run` dispatches newly eligible leaves continuously, never in waves.
 
 A stuck implementation owner must invoke exactly one `spec-run-debug` rescue agent before reporting an implementation failure. Pass exact worktree/spec paths, constraints, current changes, concrete error, observations, and attempted approaches. The debugger is read-only; the owner resumes and applies or rejects its proposed solution with evidence. External prerequisites may be blocked without debugger escalation.
 
-For `csw-run`, reuse the parent's successful preflight record. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run-worker --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
+For `csw-run`, reuse the control peer's successful preflight record forwarded by the root. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run-worker --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
 
 ## 4. Record evidence and consolidate
 
@@ -132,9 +134,9 @@ Refresh the integration head with `inspect` or the orchestration helper, then re
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty rebase '<task_path>' --onto '<commit>'
 ```
 
-On exit `3`, resolve only returned conflicts and call `continue-rebase`; use `abort-rebase` only to abandon that replay. If conflict resolution changes behavior, rerun affected verification and reconsolidate.
+On exit `3`, resolve only returned conflicts and call `continue-rebase`; use `abort-rebase` only to abandon that replay. If conflict resolution changes behavior, rerun affected verification and reconsolidate. Under `csw-run`, the root grants the original implementer an edit-only conflict lease; only the verifier continues replay after those edits stop. The owner reports continuation pending without annotating/committing mid-rebase, then resumes normal ready consolidation after replay under a new grant.
 
-Children stop at lifecycle `ready`. The parent performs focused behavioral verification and repository-required combined verification from the exact task worktree. On failure, return concrete evidence to the same owner, amend its one commit, and rerun. On success, annotate `verified`, commit `--status verified`, and mechanically check:
+Children stop at lifecycle `ready`. The integration owner performs focused behavioral verification and repository-required combined verification from the exact task worktree: the parent for standalone `csw-run-worker`, the dedicated leaf `csw-verifier` for `csw-run`. The latter uses `csw_verify` for bounded gates, commit-bound review authorization, and locked integration; the root runs none of these operations. On failure, return concrete evidence to the same owner, amend its one commit, and rerun. On success, annotate `verified`, commit `--status verified`, and mechanically check:
 
 ```text
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty check '<task_path>' --status verified
@@ -169,7 +171,7 @@ For a leaf or the final branch of a verified train:
 
 The helper rechecks the integration head and fast-forwards the existing code commits before advancing the shared controls to done through `task_ctl.set_task`. It neither rewrites code commits to embed lifecycle changes nor creates a completion commit. A failed fast-forward leaves lifecycle unchanged, so dependencies remain locked. Keep the local helper state and report any metadata finalization failure; do not repair lifecycle by hand.
 
-If the integration branch advanced, refresh/rebase, rerun affected verification, refresh evidence, and retry. After an integrated wave, inspect again and schedule newly eligible work from the canonical tree.
+If the integration branch advanced, refresh/rebase, rerun affected verification, refresh evidence, and retry. After each successful integration, inspect again and schedule newly eligible work from the canonical tree immediately. `csw-run` additionally requires review authorization for the exact final commit; do not bypass its verifier receipt by calling standalone `integrate`.
 
 ## Completion response
 

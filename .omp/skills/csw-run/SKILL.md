@@ -1,144 +1,110 @@
 ---
 name: csw-run
-description: Execute all eligible direct implementation children under .cswd/tasks continuously in dependency-aware parallel worktrees, reviewing each candidate commit before integration.
+description: Continuously orchestrate dependency-ready implementation worktrees, parallel dual reviews, and dedicated @csw-verifier verification and integration agents.
 hide: true
 ---
 
 # CSW Run
 
-Run all unfinished **direct child** tasks below `.cswd/tasks/<task-name>`. Read `skill://csw-run-worker` first. This is an orchestration wrapper around its worktree and Git control plane, not a separate implementation workflow. The target directory need not have its own control or spec. Nested task containers are reported as unsupported direct children and are not expanded.
+Run every unfinished **direct child** implementation task below `.cswd/tasks/<task-name>`. Read `skill://csw-run-worker` for its shared control-plane contracts, not permission for the root to implement or integrate. The target need not have its own control/spec. Report nested containers as unsupported; do not expand them.
 
-## Mechanical control plane
+## Ownership: root orchestrates, children execute
 
-Use only the shared helpers and preflight:
+| Role | Profile/model | Responsibility |
+| --- | --- | --- |
+| Root | Invocation model | Determine scope, supplemental dependencies and interfaces; dispatch/resume agents; grant ownership; process structured outcomes; ask about explicit waivers; report. |
+| Control | `csw-verifier` / `@csw-verifier`, control mode | Preflight once, scan/queue/prepare, atomic invocation-state updates, canonical completion confirmation. No implementation, review, or tests. |
+| Implementation owner | `spec-run-all-implementer` / `@implementer` | Existing assigned-worktree implementation and ready-result contract, including its one-time `spec-run-debug` rescue. |
+| Leaf verifier | One dedicated `csw-verifier` / `@csw-verifier` per implementation owner | All worktree/Git checks, rebase, required verification, review synthesis/evidence, and integration. Retain this peer across retries. Never implement fixes. |
+| Two independent reviewers | `csw-review` / `@csw-review` and `csw-review-2` / `@csw-review-2` | Concurrent read-only exact-commit reviews using `skill://csw-review-commit`. No tests, fixes, or integration. |
+
+The root MUST NOT inspect source/diffs to review, edit implementation or evidence, run preflight/Git/worktree helpers, build, test, verify, rebase, merge, or mark lifecycle done. Reading skill/spec requirements and agent/control JSON to decide what to schedule is orchestration. Delegating a command is not permission to run it locally as a fallback. Review deduplication, severity adjudication, and confirming fixes belong to the leaf verifier, not the root. A failed/unavailable specialist remains a blocker; never substitute the root or a default-model agent.
+
+Use the named project profiles. No isolated/new harness worktrees: use the exact helper-prepared worktree. The control peer uses the supplied integration checkout. Do not alter user model configuration.
+
+## Deterministic control plane
+
+The **control peer**, never the root, runs:
 
 ```text
-.omp/csw/bin/csw_run --repo <repo> --pretty scan <task-name>
-.omp/csw/bin/csw_run --repo <repo> --pretty queue <task-name> [--state <temporary-json-path>]
-.omp/csw/bin/csw_run --repo <repo> --pretty prepare <task-name> [--state <temporary-json-path>]
-.omp/csw/bin/csw_run --repo <repo> --pretty control
+.omp/csw/bin/csw_run --repo <repo> --pretty session
+.omp/csw/bin/csw_run --repo <repo> --pretty scan <target>
+.omp/csw/bin/csw_run --repo <repo> --pretty queue <target> --state <state_path>
 .omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run --pretty
+.omp/csw/bin/csw_run --repo <repo> --pretty prepare <target> --state <state_path>
+.omp/csw/bin/csw_run --repo <repo> --pretty outcome <target> --state <state_path> --name <child> --status <status> --reason <reason>
+.omp/csw/bin/csw_run --repo <repo> --pretty control
+.omp/csw/bin/csw_run --repo <repo> --pretty depend <target> --state <state_path> --name <child> --on <canonical-prerequisite>
 ```
 
-The script loads `task_ctl` through csw-run-worker's public API. `task_ctl` alone discovers, validates, and orders direct canonical `task.yml` controls. The script does not parse task metadata from `spec.md` or `task.md`. It preserves task_ctl's numeric-order/canonical-ID order and never guesses basenames. PyYAML 6.0.3 is the supported runtime dependency used by `task_ctl`.
+`task_ctl` alone discovers, validates, and orders canonical `task.yml` controls. Preserve returned numeric-order/canonical-ID ordering; never parse metadata from Markdown or guess basenames. PyYAML 6.0.3 is the supported dependency. Invalid/missing direct controls, missing specs, and unsupported nested containers are per-task blockers; valid independent siblings continue.
 
-Missing or malformed direct controls are retained as per-task blockers through `task_ctl.scan_tasks`; independent valid tasks continue. `task.md` contains only execution Outcome, Summary, Verification, and Errors evidence.
-
-Run `csw_preflight` exactly once per invocation before the first `prepare`. Preserve its JSON verbatim. Exit `2` or `ok: false` is a concrete blocked result; never repeat or bypass its Git, OMP, profile, model, tool, spawn, or recursion validation.
-
-`scan` returns immediate task children in task_ctl order. Valid records contain `name`, canonical `task_id`, relative `task_path`, exact spec/control/evidence paths, type, lifecycle status, order/priority, and canonical blocker records. Invalid controls retain the exact task identity and a concrete error instead of stopping sibling discovery. A missing spec is a blocker. A direct HLD/nested container is unsupported for this command.
-
-`queue` returns:
-
-- `ready`: every dependency-satisfied direct implementation child in `new`, `critic`, `planned`, or resumable `ready` state, with no skill concurrency cap;
-- `waiting`: lifecycle/dependency waits and retained running/ready owner outcomes;
-- `blocked`: invalid task inputs, unsupported containers, and failed/blocked execution outcomes;
-- `already_done`: direct tasks whose canonical integrated lifecycle is done;
-- `finished`: true only when all discovered direct tasks are done, including an empty target.
-
-`prepare` provisions or reuses all currently ready worktrees and preserves independent preparation failures. Each worktree's `.cswd` is a symbolic link to the integration checkout's shared local metadata directory. Specifications, controls, and evidence remain unversioned; updates are immediately visible to every owner. Never stage or remotely synchronize `.cswd`. `control` refreshes the validated integration branch/head without target discovery or preparation.
-
-## Local invocation state
-
-Create one parent-owned temporary JSON file outside the checkout, initialized to `{}`:
+`session` creates `{}` in an outside-checkout temporary JSON file. Control is its **sole writer**. Preserve the existing state format:
 
 ```json
 {
-  "dependencies": {
-    "child-name": [".cswd/tasks/target/other-child"]
-  },
-  "outcomes": {
-    "child-name": {
-      "status": "running|blocked|failed|ready",
-      "reason": "nonempty explanation"
-    }
-  }
+  "dependencies": {"child-name": [".cswd/tasks/target/prerequisite"]},
+  "outcomes": {"child-name": {"status": "running", "reason": "owner identity and current phase"}}
 }
 ```
 
-`dependencies` contains only supplemental semantic prerequisites and every value is an exact canonical `.cswd/tasks/...` ID. They augment, never erase, the canonical `blocked-by` records returned by task_ctl. Preserve actual prerequisites; missing canonical dependencies wait. Numeric order and priority are scheduling order, not dependencies.
+Supplemental semantic dependencies only augment canonical `blocked-by`; order/priority are not dependencies. Never erase real prerequisites. Missing dependencies wait. Outcomes are `running`, `ready`, `failed`, or `blocked`, not lifecycle statuses. Mark successful preparations running **before dispatch**, ready only on the owner's provisional commit; keep ready throughout verification/review. Return to running only when the owner receives a repair lease. Retain failed/blocked records to suppress accidental redispatch. Canonical integrated `done` overrides stale local outcomes.
 
-`outcomes` prevents duplicate dispatch/retry within this invocation. Record prepared leaves as running before dispatch. Change to ready only after the owner ends with a provisional commit; use failed for a concrete implementation/runtime failure and blocked for an external prerequisite. Running/ready suppress redispatch but never satisfy dependencies. Canonical integrated done overrides a stale local outcome.
+`queue` returns `ready`, `waiting`, `blocked`, `already_done`, and `finished`. Only canonical `done` unlocks dependencies: a ready/verified commit, reviewer approval, or agent success never does. `finished` requires every direct child done (including the empty selection). `prepare` provisions/reuses all currently ready leaves and preserves independent preparation failures. `.cswd` is a shared local symlink, never staged or remotely synchronized. Never recreate active worktrees merely to refresh the head.
 
-Only canonical `done` in the shared local task store unlocks an edge. The helper writes it only after successful integration. Ready, verified, a private branch, child report, or existing commit does not unlock an edge. Failed/blocked/running are local execution outcomes, never lifecycle statuses.
+Run preflight **exactly once per invocation**, before the first preparation or implementation dispatch. Preserve its JSON verbatim. It validates implementer/rescue, verifier, **both** review profiles, alias chains, model availability, tools/spawns, overrides, disabled profiles, and recursion. Both review aliases must resolve to different provider/model identities; different thinking settings on the same model do not qualify. Missing/misrouted aliases are blockers, not an optional no-review path. Do not rediscover reviewer routing, rerun failed preflight, or weaken it. The control agent itself uses the fixed verifier alias; if it cannot be dispatched, report that routing failure without starting implementation.
 
-## Continuous orchestration
+## Continuous event loop — never waves
 
-1. Run `scan`, create the outside-checkout state, and run `queue`. Do not parse, rewrite, or sort controls. Do not prepare an empty selection.
-2. Before any preparation or child dispatch, run the shared preflight exactly once. Stop on failure. Discover the optional commit-review aliases as described below; they are not required implementer/rescue preflight dependencies.
-3. Run `prepare`. Record preparation failures as blocked. Mark every successful prepared leaf running, then dispatch one task per record in returned order with `agent: "spec-run-all-implementer"`. Submit every eligible leaf, including a single leaf, without a skill-level cap. Harness admission limits may queue work; queued owners stay running and are never redispatched.
-4. Give each child exact `repo_root`, `task_id`, `task_path`, worktree/spec/control/evidence paths, feature branch/base, integration branch/head, exclusive scope, known interface contracts, and required verification. The child uses assigned-worktree mode, skips validation, and never integrates/rebases or edits task files directly.
-5. Consume individual owner completions continuously. Retain the owner/job identity and prepared record through review, any remediation rounds, and integration. Record crashes/dispatch failures as failed, external prerequisites as blocked, and provisional success as ready. An owner may report implementation failure only after the required one-time `spec-run-debug` rescue attempt.
-6. As soon as one leaf is ready, serialize parent takeover for that leaf. Run `control`, rebase its one ready commit onto the current canonical head, and run focused plus repository-required combined verification in that exact worktree. Do not wait for unrelated owners. Route a recoverable failure back to the same owner after marking it running; preserve its worktree and one commit.
-7. After observed verification success, use csw-run-worker `annotate --outcome verified` with exact evidence, `commit --status verified`, and `check --status verified`. Capture the helper-returned full commit ID, then perform the **Commit review gate** below in that exact worktree. Do not integrate while a review is pending, critical/high findings remain open, or an all-reviewer availability failure lacks developer consent. Remediation returns to step 6 with the same owner and worktree.
-8. Only after the review gate permits this exact commit, call `integrate`. Do not write done yourself. The helper validates commit-bound local controls and evidence against the shared task store, rechecks the canonical head, and fast-forwards before advancing lifecycle to done through task_ctl. A rejected integration leaves dependencies locked. No task metadata or completion commit is added to Git history.
-9. Immediately after successful integration, rerun `queue` on the canonical tree, then prepare and dispatch **all** newly eligible children before processing another completion or waiting. If A integrates while B runs, start every direct child now unlocked by A; B is not a barrier. Rescan after every settled outcome. Stop only at `finished` or a true stall with no eligible, running/queued, or completed owner/reviewer.
+Create a root-owned orchestration ledger with the invocation ID, control peer/state path, each prepared record, original owner/job ID, leaf verifier/job ID, monotonically increasing attempt number, candidate commit, active review pair, phase, grant holder, timer IDs, and artifact references. This is scheduling state, not a second task lifecycle. Preserve original implementer results without rewriting them. Use exact peer IDs returned by tools, never invented names.
 
-If the integration head advances before integration, refresh through `control`, rebase, rerun affected verification, update evidence, and repeat the review gate for the resulting commit before retrying. Never use the head captured at dispatch or reuse approval for an earlier commit ID. Never reprepare active work merely to refresh control state.
+1. Dispatch one control-mode verifier. It creates state, scans/queues, performs preflight once, and returns the records. Root resolves only genuinely necessary supplemental semantic dependencies from specs/contracts; control applies them. Do not prepare an empty selection.
+2. Ask control to prepare **all** currently eligible leaves in helper order, record failures blocked, and mark each prepared leaf running. Dispatch one `spec-run-all-implementer` for each returned record, including a single leaf. Preserve current dispatch and result collection: same profile, exact paths/contracts, no validation, one ready commit, rescue before implementation failure. No skill concurrency cap or dependency waves; submit all ready work to harness admission, chunking only if its per-call limit requires it. Queued jobs retain ownership and are never redispatched.
+3. Consume **individual** owner completions immediately. Keep owner identity/worktree through all remediation. Crashes/dispatch/implementation failures are failed; external prerequisites are blocked; provisional commits are ready. Immediately create that owner's dedicated leaf verifier and pass the untouched result and prepared record. Do not wait for unrelated owners.
+4. The verifier stabilizes/rebases and verifies first. On failure it returns repair/blocked evidence; do not spend a review pair on a known failing candidate. On successful helper-bound verification it returns `review_required` with exact full commit/worktree, gate receipt and prior findings context.
+5. Root dispatches **both reviewers concurrently in one task batch** for that candidate. Freeze mutations only to this leaf until **both** review attempts settle. Other owners, review pairs and verifiers continue. Forward each result/artifact to the verifier without interpreting source or findings; give it both outcomes before it decides the gate. Never cancel the second reviewer because the first succeeded.
+6. The verifier synthesizes findings, appends evidence through `csw_verify`, and returns `repair`, `blocked`, `waiver_required`, or continues to integration. Root routes decisions; it does not redo review. Critical/high findings go to the original owner with the complete all-severity ledger and original reports. After owner repair, resume the same verifier with the new ready result. Keep worktree and one commit; never reprepare or replace the owner just for a retry.
+7. The verifier integrates only with exact tested-and-reviewed authorization. All verifiers may run gates simultaneously. Serialize **only** short control/Git transactions through the helper's bounded repository lock, never tests, review, model work or IPC. Busy locks are retryable within the attempt deadline. A moved canonical head is stale verification, not an implementation defect: verifier refreshes/rebases and reruns affected gates; do not wake the owner unless a conflict or real failure requires edits. Approval for an old commit never authorizes a new one.
+8. On successful integration, the verifier immediately notifies control **and** root. Control confirms canonical done with `queue`, prepares/claims all newly ready leaves, and returns them for immediate root dispatch **before** processing another unrelated completion or waiting. If A unlocks C while B runs, C starts now. Every settled failure/blocker also triggers a queue refresh so independent work is not stranded.
+   While that control request is in flight, dispatch independently ready reviewer/verifier actions rather than waiting for the refill response. Prioritize newly prepared children as soon as the response arrives; control preparation is not a global scheduling barrier.
+9. Wait only when no ready action is pending. A pending owner, reviewer, verifier, controller request, repair handoff, queued job, or undelivered completion is not a stall. Stop only on `finished`, or a concrete no-runnable-work stall with all remaining dependencies/errors reported. `finished: false` is never complete.
 
-## Commit review gate
+### Handoffs and direct IRC
 
-### Optional reviewer routing
+Use OMP IRC to avoid copying logs/reports through root context. Root gives each peer the actual controller, original-owner, leaf-verifier and root IDs. Messages carry **invocation ID, canonical task ID, attempt, full candidate commit (or explicitly unavailable), worktree, event, and artifact reference**. Verifiers may send detailed repair packets directly to the original owner; reviewers may send reports directly to the verifier when their tools permit, but must still return their normal complete report. Root receives a compact notification and retains the authoritative completion/artifact. No source/log blobs in root messages.
 
-After successful preflight, run `omp config list --json` from `repo_root` once and preserve the result as separate review-routing evidence. Read the effective `modelRoles` value; aliases may have keys with or without a leading `@`. The preflight JSON contains only implementer/rescue-relevant roles and models, so absence there does not establish that a reviewer alias is missing. Configuration discovery failure is a concrete blocker, not proof that no reviewers are configured.
+Only root grants/resumes a worktree writer. A repair packet is **not** an edit grant. Before `implementer → verifier → frozen review → implementer` ownership transfer, settle/cancel and acknowledge the prior active lease and all review jobs. Reject stale attempt/commit messages, ignore duplicate events, and never accept an IRC claim alone as canonical done or review approval. Only control writes invocation state; only the owning verifier writes review evidence; only the original implementer edits code. If a peer is gone, retain artifacts and block that leaf rather than silently losing findings.
 
-Dispatch exactly one read-only subagent per configured alias on **every review round**:
+On a helper-managed rebase conflict, the verifier supplies the exact conflicts and grants no edits itself. Root temporarily returns the leaf to its original owner for **only the named conflict-file edits**. The owner still uses its normal result shape, reporting continuation pending in `OPEN`; it must not invoke Git, annotate, or commit while replay is stopped. After the owner relinquishes the files, the verifier calls helper `continue-rebase`. Repeat only for further named conflicts. Once replay finishes, return normal ready annotation/one-commit consolidation to the original owner, then verify afresh. No simultaneous editing and rebase continuation; root never resolves a conflict.
 
-| Configured alias | Agent profile | Required model |
-| --- | --- | --- |
-| `@csw-review` | `csw-review` | `@csw-review` |
-| `@csw-review-2` | `csw-review-2` | `@csw-review-2` |
+### Real deadlines, not invented task parameters
 
-Use these `.omp/agents` profiles, not the default task/scout model or the root model. Honor alias chains, but never substitute another alias/model on failure. Inspect effective `task.agentModelOverrides` and disabled-agent settings from the same configuration: an override resolving to a different model or a disabled/missing profile is a routing blocker for that reviewer, not permission to silently change models. Do not edit user configuration. Keep optional reviewer failures separate from the mandatory preflight; do not rerun or weaken that preflight.
+A verification attempt has a **7200-second command budget**; root gives the active verifier phase **7800 seconds wall time**, including model/tool overhead. Control requests get 600 seconds (preflight discovery commands have their own bound); review attempts get 1800 seconds each. Do not charge a parked verifier for time spent awaiting owner repairs, developer consent, or its reviewers. Each resumed active phase gets a new attempt/deadline; preserve retry evidence. After three consecutive no-progress failures/timeouts, block with evidence instead of an infinite resume loop. New code, a completed gate, or a canonical head advance is progress; unchanged repeated errors are not.
 
-If neither alias is configured, record `review not configured` and continue after the existing verification gate; absent aliases are not failed reviewer attempts. If just one is configured, dispatch it. If both are configured, dispatch both concurrently in one task batch, even if they resolve to the same model, and collect both outcomes before deciding. Do not cancel a pending reviewer merely because the other succeeded.
+The task tool has no documented per-agent timeout field: **do not invent one**. Root starts a cancellable finite asynchronous `sleep <seconds>` job for each active phase (`bash`, `async: true`, `timeout: 0`), records its job ID next to the agent job, and cancels it when that phase settles. These clock-only commands are the sole root shell exception. Timer completion is an orchestration event: cancel the corresponding overdue agent, notify control, retain its artifacts, and require child/process cleanup acknowledgement before transferring the worktree. Ignore stale timers for settled attempts. If timer dispatch fails, stop dispatching unsupervised verifier work and report the concrete error.
 
-### Review brief and result
+The verifier also uses `csw_verify`'s real command deadlines: test command 900 seconds, build 1800 seconds, total attempt 7200 seconds; smaller project limits take precedence. CTest gets `--timeout 300` per test (or a justified finite project value). Remote commands need a **remote-side** `timeout --kill-after=30s ...` as well as the local bound; killing SSH alone does not kill remote tests. Bound GPU `flock` acquisition and execution separately. Follow `skill://csw-remote`, use unique mirrors for concurrent leaves, preserve SYCL setup, and enforce TTNN timeouts. No infinite waits, unbounded retries, detached tests, or lock held over remote execution.
 
-The root passes each reviewer the exact full candidate commit ID, absolute prepared worktree path, canonical task ID, and exact specification path, with this explicit instruction:
+## Review policy and retries
 
-> Read `skill://csw-review-commit` and follow it to review commit `<full-commit-id>` in worktree `<absolute-worktree-path>`. Read the supplied task specification for intent. Return its complete Markdown commit-review summary, including the Issues list with severity, locations, evidence, impact, and remedy for every finding, or an explicit empty list. Identify the reviewed commit and worktree, coverage, and limitations. Stay read-only; do not edit files, task metadata, review.md, or Git state. Skip builds, tests, linters, formatters, and project-wide validation; the parent owns verification. Do not delegate.
+Review the green, helper-returned final commit, not the owner's earlier hash. Both reviewers receive:
 
-Reviewers use the existing owner worktree, not a new isolated worktree. Freeze mutations to that leaf while its reviewers run; unrelated implementers may continue. A successful review means a complete usable `csw-review-commit` report for the exact supplied commit/worktree, including a findings list or explicit no-findings result. Process exit alone, partial output, an incomplete review, or a report for another commit is not success. Retain supported findings from partial reports, but never treat partial coverage as approval.
+> Read `skill://csw-review-commit` and review `<full-commit>` in `<absolute-worktree>`, using `<exact-spec-path>` for intent. Return its complete Markdown report, all findings or explicit no findings, exact commit/worktree, coverage and limitations. Include prior finding IDs and claimed fixes as context; perform a complete independent review. Stay read-only; no task/evidence/Git mutation or delegation. Skip builds, tests, linters and formatters; the dedicated verifier owns verification.
 
-### Findings, remediation, and evidence
+A complete usable report for the supplied commit/worktree is success; agent exit alone, partial coverage, malformed output or another commit is not. Retain supported findings even from partial/failed reviews. Medium/low findings are recorded but nonblocking; unresolved critical/high findings block regardless of peer omissions. Verifier assigns stable task-local IDs, deduplicates by defect, retains provenance/highest supported severity, and confirms fixes with actual evidence, not implementer claims.
 
-The root compiles all returned issue lists and deduplicates by underlying defect and affected behavior/locations, not reviewer-local IDs or wording. Assign stable task-local finding IDs across rounds; preserve each source alias, source finding ID, severity, and commit. For severity disagreements retain the highest supported severity and record the rationale; do not lose a critical/high finding because another reviewer omitted it. Medium/low findings are recorded but do not block integration.
+The verifier appends each round to `review.md` **beside the exact spec**, preserving original reports, attempted aliases/outcomes, all open findings, solved findings with fixing commit/evidence, rejected findings with counterevidence, waivers, limitations and gate decision. Never label waived/unfixed findings solved, drop earlier unresolved findings, overwrite history, stage `.cswd`, or hand-edit lifecycle/evidence. `csw_verify` validates packet/receipt identity and enforces the gate; semantic adjudication remains the verifier's work.
 
-The root alone appends review evidence to `review.md` beside the exact supplied `spec_path` for this leaf, never the container's directory or a guessed basename. Create it if absent; preserve existing content. It is shared, local, unversioned `.cswd` evidence: never stage or remotely synchronize it, and do not change `task.yml` or `task.md` directly. Append a new round containing:
+- At least one complete successful review after both settle: retain reduced coverage/failures and proceed only if no critical/high blockers.
+- Both attempts fail solely due to inaccessible model/quota: verifier returns `waiver_required`; root asks the developer whether to proceed without review for **this exact commit/round**. Explicit consent only; record it through verifier. Silence/refusal/unavailable input blocks. Existing critical/high findings remain blocking.
+- No success for other reasons: blocked, no availability waiver. Missing profiles, same-model routing, wrong commits, malformed/incomplete reports and worktree failures are not quota exceptions.
 
-- Candidate full commit ID, baseline, worktree, attempted aliases, outcomes, and original reviewer summaries (including all reported findings, limitations, and failure evidence).
-- **Open issues:** the deduplicated current list at every severity, with stable IDs, provenance, evidence, impact, and remedies. Include unresolved findings from earlier rounds; omission in a later report does not close them.
-- **Solved issues:** a separate section identifying resolved finding IDs, their original report/commit, the fixing commit, and evidence from parent verification and review confirming the fix. An implementer claim alone does not mark an issue solved. Reopen regressions under the same ID.
-- The gate decision, residual risks, and any explicit developer waiver. Record rejected findings separately with counterevidence; do not label an unfixed or waived finding solved.
+Cache review authorization for the **exact final commit** in verifier state. Lock contention, an unchanged retry, or an infrastructure failure does not automatically launch another expensive pair. Inspect/reuse the script's valid receipt. Any changed commit, rebase, changed verification plan, or invalidated evidence requires the helper to reestablish gates; a different final commit requires a fresh pair **after** those gates pass. Never reuse approval by subject, branch, patch ID, implementer assertion or apparent similarity. Conservatively paying for a new commit's review is preferable to unreviewed integration. There is no global review or merge wave.
 
-Append before returning findings or integrating. Never replace earlier rounds; later round sections describe the current state while preserving history.
+## Implementer brief and evidence
 
-If any critical/high issue remains, send the compiled deduplicated list at **all severities**, with blocking IDs and both original summaries, back to the same implementer subagent that produced the commit and owns the worktree. Mark its local outcome running and resume that owner; do not replace it with a reviewer or let the root edit its implementation. Require it to fix every critical/high issue within the task scope and report dispositions for the list. It must use csw-run-worker `show`, `annotate --outcome ready`, and `commit --status ready` to amend/consolidate its existing one task commit, preserving its subject by omitting `--outcome` on `commit`; no extra fixup commit or direct Git mutation.
-
-On the owner's next ready result, return to orchestration step 6: refresh/rebase, rerun required verification, bind verified evidence, and dispatch every configured reviewer again against the new full commit ID. Give reviewers the prior finding IDs and claimed fixes as additional context, but require a complete commit review, not only a fix check. Repeat until no critical/high findings remain. Unrecoverable owner failures retain the worktree and block integration; never bypass unresolved findings to finish the queue.
-
-### Reviewer failures
-
-- **At least one successful review:** proceed using the compiled findings without asking the developer about failed peer reviewers. Record those failures and reduced coverage. This permits the normal findings/remediation path, not integration with open critical/high issues.
-- **No successful review, and every configured reviewer failed because its model was inaccessible or quota was exceeded:** display a warning naming the commit, aliases, and concrete errors, then ask the developer whether to ignore this review failure and proceed or retain the task as blocked. Only explicit consent permits proceeding without a successful review; silence, refusal, or unavailable interactive input leaves it blocked. Scope consent to this exact commit and round, record it in `review.md`, and retain any already-known critical/high blockers.
-- **No successful review for other reasons:** retain a concrete failed/blocked review outcome and do not integrate. Invalid routing, malformed/incomplete reports, wrong commits, and tool/worktree failures are not quota failures and must not be silently waived by this availability exception.
-
-Warnings/waivers never replace repository-required verification or satisfy dependency edges. Keep a review-blocked leaf in local outcomes with the precise cause and its owner/worktree intact; independent eligible leaves may continue.
-
-## Child ownership and rescue
-
-The assigned child reads `skill://csw-run-worker`, calls `show` first, works only in its exact worktree, reads complete requirements, implements the leaf, and uses:
-
-```text
-.omp/csw/bin/csw_run_worker ... annotate '<task_path>' --outcome ready --summary '<summary>'
-.omp/csw/bin/csw_run_worker ... commit '<task_path>' --status ready --outcome '<behavior>'
-```
-
-It skips builds/tests/linters/formatters during the parallel pass and reports exact parent verification still required. It never directly edits `task.yml` or `task.md`, mutates Git, integrates, rebases, expands nested tasks, or delegates except to one `spec-run-debug` when genuinely stuck.
-
-The debugger receives exact worktree/spec paths, constraints, current changes, error/dead end, observations, and attempted approaches. It is read-only and returns root cause evidence plus a concrete proposal to the same owner. The owner retains all implementation decisions and edits.
+Keep the existing `spec-run-all-implementer` brief/result contract: exact `repo_root`, `task_id`, `task_path`, worktree/spec/control/evidence paths, feature branch/base, integration branch/head, exclusive scope, interfaces, and required verification. It reads `csw-run-worker`, calls `show` first, implements only its leaf, skips all validation, and uses helper `annotate --outcome ready` plus `commit --status ready`. Preserve the subject on amendments by omitting commit `--outcome`. No extra fixup commits, direct task-file edits, Git mutation, nested task expansion, or delegation except one `spec-run-debug` rescue before implementation failure. Report proposed gates as **not run**. Replace only the old statement that the parent verifies: the dedicated leaf verifier now owns that work.
 
 ## Reporting
 
-Report separately: already done; done and integrated with final commit and observed verification; failed with retained local outcome; nondependency blocked; and dependency waiting with exact canonical cause. Include target, integration branch/head, prepared worktrees/commits, review aliases/outcomes, deduplicated open/solved counts by severity, each leaf's `review.md` path, review waivers or unconfigured review, and residual risk. `finished: false` is not completion.
+Root reports from authoritative control/verifier artifacts, not a local audit: target and integration branch/head; already done; done/integrated with final commit and observed checks; failed/blocked with retained worktrees; dependency waits with exact canonical causes. Include prepared paths, owner/verifier identities, both reviewer aliases/outcomes, open/solved counts by severity, each review.md path, explicit waivers, deadlines/timeouts, retained blockers and residual risks. Do not claim a verifier's process exit proves integration; require its helper result **and** control's canonical done confirmation.

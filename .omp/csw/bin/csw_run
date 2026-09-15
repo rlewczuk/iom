@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Scan, queue, and prepare direct csw-run implementation children."""
+"""Scan, queue, prepare, and record direct csw-run implementation children."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import runpy
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -279,6 +281,65 @@ def control(repo: Path) -> dict[str, str]:
     }
 
 
+def session(repo: Path) -> dict[str, str]:
+    fd, name = tempfile.mkstemp(prefix="csw-run-", suffix=".json")
+    path = Path(name).resolve()
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            if helper.is_relative_to(path, repo):
+                raise QueueError("temporary directory must live outside the integration checkout")
+            stream.write("{}\n")
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return {"state_path": str(path)}
+
+
+def _record_state_entry(
+    repo: Path, target: str, state_path: str, name: str, section: str, value: Any,
+) -> str:
+    tasks = scan(repo, target)["tasks"]
+    _, _, errors = _load_state(state_path, repo, tasks)
+    if errors:
+        raise QueueError("invalid invocation state: " + "; ".join(errors.values()))
+    if name not in {task["name"] for task in tasks}:
+        raise QueueError(f"state entry is not a direct child: {name!r}")
+    path = Path(state_path).expanduser().resolve()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if section == "dependencies":
+        value = list(dict.fromkeys([*state.get(section, {}).get(name, []), *value]))
+    state.setdefault(section, {})[name] = value
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        _, _, errors = _load_state(temporary, repo, tasks)
+        if errors:
+            raise QueueError("invalid invocation update: " + "; ".join(errors.values()))
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return str(path)
+
+
+def record_outcome(
+    repo: Path, target: str, state_path: str, name: str, status: str, reason: str,
+) -> dict[str, str]:
+    reason = helper.single_line(reason, "outcome reason")
+    path = _record_state_entry(repo, target, state_path, name, "outcomes", {
+        "status": status, "reason": reason,
+    })
+    return {"name": name, "status": status, "reason": reason, "state_path": path}
+
+
+def record_dependencies(
+    repo: Path, target: str, state_path: str, name: str, dependencies: list[str],
+) -> dict[str, str]:
+    path = _record_state_entry(repo, target, state_path, name, "dependencies", dependencies)
+    return {"name": name, "state_path": path}
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--repo", default=".", help="Integration checkout path")
@@ -291,6 +352,18 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("target")
         sub.add_argument("--state", help="Caller-owned temporary state JSON")
     commands.add_parser("control", help="Refresh integration checkout control state")
+    commands.add_parser("session", help="Create outside-checkout invocation state")
+    outcome = commands.add_parser("outcome", help="Atomically record an owner execution outcome")
+    outcome.add_argument("target")
+    outcome.add_argument("--state", required=True)
+    outcome.add_argument("--name", required=True, help="Exact scan-returned direct child name")
+    outcome.add_argument("--status", required=True, choices=["running", "ready", "failed", "blocked"])
+    outcome.add_argument("--reason", required=True)
+    dependencies = commands.add_parser("depend", help="Add supplemental canonical dependencies")
+    dependencies.add_argument("target")
+    dependencies.add_argument("--state", required=True)
+    dependencies.add_argument("--name", required=True, help="Exact scan-returned direct child name")
+    dependencies.add_argument("--on", required=True, action="append", help="Canonical prerequisite task ID")
     return result
 
 
@@ -298,14 +371,25 @@ def main() -> int:
     args = parser().parse_args()
     try:
         repo = helper.root_for(Path(args.repo))
-        if args.command == "scan":
-            output = scan(repo, args.target)
-        elif args.command == "queue":
-            output = queue(repo, args.target, args.state)
-        elif args.command == "prepare":
-            output = prepare(repo, args.target, args.state)
-        else:
-            output = control(repo)
+        with helper.integration_lock(repo):
+            if args.command == "scan":
+                output = scan(repo, args.target)
+            elif args.command == "queue":
+                output = queue(repo, args.target, args.state)
+            elif args.command == "prepare":
+                output = prepare(repo, args.target, args.state)
+            elif args.command == "session":
+                output = session(repo)
+            elif args.command == "outcome":
+                output = record_outcome(
+                    repo, args.target, args.state, args.name, args.status, args.reason,
+                )
+            elif args.command == "depend":
+                output = record_dependencies(
+                    repo, args.target, args.state, args.name, args.on,
+                )
+            else:
+                output = control(repo)
         print(json.dumps(output, indent=2 if args.pretty else None, sort_keys=True))
         return 0
     except (

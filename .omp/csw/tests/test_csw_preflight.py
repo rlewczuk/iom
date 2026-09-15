@@ -6,15 +6,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import stat
+import runpy
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 
 HELPER = Path(__file__).parents[1] / "bin" / "csw_preflight"
 READ_ONLY = "read, grep, glob, lsp, ast_grep"
 LOOKUP = f"{READ_ONLY}, bash, web_search"
 BUILDER = f"{READ_ONLY}, ast_edit, bash, edit, write"
+PREFLIGHT = SimpleNamespace(**runpy.run_path(str(HELPER)))
+VERIFIER = f"{READ_ONLY}, bash, write, hub"
+REVIEW = f"{READ_ONLY}, bash"
 BOSS_PROFILES = {
     "boss-errand": ("@smol", LOOKUP),
     "scout": ("@smol", f"[{READ_ONLY}]"),
@@ -44,6 +50,9 @@ class CswPreflightTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m", "initial"], check=True)
         self.write_profile("spec-run-all-implementer", "@implementer", BUILDER, "[spec-run-debug]")
         self.write_profile("spec-run-debug", "@slow", f"[{READ_ONLY}, bash]", "[]", advisor=False)
+        self.write_profile("csw-verifier", "@csw-verifier", VERIFIER, "[]", advisor=False, prewalk=False)
+        self.write_profile("csw-review", "@csw-review", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
+        self.write_profile("csw-review-2", "@csw-review-2", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
         self.omp = Path(self.temporary.name) / "omp"
 
     def tearDown(self) -> None:
@@ -57,6 +66,7 @@ class CswPreflightTests(unittest.TestCase):
         spawns: str | None = None,
         *,
         advisor: bool | None = None,
+        prewalk: bool | None = None,
     ) -> None:
         lines = [
             "---",
@@ -68,6 +78,8 @@ class CswPreflightTests(unittest.TestCase):
             lines.append(f"spawns: {spawns}")
         if advisor is not None:
             lines.append(f"advisor: {'true' if advisor else 'false'}")
+        if prewalk is not None:
+            lines.append(f"prewalk: {'true' if prewalk else 'false'}")
         lines.extend((f'model: "{model}"', "---", ""))
         (self.repo / ".omp" / "agents" / f"{name}.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -111,6 +123,9 @@ class CswPreflightTests(unittest.TestCase):
                 "smol": "openai/cheap",
                 "task": "openai/task",
                 "advisor": "openai/advisor",
+                "csw-verifier": "openai/verifier",
+                "csw-review": "openai/review",
+                "csw-review-2": "openai/review-2",
             },
             "task.agentModelOverrides": {},
             "task.agentAdvisor": {},
@@ -126,6 +141,9 @@ class CswPreflightTests(unittest.TestCase):
         result = [
             {"selector": "openai/task", "provider": "openai", "id": "task", "thinking": ["high"]},
             {"selector": "openai/advisor", "provider": "openai", "id": "advisor", "thinking": ["high"]},
+            {"selector": "openai/verifier", "provider": "openai", "id": "verifier", "thinking": ["high"]},
+            {"selector": "openai/review", "provider": "openai", "id": "review", "thinking": ["high"]},
+            {"selector": "openai/review-2", "provider": "openai", "id": "review-2", "thinking": ["high"]},
         ]
         if cheap:
             result.append({"selector": "openai/cheap", "provider": "openai", "id": "cheap", "thinking": ["low", "high"]})
@@ -153,8 +171,13 @@ class CswPreflightTests(unittest.TestCase):
         self.assertFalse(payload["git"]["clean"])
         self.assertEqual(payload["agents"]["spec-run-all-implementer"]["resolved"], "openai/cheap")
         self.assertTrue(payload["agents"]["spec-run-debug"]["available"])
-        self.assertEqual(payload["model_count"], 4)
-        self.assertEqual(len(payload["models"]), 2)
+        self.assertEqual(set(payload["agents"]), {
+            "spec-run-all-implementer",
+            "spec-run-debug",
+            "csw-verifier",
+            "csw-review",
+            "csw-review-2",
+        })
 
     def test_detached_head_is_valid_git_metadata(self):
         subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "--detach"], check=True)
@@ -186,7 +209,16 @@ class CswPreflightTests(unittest.TestCase):
 
     def test_role_alias_chain_preserves_thinking_suffix(self):
         self.write_omp(
-            self.config(modelRoles={"implementer": "@worker", "worker": "openai/cheap:low", "slow": "openai/slow"}),
+            self.config(
+                modelRoles={
+                    "implementer": "@worker",
+                    "worker": "openai/cheap:low",
+                    "slow": "openai/slow",
+                    "csw-verifier": "openai/verifier",
+                    "csw-review": "openai/review",
+                    "csw-review-2": "openai/review-2",
+                }
+            ),
             self.models(),
         )
         result = self.run_helper()
@@ -206,6 +238,84 @@ class CswPreflightTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertTrue(any("missing model role" in error for error in payload["errors"]))
         self.assertTrue(any("unavailable" in error for error in payload["errors"]))
+
+    def test_missing_verifier_profile_is_a_blocker(self):
+        (self.repo / ".omp" / "agents" / "csw-verifier.md").unlink()
+        self.write_omp(self.config(), self.models())
+        payload = json.loads(self.run_helper().stdout)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("csw-verifier.md" in error for error in payload["errors"]))
+
+    def test_disabled_verifier_is_a_blocker(self):
+        self.write_omp(self.config(**{"task.disabledAgents": ["csw-verifier"]}), self.models())
+        payload = json.loads(self.run_helper().stdout)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("csw-verifier" in error and "disabled" in error for error in payload["errors"]))
+
+    def test_misrouted_verifier_is_a_blocker(self):
+        self.write_profile("csw-verifier", "@slow", VERIFIER, "[]", advisor=False, prewalk=False)
+        self.write_omp(self.config(), self.models())
+        payload = json.loads(self.run_helper().stdout)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("csw-verifier" in error and "exact model alias" in error for error in payload["errors"]))
+
+    def test_reviewers_with_same_catalog_identity_are_rejected(self):
+        self.write_omp(
+            self.config(
+                modelRoles={
+                    "implementer": "openai/cheap",
+                    "slow": "openai/slow",
+                    "csw-verifier": "openai/verifier",
+                    "csw-review": "@primary",
+                    "primary": "openai/review",
+                    "csw-review-2": "@secondary",
+                    "secondary": "openai/review",
+                }
+            ),
+            self.models(),
+        )
+        payload = json.loads(self.run_helper().stdout)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("distinct effective provider/model identities" in error for error in payload["errors"]))
+
+    def test_distinct_review_alias_chains_use_catalog_identities(self):
+        models = self.models()
+        models[3]["selector"] = "review-primary-selector"
+        models[4]["selector"] = "review-secondary-selector"
+        self.write_omp(
+            self.config(
+                modelRoles={
+                    "implementer": "openai/cheap",
+                    "slow": "openai/slow",
+                    "csw-verifier": "openai/verifier",
+                    "csw-review": "@primary",
+                    "primary": "@review-selector",
+                    "review-selector": "review-primary-selector",
+                    "csw-review-2": "@secondary",
+                    "secondary": "@review-2-selector",
+                    "review-2-selector": "review-secondary-selector",
+                }
+            ),
+            models,
+        )
+        result = self.run_helper()
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["agents"]["csw-review"]["effective_identity"], "openai/review")
+        self.assertEqual(payload["agents"]["csw-review-2"]["effective_identity"], "openai/review-2")
+
+    def test_discovery_timeout_is_a_json_blocker(self):
+        preflight = PREFLIGHT.Preflight(self.repo, str(self.omp), "csw-run")
+        with mock.patch.object(
+            PREFLIGHT.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["git"], PREFLIGHT.DISCOVERY_TIMEOUT_SECONDS),
+        ):
+            payload = preflight.result()
+        self.assertFalse(payload["ok"])
+        self.assertIsInstance(payload["errors"], list)
+        self.assertTrue(any("timed out" in error.lower() for error in payload["errors"]))
+
 
     def test_override_and_profile_contract_are_rejected(self):
         self.write_profile("spec-run-debug", "@task", f"[{READ_ONLY}, bash]", "[]", advisor=False)

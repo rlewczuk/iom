@@ -70,10 +70,11 @@ class RunnerTests(unittest.TestCase):
         set_task(self.repo, f".cswd/tasks/example/{name}", updates)
         return directory
 
-    def run_cli(self, command, *, target="example", state=None, success=True):
+    def run_cli(self, command, *extra, target="example", state=None, success=True):
         args = [str(RUNNER), "--repo", str(self.repo), command]
-        if command != "control":
+        if command not in {"control", "session"}:
             args.append(target)
+        args.extend(extra)
         if state is not None:
             self.state.write_text(json.dumps(state), encoding="utf-8")
             args.extend(["--state", str(self.state)])
@@ -91,6 +92,33 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_control_state_updates_preserve_dependencies_and_reject_invalid_inputs(self):
+        self.task("provider")
+        self.task("consumer")
+        state_path = Path(self.run_cli("session")["state_path"])
+        self.addCleanup(state_path.unlink, missing_ok=True)
+        self.assertFalse(state_path.is_relative_to(self.repo))
+        self.run_cli(
+            "depend", "--state", str(state_path), "--name", "consumer",
+            "--on", ".cswd/tasks/example/provider",
+        )
+        self.run_cli(
+            "outcome", "--state", str(state_path), "--name", "provider",
+            "--status", "running", "--reason", "original owner active",
+        )
+        queued = self.run_cli("queue", "--state", str(state_path))
+        self.assertEqual(queued["ready"], [])
+        self.assertEqual({item["name"] for item in queued["waiting"]}, {"provider", "consumer"})
+
+        before = state_path.read_bytes()
+        self.run_cli(
+            "depend", "--state", str(state_path), "--name", "consumer",
+            "--on", "../not-canonical", success=False,
+        )
+        self.assertEqual(state_path.read_bytes(), before)
+        self.task("provider", status="done")
+        self.assertEqual(self.run_cli("queue", "--state", str(state_path))["ready"], ["consumer"])
 
     def test_discovery_queues_and_prepares_all_unfinished_tasks(self):
         self.task("00-done", status="done")
