@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <initializer_list>
@@ -26,6 +27,7 @@
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
+#include "backend/backend_conformance_model_loading.hpp"
 #include "iom/rocm/device.hpp"
 #include "rocm/copy.hpp"
 #include "iom/gpu_algorithm.hpp"
@@ -409,6 +411,36 @@ TEST_CASE("ROCm conformance: full shared suite") {
             devices, candidate->supported_data_types().subspan(0, 1),
             &gate, &oracle, true);
     CHECK_FALSE(gate.armed());
+}
+
+// The ROCm instantiation of the shared, CPU-first model-loading scenario: the
+// same backend-neutral case the CPU reference registers, on this driver's own
+// devices. Each synthetic checkpoint is loaded through the production
+// configuration and mapped-source API, realized on the CPU reference device and
+// on the selected ROCm device, and read back bit-for-bit against the fixture's
+// independent role bytes. There is no ROCm loader port and no per-backend
+// expectation. BF16 is mandatory rather than a skip condition, and the real
+// device's host transfers report positive staging scratch, so the case
+// provisions one caller-owned workspace from the ROCm reserve and has the empty
+// default scratch refused before the first copied role. The diagnostic
+// `HipStorageOracle` and the queued `inject_submission_fault_for_testing` seams
+// are deliberately absent: the production loader is synchronous, so neither a
+// storage oracle nor a queued HIP fault proves a loader failure.
+TEST_CASE("ROCm model loading realizes every published weight role of each synthetic checkpoint") {
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const std::span<const iom::DataType> supported =
+            candidate->supported_data_types();
+    REQUIRE(std::find(supported.begin(), supported.end(),
+                      iom::DataType::BF16) != supported.end());
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    iom_conformance::run_model_loading_conformance(devices);
 }
 TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
     iom_conformance::TrafficGate gate;

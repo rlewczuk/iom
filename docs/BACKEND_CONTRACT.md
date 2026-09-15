@@ -3174,6 +3174,51 @@ a foreign-`Device` destination, a null final destination, a count one short or
 one long, and one owner bound to two equal-metadata roles all preserve the
 seeded destination sentinels with no published source or upload.
 
+#### ROCm loading conformance and observable inventory
+
+ROCm adds no loader and no second scenario. The driver registers the shared
+CPU-first case of
+[CPU loading conformance and observable inventory](#cpu-loading-conformance-and-observable-inventory)
+unchanged on this backend's own devices, so every common rule — the published
+inventory, destination creation from `tensor_spec`, the complete-binding
+preflight, the upload and download workspace and ownership rules, the rejection
+policy, and source lifetime — is the shared one and is not restated here.
+`test/rocm/test_rocm_conformance.cpp` registers it as the
+`iom_rocm_conformance_tests` case `ROCm model loading*`, and the driver's custom
+doctest `main` is unchanged. The focused selections are:
+
+```text
+cmake --build build --target iom_rocm_conformance_tests
+./build/test/iom_rocm_conformance_tests --test-case="ROCm model loading*"
+ctest --test-dir build --output-on-failure -R '^iom_rocm_conformance_tests$'
+```
+
+Setup follows this driver's existing conformance convention. The CPU reference
+runs over a caller `LinearAllocator`; the candidate and the foreign device are
+two independent `make_rocm_device(0, …)` instances whose `DeviceMemoryConfig`
+reserve is the caller-selected tensor-data arena. The foreign role is therefore
+a distinct `Device` instance of the same ordinal, so exact `Device` identity
+rejects a foreign destination — never an equal backend and ordinal.
+
+ROCm host transfers need real positive scratch, so this instantiation exercises
+the positive half of the workspace policy rather than the CPU `{0, 1}` half:
+each destination view reports `{compute_staging_size(logical_nbytes), 32}`, the
+complete binding reports that same maximum from
+`upload_workspace_requirements`, the case provisions exactly one caller-owned
+`create_workspace` range from that result, and that range is suballocated from
+the reserved data arena with no new native backing. The empty default scratch is
+refused as `std::invalid_argument` before the first copied role with every
+seeded destination sentinel intact, and the readback requirement is queried
+independently of the upload one.
+
+Limitations. BF16 is a mandatory capability of the real device and never a skip
+condition. This case uses no diagnostic seam: `HipStorageOracle` is diagnostic
+only, and queued `inject_submission_fault_for_testing` faults cannot prove a
+synchronous loader failure, so neither belongs to loading coverage. Real
+accelerator build and execution are remote-only, and closure requires the
+nonempty focused selection above on the actual enabled ROCm device together with
+the full `iom_rocm_conformance_tests` suite.
+
 ### 11. Backend integration and conformance obligations
 
 The following source map is executable contract coverage. Shared scalar,
