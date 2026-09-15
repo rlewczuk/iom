@@ -93,13 +93,18 @@ A typical weight path is:
 3. Look up a named `SafeTensorView` in the retained store; its raw bytes remain
    borrowed from the store's mapping. `ModelSource::tensor_spec` exposes the
    published logical metadata, never host bytes.
-4. Construct a backend device and create the destination `Tensor` from a
-   validated `TensorSpec`.
-5. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
+4. Construct a backend device and create one destination `Tensor` per
+   published inventory entry from a validated `TensorSpec`.
+5. Preflight the complete ordered destination binding with
+   `ModelSource::upload_workspace_requirements`; it validates the whole list
+   before querying any owner and reports the maximum serial `copy_from_host`
+   requirement of the binding. The caller provisions that reusable scratch only
+   after this query, and only then transfers.
+6. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
    compatible device views.
-6. Submit compute with explicit input and output views. Operations do not
+7. Submit compute with explicit input and output views. Operations do not
    allocate operands or outputs; the caller owns their capacity and placement.
-7. Wait for the returned operation token before consuming an asynchronous
+8. Wait for the returned operation token before consuming an asynchronous
    result, destroying an owner, or violating the host-transfer synchronization
    rules below.
 
@@ -375,6 +380,16 @@ hidden-state broadcasting. Persistent checkpoint weights are not copied into a
 second session-owned weight bank, and no persistent whole-checkpoint host copy
 exists.
 
+Realization of that published source has one fixed order. The caller creates
+one destination owner per entry on its chosen device, then preflights the
+complete ordered binding with `ModelSource::upload_workspace_requirements`,
+which validates every destination — position, exact `Device` instance, BF16
+capability, and the full selected specification — before it queries any owner
+and returns the maximum serial `copy_from_host` requirement of the binding.
+Only after that query does the caller provision the reusable scratch range, and
+only then does it transfer, so no workspace is allocated for an unvalidated or
+incomplete binding and none is sized by a guess.
+
 This flow describes one sequence session, not request batching or serving.
 Leading planes supported by individual operations remain independent logical
 planes: no hidden state, normalization reduction, cache row, or workspace is
@@ -472,6 +487,15 @@ persistent BF16 weight tensors on the caller-selected device, and allocates
 bounded per-layer caches and fixed logical-run-one decode banks. Those owners
 remain at stable addresses and are not recreated merely because a later prompt
 has a different `R`.
+
+Weight realization follows create, preflight, provision, transfer: session
+setup creates one persistent BF16 weight tensor per published inventory entry,
+preflights that complete ordered binding with
+`ModelSource::upload_workspace_requirements`, provisions the reusable
+host-transfer scratch its maximum requirement reports only after that query,
+and then uploads. The preflight creates nothing, allocates no device scratch,
+and mutates no destination, so an invalid, foreign, or incomplete binding
+leaves session setup without an allocated transfer workspace.
 
 The only weight flow is mapped source -> `SafeTensors` borrowed bytes ->
 caller-created device tensors. The loader owns configuration/shape validation
@@ -673,6 +697,7 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `load_tinyllama_config(model_directory)` | Reads exactly `<model_directory>/config.json`, validates it, and returns the complete `TinyLlamaConfig` runtime dimensions. It creates no mapping, device, tensor, or workspace. |
 | `load_tinyllama_safetensors(model_directory)` | Validates the same directory's configuration and complete required SafeTensors role inventory, and returns the owning `ModelSource`, or a contextual schema/container/overflow rejection. It creates no device, tensor, or workspace and copies no payload. |
 | `ModelSource` | Immutable published weight inventory: `config()`, borrowed `weights()`, and `tensor_spec(index)`. Privately retains exactly one owning mapped store for its lifetime; non-copyable and non-movable. |
+| `ModelSource::upload_workspace_requirements(device, destinations)` | Preflights one complete ordered caller-owned destination binding, validates every destination before querying any owner, and returns the maximum serial `copy_from_host` workspace requirement of that binding. It creates, provisions, leases, and transfers nothing. |
 | `ModelWeightRole`, `ModelWeightId`, `ModelWeightInfo` | The logical role, that role's optional decoder layer, and the selected logical shape of one published inventory entry. |
 | `MappedFile(filename, min_size)` | Owns a file mapping. `data()` and `size()` expose borrowed read-only mapped bytes. |
 | `SafeTensorsFile(filename)` | Opens a single SafeTensors artifact; `operator[]`, `size()`, and `keys()` retrieve non-owning named tensor views. |

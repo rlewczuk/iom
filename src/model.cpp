@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -19,6 +20,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "iom/device.hpp"
 #include "iom/safetensors.hpp"
 #include "iom_internal.hpp"
 
@@ -604,6 +606,53 @@ std::unique_ptr<SafeTensorsDir> open_mapped_store(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Caller-owned destination binding
+// ---------------------------------------------------------------------------
+
+// One published inventory entry owns exactly one destination, so the binding's
+// checked aggregate totals are bounded exactly like the published source
+// totals: an impossible total is arithmetic failure, not a schema rejection.
+constexpr const char* kBindingLogicalBytesOverflow =
+        "TinyLlama weight destination binding logical byte total overflows";
+constexpr const char* kBindingTiledBytesOverflow =
+        "TinyLlama weight destination binding standard tiled byte total "
+        "overflows";
+
+std::string describe_quantization(QuantizationFormat quantization) {
+    if (quantization == QuantizationFormat::NONE) {
+        return "NONE";
+    }
+    return "the unsupported quantization format " +
+           std::to_string(static_cast<int>(quantization));
+}
+
+// One destination diagnostic names the exact rank, logical shape, dtype, and
+// quantization that the binding requires and the ones it carries.
+std::string describe_spec(const TensorSpec& spec) {
+    const std::span<const std::size_t> dimensions = spec.shape.dimensions();
+    return "rank " + std::to_string(spec.shape.rank()) + " logical shape " +
+           describe_shape(std::vector<std::size_t>(dimensions.begin(),
+                                                   dimensions.end())) +
+           " with dtype " + std::string(dtype_name(spec.data_type)) +
+           " and quantization " + describe_quantization(spec.quantization);
+}
+
+[[noreturn]] void reject_binding(std::string_view requirement,
+                                 std::string_view actual) {
+    throw std::invalid_argument(
+            "invalid TinyLlama weight destination binding: " +
+            std::string(requirement) + "; actual " + std::string(actual));
+}
+
+// The binding requirement of one destination index, so every rejection names
+// the position the caller supplied.
+std::string binding_requirement(std::size_t index,
+                                std::string_view requirement) {
+    return "destination " + std::to_string(index) + " requires " +
+           std::string(requirement);
+}
+
 }  // namespace
 
 TinyLlamaConfig load_tinyllama_config(
@@ -738,6 +787,122 @@ std::span<const ModelWeightInfo> ModelSource::weights() const noexcept {
 
 const TensorSpec& ModelSource::tensor_spec(std::size_t index) const {
     return impl_->specs.at(index);
+}
+
+// The single complete-binding validator shared by the preflight query and the
+// later synchronous upload. Every destination is validated before any owner is
+// queried: nothing is created, provisioned, leased, submitted, or waited for,
+// no destination content is read or written, and the source is never mutated.
+WorkspaceRequirements ModelSource::validate_destination_binding(
+        const Device& device, std::span<Tensor* const> destinations) const {
+    const std::vector<TensorSpec>& expected_specs = impl_->specs;
+    if (destinations.size() != expected_specs.size()) {
+        reject_binding("exactly " + std::to_string(expected_specs.size()) +
+                               " Tensor owners in published inventory order",
+                       std::to_string(destinations.size()) + " owners");
+    }
+
+    // The BF16 storage capability of this exact device is checked before any
+    // destination metadata is compared or queried.
+    const std::span<const DataType> supported = device.supported_data_types();
+    if (std::find(supported.begin(), supported.end(), kSelectedDataType) ==
+        supported.end()) {
+        reject_binding("a device with BF16 storage capability",
+                       "a supported_data_types() span without BF16");
+    }
+
+    // Phase one validates the complete ordered binding. The supplied
+    // destination's checked logical and standard tiled sizing is evaluated
+    // here, before its schema comparison, so an impossible declared shape is
+    // an arithmetic failure instead of an accepted or mis-sized binding; the
+    // checked aggregate totals of the whole binding are validated the same
+    // way.
+    std::vector<std::size_t> order;
+    order.reserve(destinations.size());
+    std::size_t aggregate_logical_nbytes = 0;
+    std::size_t aggregate_tiled_nbytes = 0;
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        Tensor* const destination = destinations[index];
+        if (destination == nullptr) {
+            reject_binding(binding_requirement(index, "a non-null Tensor owner"),
+                           "<null>");
+        }
+
+        // Only the owner's own full view is used. No transformed view, plane
+        // subrange, or retargeted owner is ever accepted, and the owner's
+        // stable identity is what the later upload binds.
+        const TensorView& full_view = destination->view();
+        if (full_view.owner_identity() != destination) {
+            reject_binding(
+                    binding_requirement(index, "the owner's own full view"),
+                    "a view whose owner identity is another object");
+        }
+
+        // Destinations belong to one exact Device instance: equal backend kind
+        // and ordinal on another instance are still a foreign binding.
+        if (&full_view.device() != &device) {
+            reject_binding(
+                    binding_requirement(index,
+                                        "a Tensor created by this exact "
+                                        "Device instance"),
+                    "a Tensor created by another Device instance");
+        }
+
+        const TensorSpec& actual = full_view.spec();
+        aggregate_logical_nbytes = detail::checked_add(
+                aggregate_logical_nbytes, actual.logical_nbytes(),
+                kBindingLogicalBytesOverflow);
+        aggregate_tiled_nbytes = detail::checked_add(
+                aggregate_tiled_nbytes, actual.tiled_storage_nbytes(),
+                kBindingTiledBytesOverflow);
+
+        const TensorSpec& expected = expected_specs[index];
+        if (!(actual == expected)) {
+            reject_binding(binding_requirement(index, describe_spec(expected)),
+                           describe_spec(actual));
+        }
+        order.push_back(index);
+    }
+
+    // One independent owner per published weight: a repeated Tensor pointer is
+    // rejected even when both roles carry equal logical metadata, as the
+    // `[1, H]` normalization scales and equal projection shapes do.
+    std::sort(order.begin(), order.end(),
+              [&destinations](std::size_t lhs, std::size_t rhs) {
+                  return std::less<const Tensor*>()(destinations[lhs],
+                                                    destinations[rhs]);
+              });
+    for (std::size_t i = 1; i < order.size(); ++i) {
+        if (destinations[order[i]] == destinations[order[i - 1]]) {
+            reject_binding(
+                    "one independent Tensor owner per published weight",
+                    "destination " + std::to_string(order[i]) +
+                            " repeats the owner of destination " +
+                            std::to_string(order[i - 1]));
+        }
+    }
+
+    // Phase two runs only for a completely validated binding: each owner's
+    // full view is queried exactly once through its existing pure requirement
+    // hook. The reported value is the maximum per-owner requirement for serial
+    // reuse of one scratch range, never a sum of mutually exclusive ranges and
+    // never an aggregate byte count.
+    WorkspaceRequirements maximum;
+    for (Tensor* const destination : destinations) {
+        const WorkspaceRequirements required =
+                destination->view().copy_from_host_workspace_requirements();
+        maximum.bytes = std::max(maximum.bytes, required.bytes);
+        maximum.alignment = std::max(maximum.alignment, required.alignment);
+    }
+    if (maximum.bytes == 0) {
+        return WorkspaceRequirements{0, 1};
+    }
+    return maximum;
+}
+
+WorkspaceRequirements ModelSource::upload_workspace_requirements(
+        const Device& device, std::span<Tensor* const> destinations) const {
+    return validate_destination_binding(device, destinations);
 }
 
 std::unique_ptr<ModelSource> load_tinyllama_safetensors(

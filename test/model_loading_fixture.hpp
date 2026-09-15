@@ -10,6 +10,7 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +24,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "iom/device.hpp"
 #include "iom/model.hpp"
 
 namespace iom_model_loading {
@@ -322,6 +324,217 @@ inline std::string rejected_container_message(
     REQUIRE_MESSAGE(false,
                     "expected std::runtime_error for " << directory.string());
     return std::string();
+}
+
+// ---------------------------------------------------------------------------
+// Destination preflight fixture
+// ---------------------------------------------------------------------------
+
+// Bounded storage capability tables: only BF16 membership matters to the
+// preflight, so the fixture does not duplicate the 23-entry backend table.
+inline constexpr std::array<iom::DataType, 2> kSupportedWithBf16 = {
+        iom::DataType::BF16, iom::DataType::F32};
+inline constexpr std::array<iom::DataType, 2> kSupportedWithoutBf16 = {
+        iom::DataType::F16, iom::DataType::F32};
+
+// The host-transfer workspace requirement policy of one bounded destination.
+// A zero multiplier is the CPU/TTNN `{0, 1}` policy; a positive one has the
+// accelerator shape `{checked logical bytes * multiplier, alignment}`, so the
+// preflight's maxima stay observable as actual owner query outputs.
+struct WorkspacePolicy {
+    std::size_t multiplier = 0;
+    std::size_t alignment = 1;
+};
+
+// The fixed sentinel content of every bounded destination. It is never sized
+// from a declared specification, so an unsizeable destination stays
+// constructible without allocating anything.
+inline std::vector<std::byte> sentinel_storage() {
+    return std::vector<std::byte>(4, std::byte{0xA5});
+}
+
+// One bounded destination owner without a backend, an arena, or native
+// storage. It records the requirement queries and upload calls its owner
+// receives, so a test can prove what the preflight did and did not do.
+class FakeTensor final : public iom::Tensor {
+public:
+    FakeTensor(iom::TensorSpec spec, iom::Device& device,
+               WorkspacePolicy policy = {})
+        : iom::Tensor(std::move(spec), device),
+          policy_(policy),
+          storage_(sentinel_storage()) {}
+
+    // Host-transfer requirement queries this owner has received.
+    [[nodiscard]] std::size_t requirement_queries() const noexcept {
+        return requirement_queries_;
+    }
+    // Host uploads this owner has received.
+    [[nodiscard]] std::size_t from_host_calls() const noexcept {
+        return from_host_calls_;
+    }
+    [[nodiscard]] const std::vector<std::byte>& uploaded_bytes() const noexcept {
+        return uploaded_bytes_;
+    }
+    [[nodiscard]] const std::vector<std::byte>& storage() const noexcept {
+        return storage_;
+    }
+
+    [[nodiscard]] iom::WorkspaceRequirements
+            host_transfer_workspace_requirements(
+                    std::size_t checked_logical_nbytes) const override {
+        ++requirement_queries_;
+        if (policy_.multiplier == 0) {
+            return iom::WorkspaceRequirements{0, 1};
+        }
+        return iom::WorkspaceRequirements{
+                checked_logical_nbytes * policy_.multiplier,
+                policy_.alignment};
+    }
+
+    [[nodiscard]] void* storage_handle() noexcept override {
+        return storage_.data();
+    }
+
+    void region_from_host(const iom::TensorView&,
+                          std::span<const std::byte> source,
+                          iom::RawWorkspaceView) override {
+        ++from_host_calls_;
+        uploaded_bytes_.assign(source.begin(), source.end());
+    }
+
+    void region_to_host(const iom::TensorView&, std::span<std::byte>,
+                        iom::RawWorkspaceView) const override {
+        // The bounded fixture persists no payload, so a readback must not
+        // silently appear to succeed.
+        throw std::logic_error(
+                "the bounded destination fixture has no readable storage");
+    }
+
+private:
+    WorkspacePolicy policy_;
+    mutable std::size_t requirement_queries_ = 0;
+    std::size_t from_host_calls_ = 0;
+    std::vector<std::byte> uploaded_bytes_;
+    std::vector<std::byte> storage_;
+};
+
+/**
+ * Test raw-workspace owner with no backing range. The fixture registers its
+ * exact identity through the `RawWorkspace` base like every real owner, so
+ * live/foreign/dead ownership checks have a real owner to observe.
+ */
+class FakeWorkspace final : public iom::RawWorkspace {
+public:
+    FakeWorkspace(iom::Device& device, std::size_t bytes)
+        : iom::RawWorkspace(device, bytes) {}
+
+private:
+    [[nodiscard]] void* workspace_address() const noexcept override {
+        return nullptr;
+    }
+};
+
+/**
+ * Bounded backend-neutral device: no arena, no native storage, and no queue.
+ * It records workspace provisioning so a test can prove the preflight
+ * provisions nothing, and every instance reports the same backend kind and
+ * ordinal so only exact `Device` identity can separate two instances.
+ */
+class FakeDevice final : public iom::Device {
+public:
+    explicit FakeDevice(
+            std::span<const iom::DataType> supported = kSupportedWithBf16,
+            iom::QueueConfig queue_config = {})
+        : iom::Device(queue_config), supported_(supported) {}
+
+    [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
+        return iom::BackendKind::CPU;
+    }
+
+    [[nodiscard]] std::uint32_t backend_device() const noexcept override {
+        return 3;
+    }
+
+    [[nodiscard]] std::span<const iom::DataType>
+            supported_data_types() const noexcept override {
+        return supported_;
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::Tensor> create_tensor(
+            const iom::TensorSpec& spec) override {
+        return std::make_unique<FakeTensor>(spec, *this, policy_);
+    }
+
+    // Mirrors the CPU policy: zero bytes are a valid allocation-free owner,
+    // and positive bytes are unsupported device scratch.
+    [[nodiscard]] std::unique_ptr<iom::RawWorkspace> create_workspace(
+            std::size_t bytes) override {
+        ++workspace_creations_;
+        if (bytes != 0) {
+            throw std::invalid_argument(
+                    "the bounded fixture device has no positive workspace");
+        }
+        return std::make_unique<FakeWorkspace>(*this, 0);
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
+        throw std::logic_error(
+                "the bounded fixture device creates no operation queue");
+    }
+
+    // The policy every subsequent `create_tensor` uses.
+    void set_workspace_policy(WorkspacePolicy policy) noexcept {
+        policy_ = policy;
+    }
+
+    // Raw-workspace provisioning attempted on this device.
+    [[nodiscard]] std::size_t workspace_creations() const noexcept {
+        return workspace_creations_;
+    }
+
+private:
+    std::span<const iom::DataType> supported_;
+    WorkspacePolicy policy_;
+    std::size_t workspace_creations_ = 0;
+};
+
+// Creates one bounded destination owner per published inventory entry, in
+// exact inventory order, from the source's own selected specifications.
+inline std::vector<std::unique_ptr<iom::Tensor>> make_destinations(
+        const iom::ModelSource& source, FakeDevice& device,
+        WorkspacePolicy policy = {}) {
+    device.set_workspace_policy(policy);
+    std::vector<std::unique_ptr<iom::Tensor>> destinations;
+    destinations.reserve(source.weights().size());
+    for (std::size_t index = 0; index < source.weights().size(); ++index) {
+        destinations.push_back(device.create_tensor(source.tensor_spec(index)));
+    }
+    return destinations;
+}
+
+// The stable destination pointers of one binding, in inventory order.
+inline std::vector<iom::Tensor*> destination_pointers(
+        const std::vector<std::unique_ptr<iom::Tensor>>& destinations) {
+    std::vector<iom::Tensor*> pointers;
+    pointers.reserve(destinations.size());
+    for (const std::unique_ptr<iom::Tensor>& destination : destinations) {
+        pointers.push_back(destination.get());
+    }
+    return pointers;
+}
+
+// The exact borrowed destination list the preflight ABI takes.
+inline std::span<iom::Tensor* const> as_destinations(
+        std::vector<iom::Tensor*>& pointers) {
+    return std::span<iom::Tensor* const>{pointers};
+}
+
+// The bounded owner of one destination index, for effect observation. Every
+// destination of a `FakeDevice` is a `FakeTensor`.
+inline const FakeTensor& observed(
+        const std::vector<std::unique_ptr<iom::Tensor>>& destinations,
+        std::size_t index) {
+    return static_cast<const FakeTensor&>(*destinations[index]);
 }
 
 }  // namespace iom_model_loading

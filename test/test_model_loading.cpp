@@ -18,17 +18,25 @@ namespace {
 
 using iom_model_loading::SafetensorsEntry;
 using iom_model_loading::TempDir;
+using iom_model_loading::as_destinations;
 using iom_model_loading::bf16_entry;
+using iom_model_loading::destination_pointers;
 using iom_model_loading::deterministic_payload;
 using iom_model_loading::dims_of;
 using iom_model_loading::element_count;
+using iom_model_loading::FakeDevice;
+using iom_model_loading::kSupportedWithoutBf16;
+using iom_model_loading::make_destinations;
+using iom_model_loading::observed;
 using iom_model_loading::one_layer_config;
 using iom_model_loading::rejected_config_message;
 using iom_model_loading::rejected_container_message;
 using iom_model_loading::rejected_source_message;
 using iom_model_loading::required_weight_entries;
 using iom_model_loading::same_config;
+using iom_model_loading::sentinel_storage;
 using iom_model_loading::two_layer_config;
+using iom_model_loading::WorkspacePolicy;
 using iom_model_loading::write_config;
 using iom_model_loading::write_file;
 using iom_model_loading::write_safetensors_file;
@@ -1004,6 +1012,249 @@ TEST_CASE("Model loading source keeps published metadata valid after the checkpo
     // A new load of the same directory now fails: nothing is re-read lazily.
     CHECK_THROWS_AS(iom::load_tinyllama_safetensors(dir.path()),
                     std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Upload preflight
+// ---------------------------------------------------------------------------
+
+// Loads the complete two-layer boundary checkpoint every preflight case uses.
+std::unique_ptr<iom::ModelSource> load_preflight_source(const TempDir& dir) {
+    const nlohmann::json document = two_layer_config();
+    write_checkpoint(dir, document, required_weight_entries(document));
+    return load_source(dir);
+}
+
+TEST_CASE("Model loading upload preflight returns the maximum requirement of the complete binding") {
+    const TempDir dir("preflight-maximum");
+    const std::unique_ptr<iom::ModelSource> source = load_preflight_source(dir);
+
+    FakeDevice device;
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device, WorkspacePolicy{2, 32});
+
+    // One small role demands a wider alignment than the largest role, so the
+    // byte and alignment maxima come from different owners.
+    device.set_workspace_policy(WorkspacePolicy{1, 64});
+    destinations[1] = device.create_tensor(source->tensor_spec(1));
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    const iom::WorkspaceRequirements requirements =
+            source->upload_workspace_requirements(
+                    device, as_destinations(pointers));
+
+    // token_embedding and lm_head are the largest roles: 19 * 8 * 2 = 304
+    // logical bytes, doubled by the fixture policy. Summing the mutually
+    // exclusive per-role requirements would exceed 3000 bytes, so 608 can only
+    // be the actual maximum of the owner queries.
+    CHECK(requirements.bytes == 608);
+    CHECK(requirements.alignment == 64);
+
+    // Every owner was queried exactly once, and no owner received an upload or
+    // changed its content.
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).requirement_queries() == 1);
+        CHECK(observed(destinations, index).from_host_calls() == 0);
+        CHECK(observed(destinations, index).uploaded_bytes().empty());
+        CHECK(observed(destinations, index).storage() == sentinel_storage());
+    }
+    CHECK(device.workspace_creations() == 0);
+
+    // The same complete list reports the same maxima again, and neither query
+    // changed the published source metadata.
+    const iom::WorkspaceRequirements repeated =
+            source->upload_workspace_requirements(
+                    device, as_destinations(pointers));
+    CHECK(repeated == requirements);
+    CHECK(source->weights().size() == 21);
+    CHECK(dims_of(source->tensor_spec(20).shape) ==
+          std::vector<std::size_t>{8, 12});
+    CHECK(source->config().hidden_size == 8);
+}
+
+TEST_CASE("Model loading upload preflight keeps a zero-workspace binding at {0, 1}") {
+    const TempDir dir("preflight-zero");
+    const std::unique_ptr<iom::ModelSource> source = load_preflight_source(dir);
+
+    FakeDevice device;
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device);
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    const iom::WorkspaceRequirements requirements =
+            source->upload_workspace_requirements(
+                    device, as_destinations(pointers));
+
+    // The CPU/TTNN zero-workspace policy is reported exactly, never as a
+    // positive allocation request.
+    const iom::WorkspaceRequirements no_scratch{0, 1};
+    CHECK(requirements == no_scratch);
+    CHECK(requirements.bytes == 0);
+    CHECK(requirements.alignment == 1);
+    CHECK(device.workspace_creations() == 0);
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).requirement_queries() == 1);
+        CHECK(observed(destinations, index).from_host_calls() == 0);
+    }
+}
+
+TEST_CASE("Model loading upload preflight rejects an invalid binding before any owner query") {
+    const TempDir dir("preflight-reject");
+    const std::unique_ptr<iom::ModelSource> source = load_preflight_source(dir);
+
+    FakeDevice device;
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device);
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    // One rejected preflight: the category is fixed and no owner was queried,
+    // uploaded to, or provisioned for.
+    const auto rejected =
+            [&device](const iom::ModelSource& candidate,
+                      std::span<iom::Tensor* const> binding,
+                      const std::vector<std::unique_ptr<iom::Tensor>>& owners,
+                      const char* what) {
+                CAPTURE(what);
+                CHECK_THROWS_AS(
+                        (void)candidate.upload_workspace_requirements(
+                                device, binding),
+                        std::invalid_argument);
+                for (std::size_t index = 0; index < owners.size(); ++index) {
+                    CHECK(observed(owners, index).requirement_queries() == 0);
+                    CHECK(observed(owners, index).from_host_calls() == 0);
+                }
+                CHECK(device.workspace_creations() == 0);
+            };
+
+    // A null owner at the last published index.
+    std::vector<iom::Tensor*> null_list = pointers;
+    null_list.back() = nullptr;
+    rejected(*source, as_destinations(null_list), destinations,
+             "null destination");
+
+    // One destination too few, and one too many.
+    std::vector<iom::Tensor*> short_list(pointers.begin(), pointers.end() - 1);
+    rejected(*source, as_destinations(short_list), destinations,
+             "missing destination");
+    const std::unique_ptr<iom::Tensor> excess =
+            device.create_tensor(source->tensor_spec(0));
+    std::vector<iom::Tensor*> long_list = pointers;
+    long_list.push_back(excess.get());
+    rejected(*source, as_destinations(long_list), destinations,
+             "excess destination");
+
+    // One owner bound to two roles whose logical metadata is equal: both are
+    // `[1, 8]` normalization scales, so only pointer identity can reject this.
+    REQUIRE(source->tensor_spec(3) == source->tensor_spec(1));
+    std::vector<iom::Tensor*> repeated = pointers;
+    repeated[3] = repeated[1];
+    rejected(*source, as_destinations(repeated), destinations,
+             "repeated owner");
+
+    // A wrong specification at the last published index.
+    std::vector<std::unique_ptr<iom::Tensor>> wrong =
+            make_destinations(*source, device);
+    wrong.back() = device.create_tensor(iom::TensorSpec{
+            iom::TensorShape{{8, 11}}, iom::DataType::BF16,
+            iom::QuantizationFormat::NONE});
+    std::vector<iom::Tensor*> wrong_pointers = destination_pointers(wrong);
+    rejected(*source, as_destinations(wrong_pointers), wrong,
+             "wrong final specification");
+
+    // The complete first binding stayed unqueried through every rejection.
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).requirement_queries() == 0);
+        CHECK(observed(destinations, index).storage() == sentinel_storage());
+    }
+}
+
+TEST_CASE("Model loading upload preflight rejects a foreign device instance and an absent BF16 capability") {
+    const TempDir dir("preflight-device");
+    const std::unique_ptr<iom::ModelSource> source = load_preflight_source(dir);
+
+    FakeDevice device;
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device);
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    // Two instances report the same backend kind and ordinal, so only exact
+    // Device identity separates them.
+    FakeDevice foreign;
+    CHECK(foreign.backend_kind() == device.backend_kind());
+    CHECK(foreign.backend_device() == device.backend_device());
+    CHECK_THROWS_AS((void)source->upload_workspace_requirements(
+                            foreign, as_destinations(pointers)),
+                    std::invalid_argument);
+    CHECK(device.workspace_creations() == 0);
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).requirement_queries() == 0);
+    }
+
+    // The device that created the binding accepts it.
+    const iom::WorkspaceRequirements no_scratch{0, 1};
+    CHECK(source->upload_workspace_requirements(
+                  device, as_destinations(pointers)) == no_scratch);
+
+    // A device whose storage capability omits BF16 cannot receive a published
+    // weight even when it owns every destination.
+    FakeDevice incapable{kSupportedWithoutBf16};
+    std::vector<std::unique_ptr<iom::Tensor>> incapable_destinations =
+            make_destinations(*source, incapable);
+    std::vector<iom::Tensor*> incapable_pointers =
+            destination_pointers(incapable_destinations);
+    CHECK_THROWS_AS((void)source->upload_workspace_requirements(
+                            incapable, as_destinations(incapable_pointers)),
+                    std::invalid_argument);
+    CHECK(incapable.workspace_creations() == 0);
+    for (std::size_t index = 0; index < incapable_destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(incapable_destinations, index).requirement_queries() == 0);
+        CHECK(observed(incapable_destinations, index).from_host_calls() == 0);
+    }
+}
+
+TEST_CASE("Model loading upload preflight propagates checked sizing overflow without allocating storage") {
+    const TempDir dir("preflight-overflow");
+    const std::unique_ptr<iom::ModelSource> source = load_preflight_source(dir);
+
+    FakeDevice device;
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device);
+
+    // A destination whose declared shape cannot be sized at all: 2^62 BF16
+    // elements overflow the checked logical bit count. The bounded owner holds
+    // only its fixed sentinel, so the declaration allocates nothing.
+    const iom::TensorSpec unsizeable{
+            iom::TensorShape{{1, std::size_t{1} << 62}}, iom::DataType::BF16,
+            iom::QuantizationFormat::NONE};
+    destinations.back() = device.create_tensor(unsizeable);
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    CHECK_THROWS_AS((void)source->upload_workspace_requirements(
+                            device, as_destinations(pointers)),
+                    std::overflow_error);
+
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).requirement_queries() == 0);
+        CHECK(observed(destinations, index).from_host_calls() == 0);
+        CHECK(observed(destinations, index).storage() == sentinel_storage());
+    }
+    CHECK(device.workspace_creations() == 0);
+    CHECK(source->weights().size() == 21);
+
+    // The same checked failure at the first published index propagates too.
+    std::vector<std::unique_ptr<iom::Tensor>> front =
+            make_destinations(*source, device);
+    front.front() = device.create_tensor(unsizeable);
+    std::vector<iom::Tensor*> front_pointers = destination_pointers(front);
+    CHECK_THROWS_AS((void)source->upload_workspace_requirements(
+                            device, as_destinations(front_pointers)),
+                    std::overflow_error);
 }
 
 }  // namespace

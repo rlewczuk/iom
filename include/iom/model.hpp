@@ -118,9 +118,55 @@ public:
     std::span<const ModelWeightInfo> weights() const noexcept;
     const TensorSpec& tensor_spec(std::size_t index) const;
 
+    /**
+     * Preflights one complete caller-owned destination binding and returns the
+     * reusable transfer workspace requirement of that binding. The caller
+     * first creates exactly one independent `Tensor` owner per `weights()`
+     * entry from `tensor_spec(index)`, then supplies those owners as pointers
+     * in the same published inventory order, so the binding is one-to-one and
+     * ordered: the list holds exactly `weights().size()` entries and no owner
+     * serves two roles, not even two roles whose logical metadata is equal.
+     *
+     * The complete list is validated before any owner is queried: a wrong
+     * count, a null or repeated `Tensor*`, an owner that is not from `device`
+     * or not its own full view, a device without BF16 storage capability, an
+     * unsizeable or otherwise mismatching `TensorSpec`, and an impossible
+     * checked aggregate all fail here. The result is the maximum serial
+     * per-owner `copy_from_host` requirement of the binding, never a sum of
+     * mutually exclusive scratch ranges and never an aggregate logical byte
+     * count; a binding whose requirements are all zero returns exactly
+     * `{0, 1}`. The caller provisions scratch from that result, and only then
+     * transfers weights.
+     *
+     * This query has no effect: it creates, provisions, leases, submits, and
+     * waits for nothing, mutates neither the source nor the destinations, and
+     * copies or reads no destination content. Destination/schema violations
+     * are `std::invalid_argument` and impossible checked sizing is
+     * `std::overflow_error`; because each supplied destination is sized before
+     * its schema is compared, an unsizeable declared shape reports the
+     * arithmetic failure rather than the mismatch. Backend failures keep their
+     * established categories.
+     */
+    [[nodiscard]] WorkspaceRequirements upload_workspace_requirements(
+            const Device& device,
+            std::span<Tensor* const> destinations) const;
+
 private:
     struct Impl;
     explicit ModelSource(std::unique_ptr<Impl> impl);
+
+    /**
+     * The single complete-binding validator shared by
+     * `upload_workspace_requirements` and the later synchronous upload. It
+     * validates the ordered one-to-one binding of `destinations` to the
+     * published inventory without querying, provisioning, or transferring
+     * anything, and reports the maximum serial per-owner host-transfer
+     * requirement of that binding.
+     */
+    [[nodiscard]] WorkspaceRequirements validate_destination_binding(
+            const Device& device,
+            std::span<Tensor* const> destinations) const;
+
     friend std::unique_ptr<ModelSource> load_tinyllama_safetensors(
             const std::filesystem::path& model_directory);
     std::unique_ptr<Impl> impl_;

@@ -2852,6 +2852,8 @@ public:
     const TinyLlamaConfig& config() const noexcept;
     std::span<const ModelWeightInfo> weights() const noexcept;
     const TensorSpec& tensor_spec(std::size_t index) const;
+    WorkspaceRequirements upload_workspace_requirements(
+        const Device& device, std::span<Tensor* const> destinations) const;
 private:
     struct Impl;
 };
@@ -2962,6 +2964,89 @@ or zero-copy capability, so this stage adds no DMA handle, registration API,
 zero-copy guarantee, variant list, codec, selector, eviction policy, or format
 registry, and a future aliased destination must independently retain its
 backing. Existing copy/staging remains the current path.
+
+#### Destination preflight and reusable transfer workspace
+
+Before it provisions scratch or transfers a weight, a caller preflights the
+complete destination binding of a published source:
+
+```cpp
+WorkspaceRequirements ModelSource::upload_workspace_requirements(
+    const Device& device, std::span<Tensor* const> destinations) const;
+```
+
+The caller first creates exactly one independent `Tensor` owner per `weights()`
+entry from that entry's `tensor_spec(index)`, then supplies those owners as
+pointers in exactly the published inventory order. The binding is one-to-one
+and ordered: the list holds exactly `weights().size()` entries, and one owner
+may not serve two roles, not even two roles whose selected logical metadata is
+equal, such as the `[1, H]` normalization scales.
+
+**Fixed ordering.** Create destination tensors on the chosen device, then query
+this requirement, then provision the reusable scratch it reports, and only then
+transfer. The query provisions, leases, submits, waits, allocates, and destroys
+nothing, so a caller neither guesses a workspace size nor allocates device
+scratch before the binding is known to be complete. The query deliberately takes
+no workspace: positive workspace liveness, ownership, alignment, and overlap
+rules belong to the synchronous upload, which enforces them with the shared
+`detail::WorkspaceValidation::validated` rules of
+[section 4](#4-view-and-transfer-contract).
+
+**Complete validation before the first owner query.** Every destination is
+validated against the published inventory before any per-owner requirement
+query runs, so a rejected binding reports no partial requirement and performs
+no query, allocation, or transfer. Validation covers, per destination in order:
+
+- a non-null `Tensor*`;
+- the owner's own full view, taken from `Tensor::view()`: the ABI binds owners
+  rather than views, and a view whose owner identity is another object is
+  rejected, so no transformed view, plane subrange, or retargeted owner can
+  enter the binding;
+- a `Tensor` created by the exact `device` argument instance; equal backend
+  kind and ordinal on another instance are still a foreign binding;
+- the destination device's own BF16 storage capability from
+  `supported_data_types()`, checked once for the binding before any destination
+  metadata is compared;
+- the supplied destination's checked logical and standard 16x16 tiled sizing,
+  and the checked aggregate logical and tiled byte totals of the whole binding;
+- a full `TensorSpec` match with `tensor_spec(index)`: rank, dimensions, BF16
+  leaf type, and `QuantizationFormat::NONE`.
+
+The supplied destination is sized before its schema is compared, so an
+unsizeable declared shape reports the checked arithmetic failure rather than
+the schema mismatch. Live `Device`, allocator, and `Tensor` lifetimes and
+distinct owners' nonoverlapping valid storage remain caller preconditions: this
+query claims no dangling-reference or invalid-allocation detection beyond exact
+owner and device identity.
+
+**Reported requirement.** The result is the maximum `bytes` and the maximum
+`alignment` over the binding's per-owner pure
+`copy_from_host_workspace_requirements()` results, so one serial scratch range
+satisfies every weight. It is never a sum of mutually exclusive scratch
+requirements, a guessed native storage size, or an aggregate logical byte
+count. A binding whose requirements are all zero returns exactly `{0, 1}`, so
+the CPU and TTNN zero-workspace policy never requests a positive allocation.
+The per-owner requirement hook is pure and deterministic, so the same complete
+destination list reports the same maxima regardless of arena capacity, queue
+occupancy, leases, or completion state.
+
+**Destination failures.** These categories are normative:
+
+| Condition | Exception |
+| --- | --- |
+| Missing or excess destinations, a null `Tensor*`, or one owner bound twice | `std::invalid_argument` naming the position, and both positions for a repeat |
+| A destination of another `Device` instance, or not the owner's own full view | `std::invalid_argument` naming the position |
+| A device whose `supported_data_types()` omits BF16 | `std::invalid_argument` |
+| A wrong rank, dimensions, leaf type, or quantization for the published index | `std::invalid_argument` naming the position, the required rank/shape/dtype/quantization, and the actual one |
+| Impossible checked destination or aggregate sizing | `std::overflow_error` |
+| Backend requirement-query failure | that backend's established category |
+
+`ModelSource` keeps exactly one private complete-binding validator, and the
+preflight query and the synchronous upload share it: there is no optional
+bypass, duplicate public binding container, or generic planning API. The query
+stays backend-neutral — it contains no backend-kind switch and no native
+runtime type — and it never claims readiness: successful validation of a
+binding is not a completed upload and publishes no usable device weights.
 
 ### 11. Backend integration and conformance obligations
 
