@@ -1,9 +1,12 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -11,6 +14,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "iom/alloc.hpp"
+#include "iom/cpu/device.hpp"
 
 #include "model_loading_fixture.hpp"
 
@@ -20,6 +26,7 @@ using iom_model_loading::SafetensorsEntry;
 using iom_model_loading::TempDir;
 using iom_model_loading::as_destinations;
 using iom_model_loading::bf16_entry;
+using iom_model_loading::BoundedWorkspace;
 using iom_model_loading::destination_pointers;
 using iom_model_loading::deterministic_payload;
 using iom_model_loading::dims_of;
@@ -27,6 +34,7 @@ using iom_model_loading::element_count;
 using iom_model_loading::FakeDevice;
 using iom_model_loading::kSupportedWithoutBf16;
 using iom_model_loading::make_destinations;
+using iom_model_loading::mutable_observed;
 using iom_model_loading::observed;
 using iom_model_loading::one_layer_config;
 using iom_model_loading::rejected_config_message;
@@ -36,6 +44,7 @@ using iom_model_loading::required_weight_entries;
 using iom_model_loading::same_config;
 using iom_model_loading::sentinel_storage;
 using iom_model_loading::two_layer_config;
+using iom_model_loading::UploadFailure;
 using iom_model_loading::WorkspacePolicy;
 using iom_model_loading::write_config;
 using iom_model_loading::write_file;
@@ -1255,6 +1264,381 @@ TEST_CASE("Model loading upload preflight propagates checked sizing overflow wit
     CHECK_THROWS_AS((void)source->upload_workspace_requirements(
                             device, as_destinations(front_pointers)),
                     std::overflow_error);
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous weight realization
+// ---------------------------------------------------------------------------
+
+// Publishes the source of one complete two-layer checkpoint and deletes its
+// artifacts, so a later successful upload can only read the mapping and the
+// mapped spans the published source still owns.
+std::unique_ptr<iom::ModelSource> load_realization_source(const TempDir& dir) {
+    const nlohmann::json document = two_layer_config();
+    write_checkpoint(dir, document, required_weight_entries(document));
+    std::unique_ptr<iom::ModelSource> source = load_source(dir);
+    std::error_code error;
+    REQUIRE(std::filesystem::remove(dir.path() / "model.safetensors", error));
+    REQUIRE(std::filesystem::remove(dir.path() / "config.json", error));
+    return source;
+}
+
+// The checkpoint payload the fixture wrote for one published inventory index,
+// never a value the loader was asked for.
+std::vector<SafetensorsEntry> realization_entries() {
+    return required_weight_entries(two_layer_config());
+}
+
+// The exact bytes one bounded destination received, compared with the fixture's
+// independently generated entry for the same published index.
+void check_uploaded_bytes(
+        const std::vector<SafetensorsEntry>& entries,
+        const std::vector<std::unique_ptr<iom::Tensor>>& destinations,
+        std::size_t index) {
+    REQUIRE(index < entries.size());
+    REQUIRE(index < destinations.size());
+    const std::string& expected = entries[index].payload;
+    const std::vector<std::byte>& uploaded =
+            observed(destinations, index).uploaded_bytes();
+    REQUIRE(uploaded.size() == expected.size());
+    CHECK(std::memcmp(uploaded.data(), expected.data(), uploaded.size()) == 0);
+}
+
+// No destination of a rejected or interrupted realization received a later
+// upload or wrote owner storage directly.
+void check_untouched_after(
+        const std::vector<std::unique_ptr<iom::Tensor>>& destinations,
+        std::size_t first_untouched) {
+    for (std::size_t index = first_untouched; index < destinations.size();
+         ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).from_host_calls() == 0);
+        CHECK(observed(destinations, index).uploaded_bytes().empty());
+        CHECK(observed(destinations, index).storage() == sentinel_storage());
+    }
+}
+
+// Reads every real destination back through its own view and compares it with
+// the exact checkpoint entry of its published index. The readback takes its
+// length from the destination itself, so it stays meaningful after the source
+// is gone.
+void check_readback(
+        const std::vector<SafetensorsEntry>& entries,
+        const std::vector<std::unique_ptr<iom::Tensor>>& destinations) {
+    REQUIRE(entries.size() == destinations.size());
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        std::vector<std::byte> readback(
+                destinations[index]->view().spec().logical_nbytes(),
+                std::byte{0xAA});
+        destinations[index]->view().copy_to_host(readback);
+        REQUIRE(readback.size() == entries[index].payload.size());
+        CHECK(std::memcmp(readback.data(), entries[index].payload.data(),
+                          readback.size()) == 0);
+    }
+}
+
+TEST_CASE("Model loading realization copies every published role into real device storage") {
+    const TempDir dir("realization-device");
+    const std::vector<SafetensorsEntry> entries = realization_entries();
+    std::unique_ptr<iom::ModelSource> source = load_realization_source(dir);
+    REQUIRE(source->weights().size() == entries.size());
+
+    // The published inventory order the realization relies on, checked against
+    // the independent expectation instead of the loader's own naming.
+    check_inventory(*source, expected_inventory(2));
+
+    // The caller owns the allocator and every destination owner; the loader
+    // neither creates nor provisions either, and it takes no byte of the
+    // caller's arena while realizing the weights.
+    std::vector<std::byte> arena(1u << 16);
+    iom::ListAllocator allocator(arena.data(), arena.size());
+    const std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
+
+    std::vector<std::unique_ptr<iom::Tensor>> destinations;
+    destinations.reserve(source->weights().size());
+    for (std::size_t index = 0; index < source->weights().size(); ++index) {
+        destinations.push_back(
+                device->create_tensor(source->tensor_spec(index)));
+    }
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    // The CPU binding needs no scratch, so its reported policy stays `{0, 1}`
+    // and the default empty workspace is the complete provisioned scratch.
+    const iom::WorkspaceRequirements no_scratch{0, 1};
+    CHECK(source->upload_workspace_requirements(*device,
+                                                as_destinations(pointers)) ==
+          no_scratch);
+
+    const std::size_t free_before = allocator.free_bytes();
+    source->upload_weights(*device, as_destinations(pointers));
+    CHECK(allocator.free_bytes() == free_before);
+
+    // Normal return is the publication permission: every role reads back its
+    // own exact BF16 checkpoint bytes, including the rank-one normalization
+    // vectors adapted to `[1, 8]` and the nonsquare `[8, 12]` down projection.
+    check_readback(entries, destinations);
+    CHECK(dims_of(source->tensor_spec(1).shape) ==
+          std::vector<std::size_t>{1, 8});
+    CHECK(dims_of(source->tensor_spec(6).shape) ==
+          std::vector<std::size_t>{4, 8});
+    CHECK(dims_of(source->tensor_spec(8).shape) ==
+          std::vector<std::size_t>{8, 8});
+    CHECK(dims_of(source->tensor_spec(20).shape) ==
+          std::vector<std::size_t>{8, 12});
+    CHECK(source->tensor_spec(1).logical_nbytes() == entries[1].payload.size());
+    CHECK(source->tensor_spec(20).logical_nbytes() ==
+          entries[20].payload.size());
+
+    // The realized device tensors stay independently valid once the source is
+    // gone: no destination borrows the mapping or the published metadata.
+    source.reset();
+    check_readback(entries, destinations);
+}
+
+TEST_CASE("Model loading realization validates a positive workspace before the first copied weight") {
+    const TempDir dir("realization-workspace");
+    const std::vector<SafetensorsEntry> entries = realization_entries();
+    const std::unique_ptr<iom::ModelSource> source = load_realization_source(dir);
+
+    FakeDevice device;
+    alignas(32) std::array<std::byte, 640> scratch{};
+
+    // One complete binding whose widest role needs 608 bytes, so a valid
+    // caller-provisioned scratch range is validated against every destination
+    // full owner view and then every role is uploaded exactly once.
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device, WorkspacePolicy{2, 32});
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+    const iom::WorkspaceRequirements requirements =
+            source->upload_workspace_requirements(device,
+                                                  as_destinations(pointers));
+    REQUIRE(requirements.bytes == 608);
+    REQUIRE(requirements.alignment == 32);
+
+    // The documented caller flow is query, provision, realize, so the preflight
+    // above already queried every bound owner exactly once. The realization must
+    // then add exactly one further query per bound destination — its own
+    // complete-binding validation pass, whose maxima size the scratch
+    // validation — and the copies themselves query nothing.
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        REQUIRE(observed(destinations, index).requirement_queries() == 1);
+    }
+    const std::size_t queries_after_preflight =
+            observed(destinations, 0).requirement_queries();
+
+    BoundedWorkspace workspace(device, 608, scratch.data());
+    const std::size_t created_before = device.tensor_creations();
+    REQUIRE(created_before == destinations.size());
+    source->upload_weights(device, as_destinations(pointers), workspace.view());
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).requirement_queries() ==
+              queries_after_preflight + 1);
+        CHECK(observed(destinations, index).from_host_calls() == 1);
+        check_uploaded_bytes(entries, destinations, index);
+    }
+    // The upload created no destination owner and provisioned no workspace.
+    CHECK(device.tensor_creations() == created_before);
+    CHECK(device.workspace_creations() == 0);
+
+    // One rejected scratch range: the fixed category escapes, the binding is
+    // never uploaded to, and the loader provisioned nothing. Each rejection
+    // still runs the complete-binding validation once, so the fresh owners of
+    // that binding were each queried exactly once before the scratch range was
+    // refused.
+    const auto rejected = [&source, &device](const iom::RawWorkspaceView& view,
+                                             const char* what) {
+        CAPTURE(what);
+        std::vector<std::unique_ptr<iom::Tensor>> owners =
+                make_destinations(*source, device, WorkspacePolicy{2, 32});
+        std::vector<iom::Tensor*> binding = destination_pointers(owners);
+        const std::size_t created = device.tensor_creations();
+        CHECK_THROWS_AS((void)source->upload_weights(
+                                device, as_destinations(binding), view),
+                        std::invalid_argument);
+        // A rejected scratch range still costs exactly one complete-binding
+        // validation pass and no upload at all.
+        for (std::size_t index = 0; index < owners.size(); ++index) {
+            CAPTURE(index);
+            CHECK(observed(owners, index).requirement_queries() == 1);
+        }
+        check_untouched_after(owners, 0);
+        CHECK(device.tensor_creations() == created);
+        CHECK(device.workspace_creations() == 0);
+    };
+
+    rejected(iom::RawWorkspaceView{}, "empty workspace");
+
+    BoundedWorkspace insufficient(device, 8, scratch.data());
+    rejected(insufficient.view(), "insufficient workspace");
+
+    BoundedWorkspace misaligned(device, 608, scratch.data() + 8);
+    rejected(misaligned.view(), "misaligned workspace");
+
+    FakeDevice foreign;
+    CHECK(foreign.backend_kind() == device.backend_kind());
+    CHECK(foreign.backend_device() == device.backend_device());
+    BoundedWorkspace foreign_workspace(foreign, 608, scratch.data());
+    rejected(foreign_workspace.view(), "foreign workspace");
+
+    const iom::RawWorkspaceView dead = [&device, &scratch] {
+        const auto owner =
+                std::make_unique<BoundedWorkspace>(device, 608, scratch.data());
+        return owner->view();
+    }();
+    rejected(dead, "dead workspace");
+
+    // A caller provisioning less than the reported maximum cannot smuggle a
+    // shorter range past the shared capacity rule either.
+    BoundedWorkspace short_by_one(device, 607, scratch.data());
+    rejected(short_by_one.view(), "capacity one byte short");
+
+    // A scratch range starting inside a destination's own storage range
+    // overlaps that operand. The fixture's real storage address is used with a
+    // unit alignment requirement, so only the overlap rule can reject it.
+    {
+        std::vector<std::unique_ptr<iom::Tensor>> owners =
+                make_destinations(*source, device, WorkspacePolicy{2, 1});
+        std::vector<iom::Tensor*> binding = destination_pointers(owners);
+        void* storage = binding.front()->view().native_handle();
+        REQUIRE(storage != nullptr);
+        BoundedWorkspace overlapping(device, 608, storage);
+        CHECK_THROWS_AS((void)source->upload_weights(
+                                device, as_destinations(binding),
+                                overlapping.view()),
+                        std::invalid_argument);
+        check_untouched_after(owners, 0);
+        CHECK(device.workspace_creations() == 0);
+    }
+}
+
+TEST_CASE("Model loading realization rejects an invalid complete binding before the first copied weight") {
+    const TempDir dir("realization-binding");
+    const std::unique_ptr<iom::ModelSource> source = load_realization_source(dir);
+
+    FakeDevice device;
+    alignas(32) std::array<std::byte, 640> scratch{};
+    BoundedWorkspace workspace(device, 608, scratch.data());
+
+    // A valid scratch range changes nothing: the complete ordered binding is
+    // validated first, so an invalid binding never reaches a copy.
+    const auto rejected = [&source, &device, &workspace](
+                                  std::vector<iom::Tensor*>& binding,
+                                  const std::vector<std::unique_ptr<iom::Tensor>>& owners,
+                                  const char* what) {
+        CAPTURE(what);
+        const std::size_t created = device.tensor_creations();
+        CHECK_THROWS_AS((void)source->upload_weights(
+                                device, as_destinations(binding),
+                                workspace.view()),
+                        std::invalid_argument);
+        for (std::size_t index = 0; index < owners.size(); ++index) {
+            CAPTURE(index);
+            CHECK(observed(owners, index).requirement_queries() == 0);
+        }
+        check_untouched_after(owners, 0);
+        CHECK(device.tensor_creations() == created);
+        CHECK(device.workspace_creations() == 0);
+    };
+
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device, WorkspacePolicy{2, 32});
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    // The invalid destination is the last published role, so nothing else can
+    // account for a rejected count or an early mismatch.
+    std::vector<std::unique_ptr<iom::Tensor>> wrong =
+            make_destinations(*source, device, WorkspacePolicy{2, 32});
+    wrong.back() = device.create_tensor(iom::TensorSpec{
+            iom::TensorShape{{8, 11}}, iom::DataType::BF16,
+            iom::QuantizationFormat::NONE});
+    std::vector<iom::Tensor*> wrong_pointers = destination_pointers(wrong);
+    rejected(wrong_pointers, wrong, "invalid final destination");
+
+    // One owner bound to two roles whose selected metadata is equal: both are
+    // `[1, 8]` normalization scales, so only pointer identity can reject it.
+    REQUIRE(source->tensor_spec(3) == source->tensor_spec(1));
+    std::vector<iom::Tensor*> repeated = pointers;
+    repeated[3] = repeated[1];
+    rejected(repeated, destinations, "repeated owner");
+
+    // A null owner and a short list are rejected the same way.
+    std::vector<iom::Tensor*> null_list = pointers;
+    null_list.back() = nullptr;
+    rejected(null_list, destinations, "null destination");
+    std::vector<iom::Tensor*> short_list(pointers.begin(), pointers.end() - 1);
+    rejected(short_list, destinations, "missing destination");
+}
+
+TEST_CASE("Model loading realization propagates a later synchronous upload failure without rollback") {
+    const TempDir dir("realization-failure");
+    const std::vector<SafetensorsEntry> entries = realization_entries();
+    const std::unique_ptr<iom::ModelSource> source = load_realization_source(dir);
+    REQUIRE(source->weights().size() == entries.size());
+
+    FakeDevice device;
+    std::vector<std::unique_ptr<iom::Tensor>> destinations =
+            make_destinations(*source, device);
+    std::vector<iom::Tensor*> pointers = destination_pointers(destinations);
+
+    // The fourth published role fails its first upload with an established
+    // backend runtime failure. The three earlier roles already received their
+    // exact bytes and every later destination stayed untouched.
+    mutable_observed(destinations, 3).fail_upload_at(
+            1, UploadFailure::runtime_error);
+    const std::size_t created_before = device.tensor_creations();
+    CHECK_THROWS_AS((void)source->upload_weights(
+                            device, as_destinations(pointers)),
+                    std::runtime_error);
+    CHECK(device.tensor_creations() == created_before);
+    CHECK(device.workspace_creations() == 0);
+
+    for (std::size_t index = 0; index < 3; ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).from_host_calls() == 1);
+        check_uploaded_bytes(entries, destinations, index);
+    }
+    CHECK(observed(destinations, 3).from_host_calls() == 1);
+    CHECK(observed(destinations, 3).uploaded_bytes().empty());
+    check_untouched_after(destinations, 4);
+
+    // No rollback and no retry machinery: the successful prefix keeps its
+    // bytes, the failed owner keeps its caller identity and storage, and the
+    // published source stays usable for an explicit later call.
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).storage() == sentinel_storage());
+        CHECK(destinations[index]->view().owner_identity() ==
+              destinations[index].get());
+    }
+    mutable_observed(destinations, 3).fail_upload_at(0, UploadFailure::none);
+    source->upload_weights(device, as_destinations(pointers));
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        CAPTURE(index);
+        CHECK(observed(destinations, index).from_host_calls() ==
+              (index <= 3 ? 2 : 1));
+        check_uploaded_bytes(entries, destinations, index);
+    }
+
+    // A later allocation failure escapes with its own category too: the model
+    // boundary wraps neither backend failures nor `std::bad_alloc`.
+    std::vector<std::unique_ptr<iom::Tensor>> allocation_destinations =
+            make_destinations(*source, device);
+    std::vector<iom::Tensor*> allocation_pointers =
+            destination_pointers(allocation_destinations);
+    mutable_observed(allocation_destinations, 5).fail_upload_at(
+            1, UploadFailure::allocation);
+    const std::size_t allocation_created = device.tensor_creations();
+    CHECK_THROWS_AS((void)source->upload_weights(
+                            device, as_destinations(allocation_pointers)),
+                    std::bad_alloc);
+    CHECK(device.tensor_creations() == allocation_created);
+    CHECK(device.workspace_creations() == 0);
+    CHECK(observed(allocation_destinations, 4).from_host_calls() == 1);
+    CHECK(observed(allocation_destinations, 5).from_host_calls() == 1);
+    check_untouched_after(allocation_destinations, 6);
 }
 
 }  // namespace

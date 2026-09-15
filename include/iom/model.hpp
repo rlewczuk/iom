@@ -99,8 +99,9 @@ struct ModelWeightInfo {
  * Immutable, completely validated TinyLlama weight source. It is published
  * only after the configuration and every required role passed, and it
  * privately retains exactly one owning SafeTensors mapping store for as long
- * as it lives. No checkpoint payload is copied and no device, tensor, or
- * workspace is created here.
+ * as it lives, plus one borrowed mapped BF16 span of each published entry that
+ * points into that store. No checkpoint payload is copied and no device,
+ * tensor, or workspace is created here.
  *
  * `tensor_spec(index)` exposes the selected BF16/NONE logical metadata of one
  * inventory entry, never host bytes or container types, and throws the
@@ -150,6 +151,49 @@ public:
     [[nodiscard]] WorkspaceRequirements upload_workspace_requirements(
             const Device& device,
             std::span<Tensor* const> destinations) const;
+
+    /**
+     * Realizes that complete ordered binding synchronously: the exact private
+     * mapped row-major BF16 span of each published entry is copied into the
+     * destination holding its position, in canonical inventory order. A normal
+     * `void` return is the sole successful completion and publication
+     * permission; it is not a ready wrapper or a returned readiness object, so
+     * the caller exposes its usable model only after this call returned.
+     *
+     * This call runs the same complete ordered binding validation as
+     * `upload_workspace_requirements` before the first copy, so a wrong count,
+     * a null or repeated `Tensor*`, an owner that is not from `device` or not
+     * its own full view, a device without BF16 storage capability, a
+     * mismatching full `TensorSpec`, or impossible checked sizing fails with
+     * no upload. The aggregate requirement is then calculated before any
+     * transfer effect, and when it is positive `workspace` is validated
+     * against every destination's full owner view with the shared
+     * `detail::WorkspaceValidation::validated` rules even when the supplied
+     * workspace is empty: missing, insufficient, misaligned, foreign, dead, or
+     * overlapping scratch fails before the first copied role. A zero-byte
+     * requirement of `{0, 1}` consumes no workspace, so the CPU and TTNN
+     * no-scratch policy keeps its unused-workspace behavior.
+     *
+     * The caller creates, provisions, and owns the destinations and any
+     * workspace, and both must be quiescent and alive for the whole call; the
+     * source must also outlive it, because every supplied mapping stays alive
+     * through all synchronous copies. This call allocates no tensor, no
+     * workspace, and no persistent host payload, and it submits no queued
+     * copy, OID, or `DeviceOps` work.
+     *
+     * On normal return every weight is complete. A failure is neither rolled
+     * back nor retried: a validation failure uploads nothing, and a later
+     * synchronous upload failure propagates its original established category
+     * and stops immediately, so earlier destinations may already hold copied
+     * bytes, later destinations stay untouched, and every destination and
+     * workspace keeps its caller ownership. Only setup-owned RAII resources
+     * follow the existing backend safe release/quarantine rules; no caller
+     * tensor, workspace, or view is destroyed or retargeted here.
+     */
+    void upload_weights(
+            Device& device,
+            std::span<Tensor* const> destinations,
+            RawWorkspaceView workspace = {}) const;
 
 private:
     struct Impl;

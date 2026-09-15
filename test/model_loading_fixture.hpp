@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -346,6 +347,14 @@ struct WorkspacePolicy {
     std::size_t alignment = 1;
 };
 
+// The established failure category one bounded destination reports from a
+// chosen upload instead of recording its bytes. `none` records every upload.
+enum class UploadFailure {
+    none,
+    runtime_error,
+    allocation,
+};
+
 // The fixed sentinel content of every bounded destination. It is never sized
 // from a declared specification, so an unsizeable destination stays
 // constructible without allocating anything.
@@ -355,7 +364,12 @@ inline std::vector<std::byte> sentinel_storage() {
 
 // One bounded destination owner without a backend, an arena, or native
 // storage. It records the requirement queries and upload calls its owner
-// receives, so a test can prove what the preflight did and did not do.
+// receives, so a test can prove what a preflight or a synchronous realization
+// did and did not do. A bounded upload failure policy additionally makes the
+// chosen upload throw an established category instead of recording bytes, so a
+// later synchronous realization failure, its propagation, and the untouched
+// destinations after it stay observable without any production failure
+// injection.
 class FakeTensor final : public iom::Tensor {
 public:
     FakeTensor(iom::TensorSpec spec, iom::Device& device,
@@ -379,6 +393,15 @@ public:
         return storage_;
     }
 
+    // Makes the upload whose 1-based ordinal on this owner matches `ordinal`
+    // throw `category` instead of recording bytes. Every received upload is
+    // still counted, other owners are unaffected, and no queue, retry, or
+    // production injection seam is involved.
+    void fail_upload_at(std::size_t ordinal, UploadFailure category) noexcept {
+        failing_upload_ = ordinal;
+        upload_failure_ = category;
+    }
+
     [[nodiscard]] iom::WorkspaceRequirements
             host_transfer_workspace_requirements(
                     std::size_t checked_logical_nbytes) const override {
@@ -399,6 +422,14 @@ public:
                           std::span<const std::byte> source,
                           iom::RawWorkspaceView) override {
         ++from_host_calls_;
+        if (from_host_calls_ == failing_upload_) {
+            if (upload_failure_ == UploadFailure::allocation) {
+                throw std::bad_alloc();
+            }
+            if (upload_failure_ == UploadFailure::runtime_error) {
+                throw std::runtime_error("bounded destination upload failure");
+            }
+        }
         uploaded_bytes_.assign(source.begin(), source.end());
     }
 
@@ -412,6 +443,8 @@ public:
 
 private:
     WorkspacePolicy policy_;
+    UploadFailure upload_failure_ = UploadFailure::none;
+    std::size_t failing_upload_ = 0;
     mutable std::size_t requirement_queries_ = 0;
     std::size_t from_host_calls_ = 0;
     std::vector<std::byte> uploaded_bytes_;
@@ -432,6 +465,27 @@ private:
     [[nodiscard]] void* workspace_address() const noexcept override {
         return nullptr;
     }
+};
+
+/**
+ * Bounded raw-workspace owner whose reported range base is supplied by the
+ * caller. No backing storage is allocated: the fixture only needs a real base
+ * address, a real capacity, and a real owner identity, so the shared workspace
+ * validation observes genuine liveness, exact-device, capacity, alignment, and
+ * operand-overlap ranges without a backend arena. Destroying it leaves exactly
+ * the dead owner identity a released backend workspace leaves.
+ */
+class BoundedWorkspace final : public iom::RawWorkspace {
+public:
+    BoundedWorkspace(iom::Device& device, std::size_t bytes, void* address)
+        : iom::RawWorkspace(device, bytes), address_(address) {}
+
+private:
+    [[nodiscard]] void* workspace_address() const noexcept override {
+        return address_;
+    }
+
+    void* address_;
 };
 
 /**
@@ -462,6 +516,7 @@ public:
 
     [[nodiscard]] std::unique_ptr<iom::Tensor> create_tensor(
             const iom::TensorSpec& spec) override {
+        ++tensor_creations_;
         return std::make_unique<FakeTensor>(spec, *this, policy_);
     }
 
@@ -492,10 +547,17 @@ public:
         return workspace_creations_;
     }
 
+    // Destination owners this device created, so a realization pass that
+    // hides its own tensor allocation stays observable.
+    [[nodiscard]] std::size_t tensor_creations() const noexcept {
+        return tensor_creations_;
+    }
+
 private:
     std::span<const iom::DataType> supported_;
     WorkspacePolicy policy_;
     std::size_t workspace_creations_ = 0;
+    std::size_t tensor_creations_ = 0;
 };
 
 // Creates one bounded destination owner per published inventory entry, in
@@ -535,6 +597,14 @@ inline const FakeTensor& observed(
         const std::vector<std::unique_ptr<iom::Tensor>>& destinations,
         std::size_t index) {
     return static_cast<const FakeTensor&>(*destinations[index]);
+}
+
+// The same owner for a bounded upload failure policy, so a test can choose the
+// exact later upload of one destination that must fail.
+inline FakeTensor& mutable_observed(
+        const std::vector<std::unique_ptr<iom::Tensor>>& destinations,
+        std::size_t index) {
+    return static_cast<FakeTensor&>(*destinations[index]);
 }
 
 }  // namespace iom_model_loading

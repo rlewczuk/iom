@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "iom/device.hpp"
+#include "iom/iom.hpp"
 #include "iom/safetensors.hpp"
 #include "iom_internal.hpp"
 
@@ -555,13 +556,14 @@ SafeTensorView required_view(const SafeTensorsStore& store,
 }
 
 // Validates one required role against the parsed source and appends its
-// independent selected logical metadata.
+// independent selected logical metadata and its borrowed mapped payload span.
 void append_selected(const SafeTensorsStore& store,
                      const std::filesystem::path& directory,
                      const WeightRoleSchema& schema,
                      std::optional<std::size_t> layer,
                      std::vector<ModelWeightInfo>& weights,
-                     std::vector<TensorSpec>& specs) {
+                     std::vector<TensorSpec>& specs,
+                     std::vector<std::span<const std::byte>>& payloads) {
     const std::string name = weight_name(schema, layer);
     const SafeTensorView view = required_view(store, directory, name, schema);
     const std::string requirement = describe_source(schema.source_shape);
@@ -590,6 +592,14 @@ void append_selected(const SafeTensorsStore& store,
     specs.push_back(selected_spec(
             TensorShape{std::vector<std::size_t>(dimensions.begin(),
                                                  dimensions.end())}));
+    // The selected mapped BF16 payload is retained as a borrowed span beside
+    // that metadata. It points into the store this source privately owns, so
+    // it stays valid for the whole source lifetime, it is never copied into a
+    // second host image, and no rank-one, final-axis, or transposed variant of
+    // it is formed.
+    payloads.push_back(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(view.raw<std::uint8_t>()),
+            view.nbytes()));
 }
 
 // Only a JSON-library escape from the container parser is translated here:
@@ -769,6 +779,13 @@ struct ModelSource::Impl {
 
     std::vector<ModelWeightInfo> weights;
     std::vector<TensorSpec> specs;
+
+    // One borrowed mapped payload span per published entry, index-aligned with
+    // `weights` and `specs`. Each span borrows the single owning store above
+    // and is exactly the checked logical byte length of its entry, so the
+    // synchronous realization reads the mapping directly instead of a retained
+    // host copy.
+    std::vector<std::span<const std::byte>> payloads;
 };
 
 ModelSource::ModelSource(std::unique_ptr<Impl> impl)
@@ -905,6 +922,54 @@ WorkspaceRequirements ModelSource::upload_workspace_requirements(
     return validate_destination_binding(device, destinations);
 }
 
+// The one synchronous realization path: validate the complete binding, then
+// the supplied scratch when the binding needs any, then copy each retained
+// mapped payload into its destination full owner view in canonical order.
+// Nothing here allocates, transposes, repacks, queues, or retries, and a
+// returned `void` is the only publication permission.
+void ModelSource::upload_weights(
+        Device& device, std::span<Tensor* const> destinations,
+        RawWorkspaceView workspace) const {
+    // The shared complete-binding validator runs before the first copy and
+    // returns the maximum serial per-owner host-transfer requirement of the
+    // binding, so count, order, null/repeated owners, exact `Device` identity,
+    // BF16 capability, the full selected specification, and checked sizing are
+    // all settled before any transfer effect exists.
+    const WorkspaceRequirements requirements =
+            validate_destination_binding(device, destinations);
+
+    // A positive requirement is validated before the first copied role even
+    // when the caller supplied the empty view: missing, insufficient,
+    // misaligned, foreign, dead, or storage-overlapping scratch must fail here
+    // rather than midway through the upload. Each destination's full owner
+    // view is supplied as its own borrowed singleton operand span, so the
+    // shared rule rejects scratch that overlaps the storage of any destination
+    // without copying or allocating a view. A zero-byte `{0, 1}` requirement
+    // consumes no workspace and keeps the CPU/TTNN unused-workspace behavior.
+    if (requirements.bytes != 0) {
+        for (Tensor* const destination : destinations) {
+            const TensorView& owner_view = destination->view();
+            static_cast<void>(detail::WorkspaceValidation::validated(
+                    device, workspace, requirements.bytes,
+                    requirements.alignment,
+                    std::span<const TensorView>(&owner_view, 1)));
+        }
+    }
+
+    // One synchronous `copy_from_host` per published role, in canonical
+    // inventory order, from the retained mapped span directly into the
+    // destination's full owner view: no transpose, intermediate CPU copy,
+    // per-weight checkpoint buffer, `DeviceOps::copy`, or queued work. A
+    // failure propagates its original category immediately; earlier
+    // destinations keep whatever they already received and later ones are
+    // untouched, all under unchanged caller ownership, with no rollback and no
+    // retry.
+    for (std::size_t index = 0; index < destinations.size(); ++index) {
+        destinations[index]->view().copy_from_host(impl_->payloads[index],
+                                                   workspace);
+    }
+}
+
 std::unique_ptr<ModelSource> load_tinyllama_safetensors(
         const std::filesystem::path& model_directory) {
     // The validated configuration supplies every required dimension, and a
@@ -931,16 +996,18 @@ std::unique_ptr<ModelSource> load_tinyllama_safetensors(
 
     std::vector<ModelWeightInfo> weights;
     std::vector<TensorSpec> specs;
+    std::vector<std::span<const std::byte>> payloads;
     weights.reserve(plan.required_count);
     specs.reserve(plan.required_count);
+    payloads.reserve(plan.required_count);
     for (const WeightRoleSchema& schema : plan.globals) {
         append_selected(*store, model_directory, schema, std::nullopt, weights,
-                        specs);
+                        specs, payloads);
     }
     for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
         for (const WeightRoleSchema& schema : plan.layer_roles) {
             append_selected(*store, model_directory, schema, layer, weights,
-                            specs);
+                            specs, payloads);
         }
     }
 
@@ -952,6 +1019,7 @@ std::unique_ptr<ModelSource> load_tinyllama_safetensors(
     impl->store = std::move(store);
     impl->weights = std::move(weights);
     impl->specs = std::move(specs);
+    impl->payloads = std::move(payloads);
     return std::unique_ptr<ModelSource>(new ModelSource(std::move(impl)));
 }
 

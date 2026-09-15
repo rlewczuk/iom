@@ -21,7 +21,9 @@ flowchart LR
     store --> host[caller-owned host bytes]
     host --> tensor[Device-created tensors]
     dimensions --> tensor
-    tensor --> view[TensorView operands]
+    inventory --> upload[upload_weights]
+    tensor --> upload
+    upload --> view[TensorView operands]
     view --> queue[DeviceOps queue]
     queue --> cpu[CPU queue]
     queue --> accel[CUDA / ROCm / SYCL / TTNN backend]
@@ -54,7 +56,8 @@ can coexist without a process-wide selection step.
    any mapping, allocation, or device work. `load_tinyllama_safetensors` then
    validates the complete required SafeTensors role inventory of the same
    directory, publishes it as an immutable `ModelSource`, and privately retains
-   one owning mapping store for its lifetime. `MappedFile` owns a read-only
+   one owning mapping store plus one borrowed mapped payload span per published
+   entry for its lifetime. `MappedFile` owns a read-only
    mapping. `SafeTensorsFile` parses one mapping, while `SafeTensorsDir` owns
    the shard files for a directory. Both return non-owning `SafeTensorView`
    objects over those mapped bytes.
@@ -100,11 +103,17 @@ A typical weight path is:
    before querying any owner and reports the maximum serial `copy_from_host`
    requirement of the binding. The caller provisions that reusable scratch only
    after this query, and only then transfers.
-6. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
+6. Realize the published source with
+   `ModelSource::upload_weights(device, destinations, workspace)`: it validates
+   the same complete binding and the supplied scratch before the first copy and
+   then copies each mapped BF16 payload directly into its destination full view
+   in inventory order. Its normal `void` return is the only publication
+   permission, so the caller exposes a usable model only after it returned.
+7. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
    compatible device views.
-7. Submit compute with explicit input and output views. Operations do not
+8. Submit compute with explicit input and output views. Operations do not
    allocate operands or outputs; the caller owns their capacity and placement.
-8. Wait for the returned operation token before consuming an asynchronous
+9. Wait for the returned operation token before consuming an asynchronous
    result, destroying an owner, or violating the host-transfer synchronization
    rules below.
 
@@ -387,8 +396,17 @@ which validates every destination — position, exact `Device` instance, BF16
 capability, and the full selected specification — before it queries any owner
 and returns the maximum serial `copy_from_host` requirement of the binding.
 Only after that query does the caller provision the reusable scratch range, and
-only then does it transfer, so no workspace is allocated for an unvalidated or
-incomplete binding and none is sized by a guess.
+only then does it realize the weights with
+`ModelSource::upload_weights(device, destinations, workspace)`, so no workspace
+is allocated for an unvalidated or incomplete binding and none is sized by a
+guess. The realization validates the same complete binding and the supplied
+scratch before the first copy, copies each mapped BF16 payload directly into its
+destination full owner view in inventory order, and returns `void`: that normal
+return is the only publication permission, never a ready wrapper or a returned
+readiness object. A later synchronous upload failure propagates its original
+category, stops immediately, leaves earlier destinations with their copied bytes
+and later ones untouched under unchanged caller ownership, and promises neither
+rollback nor retry, so an interrupted session setup publishes no usable model.
 
 This flow describes one sequence session, not request batching or serving.
 Leading planes supported by individual operations remain independent logical
@@ -488,14 +506,19 @@ bounded per-layer caches and fixed logical-run-one decode banks. Those owners
 remain at stable addresses and are not recreated merely because a later prompt
 has a different `R`.
 
-Weight realization follows create, preflight, provision, transfer: session
+Weight realization follows create, preflight, provision, realize: session
 setup creates one persistent BF16 weight tensor per published inventory entry,
 preflights that complete ordered binding with
 `ModelSource::upload_workspace_requirements`, provisions the reusable
 host-transfer scratch its maximum requirement reports only after that query,
-and then uploads. The preflight creates nothing, allocates no device scratch,
-and mutates no destination, so an invalid, foreign, or incomplete binding
-leaves session setup without an allocated transfer workspace.
+and then calls `ModelSource::upload_weights` with that binding and scratch. The
+preflight creates nothing, allocates no device scratch, and mutates no
+destination, so an invalid, foreign, or incomplete binding leaves session setup
+without an allocated transfer workspace. The realization itself allocates no
+tensor, workspace, or host payload; only its normal `void` return publishes the
+weights, so a setup interrupted by a rejected binding or a failed later upload
+publishes no usable model, keeps every caller-owned destination and workspace
+alive and unretargeted, and leaves no rollback or retry work behind.
 
 The only weight flow is mapped source -> `SafeTensors` borrowed bytes ->
 caller-created device tensors. The loader owns configuration/shape validation
@@ -696,8 +719,9 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | --- | --- |
 | `load_tinyllama_config(model_directory)` | Reads exactly `<model_directory>/config.json`, validates it, and returns the complete `TinyLlamaConfig` runtime dimensions. It creates no mapping, device, tensor, or workspace. |
 | `load_tinyllama_safetensors(model_directory)` | Validates the same directory's configuration and complete required SafeTensors role inventory, and returns the owning `ModelSource`, or a contextual schema/container/overflow rejection. It creates no device, tensor, or workspace and copies no payload. |
-| `ModelSource` | Immutable published weight inventory: `config()`, borrowed `weights()`, and `tensor_spec(index)`. Privately retains exactly one owning mapped store for its lifetime; non-copyable and non-movable. |
+| `ModelSource` | Immutable published weight inventory: `config()`, borrowed `weights()`, and `tensor_spec(index)`. Privately retains exactly one owning mapped store and one borrowed mapped payload span per entry for its lifetime; non-copyable and non-movable. |
 | `ModelSource::upload_workspace_requirements(device, destinations)` | Preflights one complete ordered caller-owned destination binding, validates every destination before querying any owner, and returns the maximum serial `copy_from_host` workspace requirement of that binding. It creates, provisions, leases, and transfers nothing. |
+| `ModelSource::upload_weights(device, destinations, workspace)` | Synchronously realizes that binding: it revalidates the complete binding and, for a positive requirement, the supplied scratch, then copies each mapped BF16 payload into its destination full owner view in inventory order. A normal `void` return is the only publication permission; it allocates no tensor, workspace, or host payload and promises no rollback or retry. |
 | `ModelWeightRole`, `ModelWeightId`, `ModelWeightInfo` | The logical role, that role's optional decoder layer, and the selected logical shape of one published inventory entry. |
 | `MappedFile(filename, min_size)` | Owns a file mapping. `data()` and `size()` expose borrowed read-only mapped bytes. |
 | `SafeTensorsFile(filename)` | Opens a single SafeTensors artifact; `operator[]`, `size()`, and `keys()` retrieve non-owning named tensor views. |
