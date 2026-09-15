@@ -12,6 +12,7 @@
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add.hpp"
+#include "backend/backend_conformance_model_loading.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 
@@ -282,6 +283,17 @@ TEST_CASE("CPU conformance: full shared suite composes every shared case") {
             devices.candidate->supported_data_types().subspan(0, 1),
             &devices.gate, nullptr, true);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// The CPU reference instantiation of the shared model-loading scenario. Each
+// synthetic checkpoint is loaded through the production configuration and
+// mapped-source API, realized on the CPU reference and candidate devices, and
+// read back bit-for-bit against the fixture's independent role bytes. The
+// candidate binding reports `{0, 1}`, so it realizes with the default empty
+// scratch and never calls the CPU's unsupported positive workspace factory.
+TEST_CASE("CPU model loading realizes every published weight role of each synthetic checkpoint") {
+    CpuDevices devices;
+    iom_conformance::run_model_loading_conformance(devices.conformance());
 }
 
 // A deliberately perturbed candidate layout or view map must surface as a

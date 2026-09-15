@@ -3122,6 +3122,58 @@ the fixed model-boundary container-JSON translation of the mapped-source
 subsection remains the only translation, and `std::bad_alloc`,
 `std::overflow_error`, and backend failures pass through unchanged.
 
+#### CPU loading conformance and observable inventory
+
+`test/backend/backend_conformance_model_loading.hpp` owns the one shared,
+backend-neutral loading scenario,
+`iom_conformance::run_model_loading_conformance(const ConformanceDevices&)`. It
+is the only model-loading conformance surface: it contains no backend-kind
+switch, no accelerator header, no failure-injection seam, and no second
+inventory generator, so every backend driver calls it unchanged with its own
+devices, in the fixed CPU, CUDA, ROCm, SYCL, then TTNN integration order.
+`test/cpu/test_cpu_conformance.cpp` registers it as
+`iom_backend_conformance_cpu_tests` case `CPU model loading*`, which is the CPU
+invocation:
+
+```text
+cmake --build build --target iom_backend_conformance_cpu_tests
+./build/test/iom_backend_conformance_cpu_tests --test-case="CPU model loading*"
+```
+
+The CPU case loads four independent synthetic checkpoints through
+`load_tinyllama_config` and `load_tinyllama_safetensors` only: the two-layer
+`N=2, H=8, I=12, Hq=4, Hkv=2, D=2, V=19, C=17` boundary, its one-layer form,
+and the H16 `N=1, H=16, I=20, Hq=4, Hkv=2, D=4` and H18
+`N=1, H=18, I=22, Hq=3, Hkv=1, D=6` normalization/tile-boundary forms. The
+observable inventory is exactly `3 + 9*N` selected roles — 12 for each one-layer
+checkpoint and 21 for the two-layer one — with the three globals
+`token_embedding` `[V, H]`, `final_norm` `[1, H]`, `lm_head` `[V, H]` and the
+nine per-layer roles `input_norm` and `post_attention_norm` `[1, H]`, `query`
+`[H, H]`, `key` and `value` `[Hkv*D, H]`, `attention_output` `[H, H]`,
+`mlp_gate` and `mlp_up` `[I, H]`, and `mlp_down` `[H, I]`, each selected
+`TensorSpec` being BF16/NONE with `2 * product(logical shape)` logical bytes.
+
+For every checkpoint the case creates one destination per published index from
+`tensor_spec(index)`, queries `upload_workspace_requirements`, provisions
+reusable scratch only when the reported maximum is positive, uploads through
+`upload_weights`, and reads every destination back with real `TensorView`
+transfers whose separately queried download requirement is never assumed from
+the upload one. The CPU binding reports `{0, 1}` and therefore realizes with the
+default empty view, and no positive raw-workspace factory call is made on a
+device that rejects one. Exact BF16 bits of every role are compared with the
+independent fixture bytes; there is no numeric tolerance, no CPU-computation
+oracle, and no persistent second whole-checkpoint host bank. The same source is
+realized on the driver's CPU reference device and on the selected device, and
+the realized destinations stay readable after the fixture artifacts are deleted
+and the source is released.
+
+The case also observes the failure policy of this section: valid extra tensors,
+a second shard, and unrelated documents change no selected result; an absent
+final required role, a wrong final role schema, a transposed final destination,
+a foreign-`Device` destination, a null final destination, a count one short or
+one long, and one owner bound to two equal-metadata roles all preserve the
+seeded destination sentinels with no published source or upload.
+
 ### 11. Backend integration and conformance obligations
 
 The following source map is executable contract coverage. Shared scalar,
@@ -3130,7 +3182,11 @@ in `test/backend/backend_conformance_common.hpp`,
 `test/backend/backend_conformance_memory.hpp`, and
 `test/backend/backend_conformance_add.hpp`; storage, transforms, tails, padding,
 and copies live in `test/backend/backend_conformance_copy_storage.hpp` and the
-independent `AcceleratorStorageOracle`. Backend-local targets are
+independent `AcceleratorStorageOracle`; model loading and weight realization
+live in `test/backend/backend_conformance_model_loading.hpp` with its
+`test/model_loading_fixture.hpp` checkpoint fixture, registered for CPU as the
+`iom_backend_conformance_cpu_tests` case `CPU model loading*`. Backend-local
+targets are
 `iom_cpu_conformance_tests`, `iom_cuda_conformance_tests`,
 `iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
 `iom_ttnn_conformance_tests`, registered by `add_iom_backend_tests`.
@@ -3167,6 +3223,8 @@ Use these sources when changing or extending the contract:
 - model configuration intake and its isolated fixture: `include/iom/model.hpp`,
   `src/model.cpp`, `test/test_model_loading.cpp`, and
   `test/model_loading_fixture.hpp`;
+- shared model loading and realization scenario:
+  `test/backend/backend_conformance_model_loading.hpp`;
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and

@@ -27,10 +27,12 @@ using iom_model_loading::TempDir;
 using iom_model_loading::as_destinations;
 using iom_model_loading::bf16_entry;
 using iom_model_loading::BoundedWorkspace;
+using iom_model_loading::check_inventory;
 using iom_model_loading::destination_pointers;
 using iom_model_loading::deterministic_payload;
 using iom_model_loading::dims_of;
 using iom_model_loading::element_count;
+using iom_model_loading::expected_inventory;
 using iom_model_loading::FakeDevice;
 using iom_model_loading::kSupportedWithoutBf16;
 using iom_model_loading::make_destinations;
@@ -547,74 +549,6 @@ TEST_CASE("Model loading configuration opens only config.json in the model direc
 // Mapped weight source
 // ---------------------------------------------------------------------------
 
-// One expected entry of the published inventory. The expectation is written
-// independently of the implementation, so a wrong role, layer, order, or shape
-// fails here instead of matching the production table by construction. `layer`
-// is absent for the three global roles and carries the decoder layer for the
-// nine layer-scoped roles.
-struct ExpectedWeight {
-    iom::ModelWeightRole role;
-    std::optional<std::size_t> layer;
-    std::vector<std::size_t> logical_shape;
-};
-
-// The nine layer-scoped roles of the boundary dimensions in canonical order.
-std::vector<std::pair<iom::ModelWeightRole, std::vector<std::size_t>>>
-layer_weight_plan() {
-    return {
-            {iom::ModelWeightRole::input_norm, {1, 8}},
-            {iom::ModelWeightRole::post_attention_norm, {1, 8}},
-            {iom::ModelWeightRole::query, {8, 8}},
-            {iom::ModelWeightRole::key, {4, 8}},
-            {iom::ModelWeightRole::value, {4, 8}},
-            {iom::ModelWeightRole::attention_output, {8, 8}},
-            {iom::ModelWeightRole::mlp_gate, {12, 8}},
-            {iom::ModelWeightRole::mlp_up, {12, 8}},
-            {iom::ModelWeightRole::mlp_down, {8, 12}},
-    };
-}
-
-// The complete expected inventory of `N=2, H=8, I=12, Hq=4, Hkv=2, D=2, V=19`
-// for `layers` decoder layers in canonical global/layer order.
-std::vector<ExpectedWeight> expected_inventory(std::size_t layers) {
-    std::vector<ExpectedWeight> expected{
-            {iom::ModelWeightRole::token_embedding, std::nullopt, {19, 8}},
-            {iom::ModelWeightRole::final_norm, std::nullopt, {1, 8}},
-            {iom::ModelWeightRole::lm_head, std::nullopt, {19, 8}},
-    };
-    for (std::size_t layer = 0; layer < layers; ++layer) {
-        for (const auto& role : layer_weight_plan()) {
-            expected.push_back(ExpectedWeight{role.first, layer, role.second});
-        }
-    }
-    return expected;
-}
-
-// Checks every published entry, and the selected metadata of every index,
-// against the independent expectation.
-void check_inventory(const iom::ModelSource& source,
-                     const std::vector<ExpectedWeight>& expected) {
-    const std::span<const iom::ModelWeightInfo> weights = source.weights();
-    REQUIRE(weights.size() == expected.size());
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-        CAPTURE(index);
-        const ExpectedWeight& want = expected[index];
-        const iom::ModelWeightInfo& info = weights[index];
-        CHECK(info.id.role == want.role);
-        // The identity comparison covers both directions: a global that
-        // wrongly carries a layer and a layer-scoped role that wrongly
-        // omits one both fail here with the exact expected/actual layer.
-        CHECK(info.id.layer == want.layer);
-        CHECK(dims_of(info.logical_shape) == want.logical_shape);
-
-        const iom::TensorSpec& spec = source.tensor_spec(index);
-        CHECK(dims_of(spec.shape) == want.logical_shape);
-        CHECK(spec.data_type == iom::DataType::BF16);
-        CHECK(spec.quantization == iom::QuantizationFormat::NONE);
-        CHECK(spec.logical_nbytes() == 2 * element_count(want.logical_shape));
-    }
-}
-
 // Writes `document` and `entries` as one complete checkpoint directory.
 void write_checkpoint(const TempDir& dir, const nlohmann::json& document,
                       const std::vector<SafetensorsEntry>& entries) {
@@ -664,7 +598,7 @@ TEST_CASE("Model loading source selects the complete two-layer inventory in cano
     CHECK(source->weights().size() == 21);
     CHECK(same_config(source->config(),
                       iom::load_tinyllama_config(dir.path())));
-    check_inventory(*source, expected_inventory(2));
+    check_inventory(*source, expected_inventory(document));
 
     // Selected metadata is addressed by inventory index under ordinary bounds.
     CHECK_THROWS_AS(source->tensor_spec(source->weights().size()),
@@ -681,7 +615,7 @@ TEST_CASE("Model loading source selects the complete one-layer inventory") {
 
     CHECK(source->config().num_hidden_layers == 1);
     CHECK(source->weights().size() == 12);
-    check_inventory(*source, expected_inventory(1));
+    check_inventory(*source, expected_inventory(document));
 
     // A one-layer checkpoint cannot satisfy a two-layer configuration: the
     // obviously incomplete store is rejected before any weight is named.
@@ -751,7 +685,7 @@ TEST_CASE("Model loading source ignores valid extras and unrelated documents") {
     const std::unique_ptr<iom::ModelSource> source = load_source(variant);
 
     CHECK(source->weights().size() == baseline_source->weights().size());
-    check_inventory(*source, expected_inventory(2));
+    check_inventory(*source, expected_inventory(document));
     CHECK(same_config(source->config(), baseline_source->config()));
 }
 
@@ -1016,7 +950,7 @@ TEST_CASE("Model loading source keeps published metadata valid after the checkpo
 
     CHECK(source->config().hidden_size == 8);
     CHECK(source->weights().size() == 21);
-    check_inventory(*source, expected_inventory(2));
+    check_inventory(*source, expected_inventory(document));
 
     // A new load of the same directory now fails: nothing is re-read lazily.
     CHECK_THROWS_AS(iom::load_tinyllama_safetensors(dir.path()),
@@ -1346,7 +1280,7 @@ TEST_CASE("Model loading realization copies every published role into real devic
 
     // The published inventory order the realization relies on, checked against
     // the independent expectation instead of the loader's own naming.
-    check_inventory(*source, expected_inventory(2));
+    check_inventory(*source, expected_inventory(two_layer_config()));
 
     // The caller owns the allocator and every destination owner; the loader
     // neither creates nor provisions either, and it takes no byte of the

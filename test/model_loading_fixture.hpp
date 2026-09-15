@@ -17,6 +17,7 @@
 #include <fstream>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -108,6 +109,33 @@ inline nlohmann::json two_layer_config() {
 inline nlohmann::json one_layer_config() {
     nlohmann::json document = two_layer_config();
     document["num_hidden_layers"] = 1;
+    return document;
+}
+
+// The one-layer tile-boundary configuration: N=1, H=16, I=20, Hq=4, Hkv=2,
+// D=4, V=19, C=17. Its hidden size is exactly one 16x16 tile column, and its
+// grouped K/V width `Hkv*D = 8` is half of `Hq*D = 16`.
+inline nlohmann::json h16_config() {
+    nlohmann::json document = two_layer_config();
+    document["num_hidden_layers"] = 1;
+    document["hidden_size"] = 16;
+    document["intermediate_size"] = 20;
+    document["num_attention_heads"] = 4;
+    document["num_key_value_heads"] = 2;
+    return document;
+}
+
+// The one-layer off-tile configuration: N=1, H=18, I=22, Hq=3, Hkv=1, D=6,
+// V=19, C=17. Neither the hidden size nor the intermediate size is a multiple
+// of the fixed 16x16 tile, so every selected weight and both normalization
+// payloads cross a tile boundary.
+inline nlohmann::json h18_config() {
+    nlohmann::json document = two_layer_config();
+    document["num_hidden_layers"] = 1;
+    document["hidden_size"] = 18;
+    document["intermediate_size"] = 22;
+    document["num_attention_heads"] = 3;
+    document["num_key_value_heads"] = 1;
     return document;
 }
 
@@ -293,6 +321,94 @@ inline std::vector<SafetensorsEntry> required_weight_entries(
 inline std::vector<std::size_t> dims_of(const iom::TensorShape& shape) {
     const std::span<const std::size_t> dimensions = shape.dimensions();
     return std::vector<std::size_t>(dimensions.begin(), dimensions.end());
+}
+
+// ---------------------------------------------------------------------------
+// Independent inventory expectation
+// ---------------------------------------------------------------------------
+
+// One expected inventory entry: the logical identity and the selected logical
+// shape of a published weight, encoded here independently of the
+// implementation, so a wrong role, layer, order, or shape fails instead of
+// matching the production table by construction. `layer` is absent for the
+// three global roles and carries the decoder layer for the nine layer-scoped
+// roles.
+struct ExpectedWeight {
+    iom::ModelWeightId id;
+    std::vector<std::size_t> logical_shape;
+};
+
+// The nine layer-scoped roles of those dimensions in canonical order.
+inline std::vector<std::pair<iom::ModelWeightRole, std::vector<std::size_t>>>
+layer_weight_plan(std::size_t hidden, std::size_t intermediate,
+                  std::size_t kv_width) {
+    return {
+            {iom::ModelWeightRole::input_norm, {1, hidden}},
+            {iom::ModelWeightRole::post_attention_norm, {1, hidden}},
+            {iom::ModelWeightRole::query, {hidden, hidden}},
+            {iom::ModelWeightRole::key, {kv_width, hidden}},
+            {iom::ModelWeightRole::value, {kv_width, hidden}},
+            {iom::ModelWeightRole::attention_output, {hidden, hidden}},
+            {iom::ModelWeightRole::mlp_gate, {intermediate, hidden}},
+            {iom::ModelWeightRole::mlp_up, {intermediate, hidden}},
+            {iom::ModelWeightRole::mlp_down, {hidden, intermediate}},
+    };
+}
+
+// The complete expected inventory of `config` in canonical global/layer order:
+// the three globals, then the nine layer-scoped roles of every configured
+// decoder layer. The normalization roles are `[1, H]` here, which is the
+// adapted logical metadata of their rank-one `[H]` checkpoint payloads.
+inline std::vector<ExpectedWeight> expected_inventory(
+        const nlohmann::json& config) {
+    const std::size_t layers = config.at("num_hidden_layers").get<std::size_t>();
+    const std::size_t hidden = config.at("hidden_size").get<std::size_t>();
+    const std::size_t intermediate =
+            config.at("intermediate_size").get<std::size_t>();
+    const std::size_t heads = config.at("num_attention_heads").get<std::size_t>();
+    const std::size_t kv_heads =
+            config.at("num_key_value_heads").get<std::size_t>();
+    const std::size_t vocab = config.at("vocab_size").get<std::size_t>();
+    const std::size_t kv_width = kv_heads * (hidden / heads);
+
+    std::vector<ExpectedWeight> expected{
+            {{iom::ModelWeightRole::token_embedding, std::nullopt},
+             {vocab, hidden}},
+            {{iom::ModelWeightRole::final_norm, std::nullopt}, {1, hidden}},
+            {{iom::ModelWeightRole::lm_head, std::nullopt}, {vocab, hidden}},
+    };
+    for (std::size_t layer = 0; layer < layers; ++layer) {
+        for (const auto& role :
+             layer_weight_plan(hidden, intermediate, kv_width)) {
+            expected.push_back(ExpectedWeight{{role.first, layer}, role.second});
+        }
+    }
+    return expected;
+}
+
+// Checks every published entry, and the selected metadata of every index,
+// against the independent expectation.
+inline void check_inventory(const iom::ModelSource& source,
+                            const std::vector<ExpectedWeight>& expected) {
+    const std::span<const iom::ModelWeightInfo> weights = source.weights();
+    REQUIRE(weights.size() == expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        CAPTURE(index);
+        const ExpectedWeight& want = expected[index];
+        const iom::ModelWeightInfo& info = weights[index];
+        CHECK(info.id.role == want.id.role);
+        // The identity comparison covers both directions: a global that
+        // wrongly carries a layer and a layer-scoped role that wrongly
+        // omits one both fail here with the exact expected/actual layer.
+        CHECK(info.id.layer == want.id.layer);
+        CHECK(dims_of(info.logical_shape) == want.logical_shape);
+
+        const iom::TensorSpec& spec = source.tensor_spec(index);
+        CHECK(dims_of(spec.shape) == want.logical_shape);
+        CHECK(spec.data_type == iom::DataType::BF16);
+        CHECK(spec.quantization == iom::QuantizationFormat::NONE);
+        CHECK(spec.logical_nbytes() == 2 * element_count(want.logical_shape));
+    }
 }
 
 // Loads `directory` as a mapped weight source and returns the message of the
