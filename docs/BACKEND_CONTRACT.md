@@ -2730,7 +2730,105 @@ are the remote initialized-environment commands
 non-tile dimensions, planes, GQA, padding exclusion, numerics, aliases,
 workspace failures, device rejection, accepted failures, and repeated waits.
 
-### 10. Backend integration and conformance obligations
+### 10. Model loading and weight layout
+
+Model ingestion begins with an explicit model directory and stays
+backend-neutral. Reading a configuration never searches tokenizer, generation,
+distribution, or fallback files, never creates a mapping, device, tensor, or
+workspace, and never copies checkpoint payload bytes. Configuration validation
+precedes every later loading stage, and the mapped-file -> `SafeTensors` ->
+caller-created tensor flow with the host-transfer rules of
+[section 4](#4-view-and-transfer-contract) is unchanged. Later loading stages
+extend this section instead of defining competing contracts.
+
+#### Supported TinyLlama configuration
+
+`iom::load_tinyllama_config(const std::filesystem::path& model_directory)` in
+`include/iom/model.hpp` reads exactly `<model_directory>/config.json` and
+returns a fully populated `iom::TinyLlamaConfig`. The public header declares no
+JSON type, there is no partial or empty success value, and only runtime values
+are stored:
+
+```cpp
+struct TinyLlamaConfig {
+    std::size_t num_hidden_layers;
+    std::size_t hidden_size;
+    std::size_t intermediate_size;
+    std::size_t num_attention_heads;
+    std::size_t num_key_value_heads;
+    std::size_t vocab_size;
+    std::size_t max_position_embeddings;
+    std::size_t head_dim;
+    std::size_t bos_token_id;
+    std::size_t eos_token_id;
+    float rms_norm_eps;
+    double rope_theta;
+};
+```
+
+The supported fields, their defaults, and their required values are normative:
+
+| JSON field | Rule | Result |
+| --- | --- | --- |
+| `architectures` | Required array, exactly `["LlamaForCausalLM"]` | no stored field |
+| `model_type` | Required string, exactly `"llama"` | no stored field |
+| `num_hidden_layers` | Required positive integer | `N` |
+| `hidden_size` | Required positive integer | `H` |
+| `intermediate_size` | Required positive integer | `I` |
+| `num_attention_heads` | Required positive integer | `Hq` |
+| `num_key_value_heads` | Required positive integer | `Hkv` |
+| `vocab_size` | Required positive integer | `V` |
+| `max_position_embeddings` | Required positive integer | `C` |
+| `hidden_act` | Required string, exactly `"silu"` | no stored field |
+| `rms_norm_eps` | Required finite positive number that stays finite and positive as `float` | `float` epsilon |
+| `rope_theta` | Required finite positive number representable as `double` | `double` theta |
+| `attention_bias` | Optional; absent means `false`, and a present value must be the boolean `false` | no stored field |
+| `mlp_bias` | Optional with the `attention_bias` rule | no stored field |
+| `tie_word_embeddings` | Optional with the `attention_bias` rule | no stored field |
+| `rope_scaling` | Optional; absent means no scaling, and a present value must be `null` | no stored field |
+| `pretraining_tp` | Optional; absent means the integer `1`, and a present value must be the integer `1` | no stored field |
+| `torch_dtype` | Required string, exactly `"bfloat16"` | selected source dtype |
+| `bos_token_id` | Required integer, exactly `1`, and below `V` | `1` |
+| `eos_token_id` | Required integer, exactly `2`, and below `V` | `2` |
+| `initializer_range`, `transformers_version`, `use_cache`, `pad_token_id` | Optional metadata: no validation and no merged default, and no effect on any stored value | not stored |
+| any other key, including a head-dimension override | Rejected as unknown | none |
+
+Every integer field accepts JSON integers only. Floating-point values including
+`1.0`, booleans, strings, arrays, and `null` are rejected, and each accepted
+value must be positive and representable as `std::size_t`; token ids are never
+list-valued. The configuration declares no independent head width, and the head
+plan is derived rather than read:
+
+- `H % Hq == 0`, and `Hq % Hkv == 0`;
+- `head_dim` is `D = H / Hq`, which must be positive and even;
+- `Hkv * D` is the grouped K/V width and is computed with checked arithmetic.
+
+`N`, `H`, `I`, `Hq`, `Hkv`, `D`, `V`, and `C` are the runtime parameters of
+[TinyLlama forward layout — Session sizing and lifetime](#tinyllama-forward-layout--session-sizing-and-lifetime),
+which owns the checked `F = Hq * D` equality and every storage consequence of
+those values. This section adds no checkpoint-specific dimension limit: a
+one-layer checkpoint and the two-layer `N=2, H=8, I=12, Hq=4, Hkv=2, V=19,
+C=17` boundary fixture are both supported.
+
+#### Configuration failures
+
+| Condition | Exception |
+| --- | --- |
+| Missing `config.json`, an unreadable file, or a failed read | `std::runtime_error` carrying the path and the system reason |
+| Malformed, empty, or non-object JSON | `std::invalid_argument` carrying the path |
+| Missing field, wrong type or integer kind, unsupported value, unknown key, nonrepresentable narrowing, invalid head ratio, odd `head_dim`, or invalid token policy | `std::invalid_argument` carrying the path, the field, the actual value or `<missing>`, and the violated constraint |
+| Overflow of a checked derived width | `std::overflow_error` |
+| Allocation failure while reading or decoding | `std::bad_alloc` |
+
+A missing `config.json` is an I/O failure, never a missing-field error, and
+decode exceptions from the JSON library are translated at this boundary only,
+so the standalone SafeTensors parser keeps its own behavior. Configuration
+reading allocates configuration and schema metadata alone: it creates no device
+tensor, transfer workspace, queue, or checkpoint payload copy. The mapped
+source, destination preflight, and synchronous realization stages that follow
+extend this section with their own normative subsections.
+
+### 11. Backend integration and conformance obligations
 
 The following source map is executable contract coverage. Shared scalar,
 common validation, rank, queue, workspace, and memory-boundary scenarios live
@@ -2756,7 +2854,7 @@ conformance targets. Drivers provide allocator/context setup, CPU reference,
 foreign-device identity checks, hardware gating, and native storage oracles;
 enabled hardware runs and never skips.
 
-### 11. Contract source map
+### 12. Contract source map
 
 Use these sources when changing or extending the contract:
 
@@ -2772,6 +2870,9 @@ Use these sources when changing or extending the contract:
   `test/backend/backend_conformance_oracle.hpp`;
 - native setup/allocation seams: `test/cuda`, `test/rocm`, and `test/sycl`
   smoke/conformance drivers;
+- model configuration intake and its isolated fixture: `include/iom/model.hpp`,
+  `src/model.cpp`, `test/test_model_loading.cpp`, and
+  `test/model_loading_fixture.hpp`;
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and

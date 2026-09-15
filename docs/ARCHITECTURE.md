@@ -11,10 +11,13 @@ host RAM, and accelerator memory.
 
 ```mermaid
 flowchart LR
+    directory[explicit model directory] --> config[load_tinyllama_config]
+    config --> dimensions[validated TinyLlamaConfig]
     weights[SafeTensors files or shards] --> mapped[MappedFile]
     mapped --> store[SafeTensorsFile / SafeTensorsDir]
     store --> host[caller-owned host bytes]
     host --> tensor[Device-created tensors]
+    dimensions --> tensor
     tensor --> view[TensorView operands]
     view --> queue[DeviceOps queue]
     queue --> cpu[CPU queue]
@@ -23,9 +26,9 @@ flowchart LR
 
 The public API is split between backend-neutral headers in `include/iom` and
 small backend factory headers in `include/iom/{cpu,cuda,rocm,sycl,ttnn}`.
-`libiom` contains the neutral tensor, allocation, mapped-file, SafeTensors, and
-CPU implementation. Each optional accelerator builds as a separate static
-library and links to `libiom`:
+`libiom` contains the neutral tensor, allocation, mapped-file, SafeTensors,
+model-configuration, and CPU implementation. Each optional accelerator builds
+as a separate static library and links to `libiom`:
 
 | Backend | Build option and library | Runtime/storage model |
 | --- | --- | --- |
@@ -43,10 +46,12 @@ can coexist without a process-wide selection step.
 
 ### Layers and responsibilities
 
-1. **Data and model ingestion.** `MappedFile` owns a read-only mapping.
-   `SafeTensorsFile` parses one mapping, while `SafeTensorsDir` owns the shard
-   files for a directory. Both return non-owning `SafeTensorView` objects over
-   those mapped bytes.
+1. **Data and model ingestion.** `load_tinyllama_config` validates the explicit
+   model directory's `config.json` and returns the runtime dimensions before
+   any mapping, allocation, or device work. `MappedFile` owns a read-only
+   mapping. `SafeTensorsFile` parses one mapping, while `SafeTensorsDir` owns
+   the shard files for a directory. Both return non-owning `SafeTensorView`
+   objects over those mapped bytes.
 2. **Core tensor contract.** `TensorSpec`, `Tensor`, and `TensorView` define
    logical shape, element encoding, quantization declaration, tiled layout, and
    view transformations. The core owns metadata only; actual storage belongs to
@@ -72,16 +77,18 @@ can coexist without a process-wide selection step.
 
 A typical weight path is:
 
-1. Construct `SafeTensorsFile` or `SafeTensorsDir` for the model artifact.
-2. Look up a named `SafeTensorView`; its raw bytes remain borrowed from the
+1. Validate `<model_directory>/config.json` with `load_tinyllama_config`; a
+   rejected configuration stops the path before any mapping or allocation.
+2. Construct `SafeTensorsFile` or `SafeTensorsDir` for the model artifact.
+3. Look up a named `SafeTensorView`; its raw bytes remain borrowed from the
    store's mapping.
-3. Construct a backend device and create the destination `Tensor` from a
+4. Construct a backend device and create the destination `Tensor` from a
    validated `TensorSpec`.
-4. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
+5. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
    compatible device views.
-5. Submit compute with explicit input and output views. Operations do not
+6. Submit compute with explicit input and output views. Operations do not
    allocate operands or outputs; the caller owns their capacity and placement.
-6. Wait for the returned operation token before consuming an asynchronous
+7. Wait for the returned operation token before consuming an asynchronous
    result, destroying an owner, or violating the host-transfer synchronization
    rules below.
 
@@ -339,7 +346,12 @@ Runtime configuration and loaded parameter shapes determine:
 | `Qcap` | Independent queue admission capacity; it does not size context or cache storage. |
 Layer count, current absolute position/cache length, epsilon, and RoPE
 parameters are likewise configuration. They are not inferred from one
-checkpoint's constants. The loader validates and owns persistent weights.
+checkpoint's constants. `load_tinyllama_config` reads `Nlayers`, `F`, `M`,
+`Hq`, `Hkv`, `V`, and `C` from the explicit model directory's `config.json`
+and derives the checked `D = F / Hq`: a missing or unreadable file is an I/O
+failure, and an unsupported field, value, head ratio, or token policy is
+rejected before any mapping, device, workspace, or weight work. The loader
+validates and owns persistent weights.
 Only the loader adapts checkpoint normalization vectors from `[H]` to `[1,H]`
 while materializing them; RMSNorm remains rank 2 through 8 and never gains
 rank-one input or implicit hidden-state broadcasting. Persistent checkpoint
@@ -640,6 +652,7 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 
 | API | Function |
 | --- | --- |
+| `load_tinyllama_config(model_directory)` | Reads exactly `<model_directory>/config.json`, validates it, and returns the complete `TinyLlamaConfig` runtime dimensions. It creates no mapping, device, tensor, or workspace. |
 | `MappedFile(filename, min_size)` | Owns a file mapping. `data()` and `size()` expose borrowed read-only mapped bytes. |
 | `SafeTensorsFile(filename)` | Opens a single SafeTensors artifact; `operator[]`, `size()`, and `keys()` retrieve non-owning named tensor views. |
 | `SafeTensorsDir(dirname)` | Opens a sharded SafeTensors directory with the same store interface. |
