@@ -26,6 +26,7 @@
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_model_loading.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/ttnn/device.hpp"
 #include "../../src/ttnn/registry_state.hpp"
@@ -2419,4 +2420,162 @@ TEST_CASE("TTNN conformance: workspace requirement queries report exact zero") {
             queue->add_workspace_requirements(
                     foreign->view(), rhs->view(), out->view()),
             std::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
+// Shared model loading and weight realization.
+//
+// TTNN consumes exactly the same backend-neutral scenario as every other
+// driver: `iom_conformance::run_model_loading_conformance` owns the fixture
+// directories, the mapped sources, the caller-owned destinations, the
+// workspace preflight, and the readback expectations, and this driver only
+// supplies the devices. `TtnnDevices` already implements the documented
+// one-live-context policy - one TTNN context plus an independently created CPU
+// reference device and the CPU `foreign` device that a second TTNN context
+// would violate - so the scenario's foreign-destination rejection observes
+// exact `Device` identity across two backend kinds instead of a second TTNN
+// ordinal. Native storage stays TTNN-owned per plane behind the same public
+// contracts, and the binding reports the `{0, 1}` host-transfer requirement
+// that consumes no caller workspace.
+// ---------------------------------------------------------------------------
+TEST_CASE("TTNN model loading: complete checkpoint inventories realize exact BF16 weights") {
+    require_hardware();
+    TtnnDevices devices;
+
+    // BF16 is mandatory for weight realization: a device that omits it cannot
+    // host the published inventory, so this case fails rather than skips.
+    const std::span<const iom::DataType> supported =
+            devices.candidate->supported_data_types();
+    REQUIRE(std::find(supported.begin(), supported.end(),
+                      iom::DataType::BF16) != supported.end());
+
+    iom_conformance::run_model_loading_conformance(devices.conformance());
+}
+
+// The realization of a complete ordered binding is synchronous and
+// caller-owned: `ModelSource::upload_weights` validates the binding once and
+// then copies one published role at a time into that role's destination full
+// owner view. Every one of those copies runs through the device's retained
+// host-transfer staging, so a failure after the binding was accepted is
+// exactly the loading failure the contract must report without publishing a
+// model, and the staging the interrupted transfer already acquired must not be
+// freed while it could still be read.
+//
+// Every published role of these checkpoints is one 32x32-tile BF16 native
+// plane, so the single-plane submission seam is reached by the transfer that
+// carries the role. The staging-allocation seam is armed for the first upload
+// of the binding on a device whose retained staging does not exist yet; the
+// submission seam is armed for a later upload of the same binding on warm
+// retained staging.
+TEST_CASE("TTNN model loading: failed weight uploads publish nothing and retain staging") {
+    require_hardware();
+    TtnnDevices devices;
+
+    const nlohmann::json config = iom_model_loading::two_layer_config();
+    const std::vector<iom_model_loading::SafetensorsEntry> entries =
+            iom_model_loading::required_weight_entries(config);
+    const iom_model_loading::TempDir directory(
+            iom_conformance::model_loading::fixture_tag(devices.conformance(),
+                                                        "failed-upload"));
+    const std::unique_ptr<iom::ModelSource> source =
+            iom_conformance::model_loading::load_checkpoint(
+                    directory.path(), config, entries);
+    REQUIRE(source->weights().size() == entries.size());
+
+    const std::size_t initial_allocations =
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing();
+
+    // A failed retained staging allocation leaves no storage behind: the
+    // failed attempt retains nothing, the documented `bad_alloc` reaches the
+    // caller unchanged, and no destination of the aborted binding receives its
+    // published role payload.
+    {
+        iom_conformance::model_loading::DestinationBinding binding =
+                iom_conformance::model_loading::create_binding(
+                        *devices.candidate, *source);
+        iom::ttnn_test::
+                fail_next_host_transfer_staging_allocation_for_testing();
+        REQUIRE_THROWS_AS(
+                (void)source->upload_weights(*devices.candidate,
+                                             binding.span()),
+                std::bad_alloc);
+        CHECK(iom::ttnn_test::
+                      host_transfer_staging_allocation_fault_consumed_for_testing());
+        CHECK_EQ(
+                iom::ttnn_test::
+                        host_transfer_staging_allocation_count_for_testing(),
+                initial_allocations);
+
+        // Fresh TTNN storage content is unspecified by the contract, so the
+        // negative observation of the aborted call is that no destination
+        // carries its own published role payload and therefore no later role
+        // of that call reached its destination.
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            CAPTURE(index);
+            const std::string& payload = entries[index].payload;
+            const std::span<const std::byte> published(
+                    reinterpret_cast<const std::byte*>(payload.data()),
+                    payload.size());
+            CHECK(iom_conformance::first_logical_mismatch(
+                          binding.owners[index]->view(), published)
+                          .has_value());
+        }
+
+        // Only the next normal return publishes the weights. It reuses the one
+        // retained upload slot every role of this binding fits, so the failed
+        // allocation neither kept storage alive nor forced a replacement.
+        const std::size_t before_realization =
+                iom::ttnn_test::
+                        host_transfer_staging_allocation_count_for_testing();
+        source->upload_weights(*devices.candidate, binding.span());
+        CHECK_EQ(
+                iom::ttnn_test::
+                        host_transfer_staging_allocation_count_for_testing(),
+                before_realization + 1);
+        iom_conformance::model_loading::require_realized_bytes(
+                binding, entries, "publication after a failed allocation");
+    }
+
+    // Sentinel seeding uploads every destination of this binding and warms the
+    // retained upload staging the later upload reuses, so the interrupted
+    // transfer below holds acquired staging when it fails.
+    iom_conformance::model_loading::DestinationBinding later =
+            iom_conformance::model_loading::create_binding(*devices.candidate,
+                                                           *source);
+    const std::vector<std::vector<std::byte>> sentinels =
+            iom_conformance::model_loading::seed_sentinels(later);
+    const std::size_t warm_allocations =
+            iom::ttnn_test::
+                    host_transfer_staging_allocation_count_for_testing();
+
+    iom::ttnn_test::fail_next_host_transfer_submission_for_testing(0);
+    REQUIRE_THROWS_AS(
+            (void)source->upload_weights(*devices.candidate, later.span()),
+            std::runtime_error);
+    CHECK(iom::ttnn_test::
+                  host_transfer_submission_fault_consumed_for_testing());
+
+    // The complete ordered binding stopped at its first failed role: every
+    // destination still holds the sentinel of the earlier successful upload,
+    // so no later role of the aborted call was uploaded and that call
+    // published nothing.
+    iom_conformance::model_loading::require_sentinels(
+            later, sentinels, "failed later weight upload");
+
+    // The bounded recovery drain finished the work the failed transfer had
+    // already submitted, so the staging it held returned to the facility
+    // instead of being freed or replaced while it could still be read.
+    CHECK_EQ(
+            iom::ttnn_test::host_transfer_staging_allocation_count_for_testing(),
+            warm_allocations);
+
+    // A later normal return is the publication permission, and it reuses the
+    // same retained staging the failed upload held.
+    source->upload_weights(*devices.candidate, later.span());
+    CHECK_EQ(
+            iom::ttnn_test::host_transfer_staging_allocation_count_for_testing(),
+            warm_allocations);
+    iom_conformance::model_loading::require_realized_bytes(
+            later, entries, "publication after a failed later upload");
 }

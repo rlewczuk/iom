@@ -3309,6 +3309,83 @@ SYCL setup and limitations:
   staging, and `src/sycl/device_tensor.cpp` and `src/sycl/copy.cpp` change only
   if a loading failure demonstrates a transfer defect.
 
+#### TTNN loading conformance and observable inventory
+
+The shared contract of this
+[section 10](#10-model-loading-and-weight-layout) is unchanged; this subsection
+records only TTNN setup, native-storage consequences, and the exact invocation.
+`test/ttnn/test_ttnn_conformance.cpp` registers the same backend-neutral
+scenario as `iom_ttnn_conformance_tests` cases `TTNN model loading*`, after the
+SYCL predecessor, through the existing `TtnnDevices` fixture and the target's
+custom runtime registration. The two registered cases are `TTNN model loading:
+complete checkpoint inventories realize exact BF16 weights` and `TTNN model
+loading: failed weight uploads publish nothing and retain staging`, so the
+wildcard selection covers both.
+
+**Native per-plane storage.** TTNN destinations are created from
+`tensor_spec(index)` on the selected TTNN device exactly as on every other
+backend, but realization lands in TTNN-native per-plane storage: one TTNN-owned
+plane per leading logical index, each padded to 32x32 tiles with its own native
+padding. The logical readback is compared bit-for-bit with the fixture's
+independent BF16 bytes, so native padding or a wrong slot map can never
+compensate a wrong result, and no numeric tolerance, matrix-performance claim,
+or fixed native byte formula is used. Native storage stays TTNN-owned and is
+not an `iom::Allocator` arena; unsupported quantization and unsupported leaf
+types are still rejected before native allocation by the existing
+supported-type table.
+
+**Unused workspace.** Every TTNN per-owner host-transfer requirement is
+`{0, 1}`, so a complete binding of these checkpoints reports exactly `{0, 1}`
+and realizes with the default empty `RawWorkspaceView`: positive raw workspace
+remains unsupported TTNN scratch, the scenario never provisions a positive
+workspace allocation for this device, and a standard 16x16 tiled byte count is
+never mistaken for a native32 requirement.
+
+**One live context.** `TtnnDevices` owns exactly one TTNN context
+(`make_ttnn_device(0)`); a second TTNN device of the same ordinal cannot coexist
+in one process, so its `reference` and `foreign` slots are independently created
+CPU devices with their own allocator. The foreign-destination rejection
+therefore proves exact `Device` identity across two backend kinds rather than an
+equal backend kind and ordinal, and the CPU reference device remains the
+independent comparison device for every role.
+
+**Host-transfer failures and retained staging.** Realization is synchronous, so
+there is no queued token to wait for: every role's `copy_from_host` runs through
+the device's retained host-transfer staging (one byte slot per native upload
+dtype per plane plus one download buffer). The second case exercises the
+existing staging-allocation and single-plane submission seams on a weight
+upload. A failed retained allocation raises `std::bad_alloc` before any
+destination byte is written and retains nothing. A submission fault armed for a
+later upload throws that backend's `std::runtime_error` before the failed role's
+native submission, so the complete ordered binding stops immediately: every
+destination still holds the sentinel bytes of the earlier successful upload of
+that binding, no later role of the aborted call is uploaded, and the aborted
+call publishes nothing. The bounded recovery drain then completes the work the
+failed transfer had already submitted, after which the acquired staging returns
+to the facility; only the next normal `void` return is the publication
+permission, and it reuses the same retained slot rather than the failed attempt
+having freed or replaced storage that could still be read. Retired staging is
+freed only with the device. This adds no loader hook, no backend-kind switch, no
+second loader or harness, and no whole-checkpoint host copy or native format
+rewrite; the shared scenario keeps containing no failure-injection seam.
+
+**Invocation.** The TTNN gate is remote-only through `skill://csw-remote`
+(profile alias `ttnn`), which syncs this workspace to a unique mirror and
+preserves the existing `TTNN_ENABLED` configuration and SDK arguments. TTNN
+device execution can hang, so every invocation is bounded, and
+`/home/rlew/bin/ttnn_reset` resets the host device:
+
+```text
+cmake --build build --target iom_ttnn_conformance_tests
+timeout 300s ./build/test/iom_ttnn_conformance_tests --test-case="TTNN model loading*"
+ctest --test-dir build --output-on-failure -R '^iom_ttnn_conformance_tests$' --timeout 300
+```
+
+The first two commands are the focused model-loading gate and must report a
+nonempty selection; the third is the complete TTNN conformance regression that
+must keep passing. Session, tokenizer, and neural-operation coverage is not
+owned here.
+
 ### 11. Backend integration and conformance obligations
 
 The following source map is executable contract coverage. Shared scalar,
