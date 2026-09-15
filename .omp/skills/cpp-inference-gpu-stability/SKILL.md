@@ -13,7 +13,7 @@ Before any repository work, read `skill://boss` first. Then read `.omp/cpp-revie
 ## Invocation modes
 
 - **Orchestrated:** use the supplied resolved scope and return only `ST-###` candidate packets. This is candidate-only `boss-reviewer` execution at `@task`: do not resolve a new frontier, delegate recursively, invoke synthesis, write task files, or run validation gates.
-- **Standalone:** run as the root orchestration for this area after applying Boss's root-model warning-and-consent gate. Resolve scope and the optional task destination using the shared process, own the complete stability pass and acceptance, then invoke `cpp-inference-review-synthesis` to adversarially verify and directly materialize tasks. The skill cannot switch an already-running model; `@slow` remains preferred, while an explicitly accepted mismatch may continue.
+- **Standalone:** run as the root orchestration for this area after applying Boss's root-model approval and warning-and-consent gate. Resolve scope and the optional task destination using the shared process, own the complete stability pass and acceptance, then invoke `cpp-inference-review-synthesis` to adversarially verify and directly materialize tasks. The skill cannot switch an already-running model; `@slow` remains preferred, `@csw-yoda` is automatically approved, and any other mismatch requires explicit user consent.
 
 In selected-commit mode, accept only root causes introduced or materially exposed/worsened by the target.
 

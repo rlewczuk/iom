@@ -8,13 +8,13 @@ This document is the canonical protocol for the five review areas and their synt
 
 ## Roles, routing, and permissions
 
-The visible/root session is the accountable supervisor and should run as `@slow`. A skill cannot switch the model of an already-running session: prefer the user's role configuration or model override to select `@slow`, never claim that a skill auto-switched it, and apply `skill://boss`'s warning-and-consent gate when the running model differs. In this document, root `@slow` labels include a current-model deviation explicitly accepted through that gate.
+The visible/root session is the accountable supervisor and should run as `@slow`; `@csw-yoda` is also an automatically approved root launch alias. A skill cannot switch the model of an already-running session: prefer the user's role configuration or model override to select an approved alias, never claim that a skill auto-switched it, and apply `skill://boss`'s warning-and-consent gate for any other mismatch. In this document, root `@slow` labels include automatic `@csw-yoda` approval or a current-model deviation explicitly accepted through that gate.
 
 Every root invocation first follows `skill://boss`'s deterministic preflight. Its preserved `git`, `roles`, `models`, and `agents` values are the sole environment evidence for this process; do not repeat Git/OMP/profile discovery in this reference or a specialist skill. A failed preflight stops dispatch.
 
 | Lane | Profile and role | Allowed work | Prohibited work |
 |---|---|---|---|
-| Root supervisor | visible session; prefer `@slow`, with accepted mismatch allowed | resolve scope, route work, adjudicate invariants and candidates, freeze the assignment table, materialize/validate the final set, and report coverage | silently delegating accountability or claiming unrun validation |
+| Root supervisor | visible session; prefer `@slow`, with `@csw-yoda` automatically approved and other accepted mismatches allowed | resolve scope, route work, adjudicate invariants and candidates, freeze the assignment table, materialize/validate the final set, and report coverage | silently delegating accountability or claiming unrun validation |
 | Shared reconnaissance / bounded discovery | `scout`, `@smol` | read-only broad source discovery, search, specification mapping, backend/build map, and compact coverage mapping; this profile intentionally has no bash | design judgments, task drafting, broad repeated scans, or implementation changes |
 | Atomic lookup / named command | `boss-errand`, `@smol` | read-only atomic factual lookups, named read-only git/script commands and artifacts, exact followups, and path/collision/equivalence checks | broad source/spec discovery, frontier scans, design judgments, task drafting, or implementation changes |
 | Area review | `boss-reviewer`, `@task` | read-only bounded substantive analysis and independent falsification for exactly one area; return candidate packets | delegation, nested orchestration, task-file writes, or build/test/benchmark gates |

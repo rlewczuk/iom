@@ -12,7 +12,7 @@ Read `skill://boss` first. Then read `.omp/cpp-review/references/review-process.
 
 ## Boss routing contract
 
-The canonical routing, evidence, scope, synthesis, and verification contract is `.omp/cpp-review/references/review-process.md`; this skill adds only numerical-specific routing and evidence jobs. The visible/root session should run as `@slow`, but a different running model may continue after Boss displays the mismatch warning and the user explicitly consents; a skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
+The canonical routing, evidence, scope, synthesis, and verification contract is `.omp/cpp-review/references/review-process.md`; this skill adds only numerical-specific routing and evidence jobs. The visible/root session should run as `@slow`; `@csw-yoda` is also automatically approved, while any other mismatch requires Boss's warning and explicit user consent. A skill cannot switch an already-running model. The root owns scope, routing, acceptance, the assignment table, and verification.
 
 One root supervisor schedules one shared `scout (project read-only) @smol`, atomic `boss-errand @smol` follow-ups, and bounded read-only `boss-reviewer @task` analysis/falsification. Area leaves do not delegate, invoke orchestration or synthesis, write tasks, or run gates. Dispatch independent work in one batch, use exact known ranges when cheaper than another dispatch, and do not make gratuitous calls.
 

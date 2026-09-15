@@ -6,7 +6,7 @@ argument-hint: "[candidate packets] [review scope] [spec docs/changes/... option
 
 # Review Synthesis & Direct Task Materialization
 
-Read `skill://boss` **first**, before reading any repository file, reference, or other skill, and apply its root-model warning-and-consent gate. The visible/root session should run as `@slow`, but an explicitly accepted mismatch may continue on the current model; this skill cannot switch an already-running model. Then read:
+Read `skill://boss` **first**, before reading any repository file, reference, or other skill, and apply its root-model approval and warning-and-consent gate. The visible/root session should run as `@slow`; `@csw-yoda` is also automatically approved, while any other mismatch requires explicit user consent. This skill cannot switch an already-running model. Then read:
 
 - `.omp/cpp-review/references/finding-rubric.md`
 - `.omp/cpp-review/references/review-process.md`
@@ -16,7 +16,7 @@ The shared review process is canonical. This skill is the mandatory final pass f
 
 ## Synthesis routing
 
-The root session, preferably running as `@slow` under Boss's consent policy, owns packet intake, scope/coverage accountability, candidate acceptance, root-cause reconciliation, the complete assignment table, task materialization, generated-set validation, and the completion response. Synthesis is not a second broad repository review.
+The root session, preferably launched with `@slow` or the automatically approved `@csw-yoda` alias under Boss's consent policy, owns packet intake, scope/coverage accountability, candidate acceptance, root-cause reconciliation, the complete assignment table, task materialization, generated-set validation, and the completion response. Synthesis is not a second broad repository review.
 
 Use separate, bounded lanes:
 

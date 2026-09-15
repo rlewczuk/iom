@@ -6,7 +6,7 @@ argument-hint: "[whole codebase | commit <hash|message>] [spec docs/changes/... 
 
 # C++ Inference Engine Code Review — Orchestrator
 
-Read `skill://boss` **first**, before reading any repository file, reference, or other skill, and apply its root-model warning-and-consent gate. The visible/root session should run as `@slow`, but an explicitly accepted mismatch may continue on the current model; this skill cannot switch an already-running model. Then read `.omp/cpp-review/references/review-process.md` and `.omp/cpp-review/references/finding-rubric.md`. The shared process is canonical; this file supplies the full-review workflow and area routing.
+Read `skill://boss` **first**, before reading any repository file, reference, or other skill, and apply its root-model approval and warning-and-consent gate. The visible/root session should run as `@slow`; `@csw-yoda` is also automatically approved, while any other mismatch requires explicit user consent. This skill cannot switch an already-running model. Then read `.omp/cpp-review/references/review-process.md` and `.omp/cpp-review/references/finding-rubric.md`. The shared process is canonical; this file supplies the full-review workflow and area routing.
 
 Review a C++ inference engine with CPU and accelerator backends. Optimize for **semantic correctness, stability, low conceptual complexity, cross-backend integrity, and measured performance**.
 
@@ -49,7 +49,7 @@ Task lifecycle controls are canonical in task_ctl-managed `task.yml`, never in g
 
 ## Root and worker routing
 
-The root session, preferably running as `@slow` under Boss's consent policy, owns scope resolution, one shared reconnaissance map, invariant decisions, routing, candidate acceptance, the final assignment table, task materialization, generated-set validation, and the final response. It does not broad-scan the source or ingest unbounded raw logs.
+The root session, preferably launched with `@slow` or the automatically approved `@csw-yoda` alias under Boss's consent policy, owns scope resolution, one shared reconnaissance map, invariant decisions, routing, candidate acceptance, the final assignment table, task materialization, generated-set validation, and the final response. It does not broad-scan the source or ingest unbounded raw logs.
 
 Use these lanes exactly as defined by the shared protocol:
 
