@@ -3174,6 +3174,55 @@ a foreign-`Device` destination, a null final destination, a count one short or
 one long, and one owner bound to two equal-metadata roles all preserve the
 seeded destination sentinels with no published source or upload.
 
+#### CUDA loading conformance and observable inventory
+
+The CUDA driver adds no loader port and no second scenario:
+`test/cuda/test_cuda_conformance.cpp` registers the `CUDA model loading*` case
+of the existing `iom_cuda_conformance_tests` target, whose conditional
+registration is unchanged, and calls
+`iom_conformance::run_model_loading_conformance(devices.conformance())`
+unchanged with its own devices. The checkpoints, selected inventory, ordered
+destination binding, workspace ordering, byte comparison, and failure policy are
+exactly the CPU contract above; this subsection records only what is
+CUDA-specific.
+
+**CUDA setup.** The case opens with `REQUIRE(cuInit(0) == CUDA_SUCCESS)` and
+constructs the driver's `CudaDevices`: a CPU device owning the driver's checking
+host allocator as the comparison reference, the selected CUDA device on ordinal
+0 as the candidate, and a distinct second CUDA `Device` instance as the foreign
+destination owner, each with the driver's synthetic `DeviceMemoryConfig` arena.
+Both model-loading devices are real CUDA runtime, storage, and allocator
+machinery, and the same published source realizes on the CPU reference and on
+the CUDA candidate bit-for-bit. BF16 storage capability is required rather than
+a skip reason: the shared scenario creates every destination from the published
+BF16 specifications and its binding preflight rejects a device whose
+`supported_data_types()` omits BF16, so a CUDA configuration without BF16 fails
+the case.
+
+**CUDA workspace.** A CUDA destination reports the positive staging requirement
+of its own `host_transfer_workspace_requirements`, so the complete binding
+reports the maximum serial per-owner requirement, the caller provisions real
+`Device::create_workspace` scratch from that reported maximum, and the empty
+default view is refused before the first copied role with every destination byte
+left intact. The `{0, 1}` zero-workspace policy stays the behavior of branches
+whose own requirement is zero; CUDA neither subdivides nor extends it.
+
+**CUDA limitations.** No per-backend loader, CUDA-specific expectation,
+backend-kind switch, or CUDA runtime header enters the common scenario, and the
+expected bytes stay the fixture's own independent role bytes.
+`CudaStorageOracle` remains a native-layout diagnostic of the existing storage
+and transfer cases and is never a model-loading expected-byte generator. No
+host-transfer fault injection is introduced: the existing CUDA
+queued-operation injection seams prove queue submission behavior, not a
+synchronous loader failure, so this case asserts no loader runtime failure
+category of its own and the established CUDA and container categories of this
+section stay unchanged.
+
+```text
+cmake --build build --target iom_cuda_conformance_tests
+./build/test/iom_cuda_conformance_tests --test-case="CUDA model loading*"
+```
+
 #### ROCm loading conformance and observable inventory
 
 ROCm adds no loader and no second scenario. The driver registers the shared

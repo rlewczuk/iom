@@ -20,6 +20,7 @@
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
+#include "backend/backend_conformance_model_loading.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/cuda/device.hpp"
 #include "cuda/copy.hpp"
@@ -261,6 +262,20 @@ TEST_CASE("CUDA conformance: full shared suite") {
             &devices.gate, &oracle, true);
     CHECK_FALSE(devices.gate.armed());
 }
+
+// The CUDA instantiation of the shared model-loading scenario. Each synthetic
+// checkpoint is loaded through the production configuration and mapped-source
+// API, realized on the CPU reference and the selected CUDA devices, and read
+// back bit-for-bit against the fixture's independent role bytes. A CUDA
+// binding reports a positive staging requirement, so it realizes with
+// caller-provisioned scratch of the returned maximum and refuses the empty
+// default before the first copied role.
+TEST_CASE("CUDA model loading realizes every published weight role of each synthetic checkpoint") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_model_loading_conformance(devices.conformance());
+}
+
 TEST_CASE("CUDA binary conformance: ADD MUL SUB DIV real queue") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
