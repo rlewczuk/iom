@@ -1,12 +1,14 @@
 ---
 name: csw-plan
-description: Split a change specification into dependency-ordered, prioritized implementation or design mini-specifications. Use only through /csw-plan <task-name>[/subdirectory] [--impl|--hld] or when explicitly requested.
+description: Split a change specification into parallel-ready, prioritized implementation or design mini-specifications with only genuine dependencies. Use only through /csw-plan <task-name>[/subdirectory] [--impl|--hld] or when explicitly requested.
 hide: true
 ---
 
 # CSW Plan
 
 Turn one change specification into a compact, broad, shallow set of implementation or design tasks. **Target 10–20 meaningful immediate subtasks and at most two task levels below the original change specification. Prefer direct `impl` leaves; `hld` is an exception that must earn its extra planning pass.** Write one focused, self-contained mini-specification per task; do not implement the change. Implementation leaves must remain safe for a cheap flash-class model. Avoid repeated intermediate specifications: each extra handoff risks losing requirements and weakening leaf implementation context.
+
+**Maximize safe parallel implementation across the entire change. Start with independent tasks and add only proven prerequisites; never turn the ordered task list into a serial execution plan. This applies to every useful boundary, including independent tensor operations, backend implementations, and unrelated outcomes within the same component.**
 
 The command supplies a path relative to `.cswd/tasks/` and an optional generation mode:
 
@@ -88,7 +90,11 @@ The `@slow` root owns intake, mode resolution, complete requirement accounting, 
 
 Fact packets MUST provide exact `file:line` and symbol evidence, decisive minimal excerpts, a `done`/`partial`/`missing`/`discrepant` mapping, relevant conventions and focused test commands, inspected and uninspected areas, gaps, and separate `SOURCE FACTS` from `INFERENCE`. Batch truly independent discovery and disjoint writers, collect each phase before consuming its output, and do not split output tasks merely for parallelism. No worker delegates recursively; workers skip gates, tests, linters, builds, and formatters.
 
+These are planning-time discovery and writing barriers, not dependencies between the generated implementation tasks. Disjoint-writer rules, shared verification resources, and serialized integration protect execution; they MUST NOT become `blocked-by` edges without a required producer output.
+
 Every brief is self-contained: it states exact scope and files, established facts and decisions, required output, non-goals, acceptance criteria, and any blockers. Advisor `CONTENT` must inline the requirements and non-goals, decisive excerpts and facts, constraints, alternatives with trade-offs, and one exact question; a path or URI alone is invalid. If the advisor returns `NEED EVIDENCE`, route the exact factual question back to `csw-plan-facts`, append only the evidence delta, and keep the final decision at the root.
+
+Fact briefs MUST request evidence for both required producer/consumer relationships and independence, not just a list of plausible dependencies. Frozen writer briefs MUST include the required outputs behind each approved edge, the settled contracts that let independent siblings proceed, and ownership of any shared edit regions.
 
 This contract preserves the existing generation contract: precedence and path guards, minimal scope, omission of completed work, the task template, collision protection, self-contained mini-specs, ambiguity handling, and the concise completion response remain authoritative.
 
@@ -123,7 +129,9 @@ Explore only the project areas needed to decompose and anchor the change. Read r
 - the actual files and symbols each remaining change touches;
 - local implementation and test conventions to reuse;
 - existing facilities or extension points that avoid new machinery;
-- dependency edges between pieces of work.
+- required producer outputs and the exact consumers that need them;
+- evidence of independence across outcomes, including tensor operations and backends that share an interface but not implementation outputs;
+- shared edit regions versus read-only analogues, and whether mutation ownership can be partitioned without a semantic prerequisite.
 
 Classify each source requirement as **done**, **partial**, **missing**, or **discrepant**. Generate tasks only for the remaining work. Do not trust a path, symbol, signature, or current-behavior claim until checked when it affects a task.
 
@@ -171,9 +179,26 @@ If no implementation work remains, create no task directories and report that th
 
 ### 4. Build and prioritize the task graph
 
-The root owns priorities and genuine dependency edges. `task_ctl plan` performs the topological sort, numbering, exact blocker-ID substitution, and collision checks. `boss-errand` may invoke it against root-approved candidates; it does not discover substantive source facts.
+The root owns priorities and genuine dependency edges. `task_ctl plan` only validates and orders the graph supplied by the root: it performs the topological sort, numbering, exact blocker-ID substitution, and collision checks. It cannot detect unnecessary semantic dependencies or discover missed parallelism. `boss-errand` may invoke it against root-approved candidates; it does not make those judgments.
 
-For every candidate task, identify only genuine blocking edges. A blocker is work whose output is required before the task can be planned, implemented, or verified; conceptual similarity is not a dependency. State which output is needed. Writing or decomposing an `hld` spec does not satisfy a blocker that requires its implemented behavior; that blocker remains until the required descendants are implemented and verified.
+#### Dependency-minimization gate — mandatory before numbering
+
+**Default to `blocked-by: []`. Every edge needs proof; every independent pair MUST remain unordered by the dependency graph, with neither a direct edge nor an artificial transitive path between them. An acyclic graph is not enough: an unnecessary serial chain fails planning.**
+
+Before freezing candidates, the root MUST:
+
+1. **Inventory inputs and outputs.** For each candidate, identify its delivered behavior/artifacts, the precise interfaces or state it consumes, its implementation and focused verification touchpoints, and shared edit ownership. Distinguish existing facilities and contracts settled during this planning pass from missing implementation outputs. Resolve shared design decisions now rather than requiring one implementation to serve as the next task's design input.
+2. **Search the whole decomposition for independence.** Compare candidates across and within components, operations, backends, formats, and test scopes—not just adjacent rows. Split independently implementable outcomes and different prerequisite sets where they form meaningful leaf-ready tasks; do not keep unrelated work in a serial bundle merely because it shares a component or file. Preserve the breadth/depth and no-padding rules; do not invent a task for every operation/backend combination.
+3. **Prove each proposed edge.** For “B is blocked by A,” name the exact output B consumes, evidence that it is unavailable without A, and what in B's scoped implementation or focused acceptance would be impossible or incorrect without it. Ask: **with the existing repository and frozen boundary contracts, can B be implemented and independently verified without waiting for A's output?** If yes, omit the edge. If evidence is missing, investigate or resolve the blocking ambiguity; neither guess a dependency nor discard a real prerequisite to widen the graph. Preserve source-mandated sequencing. Every retained edge MUST have non-empty `remarks` naming the required output and why this consumer needs it.
+4. **Reject incidental sequencing.** Input order, directory numbers, priority, conceptual similarity, an implementation analogue, “do one backend/operation first,” shared files, a shared test suite or accelerator, limited workers, review order, and serialized integration are not producer/consumer dependencies. Settle reusable contracts/algorithms in the mini-specs instead of making later leaves wait to copy an earlier implementation. Partition shared edit regions or assign the common mutation to one owner; coordinate unavoidable resource contention during execution. If a task genuinely consumes another task's changed code or state, retain that precise prerequisite—not a chain across every task touching the file.
+5. **Use minimal prerequisites and real joins.** When required common implementation is missing, isolate that cohesive outcome if necessary and let every consumer depend directly on it, not on one another. If the common contract/facility already exists, do not create a prerequisite task. Keep focused verification with its behavior; only genuinely required cross-cutting verification belongs in a join depending on the outputs it actually checks. Do not weaken acceptance or add scaffolding to manufacture concurrency. Attach blockers at the narrowest scope needing them: an `hld` blocker gates all its descendants, so regroup instead of lifting one branch's prerequisite onto unrelated leaves.
+6. **Falsify the graph before writing.** Challenge every edge with the counterfactual above, remove unnecessary edges and redundant transitive restatements, then check reachability between every pair identified as independent. Inspect serial chains for missed fan-out and joins for unrelated inputs; a chain through an intermediate task still serializes its endpoints. Reassess inherited edges on replans rather than copying a historical chain. Every task may proceed once its own genuine blockers are complete; never require a whole numbered group or parallel frontier to finish before an unrelated branch proceeds.
+
+For example, when a shared API implementation is genuinely missing, use `shared-api → {CUDA, ROCm, SYCL, TTNN}` and, only if required, `{CUDA, ROCm, SYCL, TTNN} → cross-backend-verification`. Never use `CUDA → ROCm → SYCL → TTNN` merely as a preferred implementation order. With the API already available, all four backend tasks have empty blocker lists.
+
+Likewise, independently implementable tensor operations such as add, multiply, activation, and reduction remain siblings with no mutual dependencies, even within one backend or a shared dispatch/test file. A genuinely composed operation that consumes new add and activation implementations depends on those outputs, not on unrelated multiply or reduction work. These are examples of the general rule, not backend- or operation-specific exceptions.
+
+Writing or decomposing an `hld` spec does not satisfy a blocker that requires its implemented behavior; that blocker remains until the required descendants are implemented and verified. **Reject and revise an over-serialized draft before calling `task_ctl plan`; do not defer dependency minimization to writers or the execution scheduler.**
 
 Assign a priority:
 
@@ -181,17 +206,19 @@ Assign a priority:
 - **P1** — required feature behavior on the normal implementation path;
 - **P2** — required finishing work such as cross-cutting verification or documentation that does not gate implementation.
 
-All generated tasks are required; P2 never means optional. The control schema also accepts P3, but this workflow's priority policy remains P0–P2. Supply root-approved candidates to `task_ctl plan '<task-id>' '<candidate-list-as-yaml>'` in parent requirement order. Each candidate supplies a precise lowercase kebab-case `slug`, `type`, `priority`, and `blocked-by` records. For an edge to another proposed candidate, use its slug as the planning input's `task-id`; the script replaces it with the exact generated task ID. Use canonical IDs for existing external prerequisites. Put the required prerequisite output in optional `remarks`, not in an ambiguous free-form blocker field.
+All generated tasks are required; P2 never means optional. The control schema also accepts P3, but this workflow's priority policy remains P0–P2. Supply root-approved candidates to `task_ctl plan '<task-id>' '<candidate-list-as-yaml>'` in parent requirement order. Each candidate supplies a precise lowercase kebab-case `slug`, `type`, `priority`, and an explicit `blocked-by` list. For an edge to another proposed candidate, use its slug as the planning input's `task-id`; the script replaces it with the exact generated task ID. Use canonical IDs for existing external prerequisites. Although `remarks` is optional in the general control schema, this planner MUST supply the output-specific rationale required by the dependency-minimization gate for every edge.
 
-The script returns dependency-first order, breaking ties by priority and then input order, assigns orders starting at 1 and `<NN>-<slug>` destinations, and reports occupied destinations. Preserve its returned IDs, orders, source paths, and blocker records verbatim. Do not hand-sort, allocate numbers, or infer dependencies from prefixes. When tasks are independent, supply an empty blocker list.
+The script returns dependency-first order, breaking ties by priority and then input order, assigns orders starting at 1 and `<NN>-<slug>` destinations, and reports occupied destinations. Preserve its returned IDs, orders, source paths, and blocker records verbatim. Do not hand-sort, allocate numbers, or infer dependencies from prefixes. This is a stable display/scheduling order, not a serial execution mandate: numbering or priority never adds blockers. Independent consumers may share a genuine prerequisite but have no mutual blockers; tasks with no genuine prerequisites keep empty lists.
 
 Use short slugs describing delivered behavior, not `setup`, `misc`, `changes`, or `cleanup`. Never silently overwrite an occupied destination. If it is the same source and outcome, revise carefully; otherwise choose a distinct precise slug, rerun `plan`, and report the collision. Equivalence is a root judgment; collision detection is script-owned.
 
 ### 5. Write one self-contained mini-spec per task
 
-Only after the root passes the breadth/depth and HLD admission gates and freezes the complete script-returned assignment table, type-readiness rationale, requirements, and acceptance does `boss-builder-fast` (`@smol`) write mini-spec prose and invoke `task_ctl set` for each task's control. The writer cannot redesign tasks, change types, allocate numbers, or directly write `task.yml`.
+Only after the root passes the breadth/depth, HLD admission, and dependency-minimization gates and freezes the complete script-returned assignment table, type-readiness rationale, requirements, and acceptance does `boss-builder-fast` (`@smol`) write mini-spec prose and invoke `task_ctl set` for each task's control. The writer cannot redesign tasks, change types or blockers, allocate numbers, or directly write `task.yml`.
 
 Each mini-spec is either a direct implementation contract (`impl`) or a bounded input to a later design/decomposition pass (`hld`). It must be understandable without reading the parent specification, fixme file, conversation, or sibling task specs. Repeat the few shared decisions needed by the task instead of saying “follow the parent spec” or “same as the previous task.” References to blockers provide sequencing, not missing requirements.
+
+Do not reintroduce hidden dependencies in prose, references, or acceptance criteria: no “after the previous task,” reliance on an unfinished sibling as the only implementation recipe, or unrelated sibling-completion gate. Carry the frozen shared contract and owned edit scope into each independent leaf. If writing reveals an actual missing prerequisite or overlapping mutation contract, report it to the root for resolution and a revised frozen graph; do not silently add sequencing.
 
 Create or update each child's control with `task_ctl set '<exact-child-id>' --type '<impl|hld>' --status new --order '<integer>' --priority '<P0|P1|P2>' --blocked '<YAML-list-of-task-id-and-optional-remarks-records>' --source '<parent-spec-path>'`. Use the frozen table's values verbatim. Preserve a revised existing task's lifecycle unless the root explicitly determines the revision invalidates that state; never reset completion incidentally. A whole configuration may instead be passed to `set --all`; this is script input, never file content written by the model.
 
@@ -240,6 +267,7 @@ Mini-spec writing rules:
 - Choose the writing contract by each child's Type, not by the invocation mode. An `impl` child generated in Design mode is still ready for direct implementation: use `Implementation references`, implementation acceptance, and executable verification; never require another planning pass or use design-completion acceptance for it.
 - For `hld`, rename `Implementation references` to `Design references`; cite verified component/interface touchpoints and useful analogues, not speculative modify lists. Keep Outcome and Requirements about the eventual delivered behavior. Add `## Decomposition requirements` describing the next logical boundaries, internal decisions still to settle, contracts to preserve, and how to reach flash-sized leaves. Acceptance criteria must distinguish the completed design breakdown from eventual implementation acceptance and carry both forward. Verification describes checks of coverage, contracts, dependency order, and leaf readiness plus the eventual integration/runtime strategy; label implementation commands as future checks, not work executed by the design planner.
 - An `hld` spec must explicitly require further planning before its own implementation. In `Decomposition requirements`, carry the original change root, this task's level, the 10–20 meaningful-child target, the expected direct `impl` leaf boundaries, and the requirement to finish within two levels below that root. Carry any justified breadth/depth exception and its evidence; nested planning MUST NOT reset the depth allowance. The next pass writes immediate child specs under this directory using the same template, normally all `impl`; an `hld` child requires a fresh admission check and explicit depth justification, not automatic recursion. Only `impl` descendants can be implemented after blockers complete; siblings need not all reach leaves first. Do not pre-generate descendants or introduce a separate design-document format.
+- Carry the dependency-minimization gate into every `hld` task's `Decomposition requirements`: independent descendant outcomes must have no mutual dependencies, shared prerequisites must have output-specific evidence, and planning/integration phases must not become implementation barriers. Preserve independence across HLD boundaries as well as within each group.
 
 - Keep only information needed to implement or further decompose this task. Do not copy the entire parent specification.
 - State concrete behavior, not vague directions such as “handle appropriately,” “support as needed,” or “update relevant files.”
@@ -270,6 +298,8 @@ Before completing:
 - account for every required source behavior exactly once, except intentional repetition needed to keep mini-specs self-contained;
 - confirm completed behavior has no task and every remaining requirement has one;
 - use `task_ctl plan` output and `task_ctl list '<task-id>' --full` to verify the generated set matches the frozen dependency/priority order; the script validates types, records, paths, and cycles rather than the model parsing metadata;
+- repeat the dependency-minimization gate against the final controls and prose: every edge has a concrete required-output rationale; no hidden sequencing, unnecessary direct edge, or artificial transitive path orders independent tasks;
+- explicitly check backend siblings, tensor-operation siblings, shared-file ownership, HLD ancestor blockers, and cross-cutting joins where present; all useful safe parallelism must survive, and every retained serial chain must be necessary rather than merely convenient;
 - confirm each script-returned type satisfies the selected mode and leaf-readiness check;
 - in Implementation mode, confirm all tasks are `impl`; in Design and Automatic modes, confirm refinement toward direct leaves was attempted and every retained `hld` passes the admission check; mode selection alone never justifies an HLD layer;
 - enforce the breadth/depth gate: target 10–20 immediate children, permit fewer only with a concrete specification-shortage rationale, justify more than 20, and normally end all branches at level 1 or 2 relative to the original root;
@@ -285,6 +315,10 @@ After all generated children and their contracts pass the consistency check, wri
 # <Parent task title> — planning summary
 
 <Brief task goal, scope, effective mode, and decomposition rationale.>
+
+## Parallelism and dependency rationale
+
+<Identify tasks that can proceed concurrently, their genuine shared prerequisites if any, and the required outputs justifying remaining serial chains and joins. Describe opportunities, not execution waves: each task unlocks after its own blockers, without waiting for unrelated branches. This is a derived explanation of the verified graph, not additional dependency metadata.>
 
 ## Generated tasks
 
@@ -304,6 +338,7 @@ Report only:
 - the ordered task list with order, type, priority, directory path, and blockers;
 - the path to the generated `summary.md`;
 - one sentence giving the effective mode, immediate child count, expected original-root-relative leaf depth, and granularity/type rationale; explicitly explain fewer than 10 children or any depth exception;
+- one sentence identifying the available parallel branches and genuine prerequisite/join boundaries; task numbering does not imply serial execution;
 - any material ambiguity, collision, or residual risk.
 
 Keep the response concise. The generated mini-specifications are the primary deliverable.

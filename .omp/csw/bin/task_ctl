@@ -155,6 +155,14 @@ IDs, sets ``status: new`` and ``source: PARENT/spec.md``, and emits the proposed
 records with a ``collision`` boolean.  It never creates or changes files;
 the caller resolves semantic equivalence and collisions and reruns.
 
+The caller supplies the dependency graph; ``plan`` neither infers blockers
+from input order, priority, or numbered IDs nor removes unnecessary supplied
+edges.  Omitted or empty ``blocked-by`` stays empty in the proposal.  A sorted,
+acyclic plan is not proof that its semantic prerequisites are minimal: the
+caller must justify each edge and preserve independent outcomes (including
+operations and backends) as unordered siblings.  ``remarks`` is optional in
+this general schema; csw-plan requires an output-specific rationale per edge.
+
 Controls are authoritative.  Commands never inspect lifecycle metadata in
 Markdown.  ``task.md`` is implementation evidence only; current execution
 outcomes may be recorded there under ``**Outcome:**`` by the execution
