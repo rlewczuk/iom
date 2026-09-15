@@ -16,6 +16,20 @@ target_link_libraries(iom_scalar_add_tests
 
 add_test(NAME iom_scalar_add_tests COMMAND iom_scalar_add_tests)
 
+# Opt-in real-checkpoint loading verification (change 0006-tinyllama /
+# 02-configuration-weight-loading). Default OFF: an ordinary configuration
+# compiles and runs the whole suite without any model artifact, hardcoded path,
+# or download. When ON, each existing conformance target below compiles one
+# additional `<Backend> real model loading` case that loads the caller-supplied
+# official checkpoint directory named by the runtime `IOM_TEST_MODEL_DIR` and
+# pinned `IOM_TEST_MODEL_ID`; the standard-GPU targets also read
+# `IOM_TEST_MODEL_ARENA_BYTES`, because the synthetic arena cannot hold that
+# reference. No new executable or test target is created.
+option(IOM_TEST_REAL_MODEL_LOADING
+    "Compile the opt-in real-checkpoint loading cases into the existing backend conformance tests"
+    OFF
+)
+
 add_executable(iom_tests
         test_iom.cpp
         test_mmap.cpp
@@ -113,6 +127,16 @@ function(add_iom_backend_tests name)
         target_compile_definitions(iom_${name}_conformance_tests
             PRIVATE
                 ${arg_COMPILE_DEFINITIONS}
+        )
+    endif()
+
+    # The opt-in real-checkpoint loading case is compiled into the enabled
+    # conformance executable only, so an OFF configuration and every smoke
+    # target stay artifact-free.
+    if(IOM_TEST_REAL_MODEL_LOADING)
+        target_compile_definitions(iom_${name}_conformance_tests
+            PRIVATE
+                IOM_TEST_REAL_MODEL_LOADING=1
         )
     endif()
 
@@ -243,6 +267,16 @@ target_link_libraries(iom_backend_conformance_cpu_tests
 )
 
 add_test(NAME iom_backend_conformance_cpu_tests COMMAND iom_backend_conformance_cpu_tests)
+
+# The CPU conformance executable is created directly rather than through
+# `add_iom_backend_tests`, so the opt-in real-checkpoint loading case is enabled
+# on it here with the same option.
+if(IOM_TEST_REAL_MODEL_LOADING)
+    target_compile_definitions(iom_backend_conformance_cpu_tests
+        PRIVATE
+            IOM_TEST_REAL_MODEL_LOADING=1
+    )
+endif()
 
 if(TTNN_ENABLED)
     add_iom_backend_tests(ttnn

@@ -611,4 +611,357 @@ inline void run_model_loading_conformance(const ConformanceDevices& devices) {
     model_loading::run_final_role_rejection_case(devices, "final-role");
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in real-checkpoint loading verification.
+//
+// Everything below is compiled only with `IOM_TEST_REAL_MODEL_LOADING=ON`, so
+// an ordinary build contains no environment intake, no checkpoint path, and no
+// real-loading code at all. The case loads a caller-supplied official
+// checkpoint on the driver's selected device and records its execution
+// evidence; nothing is downloaded, no directory is defaulted, and no missing,
+// invalid, or insufficient input is skipped, substituted, or partially loaded.
+// ---------------------------------------------------------------------------
+#ifdef IOM_TEST_REAL_MODEL_LOADING
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <optional>
+
+namespace model_loading {
+
+// The pinned official TinyLlama reference this case validates: the published
+// `TinyLlama/TinyLlama-1.1B` configuration `N22, H2048, I5632, Hq32, Hkv4, D64,
+// V32000, C2048` with exactly `3 + 9*N` required BF16 roles.
+inline constexpr std::size_t kOfficialLayers = 22;
+inline constexpr std::size_t kOfficialHidden = 2048;
+inline constexpr std::size_t kOfficialIntermediate = 5632;
+inline constexpr std::size_t kOfficialQueryHeads = 32;
+inline constexpr std::size_t kOfficialKeyValueHeads = 4;
+inline constexpr std::size_t kOfficialHeadDim = 64;
+inline constexpr std::size_t kOfficialVocab = 32000;
+inline constexpr std::size_t kOfficialContext = 2048;
+inline constexpr std::size_t kOfficialKeyValueWidth =
+        kOfficialKeyValueHeads * kOfficialHeadDim;
+inline constexpr std::size_t kOfficialRoles = 3 + 9 * kOfficialLayers;
+
+// The exact nonempty value of one environment variable, or `std::nullopt` when
+// it is unset or empty: nothing is defaulted and no directory is searched.
+inline std::optional<std::string> optional_environment(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return std::nullopt;
+    }
+    return std::string(value);
+}
+
+// The same value, required: a missing or empty variable fails this case here
+// instead of skipping or falling back to a synthetic input.
+inline std::string required_environment(const char* name,
+                                        std::string_view expectation) {
+    if (const std::optional<std::string> value = optional_environment(name)) {
+        return *value;
+    }
+    REQUIRE_MESSAGE(false, name << " must be set to " << expectation
+                                << " for the opt-in real model loading check");
+    return std::string();
+}
+
+// One caller-supplied arena byte count: a positive decimal count divisible by
+// 32, which is exactly what a standard-GPU `DeviceMemoryConfig` accepts.
+inline std::size_t parse_arena_bytes(const std::string& text) {
+    const bool decimal =
+            text.find_first_not_of("0123456789") == std::string::npos;
+    std::size_t bytes = 0;
+    bool parsed = false;
+    if (decimal) {
+        try {
+            const unsigned long long value = std::stoull(text);
+            parsed = value <= std::numeric_limits<std::size_t>::max();
+            bytes = static_cast<std::size_t>(value);
+        } catch (const std::exception&) {
+            parsed = false;
+        }
+    }
+    if (!parsed || bytes == 0 || bytes % 32 != 0) {
+        REQUIRE_MESSAGE(false, "an arena must be a positive decimal byte count "
+                               "divisible by 32: " << text);
+        return 0;
+    }
+    return bytes;
+}
+
+// The standard-GPU memory configuration of this case: the driver reserves the
+// caller-selected real capacity instead of the synthetic conformance arena,
+// which cannot hold the full official reference.
+inline iom::DeviceMemoryConfig real_model_memory_config() {
+    return iom::DeviceMemoryConfig{parse_arena_bytes(required_environment(
+            "IOM_TEST_MODEL_ARENA_BYTES",
+            "the standard-GPU tensor arena capacity in bytes"))};
+}
+
+// The reported name of one backend kind, for the evidence record only: no
+// behavior of this case depends on it.
+inline const char* backend_kind_name(iom::BackendKind kind) noexcept {
+    switch (kind) {
+    case iom::BackendKind::CPU:
+        return "CPU";
+    case iom::BackendKind::CUDA:
+        return "CUDA";
+    case iom::BackendKind::ROCM:
+        return "ROCm";
+    case iom::BackendKind::SYCL:
+        return "SYCL";
+    case iom::BackendKind::TTNN:
+        return "TTNN";
+    }
+    return "unknown";
+}
+
+// The exact invocation this case runs under: the process argv when the host
+// exposes it, so the record never claims a command that did not run.
+inline std::string invocation_record() {
+    std::ifstream command_line("/proc/self/cmdline", std::ios::binary);
+    std::string bytes{std::istreambuf_iterator<char>(command_line),
+                      std::istreambuf_iterator<char>()};
+    for (char& byte : bytes) {
+        if (byte == '\0') {
+            byte = ' ';
+        }
+    }
+    if (!bytes.empty() && bytes.back() == ' ') {
+        bytes.pop_back();
+    }
+    if (bytes.empty()) {
+        return "<unavailable>";
+    }
+    return bytes;
+}
+
+// The execution-evidence record of one real-checkpoint loading run. It prints
+// the caller environment, the pinned identity, the external artifact manifest,
+// the actual backend kind, ordinal, and `Device` identity, the exact
+// invocation, the required role count, the checked byte totals, and the
+// pass/failure result, so a run log carries the whole record the contract
+// requires. The result line reports failure unless the synchronous upload
+// returned, because only that normal return is the publication permission.
+class RealModelEvidence final {
+public:
+    RealModelEvidence(iom::Device& device, const std::string& directory,
+                      const std::string& identity,
+                      std::optional<std::size_t> arena) {
+        record("iom real model loading evidence");
+        record("  invocation      : " + invocation_record());
+        record("  backend kind    : " +
+               std::string(backend_kind_name(device.backend_kind())));
+        record("  backend ordinal : " +
+               std::to_string(device.backend_device()));
+        record("  device identity : instance " + device_identity(device));
+        record("  model directory : " + directory);
+        record("  pinned model id : " + identity);
+        record("  sha256 manifest : " + manifest_record(directory));
+        record("  arena bytes     : " +
+               (arena.has_value() ? std::to_string(*arena)
+                                  : std::string("none (native storage)")));
+        record("  required roles  : " + std::to_string(kOfficialRoles) +
+               " BF16");
+    }
+
+    RealModelEvidence(const RealModelEvidence&) = delete;
+    RealModelEvidence& operator=(const RealModelEvidence&) = delete;
+
+    // The checked aggregate standard tiled weight total of the complete
+    // official inventory.
+    void aggregate(std::size_t bytes) const {
+        record("  aggregate bytes : " + std::to_string(bytes) +
+               " (checked standard tiled weights)");
+    }
+
+    // The maximum serial host-transfer requirement this binding queried from
+    // the real destinations.
+    void scratch(const iom::WorkspaceRequirements& requirement) const {
+        record("  scratch         : " + std::to_string(requirement.bytes) +
+               " bytes / alignment " + std::to_string(requirement.alignment));
+    }
+
+    void pass() noexcept { passed_ = true; }
+
+    ~RealModelEvidence() {
+        record(std::string("  result          : ") +
+               (passed_ ? "PASS" : "FAIL"));
+        std::fflush(stdout);
+    }
+
+private:
+    static void record(const std::string& line) {
+        std::printf("%s\n", line.c_str());
+    }
+
+    // The exact instance identity of the selected device, so two runs of the
+    // same backend and ordinal are distinguishable.
+    static std::string device_identity(const iom::Device& device) {
+        char text[32] = {};
+        std::snprintf(text, sizeof(text), "%p",
+                      static_cast<const void*>(&device));
+        return std::string(text);
+    }
+
+    // The externally collected config/shard SHA-256 manifest of this checkpoint
+    // directory: the caller may pass the retained `sha256sum` output through
+    // `IOM_TEST_MODEL_SHA256`, and otherwise the exact collection command is
+    // recorded so the manifest stays bound to this run.
+    static std::string manifest_record(const std::string& directory) {
+        if (const std::optional<std::string> supplied =
+                    optional_environment("IOM_TEST_MODEL_SHA256")) {
+            return *supplied;
+        }
+        return "collect with: sha256sum " + directory + "/config.json " +
+               directory + "/*.safetensors";
+    }
+
+    bool passed_ = false;
+};
+
+// The complete official expectation of the pinned reference, encoded from the
+// constants above and the fixture's independent layer role plan, so a wrong
+// role, layer, order, or shape fails instead of matching the loader by
+// construction.
+inline std::vector<iom_model_loading::ExpectedWeight>
+official_expected_inventory() {
+    std::vector<iom_model_loading::ExpectedWeight> expected{
+            {{iom::ModelWeightRole::token_embedding, std::nullopt},
+             {kOfficialVocab, kOfficialHidden}},
+            {{iom::ModelWeightRole::final_norm, std::nullopt},
+             {1, kOfficialHidden}},
+            {{iom::ModelWeightRole::lm_head, std::nullopt},
+             {kOfficialVocab, kOfficialHidden}},
+    };
+    for (std::size_t layer = 0; layer < kOfficialLayers; ++layer) {
+        for (const auto& role : iom_model_loading::layer_weight_plan(
+                     kOfficialHidden, kOfficialIntermediate,
+                     kOfficialKeyValueWidth)) {
+            expected.push_back(
+                    iom_model_loading::ExpectedWeight{{role.first, layer},
+                                                      role.second});
+        }
+    }
+    return expected;
+}
+
+// The checked sum of two byte counts, so an impossible aggregate fails instead
+// of wrapping into a plausible arena comparison.
+inline std::size_t checked_total(std::size_t total, std::size_t bytes) {
+    REQUIRE_MESSAGE(total <= std::numeric_limits<std::size_t>::max() - bytes,
+                    "the checked byte total must not overflow: "
+                            << total << " + " << bytes);
+    return total + bytes;
+}
+
+// The one shared real-checkpoint loading case: it reads the caller's explicit
+// model directory and pinned identity, validates the complete official
+// inventory before any data tensor exists, creates one caller-owned
+// destination per published role on the selected device, queries that binding's
+// real workspace maximum, provisions scratch only when it is positive, and
+// synchronously uploads all 201 roles. Only the normal return of that upload is
+// success: there is no skip path, no default directory, no download, no
+// synthetic substitute, and no readback, generation, logits, or performance
+// claim.
+inline void real_model_loading_case(iom::Device& device) {
+    const std::string directory = required_environment(
+            "IOM_TEST_MODEL_DIR",
+            "the caller-supplied official checkpoint directory");
+    const std::string identity = required_environment(
+            "IOM_TEST_MODEL_ID",
+            "the pinned checkpoint revision or digest-manifest identity");
+
+    // A standard-GPU caller reserves this arena at device construction; CPU and
+    // TTNN own their storage natively and supply none. When it is present the
+    // complete checkpoint must fit it, so an inadequate arena fails before the
+    // first data tensor exists instead of half-loading a model.
+    std::optional<std::size_t> arena;
+    if (const std::optional<std::string> supplied =
+                optional_environment("IOM_TEST_MODEL_ARENA_BYTES")) {
+        arena = parse_arena_bytes(*supplied);
+    }
+
+    RealModelEvidence evidence(device, directory, identity, arena);
+
+    const std::filesystem::path path(directory);
+    REQUIRE_MESSAGE(std::filesystem::is_directory(path),
+                    "IOM_TEST_MODEL_DIR must name an existing checkpoint "
+                    "directory: " << directory);
+
+    const std::unique_ptr<iom::ModelSource> source =
+            iom::load_tinyllama_safetensors(path);
+    REQUIRE(source != nullptr);
+
+    // The pinned official identity, checked before any destination is created.
+    const iom::TinyLlamaConfig& config = source->config();
+    REQUIRE(config.num_hidden_layers == kOfficialLayers);
+    REQUIRE(config.hidden_size == kOfficialHidden);
+    REQUIRE(config.intermediate_size == kOfficialIntermediate);
+    REQUIRE(config.num_attention_heads == kOfficialQueryHeads);
+    REQUIRE(config.num_key_value_heads == kOfficialKeyValueHeads);
+    REQUIRE(config.vocab_size == kOfficialVocab);
+    REQUIRE(config.max_position_embeddings == kOfficialContext);
+    REQUIRE(config.head_dim == kOfficialHeadDim);
+    REQUIRE(source->weights().size() == kOfficialRoles);
+    iom_model_loading::check_inventory(*source,
+                                       official_expected_inventory());
+
+    // The checked aggregate standard tiled weight total of the complete
+    // official inventory, still before the first data tensor exists.
+    std::size_t aggregate = 0;
+    for (std::size_t index = 0; index < source->weights().size(); ++index) {
+        aggregate = checked_total(
+                aggregate, source->tensor_spec(index).tiled_storage_nbytes());
+    }
+    evidence.aggregate(aggregate);
+    if (arena.has_value()) {
+        REQUIRE_MESSAGE(*arena >= aggregate,
+                        "the caller arena must hold the complete official "
+                        "weight inventory: " << *arena << " < " << aggregate);
+    }
+
+    // One caller-owned destination per published role on the selected device,
+    // its queried maximum, scratch only when that maximum is positive, and then
+    // the synchronous upload of every role. No second device, no reference
+    // payload, and no readback: the normal return of the upload is the whole
+    // success this loading-only check claims.
+    DestinationBinding binding = create_binding(device, *source);
+    const iom::WorkspaceRequirements reported = query_requirement(
+            device, *source, binding, "real model loading");
+    evidence.scratch(reported);
+    if (arena.has_value()) {
+        const std::size_t required = checked_total(aggregate, reported.bytes);
+        REQUIRE_MESSAGE(*arena >= required,
+                        "the caller arena must hold the complete official "
+                        "weight inventory plus its queried scratch maximum: "
+                                << *arena << " < " << required);
+    }
+    const std::unique_ptr<iom::RawWorkspace> scratch =
+            provision_scratch(device, reported);
+    source->upload_weights(device, binding.span(), scratch_of(scratch));
+    evidence.pass();
+}
+
+}  // namespace model_loading
+
+// The standard-GPU environment intake of the opt-in real-checkpoint case. The
+// selected device must already be constructed with this configuration, because
+// the caller-selected arena is a device-construction value.
+inline iom::DeviceMemoryConfig real_model_memory_config() {
+    return model_loading::real_model_memory_config();
+}
+
+// The one shared real-checkpoint loading case every backend driver calls with
+// its selected device, compiled only with `IOM_TEST_REAL_MODEL_LOADING=ON`.
+inline void run_real_model_loading(iom::Device& device) {
+    model_loading::real_model_loading_case(device);
+}
+
+#endif  // IOM_TEST_REAL_MODEL_LOADING
+
 }  // namespace iom_conformance

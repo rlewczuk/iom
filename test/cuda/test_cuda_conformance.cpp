@@ -276,6 +276,21 @@ TEST_CASE("CUDA model loading realizes every published weight role of each synth
     iom_conformance::run_model_loading_conformance(devices.conformance());
 }
 
+// Opt-in real-checkpoint loading, compiled only with
+// `IOM_TEST_REAL_MODEL_LOADING=ON`. The synthetic conformance arena is
+// deliberately not reused: it cannot hold the full official reference, so the
+// caller selects the real capacity through `IOM_TEST_MODEL_ARENA_BYTES` and a
+// missing, invalid, or insufficient value fails this case instead of silently
+// shrinking the run.
+#ifdef IOM_TEST_REAL_MODEL_LOADING
+TEST_CASE("CUDA real model loading") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    const std::unique_ptr<iom::Device> candidate = iom::make_cuda_device(
+            0, iom_conformance::real_model_memory_config());
+    iom_conformance::run_real_model_loading(*candidate);
+}
+#endif
+
 TEST_CASE("CUDA binary conformance: ADD MUL SUB DIV real queue") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;

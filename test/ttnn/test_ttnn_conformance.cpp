@@ -2579,3 +2579,23 @@ TEST_CASE("TTNN model loading: failed weight uploads publish nothing and retain 
     iom_conformance::model_loading::require_realized_bytes(
             later, entries, "publication after a failed later upload");
 }
+
+// Opt-in real-checkpoint loading, compiled only with
+// `IOM_TEST_REAL_MODEL_LOADING=ON`: the ordinary TTNN suite reads no model
+// directory and downloads nothing. TTNN owns native per-plane storage and takes
+// no caller arena, so this case is the existing `TtnnDevices` fixture - one
+// live TTNN context on the selected device, with the CPU reference and foreign
+// slots this driver already establishes - and the shared case loads the caller's
+// official checkpoint through it. BF16 remains mandatory: a device that cannot
+// host the published BF16 roles fails here rather than skipping.
+#ifdef IOM_TEST_REAL_MODEL_LOADING
+TEST_CASE("TTNN real model loading") {
+    require_hardware();
+    TtnnDevices devices;
+    const std::span<const iom::DataType> supported =
+            devices.candidate->supported_data_types();
+    REQUIRE(std::find(supported.begin(), supported.end(),
+                      iom::DataType::BF16) != supported.end());
+    iom_conformance::run_real_model_loading(*devices.candidate);
+}
+#endif

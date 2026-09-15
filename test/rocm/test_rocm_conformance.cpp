@@ -442,6 +442,19 @@ TEST_CASE("ROCm model loading realizes every published weight role of each synth
             *reference, *candidate, *foreign};
     iom_conformance::run_model_loading_conformance(devices);
 }
+
+// Opt-in real-checkpoint loading, compiled only with
+// `IOM_TEST_REAL_MODEL_LOADING=ON`. The caller-selected arena replaces the
+// synthetic conformance reserve, which cannot hold the full official reference;
+// a missing, invalid, or insufficient `IOM_TEST_MODEL_ARENA_BYTES` fails this
+// case rather than skipping it or constraining the run silently.
+#ifdef IOM_TEST_REAL_MODEL_LOADING
+TEST_CASE("ROCm real model loading") {
+    const std::unique_ptr<iom::Device> candidate = iom::make_rocm_device(
+            0, iom_conformance::real_model_memory_config());
+    iom_conformance::run_real_model_loading(*candidate);
+}
+#endif
 TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
     iom_conformance::TrafficGate gate;
     auto candidate = iom::make_rocm_device(

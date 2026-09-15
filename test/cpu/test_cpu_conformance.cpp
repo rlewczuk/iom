@@ -296,6 +296,19 @@ TEST_CASE("CPU model loading realizes every published weight role of each synthe
     iom_conformance::run_model_loading_conformance(devices.conformance());
 }
 
+// Opt-in real-checkpoint loading, compiled only with
+// `IOM_TEST_REAL_MODEL_LOADING=ON`: the ordinary CPU suite reads no model
+// directory, assumes no default path, and downloads nothing. The case is this
+// driver's selected CPU device over the caller's own allocator, which is the
+// CPU ownership path; no second full-weight binding is created for a reference
+// payload.
+#ifdef IOM_TEST_REAL_MODEL_LOADING
+TEST_CASE("CPU real model loading") {
+    CpuDevices devices;
+    iom_conformance::run_real_model_loading(*devices.candidate);
+}
+#endif
+
 // A deliberately perturbed candidate layout or view map must surface as a
 // bit-for-bit logical-byte mismatch; the independently generated encodings
 // make round-trip cancellation impossible.

@@ -414,6 +414,21 @@ planes: no hidden state, normalization reduction, cache row, or workspace is
 broadcast between them. A normal single-session spelling below omits a leading
 plane index.
 
+**Opt-in real-checkpoint loading verification.** The production API above is
+unchanged, and one explicit verification path loads a caller-selected official
+checkpoint on a selected device. `cmake -DIOM_TEST_REAL_MODEL_LOADING=ON`
+compiles one additional case into each existing backend conformance executable,
+which reads the explicit `IOM_TEST_MODEL_DIR` and pinned `IOM_TEST_MODEL_ID`
+(plus `IOM_TEST_MODEL_ARENA_BYTES` on standard GPUs), validates the pinned
+`N=22, H=2048, I=5632, Hq=32, Hkv=4, D=64, V=32000, C=2048` inventory, and
+realizes all 201 BF16 roles through the fixed upload order above on the
+driver's selected device alone. The option is `OFF` by default: the ordinary
+configuration reads no model directory, assumes no default path, downloads
+nothing, and creates no second full-weight reference binding. Nothing in this
+path produces logits, tokens, generation, or performance evidence. See
+**Model loading and weight layout** in `docs/BACKEND_CONTRACT.md` for the exact
+environment contract, failure policy, and per-backend invocation.
+
 ### Forward sequence
 
 Input token indices `[1,R]` are embedded once into the first BF16 residual

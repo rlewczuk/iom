@@ -620,3 +620,18 @@ TEST_CASE("SYCL model loading realizes every published weight role of each synth
     SyclDevices devices;
     iom_conformance::run_model_loading_conformance(devices.conformance());
 }
+
+// Opt-in real-checkpoint loading, compiled only with
+// `IOM_TEST_REAL_MODEL_LOADING=ON`. This case reserves the caller-selected real
+// capacity on the eligible SYCL device instead of the synthetic conformance
+// arena, which cannot hold the full official reference, so a missing, invalid,
+// or insufficient `IOM_TEST_MODEL_ARENA_BYTES` fails it and an ineligible
+// device fails the factory rather than skipping. No context sink or oracle is
+// needed: the case observes the produced devices through public APIs only.
+#ifdef IOM_TEST_REAL_MODEL_LOADING
+TEST_CASE("SYCL real model loading") {
+    const std::unique_ptr<iom::Device> candidate = iom::make_sycl_device(
+            0, iom_conformance::real_model_memory_config());
+    iom_conformance::run_real_model_loading(*candidate);
+}
+#endif
