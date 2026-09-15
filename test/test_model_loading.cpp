@@ -1,22 +1,38 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "model_loading_fixture.hpp"
 
 namespace {
 
+using iom_model_loading::SafetensorsEntry;
 using iom_model_loading::TempDir;
+using iom_model_loading::bf16_entry;
+using iom_model_loading::deterministic_payload;
+using iom_model_loading::dims_of;
+using iom_model_loading::element_count;
 using iom_model_loading::one_layer_config;
 using iom_model_loading::rejected_config_message;
+using iom_model_loading::rejected_container_message;
+using iom_model_loading::rejected_source_message;
+using iom_model_loading::required_weight_entries;
 using iom_model_loading::same_config;
 using iom_model_loading::two_layer_config;
 using iom_model_loading::write_config;
 using iom_model_loading::write_file;
+using iom_model_loading::write_safetensors_file;
+using iom_model_loading::write_safetensors_header;
 
 // Every configuration rejection names the file and the offending field.
 void check_rejection(const std::string& message, const TempDir& dir,
@@ -508,6 +524,486 @@ TEST_CASE("Model loading configuration opens only config.json in the model direc
     std::error_code error;
     REQUIRE(std::filesystem::remove(dir.path() / "config.json", error));
     CHECK_THROWS_AS(iom::load_tinyllama_config(dir.path()), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Mapped weight source
+// ---------------------------------------------------------------------------
+
+// One expected entry of the published inventory. The expectation is written
+// independently of the implementation, so a wrong role, layer, order, or shape
+// fails here instead of matching the production table by construction. `layer`
+// is absent for the three global roles and carries the decoder layer for the
+// nine layer-scoped roles.
+struct ExpectedWeight {
+    iom::ModelWeightRole role;
+    std::optional<std::size_t> layer;
+    std::vector<std::size_t> logical_shape;
+};
+
+// The nine layer-scoped roles of the boundary dimensions in canonical order.
+std::vector<std::pair<iom::ModelWeightRole, std::vector<std::size_t>>>
+layer_weight_plan() {
+    return {
+            {iom::ModelWeightRole::input_norm, {1, 8}},
+            {iom::ModelWeightRole::post_attention_norm, {1, 8}},
+            {iom::ModelWeightRole::query, {8, 8}},
+            {iom::ModelWeightRole::key, {4, 8}},
+            {iom::ModelWeightRole::value, {4, 8}},
+            {iom::ModelWeightRole::attention_output, {8, 8}},
+            {iom::ModelWeightRole::mlp_gate, {12, 8}},
+            {iom::ModelWeightRole::mlp_up, {12, 8}},
+            {iom::ModelWeightRole::mlp_down, {8, 12}},
+    };
+}
+
+// The complete expected inventory of `N=2, H=8, I=12, Hq=4, Hkv=2, D=2, V=19`
+// for `layers` decoder layers in canonical global/layer order.
+std::vector<ExpectedWeight> expected_inventory(std::size_t layers) {
+    std::vector<ExpectedWeight> expected{
+            {iom::ModelWeightRole::token_embedding, std::nullopt, {19, 8}},
+            {iom::ModelWeightRole::final_norm, std::nullopt, {1, 8}},
+            {iom::ModelWeightRole::lm_head, std::nullopt, {19, 8}},
+    };
+    for (std::size_t layer = 0; layer < layers; ++layer) {
+        for (const auto& role : layer_weight_plan()) {
+            expected.push_back(ExpectedWeight{role.first, layer, role.second});
+        }
+    }
+    return expected;
+}
+
+// Checks every published entry, and the selected metadata of every index,
+// against the independent expectation.
+void check_inventory(const iom::ModelSource& source,
+                     const std::vector<ExpectedWeight>& expected) {
+    const std::span<const iom::ModelWeightInfo> weights = source.weights();
+    REQUIRE(weights.size() == expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        CAPTURE(index);
+        const ExpectedWeight& want = expected[index];
+        const iom::ModelWeightInfo& info = weights[index];
+        CHECK(info.id.role == want.role);
+        // The identity comparison covers both directions: a global that
+        // wrongly carries a layer and a layer-scoped role that wrongly
+        // omits one both fail here with the exact expected/actual layer.
+        CHECK(info.id.layer == want.layer);
+        CHECK(dims_of(info.logical_shape) == want.logical_shape);
+
+        const iom::TensorSpec& spec = source.tensor_spec(index);
+        CHECK(dims_of(spec.shape) == want.logical_shape);
+        CHECK(spec.data_type == iom::DataType::BF16);
+        CHECK(spec.quantization == iom::QuantizationFormat::NONE);
+        CHECK(spec.logical_nbytes() == 2 * element_count(want.logical_shape));
+    }
+}
+
+// Writes `document` and `entries` as one complete checkpoint directory.
+void write_checkpoint(const TempDir& dir, const nlohmann::json& document,
+                      const std::vector<SafetensorsEntry>& entries) {
+    write_config(dir.path(), document);
+    write_safetensors_file(dir.path(), "model.safetensors", entries);
+}
+
+// Loads a complete checkpoint directory and requires a published source.
+std::unique_ptr<iom::ModelSource> load_source(const TempDir& dir) {
+    std::unique_ptr<iom::ModelSource> source =
+            iom::load_tinyllama_safetensors(dir.path());
+    REQUIRE(source != nullptr);
+    return source;
+}
+
+// Replaces the entry named `name`, leaving the store size unchanged.
+void replace_entry(std::vector<SafetensorsEntry>& entries,
+                   const std::string& name, SafetensorsEntry replacement) {
+    for (SafetensorsEntry& entry : entries) {
+        if (entry.name == name) {
+            entry = std::move(replacement);
+            return;
+        }
+    }
+    REQUIRE_MESSAGE(false, "no fixture entry named " << name);
+}
+
+// Removes the entry named `name`, leaving the store size one smaller.
+void erase_entry(std::vector<SafetensorsEntry>& entries,
+                 const std::string& name) {
+    const auto removed =
+            std::remove_if(entries.begin(), entries.end(),
+                           [&name](const SafetensorsEntry& entry) {
+                               return entry.name == name;
+                           });
+    REQUIRE_MESSAGE(removed != entries.end(), "no fixture entry named " << name);
+    entries.erase(removed, entries.end());
+}
+
+TEST_CASE("Model loading source selects the complete two-layer inventory in canonical order") {
+    const TempDir dir("source-two-layer");
+    const nlohmann::json document = two_layer_config();
+    write_checkpoint(dir, document, required_weight_entries(document));
+
+    const std::unique_ptr<iom::ModelSource> source = load_source(dir);
+
+    CHECK(source->weights().size() == 21);
+    CHECK(same_config(source->config(),
+                      iom::load_tinyllama_config(dir.path())));
+    check_inventory(*source, expected_inventory(2));
+
+    // Selected metadata is addressed by inventory index under ordinary bounds.
+    CHECK_THROWS_AS(source->tensor_spec(source->weights().size()),
+                    std::out_of_range);
+    CHECK_THROWS_AS(source->tensor_spec(4096), std::out_of_range);
+}
+
+TEST_CASE("Model loading source selects the complete one-layer inventory") {
+    const TempDir dir("source-one-layer");
+    const nlohmann::json document = one_layer_config();
+    write_checkpoint(dir, document, required_weight_entries(document));
+
+    const std::unique_ptr<iom::ModelSource> source = load_source(dir);
+
+    CHECK(source->config().num_hidden_layers == 1);
+    CHECK(source->weights().size() == 12);
+    check_inventory(*source, expected_inventory(1));
+
+    // A one-layer checkpoint cannot satisfy a two-layer configuration: the
+    // obviously incomplete store is rejected before any weight is named.
+    const TempDir mismatch("source-one-layer-checkpoint");
+    write_checkpoint(mismatch, two_layer_config(),
+                     required_weight_entries(one_layer_config()));
+    const std::string message = rejected_source_message(mismatch.path());
+    CHECK(message.find(mismatch.path().string()) != std::string::npos);
+    CHECK(message.find("21") != std::string::npos);
+    CHECK(message.find("model.embed_tokens.weight") == std::string::npos);
+}
+
+TEST_CASE("Model loading source adapts rank-one normalization metadata without changing bytes") {
+    const TempDir dir("source-norms");
+    const nlohmann::json document = two_layer_config();
+    write_checkpoint(dir, document, required_weight_entries(document));
+
+    const std::unique_ptr<iom::ModelSource> source = load_source(dir);
+
+    // The global final norm and both per-layer scales are rank-one in the
+    // checkpoint and rank-two `[1, H]` in the published metadata. Their mapped
+    // span stays the exact `2*H` bytes the loader accepted, and only the
+    // logical byte count and the standard 16x16 padded size are derived.
+    const std::size_t norm_indices[] = {1, 3, 4, 12, 13};
+    for (const std::size_t index : norm_indices) {
+        CAPTURE(index);
+        const iom::TensorSpec& spec = source->tensor_spec(index);
+        CHECK(spec.shape.rank() == 2);
+        CHECK(dims_of(spec.shape) == std::vector<std::size_t>{1, 8});
+        CHECK(spec.logical_nbytes() == 16);
+        CHECK(spec.tiled_storage_nbytes() == 512);
+    }
+
+    // Nonsquare projections keep the checkpoint's `[out, in]` orientation.
+    CHECK(dims_of(source->tensor_spec(6).shape) ==
+          std::vector<std::size_t>{4, 8});
+    CHECK(dims_of(source->tensor_spec(11).shape) ==
+          std::vector<std::size_t>{8, 12});
+    CHECK(dims_of(source->tensor_spec(9).shape) ==
+          std::vector<std::size_t>{12, 8});
+    CHECK(source->tensor_spec(6).logical_nbytes() == 4 * 8 * 2);
+    CHECK(source->tensor_spec(11).logical_nbytes() == 8 * 12 * 2);
+}
+
+TEST_CASE("Model loading source ignores valid extras and unrelated documents") {
+    const nlohmann::json document = two_layer_config();
+    const TempDir baseline("source-baseline");
+    write_checkpoint(baseline, document, required_weight_entries(document));
+    const std::unique_ptr<iom::ModelSource> baseline_source =
+            load_source(baseline);
+
+    const TempDir variant("source-extras");
+    write_config(variant.path(), document);
+    std::vector<SafetensorsEntry> entries = required_weight_entries(document);
+    entries.push_back(SafetensorsEntry{"model.layers.0.self_attn.rotary_emb.inv_freq",
+                                       "F32", {2}, deterministic_payload(8, 401)});
+    entries.push_back(SafetensorsEntry{"extra.u8.table", "U8", {5},
+                                       deterministic_payload(5, 402)});
+    entries.push_back(bf16_entry("model.extra.unused.weight", {8, 8}, 403));
+    write_safetensors_file(variant.path(), "model.safetensors", entries);
+    // A second shard of unrelated tensors is valid and changes nothing either.
+    write_safetensors_file(variant.path(), "extra-shard.safetensors",
+                           {bf16_entry("shard.only.extra", {2, 2}, 404)});
+    write_file(variant.path(), "tokenizer.json", "not json at all");
+    write_file(variant.path(), "generation_config.json", "{\"do_sample\":true}");
+
+    const std::unique_ptr<iom::ModelSource> source = load_source(variant);
+
+    CHECK(source->weights().size() == baseline_source->weights().size());
+    check_inventory(*source, expected_inventory(2));
+    CHECK(same_config(source->config(), baseline_source->config()));
+}
+
+TEST_CASE("Model loading source rejects an empty or incomplete store before naming weights") {
+    // No SafeTensors artifact at all.
+    const TempDir empty("source-empty");
+    write_config(empty.path(), two_layer_config());
+    const std::string empty_message = rejected_source_message(empty.path());
+    CHECK(empty_message.find(empty.path().string()) != std::string::npos);
+
+    // A decoy artifact with another extension is not a store.
+    write_file(empty.path(), "model.bin", "garbage checkpoint payload");
+    CHECK_THROWS_AS(iom::load_tinyllama_safetensors(empty.path()),
+                    std::invalid_argument);
+
+    // Only the three global weights are present.
+    const TempDir partial("source-partial");
+    const nlohmann::json document = two_layer_config();
+    write_config(partial.path(), document);
+    std::vector<SafetensorsEntry> globals = required_weight_entries(document);
+    globals.resize(3);
+    write_safetensors_file(partial.path(), "model.safetensors", globals);
+    const std::string partial_message = rejected_source_message(partial.path());
+    CHECK(partial_message.find(partial.path().string()) != std::string::npos);
+    CHECK(partial_message.find("21") != std::string::npos);
+    CHECK(partial_message.find("model.embed_tokens.weight") == std::string::npos);
+
+    // An empty store is rejected as empty even when the configuration itself
+    // cannot be sized: only the checked required count precedes the mapping.
+    const TempDir unsized("source-empty-unsized");
+    nlohmann::json huge = two_layer_config();
+    huge["hidden_size"] = 4611686018427387904ULL;  // 2^62
+    huge["num_attention_heads"] = 1;
+    huge["num_key_value_heads"] = 1;
+    write_config(unsized.path(), huge);
+    CHECK_THROWS_AS(iom::load_tinyllama_safetensors(unsized.path()),
+                    std::invalid_argument);
+}
+
+TEST_CASE("Model loading source rejects a missing required weight by its checkpoint name") {
+    const nlohmann::json document = two_layer_config();
+
+    // The tensor count stays complete, so this rejection is the required-name
+    // schema check rather than the incomplete-store guard.
+    const TempDir layer_dir("source-missing-layer");
+    write_config(layer_dir.path(), document);
+    std::vector<SafetensorsEntry> entries = required_weight_entries(document);
+    erase_entry(entries, "model.layers.1.mlp.down_proj.weight");
+    entries.push_back(
+            bf16_entry("model.layers.1.mlp.down_proj.unused", {8, 12}, 501));
+    write_safetensors_file(layer_dir.path(), "model.safetensors", entries);
+    const std::string message = rejected_source_message(layer_dir.path());
+    CHECK(message.find("model.layers.1.mlp.down_proj.weight") !=
+          std::string::npos);
+    CHECK(message.find(layer_dir.path().string()) != std::string::npos);
+    CHECK(message.find("<missing>") != std::string::npos);
+
+    // A missing global role is rejected the same way.
+    const TempDir global_dir("source-missing-global");
+    write_config(global_dir.path(), document);
+    std::vector<SafetensorsEntry> global_entries =
+            required_weight_entries(document);
+    erase_entry(global_entries, "lm_head.weight");
+    global_entries.push_back(bf16_entry("lm_head.unused", {19, 8}, 502));
+    write_safetensors_file(global_dir.path(), "model.safetensors",
+                           global_entries);
+    const std::string global_message =
+            rejected_source_message(global_dir.path());
+    CHECK(global_message.find("lm_head.weight") != std::string::npos);
+    CHECK(global_message.find("<missing>") != std::string::npos);
+}
+
+TEST_CASE("Model loading source rejects wrong rank, shape, and dtype with schema context") {
+    const nlohmann::json document = two_layer_config();
+
+    // Rank: a rank-two normalization vector instead of the checkpoint's
+    // rank-one form, in a container the parser accepts.
+    const TempDir rank_dir("source-rank");
+    write_config(rank_dir.path(), document);
+    std::vector<SafetensorsEntry> rank_entries = required_weight_entries(document);
+    replace_entry(rank_entries, "model.norm.weight",
+                  bf16_entry("model.norm.weight", {1, 8}, 601));
+    write_safetensors_file(rank_dir.path(), "model.safetensors", rank_entries);
+    const std::string rank_message = rejected_source_message(rank_dir.path());
+    CHECK(rank_message.find("model.norm.weight") != std::string::npos);
+    CHECK(rank_message.find("rank 1") != std::string::npos);
+    CHECK(rank_message.find("rank 2") != std::string::npos);
+    CHECK(rank_message.find("[8]") != std::string::npos);
+    CHECK(rank_message.find("[1, 8]") != std::string::npos);
+
+    // Shape: a grouped key/value projection of the wrong source extent.
+    const TempDir shape_dir("source-shape");
+    write_config(shape_dir.path(), document);
+    std::vector<SafetensorsEntry> shape_entries =
+            required_weight_entries(document);
+    replace_entry(shape_entries, "model.layers.0.self_attn.k_proj.weight",
+                  bf16_entry("model.layers.0.self_attn.k_proj.weight", {5, 8},
+                             602));
+    write_safetensors_file(shape_dir.path(), "model.safetensors", shape_entries);
+    const std::string shape_message = rejected_source_message(shape_dir.path());
+    CHECK(shape_message.find("model.layers.0.self_attn.k_proj.weight") !=
+          std::string::npos);
+    CHECK(shape_message.find("[5, 8]") != std::string::npos);
+    CHECK(shape_message.find("[4, 8]") != std::string::npos);
+
+    // Dtype: the required shape in another encoding is still rejected.
+    const TempDir dtype_dir("source-dtype");
+    write_config(dtype_dir.path(), document);
+    std::vector<SafetensorsEntry> dtype_entries =
+            required_weight_entries(document);
+    replace_entry(dtype_entries, "model.layers.0.self_attn.q_proj.weight",
+                  SafetensorsEntry{"model.layers.0.self_attn.q_proj.weight",
+                                   "F32", {8, 8},
+                                   deterministic_payload(8 * 8 * 4, 603)});
+    write_safetensors_file(dtype_dir.path(), "model.safetensors", dtype_entries);
+    const std::string dtype_message = rejected_source_message(dtype_dir.path());
+    CHECK(dtype_message.find("model.layers.0.self_attn.q_proj.weight") !=
+          std::string::npos);
+    CHECK(dtype_message.find("F32") != std::string::npos);
+    CHECK(dtype_message.find("BF16") != std::string::npos);
+}
+
+TEST_CASE("Model loading source preserves parser behavior for malformed extras and containers") {
+    const nlohmann::json document = two_layer_config();
+
+    // An extra tensor whose payload does not match its declared shape is a
+    // parser failure, so required-name filtering cannot hide it.
+    const TempDir payload_dir("source-extra-payload");
+    write_config(payload_dir.path(), document);
+    std::vector<SafetensorsEntry> payload_entries =
+            required_weight_entries(document);
+    payload_entries.push_back(SafetensorsEntry{"extra.bad.payload", "BF16",
+                                               {4, 4},
+                                               deterministic_payload(10, 701)});
+    write_safetensors_file(payload_dir.path(), "model.safetensors",
+                           payload_entries);
+    const std::string payload_message =
+            rejected_container_message(payload_dir.path());
+    CHECK(payload_message.find("extra.bad.payload") != std::string::npos);
+
+    // An extra tensor with an unknown dtype spelling stays a parser failure.
+    const TempDir extra_dtype_dir("source-extra-dtype");
+    write_config(extra_dtype_dir.path(), document);
+    std::vector<SafetensorsEntry> extra_dtype_entries =
+            required_weight_entries(document);
+    extra_dtype_entries.push_back(SafetensorsEntry{"extra.unknown.dtype", "NOPE",
+                                                   {2},
+                                                   deterministic_payload(4, 702)});
+    write_safetensors_file(extra_dtype_dir.path(), "model.safetensors",
+                           extra_dtype_entries);
+    const std::string extra_dtype_message =
+            rejected_container_message(extra_dtype_dir.path());
+    CHECK(extra_dtype_message.find("NOPE") != std::string::npos);
+
+    // The same required name in two shards stays a duplicate-shard failure.
+    const TempDir duplicate_dir("source-duplicate");
+    write_config(duplicate_dir.path(), document);
+    write_safetensors_file(duplicate_dir.path(), "model.safetensors",
+                           required_weight_entries(document));
+    write_safetensors_file(
+            duplicate_dir.path(), "model-00002.safetensors",
+            {bf16_entry("model.embed_tokens.weight", {19, 8}, 703)});
+    const std::string duplicate_message =
+            rejected_container_message(duplicate_dir.path());
+    CHECK(duplicate_message.find("duplicate") != std::string::npos);
+    CHECK(duplicate_message.find("model.embed_tokens.weight") !=
+          std::string::npos);
+
+    // A container header that is not valid JSON is translated into a
+    // contextual container failure at the model boundary.
+    const TempDir header_dir("source-container-header");
+    write_config(header_dir.path(), document);
+    write_safetensors_header(header_dir.path(), "model.safetensors",
+                             "{ not json", deterministic_payload(4, 704));
+    const std::string header_message =
+            rejected_container_message(header_dir.path());
+    CHECK(header_message.find(header_dir.path().string()) != std::string::npos);
+
+    // A header that is valid JSON but not an object keeps the parser's own
+    // failure.
+    const TempDir object_dir("source-container-object");
+    write_config(object_dir.path(), document);
+    write_safetensors_header(object_dir.path(), "model.safetensors", "[1, 2]",
+                             deterministic_payload(4, 705));
+    const std::string object_message =
+            rejected_container_message(object_dir.path());
+    CHECK(object_message.find("invalid safetensors header") != std::string::npos);
+}
+
+TEST_CASE("Model loading source rejects impossible weight sizes without allocating a checkpoint") {
+    // Every configuration below passes configuration validation and fails
+    // exactly one checked weight-sizing bound: the required tensor count, an
+    // element product, a logical byte count, a standard tiled byte count, and
+    // the repeated-layer byte total. Each directory carries one minimal
+    // temporary SafeTensors tensor, so no huge checkpoint allocation and no
+    // generated layer name list is ever involved.
+    struct ImpossibleSize {
+        const char* bound;
+        nlohmann::json document;
+    };
+
+    std::vector<ImpossibleSize> cases;
+    {
+        nlohmann::json document = two_layer_config();
+        document["num_hidden_layers"] = 2305843009213693952ULL;  // 2^61
+        cases.push_back({"required tensor count", std::move(document)});
+    }
+    {
+        nlohmann::json document = two_layer_config();
+        document["hidden_size"] = 4611686018427387904ULL;  // 2^62
+        document["num_attention_heads"] = 1;
+        document["num_key_value_heads"] = 1;
+        cases.push_back({"element count", std::move(document)});
+    }
+    {
+        nlohmann::json document = two_layer_config();
+        document["hidden_size"] = 600000000000000000ULL;  // 6e17
+        document["num_attention_heads"] = 1;
+        document["num_key_value_heads"] = 1;
+        cases.push_back({"logical byte count", std::move(document)});
+    }
+    {
+        nlohmann::json document = two_layer_config();
+        document["vocab_size"] = 3;
+        document["hidden_size"] = 72057594037927922ULL;  // 16 * 2^52 + 2
+        document["num_attention_heads"] = 1;
+        document["num_key_value_heads"] = 1;
+        cases.push_back({"standard tiled byte count", std::move(document)});
+    }
+    {
+        nlohmann::json document = two_layer_config();
+        document["num_hidden_layers"] = 1152921504606846976ULL;  // 2^60
+        cases.push_back({"repeated-layer byte total", std::move(document)});
+    }
+
+    for (const ImpossibleSize& test_case : cases) {
+        CAPTURE(test_case.bound);
+        CAPTURE(test_case.document.dump());
+        TempDir dir("source-impossible");
+        write_config(dir.path(), test_case.document);
+        write_safetensors_file(dir.path(), "model.safetensors",
+                               {bf16_entry("extra.dummy.weight", {1, 1}, 900)});
+
+        CHECK_THROWS_AS(iom::load_tinyllama_safetensors(dir.path()),
+                        std::overflow_error);
+    }
+}
+
+TEST_CASE("Model loading source keeps published metadata valid after the checkpoint artifacts disappear") {
+    const TempDir dir("source-retained");
+    const nlohmann::json document = two_layer_config();
+    write_checkpoint(dir, document, required_weight_entries(document));
+
+    const std::unique_ptr<iom::ModelSource> source = load_source(dir);
+
+    // The factory owns a mapping that outlives the files: removing the
+    // artifacts after the complete inventory was published changes neither the
+    // configuration nor the inventory metadata.
+    std::error_code error;
+    REQUIRE(std::filesystem::remove(dir.path() / "model.safetensors", error));
+    REQUIRE(std::filesystem::remove(dir.path() / "config.json", error));
+
+    CHECK(source->config().hidden_size == 8);
+    CHECK(source->weights().size() == 21);
+    check_inventory(*source, expected_inventory(2));
+
+    // A new load of the same directory now fails: nothing is re-read lazily.
+    CHECK_THROWS_AS(iom::load_tinyllama_safetensors(dir.path()),
+                    std::runtime_error);
 }
 
 }  // namespace

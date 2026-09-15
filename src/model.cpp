@@ -8,12 +8,18 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "iom/safetensors.hpp"
 #include "iom_internal.hpp"
 
 namespace iom {
@@ -266,6 +272,338 @@ void require_supported_keys(const nlohmann::json& document,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mapped weight source
+// ---------------------------------------------------------------------------
+
+// Only BF16 with no grouped quantization is selected today; the selected
+// encoding is declared once so the schema plan and every published entry
+// cannot disagree about it.
+constexpr DataType kSelectedDataType = DataType::BF16;
+constexpr QuantizationFormat kSelectedQuantization = QuantizationFormat::NONE;
+
+// Layer-scoped checkpoint names are `model.layers.{l}.<suffix>`.
+constexpr std::string_view kLayerPrefix = "model.layers.";
+
+constexpr const char* kRequiredCountOverflow =
+        "TinyLlama weight schema required tensor count overflows";
+constexpr const char* kWeightBytesOverflow =
+        "TinyLlama weight schema weight byte total overflows";
+constexpr const char* kGroupedWidthOverflow =
+        "TinyLlama weight schema grouped key/value width overflows";
+
+// One required role of the validated configuration. `source_shape` is the
+// exact rank/shape the checkpoint must declare; `spec` is the selected
+// logical destination metadata, which differs from the source only for the
+// rank-one normalization vectors.
+struct WeightRoleSchema {
+    ModelWeightRole role;
+    std::string_view name;
+    bool layer_scoped;
+    std::vector<std::size_t> source_shape;
+    TensorSpec spec;
+};
+
+// Counts and byte totals of the complete required schema. Every value is
+// checked while the plan is built, before any inventory metadata is expanded.
+struct WeightPlan {
+    std::size_t required_count = 0;
+    std::size_t aggregate_logical_nbytes = 0;
+    std::size_t aggregate_tiled_nbytes = 0;
+    std::vector<WeightRoleSchema> globals;
+    std::vector<WeightRoleSchema> layer_roles;
+};
+
+TensorSpec selected_spec(TensorShape logical_shape) {
+    return TensorSpec{std::move(logical_shape), kSelectedDataType,
+                      kSelectedQuantization};
+}
+
+// A checkpoint normalization vector is stored rank-one `[H]`. Only the
+// logical metadata becomes `[1, H]`: the mapped span stays exactly `2*H`
+// bytes, and no rank-one shape, final-axis view, transpose, or pre-tiled
+// host copy is exposed.
+std::vector<std::size_t> adapted_logical_shape(
+        std::vector<std::size_t> source_shape) {
+    if (source_shape.size() == 1) {
+        source_shape.insert(source_shape.begin(), 1);
+    }
+    return source_shape;
+}
+
+WeightRoleSchema make_role_schema(ModelWeightRole role, std::string_view name,
+                                  bool layer_scoped,
+                                  std::vector<std::size_t> source_shape) {
+    TensorSpec spec = selected_spec(
+            TensorShape{adapted_logical_shape(source_shape)});
+    return WeightRoleSchema{role, name, layer_scoped, std::move(source_shape),
+                            std::move(spec)};
+}
+
+struct SchemaTotals {
+    std::size_t logical_nbytes = 0;
+    std::size_t tiled_nbytes = 0;
+};
+
+// Element, logical, and standard 16x16 tiled sizes of every role are checked
+// with checked arithmetic before the corresponding metadata is expanded.
+SchemaTotals checked_schema_totals(
+        const std::vector<WeightRoleSchema>& schemas) {
+    SchemaTotals totals;
+    for (const WeightRoleSchema& schema : schemas) {
+        static_cast<void>(schema.spec.shape.element_count());
+        totals.logical_nbytes = detail::checked_add(
+                totals.logical_nbytes, schema.spec.logical_nbytes(),
+                kWeightBytesOverflow);
+        totals.tiled_nbytes = detail::checked_add(
+                totals.tiled_nbytes, schema.spec.tiled_storage_nbytes(),
+                kWeightBytesOverflow);
+    }
+    return totals;
+}
+
+// The checked required tensor count `3 + 9*N` of a validated configuration.
+// It is computed before any weight name exists.
+std::size_t checked_required_count(const TinyLlamaConfig& config) {
+    return detail::checked_add(
+            3,
+            detail::checked_mul(9, config.num_hidden_layers,
+                                kRequiredCountOverflow),
+            kRequiredCountOverflow);
+}
+
+// The complete required schema of a validated configuration. The repeated
+// layers are bounded from the nine representative role sizes and the layer
+// count instead of generating one name list per possible layer, so an
+// impossible configuration fails without a huge source or name list.
+WeightPlan build_weight_plan(const TinyLlamaConfig& config,
+                             std::size_t required_count) {
+    const std::size_t kv_width = detail::checked_mul(
+            config.num_key_value_heads, config.head_dim,
+            kGroupedWidthOverflow);
+
+    WeightPlan plan;
+    plan.required_count = required_count;
+
+    plan.globals = {
+            make_role_schema(ModelWeightRole::token_embedding,
+                             "model.embed_tokens.weight", false,
+                             {config.vocab_size, config.hidden_size}),
+            make_role_schema(ModelWeightRole::final_norm, "model.norm.weight",
+                             false, {config.hidden_size}),
+            make_role_schema(ModelWeightRole::lm_head, "lm_head.weight", false,
+                             {config.vocab_size, config.hidden_size}),
+    };
+    plan.layer_roles = {
+            make_role_schema(ModelWeightRole::input_norm,
+                             "input_layernorm.weight", true,
+                             {config.hidden_size}),
+            make_role_schema(ModelWeightRole::post_attention_norm,
+                             "post_attention_layernorm.weight", true,
+                             {config.hidden_size}),
+            make_role_schema(ModelWeightRole::query,
+                             "self_attn.q_proj.weight", true,
+                             {config.hidden_size, config.hidden_size}),
+            make_role_schema(ModelWeightRole::key,
+                             "self_attn.k_proj.weight", true,
+                             {kv_width, config.hidden_size}),
+            make_role_schema(ModelWeightRole::value,
+                             "self_attn.v_proj.weight", true,
+                             {kv_width, config.hidden_size}),
+            make_role_schema(ModelWeightRole::attention_output,
+                             "self_attn.o_proj.weight", true,
+                             {config.hidden_size, config.hidden_size}),
+            make_role_schema(ModelWeightRole::mlp_gate,
+                             "mlp.gate_proj.weight", true,
+                             {config.intermediate_size, config.hidden_size}),
+            make_role_schema(ModelWeightRole::mlp_up, "mlp.up_proj.weight",
+                             true,
+                             {config.intermediate_size, config.hidden_size}),
+            make_role_schema(ModelWeightRole::mlp_down, "mlp.down_proj.weight",
+                             true,
+                             {config.hidden_size, config.intermediate_size}),
+    };
+
+    const SchemaTotals globals = checked_schema_totals(plan.globals);
+    const SchemaTotals layers = checked_schema_totals(plan.layer_roles);
+    plan.aggregate_logical_nbytes = detail::checked_add(
+            globals.logical_nbytes,
+            detail::checked_mul(layers.logical_nbytes,
+                                config.num_hidden_layers,
+                                kWeightBytesOverflow),
+            kWeightBytesOverflow);
+    plan.aggregate_tiled_nbytes = detail::checked_add(
+            globals.tiled_nbytes,
+            detail::checked_mul(layers.tiled_nbytes,
+                                config.num_hidden_layers,
+                                kWeightBytesOverflow),
+            kWeightBytesOverflow);
+    return plan;
+}
+
+// Diagnostics name the exact spelling the SafeTensors container uses.
+std::string_view dtype_name(DataType type) {
+    switch (type) {
+        case DataType::BOOL: return "BOOL";
+        case DataType::I2: return "I2";
+        case DataType::U2: return "U2";
+        case DataType::I4: return "I4";
+        case DataType::U4: return "U4";
+        case DataType::I8: return "I8";
+        case DataType::U8: return "U8";
+        case DataType::I16: return "I16";
+        case DataType::U16: return "U16";
+        case DataType::I32: return "I32";
+        case DataType::U32: return "U32";
+        case DataType::I64: return "I64";
+        case DataType::U64: return "U64";
+        case DataType::F4_E2M1: return "F4";
+        case DataType::F6_E2M3: return "F6_E2M3";
+        case DataType::F6_E3M2: return "F6_E3M2";
+        case DataType::F8_E4M3FN: return "F8_E4M3";
+        case DataType::F8_E5M2: return "F8_E5M2";
+        case DataType::F8_E8M0: return "F8_E8M0";
+        case DataType::F16: return "F16";
+        case DataType::BF16: return "BF16";
+        case DataType::F32: return "F32";
+        case DataType::F64: return "F64";
+    }
+    return "unknown";
+}
+
+std::string describe_shape(const std::vector<std::size_t>& shape) {
+    std::string text = "[";
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (i != 0) {
+            text += ", ";
+        }
+        text += std::to_string(shape[i]);
+    }
+    return text + "]";
+}
+
+std::string describe_source(const std::vector<std::size_t>& shape) {
+    return "rank " + std::to_string(shape.size()) + " source shape " +
+           describe_shape(shape) + " and dtype BF16";
+}
+
+std::string describe_view(const SafeTensorView& view) {
+    return "rank " + std::to_string(view.shape().size()) + " source shape " +
+           describe_shape(view.shape()) + " and dtype " +
+           std::string(dtype_name(view.dtype()));
+}
+
+// Every weight-schema rejection names the model directory, the logical
+// checkpoint key, the required rank/shape/dtype, and the actual one.
+[[noreturn]] void reject_weight(const std::filesystem::path& directory,
+                                const std::string& name,
+                                const std::string& requirement,
+                                const std::string& actual) {
+    throw std::invalid_argument("invalid TinyLlama weight schema: " +
+                                directory.string() + " tensor '" + name +
+                                "' requires " + requirement + "; actual " +
+                                actual);
+}
+
+[[noreturn]] void reject_empty_store(
+        const std::filesystem::path& directory) {
+    throw std::invalid_argument(
+            "invalid TinyLlama weight schema: " + directory.string() +
+            " contains no SafeTensors tensors; the validated configuration "
+            "requires a complete checkpoint");
+}
+
+// The required-count guard rejects an obviously incomplete store before any
+// layer or weight name is enumerated.
+[[noreturn]] void reject_incomplete_store(const std::filesystem::path& directory,
+                                          std::size_t found,
+                                          const WeightPlan& plan) {
+    throw std::invalid_argument(
+            "invalid TinyLlama weight schema: " + directory.string() +
+            " contains " + std::to_string(found) +
+            " SafeTensors tensors, but the validated configuration requires " +
+            std::to_string(plan.required_count) + " (" +
+            std::to_string(plan.aggregate_logical_nbytes) +
+            " logical bytes, " +
+            std::to_string(plan.aggregate_tiled_nbytes) +
+            " standard tiled bytes) before any required weight is named");
+}
+
+std::string weight_name(const WeightRoleSchema& schema,
+                        std::optional<std::size_t> layer) {
+    if (!schema.layer_scoped) {
+        return std::string(schema.name);
+    }
+    return std::string(kLayerPrefix) + std::to_string(*layer) + "." +
+           std::string(schema.name);
+}
+
+// A required name that the validated container does not carry is a schema
+// rejection, not the container's missing-name range error.
+SafeTensorView required_view(const SafeTensorsStore& store,
+                             const std::filesystem::path& directory,
+                             const std::string& name,
+                             const WeightRoleSchema& schema) {
+    try {
+        return store[name];
+    } catch (const std::out_of_range&) {
+        reject_weight(directory, name, describe_source(schema.source_shape),
+                      "<missing>");
+    }
+}
+
+// Validates one required role against the parsed source and appends its
+// independent selected logical metadata.
+void append_selected(const SafeTensorsStore& store,
+                     const std::filesystem::path& directory,
+                     const WeightRoleSchema& schema,
+                     std::optional<std::size_t> layer,
+                     std::vector<ModelWeightInfo>& weights,
+                     std::vector<TensorSpec>& specs) {
+    const std::string name = weight_name(schema, layer);
+    const SafeTensorView view = required_view(store, directory, name, schema);
+    const std::string requirement = describe_source(schema.source_shape);
+
+    // Rank, exact shape, and dtype are compared as declared; the mapped span
+    // must then be exactly the checked logical byte length of the selected
+    // metadata, which for a BF16 role is `2 * product(shape)`.
+    if (view.shape() != schema.source_shape ||
+        view.dtype() != kSelectedDataType) {
+        reject_weight(directory, name, requirement, describe_view(view));
+    }
+    if (view.nbytes() != schema.spec.logical_nbytes()) {
+        reject_weight(directory, name, requirement,
+                      describe_view(view) + " covering " +
+                              std::to_string(view.nbytes()) + " bytes");
+    }
+
+    const std::span<const std::size_t> dimensions =
+            schema.spec.shape.dimensions();
+    weights.push_back(ModelWeightInfo{
+            ModelWeightId{schema.role, layer},
+            TensorShape{std::vector<std::size_t>(dimensions.begin(),
+                                                 dimensions.end())}});
+    // Each entry owns its own logical metadata, independent of every other
+    // entry and of the retained mapping.
+    specs.push_back(selected_spec(
+            TensorShape{std::vector<std::size_t>(dimensions.begin(),
+                                                 dimensions.end())}));
+}
+
+// Only a JSON-library escape from the container parser is translated here:
+// the standalone SafeTensors API keeps its own behavior, while this boundary
+// reports a contextual container runtime failure.
+std::unique_ptr<SafeTensorsDir> open_mapped_store(
+        const std::filesystem::path& model_directory) {
+    try {
+        return std::make_unique<SafeTensorsDir>(model_directory.string());
+    } catch (const nlohmann::json::exception& error) {
+        throw std::runtime_error("invalid TinyLlama weight container: " +
+                                 model_directory.string() + ": " +
+                                 error.what());
+    }
+}
+
 }  // namespace
 
 TinyLlamaConfig load_tinyllama_config(
@@ -369,6 +707,87 @@ TinyLlamaConfig load_tinyllama_config(
                                 "* head_dim overflows"));
 
     return config;
+}
+
+struct ModelSource::Impl {
+    TinyLlamaConfig config;
+
+    // The single owning mapping store is retained for as long as the
+    // published source lives. Selected logical metadata never borrows it,
+    // so destroying temporary parser or view objects cannot invalidate the
+    // published inventory.
+    std::unique_ptr<SafeTensorsDir> store;
+
+    std::vector<ModelWeightInfo> weights;
+    std::vector<TensorSpec> specs;
+};
+
+ModelSource::ModelSource(std::unique_ptr<Impl> impl)
+        : impl_(std::move(impl)) {
+}
+
+ModelSource::~ModelSource() = default;
+
+const TinyLlamaConfig& ModelSource::config() const noexcept {
+    return impl_->config;
+}
+
+std::span<const ModelWeightInfo> ModelSource::weights() const noexcept {
+    return impl_->weights;
+}
+
+const TensorSpec& ModelSource::tensor_spec(std::size_t index) const {
+    return impl_->specs.at(index);
+}
+
+std::unique_ptr<ModelSource> load_tinyllama_safetensors(
+        const std::filesystem::path& model_directory) {
+    // The validated configuration supplies every required dimension, and a
+    // rejected configuration stops this path before any mapping exists. The
+    // checked required count is computed before any weight name is generated.
+    const TinyLlamaConfig config = load_tinyllama_config(model_directory);
+    const std::size_t required_count = checked_required_count(config);
+
+    // Exactly one owning store: exact-extension discovery, every header,
+    // byte, and range check, and duplicate-shard rejection happen here,
+    // before any required-name filtering.
+    std::unique_ptr<SafeTensorsDir> store = open_mapped_store(model_directory);
+    if (store->size() == 0) {
+        reject_empty_store(model_directory);
+    }
+
+    // Element products, logical byte counts, standard tiled byte counts, and
+    // the repeated-layer aggregate are checked from the validated dimensions
+    // before any required weight is named or inventory metadata is expanded.
+    const WeightPlan plan = build_weight_plan(config, required_count);
+    if (store->size() < plan.required_count) {
+        reject_incomplete_store(model_directory, store->size(), plan);
+    }
+
+    std::vector<ModelWeightInfo> weights;
+    std::vector<TensorSpec> specs;
+    weights.reserve(plan.required_count);
+    specs.reserve(plan.required_count);
+    for (const WeightRoleSchema& schema : plan.globals) {
+        append_selected(*store, model_directory, schema, std::nullopt, weights,
+                        specs);
+    }
+    for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+        for (const WeightRoleSchema& schema : plan.layer_roles) {
+            append_selected(*store, model_directory, schema, layer, weights,
+                            specs);
+        }
+    }
+
+    // The published owner is created only after the complete inventory
+    // passed. Every failure above cleaned up through RAII and left the source
+    // artifacts unchanged, and no checkpoint payload byte was copied.
+    auto impl = std::make_unique<ModelSource::Impl>();
+    impl->config = config;
+    impl->store = std::move(store);
+    impl->weights = std::move(weights);
+    impl->specs = std::move(specs);
+    return std::unique_ptr<ModelSource>(new ModelSource(std::move(impl)));
 }
 
 }  // namespace iom

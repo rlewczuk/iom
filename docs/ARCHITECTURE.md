@@ -15,6 +15,9 @@ flowchart LR
     config --> dimensions[validated TinyLlamaConfig]
     weights[SafeTensors files or shards] --> mapped[MappedFile]
     mapped --> store[SafeTensorsFile / SafeTensorsDir]
+    dimensions --> source[load_tinyllama_safetensors]
+    store --> source
+    source --> inventory[ModelSource inventory]
     store --> host[caller-owned host bytes]
     host --> tensor[Device-created tensors]
     dimensions --> tensor
@@ -27,8 +30,8 @@ flowchart LR
 The public API is split between backend-neutral headers in `include/iom` and
 small backend factory headers in `include/iom/{cpu,cuda,rocm,sycl,ttnn}`.
 `libiom` contains the neutral tensor, allocation, mapped-file, SafeTensors,
-model-configuration, and CPU implementation. Each optional accelerator builds
-as a separate static library and links to `libiom`:
+model-configuration/model-source, and CPU implementation. Each optional
+accelerator builds as a separate static library and links to `libiom`:
 
 | Backend | Build option and library | Runtime/storage model |
 | --- | --- | --- |
@@ -48,7 +51,10 @@ can coexist without a process-wide selection step.
 
 1. **Data and model ingestion.** `load_tinyllama_config` validates the explicit
    model directory's `config.json` and returns the runtime dimensions before
-   any mapping, allocation, or device work. `MappedFile` owns a read-only
+   any mapping, allocation, or device work. `load_tinyllama_safetensors` then
+   validates the complete required SafeTensors role inventory of the same
+   directory, publishes it as an immutable `ModelSource`, and privately retains
+   one owning mapping store for its lifetime. `MappedFile` owns a read-only
    mapping. `SafeTensorsFile` parses one mapping, while `SafeTensorsDir` owns
    the shard files for a directory. Both return non-owning `SafeTensorView`
    objects over those mapped bytes.
@@ -79,9 +85,14 @@ A typical weight path is:
 
 1. Validate `<model_directory>/config.json` with `load_tinyllama_config`; a
    rejected configuration stops the path before any mapping or allocation.
-2. Construct `SafeTensorsFile` or `SafeTensorsDir` for the model artifact.
-3. Look up a named `SafeTensorView`; its raw bytes remain borrowed from the
-   store's mapping.
+2. Validate the complete required weight inventory with
+   `load_tinyllama_safetensors`, which opens and retains exactly one owning
+   `SafeTensorsFile`/`SafeTensorsDir` and publishes the `ModelSource`
+   inventory. A missing, wrong, or obviously incomplete checkpoint is rejected
+   here before any device, tensor, or workspace exists.
+3. Look up a named `SafeTensorView` in the retained store; its raw bytes remain
+   borrowed from the store's mapping. `ModelSource::tensor_spec` exposes the
+   published logical metadata, never host bytes.
 4. Construct a backend device and create the destination `Tensor` from a
    validated `TensorSpec`.
 5. Copy host bytes into the tensor view, or schedule a `DeviceOps::copy` between
@@ -350,12 +361,19 @@ checkpoint's constants. `load_tinyllama_config` reads `Nlayers`, `F`, `M`,
 `Hq`, `Hkv`, `V`, and `C` from the explicit model directory's `config.json`
 and derives the checked `D = F / Hq`: a missing or unreadable file is an I/O
 failure, and an unsupported field, value, head ratio, or token policy is
-rejected before any mapping, device, workspace, or weight work. The loader
-validates and owns persistent weights.
-Only the loader adapts checkpoint normalization vectors from `[H]` to `[1,H]`
-while materializing them; RMSNorm remains rank 2 through 8 and never gains
-rank-one input or implicit hidden-state broadcasting. Persistent checkpoint
-weights are not copied into a second session-owned weight bank.
+rejected before any mapping, device, workspace, or weight work.
+`load_tinyllama_safetensors` then validates the complete required role
+inventory of that same directory and owns the mapped source behind the
+published `ModelSource`, whose selected metadata carries the logical identity
+and shape of every required weight.
+Only the loader adapts checkpoint normalization vectors from `[H]` to `[1,H]`,
+and it does so in logical metadata alone: the mapped span of every required
+weight stays exactly `2 * product(source shape)` bytes, so no rank-one
+`TensorShape`, final-axis view, transpose, or host repack is exposed. RMSNorm
+remains rank 2 through 8 and never gains rank-one input or implicit
+hidden-state broadcasting. Persistent checkpoint weights are not copied into a
+second session-owned weight bank, and no persistent whole-checkpoint host copy
+exists.
 
 This flow describes one sequence session, not request batching or serving.
 Leading planes supported by individual operations remain independent logical
@@ -653,6 +671,9 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | API | Function |
 | --- | --- |
 | `load_tinyllama_config(model_directory)` | Reads exactly `<model_directory>/config.json`, validates it, and returns the complete `TinyLlamaConfig` runtime dimensions. It creates no mapping, device, tensor, or workspace. |
+| `load_tinyllama_safetensors(model_directory)` | Validates the same directory's configuration and complete required SafeTensors role inventory, and returns the owning `ModelSource`, or a contextual schema/container/overflow rejection. It creates no device, tensor, or workspace and copies no payload. |
+| `ModelSource` | Immutable published weight inventory: `config()`, borrowed `weights()`, and `tensor_spec(index)`. Privately retains exactly one owning mapped store for its lifetime; non-copyable and non-movable. |
+| `ModelWeightRole`, `ModelWeightId`, `ModelWeightInfo` | The logical role, that role's optional decoder layer, and the selected logical shape of one published inventory entry. |
 | `MappedFile(filename, min_size)` | Owns a file mapping. `data()` and `size()` expose borrowed read-only mapped bytes. |
 | `SafeTensorsFile(filename)` | Opens a single SafeTensors artifact; `operator[]`, `size()`, and `keys()` retrieve non-owning named tensor views. |
 | `SafeTensorsDir(dirname)` | Opens a sharded SafeTensors directory with the same store interface. |
