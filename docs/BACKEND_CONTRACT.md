@@ -3268,6 +3268,47 @@ accelerator build and execution are remote-only, and closure requires the
 nonempty focused selection above on the actual enabled ROCm device together with
 the full `iom_rocm_conformance_tests` suite.
 
+#### SYCL loading conformance and observable inventory
+
+`test/sycl/test_sycl_conformance.cpp` registers the same shared scenario as
+`iom_sycl_conformance_tests` case `SYCL model loading*`, which is the fourth
+invocation of the CPU-first case above, after the ROCm case and before TTNN:
+
+```text
+cmake --build build --target iom_sycl_conformance_tests
+./build/test/iom_sycl_conformance_tests --test-case="SYCL model loading*"
+```
+
+The case is the existing `SyclDevices` fixture, unchanged and not duplicated:
+one independent CPU reference device, the selected eligible SYCL device as
+candidate, and a second distinct SYCL device instance at the same ordinal as
+the foreign device, whose owned context differs from the candidate's, so the
+foreign-destination rejection is judged against the exact candidate instance
+rather than the ordinal. Every destination is created on the candidate from
+`ModelSource::tensor_spec(index)`, the binding preflight is compared with the
+real maximum serial per-owner `copy_from_host` requirement reported by those
+destination views, positive scratch is provisioned from that exact candidate
+device through `create_workspace` and used as the upload workspace, and the
+CPU reference realizes the same binding through its zero-byte `{0, 1}` path.
+Both workspace policies are therefore observed by actual queries rather than a
+backend-kind switch, and readback is a real `TensorView` transfer with a
+separately queried download requirement.
+
+SYCL setup and limitations:
+
+- SYCL execution is remote-only. Configure with the actual `SYCL_ENABLED` flag
+  and the existing SDK arguments under a profile override whose `REMOTE_SETUP`
+  is empty; before every build and test run execute
+  `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-setvars.log 2>&1; set -u`,
+  preserve that environment, and run `sycl-ls` to confirm a Level Zero GPU.
+- BF16 storage is mandatory and the fixture requires an eligible device: an
+  unavailable Level Zero GPU, or a device that cannot hold the required BF16
+  roles, is a failure, never a skip.
+- The loader stays backend-neutral: SYCL types remain backend-private, no
+  accelerator header enters common code, `model.cpp` keeps its internal
+  staging, and `src/sycl/device_tensor.cpp` and `src/sycl/copy.cpp` change only
+  if a loading failure demonstrates a transfer defect.
+
 ### 11. Backend integration and conformance obligations
 
 The following source map is executable contract coverage. Shared scalar,

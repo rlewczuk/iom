@@ -21,6 +21,7 @@
 #include "backend/backend_conformance_other.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
+#include "backend/backend_conformance_model_loading.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
 #include "copy.hpp"
@@ -597,4 +598,25 @@ TEST_CASE("SYCL conformance: workspace requirement queries are pure and exact") 
                     foreign_tensor->view(), rhs->view(), out->view()),
             std::invalid_argument);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// The SYCL instantiation of the shared, backend-neutral model-loading
+// scenario, and the sole integration point of this leaf. The existing
+// SyclDevices fixture already provides the three roles it needs: the CPU
+// reference device, the selected eligible SYCL device as candidate, and a
+// second distinct SYCL device instance at the same ordinal as the foreign
+// device, whose owned context differs from the candidate's, so the
+// foreign-destination rejection is judged against the exact candidate
+// instance rather than the ordinal. The candidate binding reports a positive
+// word-padded staging requirement, so the shared case queries that
+// requirement from the real destination views, provisions caller scratch from
+// this exact device, and validates the empty default before the first copied
+// role; the CPU reference realizes the same binding through its zero-byte
+// `{0, 1}` path. Every destination is created from the source's own selected
+// specification, readback is a real `TensorView` transfer, and BF16 and real
+// Level Zero hardware are required: an ineligible device fails the fixture,
+// it is never skipped.
+TEST_CASE("SYCL model loading realizes every published weight role of each synthetic checkpoint") {
+    SyclDevices devices;
+    iom_conformance::run_model_loading_conformance(devices.conformance());
 }
