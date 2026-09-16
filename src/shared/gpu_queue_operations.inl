@@ -124,6 +124,79 @@ oid GpuQueue<Policy>::binary_impl(const BinaryRequest& request) {
 }
 
 template <typename Policy>
+oid GpuQueue<Policy>::rmsnorm_impl(const RmsnormRequest& request) {
+    std::lock_guard<std::mutex> submission_lock(
+            submission_order_mutex_);
+    // Descriptor arithmetic is validated before common acceptance. The
+    // metadata slot itself is acquired only by the dispatching head, exactly
+    // as the binary branch does; no shape, device, dtype, quantization,
+    // alias, workspace, or epsilon rule is re-checked here.
+    (void)detail::make_rmsnorm_metadata(request);
+    auto completion = std::make_shared<CompletionState>();
+    const detail::Fence fence = build_fence(completion);
+    return submit_rmsnorm(
+            request, *registry_state_, registry_queue_id_, fence,
+            [this, completion](
+                    std::uint64_t sequence,
+                    const RmsnormRequest& captured,
+                    detail::BinaryEntryRegistration entries) {
+                auto submission = state_->try_acquire();
+                if (submission == nullptr) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                const auto metadata_slot = metadata_pool_->try_acquire();
+                if (!metadata_slot.has_value()) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                MetadataLease metadata_lease{
+                        metadata_pool_.get(), *metadata_slot};
+                completion->bind(submission);
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] =
+                                outcomes_.try_emplace(sequence);
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    std::string("duplicate ")
+                                    + Policy::backend_label()
+                                    + " outstanding-work sequence");
+                        }
+                        it->second.rmsnorm_entries = entries;
+                        it->second.completion = completion;
+                        it->second.is_rmsnorm = true;
+                    }
+                    Task task;
+                    task.sequence = sequence;
+                    task.is_rmsnorm = true;
+                    task.rmsnorm_request.emplace(captured);
+                    task.rmsnorm_entries = entries;
+                    task.submission = submission.get();
+                    task.completion = completion;
+                    task.fence = task.submission;
+                    task.metadata_lease = std::move(metadata_lease);
+                    worker_.submit_copy(std::move(task));
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        outcomes_.erase(sequence);
+                    }
+                    completion->clear();
+                    throw;
+                }
+            });
+}
+
+template <typename Policy>
+bool GpuQueue<Policy>::rmsnorm_supported(DataType data_type) const {
+    // The policy owns the immutable RMSNorm capability for the applicable
+    // leaves; this port adds no leaf of its own and stays conservative until
+    // the backend wrapper launches the shared tiled operation.
+    static_cast<void>(data_type);
+    return Policy::rmsnorm_supported();
+}
+
+template <typename Policy>
 void GpuQueue<Policy>::execute(Task& task) {
     task.fence = task.submission;
     std::exception_ptr retained_failure;
@@ -191,6 +264,35 @@ void GpuQueue<Policy>::execute(Task& task) {
             }
             Policy::check_kernel(Policy::copy_kernel_operation());
             Policy::after_grid_stride_launch();
+            Policy::record_event(
+                    state_->event_of(*task.submission), stream_);
+            event_recorded = true;
+            state_->mark_event_recorded(*task.submission);
+        } else if (task.is_rmsnorm) {
+            const RmsnormRequest& request = *task.rmsnorm_request;
+            const std::size_t metadata_bytes =
+                    detail::rmsnorm_metadata_storage_bytes(
+                            request.x.spec.shape.dimensions().size());
+            const std::size_t metadata_slot = task.metadata_lease.slot;
+            task.submission->attach_metadata_slot(metadata_slot);
+            task.metadata_lease.handoff();
+            detail::write_rmsnorm_metadata(
+                    metadata_pool_->host_data(metadata_slot),
+                    metadata_pool_->device_data(metadata_slot), request);
+            // The fixed metadata partition is uploaded on the queue's own
+            // stream, so the device operation reads leading extents and
+            // plane strides without a device-to-host round trip. From here
+            // on the fixed event resource is only reusable through a proven
+            // completion.
+            native_work_submitted = true;
+            Policy::copy_from_host(
+                    stream_, metadata_pool_->device_data(metadata_slot),
+                    metadata_pool_->host_data(metadata_slot), metadata_bytes);
+            const detail::RmsnormMetadata metadata =
+                    *reinterpret_cast<const detail::RmsnormMetadata*>(
+                            metadata_pool_->host_data(metadata_slot));
+            Policy::launch_rmsnorm(stream_, metadata);
+            Policy::check_kernel(Policy::rmsnorm_kernel_operation());
             Policy::record_event(
                     state_->event_of(*task.submission), stream_);
             event_recorded = true;
@@ -287,6 +389,14 @@ void GpuQueue<Policy>::complete_task(
         detail::complete_workspace_lease(
                 *registry_state_, outcome.workspace_lease,
                 completion_proven);
+    } else if (outcome.is_rmsnorm) {
+        // RMSNorm consumes no raw workspace, so its admitted `{0, 1}`
+        // requirement reserved no lease; the deduplicated read/read
+        // `x`/`scale` and disjoint-output registrations are finalized
+        // under the same failure and completion-proof rules.
+        (void)detail::release_or_invalidate_binary_entries(
+                registry_state_->registry, outcome.rmsnorm_entries,
+                failed, completion_proven);
     } else {
         (void)detail::release_or_invalidate_entries(
                 registry_state_->registry, outcome.common, failed,

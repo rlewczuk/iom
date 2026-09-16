@@ -2910,6 +2910,33 @@ integer norm, quantization, or storage-format staging is introduced.
    rounds every FP32 intermediate and uses `double` for `F64`; production
    code MUST NOT serve as its own oracle.
 
+**Shared CUDA/ROCm queue and tiled-kernel core.** The two accelerator
+backends share one queue branch and one tiled device operation.
+`src/shared/gpu_queue.hpp` carries the immutable RMSNorm task and completion
+record beside the copy and binary variants, and
+`src/shared/gpu_queue_operations.inl` submits, dispatches, and completes it on
+the same fixed partition as every accelerator copy: the exactly `C` eagerly
+created completion resources, the fixed 512-byte metadata slots, the
+preallocated worker, the common owner registration output, and the `{0, 1}`
+zero-workspace requirement are reused with no queue growth, per-call
+allocation, second stream, or submission-side wait, and all terminal paths
+go through the existing completion release and quarantine rules. Immutable
+request scalars, view snapshots, owner registrations, the fixed metadata
+lease, and the event-ring submission are captured by value before the worker
+runs; no borrowed view, workspace lease, or metadata slot outlives proven
+completion. `src/shared/standard_tiled_rmsnorm.inl` is the complete
+backend-parameterized CUDA/HIP device kernel and device codec: independent
+leading planes and rows, a logical-`F`-only traversal that never reads or
+writes tile padding, the frozen FP32 accumulator (FP64 for `F64`) with the
+special-value and signed-zero rules above, and exactly one
+round-to-nearest-even output encode with no host decode, hidden transfer, or
+hidden allocation. Each backend contributes only its own `gpu_policy`
+launcher, which must use the queue's already-created nonblocking stream.
+This core does not claim either backend enabled: until the CUDA and ROCm
+wrapper leaves implement those launch callbacks, both backends keep reporting
+`Unsupported` for every applicable leaf, and an unlaunched accepted request
+is a terminal failure rather than stub success.
+
 The common owner is `src/device_ops_rmsnorm.cpp` behind
 `include/iom/iom.hpp`. `test/test_iom.cpp` owns signature/cutover, query
 purity, validation precedence, rejection-effect, snapshot-lifetime,

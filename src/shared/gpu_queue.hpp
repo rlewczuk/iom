@@ -20,10 +20,11 @@
 // native resources.
 //
 // This header must be included by a backend translation unit only after the
-// backend-specific expansion of standard_tiled_copy.inl, because the queue
-// composes that file's metadata helpers (CopyMetadataLayout,
-// InlineCopyMetadata, copy_metadata_layout, write_copy_metadata) by
-// non-dependent names.
+// backend-specific expansion of standard_tiled_copy.inl and
+// standard_tiled_rmsnorm.inl, because the queue composes those files'
+// metadata helpers (CopyMetadataLayout, InlineCopyMetadata,
+// copy_metadata_layout, write_copy_metadata, RmsnormMetadata,
+// make_rmsnorm_metadata, write_rmsnorm_metadata) by non-dependent names.
 
 #include <cstdint>
 #include <optional>
@@ -174,6 +175,9 @@ class GpuQueue final : public DeviceOps {
         bool is_binary = false;
         std::optional<BinaryRequest> binary_request;
         detail::BinaryEntryRegistration binary_entries{};
+        bool is_rmsnorm = false;
+        std::optional<RmsnormRequest> rmsnorm_request;
+        detail::BinaryEntryRegistration rmsnorm_entries{};
         detail::EntryRegistration entries{};
         typename EventRing::Submission* submission = nullptr;
         std::shared_ptr<CompletionState> completion;
@@ -199,9 +203,11 @@ class GpuQueue final : public DeviceOps {
     struct GpuOutcome {
         detail::SequenceOutcome common{};
         detail::BinaryEntryRegistration binary_entries{};
+        detail::BinaryEntryRegistration rmsnorm_entries{};
         detail::WorkspaceLease workspace_lease{};
         std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
+        bool is_rmsnorm = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -231,6 +237,16 @@ public:
             const TensorView& source, TensorView& destination) override;
 
     oid binary_impl(const BinaryRequest& request) override;
+
+    // RMSNorm consumes the immutable common request and the common
+    // owner-registration output; the shared branch adds no admission of its
+    // own and reuses the fixed metadata, event, worker, and metadata-lease
+    // resources above. The capability stays the backend policy's until its
+    // RMSNorm wrapper lands.
+    oid rmsnorm_impl(const RmsnormRequest& request) override;
+
+    [[nodiscard]] bool rmsnorm_supported(
+            DataType data_type) const override;
 
 private:
     void execute(Task& task);

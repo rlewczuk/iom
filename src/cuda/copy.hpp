@@ -20,6 +20,13 @@
 
 #include "iom/iom.hpp"
 
+namespace iom::detail {
+// Device descriptor of the shared 16x16 tiled RMSNorm operation
+// (src/shared/standard_tiled_rmsnorm.inl). The CUDA translation unit is the
+// only place where its definition is needed.
+struct RmsnormMetadata;
+}  // namespace iom::detail
+
 namespace iom::cuda_detail {
 enum class SubmissionFault {
     none,
@@ -262,6 +269,25 @@ struct gpu_policy {
             noexcept {
         return "CUDA copy kernel launch";
     }
+
+    // RMSNorm seams. The complete backend-parameterized device operation
+    // lives in src/shared/standard_tiled_rmsnorm.inl; the CUDA RMSNorm
+    // wrapper leaf implements launch_rmsnorm in copy.cu to launch it on the
+    // queue's existing nonblocking stream. Until that wrapper lands the
+    // operation stays conservatively Unsupported: the capability predicate
+    // rejects every request before admission, and this callback reports the
+    // same terminal outcome instead of a stub success.
+    [[nodiscard]] static constexpr const char* rmsnorm_kernel_operation()
+            noexcept {
+        return "CUDA RMSNorm kernel launch";
+    }
+
+    [[nodiscard]] static constexpr bool rmsnorm_supported() noexcept {
+        return false;
+    }
+
+    static void launch_rmsnorm(
+            stream_type stream, const detail::RmsnormMetadata& metadata);
 
     [[nodiscard]] static constexpr const char* backend_label() noexcept {
         return "CUDA";

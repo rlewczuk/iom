@@ -2,6 +2,7 @@
 #include "copy.hpp"
 
 #include "iom/device.hpp"
+#include "../iom_internal.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -68,6 +69,7 @@ bool consume_submission_fault(
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
 #include "../shared/standard_tiled_copy.inl"
 #include "../shared/standard_tiled_add.inl"
+#include "../shared/standard_tiled_rmsnorm.inl"
 
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_BARRIER
@@ -78,6 +80,19 @@ bool consume_submission_fault(
 #include "../shared/gpu_queue.hpp"
 
 namespace iom::cuda_detail {
+
+// Conservative RMSNorm wrapper. The shared 16x16 tiled device operation is
+// compiled and explicitly instantiated below, but CUDA does not yet launch
+// it: the RMSNorm wrapper leaf replaces this body with the shared launch on
+// the queue's existing nonblocking stream. Until then the operation reports
+// the established Unsupported outcome instead of a stub success.
+void gpu_policy::launch_rmsnorm(
+        cudaStream_t stream, const detail::RmsnormMetadata& metadata) {
+    static_cast<void>(stream);
+    static_cast<void>(metadata);
+    throw detail::UnsupportedOperation();
+}
+
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
     g_event_record_failures.store(
@@ -211,3 +226,18 @@ void reclaim_retained_queue_leases_for_testing(Device& device) {
 #endif  // IOM_ENABLE_TESTING
 
 }  // namespace iom::cuda_detail
+
+namespace iom::detail {
+
+// Compile-time coverage of the otherwise deferred launch boundary: the shared
+// launcher and its device operation are instantiated for this backend policy
+// in every build of this translation unit, so both toolchains compile the
+// complete shared implementation before a wrapper calls it. An explicit
+// instantiation is only well-formed in an enclosing namespace of the
+// template's own namespace, so this one lives here rather than in
+// `iom::cuda_detail`.
+template void launch_standard_tiled_rmsnorm<iom::cuda_detail::gpu_policy>(
+        iom::cuda_detail::gpu_policy::stream_type stream,
+        const RmsnormMetadata& metadata);
+
+}  // namespace iom::detail
