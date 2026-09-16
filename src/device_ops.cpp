@@ -12,10 +12,214 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 namespace iom {
     using detail::UnsupportedOperation;
+
+    namespace detail {
+
+        namespace {
+            // Structurally rejected operand text, tagged with the operation
+            // whose admission is being validated. Composed on the rejection
+            // path only, so a successful admission allocates nothing.
+            [[noreturn]] void reject_operand(
+                    const char* operation, std::string_view what) {
+                std::string message(operation);
+                message += ' ';
+                message += what;
+                throw std::invalid_argument(std::move(message));
+            }
+
+            // Scalar rounding of one final matrix extent to the standard
+            // 16x16 tile grid: the allocation-free equivalent of one
+            // TensorSpec::standard_padded_shape dimension.
+            [[nodiscard]] std::size_t padded_extent(
+                    std::size_t extent, const char* what) {
+                const std::size_t remainder = extent % TensorSpec::TILE;
+                if (remainder == 0) {
+                    return extent;
+                }
+                return checked_add(
+                        extent, TensorSpec::TILE - remainder, what);
+            }
+
+            // Checked product of the leading plane-selecting extents.
+            [[nodiscard]] std::size_t checked_plane_count(
+                    const TensorShape& shape, const char* what) {
+                std::size_t planes = 1;
+                const std::span<const std::size_t> dimensions =
+                        shape.dimensions();
+                for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
+                    planes = checked_mul(planes, dimensions[i], what);
+                }
+                return planes;
+            }
+
+            // Checked padded element count of one shape, computed with scalar
+            // rounding instead of a vector-backed padded shape. Precondition:
+            // the shape has rank two through eight.
+            [[nodiscard]] std::size_t checked_tiled_element_count(
+                    const TensorShape& shape, const char* what) {
+                const std::span<const std::size_t> dimensions =
+                        shape.dimensions();
+                const std::size_t last = dimensions.size() - 1;
+                const std::size_t rows =
+                        padded_extent(dimensions[last - 1], what);
+                const std::size_t columns =
+                        padded_extent(dimensions[last], what);
+                std::size_t elements = 1;
+                for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
+                    elements = checked_mul(elements, dimensions[i], what);
+                }
+                return checked_mul(
+                        checked_mul(elements, rows, what), columns, what);
+            }
+
+            // Checked storage bytes a whole owner of `spec` reserves: the
+            // allocation-free equivalent of
+            // TensorSpec::tiled_storage_nbytes(). Precondition: the spec
+            // carries a recognized leaf encoding and a valid shape.
+            [[nodiscard]] std::size_t checked_tiled_storage_bytes(
+                    const TensorSpec& spec, const char* what) {
+                const std::size_t bits = leaf_bits(spec.data_type);
+                const std::size_t elements =
+                        checked_tiled_element_count(spec.shape, what);
+                return bits_to_bytes(checked_mul(elements, bits, what), what);
+            }
+        }  // namespace
+
+        bool recognized_data_type(DataType value) noexcept {
+            // The declared leaves are contiguous, and leaf_bits covers exactly
+            // this interval.
+            return value >= DataType::BOOL && value <= DataType::F64;
+        }
+
+        bool recognized_quantization(QuantizationFormat value) noexcept {
+            // TensorSpec::validate uses the same declared-enum interval.
+            return value >= QuantizationFormat::NONE
+                    && value <= QuantizationFormat::TT_BFP8A;
+        }
+
+        void validate_checked_spec(
+                const TensorSpec& spec, const char* operation) {
+            if (!recognized_data_type(spec.data_type)) {
+                throw std::invalid_argument("unknown DataType value");
+            }
+            if (!recognized_quantization(spec.quantization)) {
+                throw std::invalid_argument("unknown quantization format");
+            }
+            if (spec.shape.rank() < 2) {
+                reject_operand(operation, "requires rank at least two");
+            }
+            if (spec.shape.rank() > kMaxTensorRank) {
+                reject_operand(operation, "requires rank at most eight");
+            }
+            for (const std::size_t dimension : spec.shape.dimensions()) {
+                if (dimension == 0) {
+                    reject_operand(operation, "dimensions must be nonzero");
+                }
+            }
+        }
+
+        CheckedViewFacts validate_checked_view(
+                const Device& device, const TensorView& view,
+                const char* operation) {
+            const Tensor* owner = view.owner_identity();
+            if (owner == nullptr) {
+                reject_operand(operation, "view has no owner");
+            }
+            if (&view.device() != &device
+                    || &owner->view().device() != &device
+                    || owner->view().owner_identity() != owner) {
+                reject_operand(
+                        operation, "view owner belongs to another device");
+            }
+            const void* handle = view.native_handle();
+            if (handle == nullptr
+                    || handle != owner->view().native_handle()) {
+                reject_operand(operation, "view has no stable owner handle");
+            }
+
+            const TensorSpec& spec = view.spec();
+            const TensorSpec& owner_spec = owner->view().spec();
+            const std::span<const std::size_t> dimensions =
+                    spec.shape.dimensions();
+            const std::span<const std::size_t> owner_dimensions =
+                    owner_spec.shape.dimensions();
+            // Callers validate the spec first, but the final matrix axes are
+            // indexed below, so the rank minimum is re-checked here rather
+            // than trusting a spec this path did not validate.
+            if (dimensions.size() < 2) {
+                reject_operand(operation, "requires rank at least two");
+            }
+            if (spec.data_type != owner_spec.data_type
+                    || spec.quantization != owner_spec.quantization
+                    || dimensions[dimensions.size() - 2]
+                            != owner_dimensions[owner_dimensions.size() - 2]
+                    || dimensions.back() != owner_dimensions.back()) {
+                reject_operand(
+                        operation,
+                        "view specification does not match its owner");
+            }
+
+            const std::size_t leading = dimensions.size() - 2;
+            const std::span<const std::size_t> strides =
+                    view.plane_strides();
+            if (strides.size() != leading) {
+                reject_operand(
+                        operation,
+                        "plane stride count does not match the view rank");
+            }
+            std::size_t max_plane = view.plane_offset();
+            for (std::size_t i = 0; i < leading; ++i) {
+                if (strides[i] == 0) {
+                    reject_operand(
+                            operation,
+                            "view does not permit zero plane strides");
+                }
+                max_plane = checked_add(
+                        max_plane,
+                        checked_mul(
+                                dimensions[i] - 1, strides[i],
+                                "plane address overflows"),
+                        "plane address overflows");
+            }
+            if (max_plane
+                    >= checked_plane_count(
+                            owner_spec.shape, "plane count overflows")) {
+                reject_operand(
+                        operation, "view addresses outside its owner");
+            }
+
+            const std::size_t last_slot = standard_plane_slot(
+                    spec, max_plane, dimensions[leading] - 1,
+                    dimensions[leading + 1] - 1);
+            const std::size_t addressed_bits = checked_mul(
+                    checked_add(last_slot, 1, "slot count overflows"),
+                    leaf_bits(spec.data_type), "view size overflows");
+            const std::size_t addressed_bytes = bits_to_bytes(
+                    addressed_bits, "view byte size overflows");
+            const std::size_t storage_bytes = checked_tiled_storage_bytes(
+                    owner_spec, "owner storage size overflows");
+            if (addressed_bytes > storage_bytes) {
+                reject_operand(
+                        operation, "view exceeds its owner storage");
+            }
+            const std::size_t logical_bits = checked_mul(
+                    spec.shape.element_count(), leaf_bits(spec.data_type),
+                    "logical size overflows");
+            const std::size_t logical_bytes = bits_to_bytes(
+                    logical_bits, "logical byte size overflows");
+            return CheckedViewFacts{
+                    max_plane, addressed_bytes, storage_bytes,
+                    logical_bytes};
+        }
+
+    }  // namespace detail
+
     void Device::reserve_queue_slot() const {
         std::lock_guard<std::mutex> lock(queue_registry_mutex_);
         if (live_queue_count_ == 4) throw std::bad_alloc();

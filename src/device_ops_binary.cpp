@@ -13,44 +13,15 @@
 
 namespace iom {
 
-    using detail::bits_to_bytes;
-    using detail::checked_add;
-    using detail::checked_mul;
-    using detail::kMaxTensorRank;
     using detail::UnsupportedOperation;
+    using detail::validate_checked_spec;
+    using detail::validate_checked_view;
 
     namespace {
-        bool recognized_quantization(QuantizationFormat value) noexcept {
-            switch (value) {
-                case QuantizationFormat::NONE:
-                case QuantizationFormat::INT8_SYMMETRIC:
-                case QuantizationFormat::INT8_ASYMMETRIC:
-                case QuantizationFormat::INT4_SYMMETRIC:
-                case QuantizationFormat::INT4_ASYMMETRIC:
-                case QuantizationFormat::OCP_MXFP4:
-                case QuantizationFormat::OCP_MXFP8_E4M3:
-                case QuantizationFormat::OCP_MXFP8_E5M2:
-                case QuantizationFormat::NVIDIA_NVFP4:
-                case QuantizationFormat::GGML_Q4_0:
-                case QuantizationFormat::GGML_Q4_1:
-                case QuantizationFormat::GGML_Q5_0:
-                case QuantizationFormat::GGML_Q5_1:
-                case QuantizationFormat::GGML_Q8_0:
-                case QuantizationFormat::GGML_Q2_K:
-                case QuantizationFormat::GGML_Q3_K:
-                case QuantizationFormat::GGML_Q4_K:
-                case QuantizationFormat::GGML_Q5_K:
-                case QuantizationFormat::GGML_Q6_K:
-                case QuantizationFormat::TT_BFP2:
-                case QuantizationFormat::TT_BFP2A:
-                case QuantizationFormat::TT_BFP4:
-                case QuantizationFormat::TT_BFP4A:
-                case QuantizationFormat::TT_BFP8:
-                case QuantizationFormat::TT_BFP8A:
-                    return true;
-            }
-            return false;
-        }
+        // Established diagnostic tag of the four binary operations. The
+        // shared checked-view admission path only interpolates it into
+        // rejection text.
+        constexpr const char* kAdmissionContext = "ADD";
 
         bool add_numeric_leaf(DataType value) noexcept {
             switch (value) {
@@ -85,120 +56,6 @@ namespace iom {
             }
         }
 
-        void validate_binary_spec(const TensorSpec& spec) {
-            (void)detail::leaf_bits(spec.data_type);
-            if (!recognized_quantization(spec.quantization)) {
-                throw std::invalid_argument("unknown quantization format");
-            }
-            if (spec.shape.rank() < 2) {
-                throw std::invalid_argument("ADD requires rank at least two");
-            }
-            if (spec.shape.rank() > kMaxTensorRank) {
-                throw std::invalid_argument("ADD requires rank at most eight");
-            }
-            for (const std::size_t dimension : spec.shape.dimensions()) {
-                if (dimension == 0) {
-                    throw std::invalid_argument(
-                            "ADD dimensions must be nonzero");
-                }
-            }
-        }
-
-        std::size_t checked_binary_plane_count(const TensorShape& shape) {
-            std::size_t planes = 1;
-            const std::span<const std::size_t> dimensions =
-                    shape.dimensions();
-            for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
-                planes = checked_mul(
-                        planes, dimensions[i],
-                        "ADD plane count overflows");
-            }
-            return planes;
-        }
-
-        void validate_binary_view(
-                const Device& device, const TensorView& view) {
-            const Tensor* owner = view.owner_identity();
-            if (owner == nullptr) {
-                throw std::invalid_argument("ADD view has no owner");
-            }
-            if (&view.device() != &device
-                    || &owner->view().device() != &device
-                    || owner->view().owner_identity() != owner) {
-                throw std::invalid_argument(
-                        "ADD view owner belongs to another device");
-            }
-            const void* handle = view.native_handle();
-            if (handle == nullptr
-                    || handle != owner->view().native_handle()) {
-                throw std::invalid_argument(
-                        "ADD view has no stable owner handle");
-            }
-
-            const TensorSpec& spec = view.spec();
-            const TensorSpec& owner_spec = owner->view().spec();
-            const std::span<const std::size_t> dimensions =
-                    spec.shape.dimensions();
-            const std::span<const std::size_t> owner_dimensions =
-                    owner_spec.shape.dimensions();
-            if (spec.data_type != owner_spec.data_type
-                    || spec.quantization != owner_spec.quantization
-                    || dimensions[dimensions.size() - 2]
-                            != owner_dimensions[owner_dimensions.size() - 2]
-                    || dimensions.back() != owner_dimensions.back()) {
-                throw std::invalid_argument(
-                        "ADD view specification does not match its owner");
-            }
-
-            const std::size_t leading = dimensions.size() - 2;
-            const std::span<const std::size_t> strides =
-                    view.plane_strides();
-            if (strides.size() != leading) {
-                throw std::invalid_argument("invalid ADD plane stride count");
-            }
-            std::size_t max_plane = view.plane_offset();
-            for (std::size_t i = 0; i < leading; ++i) {
-                if (strides[i] == 0) {
-                    throw std::invalid_argument(
-                            "ADD does not permit zero strides");
-                }
-                max_plane = checked_add(
-                        max_plane,
-                        checked_mul(
-                                dimensions[i] - 1, strides[i],
-                                "ADD plane address overflows"),
-                        "ADD plane address overflows");
-            }
-            if (max_plane >= checked_binary_plane_count(owner_spec.shape)) {
-                throw std::invalid_argument(
-                        "ADD view addresses outside its owner");
-            }
-
-            const std::size_t last_slot = detail::standard_plane_slot(
-                    spec, max_plane, dimensions[leading] - 1,
-                    dimensions[leading + 1] - 1);
-            const std::size_t addressed_bits = checked_mul(
-                    checked_add(last_slot, 1, "ADD slot count overflows"),
-                    detail::leaf_bits(spec.data_type),
-                    "ADD view size overflows");
-            const std::size_t addressed_bytes =
-                    bits_to_bytes(addressed_bits, "ADD view byte size overflows");
-            const std::size_t owner_bits = checked_mul(
-                    owner_spec.standard_padded_shape().element_count(),
-                    detail::leaf_bits(owner_spec.data_type),
-                    "ADD owner storage size overflows");
-            if (addressed_bytes
-                    > bits_to_bytes(
-                            owner_bits, "ADD owner storage size overflows")) {
-                throw std::invalid_argument(
-                        "ADD view exceeds its owner storage");
-            }
-            const std::size_t logical_bits = checked_mul(
-                    spec.shape.element_count(),
-                    detail::leaf_bits(spec.data_type),
-                    "ADD logical size overflows");
-            (void)bits_to_bytes(logical_bits, "ADD logical size overflows");
-        }
     }  // namespace
 
     DeviceOps::BinaryViewSnapshot DeviceOps::snapshot_binary_view(
@@ -246,18 +103,21 @@ namespace iom {
             const Device& device, BinaryOperation operation,
             const TensorView& lhs, const TensorView& rhs,
             const TensorView& out) {
-        validate_binary_spec(lhs.spec());
-        validate_binary_spec(rhs.spec());
-        validate_binary_spec(out.spec());
+        validate_checked_spec(lhs.spec(), kAdmissionContext);
+        validate_checked_spec(rhs.spec(), kAdmissionContext);
+        validate_checked_spec(out.spec(), kAdmissionContext);
         if (lhs.spec().data_type != rhs.spec().data_type
                 || lhs.spec().data_type != out.spec().data_type
                 || lhs.spec().quantization != rhs.spec().quantization
                 || lhs.spec().quantization != out.spec().quantization) {
             throw std::invalid_argument("binary specifications do not match");
         }
-        validate_binary_view(device, lhs);
-        validate_binary_view(device, rhs);
-        validate_binary_view(device, out);
+        // The shared checked-view path validates each operand's live
+        // owner/bounds and checked arithmetic; the broadcast, alias, and
+        // capability rules below stay binary-owned.
+        (void)validate_checked_view(device, lhs, kAdmissionContext);
+        (void)validate_checked_view(device, rhs, kAdmissionContext);
+        (void)validate_checked_view(device, out, kAdmissionContext);
         const auto lhs_dims = lhs.spec().shape.dimensions();
         const auto rhs_dims = rhs.spec().shape.dimensions();
         const std::size_t rank = std::max(lhs_dims.size(), rhs_dims.size());

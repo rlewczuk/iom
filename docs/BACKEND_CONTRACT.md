@@ -527,8 +527,14 @@ All ranks remain in 2 through 8 and all dimensions are nonzero. Embedding and
 linear validate, in the common precedence and before effects: well-formed
 views, ranks, shapes, leading mappings, exact device ownership, leaf type and
 quantization; scalar and range rules; aliasing and capability; then checked
-element, stride, byte-range, output-size, and other shape products. Linear
-additionally validates a recognized `layout`, `s <= T`, `R > 0`,
+element, stride, byte-range, output-size, and other shape products. Binary and
+embedding share one bounded, allocation-free checked-view admission path for
+the common structural facts: recognized encodings, rank and nonzero extents,
+exact live owner and stable native handle, leading-only view metadata,
+selected-plane bounds, and checked plane, tile, element, bit, and byte
+arithmetic. It allocates, snapshots, registers, and leases nothing, and
+shaping, capability, alias, and workspace policy stay with each operation.
+Linear additionally validates a recognized `layout`, `s <= T`, `R > 0`,
 `R <= T-s`, `H > 0`, and `D > 0`; head-planar mode checks `H*D` for overflow
 before comparing it with `O`, while ordinary mode requires `H=1,D=O`.
 Logical mapping excludes all 16x16 tile padding and honors every transformed
