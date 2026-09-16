@@ -158,6 +158,47 @@ namespace iom {
         [[nodiscard]] WorkspaceRequirements div_workspace_requirements(
                 const TensorView& lhs, const TensorView& rhs,
                 const TensorView& out);
+        /**
+         * Embedding row lookup `out[b, r, f] = table[indices[b, 0, r], f]`
+         * over a rank-two `E[V, F]` table shared unchanged by every
+         * independent leading plane, `indices[..., 1, R]`, and
+         * `out[..., R, F]`. Index and output views carry the same leading
+         * tuple; all three views keep rank two through eight, nonzero
+         * runtime extents, and their own selected plane offset and leading
+         * strides. There is no leading broadcast, singleton output-rank
+         * inflation, final-axis transform, or padding-dependent behavior.
+         * Table and output share one leaf encoding and
+         * `QuantizationFormat::NONE`; the index leaf is one of the twelve
+         * integral leaves, because `BOOL` and every floating leaf are not
+         * ID semantics. Selected payload bits are copied unchanged, with no
+         * arithmetic or re-encoding.
+         *
+         * Admission precedes any backend effect: well-formed views, rank
+         * and shape structure, exact queue device identity, live owner and
+         * stable native handle, leading bounds, checked element, byte,
+         * tile, plane, and stride arithmetic, table/output encoding
+         * agreement, and conservative output/input overlap. Input/input
+         * read aliases are valid. A supplied workspace is validated only
+         * for a positive backend requirement, after the capability query.
+         * Negative results are synchronous errors and positive values are
+         * accepted tokens whose retained failures rethrow on every wait.
+         *
+         * `embedding_workspace_requirements` is pure and deterministic: it
+         * runs the same validation and consults the backend capability
+         * without allocating, registering, leasing, consuming a sequence,
+         * uploading metadata, reading an index, or submitting. Both backend
+         * hooks default to `Unsupported`, so a backend advertises this
+         * operation only by overriding them; the operation-owned Embedding
+         * lookup section of `docs/BACKEND_CONTRACT.md` stays the normative
+         * source for per-backend payload, index, workspace, status, and
+         * failure policy.
+         */
+        oid embedding(const TensorView& table, const TensorView& indices,
+                      TensorView& out,
+                      RawWorkspaceView workspace = {}) noexcept;
+        [[nodiscard]] WorkspaceRequirements embedding_workspace_requirements(
+                const TensorView& table, const TensorView& indices,
+                const TensorView& out);
         oid silu(const TensorView& x, TensorView& y) noexcept;
         oid linear(const TensorView& x, const TensorView& w,
                    TensorView& y) noexcept;
@@ -270,6 +311,42 @@ namespace iom {
                   workspace_lease(other.workspace_lease) {}
         };
 
+        /**
+         * Immutable admission snapshot of one embedding submission:
+         * value-copied view metadata and stable owner identities for the
+         * table, index, and output operands, the validated caller workspace,
+         * the backend-reported requirement, and the workspace lease retained
+         * through proven completion. No callback may retain the caller's
+         * borrowed `TensorView` object, and no field changes after
+         * admission.
+         */
+        struct EmbeddingRequest {
+            CopyViewSnapshot table;
+            CopyViewSnapshot indices;
+            CopyViewSnapshot out;
+            RawWorkspaceView workspace;
+            WorkspaceRequirements workspace_requirements;
+            detail::WorkspaceLease workspace_lease;
+            EmbeddingRequest(
+                    CopyViewSnapshot table_, CopyViewSnapshot indices_,
+                    CopyViewSnapshot out_,
+                    RawWorkspaceView workspace_ = {},
+                    WorkspaceRequirements workspace_requirements_ = {},
+                    detail::WorkspaceLease workspace_lease_ = {})
+                : table(std::move(table_)), indices(std::move(indices_)),
+                  out(std::move(out_)), workspace(workspace_),
+                  workspace_requirements(workspace_requirements_),
+                  workspace_lease(workspace_lease_) {}
+            EmbeddingRequest(const EmbeddingRequest&) = default;
+            EmbeddingRequest& operator=(const EmbeddingRequest&) = delete;
+            EmbeddingRequest(EmbeddingRequest&& other) noexcept
+                : table(std::move(other.table)),
+                  indices(std::move(other.indices)), out(std::move(other.out)),
+                  workspace(other.workspace),
+                  workspace_requirements(other.workspace_requirements),
+                  workspace_lease(other.workspace_lease) {}
+        };
+
         // Immutable host-side copy descriptor retained by admission. It
         // contains value-copied view metadata and stable owner identities; no
         // callback may retain the caller's borrowed view object.
@@ -319,6 +396,7 @@ namespace iom {
         virtual oid copy_impl(
                 const TensorView& source, TensorView& destination);
         virtual oid binary_impl(const BinaryRequest& request);
+        virtual oid embedding_impl(const EmbeddingRequest& request);
         virtual oid silu_impl(const TensorView& x, TensorView& y);
         virtual oid linear_impl(const TensorView& x, const TensorView& w,
                                 TensorView& y);
@@ -350,6 +428,20 @@ namespace iom {
          */
         [[nodiscard]] virtual WorkspaceRequirements
                 binary_workspace_requirements(const BinaryRequest& request);
+        /**
+         * Backend hook behind `embedding_workspace_requirements`. Receives
+         * the already fully validated views and must stay pure: no
+         * allocation, registration, lease, token/queue resource, submission,
+         * index read, or retained view reference, and no dependence on free
+         * arena capacity, fragmentation, queue occupancy, or completion
+         * state. A backend that does not implement the operation reports
+         * `UnsupportedOperation` here, and common validation always precedes
+         * this capability decision.
+         */
+        [[nodiscard]] virtual WorkspaceRequirements
+                embedding_workspace_requirements_impl(
+                        const TensorView& table, const TensorView& indices,
+                        const TensorView& out);
         [[nodiscard]] const Device& queue_device() const;
         virtual void fence_through_sequence(
                 std::uint64_t sequence) noexcept;
@@ -438,26 +530,39 @@ namespace iom {
                     });
         }
 
-        template <typename QueueWork>
-        oid submit_binary(
-                const BinaryRequest& request, detail::RegistryState& state,
-                detail::QueueId queue_id, const detail::Fence& fence,
-                QueueWork queue_work) {
+        /**
+         * Shared prepared-ownership submission for operations with exactly
+         * three owner-registered views and an optional leased workspace.
+         * `Request` is the immutable admission snapshot type; it must expose
+         * `workspace`, `workspace_requirements`, and `workspace_lease`, as
+         * `BinaryRequest` and `EmbeddingRequest` do. The retained copy is
+         * registered in one all-or-nothing prepare step — workspace lease
+         * first, then the three owner records through the existing registry
+         * record types — before the FIFO node is published, and its rollback
+         * releases partial registrations and leases. Binary and embedding
+         * share this one ownership mechanism.
+         */
+        template <typename Request, typename QueueWork>
+        oid submit_three_owner_request(
+                const Request& request,
+                const std::array<detail::BinaryOwnerRegistration, 3>& owners,
+                detail::RegistryState& state, detail::QueueId queue_id,
+                const detail::Fence& fence, QueueWork queue_work) {
             struct Prepared {
-                BinaryRequest request;
+                Request request;
                 detail::WorkspaceLease workspace_lease;
                 detail::BinaryEntryRegistration entries;
                 std::function<void(
-                        std::uint64_t, const BinaryRequest&,
+                        std::uint64_t, const Request&,
                         detail::BinaryEntryRegistration)> work;
                 Prepared(
-                        const BinaryRequest& request_, QueueWork work_)
+                        const Request& request_, QueueWork work_)
                     : request(request_), work(std::move(work_)) {}
             };
             auto prepared = std::make_shared<Prepared>(
                     request, std::move(queue_work));
             return submit_prepared(
-                    [prepared, &state, queue_id, fence](
+                    [prepared, owners, &state, queue_id, fence](
                             std::uint64_t sequence) {
                         try {
                             if (prepared->request.workspace_requirements.bytes
@@ -475,18 +580,6 @@ namespace iom {
                                 prepared->request.workspace_lease =
                                         prepared->workspace_lease;
                             }
-                            const std::array<detail::BinaryOwnerRegistration, 3>
-                                    owners{{
-                                            {prepared->request.lhs
-                                                     .owner_identity,
-                                             prepared->request.lhs.native_handle},
-                                            {prepared->request.rhs
-                                                     .owner_identity,
-                                             prepared->request.rhs.native_handle},
-                                            {prepared->request.out
-                                                     .owner_identity,
-                                             prepared->request.out.native_handle},
-                                    }};
                             prepared->entries = detail::register_binary_entries(
                                     state, queue_id, sequence, owners, fence);
                         } catch (...) {
@@ -586,6 +679,40 @@ namespace iom {
                                             prepared->entries.count));
                         }
                     });
+        }
+
+        template <typename QueueWork>
+        oid submit_binary(
+                const BinaryRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            return submit_three_owner_request(
+                    request,
+                    std::array<detail::BinaryOwnerRegistration, 3>{{
+                            {request.lhs.owner_identity,
+                             request.lhs.native_handle},
+                            {request.rhs.owner_identity,
+                             request.rhs.native_handle},
+                            {request.out.owner_identity,
+                             request.out.native_handle}}},
+                    state, queue_id, fence, std::move(queue_work));
+        }
+
+        template <typename QueueWork>
+        oid submit_embedding(
+                const EmbeddingRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            return submit_three_owner_request(
+                    request,
+                    std::array<detail::BinaryOwnerRegistration, 3>{{
+                            {request.table.owner_identity,
+                             request.table.native_handle},
+                            {request.indices.owner_identity,
+                             request.indices.native_handle},
+                            {request.out.owner_identity,
+                             request.out.native_handle}}},
+                    state, queue_id, fence, std::move(queue_work));
         }
 
         void complete(std::uint64_t sequence,

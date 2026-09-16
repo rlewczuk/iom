@@ -799,6 +799,56 @@ public:
     mutable std::size_t to_destination_size = 0;
 };
 
+/*
+ * Test owner with its own exactly sized, 32-byte-aligned backing buffer.
+ * The embedding facade compares the real reserved storage ranges of distinct
+ * standard-layout owners, so a fixture whose declared storage is not real
+ * would report phantom intersection between unrelated operands.
+ */
+class OwnedFakeTensor {
+public:
+    OwnedFakeTensor(
+            iom::Device& device, std::vector<std::size_t> dimensions,
+            iom::DataType data_type = iom::DataType::F32)
+            : tensor_(make_spec(std::move(dimensions), data_type), device),
+              bytes_(tensor_.view().spec().tiled_storage_nbytes()),
+              buffer_(::operator new(
+                      std::max<std::size_t>(bytes_, 1),
+                      std::align_val_t(32))) {
+        tensor_.use_storage_handle(buffer_);
+    }
+
+    ~OwnedFakeTensor() {
+        ::operator delete(buffer_, std::align_val_t(32));
+    }
+
+    OwnedFakeTensor(const OwnedFakeTensor&) = delete;
+    OwnedFakeTensor& operator=(const OwnedFakeTensor&) = delete;
+    OwnedFakeTensor(OwnedFakeTensor&&) = delete;
+    OwnedFakeTensor& operator=(OwnedFakeTensor&&) = delete;
+
+    [[nodiscard]] iom::TensorView& view() noexcept {
+        return tensor_.view();
+    }
+    [[nodiscard]] const iom::TensorView& view() const noexcept {
+        return tensor_.view();
+    }
+    [[nodiscard]] FakeTensor& owner() noexcept {
+        return tensor_;
+    }
+    [[nodiscard]] void* storage_base() const noexcept {
+        return buffer_;
+    }
+    [[nodiscard]] std::size_t storage_bytes() const noexcept {
+        return bytes_;
+    }
+
+private:
+    FakeTensor tensor_;
+    std::size_t bytes_;
+    void* buffer_;
+};
+
 // Deterministic deferred operation queue: submissions are recorded and the
 // test thread plays the in-order worker by completing sequences through the
 // common DeviceOps machinery. No threads, backends, or real work involved.
@@ -813,6 +863,11 @@ public:
     };
 
     enum class RmsnormFailure {
+        none,
+        post_acceptance,
+    };
+
+    enum class EmbeddingFailure {
         none,
         post_acceptance,
     };
@@ -850,6 +905,14 @@ public:
         float epsilon;
         iom::WorkspaceRequirements workspace_requirements;
         iom::detail::BinaryEntryRegistration entries;
+        bool retained_failure;
+    };
+
+    struct EmbeddingRecord {
+        std::uint64_t sequence;
+        std::array<AddViewRecord, 3> views;
+        iom::detail::BinaryEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
         bool retained_failure;
     };
 
@@ -918,6 +981,40 @@ public:
             return;
         }
         throw std::invalid_argument("unknown fake RMSNORM sequence");
+    }
+
+    void set_embedding_requirements(
+            iom::WorkspaceRequirements requirements) noexcept {
+        embedding_requirements_ = requirements;
+    }
+
+    void inject_embedding_failure(EmbeddingFailure failure) noexcept {
+        next_embedding_failure_ = failure;
+    }
+
+    [[nodiscard]] const std::vector<EmbeddingRecord>& embedding_records()
+            const noexcept {
+        return embedding_records_;
+    }
+
+    // Plays the in-order completion of one accepted embedding submission
+    // through the common DeviceOps machinery and releases or quarantines its
+    // owners, workspace lease, and entries exactly as a proven-completion
+    // worker would.
+    void finish_embedding(std::uint64_t sequence) {
+        for (const EmbeddingRecord& record : embedding_records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_binary_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            iom::detail::complete_workspace_lease(
+                    registry_state_, record.workspace_lease, true);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake embedding sequence");
     }
 
     // Successfully queued operations in submission order.
@@ -1005,6 +1102,61 @@ protected:
                 });
     }
 
+
+    // The pure requirement hook reports the fake backend's fixed policy and
+    // touches no view metadata, queue state, or allocation.
+    iom::WorkspaceRequirements embedding_workspace_requirements_impl(
+            const iom::TensorView&, const iom::TensorView&,
+            const iom::TensorView&) override {
+        return embedding_requirements_;
+    }
+
+    iom::oid embedding_impl(const EmbeddingRequest& request) override {
+        const EmbeddingFailure failure =
+                std::exchange(next_embedding_failure_, EmbeddingFailure::none);
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_embedding(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence,
+                        const EmbeddingRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
+                    const auto record_view = [](const CopyViewSnapshot& view) {
+                        return AddViewRecord{
+                                view.spec,
+                                view.device_identity,
+                                view.owner_identity,
+                                view.native_handle,
+                                view.plane_offset,
+                                view.plane_strides,
+                                {},
+                                false,
+                                false,
+                                false};
+                    };
+                    EmbeddingRecord record{
+                            sequence,
+                            {record_view(snapshot.table),
+                             record_view(snapshot.indices),
+                             record_view(snapshot.out)},
+                            entries,
+                            snapshot.workspace_lease,
+                            failure == EmbeddingFailure::post_acceptance};
+                    embedding_records_.push_back(std::move(record));
+                    submissions.push_back({sequence, "embedding"});
+                    if (failure == EmbeddingFailure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(
+                                        std::invalid_argument(
+                                                "fake embedding invalid "
+                                                "index")));
+                    }
+                });
+    }
 
     iom::oid silu_impl(const iom::TensorView& x, iom::TensorView& y) override {
         silu_aliased = &x == &y;
@@ -1100,8 +1252,29 @@ private:
     std::vector<RmsnormRecord> rmsnorm_records_;
     AddFailure next_add_failure_ = AddFailure::none;
     RmsnormFailure next_rmsnorm_failure_ = RmsnormFailure::none;
+    std::vector<EmbeddingRecord> embedding_records_;
+    iom::WorkspaceRequirements embedding_requirements_{0, 1};
+    EmbeddingFailure next_embedding_failure_ = EmbeddingFailure::none;
     bool admission_unavailable_ = false;
 
+};
+
+/*
+ * A backend that implements no embedding hooks at all. Both embedding hooks
+ * keep their `Unsupported` defaults, which is exactly the state of every
+ * backend that has not landed its own embedding leaf.
+ */
+class UnportedQueue final : public iom::DeviceOps {
+public:
+    explicit UnportedQueue(const iom::Device& device)
+            : iom::DeviceOps(device) {}
+
+    // Sequence allocation stays observable without adding an operation hook:
+    // a rejected submission must leave the next sequence untouched, so the
+    // empty queued probe reports which sequence the next accepted work takes.
+    iom::oid probe() {
+        return submit([](std::uint64_t) {});
+    }
 };
 
 class InlineQueue final : public iom::DeviceOps {
@@ -2204,6 +2377,14 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
                                 TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
+        decltype(&DeviceOps::embedding),
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&, iom::RawWorkspaceView) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::embedding_workspace_requirements),
+        iom::WorkspaceRequirements (DeviceOps::*)(
+                const TensorView&, const TensorView&, const TensorView&)>);
+    static_assert(std::is_same_v<
         decltype(&DeviceOps::rmsnorm),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
                                 TensorView&, float,
@@ -2232,6 +2413,9 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
     static_assert(!std::is_invocable_v<
         decltype(&DeviceOps::add),
         DeviceOps*, const iom::Tensor&, const iom::Tensor&, iom::Tensor&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::embedding), DeviceOps*, const iom::Tensor&,
+        const iom::Tensor&, iom::Tensor&>);
     static_assert(!std::is_invocable_v<
         decltype(&DeviceOps::sdpa), DeviceOps*, const iom::Tensor&, const iom::Tensor&,
         const iom::Tensor&, size_t, size_t, size_t, iom::Tensor&>);
@@ -3101,6 +3285,551 @@ TEST_CASE("Unported RMSNorm hooks reject before workspace inspection or effects"
     const iom::oid probe = queue.copy(x.view(), out.view());
     CHECK_EQ(token_sequence(probe), 1);
     CHECK_NOTHROW(queue.wait(probe));
+}
+
+namespace {
+
+// Every recognized integral ID leaf.
+constexpr std::initializer_list<iom::DataType> kEmbeddingIdDataTypes = {
+    iom::DataType::I2, iom::DataType::U2,
+    iom::DataType::I4, iom::DataType::U4,
+    iom::DataType::I8, iom::DataType::U8,
+    iom::DataType::I16, iom::DataType::U16,
+    iom::DataType::I32, iom::DataType::U32,
+    iom::DataType::I64, iom::DataType::U64,
+};
+
+// Recognized leaves that are not ID semantics.
+constexpr std::initializer_list<iom::DataType> kEmbeddingNonIdDataTypes = {
+    iom::DataType::BOOL,
+    iom::DataType::F4_E2M1, iom::DataType::F6_E2M3,
+    iom::DataType::F6_E3M2, iom::DataType::F8_E4M3FN,
+    iom::DataType::F8_E5M2, iom::DataType::F8_E8M0,
+    iom::DataType::F16, iom::DataType::BF16,
+    iom::DataType::F32, iom::DataType::F64,
+};
+
+// A workspace view whose owning workspace is already destroyed. Only the
+// owner identity survives, which is exactly what the zero-requirement policy
+// observes without validating or leasing the range.
+iom::RawWorkspaceView dead_workspace_view(iom::Device& device) {
+    FakeWorkspace dead(device, reinterpret_cast<void*>(0x4A00), 64);
+    return dead.view();
+}
+
+}  // namespace
+
+TEST_CASE("Embedding admission precedes capability and leaves unported hooks unsupported") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    UnportedQueue queue(device);
+
+    // A well-formed request against a backend whose hooks keep their
+    // Unsupported default reports the capability error through both the
+    // noexcept facade and the throwing query.
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                unsupported);
+        CHECK_THROWS_AS(
+                (void)queue.embedding_workspace_requirements(
+                        table.view(), ids.view(), out.view()),
+                std::runtime_error);
+    }
+
+    // An unported capability is reported before otherwise unusable scratch is
+    // inspected: empty, undersized, misaligned, foreign, and dead ranges all
+    // still report Unsupported rather than InvalidArgument.
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        FakeWorkspace small(device, reinterpret_cast<void*>(0x4712), 16);
+        FakeWorkspace foreign_workspace(
+                foreign, reinterpret_cast<void*>(0x4712), 64);
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                unsupported);
+        CHECK_EQ(
+                queue.embedding(
+                        table.view(), ids.view(), out.view(), small.view()),
+                unsupported);
+        CHECK_EQ(
+                queue.embedding(
+                        table.view(), ids.view(), out.view(),
+                        dead_workspace_view(device)),
+                unsupported);
+        CHECK_EQ(
+                queue.embedding(
+                        table.view(), ids.view(), out.view(),
+                        foreign_workspace.view()),
+                unsupported);
+    }
+
+    // Common structural, device, view, shape, overflow, and alias errors keep
+    // their own categories and precede the capability decision.
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        const auto unknown = static_cast<iom::DataType>(127);
+        const_cast<iom::TensorSpec&>(table.owner().view().spec()).data_type =
+                unknown;
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        const auto unknown = static_cast<iom::QuantizationFormat>(127);
+        const_cast<iom::TensorSpec&>(table.owner().view().spec()).quantization =
+                unknown;
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        OwnedFakeTensor table(device, {2, 4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        const_cast<std::size_t*>(
+                table.owner().view().spec().shape.dimensions().data())[0] = 0;
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        // The index view must keep its single dummy row axis.
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {2, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        // The output run axis must equal the index run axis.
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {4, 16});
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        // Index and output leading tuples must match exactly.
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {2, 1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 3, 16});
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        // Table and output must share one leaf encoding.
+        OwnedFakeTensor table(device, {4, 16}, iom::DataType::F32);
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16}, iom::DataType::F16);
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        OwnedFakeTensor table(foreign, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        table.owner().use_storage_handle(nullptr);
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+    }
+    {
+        // Checked plane-addressing arithmetic overflows instead of wrapping.
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {3, 1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 3, 16});
+        const_cast<std::size_t*>(
+                ids.owner().view().plane_strides().data())[0] =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                iom::to_oid(iom::OidError::Overflow));
+    }
+    {
+        // The output may never alias an input owner even where the windows
+        // appear disjoint, and a distinct owner that shares an input backing
+        // handle or intersects its storage range is rejected as well.
+        OwnedFakeTensor shared(device, {3, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        CHECK_EQ(
+                queue.embedding(shared.view(), ids.view(), shared.view()),
+                invalid);
+
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor out(device, {3, 16});
+        out.owner().use_storage_handle(table.view().native_handle());
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                invalid);
+
+        OwnedFakeTensor overlapping(device, {3, 16});
+        overlapping.owner().use_storage_handle(
+                static_cast<std::byte*>(table.storage_base())
+                + table.storage_bytes() - 32);
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), overlapping.view()),
+                invalid);
+    }
+
+    // Recognized but inapplicable index leaves, and recognized non-NONE
+    // quantization, are capability rejections rather than invalid input.
+    for (const iom::DataType id_type : kEmbeddingNonIdDataTypes) {
+        CAPTURE(static_cast<int>(id_type));
+        OwnedFakeTensor table(device, {4, 16}, iom::DataType::BF16);
+        OwnedFakeTensor ids(device, {1, 3}, id_type);
+        OwnedFakeTensor out(device, {3, 16}, iom::DataType::BF16);
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                unsupported);
+    }
+    {
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        for (iom::TensorView* view :
+             {&table.view(), &ids.view(), &out.view()}) {
+            const_cast<iom::TensorSpec&>(view->spec()).quantization =
+                    iom::QuantizationFormat::OCP_MXFP4;
+        }
+        CHECK_EQ(
+                queue.embedding(table.view(), ids.view(), out.view()),
+                unsupported);
+    }
+
+    // Every rejection above is a negative synchronous result: nothing was
+    // registered, leased, or submitted, and no sequence was consumed, so the
+    // next accepted work still takes the very first sequence.
+    CHECK_EQ(token_sequence(queue.probe()), 1);
+}
+
+TEST_CASE("Embedding accepts every payload leaf and every integral ID leaf") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    std::uint64_t expected_sequence = 1;
+
+    for (const iom::DataType payload : kAllDataTypes) {
+        CAPTURE(static_cast<int>(payload));
+        OwnedFakeTensor table(device, {4, 16}, payload);
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16}, payload);
+        const iom::oid token =
+                queue.embedding(table.view(), ids.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(token_sequence(token), expected_sequence);
+        REQUIRE_EQ(queue.embedding_records().size(), expected_sequence);
+        CHECK_EQ(queue.embedding_records().back().entries.count, 3);
+        queue.finish_embedding(expected_sequence);
+        CHECK_NOTHROW(queue.wait(token));
+        ++expected_sequence;
+    }
+    for (const iom::DataType id_type : kEmbeddingIdDataTypes) {
+        CAPTURE(static_cast<int>(id_type));
+        OwnedFakeTensor table(device, {4, 16}, iom::DataType::BF16);
+        OwnedFakeTensor ids(device, {1, 3}, id_type);
+        OwnedFakeTensor out(device, {3, 16}, iom::DataType::BF16);
+        const iom::oid token =
+                queue.embedding(table.view(), ids.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(token_sequence(token), expected_sequence);
+        queue.finish_embedding(expected_sequence);
+        CHECK_NOTHROW(queue.wait(token));
+        ++expected_sequence;
+    }
+    CHECK_EQ(expected_sequence, 23 + 12 + 1);
+    CHECK_EQ(queue.embedding_records().size(), std::size_t{23 + 12});
+}
+
+TEST_CASE("Embedding workspace requirement queries are pure and deterministic") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    OwnedFakeTensor table(device, {4, 16});
+    OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+    OwnedFakeTensor out(device, {3, 16});
+
+    // The fake backend reports its own fixed zero-scratch policy verbatim.
+    CHECK(queue.embedding_workspace_requirements(
+                  table.view(), ids.view(), out.view())
+          == iom::WorkspaceRequirements{0, 1});
+
+    // A positive fixed policy repeats identically and allocates nothing.
+    queue.set_embedding_requirements({32, 32});
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements measured =
+            queue.embedding_workspace_requirements(
+                    table.view(), ids.view(), out.view());
+    const std::size_t allocations = iom_test::disarm();
+    CHECK_EQ(allocations, 0);
+    CHECK(measured == iom::WorkspaceRequirements{32, 32});
+    CHECK(queue.embedding_workspace_requirements(
+                  table.view(), ids.view(), out.view())
+          == iom::WorkspaceRequirements{32, 32});
+
+    // The query validates exactly as submission does and reports the
+    // established categories instead of mapping them through the facade.
+    OwnedFakeTensor foreign_table(foreign, {4, 16});
+    CHECK_THROWS_AS(
+            (void)queue.embedding_workspace_requirements(
+                    foreign_table.view(), ids.view(), out.view()),
+            std::invalid_argument);
+    OwnedFakeTensor wrong_rows(device, {2, 3});
+    CHECK_THROWS_AS(
+            (void)queue.embedding_workspace_requirements(
+                    table.view(), wrong_rows.view(), out.view()),
+            std::invalid_argument);
+    OwnedFakeTensor floating_ids(device, {1, 3}, iom::DataType::F32);
+    CHECK_THROWS_AS(
+            (void)queue.embedding_workspace_requirements(
+                    table.view(), floating_ids.view(), out.view()),
+            std::runtime_error);
+
+    // No submission, record, registration, lease, or sequence consumption.
+    CHECK(queue.submissions.empty());
+    CHECK(queue.embedding_records().empty());
+    CHECK_EQ(queue.registered_at(table.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(ids.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+    CHECK_EQ(token_sequence(queue.probe()), 1);
+    CHECK_EQ(queue.submissions.size(), std::size_t{1});
+}
+
+TEST_CASE("Embedding leases positive workspace until its completion proof") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid exhausted = iom::to_oid(iom::OidError::ResourceExhausted);
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    queue.set_embedding_requirements({32, 32});
+    OwnedFakeTensor table(device, {4, 16});
+    OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+    OwnedFakeTensor out(device, {3, 16});
+
+    void* const base = reinterpret_cast<void*>(0x4B00);
+    void* const second = reinterpret_cast<void*>(0x4B20);
+    FakeWorkspace workspace(device, base, 64);
+    FakeWorkspace small(device, reinterpret_cast<void*>(0x4C00), 16);
+    FakeWorkspace misaligned(device, reinterpret_cast<void*>(0x4D01), 64);
+    FakeWorkspace foreign_workspace(foreign, reinterpret_cast<void*>(0x4E00), 64);
+
+    // Every unusable supplied range rejects before dispatch, registration,
+    // lease, or sequence consumption.
+    CHECK_EQ(
+            queue.embedding(table.view(), ids.view(), out.view()),
+            invalid);
+    CHECK_EQ(
+            queue.embedding(
+                    table.view(), ids.view(), out.view(),
+                    iom::RawWorkspaceView{}),
+            invalid);
+    CHECK_EQ(
+            queue.embedding(
+                    table.view(), ids.view(), out.view(), small.view()),
+            invalid);
+    CHECK_EQ(
+            queue.embedding(
+                    table.view(), ids.view(), out.view(), misaligned.view()),
+            invalid);
+    CHECK_EQ(
+            queue.embedding(
+                    table.view(), ids.view(), out.view(),
+                    foreign_workspace.view()),
+            invalid);
+    CHECK_EQ(
+            queue.embedding(
+                    table.view(), ids.view(), out.view(),
+                    dead_workspace_view(device)),
+            invalid);
+    CHECK(queue.embedding_records().empty());
+    CHECK(queue.submissions.empty());
+    CHECK_EQ(queue.registered_at(base), 0);
+
+    // A live, aligned, sufficient, disjoint range is admitted and leased.
+    const iom::oid token = queue.embedding(
+            table.view(), ids.view(), out.view(),
+            workspace.view().subrange(0, 32));
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.embedding_records().size(), std::size_t{1});
+    CHECK_EQ(queue.registered_at(base), 1);
+
+    // An overlapping live lease is bounded-resource exhaustion, and the
+    // rejected attempt leaves neither record nor lease behind.
+    CHECK_EQ(
+            queue.embedding(
+                    table.view(), ids.view(), out.view(),
+                    workspace.view().subrange(0, 32)),
+            exhausted);
+    CHECK_EQ(queue.embedding_records().size(), std::size_t{1});
+    CHECK_EQ(queue.registered_at(base), 1);
+
+    // A disjoint aligned subrange of the same owner is independent.
+    const iom::oid disjoint = queue.embedding(
+            table.view(), ids.view(), out.view(),
+            workspace.view().subrange(32, 32));
+    REQUIRE(iom::oid_is_token(disjoint));
+    CHECK_EQ(queue.registered_at(second), 1);
+
+    // Proven completion releases both leases, and the whole range is reused.
+    queue.finish_embedding(token_sequence(token));
+    CHECK_EQ(queue.registered_at(base), 0);
+    CHECK_NOTHROW(queue.wait(token));
+    queue.finish_embedding(token_sequence(disjoint));
+    CHECK_EQ(queue.registered_at(second), 0);
+    CHECK_NOTHROW(queue.wait(disjoint));
+
+    const iom::oid reused = queue.embedding(
+            table.view(), ids.view(), out.view(),
+            workspace.view().subrange(0, 32));
+    REQUIRE(iom::oid_is_token(reused));
+    queue.finish_embedding(token_sequence(reused));
+    CHECK_NOTHROW(queue.wait(reused));
+    CHECK_EQ(queue.registered_at(base), 0);
+}
+
+TEST_CASE("Embedding zero requirement neither validates nor leases an unused range") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    OwnedFakeTensor table(device, {4, 16});
+    OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+    OwnedFakeTensor out(device, {3, 16});
+
+    void* const foreign_base = reinterpret_cast<void*>(0x4F00);
+    void* const small_base = reinterpret_cast<void*>(0x4F40);
+    FakeWorkspace foreign_workspace(foreign, foreign_base, 64);
+    FakeWorkspace small(device, small_base, 8);
+
+    const iom::oid empty_token =
+            queue.embedding(table.view(), ids.view(), out.view());
+    const iom::oid dead_token = queue.embedding(
+            table.view(), ids.view(), out.view(), dead_workspace_view(device));
+    const iom::oid foreign_token = queue.embedding(
+            table.view(), ids.view(), out.view(), foreign_workspace.view());
+    const iom::oid small_token = queue.embedding(
+            table.view(), ids.view(), out.view(), small.view());
+    REQUIRE(iom::oid_is_token(empty_token));
+    REQUIRE(iom::oid_is_token(dead_token));
+    REQUIRE(iom::oid_is_token(foreign_token));
+    REQUIRE(iom::oid_is_token(small_token));
+
+    // The unused ranges stay unregistered and unleaased.
+    CHECK_EQ(queue.registered_at(foreign_base), 0);
+    CHECK_EQ(queue.registered_at(small_base), 0);
+
+    queue.finish_embedding(token_sequence(empty_token));
+    queue.finish_embedding(token_sequence(dead_token));
+    queue.finish_embedding(token_sequence(foreign_token));
+    queue.finish_embedding(token_sequence(small_token));
+    CHECK_NOTHROW(queue.wait(empty_token));
+    CHECK_NOTHROW(queue.wait(dead_token));
+    CHECK_NOTHROW(queue.wait(foreign_token));
+    CHECK_NOTHROW(queue.wait(small_token));
+
+    CHECK(queue.embedding_workspace_requirements(
+                  table.view(), ids.view(), out.view())
+          == iom::WorkspaceRequirements{0, 1});
+    CHECK_EQ(queue.embedding_records().size(), std::size_t{4});
+}
+
+TEST_CASE("Embedding snapshots live owners and retains accepted failures") {
+    FakeDevice device;
+    {
+        // Transformed leading views are snapshotted while the derived view
+        // temporaries die, and the three distinct owners register once each.
+        FakeQueue queue(device);
+        OwnedFakeTensor table_owner(device, {2, 4, 16});
+        OwnedFakeTensor index_owner(device, {2, 1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out_owner(device, {2, 3, 16});
+        iom::TensorView out_view = out_owner.view().select(0, 1);
+
+        const iom::oid token = queue.embedding(
+                table_owner.view().select(0, 1),
+                index_owner.view().select(0, 1), out_view);
+        REQUIRE(iom::oid_is_token(token));
+        const FakeQueue::EmbeddingRecord& record =
+                queue.embedding_records().back();
+        CHECK_EQ(record.views[0].plane_offset, 1);
+        CHECK_EQ(record.views[1].plane_offset, 1);
+        CHECK_EQ(record.views[2].plane_offset, 1);
+        CHECK_EQ(record.views[0].owner, &table_owner.owner());
+        CHECK_EQ(record.views[1].owner, &index_owner.owner());
+        CHECK_EQ(record.views[2].owner, &out_owner.owner());
+        CHECK_EQ(record.views[0].handle, table_owner.storage_base());
+        CHECK_EQ(record.entries.count, 3);
+        queue.finish_embedding(token_sequence(token));
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_NOTHROW(queue.wait(token));
+    }
+    {
+        // One owner serves the rank-two table and the `[1, R]` index view:
+        // valid read/read aliasing registers that owner exactly once. U32 is
+        // both an applicable payload leaf and one of the twelve ID leaves.
+        FakeQueue queue(device);
+        OwnedFakeTensor shared(device, {1, 8}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {8, 8}, iom::DataType::U32);
+        const iom::oid token =
+                queue.embedding(shared.view(), shared.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(queue.embedding_records().back().entries.count, 2);
+        CHECK_EQ(queue.registered_at(shared.view().native_handle()), 1);
+        queue.finish_embedding(token_sequence(token));
+        CHECK_EQ(queue.registered_at(shared.view().native_handle()), 0);
+        CHECK_NOTHROW(queue.wait(token));
+    }
+    {
+        // An accepted queued data failure stays a positive token, is
+        // rethrown with the same category on every wait, and leaves the
+        // unusable output without any rollback guarantee. The unknown
+        // completion keeps the owners quarantined.
+        FakeQueue queue(device);
+        OwnedFakeTensor table(device, {4, 16});
+        OwnedFakeTensor ids(device, {1, 3}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {3, 16});
+        queue.inject_embedding_failure(
+                FakeQueue::EmbeddingFailure::post_acceptance);
+        const iom::oid token =
+                queue.embedding(table.view(), ids.view(), out.view());
+        REQUIRE(iom::oid_is_token(token));
+        queue.finish_embedding(token_sequence(token));
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            CHECK_THROWS_AS(queue.wait(token), std::invalid_argument);
+        }
+        CHECK_EQ(queue.registered_at(table.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(ids.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
+    }
 }
 
 TEST_CASE("DeviceOps queue ids lease exclusively across threads and are reused after release") {

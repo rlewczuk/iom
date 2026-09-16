@@ -425,13 +425,19 @@ reporting that operation `Unsupported` until its own port lands.
 #### TinyLlama forward layout — Embedding and projection boundaries
 
 This subsection freezes planned backend-neutral boundaries; it does not
-advertise an implementation. The operation-owned
-[Embedding lookup](#embedding-lookup) and
-[Linear projections](#linear-projections) sections publish the exact target
-ABI. The existing three-view `linear` signature remains unchanged and returns
-`Unsupported` as specified above, and embedding returns `Unsupported` until a
-backend port lands. In the target ABI, `LinearOutputLayout` and the methods are
-exactly:
+advertise an implementation. The embedding methods below are declared and
+admitted by the current neural facade: common structural, device, view, shape,
+alias, and checked-arithmetic validation and the pure requirement query are
+implemented, while both backend hooks still report `Unsupported`, so embedding
+returns `Unsupported` until a backend port lands and no backend implements or
+advertises the operation yet. The existing three-view `linear` signature
+remains unchanged and returns `Unsupported` as specified above, and
+`LinearOutputLayout` with the wider `linear` methods remains the target ABI.
+The operation-owned [Embedding lookup](#embedding-lookup) and
+[Linear projections](#linear-projections) sections and their backend gates
+publish the exact target ABI and remain the normative source for per-backend
+capability, workspace, status, and failure policy. The embedding declarations
+and the target `LinearOutputLayout` and `linear` methods are exactly:
 
 ```cpp
 enum class LinearOutputLayout { ordinary, head_planar };
