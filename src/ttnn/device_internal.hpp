@@ -7,6 +7,7 @@
 #include <span>
 #include <stdexcept>
 
+#include <tt-metalium/mesh_buffer.hpp>
 #include <ttnn/device.hpp>
 #include <ttnn/tensor/tensor.hpp>
 
@@ -67,5 +68,50 @@ private:
     std::mutex api_mutex_;
     detail::RegistryState registry_state_;
 };
+
+namespace ttnn_detail {
+
+/**
+ * Checked, owner-absolute view of one live positive TTNN raw-workspace
+ * owner. Queue code addresses the caller's native scratch only through this
+ * record: the owning replicated DRAM allocation, its actual native page
+ * size, the native base address that common range and lease identity use,
+ * the owner's logical bytes, and the view's owner-absolute logical offset.
+ * Neither a subrange nor an operation creates a second native buffer or a
+ * new native view.
+ */
+struct NativeWorkspace {
+    // The single owning replicated DRAM allocation of the workspace owner.
+    tt::tt_metal::distributed::MeshBuffer* owner = nullptr;
+    // Actual native page size; the owner is one contiguous page, so this is
+    // the requested logical byte count rounded up to 32.
+    std::uint64_t page_size = 0;
+    // Native base address of the owner, shared by every subrange identity.
+    std::uint64_t base = 0;
+    // Logical bytes owned by the caller's request (`RawWorkspace::byte_size`).
+    std::size_t logical_bytes = 0;
+    // Owner-absolute logical offset of the checked view.
+    std::size_t offset = 0;
+
+    // Native address of this view's first byte.
+    [[nodiscard]] std::uint64_t range_address() const noexcept {
+        return base + offset;
+    }
+};
+
+/**
+ * Checked access to the native owner behind one live positive workspace view
+ * created by `device`. An empty view, an owner that is not live on `device`
+ * (foreign or already destroyed; never dereferenced), a zero-byte owner
+ * without a native allocation, a non-32-byte-aligned owner-absolute offset,
+ * an empty range, and a range that ends past the owner's logical bytes all
+ * reject as `std::invalid_argument` before any native effect. A live native
+ * owner without an address or without its checked page/alignment invariants
+ * reports `std::runtime_error`.
+ */
+[[nodiscard]] NativeWorkspace checked_native_workspace(
+        TtnnDevice& device, const RawWorkspaceView& workspace);
+
+}  // namespace ttnn_detail
 
 }  // namespace iom

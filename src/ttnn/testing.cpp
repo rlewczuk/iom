@@ -13,7 +13,7 @@
 #ifdef IOM_ENABLE_TESTING
 namespace iom::ttnn_detail {
 static std::atomic<bool> g_fail_next_quarantine_action{false};
-static bool g_quarantine_action_fault_consumed = false;
+static std::atomic<bool> g_quarantine_action_fault_consumed{false};
 
 static std::atomic<bool> g_fail_next_copy_registration{false};
 static std::atomic<bool> g_fail_next_copy_outcome_insertion{false};
@@ -41,8 +41,10 @@ static bool g_binary_execution_reached = false;
 void consume_quarantine_action_fault_locked() noexcept(false) {
     if (g_fail_next_quarantine_action.exchange(
                 false, std::memory_order_acquire)
-            && !g_quarantine_action_fault_consumed) {
-        g_quarantine_action_fault_consumed = true;
+            && !g_quarantine_action_fault_consumed.load(
+                    std::memory_order_acquire)) {
+        g_quarantine_action_fault_consumed.store(
+                true, std::memory_order_release);
         throw std::bad_alloc();
     }
 }
@@ -160,12 +162,18 @@ void release_binary_execution_barrier_for_testing() noexcept {
 
 
 void fail_next_quarantine_action_for_testing() noexcept {
+    // Arming is one-shot per arm, like the other per-arm seams: the
+    // consumed state is cleared here, so a re-armed fault is never refused
+    // because an earlier test case already consumed one.
+    ttnn_detail::g_quarantine_action_fault_consumed.store(
+            false, std::memory_order_release);
     ttnn_detail::g_fail_next_quarantine_action.store(
             true, std::memory_order_release);
 }
 
 bool quarantine_action_fault_consumed_for_testing() noexcept {
-    return ttnn_detail::g_quarantine_action_fault_consumed;
+    return ttnn_detail::g_quarantine_action_fault_consumed.load(
+            std::memory_order_acquire);
 }
 
 void fail_next_copy_planes_submission_for_testing(
@@ -268,3 +276,51 @@ std::size_t host_transfer_staging_allocation_count_for_testing() noexcept {
 
 }  // namespace iom::ttnn_test
 #endif
+
+// Native raw-workspace accounting is defined in every build so the owning
+// workspace header and its cleanup action need no build-mode split; a build
+// without the testing seam simply counts nothing.
+namespace iom::ttnn_test {
+#ifdef IOM_ENABLE_TESTING
+namespace {
+    std::atomic<std::size_t> g_native_workspace_allocations{0};
+    std::atomic<std::size_t> g_native_workspace_releases{0};
+}  // namespace
+#endif
+
+void reset_native_workspace_counts_for_testing() noexcept {
+#ifdef IOM_ENABLE_TESTING
+    g_native_workspace_allocations.store(0, std::memory_order_release);
+    g_native_workspace_releases.store(0, std::memory_order_release);
+#endif
+}
+
+void record_native_workspace_allocation_for_testing() noexcept {
+#ifdef IOM_ENABLE_TESTING
+    g_native_workspace_allocations.fetch_add(1, std::memory_order_acq_rel);
+#endif
+}
+
+void record_native_workspace_release_for_testing() noexcept {
+#ifdef IOM_ENABLE_TESTING
+    g_native_workspace_releases.fetch_add(1, std::memory_order_acq_rel);
+#endif
+}
+
+std::size_t native_workspace_allocation_count_for_testing() noexcept {
+#ifdef IOM_ENABLE_TESTING
+    return g_native_workspace_allocations.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+std::size_t native_workspace_release_count_for_testing() noexcept {
+#ifdef IOM_ENABLE_TESTING
+    return g_native_workspace_releases.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+}  // namespace iom::ttnn_test

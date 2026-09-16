@@ -83,11 +83,16 @@ namespace iom {
          * return a valid allocation-free empty owner on every backend;
          * positive bytes suballocate the already reserved 32-byte-aligned
          * data arena on CUDA, ROCm, and SYCL (never a new native backing;
-         * exhaustion including fragmentation is std::bad_alloc) and are
-         * rejected as unsupported device scratch with
-         * `std::invalid_argument` on CPU and TTNN. The owner is stable,
-         * non-copyable, non-movable, and must be destroyed before its
-         * creating Device.
+         * exhaustion including fragmentation is std::bad_alloc), own one
+         * replicated DRAM native page on TTNN whose page size is the
+         * checked request rounded up to 32 bytes (overflow of that
+         * rounding or of the native page-size range is
+         * `std::overflow_error`), and are rejected as unsupported device
+         * scratch with `std::invalid_argument` on CPU. A TTNN owner reports
+         * exactly the requested logical byte count through `byte_size()`
+         * and releases its native allocation only after proven completion.
+         * The owner is stable, non-copyable, non-movable, and must be
+         * destroyed before its creating Device.
          */
         [[nodiscard]] virtual std::unique_ptr<RawWorkspace>
                 create_workspace(std::size_t bytes) = 0;

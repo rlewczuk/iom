@@ -2,6 +2,7 @@
 #include "device_internal.hpp"
 
 #include <tt-metalium/host_api.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
 #include <tt-metalium/tile.hpp>
 #include <ttnn/device.hpp>
 #include <ttnn/tensor/tensor.hpp>
@@ -189,15 +190,212 @@ namespace iom {
             std::unique_ptr<std::vector<ttnn::Tensor>> planes_;
         };
 
+        // Checked round-up of one positive logical request to the native
+        // 32-byte page granularity.
+        [[nodiscard]] std::size_t checked_physical_workspace_size(
+                std::size_t bytes) {
+            if (bytes > std::numeric_limits<std::size_t>::max() - 31) {
+                throw std::overflow_error(
+                        "TTNN workspace size round-up overflows");
+            }
+            const std::size_t physical = (bytes + 31) / 32 * 32;
+            if (physical > std::numeric_limits<std::uint32_t>::max()) {
+                // The native page size is a 32-bit field, so a larger
+                // request cannot be one contiguous native page.
+                throw std::overflow_error(
+                        "TTNN workspace size exceeds the native page size");
+            }
+            return physical;
+        }
+
+        // One owning replicated DRAM native page for a positive request:
+        // the whole physically rounded request is a single contiguous page,
+        // never an interleaved multi-page allocation and never the
+        // non-owning explicit-address form.
+        [[nodiscard]] std::shared_ptr<
+                tt::tt_metal::distributed::MeshBuffer>
+        make_native_workspace(TtnnDevice& device, std::size_t bytes) {
+            const std::size_t physical =
+                    checked_physical_workspace_size(bytes);
+            std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> buffer =
+                    tt::tt_metal::distributed::MeshBuffer::create(
+                            tt::tt_metal::distributed::ReplicatedBufferConfig{
+                                    static_cast<tt::tt_metal::DeviceAddr>(
+                                            physical)},
+                            tt::tt_metal::distributed::DeviceLocalBufferConfig{
+                                    .page_size =
+                                            static_cast<tt::tt_metal::DeviceAddr>(
+                                                    physical),
+                                    .buffer_type =
+                                            tt::tt_metal::BufferType::DRAM},
+                            &device.mesh());
+            const tt::tt_metal::Buffer* const reference =
+                    buffer == nullptr ? nullptr
+                                      : buffer->get_reference_buffer();
+            if (buffer == nullptr || buffer->address() == 0) {
+                throw std::runtime_error(
+                        "TTNN workspace has no native address");
+            }
+            if (reference == nullptr || reference->alignment() < 32) {
+                throw std::runtime_error(
+                        "TTNN workspace native alignment is below 32 bytes");
+            }
+            if (buffer->device_local_config().page_size != physical
+                    || buffer->size() != physical
+                    || buffer->num_pages() != 1) {
+                throw std::runtime_error(
+                        "TTNN workspace native page invariants are not met");
+            }
+            iom::ttnn_test::record_native_workspace_allocation_for_testing();
+            return buffer;
+        }
+
         /**
-         * TTNN raw-workspace owner. Only the zero-byte empty workspace
-         * exists: the base RawWorkspace registers the exact identity with
-         * the device and no native allocation is ever touched.
+         * TTNN raw-workspace owner. A positive request owns exactly one
+         * replicated DRAM `MeshBuffer` on the existing unit mesh: one
+         * contiguous native page whose page size is the caller's logical
+         * bytes rounded up to 32. `byte_size()` stays the caller-requested
+         * logical bytes, and the native allocation is released only through
+         * the workspace lease and the registry completion proof; unproved
+         * use retains the real allocation in the device quarantine, or
+         * deliberately holds on to it when no quarantine record can be
+         * created. The zero-byte owner keeps the empty semantics and touches
+         * no native allocation.
          */
         class TtnnWorkspace final : public RawWorkspace {
+            // The storage an unproved native owner is handed to when no
+            // quarantine record can be created. It is heap-allocated and
+            // reserved while construction is still fail-safe, so the
+            // `std::shared_ptr` handover is a noexcept move and the cell
+            // itself can be deliberately leaked instead of returning the
+            // real `MeshBuffer` to TTNN.
+            using RetentionCell =
+                    std::shared_ptr<
+                            tt::tt_metal::distributed::MeshBuffer>;
+
         public:
             TtnnWorkspace(TtnnDevice& device, std::size_t bytes)
-                    : RawWorkspace(device, bytes) {}
+                    : RawWorkspace(device, bytes), device_(device),
+                      state_(&device.registry_state()) {
+                if (bytes != 0) {
+                    // The retention cell is reserved before the native
+                    // allocation, while construction can still fail
+                    // cleanly: every owner that can hold native work then
+                    // has allocation-free storage to be retained in.
+                    retention_ = std::make_unique<RetentionCell>();
+                    native_ = make_native_workspace(device, bytes);
+                }
+            }
+
+            ~TtnnWorkspace() noexcept override {
+                if (!native_) {
+                    return;
+                }
+                const auto quarantine_native = [this]() noexcept {
+                    // First step retains the owning reference in the cell
+                    // reserved by the constructor: a `std::shared_ptr` move
+                    // cannot allocate and cannot throw, so from here on the
+                    // real `MeshBuffer` survives every failure below instead
+                    // of being returned to TTNN without a completion proof.
+                    *retention_ = std::move(native_);
+                    if (!*retention_) {
+                        return;
+                    }
+                    try {
+#ifdef IOM_ENABLE_TESTING
+                        ttnn_detail::consume_quarantine_action_fault_locked();
+#endif
+                        auto action = std::unique_ptr<
+                                ttnn_detail::TtnnNativeCleanupAction>(
+                                new ttnn_detail::TtnnNativeCleanupAction(
+                                        *retention_,
+                                        [device = &device_] {
+                                            std::lock_guard<std::mutex> lock(
+                                                    device->api_mutex());
+                                            device->mesh()
+                                                    .mesh_command_queue(0)
+                                                    .finish();
+                                        }));
+                        state_->quarantine.add(std::move(action));
+                        // The recorded quarantine action is the owner now,
+                        // so the cell's reference is dropped: the native
+                        // allocation is released only once that action runs
+                        // behind a completed proof.
+                        retention_->reset();
+                    } catch (...) {
+                        // No quarantine record can be created: the cell is
+                        // deliberately leaked, exactly like the tensor
+                        // path's retained payload, so an unproved native
+                        // owner is never returned to TTNN.
+                        (void)retention_.release();
+                    }
+                };
+                const auto release_native = [this]() noexcept {
+                    if (!native_) {
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(
+                                device_.api_mutex());
+                        native_.reset();
+                    }
+                    iom::ttnn_test::
+                            record_native_workspace_release_for_testing();
+                };
+                if (native_range_retained()) {
+                    // A live or quarantined lease of this owner is not a
+                    // completion proof: the real native allocation stays
+                    // retained instead of being released early.
+                    quarantine_native();
+                    return;
+                }
+                iom::detail::release_or_quarantine(
+                        state_->registry, workspace_address(),
+                        quarantine_native, release_native);
+            }
+
+            [[nodiscard]] tt::tt_metal::distributed::MeshBuffer* native_owner()
+                    const noexcept {
+                return native_.get();
+            }
+
+            [[nodiscard]] std::uint64_t native_page_size() const noexcept {
+                return native_ != nullptr
+                        ? native_->device_local_config().page_size
+                        : 0;
+            }
+
+        protected:
+            [[nodiscard]] void* workspace_address() const noexcept override {
+                return native_ != nullptr
+                        ? reinterpret_cast<void*>(
+                                  static_cast<std::uintptr_t>(
+                                          native_->address()))
+                        : nullptr;
+            }
+
+        private:
+            // True while a live or quarantined lease of this owner retains
+            // any range, whether or not a registry entry is still present.
+            // Bookkeeping that cannot be read retains conservatively.
+            [[nodiscard]] bool native_range_retained() noexcept {
+                try {
+                    std::lock_guard<std::mutex> lock(
+                            state_->allocation_mutex);
+                    return iom::detail::workspace_range_retained(
+                            state_->workspace_leases, this,
+                            workspace_address(), byte_size());
+                } catch (...) {
+                    return true;
+                }
+            }
+
+            TtnnDevice& device_;
+            detail::RegistryState* state_;
+            std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> native_;
+            // Reserved at construction; its heap cell is deliberately
+            // leaked when `native_` cannot be recorded in the quarantine.
+            std::unique_ptr<RetentionCell> retention_;
         };
     }  // namespace
     TtnnDevice::TtnnDevice(
@@ -254,15 +452,68 @@ namespace iom {
 
     std::unique_ptr<RawWorkspace> TtnnDevice::create_workspace(
             std::size_t bytes) {
-        if (bytes != 0) {
-            // Positive scratch is unsupported device storage here: no
-            // dummy native storage is manufactured and no TTNN allocation
-            // is touched.
-            throw std::invalid_argument(
-                    "TTNN devices do not support positive raw workspace "
-                    "allocation");
+        if (bytes == 0) {
+            // The empty owner allocates nothing and touches no native
+            // allocation.
+            return std::make_unique<TtnnWorkspace>(*this, 0);
         }
-        return std::make_unique<TtnnWorkspace>(*this, 0);
+        // Positive requests own one replicated DRAM native page; creation
+        // is serialized with every other TTNN runtime call of this device.
+        std::lock_guard<std::mutex> lock(api_mutex_);
+        return std::make_unique<TtnnWorkspace>(*this, bytes);
+    }
+
+    ttnn_detail::NativeWorkspace ttnn_detail::checked_native_workspace(
+            TtnnDevice& device, const RawWorkspaceView& workspace) {
+        if (workspace.empty()) {
+            throw std::invalid_argument(
+                    "workspace view is empty");
+        }
+        const RawWorkspace* const owner = workspace.owner_identity();
+        if (owner == nullptr || !device.owns_workspace(owner)) {
+            // Foreign or already-destroyed owners are rejected by identity;
+            // a dead owner is never dereferenced.
+            throw std::invalid_argument(
+                    "workspace owner is not live on this device");
+        }
+        if (&workspace.device() != &device) {
+            throw std::invalid_argument(
+                    "workspace does not belong to this device");
+        }
+        const auto* const workspace_owner =
+                dynamic_cast<const TtnnWorkspace*>(owner);
+        if (workspace_owner == nullptr
+                || workspace_owner->native_owner() == nullptr) {
+            throw std::invalid_argument(
+                    "workspace owner has no positive native allocation");
+        }
+        const std::size_t logical_bytes = workspace_owner->byte_size();
+        const std::size_t offset = workspace.offset();
+        const std::size_t bytes = workspace.byte_size();
+        if (offset % 32 != 0) {
+            throw std::invalid_argument(
+                    "workspace offset is not 32-byte aligned");
+        }
+        if (bytes == 0) {
+            throw std::invalid_argument("workspace range is empty");
+        }
+        if (offset > logical_bytes || bytes > logical_bytes - offset) {
+            throw std::invalid_argument(
+                    "workspace range exceeds the owner's logical bytes");
+        }
+        tt::tt_metal::distributed::MeshBuffer* const native =
+                workspace_owner->native_owner();
+        if (native->address() == 0
+                || workspace_owner->native_page_size() == 0) {
+            throw std::runtime_error(
+                    "TTNN workspace native owner has no address or page");
+        }
+        return ttnn_detail::NativeWorkspace{
+                native,
+                workspace_owner->native_page_size(),
+                static_cast<std::uint64_t>(native->address()),
+                logical_bytes,
+                offset};
     }
 
 

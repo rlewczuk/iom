@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
+#include <tt-metalium/mesh_buffer.hpp>
 #include <ttnn/tensor/tensor.hpp>
 
 #include "iom/detail/outstanding_work_registry.hpp"
@@ -15,6 +18,10 @@ namespace iom::ttnn_test {
     void hold_binary_execution_barrier_for_testing() noexcept;
     void wait_binary_execution_barrier_for_testing() noexcept;
     void release_binary_execution_barrier_for_testing() noexcept;
+    // Fails the next quarantine-action construction with std::bad_alloc.
+    // Arming is one-shot per arm: the consumed state is cleared on every
+    // arm, so a test observes its own false-to-true transition instead of
+    // an earlier test's consumption.
     void fail_next_quarantine_action_for_testing() noexcept;
     bool quarantine_action_fault_consumed_for_testing() noexcept;
 
@@ -69,6 +76,17 @@ namespace iom::ttnn_test {
     // creations and growths, including replacements after a discarded
     // slot).
     std::size_t host_transfer_staging_allocation_count_for_testing() noexcept;
+
+    // Native raw-workspace accounting: one native allocation per positive
+    // create_workspace and one native release per retired owning buffer,
+    // whether released directly or by a completed quarantine action. These
+    // symbols always exist so the owning header needs no build-mode split;
+    // outside a testing build they count nothing.
+    void reset_native_workspace_counts_for_testing() noexcept;
+    void record_native_workspace_allocation_for_testing() noexcept;
+    void record_native_workspace_release_for_testing() noexcept;
+    std::size_t native_workspace_allocation_count_for_testing() noexcept;
+    std::size_t native_workspace_release_count_for_testing() noexcept;
 }
 namespace iom::ttnn_detail {
 
@@ -79,6 +97,15 @@ public:
             std::vector<ttnn::Tensor> planes, std::function<void()> finish)
             : planes_(std::move(planes)), finish_(std::move(finish)) {}
 
+    // Retains one owning native workspace buffer until this action runs:
+    // the real allocation is released only after the queued work behind
+    // `finish` is proved complete, so an unproved workspace owner keeps its
+    // storage instead of returning it early.
+    TtnnNativeCleanupAction(
+            std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> workspace,
+            std::function<void()> finish)
+            : workspace_(std::move(workspace)), finish_(std::move(finish)) {}
+
     void run() noexcept override {
         if (completed_) {
             return;
@@ -88,6 +115,7 @@ public:
                 finish_();
             }
             planes_.clear();
+            release_workspace();
             completed_ = true;
         } catch (...) {
             if (failure_ == nullptr) {
@@ -109,7 +137,16 @@ public:
     }
 
 private:
+    void release_workspace() noexcept {
+        if (!workspace_) {
+            return;
+        }
+        workspace_.reset();
+        iom::ttnn_test::record_native_workspace_release_for_testing();
+    }
+
     std::vector<ttnn::Tensor> planes_;
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> workspace_;
     std::function<void()> finish_;
     std::exception_ptr failure_;
     bool completed_ = false;

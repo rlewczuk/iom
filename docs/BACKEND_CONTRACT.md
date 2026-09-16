@@ -1277,11 +1277,15 @@ The caller owns every output and all scratch. Nonzero scratch MUST be a live
 bytes, the queried alignment, and no overlap with any operand or output.
 Workspace subrange offsets are checked and 32-byte aligned, and owner
 subranges are at least 32-byte aligned. An empty workspace is valid exactly
-when the query reports zero bytes. CPU and TTNN currently reject creation of a
-positive `RawWorkspace`; the first operation that actually requires positive
-scratch on either backend owns the minimal factory support and conformance
-tests. A capability-blocked backend MUST name the missing evidence instead of
-inventing a byte requirement.
+when the query reports zero bytes. CPU still rejects creation of a positive
+`RawWorkspace`; TTNN creation of a positive `RawWorkspace` now owns one
+replicated DRAM native page whose page size is the checked request rounded up
+to 32 bytes while `byte_size()` stays exactly the caller-requested logical
+bytes, and its native allocation is released only after proven completion.
+The first operation that actually requires positive scratch on a backend owns
+the minimal factory support and conformance tests. A capability-blocked
+backend MUST name the missing evidence instead of inventing a byte
+requirement.
 
 The reusable session scratch capacity is the maximum of the actual
 prefill/decode operation and host-transfer requirements, not the sum of
@@ -1704,13 +1708,14 @@ queries:
 | CUDA | Direct linear may query zero global scratch because its assessed route uses fixed kernel-local tiles. SDPA's assessed caller range contains checked, 32-byte-aligned FP32 score and BF16 probability segments. |
 | ROCm | The conservative assessed linear range contains checked aligned `x_pack` and `y_pack`. Its SDPA range contains `q_pack`, sequentially reused per-`Hkv` K/V pack, FP32 scores, BF16 probabilities, BF16 PV, and merged staging. |
 | SYCL | The assessed linear range contains checked FP32 product staging. Its conservative SDPA range contains FP32 scores, BF16 probabilities, FP32 PV, and BF16 head staging, with reuse only after the producing stage completes. |
-| TTNN | Native32 score and probability storage is a minimum SDPA need; optional packs/PV storage depend on the selected Metalium path. The assessed buffer route may require 4096-byte alignment. Exact positive workspace remains capability-blocked until an owning operation implements the TTNN factory/range path; neither hidden TTNN tensors nor guessed bytes are allowed. |
+| TTNN | Native32 score and probability storage is a minimum SDPA need; optional packs/PV storage depend on the selected Metalium path. The assessed buffer route may require 4096-byte alignment. The TTNN factory/range path now exists (one owning replicated DRAM native page per positive request); the exact positive SDPA requirement itself remains unassessed, and neither hidden TTNN tensors nor guessed bytes are allowed. |
 
 Standard CUDA/ROCm/SYCL tensor data and raw workspace subranges retain the
 existing 32-byte arena guarantees. TTNN uses its assessed native32 allocation
-and checked `uint32` limits, never the standard tensor byte formula. CPU and
-TTNN continue to reject positive `create_workspace` requests until the first
-operation that needs them closes its minimal backend-private factory gap.
+and checked `uint32` limits, never the standard tensor byte formula. CPU
+continues to reject positive `create_workspace` requests; TTNN now owns real
+positive scratch, so an operation that needs it names its own queried
+requirement instead of inheriting a missing backend-private factory gap.
 Unknown capability-dependent requirements are recorded as missing evidence,
 not filled with a speculative constant.
 
@@ -1957,17 +1962,19 @@ readers cannot express the installed layout. Scratch never includes persistent
 weights, Q/K/V owners, output, or duplicate caches. The scheduler may reuse
 nonoverlapping-lifetime subranges only after their native completion is proven.
 
-Current TTNN `create_workspace(bytes)` rejects every positive size, so the
-score/P route is a concrete blocker rather than permission for a hidden tensor
-allocation. The first TTNN operation that actually requires positive scratch
-owns minimal TTNN-private `RawWorkspace` buffer support: the TTNN leaf under
-`.cswd/tasks/006-tinyllama/04-linear-projections` if its selected linear route
-packs, otherwise the TTNN SDPA leaf under
-`.cswd/tasks/006-tinyllama/08-causal-grouped-attention`. Creation, rebind,
-subrange addressability, exact-device checks, and destruction/reset must be
-implemented before queued use. Workspace and output are disjoint from all
-operands and each other; new output/read and scratch/operand overlap are
-rejected, while valid read/read overlap, including exact Q/K/V aliases, is
+TTNN `create_workspace(bytes)` now owns real positive scratch, so the score/P
+route is blocked by its own kernels and alignment needs rather than by the
+absence of a native factory or by permission for a hidden tensor allocation.
+The embedding-lookup leaf under
+`.cswd/tasks/006-tinyllama/03-embedding-lookup` owns that minimal TTNN-private
+`RawWorkspace` factory: one owning replicated DRAM `MeshBuffer` on the existing
+mesh, exposed as exactly the requested logical bytes over one contiguous native
+page whose page size is the checked request rounded up to 32 bytes, with
+checked owner-absolute range access and release only after proven completion.
+Creation, rebind, subrange addressability, exact-device checks, and
+destruction/reset follow those semantics. Workspace and output are disjoint
+from all operands and each other; new output/read and scratch/operand overlap
+are rejected, while valid read/read overlap, including exact Q/K/V aliases, is
 accepted.
 
 One facade submission must enqueue the bounded program on the exact
@@ -3517,9 +3524,9 @@ supported-type table.
 
 **Unused workspace.** Every TTNN per-owner host-transfer requirement is
 `{0, 1}`, so a complete binding of these checkpoints reports exactly `{0, 1}`
-and realizes with the default empty `RawWorkspaceView`: positive raw workspace
-remains unsupported TTNN scratch, the scenario never provisions a positive
-workspace allocation for this device, and a standard 16x16 tiled byte count is
+and realizes with the default empty `RawWorkspaceView`: the scenario never
+provisions the real owning TTNN-native positive scratch an operation
+requirement can create on this device, and a standard 16x16 tiled byte count is
 never mistaken for a native32 requirement.
 
 **One live context.** `TtnnDevices` owns exactly one TTNN context
