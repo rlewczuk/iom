@@ -8,6 +8,9 @@ source "$SCRIPT_DIR/csw-remote-common.sh"
 PROFILE_ARG="$1"
 TASK_ID="$2"
 
+require_task_directory
+log_execution sync "$PROFILE_ARG" "$TASK_ID"
+
 require_cmd ssh
 require_cmd rsync
 require_cmd mktemp
@@ -47,9 +50,9 @@ while IFS= read -r -d '' path; do
 done <"$UNVERSIONED_PATHS"
 
 # Create the destination first. This also validates SSH connectivity.
-ssh "$SSH_HOST" "mkdir -p $(quote_single "$REMOTE_DIR")"
+run_logged ssh "$SSH_HOST" "mkdir -p $(quote_single "$REMOTE_DIR")"
 
-rsync -a --delete-delay --human-readable --prune-empty-dirs \
+run_logged rsync -a --delete-delay --human-readable --prune-empty-dirs \
   --exclude='/.cswd' \
   --exclude='*/.cswd' \
   --include='/_local/' \

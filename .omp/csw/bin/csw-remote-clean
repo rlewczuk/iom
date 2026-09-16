@@ -7,6 +7,9 @@ source "$SCRIPT_DIR/csw-remote-common.sh"
 [[ $# -eq 2 ]] || fail "usage: csw-remote-clean <profile> <task-id>"
 PROFILE_ARG="$1"
 TASK_ID="$2"
+require_task_directory
+log_execution clean "$PROFILE_ARG" "$TASK_ID"
+
 
 require_cmd ssh
 resolve_workspace
@@ -14,5 +17,5 @@ validate_task_id "$TASK_ID"
 load_profile "$PROFILE_ARG"
 REMOTE_DIR="$(remote_dir_for "$TASK_ID")"
 
-ssh "$SSH_HOST" "rm -rf -- $(quote_single "$REMOTE_DIR")"
+run_logged ssh "$SSH_HOST" "rm -rf -- $(quote_single "$REMOTE_DIR")"
 printf 'Removed %s:%s\n' "$SSH_HOST" "$REMOTE_DIR"

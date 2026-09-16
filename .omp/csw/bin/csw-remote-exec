@@ -9,6 +9,9 @@ PROFILE_ARG="$1"
 TASK_ID="$2"
 shift 2
 COMMAND="$*"
+require_task_directory
+log_execution exec "$PROFILE_ARG" "$TASK_ID" "$@"
+
 
 require_cmd ssh
 resolve_workspace
@@ -22,4 +25,4 @@ if [[ -n "${REMOTE_SETUP:-}" ]]; then
 fi
 REMOTE_SCRIPT+=" ${COMMAND}"
 
-ssh "$SSH_HOST" "bash -lc $(quote_single "$REMOTE_SCRIPT")"
+run_logged ssh "$SSH_HOST" "bash -lc $(quote_single "$REMOTE_SCRIPT")"

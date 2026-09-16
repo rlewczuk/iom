@@ -3,6 +3,52 @@ set -euo pipefail
 
 CONFIG_FILE=
 WORKSPACE_ROOT=
+
+REMOTE_LOG=
+
+require_task_directory() {
+  local task_directory="${CSW_REMOTE_TASK_DIR:-}"
+  [[ -n "$task_directory" ]] ||
+    fail "CSW_REMOTE_TASK_DIR must name the local task directory"
+  [[ -d "$task_directory" ]] ||
+    fail "task directory is not a directory: $task_directory"
+  REMOTE_LOG="$(cd -- "$task_directory" && pwd -P)/remote.log"
+  : >>"$REMOTE_LOG" || fail "cannot append remote log: $REMOTE_LOG"
+}
+
+log_execution() {
+  {
+    printf '\n=== %(%Y-%m-%dT%H:%M:%S%z)T csw-remote-%s ===\n' -1 "$1"
+    shift
+    printf 'argv:'
+    printf ' %q' "$@"
+    printf '\n'
+  } >>"$REMOTE_LOG"
+}
+
+run_logged() {
+  local stdout_file stderr_file status
+  stdout_file="$(mktemp)"
+  stderr_file="$(mktemp)"
+  trap 'rm -f -- "$stdout_file" "$stderr_file"' RETURN
+
+  if "$@" >"$stdout_file" 2>"$stderr_file"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [[ -s "$stdout_file" ]]; then
+    printf '%s stdout:\n' "$1" >>"$REMOTE_LOG"
+    cat "$stdout_file" | tee -a "$REMOTE_LOG"
+  fi
+  if [[ -s "$stderr_file" ]]; then
+    printf '%s stderr:\n' "$1" >>"$REMOTE_LOG"
+    cat "$stderr_file" | tee -a "$REMOTE_LOG" >&2
+  fi
+  printf 'exit: %d\n' "$status" >>"$REMOTE_LOG"
+  return "$status"
+}
 PRIMARY_WORKTREE_ROOT=
 WORKSPACE_KIND=
 

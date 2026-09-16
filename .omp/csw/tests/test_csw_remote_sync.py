@@ -10,6 +10,8 @@ import tempfile
 import unittest
 
 
+REMOTE_CLEAN = Path(__file__).parents[1] / "bin" / "csw-remote-clean"
+REMOTE_EXEC = Path(__file__).parents[1] / "bin" / "csw-remote-exec"
 REMOTE_SYNC = Path(__file__).parents[1] / "bin" / "csw-remote-sync"
 
 
@@ -55,6 +57,8 @@ class RemoteSyncTests(unittest.TestCase):
                     metadata = temporary_root / f"{mode}-metadata"
                     (metadata / "tasks").mkdir(parents=True)
                     (metadata / "tasks" / "secret.yml").write_text("private\n", encoding="utf-8")
+                    task_directory = metadata / "tasks" / f"filter-{mode}"
+                    task_directory.mkdir()
                     if mode == "directory":
                         (workspace / ".cswd").mkdir()
                         (workspace / ".cswd" / "tasks").mkdir()
@@ -88,6 +92,7 @@ class RemoteSyncTests(unittest.TestCase):
                     environment["CSW_REMOTE_CONFIG"] = str(config)
                     environment["CSW_REMOTE_WORKSPACE"] = str(workspace)
                     environment["RSYNC_RSH"] = str(fake_bin / "ssh")
+                    environment["CSW_REMOTE_TASK_DIR"] = str(task_directory)
                     result = subprocess.run(
                         [str(REMOTE_SYNC), "local", f"filter-{mode}"],
                         cwd=workspace,
@@ -109,6 +114,37 @@ class RemoteSyncTests(unittest.TestCase):
                         (destination / "_local" / "helper.sh").read_text(encoding="utf-8"),
                         "#!/bin/sh\n",
                     )
+                    command = subprocess.run(
+                        [str(REMOTE_EXEC), "local", f"filter-{mode}",
+                         "printf remote-stdout; printf remote-stderr >&2"],
+                        cwd=workspace,
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=30,
+                    )
+                    self.assertEqual(command.returncode, 0, command.stderr)
+                    self.assertEqual(command.stdout, "remote-stdout")
+                    self.assertEqual(command.stderr, "remote-stderr")
+                    clean = subprocess.run(
+                        [str(REMOTE_CLEAN), "local", f"filter-{mode}"],
+                        cwd=workspace,
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=30,
+                    )
+                    self.assertEqual(clean.returncode, 0, clean.stderr)
+                    remote_log = (task_directory / "remote.log").read_text(encoding="utf-8")
+                    self.assertIn(f"argv: local filter-{mode}", remote_log)
+                    self.assertIn("csw-remote-sync", remote_log)
+                    self.assertIn("csw-remote-exec", remote_log)
+                    self.assertIn("csw-remote-clean", remote_log)
+                    self.assertIn("remote-stdout", remote_log)
+                    self.assertIn("remote-stderr", remote_log)
+                    self.assertIn("ssh stderr:", remote_log)
 
 
 if __name__ == "__main__":

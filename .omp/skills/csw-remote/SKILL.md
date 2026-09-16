@@ -38,21 +38,23 @@ The scripts resolve the selected workspace with Git:
 - Set `CSW_REMOTE_WORKSPACE` to a path inside the intended checkout or worktree when invoking a script from elsewhere.
 - They compare the worktree Git directory with the common Git directory and report `checkout` or `worktree` in `csw-remote-sync` output.
 
-For a `csw-run-worker` task, run from its exact `.work/<task-path>` worktree:
+For a `csw-run-worker` task, run from its exact `.work/<task-path>` worktree. Every helper invocation requires `CSW_REMOTE_TASK_DIR` set to the local directory containing the task's returned `spec_path` and `task.yml`; the scripts append the invocation and remote stdout/stderr to its `remote.log`. Do not point it into the remote mirror.
 
 ```bash
 cd .work/<task-path>
+export CSW_REMOTE_TASK_DIR="$(dirname "$spec_path")"
 .omp/csw/bin/csw-remote-sync rocm task-123
 ```
 
-Alternatively, select it explicitly from the primary checkout:
+Alternatively, select the worktree explicitly from the primary checkout:
 
 ```bash
 CSW_REMOTE_WORKSPACE=.work/<task-path> \
+CSW_REMOTE_TASK_DIR=.cswd/tasks/<task-path> \
   .omp/csw/bin/csw-remote-sync rocm task-123
 ```
 
-Never sync a `csw-run-worker` task from the primary checkout. Confirm that the `csw-remote-sync` output names the exact assigned worktree before remote execution.
+Use the same `CSW_REMOTE_TASK_DIR` for `csw-remote-exec` and `csw-remote-clean`. Never sync a `csw-run-worker` task from the primary checkout. Confirm that the `csw-remote-sync` output names the exact assigned worktree before remote execution.
 
 The worktree's `.cswd` link exposes local task specifications, lifecycle controls, and evidence only. Read specifications and update task status locally through the task helpers. Never run task-control helpers remotely, resolve remote paths through `.cswd`, or require task metadata in a remote build/test command. Pass the needed code paths and command arguments explicitly.
 
@@ -60,7 +62,7 @@ The worktree's `.cswd` link exposes local task specifications, lifecycle control
 
 Assume the selected workspace is the local task/worktree root.
 
-1. Pick a configured host and a unique task id.
+1. Pick a configured host and a unique task id. Set `CSW_REMOTE_TASK_DIR` to the local task directory that owns the resulting evidence.
 2. Sync the local workspace:
 
 ```bash

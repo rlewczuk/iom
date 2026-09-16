@@ -84,6 +84,8 @@ If coherent dirty state must be preserved, use `checkpoint`; never checkpoint me
 
 Prefix every Read/Edit/Write path with the returned worktree and set every Bash `cwd` to it. Read the complete spec, repository guidance, relevant code/tests, and applicable skills. Implement only that leaf.
 
+When verification uses `csw-remote-*`, set `CSW_REMOTE_TASK_DIR` for every sync, exec, and clean invocation to `dirname(spec_path)` from the prepared leaf record. This writes `remote.log` beside `spec.md` and `task.yml` in the shared local task store; do not use a remote path or substitute the worktree root.
+
 For container execution, provision each ready leaf before dispatch and give one owner its exact repo root, task IDs/paths, worktree paths, branch/base, exclusive scope, canonical dependency contracts, and verification still required. Children skip all validation during the parallel pass. They never edit controls or evidence directly and never mutate Git except through this helper. `csw-run` dispatches newly eligible leaves continuously, never in waves.
 
 A stuck implementation owner must invoke exactly one `spec-run-debug` rescue agent before reporting an implementation failure. Pass exact worktree/spec paths, constraints, current changes, concrete error, observations, and attempted approaches. The debugger is read-only; the owner resumes and applies or rejects its proposed solution with evidence. External prerequisites may be blocked without debugger escalation.
