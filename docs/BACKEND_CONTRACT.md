@@ -3881,6 +3881,11 @@ which leaves that backend implements.
 | ROCm | all 23 | all 12 | `NONE` only |
 | SYCL | all 23 | all 12 | `NONE` only |
 | TTNN (final) | 22: all except `F8_E8M0` | all 12 | `NONE` only |
+The CPU implementation covers all 23 payload and 12 integral index leaves for
+`QuantizationFormat::NONE`. It reports `{0,1}`, rejects positive
+`RawWorkspace` creation, executes gathers on the existing asynchronous FIFO
+worker with raw bit helpers, and defers queued negative or out-of-vocabulary
+IDs as repeatable `std::invalid_argument` failures after acceptance.
 
 The TTNN row is the required final capability, not an advertisement that it is
 implemented today: TTNN rejects only `F8_E8M0` as a payload leaf. The first

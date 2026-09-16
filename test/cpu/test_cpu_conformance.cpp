@@ -277,16 +277,13 @@ TEST_CASE("CPU conformance: binary operations are supported") {
     CHECK_FALSE(devices.gate.armed());
 }
 
-// CPU's declared embedding expectation: the complete 23-payload/12-index matrix
-// the CPU port must reach and the fixed `{0, 1}` scratch policy. This revision
-// has no CPU embedding hook yet (leaf `05-cpu-embedding` lands it), so the
-// implemented span stays explicitly empty: every shared case observes
-// capability rejection only and no case reports gather success.
+// CPU's declared embedding expectation covers the complete 23-payload/12-index
+// matrix and the fixed `{0, 1}` scratch policy.
 constexpr iom_conformance::EmbeddingDeclaration kCpuEmbeddingDeclaration{
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        iom_conformance::kNoEmbeddingSpan,
-        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
         false,
         iom::WorkspaceRequirements{0, 1}};
 

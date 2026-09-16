@@ -8,6 +8,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -270,6 +271,170 @@ private:
                         throw;
                     }
                 });
+    }
+    template <typename Operation>
+    static void visit_embedding_planes(
+            std::span<const std::size_t> dimensions,
+            std::span<const std::size_t> index_strides,
+            std::span<const std::size_t> output_strides,
+            std::size_t leading_rank, std::size_t axis,
+            std::size_t index_plane, std::size_t output_plane,
+            Operation&& operation) {
+        if (axis == leading_rank) {
+            operation(index_plane, output_plane);
+            return;
+        }
+        for (std::size_t index = 0; index < dimensions[axis]; ++index) {
+            visit_embedding_planes(
+                    dimensions, index_strides, output_strides, leading_rank,
+                    axis + 1,
+                    index_plane + index * index_strides[axis],
+                    output_plane + index * output_strides[axis], operation);
+        }
+    }
+
+    static bool embedding_index_is_signed(DataType type) noexcept {
+        switch (type) {
+            case DataType::I2:
+            case DataType::I4:
+            case DataType::I8:
+            case DataType::I16:
+            case DataType::I32:
+            case DataType::I64:
+                return true;
+            case DataType::U2:
+            case DataType::U4:
+            case DataType::U8:
+            case DataType::U16:
+            case DataType::U32:
+            case DataType::U64:
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    static void embedding_elements(const EmbeddingRequest& request) {
+        const auto table_dimensions = request.table.spec.shape.dimensions();
+        const auto index_dimensions = request.indices.spec.shape.dimensions();
+        const auto output_dimensions = request.out.spec.shape.dimensions();
+        const std::size_t leading_rank = index_dimensions.size() - 2;
+        const std::size_t run = index_dimensions.back();
+        const std::size_t features = table_dimensions.back();
+        const std::size_t vocabulary = table_dimensions.front();
+        const std::size_t payload_bits =
+                detail::leaf_bits(request.table.spec.data_type);
+        const std::size_t index_bits =
+                detail::leaf_bits(request.indices.spec.data_type);
+        const std::uint64_t index_mask = index_bits == 64
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (std::uint64_t{1} << index_bits) - 1;
+        const bool index_is_signed =
+                embedding_index_is_signed(request.indices.spec.data_type);
+        const auto* table_base =
+                static_cast<const unsigned char*>(request.table.native_handle);
+        const auto* index_base =
+                static_cast<const unsigned char*>(request.indices.native_handle);
+        auto* output_base =
+                static_cast<unsigned char*>(request.out.native_handle);
+
+        const auto validate_indices = [&](std::size_t index_plane,
+                                          std::size_t) {
+            for (std::size_t row = 0; row < run; ++row) {
+                const std::size_t index_slot = detail::standard_plane_slot(
+                        request.indices.spec, index_plane, 0, row);
+                const std::uint64_t raw = cpu_detail::load_bits(
+                        index_base, index_slot * index_bits, index_bits)
+                        & index_mask;
+                if (index_is_signed
+                        && (raw & (std::uint64_t{1} << (index_bits - 1)))
+                                != 0) {
+                    throw std::invalid_argument(
+                            "CPU embedding index is negative");
+                }
+                if (raw >= static_cast<std::uint64_t>(vocabulary)) {
+                    throw std::invalid_argument(
+                            "CPU embedding index is out of range");
+                }
+            }
+        };
+        visit_embedding_planes(
+                index_dimensions, request.indices.plane_strides,
+                request.out.plane_strides, leading_rank, 0,
+                request.indices.plane_offset, request.out.plane_offset,
+                validate_indices);
+
+        const auto gather = [&](std::size_t index_plane,
+                                std::size_t output_plane) {
+            for (std::size_t row = 0; row < run; ++row) {
+                const std::size_t index_slot = detail::standard_plane_slot(
+                        request.indices.spec, index_plane, 0, row);
+                const std::uint64_t raw = cpu_detail::load_bits(
+                        index_base, index_slot * index_bits, index_bits)
+                        & index_mask;
+                const std::size_t table_row = static_cast<std::size_t>(raw);
+                for (std::size_t feature = 0; feature < features; ++feature) {
+                    const std::size_t table_slot = detail::standard_plane_slot(
+                            request.table.spec, request.table.plane_offset,
+                            table_row, feature);
+                    const std::size_t output_slot = detail::standard_plane_slot(
+                            request.out.spec, output_plane, row, feature);
+                    cpu_detail::copy_value(
+                            output_base, output_slot * payload_bits, table_base,
+                            table_slot * payload_bits, payload_bits);
+                }
+            }
+        };
+        visit_embedding_planes(
+                output_dimensions, request.indices.plane_strides,
+                request.out.plane_strides, leading_rank, 0,
+                request.indices.plane_offset, request.out.plane_offset,
+                gather);
+    }
+
+    oid embedding_impl(const EmbeddingRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_embedding(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this](
+                        std::uint64_t sequence,
+                        const EmbeddingRequest& captured,
+                        detail::BinaryEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        embedding_elements(captured);
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)detail::release_or_invalidate_binary_entries(
+                                            device_->registry_state().registry,
+                                            entries,
+                                            static_cast<bool>(failure), true);
+                                    detail::complete_workspace_lease(
+                                            device_->registry_state(),
+                                            captured.workspace_lease, true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        detail::complete_workspace_lease(
+                                device_->registry_state(),
+                                captured.workspace_lease, true);
+                        throw;
+                    }
+                });
+    }
+
+    WorkspaceRequirements embedding_workspace_requirements_impl(
+            const TensorView&, const TensorView&, const TensorView&) override {
+        return {0, 1};
     }
 
     static void copy_elements(
