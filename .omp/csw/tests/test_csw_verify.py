@@ -39,7 +39,7 @@ class VerifierTests(unittest.TestCase):
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Verifier Test")
         self.git("config", "user.email", "verifier@example.invalid")
-        (self.repo / ".gitignore").write_text(".work/\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(".work/\n.omp/\n", encoding="utf-8")
         self.git("add", ".gitignore")
         self.git("commit", "-qm", "initial")
         (self.repo / ".cswd").mkdir()
@@ -146,6 +146,49 @@ class VerifierTests(unittest.TestCase):
         self.integrate(task, ok=False)
         self.assertNotEqual(self.lifecycle(task), "done")
         self.assertFalse((self.repo / "leaf.txt").exists())
+
+    def test_gate_environment_and_remote_failure_are_visible(self):
+        task, wt = self.ready("remote")
+        task_directory = self.repo / ".cswd" / "tasks" / task
+        helper_directory = self.repo / ".omp" / "csw" / "bin"
+        helper_directory.mkdir(parents=True)
+        sync = helper_directory / "csw-remote-sync"
+        execute = helper_directory / "csw-remote-exec"
+        sync.write_text("#!/bin/sh\nprintf 'remote unavailable\\n' >&2\nexit 19\n", encoding="utf-8")
+        execute.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        sync.chmod(0o755)
+        execute.chmod(0o755)
+        environment = {
+            "CSW_REMOTE_TASK_DIR": str(task_directory),
+            "CSW_REMOTE_WORKSPACE": str(wt),
+        }
+        plan = {
+            "commands": [
+                {"name": "remote sync", "argv": [str(sync), "cuda", "remote-test"],
+                 "env": environment, "timeout_seconds": 5},
+                {"name": "remote test", "argv": [str(execute), "cuda", "remote-test",
+                                                "timeout --kill-after=5s 30s true"],
+                 "env": environment, "timeout_seconds": 5},
+            ],
+            "total_timeout_seconds": 10,
+        }
+        outcome = self.verify(task, plan, ok=False)
+        self.assertEqual(outcome["problem"]["remote"]["profile"], "cuda")
+        self.assertEqual(outcome["problem"]["exit"], 19)
+        self.assertIn("remote unavailable", outcome["problem"]["diagnostic"])
+        self.assertIn("remote verification gate remote sync failed", outcome["problem"]["summary"])
+        self.assertEqual(
+            outcome["problem"]["remote"]["remote_log"],
+            str(task_directory.resolve() / "remote.log"),
+        )
+
+    def test_remote_plan_requires_exact_evidence_paths_and_bounded_execution(self):
+        task, wt = self.ready("remote-plan")
+        plan = self.plan(task)
+        plan["commands"][0]["argv"] = ["csw-remote-exec", "cuda", "remote-test", "true"]
+        with self.assertRaisesRegex(API.worker.TaskError, "CSW_REMOTE_TASK_DIR"):
+            API.validate_remote_plan(API.command_plan(json.dumps(plan)), self.repo, task, wt)
+
 
     def assert_not_running(self, pid):
         stat = Path(f"/proc/{pid}/stat")

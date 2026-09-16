@@ -127,6 +127,20 @@ class RemoteSyncTests(unittest.TestCase):
                     self.assertEqual(command.returncode, 0, command.stderr)
                     self.assertEqual(command.stdout, "remote-stdout")
                     self.assertEqual(command.stderr, "remote-stderr")
+                    failure = subprocess.run(
+                        [str(REMOTE_EXEC), "local", f"filter-{mode}",
+                         "printf remote-failure >&2; exit 23"],
+                        cwd=workspace,
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=30,
+                    )
+                    self.assertEqual(failure.returncode, 23)
+                    self.assertIn("remote-failure", failure.stderr)
+                    self.assertIn("ssh failed with exit 23; full output:", failure.stderr)
+                    self.assertIn(str(task_directory / "remote.log"), failure.stderr)
                     clean = subprocess.run(
                         [str(REMOTE_CLEAN), "local", f"filter-{mode}"],
                         cwd=workspace,
@@ -144,6 +158,8 @@ class RemoteSyncTests(unittest.TestCase):
                     self.assertIn("csw-remote-clean", remote_log)
                     self.assertIn("remote-stdout", remote_log)
                     self.assertIn("remote-stderr", remote_log)
+                    self.assertIn("remote-failure", remote_log)
+                    self.assertIn("exit: 23", remote_log)
                     self.assertIn("ssh stderr:", remote_log)
 
 

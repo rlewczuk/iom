@@ -3,9 +3,11 @@
 
 verify TASK --plan FILE --summary TEXT
   Plan: {"commands":[{"name":"gate","argv":["program","arg"],
-  "timeout_seconds":900}],"total_timeout_seconds":7200}. Nonempty; no shell
-  interpolation. All commands run in the exact worktree. CTest needs --timeout;
-  SSH commands also need a remote-side timeout and bounded device lock.
+  "env":{"NAME":"value"},"timeout_seconds":900}],
+  "total_timeout_seconds":7200}. Nonempty; no shell interpolation. All commands
+  run in the exact worktree. CTest needs --timeout. csw-remote helper gates
+  require exact task/worktree environment, sync before exec, and a remote-side
+  timeout with --kill-after; bounded device locks remain mandatory.
 
 review TASK --packet FILE
   Packet: {"commit":"full ID","base":"full ID","worktree":"absolute path",
@@ -62,6 +64,8 @@ SEVERITIES = ("low", "medium", "high", "critical")
 ISSUE = re.compile(r"^\s*(\d+)\.\s+\*\*\[(critical|high|medium|low)\]", re.MULTILINE | re.IGNORECASE)
 MAX_ATTEMPT_SECONDS = 7200
 STATE_FILE = "csw-verifier-state.json"
+ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+REMOTE_HELPERS = {"csw-remote-sync", "csw-remote-exec", "csw-remote-clean"}
 
 
 def result(ok: bool, code: str = "ok", **fields: Any) -> dict[str, Any]:
@@ -144,10 +148,15 @@ def command_plan(value: str) -> dict[str, Any]:
         if name in names:
             raise worker.TaskError(f"duplicate gate name: {name}")
         names.add(name)
-        argv, timeout = entry.get("argv"), entry.get("timeout_seconds")
+        argv, timeout, environment = entry.get("argv"), entry.get("timeout_seconds"), entry.get("env", {})
         if (not isinstance(argv, list) or not argv
                 or any(not isinstance(arg, str) or "\0" in arg for arg in argv) or not argv[0]):
             raise worker.TaskError(f"{name}: argv must be a nonempty argument array")
+        if (not isinstance(environment, dict)
+                or any(not isinstance(key, str) or not ENVIRONMENT_NAME.fullmatch(key)
+                       or not isinstance(value, str) or "\0" in value
+                       for key, value in environment.items())):
+            raise worker.TaskError(f"{name}: env must map valid variable names to string values")
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                 or not math.isfinite(timeout) or not 0 < timeout <= total):
             raise worker.TaskError(f"{name}: timeout must be positive and no greater than the total budget")
@@ -156,8 +165,74 @@ def command_plan(value: str) -> dict[str, Any]:
             limits += [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--timeout"]
             if not limits or any(not math.isfinite(float(limit)) or float(limit) <= 0 for limit in limits):
                 raise worker.TaskError("CTest requires a positive finite --timeout per test")
-        normalized.append({"name": name, "argv": argv, "timeout_seconds": float(timeout)})
+        normalized.append({
+            "name": name, "argv": argv, "env": environment, "timeout_seconds": float(timeout),
+        })
     return {"commands": normalized, "total_timeout_seconds": float(total)}
+
+
+def remote_helper(gate: dict[str, Any]) -> str | None:
+    name = Path(gate["argv"][0]).name
+    return name if name in REMOTE_HELPERS else None
+
+
+def validate_remote_plan(plan: dict[str, Any], repo: Path, task: str, wt: Path) -> None:
+    expected_task_dir = worker.task_directory(repo, task).resolve()
+    expected_worktree = wt.resolve()
+    synchronized: set[tuple[str, str]] = set()
+    executed: set[tuple[str, str]] = set()
+    remote_exec_seen = False
+    for gate in plan["commands"]:
+        helper = remote_helper(gate)
+        if helper is None:
+            continue
+        argv, environment = gate["argv"], gate["env"]
+        if len(argv) < 3:
+            raise worker.TaskError(f"{gate['name']}: {helper} requires profile and task id")
+        task_directory = environment.get("CSW_REMOTE_TASK_DIR")
+        workspace = environment.get("CSW_REMOTE_WORKSPACE")
+        if not task_directory or Path(task_directory).resolve() != expected_task_dir:
+            raise worker.TaskError(
+                f"{gate['name']}: CSW_REMOTE_TASK_DIR must be {expected_task_dir}"
+            )
+        if not workspace or Path(workspace).resolve() != expected_worktree:
+            raise worker.TaskError(
+                f"{gate['name']}: CSW_REMOTE_WORKSPACE must be {expected_worktree}"
+            )
+        expected_helper = (repo / ".omp" / "csw" / "bin" / helper).resolve()
+        if Path(argv[0]).resolve() != expected_helper:
+            raise worker.TaskError(
+                f"{gate['name']}: use integration helper {expected_helper}"
+            )
+        key = (argv[1], argv[2])
+        if helper == "csw-remote-sync":
+            synchronized.add(key)
+            continue
+        if helper == "csw-remote-clean":
+            if key not in executed and key not in synchronized:
+                raise worker.TaskError(
+                    f"{gate['name']}: clean requires an earlier remote operation "
+                    f"for {argv[1]} {argv[2]}"
+                )
+            continue
+        if key not in synchronized:
+            raise worker.TaskError(
+                f"{gate['name']}: {helper} requires an immediately preceding sync "
+                f"for {argv[1]} {argv[2]}"
+            )
+        synchronized.remove(key)
+        executed.add(key)
+        remote_exec_seen = True
+        command = " ".join(argv[3:])
+        if not re.search(r"(?:^|[\s;&|])(?:\S*/)?timeout(?:\s|$)", command):
+            raise worker.TaskError(f"{gate['name']}: remote command requires timeout")
+        if "--kill-after" not in command:
+            raise worker.TaskError(f"{gate['name']}: remote timeout requires --kill-after")
+        if (re.search(r"(?:^|[\s;&|])flock(?:\s|$)", command)
+                and not re.search(r"(?:^|\s)(?:-w|--timeout(?:=|\s))", command)):
+            raise worker.TaskError(f"{gate['name']}: remote flock acquisition must be bounded")
+    if synchronized and not remote_exec_seen:
+        raise worker.TaskError("remote verification plan requires at least one csw-remote-exec gate")
 
 
 def stop_group(process: subprocess.Popen) -> None:
@@ -188,7 +263,9 @@ def run_gate(wt: Path, gate: dict[str, Any], deadline: float, log: Path) -> dict
             observed.update(timed_out=True, error="total verification deadline exceeded")
         else:
             try:
-                process = subprocess.Popen(gate["argv"], cwd=wt, stdout=stream,
+                environment = os.environ.copy()
+                environment.update(gate["env"])
+                process = subprocess.Popen(gate["argv"], cwd=wt, env=environment, stdout=stream,
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 try:
                     observed["returncode"] = process.wait(timeout=remaining)
@@ -211,6 +288,42 @@ def run_gate(wt: Path, gate: dict[str, Any], deadline: float, log: Path) -> dict
                 raise
     observed["elapsed_seconds"] = round(time.monotonic() - started, 3)
     return observed
+
+
+def failure_problem(failed: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    try:
+        diagnostic = Path(failed["log"]).read_bytes()[-4096:].decode(errors="replace").strip()
+    except OSError as exc:
+        diagnostic = f"unable to read gate log: {exc}"
+    diagnostic = re.sub(r"\s+", " ", diagnostic)
+    problem = {
+        "gate": failed["name"],
+        "argv": failed["argv"],
+        "exit": failed["returncode"],
+        "timed_out": failed["timed_out"],
+        "error": failed.get("error"),
+        "gate_log": failed["log"],
+        "diagnostic": diagnostic,
+    }
+    gate = next(entry for entry in plan["commands"] if entry["name"] == failed["name"])
+    helper = remote_helper(gate)
+    if helper is not None:
+        task_directory = Path(gate["env"]["CSW_REMOTE_TASK_DIR"]).resolve()
+        problem["remote"] = {
+            "helper": helper,
+            "profile": failed["argv"][1],
+            "task_id": failed["argv"][2],
+            "remote_log": str(task_directory / "remote.log"),
+        }
+    scope = "remote verification" if "remote" in problem else "verification"
+    detail = diagnostic or problem["error"] or "command produced no diagnostic output"
+    problem["summary"] = (
+        f"{scope} gate {failed['name']} failed: exit={failed['returncode']} "
+        f"timeout={failed['timed_out']}; {detail}; gate_log={failed['log']}"
+    )
+    if "remote" in problem:
+        problem["summary"] += f"; remote_log={problem['remote']['remote_log']}"
+    return problem
 
 
 def snapshot(repo: Path, task: str) -> dict[str, Any]:
@@ -242,6 +355,7 @@ def conflict(repo: Path, task: str, wt: Path, error: str) -> dict[str, Any]:
 
 def verify(repo: Path, task: str, wt: Path, plan_arg: str, summary: str) -> dict[str, Any]:
     plan = command_plan(plan_arg)
+    validate_remote_plan(plan, repo, task, wt)
     summary = worker.single_line(summary, "verification summary")
     deadline = time.monotonic() + plan["total_timeout_seconds"]
     data = load(wt)
@@ -287,17 +401,19 @@ def verify(repo: Path, task: str, wt: Path, plan_arg: str, summary: str) -> dict
     with worker.integration_lock(repo):
         if not all(gate["ok"] for gate in gates):
             failed = gates[-1]
+            problem = failure_problem(failed, plan)
+            receipt["problem"] = problem
             try:
                 unchanged = snapshot(repo, task)
                 if matching(receipt, unchanged):
-                    error = f"{failed['name']}: {json.dumps(failed['argv'])}; exit={failed['returncode']}; timeout={failed['timed_out']}; log={failed['log']}"
-                    worker.annotate_task(repo, task, task, "failed", summary, [], [error])
+                    worker.annotate_task(repo, task, task, "failed", summary, [], [problem["summary"]])
                     retained = worker.commit_task(repo, task, unchanged["status"], None)
                     receipt["retained_commit"] = retained["commit"]
             except (worker.TaskError, worker.TaskCtlError, OSError) as exc:
                 receipt["evidence_error"] = str(exc)
             save(wt, data)
-            return result(False, "gate_timeout" if failed["timed_out"] else "gate_failed", task=task, receipt=receipt)
+            return result(False, "gate_timeout" if failed["timed_out"] else "gate_failed",
+                          task=task, problem=problem, receipt=receipt)
         if not matching(receipt, snapshot(repo, task)):
             raise worker.TaskError("gate changed the candidate commit, tree or base")
         if worker.head(repo) != current["base"]:

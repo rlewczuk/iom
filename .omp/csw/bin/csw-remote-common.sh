@@ -47,6 +47,10 @@ run_logged() {
     cat "$stderr_file" | tee -a "$REMOTE_LOG" >&2
   fi
   printf 'exit: %d\n' "$status" >>"$REMOTE_LOG"
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s failed with exit %d; full output: %s\n' \
+      "$1" "$status" "$REMOTE_LOG" >&2
+  fi
   return "$status"
 }
 PRIMARY_WORKTREE_ROOT=
