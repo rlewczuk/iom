@@ -4146,6 +4146,29 @@ gather conformance. The existing copy/add/mul/sub/div suites and the `silu`,
 `linear`, `rmsnorm`, and `sdpa` `Unsupported` probes remain unchanged until
 their own operation leaves migrate them.
 
+Each driver declares through `iom_conformance::EmbeddingDeclaration` the
+payload and index matrix its port must reach (with `staged` set exactly while
+that declaration is the explicitly temporary intermediate matrix), the leaves
+this revision implements (both spans empty for an unported port), and its exact
+workspace requirement (`{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and
+TTNN). The matrix drives the shared fixtures, so a case exists exactly for a
+leaf the port must reach; `iom_conformance::kEmbeddingPayloadSpan`,
+`iom_conformance::kEmbeddingIdSpan`,
+`iom_conformance::kEmbeddingStagedTtnnPayloadSpan`, and
+`iom_conformance::kEmbeddingStagedTtnnIdSpan` are the standard 23/12 and the
+explicitly temporary staged TTNN 19/10 declarations, and
+`iom_conformance::kNoEmbeddingSpan` is the empty implemented span of an
+unported port. Entry points are
+`iom_conformance::run_embedding_conformance` (self-check, declared request
+cases, and common admission/ownership/queue/failure cases),
+`iom_conformance::run_embedding_oracle_self_check`,
+`iom_conformance::run_embedding_reference_conformance`, and
+`iom_conformance::run_embedding_common_conformance`, and the driver cases are
+the `embedding lookup reference, admission, and lifetime` cases of
+`test/cpu/test_cpu_conformance.cpp`, `test/cuda/test_cuda_conformance.cpp`,
+`test/rocm/test_rocm_conformance.cpp`, `test/sycl/test_sycl_conformance.cpp`,
+and `test/ttnn/test_ttnn_conformance.cpp`.
+
 Every rule in this section MUST be observable through the shared conformance
 suite or through a focused native lifetime and control-transfer scenario; tests
 assert behavior rather than field forwarding, source text, or incidental message
@@ -4190,11 +4213,10 @@ Implementers need these existing sources and seams:
   `test/CMakeLists.txt`.
 
 These files are planned targets and do not exist yet:
-`src/device_ops_embedding.cpp`, `src/shared/standard_tiled_embedding.hpp` and
-`src/shared/standard_tiled_embedding.inl`, the TTNN embedding sources
+`src/shared/standard_tiled_embedding.hpp` and
+`src/shared/standard_tiled_embedding.inl`, and the TTNN embedding sources
 (`src/ttnn/embedding.hpp`, `src/ttnn/embedding.cpp`,
-`src/ttnn/kernels/embedding.cpp`, and `src/ttnn/queue_embedding.cpp`), and
-`test/backend/backend_conformance_embedding.hpp`.
+`src/ttnn/kernels/embedding.cpp`, and `src/ttnn/queue_embedding.cpp`).
 
 The genuine prerequisites and the final closure are producer/consumer
 relationships, not a fixed serial backend order:

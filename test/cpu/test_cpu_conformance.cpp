@@ -10,6 +10,7 @@
 #include <vector>
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -274,6 +275,33 @@ TEST_CASE("CPU conformance: binary operations are supported") {
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "CPU", true);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// CPU's declared embedding expectation: the complete 23-payload/12-index matrix
+// the CPU port must reach and the fixed `{0, 1}` scratch policy. This revision
+// has no CPU embedding hook yet (leaf `05-cpu-embedding` lands it), so the
+// implemented span stays explicitly empty: every shared case observes
+// capability rejection only and no case reports gather success.
+constexpr iom_conformance::EmbeddingDeclaration kCpuEmbeddingDeclaration{
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        false,
+        iom::WorkspaceRequirements{0, 1}};
+
+TEST_CASE("CPU conformance: embedding lookup reference, admission, and lifetime") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    iom_conformance::run_embedding_conformance(
+            devices.conformance(), kCpuEmbeddingDeclaration, &devices.gate,
+            &oracle);
+    CHECK_FALSE(devices.gate.armed());
+    // The declared zero requirement is the whole CPU scratch contract: a
+    // positive CPU raw workspace stays impossible, so no embedding request can
+    // ever be handed positive CPU scratch.
+    CHECK_THROWS_AS(
+            devices.candidate->create_workspace(1), std::invalid_argument);
 }
 
 TEST_CASE("CPU conformance: full shared suite composes every shared case") {

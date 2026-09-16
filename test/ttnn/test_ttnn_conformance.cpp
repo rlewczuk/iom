@@ -24,6 +24,7 @@
 #include "backend/backend_conformance_oracle.hpp"
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -897,6 +898,32 @@ TEST_CASE("TTNN conformance: compute methods reject capability without submittin
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, iom::ttnn_supported_data_types(), nullptr,
             "TTNN", true);
+}
+
+// TTNN's declared embedding expectation: the explicitly temporary one-carrier
+// matrix of the staged port (19 payload leaves and 10 narrow index leaves,
+// `staged` true) and the exact `{32, 32}` status-workspace contract, whose
+// status subrange alone is read back. The wide-carrier leaf replaces both
+// spans with the final 22/12 TTNN matrix. This revision has no TTNN embedding
+// hook yet (leaves `10-ttnn-native-embedding` and `11-ttnn-wide-carriers` land
+// it), so the implemented span stays explicitly empty: every shared case
+// observes capability rejection only, and neither a staged span nor a
+// rejection probe is reported as gather success.
+constexpr iom_conformance::EmbeddingDeclaration kTtnnEmbeddingDeclaration{
+        iom_conformance::kEmbeddingStagedTtnnPayloadSpan,
+        iom_conformance::kEmbeddingStagedTtnnIdSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        true,
+        iom::WorkspaceRequirements{32, 32}};
+
+TEST_CASE("TTNN conformance: embedding lookup reference, admission, and lifetime") {
+    require_hardware();
+    TtnnDevices devices;
+    TtnnStorageOracle oracle;
+    iom_conformance::run_embedding_conformance(
+            devices.conformance(), kTtnnEmbeddingDeclaration, nullptr,
+            &oracle);
 }
 
 TEST_CASE("TTNN conformance: full shared suite") {

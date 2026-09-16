@@ -18,6 +18,7 @@
 
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
@@ -408,6 +409,30 @@ TEST_CASE("SYCL conformance: compute methods reject capability without submittin
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "SYCL", true);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// SYCL's declared embedding expectation: the complete 23-payload/12-index
+// matrix the SYCL port must reach and the exact `{32, 32}` status-workspace
+// contract, whose control-status read is the four-byte device-to-host copy
+// into caller-owned USM memory. This revision has no SYCL embedding hook yet
+// (leaf `08-sycl-embedding` lands it), so the implemented span stays
+// explicitly empty: every shared case observes capability rejection only and
+// no case reports gather success.
+constexpr iom_conformance::EmbeddingDeclaration kSyclEmbeddingDeclaration{
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        false,
+        iom::WorkspaceRequirements{32, 32}};
+
+TEST_CASE("SYCL conformance: embedding lookup reference, admission, and lifetime") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    iom_conformance::run_embedding_conformance(
+            devices.conformance(), kSyclEmbeddingDeclaration, &devices.gate,
+            &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 

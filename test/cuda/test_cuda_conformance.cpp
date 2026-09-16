@@ -18,6 +18,7 @@
 
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -249,6 +250,30 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "CUDA", true);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// CUDA's declared embedding expectation: the complete 23-payload/12-index
+// matrix the CUDA port must reach and the exact `{32, 32}` status-workspace
+// contract. This revision has no CUDA embedding hook yet (leaf
+// `06-cuda-embedding` lands it), so the implemented span stays explicitly
+// empty: every shared case observes capability rejection only and no case
+// reports gather success.
+constexpr iom_conformance::EmbeddingDeclaration kCudaEmbeddingDeclaration{
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kNoEmbeddingSpan,
+        false,
+        iom::WorkspaceRequirements{32, 32}};
+
+TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    iom_conformance::run_embedding_conformance(
+            devices.conformance(), kCudaEmbeddingDeclaration, &devices.gate,
+            &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 
