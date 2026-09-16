@@ -539,7 +539,8 @@ inline void run_compute_capability_conformance(
         const std::span<const iom::DataType>,
         ConformanceObserver* observer = nullptr,
         std::string_view backend_label = {},
-        bool binary_supported = false) {
+        bool binary_supported = false,
+        bool rmsnorm_supported = false) {
     const iom::TensorSpec spec{iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     auto x = candidate.create_tensor(spec);
     auto y = candidate.create_tensor(spec);
@@ -607,8 +608,19 @@ inline void run_compute_capability_conformance(
     }
     CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
     CHECK_EQ(queue->linear(x->view(), w->view(), y->view()), unsupported);
-    CHECK_EQ(queue->rmsnorm(x->view(), scale->view(), y->view(), 1e-6F),
-             unsupported);
+    // The valid-shape `[2,16,16]`/`[1,16]` RMS normalization request exercises
+    // the operation's own capability: a backend whose port has landed queues
+    // it on the real path and must complete, while a backend that still
+    // reports the operation `Unsupported` rejects it before submission.
+    if (rmsnorm_supported) {
+        const iom::oid rmsnorm_token =
+                queue->rmsnorm(x->view(), scale->view(), y->view(), 1e-6F);
+        REQUIRE(iom::oid_is_token(rmsnorm_token));
+        CHECK_NOTHROW(queue->wait(rmsnorm_token));
+    } else {
+        CHECK_EQ(queue->rmsnorm(x->view(), scale->view(), y->view(), 1e-6F),
+                 unsupported);
+    }
     CHECK_EQ(queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
                          attn->view()),
              unsupported);
@@ -622,7 +634,9 @@ inline void run_compute_capability_conformance(
                                "attn after capability failures");
     }
     const iom::oid probe = queue->copy(x->view(), scratch->view());
-    CHECK_EQ(token_sequence(probe), binary_supported ? 5 : 1);
+    CHECK_EQ(
+            token_sequence(probe),
+            (binary_supported ? 4 : 0) + (rmsnorm_supported ? 1 : 0) + 1);
     queue->wait(probe);
     queue.reset();
 
@@ -638,7 +652,8 @@ inline void run_backend_conformance(
         const std::span<const iom::DataType> supported_types,
         ConformanceObserver* observer = nullptr,
         AcceleratorStorageOracle* oracle = nullptr,
-        bool binary_supported = false) {
+        bool binary_supported = false,
+        bool rmsnorm_supported = false) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
     run_async_copy_conformance(devices, supported_types, observer, oracle);
     run_copy_error_conformance(devices, supported_types, observer);
@@ -648,6 +663,7 @@ inline void run_backend_conformance(
     run_binary_rank_boundary_conformance(devices.candidate);
     run_memory_contract_conformance(devices);
     run_compute_capability_conformance(
-            devices.candidate, supported_types, observer, {}, binary_supported);
+            devices.candidate, supported_types, observer, {}, binary_supported,
+            rmsnorm_supported);
 }
 }  // namespace iom_conformance

@@ -139,6 +139,7 @@ SyclQueue::SyclQueue(
                   resource_provider.reserve_queue_resources())),
           completion_pool_(std::make_shared<SyclCompletionPool>(
                   resource_provider.queue_slot_count())),
+          fp64_supported_(native_device.has(sycl::aspect::fp64)),
           queue_(make_queue_with_fault_check(context, native_device)),
           worker_(
                   detail::StagedWorker<Task>::Callbacks{
@@ -290,6 +291,10 @@ void SyclQueue::execute(Task& task) {
         execute_binary(task);
         return;
     }
+    if (task.rmsnorm_request.has_value()) {
+        execute_rmsnorm(task);
+        return;
+    }
     if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
         throw std::bad_alloc();
     }
@@ -419,6 +424,13 @@ void SyclQueue::complete_task(
                     *state_, outcome.workspace_lease,
                     outcome.state != nullptr
                             && outcome.state->completion_proven());
+        } else if (outcome.rmsnorm_entries.has_value()) {
+            // RMS normalization registers the same read/read-deduplicated
+            // owner set but consumes no `RawWorkspace`, so only the owner
+            // entries are released or invalidated.
+            (void)detail::release_or_invalidate_binary_entries(
+                    state_->registry, *outcome.rmsnorm_entries, failed,
+                    fence_succeeded);
         } else {
             (void)detail::release_or_invalidate_entries(
                     state_->registry, outcome.common, failed,

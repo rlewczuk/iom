@@ -26,6 +26,11 @@ class SyclQueue final : public DeviceOps {
         detail::EntryRegistration copy_entries;
         std::optional<BinaryRequest> binary_request;
         detail::BinaryEntryRegistration binary_entries;
+        // Immutable RMS normalization request captured by admission, plus the
+        // common owner registrations retained until proven completion. RMS
+        // normalization consumes no `RawWorkspace`, so no lease is carried.
+        std::optional<RmsnormRequest> rmsnorm_request;
+        detail::BinaryEntryRegistration rmsnorm_entries;
     };
 
     struct SyclSequenceOutcome {
@@ -33,6 +38,7 @@ class SyclQueue final : public DeviceOps {
         std::shared_ptr<SyclFenceState> state;
         std::optional<detail::BinaryEntryRegistration> binary_entries;
         detail::WorkspaceLease workspace_lease;
+        std::optional<detail::BinaryEntryRegistration> rmsnorm_entries;
     };
 
 public:
@@ -58,6 +64,16 @@ public:
             const TensorView& source,
             TensorView& destination) override;
     oid binary_impl(const BinaryRequest& request) override;
+    oid rmsnorm_impl(const RmsnormRequest& request) override;
+
+    // Immutable device capability of the implemented RMS normalization leaf
+    // set: the eight non-`F64` applicable float leaves are always queueable,
+    // and `F64` is queueable exactly when the selected device reports
+    // `sycl::aspect::fp64`. The common facade consults this predicate for
+    // both the call and the pure requirement query, so an absent aspect is
+    // `Unsupported` before any queue effect.
+    [[nodiscard]] bool rmsnorm_supported(
+            DataType data_type) const override;
 
     [[nodiscard]] std::string_view backend_label() const noexcept override {
         return "SYCL";
@@ -69,6 +85,7 @@ public:
 private:
     void execute(Task& task);
     void execute_binary(Task& task);
+    void execute_rmsnorm(Task& task);
     void complete_task(
             std::uint64_t sequence, std::exception_ptr callback_failure);
 
@@ -105,6 +122,9 @@ private:
     // constructed (member declaration order).
     std::shared_ptr<detail::MetadataSlotPool> metadata_pool_;
     std::shared_ptr<SyclCompletionPool> completion_pool_;
+    // Immutable capability of the selected native device, published to the
+    // common RMS normalization facade through `rmsnorm_supported`.
+    const bool fp64_supported_ = false;
     sycl::queue queue_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;

@@ -267,6 +267,7 @@ if(SYCL_ENABLED)
         src/sycl/device_tensor.cpp
         src/sycl/copy.cpp
         src/sycl/queue_binary.cpp
+        src/sycl/queue_rmsnorm.cpp
         src/sycl/queue.cpp
         src/sycl/add.cpp
         src/sycl/runtime.hpp

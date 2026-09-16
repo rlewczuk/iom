@@ -404,11 +404,13 @@ TEST_CASE("SYCL conformance: deferred queue lifetime and stability") {
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("SYCL conformance: compute methods reject capability without submitting") {
+TEST_CASE("SYCL conformance: compute methods reject unsupported capability without submitting") {
     SyclDevices devices;
+    // RMS normalization has a landed SYCL port, so the shared probe queues it
+    // through the real path; SiLU, linear, and SDPA stay `Unsupported`.
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "SYCL", true);
+            &devices.gate, "SYCL", true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -442,8 +444,62 @@ TEST_CASE("SYCL conformance: full shared suite") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true);
+            &devices.gate, &oracle, true, true);
     CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("SYCL conformance: RMS normalization capability follows the device FP64 aspect") {
+    // The `docs/BACKEND_CONTRACT.md` **RMS normalization** capability matrix
+    // makes the SYCL port queue the eight non-`F64` applicable leaves and
+    // queue `F64` exactly when the selected device reports
+    // `sycl::aspect::fp64`. The pure query and the call share that one
+    // immutable capability, so they must agree in either direction.
+    SyclDevices devices;
+    const auto queue = devices.candidate->create_ops();
+    const iom::WorkspaceRequirements zero{0, 1};
+    for (const iom::DataType data_type : {
+                 iom::DataType::F4_E2M1,
+                 iom::DataType::F6_E2M3,
+                 iom::DataType::F6_E3M2,
+                 iom::DataType::F8_E4M3FN,
+                 iom::DataType::F8_E5M2,
+                 iom::DataType::F16,
+                 iom::DataType::BF16,
+                 iom::DataType::F32}) {
+        const iom::TensorSpec spec{iom::TensorShape{{1, 16}}, data_type};
+        auto x = devices.candidate->create_tensor(spec);
+        auto scale = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        CHECK(queue->rmsnorm_workspace_requirements(
+                      x->view(), scale->view(), out->view(), 1e-6F)
+              == zero);
+    }
+
+    const iom::TensorSpec double_spec{
+            iom::TensorShape{{1, 16}}, iom::DataType::F64};
+    auto x = devices.candidate->create_tensor(double_spec);
+    auto scale = devices.candidate->create_tensor(double_spec);
+    auto out = devices.candidate->create_tensor(double_spec);
+    const sycl::device native_device =
+            devices.candidate_context->get_devices().front();
+    if (native_device.has(sycl::aspect::fp64)) {
+        CHECK(queue->rmsnorm_workspace_requirements(
+                      x->view(), scale->view(), out->view(), 1e-6F)
+              == zero);
+        const iom::oid token =
+                queue->rmsnorm(x->view(), scale->view(), out->view(), 1e-6F);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+    } else {
+        CHECK_THROWS_AS(
+                (void)queue->rmsnorm_workspace_requirements(
+                        x->view(), scale->view(), out->view(), 1e-6F),
+                std::runtime_error);
+        CHECK_EQ(
+                queue->rmsnorm(
+                        x->view(), scale->view(), out->view(), 1e-6F),
+                iom::to_oid(iom::OidError::Unsupported));
+    }
 }
 
 TEST_CASE("SYCL conformance: binary requests use native queue and owner registry") {
