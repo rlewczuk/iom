@@ -418,7 +418,9 @@ must record that fact rather than adding an example.
 
 Other compute hooks (`silu`, `linear`, `rmsnorm`, and `sdpa`) remain unsupported
 and return negative `Unsupported` before submission, mutation, or token
-acceptance.
+acceptance. The RMS normalization ABI and its common admission contract are
+already frozen by [RMS normalization](#rms-normalization); every backend keeps
+reporting that operation `Unsupported` until its own port lands.
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
@@ -736,8 +738,10 @@ probes migrate only when a backend is actually ported and do not constitute
 numerical conformance.
 #### TinyLlama forward layout — Normalization and MLP boundaries
 
-The following interfaces are planned ABIs. This documentation does not make
-them available:
+The following interfaces are the planned ABI of this subsection. The RMS
+normalization declarations and their admission contract are frozen and
+declared by [RMS normalization](#rms-normalization); the SiLU declarations are
+still planned and undeclared:
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
@@ -752,8 +756,9 @@ WorkspaceRequirements silu_workspace_requirements(
         const TensorView& x, const TensorView& out);
 ```
 
-The RMS normalization implementation MUST remove the current redundant `dim`
-argument in the same declaration/caller/test cutover. The last logical axis is
+The RMS normalization cutover removed the redundant `dim` argument from
+declarations, definitions, callers, tests, and documentation; no overload,
+alias, compatibility shim, or re-export survives. The last logical axis is
 the feature width. For `x` and `out` shaped `[...,R,F]`, `scale` MUST have
 exactly `[1,F]`; it is shared explicitly across every row and independent
 leading plane, without introducing a general hidden-state or leading-plane
@@ -849,11 +854,11 @@ the corresponding operation contract.
 
 The detailed datatype applicability, special-value behavior, references,
 tolerances, fixture provenance, snapshots/hooks, kernels, and evidenced
-backend limitations remain solely owned by the planned **RMS normalization**
-and **SiLU** operation sections. Until each operation sibling lands, the
-current `rmsnorm` and `silu` calls continue to return negative `Unsupported`
-before submission, mutation, or token acceptance; no declaration or kernel is
-changed by this documentation contract.
+backend limitations remain solely owned by the
+[RMS normalization](#rms-normalization) and planned **SiLU** operation
+sections. Until each operation's backend ports land, the `rmsnorm` and `silu`
+calls continue to return negative `Unsupported` before submission, mutation,
+or token acceptance, and this plan subsection declares no ABI of its own.
 
 Delivery is operation-first, not mathematical-forward order: embedding,
 linear, RMSNorm, RoPE, cache append, SiLU, and finally SDPA. For each operation,
@@ -2736,6 +2741,170 @@ are the remote initialized-environment commands
 non-tile dimensions, planes, GQA, padding exclusion, numerics, aliases,
 workspace failures, device rejection, accepted failures, and repeated waits.
 
+#### RMS normalization
+
+This is the operation-owned contract for `DeviceOps::rmsnorm`. The common
+facade, its admission rules, and its pure requirement query are declared and
+frozen here; no backend port has landed yet, so every backend currently
+reports the operation `Unsupported` exactly as section 9 states above, and an
+unsupported port never counts as numerical conformance. The exact ABI is:
+
+```cpp
+oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
+            float eps, RawWorkspaceView workspace = {}) noexcept;
+WorkspaceRequirements rmsnorm_workspace_requirements(
+        const TensorView& x, const TensorView& scale,
+        const TensorView& out, float eps);
+```
+
+The redundant `dim` argument is removed from declarations, definitions,
+callers, tests, and documentation in one clean cutover; no overload, alias,
+compatibility shim, or re-export remains. The feature extent is the
+operation's `F`, and no operation-specific host span, implicit conversion,
+integer norm, quantization, or storage-format staging is introduced.
+
+1. **Layout.** `x` and `out` have identical logical shape `[...,R,F]` with
+   rank two through eight and nonzero extents. `scale` is exactly rank-two
+   `[1,F]`, shared explicitly across every independent leading plane and row;
+   RMSNorm MUST NOT accept a rank-one scale or introduce a general
+   hidden-state or leading-plane broadcast. Every plane and row is
+   independent: the reduction covers exactly the `F` logical features of its
+   own row, and tiled padding, other rows, other planes, and other requests
+   MUST NOT contribute. Selected plane offsets and strides are honored, and
+   final-axis transforms or shape inflation are rejected. All three views use
+   the same applicable leaf type and `QuantizationFormat::NONE`, output
+   storage is disjoint from both inputs, and read/read overlap between `x` and
+   `scale` remains valid.
+2. **Arithmetic.** For every leading-plane index `b`, row `r`, and feature
+   `f`, RMSNorm is row-local and evaluates
+   `out[b,r,f] = x[b,r,f] * rsqrt(sum(i=0..F-1, x[b,r,i] * x[b,r,i]) / F + eps)
+   * scale[0,f]` in the direct accumulator domain of its leaf, never against
+   an unbounded-real oracle. `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`,
+   `F8_E5M2`, `F16`, `BF16`, and `F32` decode to FP32, and every square,
+   product, and reduction step is FP32, with FP32 overflow/underflow and
+   permitted reduction reassociation within the comparison policy below.
+   `F64` stays FP64 throughout. The mean, epsilon addition, reciprocal square
+   root, normalization, and scale multiplication use that accumulator, and
+   the result is encoded exactly once to the output leaf using
+   round-to-nearest, ties-to-even together with the existing named-format
+   special-value and saturation rules.
+3. **Special values and epsilon.** `eps` MUST be finite and nonnegative.
+   `eps == 0` on an all-zero row produces quiet NaNs with no NaN payload
+   promise. NaN in `x` makes the shared row reduction NaN and poisons that
+   row. Infinite `x` makes the reduction infinite: finite features normalize
+   to signed zero, and infinite features become quiet NaN before the scale
+   multiply. A nonfinite `scale` affects only its own feature after the shared
+   norm. Admission MUST NOT scan for nonfinite data, and no RMS-specific
+   queued data failure is added.
+4. **Capability matrix.** Applicability is exactly the nine ordinary signed
+   floating leaves; the remaining fourteen leaves have no integer, boolean,
+   or exponent-only normalization contract. The matrix below is the complete
+   leaf-by-backend capability record.
+
+   | Leaf | Contract | CPU | CUDA | ROCm | SYCL | TTNN |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | `BOOL` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I2`, `U2` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I4`, `U4` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I8`, `U8` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I16`, `U16` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I32`, `U32` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I64`, `U64` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `F4_E2M1` | applicable | supported | supported | supported | supported | `Unsupported` |
+   | `F6_E2M3` | applicable | supported | supported | supported | supported | `Unsupported` |
+   | `F6_E3M2` | applicable | supported | supported | supported | supported | `Unsupported` |
+   | `F8_E4M3FN` | applicable | supported | supported | supported | supported | `Unsupported` |
+   | `F8_E5M2` | applicable | supported | supported | supported | supported | `Unsupported` |
+   | `F8_E8M0` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `F16` | applicable | supported | supported | supported | supported | `Unsupported` |
+   | `BF16` | applicable | supported | supported | supported | supported | supported |
+   | `F32` | applicable | supported | supported | supported | supported | supported |
+   | `F64` | applicable | supported | supported | supported | `aspect::fp64` only | `Unsupported` |
+
+   CPU, CUDA, and ROCm support all nine applicable floating leaves. SYCL
+   supports the eight non-`F64` leaves and supports `F64` only when the device
+   reports `aspect::fp64`; otherwise `F64` is `Unsupported`. TTNN supports only
+   `BF16` and `F32`: its seven encoded-carrier floats (`F4_E2M1`, `F6_E2M3`,
+   `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, and `F64`) are `Unsupported`
+   because native TILE compute cannot consume those carrier layouts without
+   the forbidden host staging. On every backend, an unknown dtype
+   enumeration value is `InvalidArgument`, while a recognized inapplicable or
+   unsupported leaf and a recognized non-`NONE` quantization format are
+   `Unsupported`.
+5. **Admission order.** Before capability dispatch or any queue effect, a
+   submission validates in exactly this order: (1) rank, nonzero extents,
+   identical `[...,R,F]` shape, and `scale == [1,F]`; (2) exact queue `Device`
+   identity for every view, stable live owner registration and native handle,
+   selected plane and leading bounds, and stride and view metadata; (3)
+   checked element, byte, address, stride, plane, feature, and tile
+   arithmetic, rejecting overflow before narrowing or pointer calculation;
+   (4) exact same leaf type and `QuantizationFormat::NONE`, output
+   disjointness, and conservative output/input alias rejection; (5) finite
+   nonnegative epsilon; (6) immutable backend capability; and (7) supplied
+   workspace validation and lease. This is the generic facade order of
+   *TinyLlama forward layout — Workspace and execution* above, split so that
+   leaf applicability and conservative aliasing are host-checkable admission,
+   epsilon precedes immutable capability, and supplied-workspace admission
+   follows capability and therefore never masks an unported backend. Read/read
+   `x`/`scale` aliases are allowed, but any output alias is rejected even when
+   transformed windows appear disjoint, and no data is inspected to admit a
+   request.
+6. **Requirement query and workspace.** The throwing query is pure and
+   deterministic: it allocates no host or native metadata, constructs no
+   request or vector snapshot, registers or leases no owner, mutates no
+   queue, token, or state, reads no data, and submits nothing, so it stays
+   pure while the queue is occupied. Its result depends only on the validated
+   views, `eps`, and immutable capability, and every supported implementation
+   returns exactly `{0, 1}` and consumes no `RawWorkspace`. Because the
+   requirement is `{0, 1}`, only the empty `RawWorkspaceView{}` is admissible;
+   any supplied workspace with an owner is `InvalidArgument` before dispatch,
+   with no hidden allocation, relocation, host arithmetic, or host roundtrip.
+   Unsupported capability and malformed query inputs surface as the
+   established throwing exceptions instead of OID mapping.
+7. **Request snapshot and ownership.** Successful admission constructs one
+   immutable `RmsnormRequest` that owns value-copied metadata for `x`,
+   `scale`, and `out` (shape, leaf type, quantization, plane offset, plane
+   strides, and validated bounds), their exact live owner and native-handle
+   identities, the validated epsilon, and the admitted `{0, 1}` requirement.
+   No borrowed `TensorView` or caller-owned metadata is retained, and
+   snapshot values do not change when caller views or their backing metadata
+   are mutated or destroyed. Read/read owner identities are deduplicated;
+   output storage stays disjoint. Every required owner is registered and
+   retained through proven in-order completion by the existing
+   prepare/register/dispatch/rollback, OID sequencing, completion-release,
+   and quarantine machinery — this contract adds no second registry or
+   workspace framework. Temporary caller views may die immediately after the
+   call returns.
+8. **Errors and default hooks.** Host-checkable shape, metadata, device,
+   alias, dtype, epsilon, workspace, and overflow failures are admission
+   failures: the `noexcept` facade maps them to the established negative OIDs
+   without consuming a token, registering an owner, submitting work, or
+   mutating queue or output state, and successful accepted work returns a
+   positive token. A runtime failure after acceptance leaves output unusable,
+   and every wait for that token repeats the same failure. The default common
+   RMSNorm hooks keep a well-formed request `Unsupported`, so a valid-shape
+   request on an unported backend reaches explicit capability rejection
+   before workspace inspection or execution and is never counted as
+   successful conformance. A backend port replaces only its own capability
+   predicate and implementation.
+9. **Comparison policy.** The conformance policy is fixed before measurement:
+   special-value class and signed-zero checks are exact while NaN payloads
+   are ignored; finite `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`,
+   `F8_E5M2`, `F16`, and `BF16` outputs must lie within two adjacent
+   destination encodings of the reference; `F32` requires
+   `abs_err <= 1e-6 + 2e-5 * abs(reference)`; and `F64` requires
+   `abs_err <= 1e-15 + 1e-12 * abs(reference)`. The independent reference
+   rounds every FP32 intermediate and uses `double` for `F64`; production
+   code MUST NOT serve as its own oracle.
+
+The common owner is `src/device_ops_rmsnorm.cpp` behind
+`include/iom/iom.hpp`. `test/test_iom.cpp` owns signature/cutover, query
+purity, validation precedence, rejection-effect, snapshot-lifetime,
+registration-lifetime, workspace, and repeat-wait coverage;
+`test/backend/backend_conformance_other.hpp` and `test/cpu/test_cpu.cpp` own
+the valid-shape `Unsupported` probes. Backend kernels and their
+backend-specific launch code remain owned by their own ports.
+
 ### 10. Model loading and weight layout
 
 Model ingestion begins with an explicit model directory and stays
@@ -3555,6 +3724,11 @@ Use these sources when changing or extending the contract:
 - common binary validation, operation dispatch, and independent scalar oracle:
   `test/backend/backend_conformance_common.hpp`,
   `test/backend/backend_conformance_add.hpp`;
+- common RMS normalization layout, admission, capability, request snapshot,
+  and pure requirement query: `src/device_ops_rmsnorm.cpp`, with its API,
+  purity, precedence, rejection-effect, snapshot, and ownership tests in
+  `test/test_iom.cpp` and its valid-shape `Unsupported` probes in
+  `test/backend/backend_conformance_other.hpp` and `test/cpu/test_cpu.cpp`;
 - storage, transfer, copy, and physical oracle:
   `test/backend/backend_conformance_copy_storage.hpp`,
   `test/backend/backend_conformance_oracle.hpp`;

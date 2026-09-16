@@ -15,11 +15,6 @@ namespace iom {
         throw UnsupportedOperation();
     }
 
-    oid DeviceOps::rmsnorm_impl(
-            const TensorView&, TensorView&, const TensorView&, float, size_t) {
-        throw UnsupportedOperation();
-    }
-
     oid DeviceOps::sdpa_impl(
             const TensorView&, const TensorView&, const TensorView&,
             size_t, size_t, size_t, TensorView&) {
@@ -42,20 +37,6 @@ namespace iom {
         try {
             validate_views(queue_device(), {&x, &w, &y});
             return invoke(linear_impl(x, w, y));
-        } catch (...) {
-            return invoke_failure(std::current_exception());
-        }
-    }
-
-    oid DeviceOps::rmsnorm(
-            const TensorView& x, TensorView& y, const TensorView& w,
-            float eps, size_t dim) noexcept {
-        try {
-            validate_views(queue_device(), {&x, &y, &w});
-            if (!(eps >= 0.0F) || dim == 0) {
-                throw std::invalid_argument("invalid rmsnorm parameters");
-            }
-            return invoke(rmsnorm_impl(x, y, w, eps, dim));
         } catch (...) {
             return invoke_failure(std::current_exception());
         }

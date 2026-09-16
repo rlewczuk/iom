@@ -812,6 +812,11 @@ public:
         post_acceptance,
     };
 
+    enum class RmsnormFailure {
+        none,
+        post_acceptance,
+    };
+
     struct Submission {
         std::uint64_t sequence;
         const char* op;
@@ -839,6 +844,15 @@ public:
         bool retained_failure;
     };
 
+    struct RmsnormRecord {
+        std::uint64_t sequence;
+        std::array<AddViewRecord, 3> views;
+        float epsilon;
+        iom::WorkspaceRequirements workspace_requirements;
+        iom::detail::BinaryEntryRegistration entries;
+        bool retained_failure;
+    };
+
     FakeQueue() = default;
     explicit FakeQueue(const iom::Device& device)
             : iom::DeviceOps(device) {}
@@ -854,6 +868,10 @@ public:
         next_add_failure_ = failure;
     }
 
+    void inject_rmsnorm_failure(RmsnormFailure failure) noexcept {
+        next_rmsnorm_failure_ = failure;
+    }
+
     void set_admission_unavailable(bool unavailable) noexcept {
         admission_unavailable_ = unavailable;
     }
@@ -862,8 +880,15 @@ public:
         return add_records_;
     }
 
-    [[nodiscard]] std::size_t registered_at(void* address) const {
-        return registry_state_.registry.snapshot_for(address).size();
+    [[nodiscard]] const std::vector<RmsnormRecord>& rmsnorm_records() const
+            noexcept {
+        return rmsnorm_records_;
+    }
+
+    [[nodiscard]] std::size_t registered_at(const void* address) const {
+        return registry_state_.registry
+                .snapshot_for(const_cast<void*>(address))
+                .size();
     }
     void finish_add(std::uint64_t sequence) {
         for (const BinaryRecord& record : add_records_) {
@@ -879,6 +904,20 @@ public:
             return;
         }
         throw std::invalid_argument("unknown fake ADD sequence");
+    }
+
+    void finish_rmsnorm(std::uint64_t sequence) {
+        for (const RmsnormRecord& record : rmsnorm_records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_binary_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake RMSNORM sequence");
     }
 
     // Successfully queued operations in submission order.
@@ -981,11 +1020,68 @@ protected:
         });
     }
 
-    iom::oid rmsnorm_impl(const iom::TensorView&, iom::TensorView&,
-                          const iom::TensorView&, float, size_t) override {
-        return submit([&](std::uint64_t sequence) {
-            submissions.push_back({sequence, "rmsnorm"});
-        });
+    [[nodiscard]] bool rmsnorm_supported(
+            iom::DataType data_type) const override {
+        switch (data_type) {
+            case iom::DataType::F4_E2M1:
+            case iom::DataType::F6_E2M3:
+            case iom::DataType::F6_E3M2:
+            case iom::DataType::F8_E4M3FN:
+            case iom::DataType::F8_E5M2:
+            case iom::DataType::F16:
+            case iom::DataType::BF16:
+            case iom::DataType::F32:
+            case iom::DataType::F64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    iom::oid rmsnorm_impl(const RmsnormRequest& request) override {
+        const RmsnormFailure failure =
+                std::exchange(next_rmsnorm_failure_, RmsnormFailure::none);
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_rmsnorm(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence,
+                        const RmsnormRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
+                    const auto record_view =
+                            [](const CopyViewSnapshot& view) {
+                                return AddViewRecord{
+                                        view.spec,
+                                        view.device_identity,
+                                        view.owner_identity,
+                                        view.native_handle,
+                                        view.plane_offset,
+                                        view.plane_strides,
+                                        {},
+                                        false,
+                                        false,
+                                        false};
+                            };
+                    rmsnorm_records_.push_back(RmsnormRecord{
+                            sequence,
+                            {record_view(snapshot.x),
+                             record_view(snapshot.scale),
+                             record_view(snapshot.out)},
+                            snapshot.epsilon,
+                            snapshot.workspace_requirements,
+                            entries,
+                            failure == RmsnormFailure::post_acceptance});
+                    submissions.push_back({sequence, "rmsnorm"});
+                    if (failure == RmsnormFailure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake RMSNORM retained failure")));
+                    }
+                });
     }
 
     iom::oid sdpa_impl(const iom::TensorView&, const iom::TensorView&,
@@ -1001,7 +1097,9 @@ private:
     iom::detail::QueueId registry_queue_id_ =
             iom::detail::allocate_queue_id(registry_state_);
     std::vector<BinaryRecord> add_records_;
+    std::vector<RmsnormRecord> rmsnorm_records_;
     AddFailure next_add_failure_ = AddFailure::none;
+    RmsnormFailure next_rmsnorm_failure_ = RmsnormFailure::none;
     bool admission_unavailable_ = false;
 
 };
@@ -2107,8 +2205,13 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
                                 TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::rmsnorm),
-        iom::oid (DeviceOps::*)(const TensorView&, TensorView&,
-                                const TensorView&, float, size_t) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
+                                TensorView&, float,
+                                iom::RawWorkspaceView) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::rmsnorm_workspace_requirements),
+        iom::WorkspaceRequirements (DeviceOps::*)(const TensorView&,
+                                const TensorView&, const TensorView&, float)>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::sdpa),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
@@ -2133,6 +2236,23 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         decltype(&DeviceOps::sdpa), DeviceOps*, const iom::Tensor&, const iom::Tensor&,
         const iom::Tensor&, size_t, size_t, size_t, iom::Tensor&>);
 
+    // The redundant `dim` argument and every old RMSNorm call form are gone:
+    // no overload, alias, compatibility shim, or re-export survives the
+    // cutover. `x` and `out` are the [`...,R,F`] views and `scale` is the
+    // rank-two `[1,F]` view shared across planes and rows.
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::rmsnorm), DeviceOps*, const TensorView&,
+        TensorView&, const TensorView&, float, std::size_t>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::rmsnorm), DeviceOps*, const TensorView&,
+        TensorView&, const TensorView&, float>);
+    // The requirement query reports the validated views and epsilon only; it
+    // never receives a workspace.
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::rmsnorm_workspace_requirements), DeviceOps*,
+        const TensorView&, const TensorView&, const TensorView&, float,
+        iom::RawWorkspaceView>);
+
     static_assert(!std::is_copy_constructible_v<DeviceOps>);
     static_assert(!std::is_move_constructible_v<DeviceOps>);
     static_assert(!std::is_copy_assignable_v<DeviceOps>);
@@ -2145,6 +2265,7 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     FakeTensor a = make_tensor(device, {2, 3, 16, 16});
     const FakeTensor& frozen = a;
     FakeTensor b = make_tensor(device, {2, 3, 16, 16});
+    FakeTensor scale = make_tensor(device, {1, 16});
 
     CHECK(iom::oid_is_token(queue.copy(a.view(), b.view())));
     CHECK(iom::oid_is_token(queue.add(frozen.view(), a.view(), b.view())));
@@ -2152,7 +2273,8 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     CHECK(iom::oid_is_token(queue.silu(b.view(), b.view())));
     CHECK(queue.silu_aliased);
     CHECK(iom::oid_is_token(queue.linear(a.view(), b.view(), b.view())));
-    CHECK(iom::oid_is_token(queue.rmsnorm(a.view(), b.view(), b.view(), 1e-6F, 1)));
+    CHECK(iom::oid_is_token(
+            queue.rmsnorm(a.view(), scale.view(), b.view(), 1e-6F)));
     CHECK(iom::oid_is_token(queue.sdpa(a.view(), b.view(), b.view(), 2, 1, 16, b.view())));
 
     // Derived views are equally acceptable operands.
@@ -2516,6 +2638,469 @@ TEST_CASE("ADD maps pre-acceptance failures without consuming a sequence") {
             iom::to_oid(iom::OidError::Overflow));
     CHECK(exhausted.add_records().empty());
     CHECK(exhausted.submissions.empty());
+}
+
+TEST_CASE("RMSNorm workspace requirement query is pure and deterministic") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    FakeTensor x = make_tensor(device, {2, 3, 17, 33});
+    FakeTensor scale = make_tensor(device, {1, 33});
+    FakeTensor out = make_tensor(device, {2, 3, 17, 33});
+
+    const iom::WorkspaceRequirements zero{0, 1};
+    CHECK(queue.rmsnorm_workspace_requirements(
+                  x.view(), scale.view(), out.view(), 1e-6F) == zero);
+    CHECK(queue.rmsnorm_workspace_requirements(
+                  x.view(), scale.view(), out.view(), 0.0F) == zero);
+
+    // The query stays pure, deterministic, and allocation-free while the
+    // queue holds accepted work.
+    const iom::oid accepted =
+            queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F);
+    REQUIRE(iom::oid_is_token(accepted));
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements measured =
+            queue.rmsnorm_workspace_requirements(
+                    x.view(), scale.view(), out.view(), 1e-6F);
+    const std::size_t allocations = iom_test::disarm();
+    CHECK_EQ(allocations, std::size_t{0});
+    CHECK(measured == zero);
+    REQUIRE_EQ(queue.rmsnorm_records().size(), std::size_t{1});
+    CHECK_EQ(queue.submissions.size(), std::size_t{1});
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 1);
+    CHECK_EQ(queue.registered_at(scale.view().native_handle()), 1);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
+
+    // The query validates exactly what admission validates, with the
+    // established throwing categories instead of OID mapping.
+    FakeTensor foreign_x = make_tensor(foreign, {2, 3, 17, 33});
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    foreign_x.view(), scale.view(), out.view(), 1e-6F),
+            std::invalid_argument);
+    FakeTensor wrong_scale = make_tensor(device, {1, 16});
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    x.view(), wrong_scale.view(), out.view(), 1e-6F),
+            std::invalid_argument);
+    FakeTensor mismatched = make_tensor(device, {1, 33}, iom::DataType::F16);
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    x.view(), mismatched.view(), out.view(), 1e-6F),
+            std::invalid_argument);
+    FakeTensor boolean_x =
+            make_tensor(device, {2, 3, 17, 33}, iom::DataType::BOOL);
+    FakeTensor boolean_scale =
+            make_tensor(device, {1, 33}, iom::DataType::BOOL);
+    FakeTensor boolean_out =
+            make_tensor(device, {2, 3, 17, 33}, iom::DataType::BOOL);
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    boolean_x.view(), boolean_scale.view(), boolean_out.view(),
+                    1e-6F),
+            std::runtime_error);
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    x.view(), scale.view(), out.view(), -1e-6F),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    x.view(), scale.view(), out.view(),
+                    std::numeric_limits<float>::quiet_NaN()),
+            std::invalid_argument);
+
+    // No query produced a record, submission, registration, or token.
+    CHECK_EQ(queue.submissions.size(), std::size_t{1});
+    CHECK_EQ(queue.rmsnorm_records().size(), std::size_t{1});
+    queue.finish_rmsnorm(token_sequence(accepted));
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+    CHECK_NOTHROW(queue.wait(accepted));
+    CHECK_NOTHROW(queue.wait(accepted));
+}
+
+TEST_CASE("RMSNorm admission preserves error precedence and rejection effects") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+
+    // Unknown leaf and quantization enumerations are invalid input, ahead of
+    // any applicability or capability decision.
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        const auto unknown = static_cast<iom::DataType>(127);
+        const_cast<iom::TensorSpec&>(x.view().spec()).data_type = unknown;
+        const_cast<iom::TensorSpec&>(scale.view().spec()).data_type = unknown;
+        const_cast<iom::TensorSpec&>(out.view().spec()).data_type = unknown;
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        const auto unknown = static_cast<iom::QuantizationFormat>(127);
+        const_cast<iom::TensorSpec&>(x.view().spec()).quantization = unknown;
+        const_cast<iom::TensorSpec&>(scale.view().spec()).quantization = unknown;
+        const_cast<iom::TensorSpec&>(out.view().spec()).quantization = unknown;
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        for (iom::TensorView* view :
+             {&x.view(), &scale.view(), &out.view()}) {
+            const_cast<std::size_t*>(
+                    view->spec().shape.dimensions().data())[0] = 0;
+        }
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        x.use_storage_handle(nullptr);
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+
+    // Structural shape rules: identical `[...,R,F]` inputs/output, exactly
+    // rank-two `[1,F]` scale, and no shape inflation.
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 16});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {2, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {2, 1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {3, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+
+    // Matching leaf types and quantization, disjoint output storage, and
+    // finite nonnegative epsilon.
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33}, iom::DataType::F16);
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        const_cast<iom::TensorSpec&>(scale.view().spec()).quantization =
+                iom::QuantizationFormat::GGML_Q4_0;
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        // Any output alias is rejected, even for the identical window a
+        // binary operation would accept in place.
+        iom::TensorView out_alias = x.view();
+        CHECK_EQ(queue.rmsnorm(x.view(), scale.view(), out_alias, 1e-6F), invalid);
+
+        // An output window over the scale owner is rejected as well.
+        FakeTensor shared_x = make_tensor(device, {1, 33});
+        FakeTensor shared_scale = make_tensor(device, {1, 33});
+        CHECK_EQ(
+                queue.rmsnorm(
+                        shared_x.view(), shared_scale.view(),
+                        shared_scale.view(), 1e-6F),
+                invalid);
+    }
+    for (const float epsilon :
+         {-1e-6F, std::numeric_limits<float>::quiet_NaN(),
+          std::numeric_limits<float>::infinity()}) {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), epsilon),
+                invalid);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        FakeWorkspace workspace(
+                device, reinterpret_cast<void*>(0x4300), 64);
+        CHECK_EQ(
+                queue.rmsnorm(
+                        x.view(), scale.view(), out.view(), 1e-6F,
+                        workspace.view()),
+                invalid);
+    }
+
+    // Recognized but inapplicable leaves are unsupported everywhere, and a
+    // matching recognized non-NONE quantization is unsupported as well.
+    for (const iom::DataType excluded : {
+                 iom::DataType::BOOL,
+                 iom::DataType::I2, iom::DataType::U2,
+                 iom::DataType::I4, iom::DataType::U4,
+                 iom::DataType::I8, iom::DataType::U8,
+                 iom::DataType::I16, iom::DataType::U16,
+                 iom::DataType::I32, iom::DataType::U32,
+                 iom::DataType::I64, iom::DataType::U64,
+                 iom::DataType::F8_E8M0}) {
+        CAPTURE(static_cast<int>(excluded));
+        FakeTensor x = make_tensor(device, {2, 17, 33}, excluded);
+        FakeTensor scale = make_tensor(device, {1, 33}, excluded);
+        FakeTensor out = make_tensor(device, {2, 17, 33}, excluded);
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                unsupported);
+    }
+    {
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        for (iom::TensorView* view :
+             {&x.view(), &scale.view(), &out.view()}) {
+            const_cast<iom::TensorSpec&>(view->spec()).quantization =
+                    iom::QuantizationFormat::GGML_Q4_0;
+        }
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                unsupported);
+    }
+
+    // Device identity, leading bounds and strides, and checked arithmetic.
+    {
+        FakeTensor x = make_tensor(foreign, {2, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {2, 17, 33});
+        CHECK_EQ(
+                queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+                invalid);
+    }
+    {
+        FakeTensor owner = make_tensor(device, {3, 17, 33});
+        FakeTensor scale = make_tensor(device, {1, 33});
+        FakeTensor out = make_tensor(device, {3, 17, 33});
+        iom::TensorView malformed = owner.view();
+        const_cast<std::size_t*>(malformed.plane_strides().data())[0] = 0;
+        CHECK_EQ(queue.rmsnorm(malformed, scale.view(), out.view(), 1e-6F),
+                 invalid);
+
+        iom::TensorView out_of_range = owner.view();
+        const_cast<std::size_t*>(out_of_range.plane_strides().data())[0] = 2;
+        CHECK_EQ(
+                queue.rmsnorm(out_of_range, scale.view(), out.view(), 1e-6F),
+                invalid);
+
+        iom::TensorView overflowed = owner.view();
+        const_cast<std::size_t*>(overflowed.plane_strides().data())[0] =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_EQ(
+                queue.rmsnorm(overflowed, scale.view(), out.view(), 1e-6F),
+                iom::to_oid(iom::OidError::Overflow));
+    }
+
+    // Rejections register nothing, queue nothing, and consume no sequence.
+    CHECK(queue.rmsnorm_records().empty());
+    CHECK(queue.submissions.empty());
+    FakeTensor x = make_tensor(device, {2, 17, 33});
+    FakeTensor scale = make_tensor(device, {1, 33});
+    FakeTensor out = make_tensor(device, {2, 17, 33});
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+    const iom::oid first = queue.rmsnorm(
+            x.view(), scale.view(), out.view(), 1e-6F,
+            iom::RawWorkspaceView{});
+    REQUIRE(iom::oid_is_token(first));
+    CHECK_EQ(token_sequence(first), 1);
+    queue.finish_rmsnorm(token_sequence(first));
+    CHECK_NOTHROW(queue.wait(first));
+
+    // Submission-sequence exhaustion is the one pre-admission Overflow.
+    FakeQueue exhausted(device);
+    exhausted.seek_next_sequence(kMaxSequence + 1);
+    CHECK_EQ(
+            exhausted.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+            iom::to_oid(iom::OidError::Overflow));
+    CHECK(exhausted.rmsnorm_records().empty());
+    CHECK(exhausted.submissions.empty());
+}
+
+TEST_CASE("RMSNorm snapshots immutable metadata and retains owners until completion") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    FakeTensor owner = make_tensor(device, {2, 3, 17, 33});
+    FakeTensor scale = make_tensor(device, {1, 33});
+    // The submitted `x` below is the leading-selected view of `owner`, so the
+    // output must carry that same `[...,R,F]` shape and a disjoint owner.
+    FakeTensor out = make_tensor(device, {3, 17, 33});
+
+    // A temporary transformed view is captured by value: the request keeps
+    // the selected offset and strides after the caller's view dies or is
+    // mutated, and no borrowed view reference escapes the call.
+    iom::TensorView temporary = owner.view().select(0, 1);
+    const iom::TensorSpec x_spec = temporary.spec();
+    const std::size_t x_offset = temporary.plane_offset();
+    const std::vector<std::size_t> x_strides = strides_of(temporary);
+    const void* const x_handle = temporary.native_handle();
+    const iom::WorkspaceRequirements zero_requirement{0, 1};
+    const void* const scale_handle = scale.view().native_handle();
+    const void* const out_handle = out.view().native_handle();
+    const iom::oid token =
+            queue.rmsnorm(temporary, scale.view(), out.view(), 1e-6F);
+    REQUIRE(iom::oid_is_token(token));
+    const_cast<std::size_t*>(temporary.plane_strides().data())[0] = 99;
+
+    const FakeQueue::RmsnormRecord& record = queue.rmsnorm_records().back();
+    CHECK_EQ(record.sequence, token_sequence(token));
+    CHECK(record.views[0].spec == x_spec);
+    CHECK_EQ(record.views[0].device, &device);
+    CHECK_EQ(record.views[0].owner, owner.view().owner_identity());
+    CHECK_EQ(record.views[0].handle, x_handle);
+    CHECK_EQ(record.views[0].plane_offset, x_offset);
+    CHECK(record.views[0].plane_strides == x_strides);
+    CHECK(record.views[1].spec == scale.view().spec());
+    CHECK_EQ(record.views[1].handle, scale_handle);
+    CHECK(record.views[2].spec == out.view().spec());
+    CHECK_EQ(record.views[2].handle, out_handle);
+    CHECK_EQ(record.epsilon, 1e-6F);
+    CHECK(record.workspace_requirements == zero_requirement);
+    CHECK_FALSE(record.retained_failure);
+
+    // Every required owner stays registered until proven completion.
+    REQUIRE_EQ(record.entries.count, std::size_t{3});
+    CHECK_EQ(queue.registered_at(x_handle), 1);
+    CHECK_EQ(queue.registered_at(scale_handle), 1);
+    CHECK_EQ(queue.registered_at(out_handle), 1);
+    CHECK_EQ(queue.submissions.back().sequence, token_sequence(token));
+    CHECK(std::string_view(queue.submissions.back().op) == "rmsnorm");
+    queue.finish_rmsnorm(token_sequence(token));
+    CHECK_EQ(queue.registered_at(x_handle), 0);
+    CHECK_EQ(queue.registered_at(scale_handle), 0);
+    CHECK_EQ(queue.registered_at(out_handle), 0);
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_NOTHROW(queue.wait(token));
+
+    // Read/read `x`/`scale` overlap is admissible and registers one owner;
+    // the disjoint output keeps its own registration.
+    {
+        FakeQueue deduped(device);
+        FakeTensor shared = make_tensor(device, {1, 33});
+        FakeTensor distinct = make_tensor(device, {1, 33});
+        const iom::oid alias = deduped.rmsnorm(
+                shared.view(), shared.view(), distinct.view(), 0.0F);
+        REQUIRE(iom::oid_is_token(alias));
+        REQUIRE_EQ(
+                deduped.rmsnorm_records().back().entries.count,
+                std::size_t{2});
+        CHECK_EQ(deduped.registered_at(shared.view().native_handle()), 1);
+        CHECK_EQ(deduped.registered_at(distinct.view().native_handle()), 1);
+        deduped.finish_rmsnorm(token_sequence(alias));
+        CHECK_EQ(deduped.registered_at(shared.view().native_handle()), 0);
+        CHECK_EQ(deduped.registered_at(distinct.view().native_handle()), 0);
+    }
+
+    // An accepted runtime failure leaves output unusable, repeats the same
+    // error on every wait, and keeps the affected owners quarantined.
+    {
+        FakeQueue failing(device);
+        FakeTensor x = make_tensor(device, {2, 17, 33});
+        FakeTensor failed_scale = make_tensor(device, {1, 33});
+        FakeTensor failed_out = make_tensor(device, {2, 17, 33});
+        failing.inject_rmsnorm_failure(
+                FakeQueue::RmsnormFailure::post_acceptance);
+        const iom::oid failed =
+                failing.rmsnorm(x.view(), failed_scale.view(),
+                                failed_out.view(), 1e-6F);
+        REQUIRE(iom::oid_is_token(failed));
+        failing.finish_rmsnorm(token_sequence(failed));
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            CHECK_THROWS_WITH_AS(
+                    failing.wait(failed), "fake RMSNORM retained failure",
+                    std::runtime_error);
+        }
+        CHECK(failing.rmsnorm_records().back().retained_failure);
+        CHECK_EQ(failing.registered_at(x.view().native_handle()), 1);
+        CHECK_EQ(failing.registered_at(failed_scale.view().native_handle()), 1);
+        CHECK_EQ(failing.registered_at(failed_out.view().native_handle()), 1);
+    }
+}
+
+TEST_CASE("Unported RMSNorm hooks reject before workspace inspection or effects") {
+    FakeDevice device;
+    FakeDevice foreign;
+    InlineQueue queue(device);
+    FakeTensor x = make_tensor(device, {2, 17, 33});
+    FakeTensor scale = make_tensor(device, {1, 33});
+    FakeTensor out = make_tensor(device, {2, 17, 33});
+    FakeWorkspace workspace(device, reinterpret_cast<void*>(0x4400), 64);
+    FakeWorkspace foreign_workspace(
+            foreign, reinterpret_cast<void*>(0x4800), 64);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+
+    // A valid-shape request on a backend whose RMSNorm port has not landed
+    // reaches explicit capability rejection instead of execution or a false
+    // conformance claim.
+    CHECK_EQ(
+            queue.rmsnorm(x.view(), scale.view(), out.view(), 1e-6F),
+            unsupported);
+    // Immutable capability precedes workspace validation, so neither a live
+    // nor a foreign supplied workspace changes the category.
+    CHECK_EQ(
+            queue.rmsnorm(
+                    x.view(), scale.view(), out.view(), 1e-6F,
+                    workspace.view()),
+            unsupported);
+    CHECK_EQ(
+            queue.rmsnorm(
+                    x.view(), scale.view(), out.view(), 1e-6F,
+                    foreign_workspace.view()),
+            unsupported);
+    // The pure query reports the same unsupported capability with the
+    // established throwing error.
+    CHECK_THROWS_AS(
+            (void)queue.rmsnorm_workspace_requirements(
+                    x.view(), scale.view(), out.view(), 1e-6F),
+            std::runtime_error);
+
+    // None of the rejected calls consumed a sequence or reached the queue.
+    const iom::oid probe = queue.copy(x.view(), out.view());
+    CHECK_EQ(token_sequence(probe), 1);
+    CHECK_NOTHROW(queue.wait(probe));
 }
 
 TEST_CASE("DeviceOps queue ids lease exclusively across threads and are reused after release") {

@@ -546,6 +546,11 @@ inline void run_compute_capability_conformance(
     auto w = candidate.create_tensor(spec);
     auto attn = candidate.create_tensor(spec);
     auto scratch = candidate.create_tensor(spec);
+    // The rank-two `[1,F]` RMSNorm scale shared across planes and rows: the
+    // probe stays a valid-shape request so it exercises capability rejection
+    // rather than structural validation.
+    auto scale = candidate.create_tensor(
+            iom::TensorSpec{iom::TensorShape{{1, 16}}, iom::DataType::F32});
     if (observer != nullptr) {
         observer->setup_complete();
     }
@@ -602,7 +607,7 @@ inline void run_compute_capability_conformance(
     }
     CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
     CHECK_EQ(queue->linear(x->view(), w->view(), y->view()), unsupported);
-    CHECK_EQ(queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6F, 1),
+    CHECK_EQ(queue->rmsnorm(x->view(), scale->view(), y->view(), 1e-6F),
              unsupported);
     CHECK_EQ(queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
                          attn->view()),

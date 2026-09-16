@@ -75,6 +75,7 @@ set(IOM_SOURCES
         src/device_ops.cpp
         src/device_ops_copy.cpp
         src/device_ops_binary.cpp
+        src/device_ops_rmsnorm.cpp
         src/device_ops_neural.cpp
         src/workspace.cpp
         src/tensor.cpp

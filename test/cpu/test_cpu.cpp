@@ -1219,10 +1219,15 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
     auto y = device->create_tensor(spec);
     auto w = device->create_tensor(spec);
     auto attn = device->create_tensor(spec);
+    auto scale = device->create_tensor(make_spec({1, 16}, iom::DataType::F32));
+    auto rmsnorm_out = device->create_tensor(spec);
 
     fill_storage(*y, kSentinel);
     fill_storage(*attn, kSentinel);
+    fill_storage(*rmsnorm_out, kSentinel);
     const std::vector<std::byte> attn_untouched = snapshot_storage(*attn);
+    const std::vector<std::byte> rmsnorm_out_untouched =
+            snapshot_storage(*rmsnorm_out);
 
     const iom::oid add_token = queue->add(x->view(), x->view(), y->view());
     const iom::oid mul_token = queue->mul(x->view(), x->view(), y->view());
@@ -1243,15 +1248,38 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
     CHECK_EQ(
             queue->linear(x->view(), w->view(), y->view()),
             iom::to_oid(iom::OidError::Unsupported));
+    // RMSNorm is declared and admitted by common code, but no CPU port has
+    // landed: the valid-shape request is unsupported, leaves its output
+    // untouched, and the pure requirement query reports the same capability
+    // through the established throwing error.
     CHECK_EQ(
-            queue->rmsnorm(x->view(), y->view(), w->view(), 1e-6f, 1),
+            queue->rmsnorm(x->view(), scale->view(), rmsnorm_out->view(), 1e-6f),
             iom::to_oid(iom::OidError::Unsupported));
+    CHECK_THROWS_AS(
+            (void)queue->rmsnorm_workspace_requirements(
+                    x->view(), scale->view(), rmsnorm_out->view(), 1e-6f),
+            std::runtime_error);
     CHECK_EQ(
             queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
                         attn->view()),
             iom::to_oid(iom::OidError::Unsupported));
 
+    // A recognized inapplicable leaf with a valid shape is unsupported by
+    // common admission on every backend, independent of any port.
+    auto integer_x =
+            device->create_tensor(make_spec({16, 16}, iom::DataType::I16));
+    auto integer_scale =
+            device->create_tensor(make_spec({1, 16}, iom::DataType::I16));
+    auto integer_out =
+            device->create_tensor(make_spec({16, 16}, iom::DataType::I16));
+    CHECK_EQ(
+            queue->rmsnorm(
+                    integer_x->view(), integer_scale->view(),
+                    integer_out->view(), 1e-6f),
+            iom::to_oid(iom::OidError::Unsupported));
+
     expect_storage_matches(*attn, attn_untouched);
+    expect_storage_matches(*rmsnorm_out, rmsnorm_out_untouched);
 
     // The four accepted binary operations consume the first four sequences.
     const iom::oid probe = queue->copy(x->view(), y->view());

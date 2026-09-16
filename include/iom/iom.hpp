@@ -161,8 +161,49 @@ namespace iom {
         oid silu(const TensorView& x, TensorView& y) noexcept;
         oid linear(const TensorView& x, const TensorView& w,
                    TensorView& y) noexcept;
-        oid rmsnorm(const TensorView& x, TensorView& y, const TensorView& w,
-                    float eps, size_t dim) noexcept;
+        /**
+         * Common `noexcept` facade for RMS normalization. `x` and `out` have
+         * identical logical `[...,R,F]` shape with rank two through eight and
+         * nonzero extents; rank-two `scale` is exactly `[1,F]` and is shared
+         * across every leading plane and row. Each row reduces over its own
+         * `F` logical features only, and every plane, row, padding element,
+         * and other request stays independent. The redundant `dim` argument
+         * is gone: the feature extent is the operation's `F`.
+         *
+         * Admission validates shape, device, owner, handle, stride and
+         * checked range arithmetic, dtype and `QuantizationFormat::NONE`,
+         * disjoint output storage, and finite nonnegative `eps` before the
+         * immutable backend capability. A nonempty workspace is invalid,
+         * because the queried requirement is exactly `{0, 1}`. Failures are
+         * mapped to the established negative OIDs without consuming a
+         * sequence, registering an owner, submitting work, or mutating
+         * output; accepted work returns a positive token whose owners stay
+         * registered through proven completion. The default backend hook is
+         * `Unsupported` until an operation port replaces it.
+         */
+        oid rmsnorm(const TensorView& x, const TensorView& scale,
+                    TensorView& out, float eps,
+                    RawWorkspaceView workspace = {}) noexcept;
+        /**
+         * Pure deterministic raw-workspace requirement query for `rmsnorm`.
+         * It runs exactly the admission validation of the operation — shape,
+         * exact device identity, live owners and handles, leading bounds and
+         * strides, checked arithmetic, dtype/quantization, disjoint output,
+         * epsilon, and immutable backend capability — and then reports the
+         * requirement with no allocation, request or vector snapshot
+         * construction, owner or lease registration, sequence/token
+         * consumption, data read, state mutation, or submission, and no
+         * dependence on queue occupancy or completion state. Every supported
+         * implementation returns exactly `{0, 1}` and consumes no
+         * `RawWorkspace`, so the only admissible supplied workspace is the
+         * empty default. Validation failures and an unsupported backend
+         * capability surface as the corresponding exception
+         * (`std::invalid_argument`, `std::overflow_error`,
+         * `UnsupportedOperation`), never through OID error mapping.
+         */
+        [[nodiscard]] WorkspaceRequirements rmsnorm_workspace_requirements(
+                const TensorView& x, const TensorView& scale,
+                const TensorView& out, float eps);
         oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
                  size_t n_heads, size_t n_kv_heads, size_t head_dim,
                  TensorView& attn_out) noexcept;
@@ -244,6 +285,35 @@ namespace iom {
                   no_op(no_op_) {}
         };
 
+        // Immutable host-side RMS normalization request retained by
+        // admission. It owns value-copied view metadata — shape, leaf type,
+        // quantization, plane offset, and plane strides — and the stable
+        // device, owner, and native-handle identities of `x`, `scale`, and
+        // `out`, plus the validated epsilon and the admitted workspace
+        // requirement. No callback may retain the caller's borrowed view
+        // object, and snapshot values do not change when caller views or
+        // their backing metadata are mutated or destroyed.
+        struct RmsnormRequest {
+            CopyViewSnapshot x;
+            CopyViewSnapshot scale;
+            CopyViewSnapshot out;
+            float epsilon;
+            WorkspaceRequirements workspace_requirements;
+            RmsnormRequest(
+                    CopyViewSnapshot x_, CopyViewSnapshot scale_,
+                    CopyViewSnapshot out_, float epsilon_,
+                    WorkspaceRequirements workspace_requirements_ = {})
+                : x(std::move(x_)), scale(std::move(scale_)),
+                  out(std::move(out_)), epsilon(epsilon_),
+                  workspace_requirements(workspace_requirements_) {}
+            RmsnormRequest(const RmsnormRequest&) = default;
+            RmsnormRequest& operator=(const RmsnormRequest&) = delete;
+            RmsnormRequest(RmsnormRequest&& other) noexcept
+                : x(std::move(other.x)), scale(std::move(other.scale)),
+                  out(std::move(other.out)), epsilon(other.epsilon),
+                  workspace_requirements(other.workspace_requirements) {}
+        };
+
         DeviceOps();
         explicit DeviceOps(const Device& device);
         virtual oid copy_impl(
@@ -252,8 +322,22 @@ namespace iom {
         virtual oid silu_impl(const TensorView& x, TensorView& y);
         virtual oid linear_impl(const TensorView& x, const TensorView& w,
                                 TensorView& y);
-        virtual oid rmsnorm_impl(const TensorView& x, TensorView& y,
-                                 const TensorView& w, float eps, size_t dim);
+        virtual oid rmsnorm_impl(const RmsnormRequest& request);
+        /**
+         * Immutable RMS normalization capability for one already validated
+         * applicable leaf. A ported backend returns true exactly for the
+         * leaves it queues; the default common implementation reports every
+         * leaf unsupported, so a valid-shape request on an unported backend
+         * reaches explicit capability rejection and stays `Unsupported`
+         * before any workspace inspection, owner registration, sequence
+         * consumption, or dispatch. Pure: it allocates nothing and has no
+         * registration, lease, token/queue, or backend effect. It is only
+         * ever asked about the nine applicable floating leaves; recognized
+         * inapplicable leaves and non-`NONE` quantization are rejected by
+         * common validation first.
+         */
+        [[nodiscard]] virtual bool rmsnorm_supported(
+                DataType data_type) const;
         virtual oid sdpa_impl(const TensorView& q, const TensorView& k,
                               const TensorView& v, size_t n_heads,
                               size_t n_kv_heads, size_t head_dim,
@@ -437,6 +521,69 @@ namespace iom {
                         if (prepared->workspace_lease.entry_id != 0) {
                             detail::complete_workspace_lease(
                                     state, prepared->workspace_lease, true);
+                        }
+                    });
+        }
+
+        // Admission path used by a ported RMS normalization hook. The
+        // immutable request is captured first, then every distinct owner is
+        // registered through the existing in-order prepare/register/dispatch/
+        // rollback machinery until proven completion. RMS normalization
+        // consumes no raw workspace, so no lease is acquired and only the
+        // read/read `x`/`scale` identities are deduplicated.
+        template <typename QueueWork>
+        oid submit_rmsnorm(
+                const RmsnormRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            struct Prepared {
+                RmsnormRequest request;
+                detail::BinaryEntryRegistration entries;
+                std::function<void(
+                        std::uint64_t, const RmsnormRequest&,
+                        detail::BinaryEntryRegistration)> work;
+                Prepared(const RmsnormRequest& request_, QueueWork work_)
+                    : request(request_), work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    request, std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, fence](
+                            std::uint64_t sequence) {
+                        const std::array<detail::BinaryOwnerRegistration, 3>
+                                owners{{
+                                        {prepared->request.x.owner_identity,
+                                         prepared->request.x.native_handle},
+                                        {prepared->request.scale.owner_identity,
+                                         prepared->request.scale.native_handle},
+                                        {prepared->request.out.owner_identity,
+                                         prepared->request.out.native_handle},
+                                }};
+                        try {
+                            prepared->entries = detail::register_binary_entries(
+                                    state, queue_id, sequence, owners, fence);
+                        } catch (...) {
+                            if (prepared->entries.count != 0) {
+                                state.registry.remove_entries(
+                                        std::span<const detail::EntryId>(
+                                                prepared->entries.entries.data(),
+                                                prepared->entries.count));
+                                prepared->entries = {};
+                            }
+                            throw;
+                        }
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.count != 0) {
+                            state.registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            prepared->entries.entries.data(),
+                                            prepared->entries.count));
                         }
                     });
         }
