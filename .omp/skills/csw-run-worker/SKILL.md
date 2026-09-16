@@ -33,7 +33,7 @@ Exit status `2` is a validation or safety failure. Exit status `3` is a helper-m
 - The integration checkout is the canonical control plane. Do not edit, build, test, format, or run task code there.
 - Only canonical `done` in the shared local task store satisfies a dependency. Missing dependencies wait. `ready`, `verified`, a child claim, or a private branch never unlocks an edge; the helper writes done only after successful integration.
 - Lifecycle values are `new`, `critic`, `planned`, `ready`, `verified`, and `done`. `running`, `failed`, and `blocked` are execution outcomes only.
-- Execution can start from `new`, `critic`, or `planned`, or resume from `ready`, once blockers are done. Successful implementation advances to `ready`; observed verification advances to `verified`; only `integrate` may advance it to `done`.
+- Execution can start from `new`, `critic`, or `planned`, or resume from `ready`, once blockers are done. Successful implementation advances to `ready`; observed verification advances to `verified`; only `integrate` may advance a leaf to `done`.
 - Failed and blocked attempts retain evidence and their one task commit without changing the current lifecycle; they are never integrated and never satisfy dependencies.
 - Each attempted leaf retains exactly one non-merge commit with subject `csw-run-worker(<full-task-path>): <outcome>`.
 - Rebase task commits; never merge task branches. Keep worktrees and feature branches as resumable state.
@@ -145,6 +145,8 @@ Children stop at lifecycle `ready`. The integration owner performs focused behav
 For a container train, rebase task commits in helper order and refresh verification after replay. Combined verification runs from the final train worktree. If an earlier task changes, rebuild every later replay. Every final train commit must have matching verified controls and evidence in its owner's local helper state; task metadata is not stored in Git commits.
 
 ## 6. Container roll-up
+
+Under `csw-run`, skip the standalone protocol below: `csw_run queue` completes the requested HLD through `task_ctl` once all direct children are canonically done. It also repairs an already-completed selection without roll-up annotations, worktree preparation, or another commit.
 
 When every implementation leaf beneath a requested container is either done in the shared task store or verified in the final train, the final leaf owner records each ancestor roll-up as verified before its final commit:
 

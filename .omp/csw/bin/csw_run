@@ -238,6 +238,8 @@ def queue(repo: Path, target: str, state_path: str | None) -> dict[str, Any]:
             waiting.append({"name": name, "reason": f"lifecycle status is {status}; awaiting integration"})
 
     finished = len(already_done) == len(tasks) and not blocked and not waiting
+    if finished and tasks:
+        helper.task_ctl_complete_hld(repo, result["target_id"])
     result.update({
         "ready": ready,
         "waiting": waiting,

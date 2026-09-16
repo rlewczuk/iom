@@ -20,6 +20,13 @@ continuing independent tasks. Container/path errors still raise.
 ``plan_tasks`` is also available for callers that want the CLI's mechanical
 planning operation.
 
+``complete_hld(repo, task_id)`` marks an existing, non-cancelled HLD ``done``
+only when it has direct children and every child is canonically ``done``.
+It leaves missing parent controls, other task types, and empty containers
+unchanged; it neither walks ancestors nor rewrites an already-done parent.
+Validation and write errors propagate. Callers must serialize the check and
+write with lifecycle mutations; ``csw_run queue`` holds the integration lock.
+
 Schema
 ------
 A control is a YAML mapping containing only these keys, in this form::
@@ -730,6 +737,21 @@ def scan_tasks(repo: Path, task_id: str) -> list[dict[str, Any]]:
     root = _normalize_repo(repo)
     canonical = _canonical_id(task_id, allow_root=True)
     return _direct_records(root, canonical, diagnostics=True)
+
+
+def complete_hld(repo: Path, task_id: str) -> None:
+    """Complete an existing HLD from canonical children under the caller's lock."""
+    root = _normalize_repo(repo)
+    canonical = _canonical_id(task_id, allow_root=False)
+    control = task_dir(root, canonical) / "task.yml"
+    if not control.exists() and not control.is_symlink():
+        return
+    config = get_task(root, canonical)
+    if config["type"] != "hld" or config["status"] in {"done", "cancelled"}:
+        return
+    children = _direct_records(root, canonical)
+    if children and all(child["status"] == "done" for child in children):
+        set_task(root, canonical, {"status": "done"})
 
 
 def detect_cycle(edges: Mapping[str, Iterable[str]]) -> None:

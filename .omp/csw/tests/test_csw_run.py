@@ -338,6 +338,49 @@ class RunnerTests(unittest.TestCase):
         queue = self.run_cli("queue")
         self.assertTrue(queue["finished"])
         self.assertEqual(queue["ready"], [])
+        self.assertFalse((self.target / "task.yml").exists())
+
+    def test_queue_completes_hld_after_all_children_done_without_another_commit(self):
+        parent = ".cswd/tasks/example"
+        set_task(self.repo, parent, {"type": "hld", "status": "planned"})
+        self.task("01-done", status="done")
+        self.task("02-last", status="verified")
+        base = self.git("rev-parse", "HEAD")
+        state = {"outcomes": {"02-last": {"status": "ready", "reason": "awaiting integration"}}}
+        self.assertFalse(self.run_cli("queue", state=state)["finished"])
+        self.assertEqual(get_task(self.repo, parent)["status"], "planned")
+
+        self.task("02-last", status="done")
+        self.assertTrue(self.run_cli("queue", state=state)["finished"])
+        self.assertEqual(get_task(self.repo, parent)["status"], "done")
+        self.assertTrue(self.run_cli("queue", state=state)["finished"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), base)
+        self.assertFalse((self.repo / ".work").exists())
+
+    def test_queue_leaves_empty_non_hld_and_cancelled_targets_unchanged(self):
+        parent = ".cswd/tasks/example"
+        set_task(self.repo, parent, {"type": "hld", "status": "planned"})
+        self.assertTrue(self.run_cli("queue")["finished"])
+        self.assertEqual(get_task(self.repo, parent)["status"], "planned")
+        self.task("01-done", status="done")
+        for task_type, status in (("impl", "ready"), ("hld", "cancelled")):
+            with self.subTest(task_type=task_type, status=status):
+                set_task(self.repo, parent, {"type": task_type, "status": status})
+                self.assertTrue(self.run_cli("queue")["finished"])
+                self.assertEqual(get_task(self.repo, parent)["status"], status)
+
+    def test_queue_parent_completion_errors_are_retryable_not_finished(self):
+        self.task("01-done", status="done")
+        control = self.target / "task.yml"
+        control.write_text("type: hld\nstatus: [planned]\n", encoding="utf-8")
+        failed = self.run_cli("queue", success=False)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+
+        parent = ".cswd/tasks/example"
+        set_task(self.repo, parent, {"type": "hld", "status": "planned"}, replace=True)
+        self.assertTrue(self.run_cli("queue")["finished"])
+        self.assertEqual(get_task(self.repo, parent)["status"], "done")
 
     def test_prepare_reuse_integration_and_dependency_refill_while_owner_runs(self):
         self.task("01-consumer", ["02-provider"])

@@ -132,6 +132,41 @@ class TaskCtlTests(unittest.TestCase):
             )
         self.assertEqual((directory / "task.yml").read_bytes(), before)
 
+    def test_complete_hld_requires_nonempty_all_done_children_to_unlock_dependents(self) -> None:
+        parent = ".cswd/tasks/parent"
+        self.set_task(parent, {"type": "hld", "status": "planned"})
+        complete = self.api["complete_hld"]
+        complete(self.repo, parent)
+        self.assertEqual(self.api["get_task"](self.repo, parent)["status"], "planned")
+
+        consumer = ".cswd/tasks/consumer"
+        self.set_task(consumer, {
+            "type": "impl", "status": "new", "blocked-by": [{"task-id": parent}],
+        })
+        self.set_task(f"{parent}/first", {"type": "impl", "status": "done"})
+        self.set_task(f"{parent}/last", {"type": "impl", "status": "verified"})
+        complete(self.repo, parent)
+        self.assertEqual(self.api["get_task"](self.repo, parent)["status"], "planned")
+        self.assertEqual(self.api["list_tasks"](self.repo, ".cswd/tasks", impl=True), [])
+
+        self.set_task(f"{parent}/last", {"type": "impl", "status": "done"})
+        complete(self.repo, parent)
+        self.assertEqual(self.api["get_task"](self.repo, parent)["status"], "done")
+        self.assertEqual(
+            [item["task-id"] for item in self.api["list_tasks"](self.repo, ".cswd/tasks", impl=True)],
+            [consumer],
+        )
+
+    def test_complete_hld_rejects_malformed_children_before_writing(self) -> None:
+        parent = ".cswd/tasks/parent"
+        self.set_task(parent, {"type": "hld", "status": "planned"})
+        self.set_task(f"{parent}/first", {"type": "impl", "status": "done"})
+        invalid = self.make_dir(f"{parent}/last") / "task.yml"
+        invalid.write_text("type: impl\nstatus: [done]\n", encoding="utf-8")
+        with self.assertRaises(self.TaskCtlError):
+            self.api["complete_hld"](self.repo, parent)
+        self.assertEqual(self.api["get_task"](self.repo, parent)["status"], "planned")
+
     def test_cli_whole_yaml_fields_and_conflicts(self) -> None:
         self.make_dir(".cswd/tasks/item")
         whole = "type: impl\nstatus: ready\nblocked-by: []\nsource: .cswd/tasks/item/spec.md"

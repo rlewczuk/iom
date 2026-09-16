@@ -28,6 +28,7 @@ task_ctl_get_task = _TASK_CTL["get_task"]
 task_ctl_set_task = _TASK_CTL["set_task"]
 task_ctl_list_tasks = _TASK_CTL["list_tasks"]
 task_ctl_scan_tasks = _TASK_CTL["scan_tasks"]
+task_ctl_complete_hld = _TASK_CTL["complete_hld"]
 task_ctl_detect_cycle = _TASK_CTL["detect_cycle"]
 
 
