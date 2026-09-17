@@ -424,15 +424,15 @@ backends without one of those ports keep reporting RMSNorm `Unsupported`.
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
-This subsection freezes planned backend-neutral boundaries; it does not
-advertise an implementation. The embedding methods below are declared and
+This subsection freezes the backend-neutral boundaries and records the
+implemented embedding ports. The embedding methods below are declared and
 admitted by the current neural facade: common structural, device, view, shape,
-alias, and checked-arithmetic validation and the pure requirement query are
-implemented, while both backend hooks still report `Unsupported`, so embedding
-returns `Unsupported` until a backend port lands and no backend implements or
-advertises the operation yet. The existing three-view `linear` signature
-remains unchanged and returns `Unsupported` as specified above, and
-`LinearOutputLayout` with the wider `linear` methods remains the target ABI.
+alias, checked-arithmetic validation, and the pure requirement query are
+implemented, while CPU, CUDA, and ROCm provide their operation hooks. SYCL and
+TTNN remain explicitly capability-gated according to their own port state, and
+the existing three-view `linear` signature remains unchanged and returns
+`Unsupported` as specified above. `LinearOutputLayout` with the wider `linear`
+methods remains the target ABI.
 The operation-owned [Embedding lookup](#embedding-lookup) and
 [Linear projections](#linear-projections) sections and their backend gates
 publish the exact target ABI and remain the normative source for per-backend
@@ -4067,6 +4067,16 @@ only after event proof and caches a queued `std::invalid_argument`; native
 launch, transfer, and event failures retain precedence. These are inspected
 source/API facts. CUDA build, device, allocation, and control-transfer runtime
 validation remain future verification obligations.
+
+The ROCm implementation uses the same shared raw-word metadata and gather
+kernel. `src/rocm/copy.hip` enqueues the metadata upload, device status reset,
+bounded 256-thread HIP gather, exactly one four-byte `hipMemcpyAsync` status
+transfer, and the completion event on the queue stream. `src/rocm/device.cpp`
+reserves one page-locked `hipHostMalloc` status cell per fixed queue metadata
+slot and releases it through `hipHostFree` only after the queue-resource lease
+has proven completion. These are inspected source/API facts; the ROCm build,
+device, allocation, and control-transfer runtime results are recorded only by
+the remote verification gate.
 
 TTNN transfers the entire 32-byte control packet. Its positive workspace is one
 real owning replicated DRAM `MeshBuffer` on the existing unit mesh, whose native

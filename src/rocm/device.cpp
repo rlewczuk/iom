@@ -24,6 +24,11 @@
 namespace iom {
 
     namespace {
+        void free_status_cells(void* address) noexcept {
+            if (address != nullptr) {
+                (void)hipHostFree(address);
+            }
+        }
 
         // A native device-memory failure maps to std::bad_alloc; any other
         // runtime status keeps the established runtime category.
@@ -129,6 +134,7 @@ namespace iom {
 
     [[nodiscard]] detail::QueueResourceLease
             RocmDevice::reserve_queue_resources() {
+        activate();
         std::lock_guard<std::mutex> lock(bookkeeping_mutex_);
         const std::size_t slot_count = queue_slot_count_;
         std::vector<std::size_t> indices;
@@ -167,10 +173,31 @@ namespace iom {
             release_queue_resources_locked(base, slot_count);
             throw;
         }
+        if (slot_count > std::numeric_limits<std::size_t>::max()
+                / sizeof(std::uint32_t)) {
+            release_queue_resources_locked(base, slot_count);
+            throw std::overflow_error(
+                    "ROCm status-cell allocation size overflows");
+        }
+        const std::size_t status_bytes =
+                slot_count * sizeof(std::uint32_t);
+        void* status_cells = nullptr;
+        const hipError_t status =
+                hipHostMalloc(&status_cells, status_bytes, hipHostMallocDefault);
+        if (status == hipErrorOutOfMemory) {
+            free_status_cells(status_cells);
+            release_queue_resources_locked(base, slot_count);
+            throw std::bad_alloc();
+        }
+        if (status != hipSuccess) {
+            free_status_cells(status_cells);
+            release_queue_resources_locked(base, slot_count);
+            throw rocm_detail::hip_error("hipHostMalloc", status);
+        }
         return make_lease(
                 *this, base, slot_count,
                 metadata_allocator_->ptr_from_index(base),
-                std::move(host_mirrors));
+                std::move(host_mirrors), status_cells, &free_status_cells);
     }
 
     void RocmDevice::release_queue_resources(

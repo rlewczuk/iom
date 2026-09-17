@@ -396,17 +396,13 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
     CHECK_FALSE(gate.armed());
 }
 
-// ROCm's declared embedding expectation: the complete 23-payload/12-index
-// matrix the ROCm port must reach and the exact `{32, 32}` status-workspace
-// contract. This revision has no ROCm embedding hook yet (leaf
-// `07-rocm-embedding` lands it), so the implemented span stays explicitly
-// empty: every shared case observes capability rejection only and no case
-// reports gather success.
+// ROCm implements the complete embedding payload/index matrix through the
+// shared raw-word gather and reports the accelerator control workspace.
 constexpr iom_conformance::EmbeddingDeclaration kRocmEmbeddingDeclaration{
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        iom_conformance::kNoEmbeddingSpan,
-        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
         false,
         iom::WorkspaceRequirements{32, 32}};
 
@@ -427,8 +423,56 @@ TEST_CASE("ROCm conformance: embedding lookup reference, admission, and lifetime
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm embedding status transfer failure retires safely") {
+    iom_conformance::TrafficGate gate;
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec table_spec{
+            iom::TensorShape{{4, 8}}, iom::DataType::U8};
+    const iom::TensorSpec index_spec{
+            iom::TensorShape{{1, 8}}, iom::DataType::U32};
+    const iom::TensorSpec output_spec{
+            iom::TensorShape{{8, 8}}, iom::DataType::U8};
+    auto table = candidate->create_tensor(table_spec);
+    auto indices = candidate->create_tensor(index_spec);
+    auto output = candidate->create_tensor(output_spec);
+    iom_conformance::copy_from_host(
+            table->view(),
+            std::vector<std::byte>(table_spec.logical_nbytes()));
+    iom_conformance::copy_from_host(
+            indices->view(),
+            std::vector<std::byte>(index_spec.logical_nbytes()));
+    auto workspace = candidate->create_workspace(32);
+    auto queue = candidate->create_ops();
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::embedding_status_copy);
+    const iom::oid failed = queue->embedding(
+            table->view(), indices->view(), output->view(), workspace->view());
+    REQUIRE(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+
+    const iom::oid recovered = queue->embedding(
+            table->view(), indices->view(), output->view(), workspace->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::third_plane_launch);
+    const iom::oid native_failed = queue->embedding(
+            table->view(), indices->view(), output->view(), workspace->view());
+    REQUIRE(iom::oid_is_token(native_failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, native_failed);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+    CHECK_FALSE(gate.armed());
+}
+
 TEST_CASE("ROCm conformance: full shared suite") {
     iom_conformance::TrafficGate gate;
+
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
     auto reference = iom::make_cpu_device(reference_allocator);

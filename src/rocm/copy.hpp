@@ -32,6 +32,7 @@ enum class SubmissionFault {
     queue_event_create,
     queue_stream_create,
     third_plane_launch,
+    embedding_status_copy,
     event_record,
     stream_synchronize,
     registration,
@@ -65,7 +66,6 @@ inline void check_hip(const char* operation, hipError_t status) {
 }
 
 struct gpu_policy {
-    static constexpr bool embedding_enabled = false;
     using context_type = int;
     using stream_type = hipStream_t;
     using event_type = hipEvent_t;
@@ -216,6 +216,16 @@ struct gpu_policy {
                 "hipMemcpy DtoH",
                 hipMemcpy(destination, source, bytes, hipMemcpyDeviceToHost));
     }
+    static void copy_status_to_host(
+            stream_type stream, void* destination, const void* source,
+            std::size_t bytes) {
+        hipError_t status = hipMemcpyAsync(
+                destination, source, bytes, hipMemcpyDeviceToHost, stream);
+        if (consume_submission_fault(SubmissionFault::embedding_status_copy)) {
+            status = hipErrorInvalidValue;
+        }
+        check_hip("hipMemcpyAsync embedding status DtoH", status);
+    }
 
 
     static void memset(
@@ -252,6 +262,12 @@ struct gpu_policy {
     static void after_grid_stride_launch() {
         if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
             check_hip("HIP copy kernel launch", hipErrorInvalidValue);
+        }
+    }
+
+    static void after_embedding_launch() {
+        if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
+            check_hip(gather_kernel_operation(), hipErrorInvalidValue);
         }
     }
 

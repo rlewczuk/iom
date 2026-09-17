@@ -64,7 +64,6 @@ inline void check_cuda_kernel(const char* operation, cudaError_t status) {
 }
 
 struct gpu_policy {
-    static constexpr bool embedding_enabled = true;
     using context_type = CUcontext;
     using stream_type = cudaStream_t;
     using event_type = cudaEvent_t;
