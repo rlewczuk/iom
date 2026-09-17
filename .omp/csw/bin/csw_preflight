@@ -85,8 +85,8 @@ BOSS_AGENTS = (
     AgentContract("csw-plan-facts", "@task", READ_ONLY_TOOLS),
 )
 SPEC_RUN_ALL_AGENTS = (
-    AgentContract("spec-run-all-implementer", "@implementer", BUILDER_TOOLS, ("spec-run-debug",)),
-    AgentContract("spec-run-debug", "@slow", (*READ_ONLY_TOOLS, "bash")),
+    AgentContract("spec-run-all-implementer", "@implementer", BUILDER_TOOLS, ("csw-debug",)),
+    AgentContract("csw-debug", "@slow", (*READ_ONLY_TOOLS, "bash")),
     AgentContract(
         "csw-verifier",
         "@csw-verifier",

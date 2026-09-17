@@ -48,8 +48,8 @@ class CswPreflightTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Preflight Test"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "preflight@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m", "initial"], check=True)
-        self.write_profile("spec-run-all-implementer", "@implementer", BUILDER, "[spec-run-debug]")
-        self.write_profile("spec-run-debug", "@slow", f"[{READ_ONLY}, bash]", "[]", advisor=False)
+        self.write_profile("spec-run-all-implementer", "@implementer", BUILDER, "[csw-debug]")
+        self.write_profile("csw-debug", "@slow", f"[{READ_ONLY}, bash]", "[]", advisor=False)
         self.write_profile("csw-verifier", "@csw-verifier", VERIFIER, "[]", advisor=False, prewalk=False)
         self.write_profile("csw-review", "@csw-review", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
         self.write_profile("csw-review-2", "@csw-review-2", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
@@ -170,10 +170,10 @@ class CswPreflightTests(unittest.TestCase):
         self.assertTrue(payload["git"]["head"])
         self.assertFalse(payload["git"]["clean"])
         self.assertEqual(payload["agents"]["spec-run-all-implementer"]["resolved"], "openai/cheap")
-        self.assertTrue(payload["agents"]["spec-run-debug"]["available"])
+        self.assertTrue(payload["agents"]["csw-debug"]["available"])
         self.assertEqual(set(payload["agents"]), {
             "spec-run-all-implementer",
-            "spec-run-debug",
+            "csw-debug",
             "csw-verifier",
             "csw-review",
             "csw-review-2",
@@ -194,7 +194,7 @@ class CswPreflightTests(unittest.TestCase):
         result = self.run_helper("csw-run-worker")
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(set(payload["agents"]), {"spec-run-debug"})
+        self.assertEqual(set(payload["agents"]), {"csw-debug"})
 
     def test_boss_contract_validates_every_associated_profile(self):
         self.write_boss_profiles()
@@ -318,7 +318,7 @@ class CswPreflightTests(unittest.TestCase):
 
 
     def test_override_and_profile_contract_are_rejected(self):
-        self.write_profile("spec-run-debug", "@task", f"[{READ_ONLY}, bash]", "[]", advisor=False)
+        self.write_profile("csw-debug", "@task", f"[{READ_ONLY}, bash]", "[]", advisor=False)
         self.write_omp(
             self.config(**{"task.agentModelOverrides": {"spec-run-all-implementer": "@slow"}}),
             self.models(),
@@ -334,7 +334,7 @@ class CswPreflightTests(unittest.TestCase):
                 **{
                     "task.agentAdvisor": {"spec-run-all-implementer": "on"},
                     "task.agentPrewalk": {"spec-run-all-implementer": True},
-                    "task.disabledAgents": ["spec-run-debug"],
+                    "task.disabledAgents": ["csw-debug"],
                     "task.maxRecursionDepth": 1,
                 }
             ),
