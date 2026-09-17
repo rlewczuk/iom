@@ -8,7 +8,7 @@ hide: true
 
 Implement the requested specification completely. Each executable implementation task owns one deterministic feature branch, one registered worktree under `.work/`, sibling `spec.md`, `task.yml`, and `task.md` under `.cswd/tasks/`, and exactly one final code commit. A target with implementation descendants is a container: execute those leaves, never the container as implementation.
 
-When invoked by `csw-run`, that skill's role boundaries take precedence: the root only orchestrates, its control-mode `csw-verifier` owns discovery/preparation, and one dedicated leaf `csw-verifier` owns rebase, verification, review evidence, and integration. The original implementer still owns code edits and the unchanged ready-result contract. Standalone `csw-run-worker` execution retains the workflow below.
+When invoked by `csw-run`, that skill's role boundaries take precedence: the root only orchestrates, its control-mode `csw-verifier` owns discovery/preparation, and one dedicated leaf `csw-verifier` owns rebase, independent final verification, review evidence, and integration. The original implementer owns code edits and mandatory focused testing before the ready handoff. Standalone `csw-run-worker` execution retains the workflow below.
 
 ## Mandatory control plane
 
@@ -84,28 +84,44 @@ If coherent dirty state must be preserved, use `checkpoint`; never checkpoint me
 
 Prefix every Read/Edit/Write path with the returned worktree and set every Bash `cwd` to it. Read the complete spec, repository guidance, relevant code/tests, and applicable skills. Implement only that leaf.
 
-When verification uses `csw-remote-*`, first read `skill://csw-remote`. Use the exact assigned worktree and a unique mirror ID. Set `CSW_REMOTE_TASK_DIR` to `dirname(spec_path)` and `CSW_REMOTE_WORKSPACE` to the returned `worktree` for every sync, exec, and clean invocation. This writes `remote.log` beside `spec.md` and `task.yml` in the shared local task store; do not use a remote path or substitute the integration checkout/worktree root for the task directory. Sync before each remote build/test sequence and reject local execution as evidence when the backend requires its configured remote host.
+When verification uses `csw-remote-*`, first read `skill://csw-remote`. Invoke the integration checkout's current remote helpers with Bash `cwd` set to the exact assigned worktree and a unique mirror ID for this leaf/owner attempt. Set `CSW_REMOTE_TASK_DIR` to `dirname(spec_path)` and `CSW_REMOTE_WORKSPACE` to the returned `worktree` for every sync, exec, and clean invocation. This writes `remote.log` beside `spec.md` and `task.yml` in the shared local task store; do not use a remote path or substitute the integration checkout/worktree root for the task directory. Put a fresh sync immediately before every exec for the same profile/mirror, confirm it reports the exact assigned worktree, and reject local execution as evidence when the backend requires its configured remote host.
 
-For container execution, provision each ready leaf before dispatch and give one owner its exact repo root, task IDs/paths, worktree paths, branch/base, exclusive scope, canonical dependency contracts, and verification still required. Children skip all validation during the parallel pass. They never edit controls or evidence directly and never mutate Git except through this helper. `csw-run` dispatches newly eligible leaves continuously, never in waves.
+Remote sync excludes ordinary untracked files. Before syncing newly added source/tests, use helper `checkpoint` to make them tracked without marking the task ready; never stage directly or test a mirror missing those files. Checkpoints are temporary helper-owned history, consolidated by the final `commit`, not extra final task commits. When checkpoints exist, supply commit `--outcome` explicitly (reuse the existing final outcome on repairs); omission only works with exactly one existing final task commit. Temporary executable probes may use the remote skill's `_local/` exception; remove them before final consolidation.
+
+For container execution, provision each ready leaf before dispatch and give one owner its exact repo root, task IDs/paths, worktree paths, branch/base, exclusive scope, canonical dependency contracts, focused checks it must execute, and final verification still required. Children MUST build and run focused tests during implementation, even when other children run concurrently; they do not own combined integration gates. They never edit controls or evidence directly and never mutate Git except through this helper. `csw-run` dispatches newly eligible leaves continuously, never in waves.
 
 A stuck implementation owner must invoke exactly one `spec-run-debug` rescue agent before reporting an implementation failure. Pass exact worktree/spec paths, constraints, current changes, concrete error, observations, and attempted approaches. The debugger is read-only; the owner resumes and applies or rejects its proposed solution with evidence. External prerequisites may be blocked without debugger escalation.
 
 For `csw-run`, reuse the control peer's successful preflight record forwarded by the root. Otherwise run `.omp/csw/bin/csw_preflight --repo <repo> --workflow csw-run-worker --pretty` once before container dispatch. A failed preflight is retained failure evidence; never substitute another profile/model.
 
+### Required implementer checks before ready
+
+Testing is part of implementation, not work deferred entirely to a verifier. The owner MUST execute real checks, diagnose failures, fix its code, and rerun affected checks after the final edit and each repair before handing off:
+
+- Backend-specific code: configure/build the affected targets, run relevant unit/regression tests, and run the backend conformance suite on **each touched backend** using its configured remote host where required. A CPU pass does not validate CUDA, ROCm, SYCL, or TTNN code.
+- Backend-neutral code: configure/build and run relevant unit/regression tests plus conformance on **at least one supported backend** that exercises the change. Prefer a configured remote backend; local CPU is valid only where repository/spec policy allows it. State the selection and coverage limits. The integration owner still runs all repository-required backends before integration.
+- Exercise the changed behavior, not just configuration, compilation, test discovery, or unrelated smoke tests. Use existing tests and keep a regression test where a plausible bug warrants it; if existing tests miss the behavior, run a focused executable scenario. Report actual executed tests/results; an empty selection, disabled tests, or skipped hardware checks is not a pass.
+- Documentation/workflow-only changes with no backend behavior use the relevant executable helper checks instead; explain the backend-test non-applicability. Do not invent a backend test merely to fill the report.
+
+Use `csw-remote` sync/exec directly through the available Bash tool for implementer checks; `csw_verify` and its final receipts remain the verifier's responsibility under `csw-run`. Keep build artifacts ignored or outside the checkout. Bound each build to 1800 seconds and each test command to 900 seconds (smaller project limits take precedence), with finite local tool deadlines and remote-side `timeout --kill-after=30s ...`. Use CTest `--timeout 300` or a justified finite project value. Bound hardware lock acquisition separately with `flock -w`; independent mirrors do not eliminate shared-GPU contention. No detached tests or lock held across editing/handoffs. Follow TTNN timeout/reset guidance and the SYCL outside-checkout no-setup profile override with nounset-safe initialization on **every** remote command.
+
+Do not return `ready` with failing or unexecuted required implementer checks. Code/test failures stay with the owner for repair and the existing one-time debugger rescue before failure; missing hardware, SSH access, SDKs, or other external prerequisites produce `blocked` with concrete evidence. Preserve failures even after recovery: backend/profile, mirror, sync/exec operation and exact command, exit/timeout, diagnostic excerpt, log paths including `remote.log`, and cleanup state. Stop owned processes and confirm remote execution has stopped before relinquishing the worktree; unconfirmed cleanup blocks transfer. The edit-only rebase-conflict lease remains an exception: defer checks until replay completes and the root grants normal implementation ownership again.
+
 ## 4. Record evidence and consolidate
 
 Never edit `task.md` or `task.yml` directly. `annotate` preserves unrelated task prose and replaces generated Outcome/Summary/Verification/Errors in the shared `.cswd/tasks/` store. For `ready` and `verified`, it delegates the lifecycle write to `task_ctl.set_task`; failed/blocked affect evidence only. `commit` records the code and binds local metadata to that commit without staging `.cswd`. Metadata-only attempts retain an empty code commit.
 
-Provisional success:
+Provisional success after the required implementer checks pass (still `ready`, not final verification):
 
 ```text
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<task_path>' \
-  --outcome ready --summary '<factual provisional summary>'
+  --outcome ready --summary '<factual provisional summary>' \
+  --verification '<implementer: backend/profile, exact command — observed result, log path>'
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty commit '<task_path>' \
   --status ready --outcome '<concise behavioral outcome>'
 ```
 
-Observed verification:
+Observed final verification by the integration owner:
 
 ```text
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty annotate '<task_path>' \
@@ -138,7 +154,7 @@ Refresh the integration head with `inspect` or the orchestration helper, then re
 
 On exit `3`, resolve only returned conflicts and call `continue-rebase`; use `abort-rebase` only to abandon that replay. If conflict resolution changes behavior, rerun affected verification and reconsolidate. Under `csw-run`, the root grants the original implementer an edit-only conflict lease; only the verifier continues replay after those edits stop. The owner reports continuation pending without annotating/committing mid-rebase, then resumes normal ready consolidation after replay under a new grant.
 
-Children stop at lifecycle `ready`. The integration owner performs focused behavioral verification and repository-required combined verification from the exact task worktree: the parent for standalone `csw-run-worker`, the dedicated leaf `csw-verifier` for `csw-run`. For accelerator work, the integration owner MUST use `csw-remote` sync/exec from that worktree, retain `remote.log`, and report profile, operation/command, exit/timeout, diagnostic output, and both local log paths on failure; an inaccessible child session or bare artifact path is not an adequate error report. The `csw-run` verifier uses `csw_verify` for bounded gates, commit-bound review authorization, and locked integration; the root runs none of these operations. On failure, return concrete evidence to the same owner, amend its one commit, and rerun. On success, annotate `verified`, commit `--status verified`, and mechanically check:
+Children stop at lifecycle `ready` **after** the required implementer checks pass and their evidence is recorded. The integration owner independently performs focused behavioral verification and repository-required combined verification from the exact task worktree: the parent for standalone `csw-run-worker`, the dedicated leaf `csw-verifier` for `csw-run`. Implementer passes inform the plan but never replace final commit-bound gates or all-backend repository requirements. For accelerator work, the integration owner MUST use `csw-remote` sync/exec from that worktree, retain `remote.log`, and report profile, operation/command, exit/timeout, diagnostic output, and both local log paths on failure; an inaccessible child session or bare artifact path is not an adequate error report. The `csw-run` verifier uses `csw_verify` for bounded gates, commit-bound review authorization, and locked integration; the root runs none of these operations. On failure, return concrete evidence to the same owner, amend its one commit, and rerun. On success, annotate `verified`, commit `--status verified`, and mechanically check:
 
 ```text
 .omp/csw/bin/csw_run_worker --repo '<repo_root>' --pretty check '<task_path>' --status verified
