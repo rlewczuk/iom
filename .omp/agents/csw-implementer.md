@@ -1,5 +1,5 @@
 ---
-name: spec-run-all-implementer
+name: csw-implementer
 description: Implements and tests one prepared csw-run leaf in its assigned csw-run-worker worktree; may invoke only the @slow rescue debugger and never integrates.
 tools: read, grep, glob, lsp, ast_grep, ast_edit, bash, edit, write
 spawns: [csw-debug]

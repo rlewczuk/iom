@@ -48,7 +48,7 @@ class CswPreflightTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Preflight Test"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "preflight@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m", "initial"], check=True)
-        self.write_profile("spec-run-all-implementer", "@implementer", BUILDER, "[csw-debug]")
+        self.write_profile("csw-implementer", "@implementer", BUILDER, "[csw-debug]")
         self.write_profile("csw-debug", "@slow", f"[{READ_ONLY}, bash]", "[]", advisor=False)
         self.write_profile("csw-verifier", "@csw-verifier", VERIFIER, "[]", advisor=False, prewalk=False)
         self.write_profile("csw-review", "@csw-review", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
@@ -169,10 +169,10 @@ class CswPreflightTests(unittest.TestCase):
         self.assertEqual(payload["git"]["repo_root"], str(self.repo.resolve()))
         self.assertTrue(payload["git"]["head"])
         self.assertFalse(payload["git"]["clean"])
-        self.assertEqual(payload["agents"]["spec-run-all-implementer"]["resolved"], "openai/cheap")
+        self.assertEqual(payload["agents"]["csw-implementer"]["resolved"], "openai/cheap")
         self.assertTrue(payload["agents"]["csw-debug"]["available"])
         self.assertEqual(set(payload["agents"]), {
-            "spec-run-all-implementer",
+            "csw-implementer",
             "csw-debug",
             "csw-verifier",
             "csw-review",
@@ -189,7 +189,7 @@ class CswPreflightTests(unittest.TestCase):
         self.assertIsNone(payload["git"]["branch"])
 
     def test_csw_run_worker_checks_only_debugger_profile(self):
-        (self.repo / ".omp" / "agents" / "spec-run-all-implementer.md").unlink()
+        (self.repo / ".omp" / "agents" / "csw-implementer.md").unlink()
         self.write_omp(self.config(), self.models())
         result = self.run_helper("csw-run-worker")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -224,8 +224,8 @@ class CswPreflightTests(unittest.TestCase):
         result = self.run_helper()
         payload = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["agents"]["spec-run-all-implementer"]["resolved"], "openai/cheap")
-        self.assertEqual(payload["agents"]["spec-run-all-implementer"]["thinking"], "low")
+        self.assertEqual(payload["agents"]["csw-implementer"]["resolved"], "openai/cheap")
+        self.assertEqual(payload["agents"]["csw-implementer"]["thinking"], "low")
 
     def test_missing_role_and_model_are_blockers(self):
         self.write_omp(
@@ -320,7 +320,7 @@ class CswPreflightTests(unittest.TestCase):
     def test_override_and_profile_contract_are_rejected(self):
         self.write_profile("csw-debug", "@task", f"[{READ_ONLY}, bash]", "[]", advisor=False)
         self.write_omp(
-            self.config(**{"task.agentModelOverrides": {"spec-run-all-implementer": "@slow"}}),
+            self.config(**{"task.agentModelOverrides": {"csw-implementer": "@slow"}}),
             self.models(),
         )
         payload = json.loads(self.run_helper().stdout)
@@ -332,8 +332,8 @@ class CswPreflightTests(unittest.TestCase):
         self.write_omp(
             self.config(
                 **{
-                    "task.agentAdvisor": {"spec-run-all-implementer": "on"},
-                    "task.agentPrewalk": {"spec-run-all-implementer": True},
+                    "task.agentAdvisor": {"csw-implementer": "on"},
+                    "task.agentPrewalk": {"csw-implementer": True},
                     "task.disabledAgents": ["csw-debug"],
                     "task.maxRecursionDepth": 1,
                 }
