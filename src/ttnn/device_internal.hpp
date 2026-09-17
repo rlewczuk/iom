@@ -84,6 +84,9 @@ namespace ttnn_detail {
 struct NativeWorkspace {
     // The single owning replicated DRAM allocation of the workspace owner.
     tt::tt_metal::distributed::MeshBuffer* owner = nullptr;
+    // Shared ownership keeps the real MeshBuffer alive across an accepted
+    // asynchronous submission even if the caller destroys its RawWorkspace.
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> owner_handle;
     // Actual native page size; the owner is one contiguous page, so this is
     // the requested logical byte count rounded up to 32.
     std::uint64_t page_size = 0;

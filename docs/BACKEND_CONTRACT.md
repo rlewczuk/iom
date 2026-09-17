@@ -3934,21 +3934,19 @@ which leaves that backend implements.
 | CUDA | all 23 | all 12 | `NONE` only |
 | ROCm | all 23 | all 12 | `NONE` only |
 | SYCL | all 23 | all 12 | `NONE` only |
-| TTNN (final) | 22: all except `F8_E8M0` | all 12 | `NONE` only |
+| TTNN (staged native) | 19: all except `F8_E8M0`, `I64`, `U64`, `F64` | 10: all except `I64`, `U64` | `NONE` only |
+| TTNN (final, pending wide carriers) | 22: all except `F8_E8M0` | all 12 | `NONE` only |
 The CPU implementation covers all 23 payload and 12 integral index leaves for
 `QuantizationFormat::NONE`. It reports `{0,1}`, rejects positive
 `RawWorkspace` creation, executes gathers on the existing asynchronous FIFO
 worker with raw bit helpers, and defers queued negative or out-of-vocabulary
 IDs as repeatable `std::invalid_argument` failures after acceptance.
 
-The TTNN row is the required final capability, not an advertisement that it is
-implemented today: TTNN rejects only `F8_E8M0` as a payload leaf. The first
-native TTNN port is a staged one-carrier implementation that exposes 19 payload
-leaves (excluding `F8_E8M0`, `I64`, `U64`, and `F64`) and 10 index leaves
-(excluding `I64` and `U64`). That staging is explicitly non-final and is
-neither a permanent BF16-only nor a permanent width restriction; the
-immediately following double-carrier work completes the required 22/12 matrix,
-and only then may the TTNN row be claimed.
+The TTNN staged-native row is implemented by the first port and is explicitly
+non-final. It uses one-carrier native storage for its 19 payload leaves and 10
+index leaves; the immediately following double-carrier work completes the
+required 22/12 matrix. Until that work lands, the final row remains a target,
+not an advertised implementation.
 
 No backend may advertise a capability it has not implemented. An `Unsupported`
 result, a storage-only observation, or a rejection-only probe is never

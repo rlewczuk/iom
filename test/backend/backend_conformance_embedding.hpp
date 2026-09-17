@@ -1617,6 +1617,9 @@ inline void run_embedding_reference_conformance(
         const bool implements = embedding_implements(
                 declaration, iom::DataType::U32, iom::DataType::U32);
         if (implements) {
+            std::vector<std::byte> valid_ids(
+                    table->view().spec().logical_nbytes(), std::byte{0});
+            copy_from_host(table->view(), valid_ids);
             const EmbeddingRealSubmission aliased_submission =
                     submit_real_embedding(
                             candidate, *queue, declaration, table->view(),

@@ -140,12 +140,16 @@ if(TTNN_ENABLED)
     add_library(iom_ttnn STATIC
         src/ttnn/device.cpp
         src/ttnn/queue.cpp
+        src/ttnn/queue_embedding.cpp
         src/ttnn/queue_copy.cpp
         src/ttnn/device_types.cpp
         src/ttnn/rmsnorm_device_operation.cpp
         src/ttnn/device_internal.hpp
         src/ttnn/queue_internal.hpp
         src/ttnn/copy.cpp
+        src/ttnn/embedding.cpp
+        src/ttnn/embedding.hpp
+        src/ttnn/kernels/embedding.cpp
         src/ttnn/testing.cpp
         src/ttnn/binary.cpp
         src/ttnn/rmsnorm_device_operation.hpp
@@ -154,6 +158,15 @@ if(TTNN_ENABLED)
         src/ttnn/testing_internal.hpp
         src/ttnn/staging.hpp
         include/iom/ttnn/device.hpp
+    )
+
+    set_source_files_properties(
+        src/ttnn/kernels/embedding.cpp
+        PROPERTIES HEADER_FILE_ONLY TRUE
+    )
+    target_compile_definitions(iom_ttnn
+        PRIVATE
+            IOM_TTNN_EMBEDDING_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/embedding.cpp"
     )
 
     target_include_directories(iom_ttnn

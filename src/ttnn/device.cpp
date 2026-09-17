@@ -359,6 +359,12 @@ namespace iom {
                 return native_.get();
             }
 
+            [[nodiscard]] std::shared_ptr<
+                    tt::tt_metal::distributed::MeshBuffer>
+            native_owner_handle() const noexcept {
+                return native_;
+            }
+
             [[nodiscard]] std::uint64_t native_page_size() const noexcept {
                 return native_ != nullptr
                         ? native_->device_local_config().page_size
@@ -501,6 +507,10 @@ namespace iom {
             throw std::invalid_argument(
                     "workspace range exceeds the owner's logical bytes");
         }
+        if (offset > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error(
+                    "workspace offset exceeds the native address range");
+        }
         tt::tt_metal::distributed::MeshBuffer* const native =
                 workspace_owner->native_owner();
         if (native->address() == 0
@@ -510,12 +520,14 @@ namespace iom {
         }
         return ttnn_detail::NativeWorkspace{
                 native,
+                workspace_owner->native_owner_handle(),
                 workspace_owner->native_page_size(),
                 static_cast<std::uint64_t>(native->address()),
                 logical_bytes,
                 offset};
-    }
 
+
+    }
 
     std::unique_ptr<Device> make_ttnn_device(
             std::uint32_t device_ordinal, QueueConfig queue_config) {

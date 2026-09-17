@@ -1035,20 +1035,16 @@ TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
     }
 }
 
-// TTNN's declared embedding expectation: the explicitly temporary one-carrier
-// matrix of the staged port (19 payload leaves and 10 narrow index leaves,
-// `staged` true) and the exact `{32, 32}` status-workspace contract, whose
-// status subrange alone is read back. The wide-carrier leaf replaces both
-// spans with the final 22/12 TTNN matrix. This revision has no TTNN embedding
-// hook yet (leaves `10-ttnn-native-embedding` and `11-ttnn-wide-carriers` land
-// it), so the implemented span stays explicitly empty: every shared case
-// observes capability rejection only, and neither a staged span nor a
-// rejection probe is reported as gather success.
+// TTNN's staged-native embedding path supports the temporary one-carrier
+// matrix: 19 payload leaves and 10 narrow index leaves. The native path
+// reports the exact `{32, 32}` status-workspace contract, whose status
+// subrange alone is read back. The wide-carrier leaf replaces both spans with
+// the final 22/12 TTNN matrix.
 constexpr iom_conformance::EmbeddingDeclaration kTtnnEmbeddingDeclaration{
         iom_conformance::kEmbeddingStagedTtnnPayloadSpan,
         iom_conformance::kEmbeddingStagedTtnnIdSpan,
-        iom_conformance::kNoEmbeddingSpan,
-        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kEmbeddingStagedTtnnPayloadSpan,
+        iom_conformance::kEmbeddingStagedTtnnIdSpan,
         true,
         iom::WorkspaceRequirements{32, 32}};
 
@@ -1059,6 +1055,53 @@ TEST_CASE("TTNN conformance: embedding lookup reference, admission, and lifetime
     iom_conformance::run_embedding_conformance(
             devices.conformance(), kTtnnEmbeddingDeclaration, nullptr,
             &oracle);
+}
+
+TEST_CASE("TTNN embedding owners survive accepted dispatch before wait") {
+    require_hardware();
+    TtnnDevices devices;
+    const iom::TensorSpec table_spec{
+            iom::TensorShape{{1, 8}}, iom::DataType::U32};
+    const iom::TensorSpec index_spec{
+            iom::TensorShape{{1, 8}}, iom::DataType::U32};
+    const iom::TensorSpec output_spec{
+            iom::TensorShape{{8, 8}}, iom::DataType::U32};
+    auto queue = devices.candidate->create_ops();
+
+    for (int doomed = 0; doomed != 4; ++doomed) {
+        auto table = devices.candidate->create_tensor(table_spec);
+        auto indices = devices.candidate->create_tensor(index_spec);
+        auto output = devices.candidate->create_tensor(output_spec);
+        auto workspace = devices.candidate->create_workspace(32);
+        const std::vector<std::byte> table_bytes(
+                table_spec.logical_nbytes(), std::byte{7});
+        const std::vector<std::byte> index_bytes(
+                index_spec.logical_nbytes(), std::byte{0});
+        const std::vector<std::byte> output_bytes(
+                output_spec.logical_nbytes(), std::byte{0xA5});
+        iom_conformance::copy_from_host(table->view(), table_bytes);
+        iom_conformance::copy_from_host(indices->view(), index_bytes);
+        iom_conformance::copy_from_host(output->view(), output_bytes);
+
+        const iom::oid token = queue->embedding(
+                table->view(), indices->view(), output->view(),
+                workspace->view());
+        REQUIRE(iom::oid_is_token(token));
+        switch (doomed) {
+            case 0: table.reset(); break;
+            case 1: indices.reset(); break;
+            case 2: output.reset(); break;
+            case 3: workspace.reset(); break;
+        }
+        CHECK_NOTHROW(queue->wait(token));
+        if (output != nullptr) {
+            const std::vector<std::byte> expected(
+                    output_spec.logical_nbytes(), std::byte{7});
+            iom_conformance::require_logical_bytes(
+                    output->view(), expected,
+                    "embedding output after owner destruction");
+        }
+    }
 }
 
 TEST_CASE("TTNN conformance: full shared suite") {

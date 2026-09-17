@@ -87,6 +87,8 @@ TtnnQueue::TtnnQueue(TtnnDevice& device)
           device_(&device),
           state_(&device.registry_state()),
           registry_queue_id_(detail::allocate_queue_id(*state_)),
+          embedding_status_(device.queue_config().max_in_flight_per_queue),
+          embedding_program_(device.mesh()),
           worker_(
                   detail::StagedWorker<Task>::Callbacks{
                           [this](Task& task) { execute(task); },
@@ -291,6 +293,10 @@ void TtnnQueue::execute(Task& task) {
         execute_rmsnorm(task);
         return;
     }
+    if (task.is_embedding) {
+        execute_embedding(task);
+        return;
+    }
     if (task.is_binary) {
         bool submitted = false;
         bool completion_proven = false;
@@ -384,6 +390,16 @@ void TtnnQueue::publish_native_completion(std::uint64_t sequence) noexcept {
 
 void TtnnQueue::complete_task(
         std::uint64_t sequence, std::exception_ptr failure) {
+    bool is_embedding = false;
+    {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
+        is_embedding =
+                embedding_outcomes_.find(sequence) != embedding_outcomes_.end();
+    }
+    if (is_embedding) {
+        complete_embedding_task(sequence, std::move(failure));
+        return;
+    }
     RmsnormOutcome rmsnorm_outcome;
     bool is_rmsnorm = false;
     BinaryOutcome binary_outcome;
