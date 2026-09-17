@@ -254,16 +254,13 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
 }
 
 // CUDA's declared embedding expectation: the complete 23-payload/12-index
-// matrix the CUDA port must reach and the exact `{32, 32}` status-workspace
-// contract. This revision has no CUDA embedding hook yet (leaf
-// `06-cuda-embedding` lands it), so the implemented span stays explicitly
-// empty: every shared case observes capability rejection only and no case
-// reports gather success.
+// matrix and exact `{32, 32}` status-workspace contract. The native CUDA
+// gather copies raw words and reports deferred queued-ID bounds failures.
 constexpr iom_conformance::EmbeddingDeclaration kCudaEmbeddingDeclaration{
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        iom_conformance::kNoEmbeddingSpan,
-        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
         false,
         iom::WorkspaceRequirements{32, 32}};
 
@@ -275,6 +272,51 @@ TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime
             devices.conformance(), kCudaEmbeddingDeclaration, &devices.gate,
             &oracle);
     CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA embedding status transfer failure retires safely") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    const iom::TensorSpec table_spec{
+            iom::TensorShape{{4, 8}}, iom::DataType::U8};
+    const iom::TensorSpec index_spec{
+            iom::TensorShape{{1, 8}}, iom::DataType::U32};
+    const iom::TensorSpec output_spec{
+            iom::TensorShape{{8, 8}}, iom::DataType::U8};
+    auto table = devices.candidate->create_tensor(table_spec);
+    auto indices = devices.candidate->create_tensor(index_spec);
+    auto output = devices.candidate->create_tensor(output_spec);
+    iom_conformance::copy_from_host(
+            table->view(),
+            std::vector<std::byte>(table_spec.logical_nbytes()));
+    iom_conformance::copy_from_host(
+            indices->view(),
+            std::vector<std::byte>(index_spec.logical_nbytes()));
+    auto workspace = devices.candidate->create_workspace(32);
+    auto queue = devices.candidate->create_ops();
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::embedding_status_copy);
+    const iom::oid failed = queue->embedding(
+            table->view(), indices->view(), output->view(), workspace->view());
+    REQUIRE(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    const iom::oid recovered = queue->embedding(
+            table->view(), indices->view(), output->view(), workspace->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::third_plane_launch);
+    const iom::oid native_failed = queue->embedding(
+            table->view(), indices->view(), output->view(), workspace->view());
+    REQUIRE(iom::oid_is_token(native_failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, native_failed);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
 }
 
 TEST_CASE("CUDA conformance: full shared suite") {

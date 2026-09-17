@@ -68,6 +68,7 @@ bool consume_submission_fault(
 #define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
     kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
 #include "../shared/standard_tiled_copy.inl"
+#include "../shared/standard_tiled_embedding.inl"
 #include "../shared/standard_tiled_add.inl"
 #include "../shared/standard_tiled_rmsnorm.inl"
 

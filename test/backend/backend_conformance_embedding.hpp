@@ -1611,12 +1611,23 @@ inline void run_embedding_reference_conformance(
                         foreign->view(), table->view(), out->view()),
                 invalid);
         // Input/input read aliasing is allowed. Only the capability decision
-        // may follow for an undeclared leaf pair.
-        const iom::oid aliased =
-                queue->embedding(table->view(), table->view(), out->view());
-        CHECK_NE(aliased, invalid);
-        if (!embedding_implements(
-                    declaration, iom::DataType::U32, iom::DataType::U32)) {
+        // may follow for an undeclared leaf pair. Ported positive-workspace
+        // backends must pass a live caller-owned range and retain it until
+        // this accepted aliased submission has completed.
+        const bool implements = embedding_implements(
+                declaration, iom::DataType::U32, iom::DataType::U32);
+        if (implements) {
+            const EmbeddingRealSubmission aliased_submission =
+                    submit_real_embedding(
+                            candidate, *queue, declaration, table->view(),
+                            table->view(), out->view());
+            CHECK_NE(aliased_submission.result, invalid);
+            REQUIRE(iom::oid_is_token(aliased_submission.result));
+            CHECK_NOTHROW(queue->wait(aliased_submission.result));
+        } else {
+            const iom::oid aliased =
+                    queue->embedding(table->view(), table->view(), out->view());
+            CHECK_NE(aliased, invalid);
             CHECK_EQ(aliased, unsupported);
         }
     }

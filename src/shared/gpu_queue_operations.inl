@@ -197,6 +197,82 @@ bool GpuQueue<Policy>::rmsnorm_supported(DataType data_type) const {
 }
 
 template <typename Policy>
+WorkspaceRequirements GpuQueue<Policy>::embedding_workspace_requirements_impl(
+        const TensorView&, const TensorView&, const TensorView&) {
+    if constexpr (!Policy::embedding_enabled) {
+        throw UnsupportedOperation();
+    } else {
+        return WorkspaceRequirements{32, 32};
+    }
+}
+
+template <typename Policy>
+oid GpuQueue<Policy>::embedding_impl(const EmbeddingRequest& request) {
+    if constexpr (!Policy::embedding_enabled) {
+        throw UnsupportedOperation();
+    } else {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        const std::size_t rank = request.indices.spec.shape.rank();
+        (void)detail::embedding_metadata_storage_bytes(rank);
+        auto completion = std::make_shared<CompletionState>();
+        const detail::Fence fence = build_fence(completion);
+        return submit_embedding(
+                request, *registry_state_, registry_queue_id_, fence,
+                [this, completion](
+                        std::uint64_t sequence,
+                        const EmbeddingRequest& captured,
+                        detail::BinaryEntryRegistration entries) {
+                    auto submission = state_->try_acquire();
+                    if (submission == nullptr) {
+                        throw detail::AdmissionResourceUnavailable{};
+                    }
+                    const auto metadata_slot = metadata_pool_->try_acquire();
+                    if (!metadata_slot.has_value()) {
+                        throw detail::AdmissionResourceUnavailable{};
+                    }
+                    MetadataLease metadata_lease{
+                            metadata_pool_.get(), *metadata_slot};
+                    completion->bind(submission);
+                    try {
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            const auto [it, inserted] =
+                                    outcomes_.try_emplace(sequence);
+                            if (!inserted) {
+                                throw std::logic_error(
+                                        "duplicate GPU embedding sequence");
+                            }
+                            it->second.binary_entries = entries;
+                            it->second.workspace_lease =
+                                    captured.workspace_lease;
+                            it->second.completion = completion;
+                            it->second.is_embedding = true;
+                        }
+                        Task task;
+                        task.sequence = sequence;
+                        task.is_embedding = true;
+                        task.embedding_request.emplace(captured);
+                        task.binary_entries = entries;
+                        task.status_slot = *metadata_slot;
+                        task.submission = submission.get();
+                        task.completion = completion;
+                        task.fence = task.submission;
+                        task.metadata_lease = std::move(metadata_lease);
+                        worker_.submit_copy(std::move(task));
+                    } catch (...) {
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            outcomes_.erase(sequence);
+                        }
+                        completion->clear();
+                        throw;
+                    }
+                });
+    }
+}
+
+template <typename Policy>
 void GpuQueue<Policy>::execute(Task& task) {
     task.fence = task.submission;
     std::exception_ptr retained_failure;
@@ -205,6 +281,36 @@ void GpuQueue<Policy>::execute(Task& task) {
 
     try {
         Policy::activate(context_);
+        const auto execute_copy = [&] {
+            const CopyRequest& request = *task.copy_request;
+            if (request.no_op) {
+                state_->mark_stream_drained(*task.submission);
+                return;
+            }
+            const detail::CopyMetadataLayout layout =
+                    detail::copy_metadata_layout(
+                            SnapshotView{request.source},
+                            SnapshotView{request.destination});
+            detail::InlineCopyMetadata metadata{};
+            detail::write_copy_metadata(
+                    metadata, SnapshotView{request.source},
+                    SnapshotView{request.destination});
+            native_work_submitted = true;
+            detail::launch_grid_stride_copy<Policy>(
+                    stream_,
+                    static_cast<const unsigned char*>(
+                            request.source.native_handle),
+                    static_cast<unsigned char*>(
+                            request.destination.native_handle),
+                    metadata, layout.total_words);
+            Policy::check_kernel(Policy::copy_kernel_operation());
+            Policy::after_grid_stride_launch();
+            Policy::record_event(
+                    state_->event_of(*task.submission), stream_);
+            event_recorded = true;
+            state_->mark_event_recorded(*task.submission);
+        };
+
         if (task.is_binary) {
             const BinaryRequest& request = *task.binary_request;
             const std::size_t metadata_bytes =
@@ -297,34 +403,62 @@ void GpuQueue<Policy>::execute(Task& task) {
                     state_->event_of(*task.submission), stream_);
             event_recorded = true;
             state_->mark_event_recorded(*task.submission);
-        } else {
-            const CopyRequest& request = *task.copy_request;
-            if (request.no_op) {
-                state_->mark_stream_drained(*task.submission);
-                return;
+        } else if constexpr (Policy::embedding_enabled) {
+            if (!task.is_embedding) {
+                execute_copy();
+            } else {
+                const EmbeddingRequest& request = *task.embedding_request;
+                const std::size_t metadata_slot =
+                        task.metadata_lease.slot;
+                const std::size_t metadata_bytes =
+                        detail::embedding_metadata_storage_bytes(
+                                request.indices.spec.shape.rank());
+                task.submission->attach_metadata_slot(metadata_slot);
+                task.metadata_lease.handoff();
+                const auto metadata = detail::write_embedding_metadata(
+                        metadata_pool_->host_data(metadata_slot),
+                        metadata_pool_->device_data(metadata_slot), request);
+                native_work_submitted = true;
+                Policy::copy_from_host(
+                        stream_, metadata_pool_->device_data(metadata_slot),
+                        metadata_pool_->host_data(metadata_slot),
+                        metadata_bytes);
+                auto* status_cell =
+                        metadata_pool_->status_data(task.status_slot);
+                void* status_device =
+                        detail::WorkspaceValidation::address(
+                                request.workspace);
+                if (status_cell == nullptr || status_device == nullptr) {
+                    throw std::runtime_error(
+                            "CUDA embedding status resources are unavailable");
+                }
+                // The status word is device control state, not a caller
+                // initialized value. It is reset in FIFO order immediately
+                // before the gather and copied back only after that work.
+                Policy::memset(
+                        stream_, status_device, sizeof(std::uint32_t));
+                detail::launch_grid_stride_embedding<Policy>(
+                        stream_,
+                        static_cast<const unsigned char*>(
+                                request.table.native_handle),
+                        static_cast<const unsigned char*>(
+                                request.indices.native_handle),
+                        static_cast<unsigned char*>(
+                                request.out.native_handle),
+                        static_cast<std::uint32_t*>(status_device), metadata);
+                Policy::check_kernel(Policy::gather_kernel_operation());
+                Policy::after_embedding_launch();
+                Policy::copy_status_to_host(
+                        stream_, status_cell, status_device,
+                        sizeof(std::uint32_t));
+                task.submission->attach_status_cell(status_cell);
+                Policy::record_event(
+                        state_->event_of(*task.submission), stream_);
+                event_recorded = true;
+                state_->mark_event_recorded(*task.submission);
             }
-            const detail::CopyMetadataLayout layout =
-                    detail::copy_metadata_layout(
-                            SnapshotView{request.source},
-                            SnapshotView{request.destination});
-            detail::InlineCopyMetadata metadata{};
-            detail::write_copy_metadata(
-                    metadata, SnapshotView{request.source},
-                    SnapshotView{request.destination});
-            native_work_submitted = true;
-            detail::launch_grid_stride_copy<Policy>(
-                    stream_,
-                    static_cast<const unsigned char*>(
-                            request.source.native_handle),
-                    static_cast<unsigned char*>(
-                            request.destination.native_handle),
-                    metadata, layout.total_words);
-            Policy::check_kernel(Policy::copy_kernel_operation());
-            Policy::after_grid_stride_launch();
-            Policy::record_event(
-                    state_->event_of(*task.submission), stream_);
-            event_recorded = true;
-            state_->mark_event_recorded(*task.submission);
+        } else {
+            execute_copy();
         }
     } catch (...) {
         retained_failure = std::current_exception();
@@ -373,16 +507,32 @@ void GpuQueue<Policy>::complete_task(
         return;
     }
 
+    const bool completion_proven =
+            outcome.completion == nullptr
+            || outcome.completion->completion_proven();
+    if (outcome.is_embedding && !failure && completion_proven) {
+        const bool native_success =
+                outcome.completion == nullptr
+                || outcome.completion->result().failure == nullptr;
+        if (native_success) {
+            const auto status = outcome.completion != nullptr
+                    ? outcome.completion->status_word() : std::nullopt;
+            if (!status.has_value()) {
+                failure = std::make_exception_ptr(std::runtime_error(
+                        "CUDA embedding status cell is unavailable"));
+            } else if (*status != 0) {
+                failure = std::make_exception_ptr(std::invalid_argument(
+                        "embedding index is out of range"));
+            }
+        }
+    }
     if (outcome.completion != nullptr) {
         const detail::FenceResult result =
                 outcome.completion->finalize(std::move(failure));
         failure = result.failure;
     }
     const bool failed = static_cast<bool>(failure);
-    const bool completion_proven =
-            outcome.completion == nullptr
-            || outcome.completion->completion_proven();
-    if (outcome.is_binary) {
+    if (outcome.is_binary || outcome.is_embedding) {
         (void)detail::release_or_invalidate_binary_entries(
                 registry_state_->registry, outcome.binary_entries,
                 failed, completion_proven);

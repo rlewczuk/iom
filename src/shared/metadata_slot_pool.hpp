@@ -10,6 +10,7 @@
 // only by a covering proof.
 
 #include <array>
+#include <cstdint>
 #include <condition_variable>
 #include <optional>
 #include <memory>
@@ -162,10 +163,18 @@ public:
     }
 
     [[nodiscard]] void* device_data(std::size_t index) {
+
         if (index >= slot_count_) {
             throw std::out_of_range("metadata slot index is out of range");
         }
         return resources_.device_data(index);
+    }
+
+    // Status cells share the queue's fixed C-slot lifetime. An embedding
+    // submission uses the same metadata slot lease, so the cell remains
+    // retained through completion proof or quarantine.
+    [[nodiscard]] std::uint32_t* status_data(std::size_t index) const noexcept {
+        return resources_.status_data(index);
     }
 
 private:

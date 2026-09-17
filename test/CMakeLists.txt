@@ -36,6 +36,7 @@ add_executable(iom_tests
         test_safetensors.cpp
         test_model_loading.cpp
         test_alloc.cpp
+        test_gpu_status.cpp
 )
 
 set_source_files_properties(test_iom.cpp PROPERTIES

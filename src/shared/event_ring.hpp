@@ -9,6 +9,8 @@
 // submission waits for one of the fixed C resources to become free.
 
 #include <stdexcept>
+#include <cstdint>
+#include <optional>
 
 #include <array>
 #include <condition_variable>
@@ -71,6 +73,17 @@ public:
             metadata_slot_ = slot;
         }
 
+        // Attached only after the status transfer has been enqueued. Its
+        // metadata lease retains the cell until completion proof and capture.
+        void attach_status_cell(const std::uint32_t* cell) noexcept {
+            status_cell_ = cell;
+        }
+
+        [[nodiscard]] std::optional<std::uint32_t> status_word() const noexcept {
+            std::lock_guard<std::mutex> lock(ring_->mutex_);
+            return status_word_;
+        }
+
         // Public so std::make_shared can allocate the record in a single
         // allocation: access to a nested class's private constructor is not
         // granted inside <memory>'s make_shared instantiation. Only
@@ -92,6 +105,8 @@ public:
         std::size_t pool_index_ = kNoAttachedSlot;
         FenceResult result_ = FenceResult::pending();
         std::size_t metadata_slot_ = kNoAttachedSlot;
+        const std::uint32_t* status_cell_ = nullptr;
+        std::optional<std::uint32_t> status_word_;
         bool event_recorded_ = false;
         bool stream_drained_ = false;
         bool synchronized_on_complete_ = false;
@@ -231,6 +246,7 @@ public:
                 throw std::runtime_error(
                         "GPU completion event was never recorded");
             }
+            snapshot_status_locked(submission);
             submission.synchronized_on_complete_ = true;
             submission.disposition_ = CompletionDisposition::Complete;
         } catch (...) {
@@ -278,6 +294,11 @@ public:
                 set_retire_unknown_locked(submission);
                 submission.result_ = FenceResult::failed(failure);
             }
+        }
+        // Shutdown may skip on_worker_complete; its covering proof above
+        // must also capture the status before returning the slot to the pool.
+        if (submission.disposition_ == CompletionDisposition::Complete) {
+            snapshot_status_locked(submission);
         }
         if (submission.metadata_slot_ != kNoAttachedSlot) {
             if (submission.disposition_
@@ -359,6 +380,13 @@ public:
 #endif
 
 private:
+    void snapshot_status_locked(Submission& submission) noexcept {
+        if (submission.status_cell_ != nullptr) {
+            submission.status_word_ = *submission.status_cell_;
+            submission.status_cell_ = nullptr;
+        }
+    }
+
     void set_retire_unknown_locked(Submission& submission) noexcept {
         if (submission.disposition_ != CompletionDisposition::RetireUnknown) {
             submission.disposition_ = CompletionDisposition::RetireUnknown;

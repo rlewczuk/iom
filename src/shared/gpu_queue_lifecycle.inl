@@ -127,10 +127,10 @@ GpuQueue<Policy>::~GpuQueue() {
     }
     // Unknown completion: quarantine the entire unresolved lease at the
     // Device boundary. The partition and queue-count reservation stay
-    // retained with the completion resources, host mirrors, and the
-    // queue's own covering-proof handle until this queue's own drain is
-    // proved; a drain of another queue is never sufficient. Capture
-    // order matters: the pool must be destroyed after the ring that
+    // retained with the completion resources, host mirrors, optional status
+    // cells, and the queue's own covering-proof handle until this queue's
+    // own drain is proved; a drain of another queue is never sufficient.
+    // Capture order matters: the pool must be destroyed after the ring that
     // borrows it, so it is declared first (lambda captures are
     // destroyed in reverse declaration order).
     const typename Policy::context_type retained_context = context_;

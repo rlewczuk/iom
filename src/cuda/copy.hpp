@@ -34,14 +34,15 @@ enum class SubmissionFault {
     queue_event_create,
     queue_stream_create,
     third_plane_launch,
+    embedding_status_copy,
     event_record,
     stream_synchronize,
     registration,
     outcome_insertion,
 };
-
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
-[[nodiscard]] bool consume_submission_fault(SubmissionFault fault) noexcept;
+[[nodiscard]] bool consume_submission_fault(
+        SubmissionFault fault) noexcept;
 
 #ifdef IOM_ENABLE_TESTING
 // Counters over the policy's native queue-resource lifecycle. Queue setup
@@ -63,6 +64,7 @@ inline void check_cuda_kernel(const char* operation, cudaError_t status) {
 }
 
 struct gpu_policy {
+    static constexpr bool embedding_enabled = true;
     using context_type = CUcontext;
     using stream_type = cudaStream_t;
     using event_type = cudaEvent_t;
@@ -230,6 +232,17 @@ struct gpu_policy {
                 cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost));
     }
 
+    static void copy_status_to_host(
+            stream_type stream, void* destination, const void* source,
+            std::size_t bytes) {
+        cudaError_t status = cudaMemcpyAsync(
+                destination, source, bytes, cudaMemcpyDeviceToHost, stream);
+        if (consume_submission_fault(SubmissionFault::embedding_status_copy)) {
+            status = cudaErrorInvalidValue;
+        }
+        check_cuda_kernel("cudaMemcpyAsync embedding status DtoH", status);
+    }
+
     static void memset(
             stream_type stream, void* destination, std::size_t bytes) {
         check_cuda_kernel(
@@ -250,8 +263,15 @@ struct gpu_policy {
     }
 
     static void after_grid_stride_launch() {
+
         if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
             check_cuda_kernel(copy_kernel_operation(), cudaErrorInvalidValue);
+        }
+    }
+
+    static void after_embedding_launch() {
+        if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
+            check_cuda_kernel(gather_kernel_operation(), cudaErrorInvalidValue);
         }
     }
 

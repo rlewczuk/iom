@@ -65,11 +65,11 @@ inline void check_hip(const char* operation, hipError_t status) {
 }
 
 struct gpu_policy {
+    static constexpr bool embedding_enabled = false;
     using context_type = int;
     using stream_type = hipStream_t;
     using event_type = hipEvent_t;
     using device_pointer = hipDeviceptr_t;
-
     [[nodiscard]] static constexpr stream_type null_stream() noexcept {
         return nullptr;
     }
@@ -217,6 +217,7 @@ struct gpu_policy {
                 hipMemcpy(destination, source, bytes, hipMemcpyDeviceToHost));
     }
 
+
     static void memset(
             stream_type stream, void* destination, std::size_t bytes) {
         check_hip(
@@ -287,8 +288,10 @@ struct gpu_policy {
             stream_type stream, const detail::RmsnormMetadata& metadata);
 
     [[nodiscard]] static constexpr const char* backend_label() noexcept {
+
         return "ROCm";
     }
+
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
 

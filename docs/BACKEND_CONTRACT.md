@@ -4054,6 +4054,20 @@ gather, and MUST NOT add a submission-side wait; its actual oneAPI behavior
 remains a future remote verification obligation. Native launch, copy, or event
 failure always takes precedence over the status word.
 
+The CUDA implementation is the standard raw-word path in
+`src/shared/standard_tiled_embedding.hpp`,
+`src/shared/standard_tiled_embedding.inl`, and `src/shared/gpu_queue_operations.inl`.
+`src/cuda/copy.cu` enqueues the fixed metadata upload, device status reset,
+one bounded 256-thread grid-stride gather, exactly one four-byte
+`cudaMemcpyAsync` status transfer, and the completion event on the queue
+stream. `src/cuda/device.cpp` reserves one page-locked `cudaHostAlloc` status
+cell per fixed queue metadata slot and releases it through `cudaFreeHost` only
+when that queue-resource lease is proven safe. The worker interprets the cell
+only after event proof and caches a queued `std::invalid_argument`; native
+launch, transfer, and event failures retain precedence. These are inspected
+source/API facts. CUDA build, device, allocation, and control-transfer runtime
+validation remain future verification obligations.
+
 TTNN transfers the entire 32-byte control packet. Its positive workspace is one
 real owning replicated DRAM `MeshBuffer` on the existing unit mesh, whose native
 page size is the checked request rounded up to a multiple of 32 while

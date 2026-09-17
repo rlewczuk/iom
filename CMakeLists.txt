@@ -190,6 +190,8 @@ if(CUDA_ENABLED)
         src/shared/gpu_queue_operations.inl
         src/shared/standard_tiled_copy.hpp
         src/shared/standard_tiled_copy.inl
+        src/shared/standard_tiled_embedding.hpp
+        src/shared/standard_tiled_embedding.inl
         src/shared/standard_tiled_copy_metadata.inl
         include/iom/cuda/device.hpp
     )

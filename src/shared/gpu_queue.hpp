@@ -38,10 +38,13 @@
 #include <string_view>
 #include <utility>
 
+#include "../iom_internal.hpp"
+
 #include "event_ring.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/iom.hpp"
 #include "queue_resources.hpp"
+#include "standard_tiled_embedding.hpp"
 
 namespace iom::detail {
 
@@ -116,6 +119,12 @@ class GpuQueue final : public DeviceOps {
             return result;
         }
 
+        [[nodiscard]] std::optional<std::uint32_t> status_word() const noexcept {
+            std::lock_guard<std::mutex> lock(mutex);
+            return submission != nullptr ? submission->status_word()
+                                         : std::nullopt;
+        }
+
         [[nodiscard]] bool completion_proven() const noexcept {
             std::lock_guard<std::mutex> lock(mutex);
             if (finalized) {
@@ -174,6 +183,9 @@ class GpuQueue final : public DeviceOps {
         std::optional<CopyRequest> copy_request;
         bool is_binary = false;
         std::optional<BinaryRequest> binary_request;
+        bool is_embedding = false;
+        std::optional<EmbeddingRequest> embedding_request;
+        std::size_t status_slot = EventRing::kNoAttachedSlot;
         detail::BinaryEntryRegistration binary_entries{};
         bool is_rmsnorm = false;
         std::optional<RmsnormRequest> rmsnorm_request;
@@ -208,6 +220,7 @@ class GpuQueue final : public DeviceOps {
         std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
         bool is_rmsnorm = false;
+        bool is_embedding = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -231,11 +244,9 @@ public:
             QueueResourceProvider& resource_provider,
             typename Policy::context_type context,
             detail::RegistryState& registry_state);
-
     ~GpuQueue() override;
-    iom::oid copy_impl(
+    oid copy_impl(
             const TensorView& source, TensorView& destination) override;
-
     oid binary_impl(const BinaryRequest& request) override;
 
     // RMSNorm consumes the immutable common request and the common
@@ -248,6 +259,10 @@ public:
     [[nodiscard]] bool rmsnorm_supported(
             DataType data_type) const override;
 
+    WorkspaceRequirements embedding_workspace_requirements_impl(
+            const TensorView& table, const TensorView& indices,
+            const TensorView& out) override;
+    oid embedding_impl(const EmbeddingRequest& request) override;
 private:
     void execute(Task& task);
 

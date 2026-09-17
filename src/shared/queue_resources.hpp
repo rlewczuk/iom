@@ -12,9 +12,10 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
-
+#include <utility>
 namespace iom::detail {
 
 inline constexpr std::size_t kMaxLiveGpuQueues = 4;
@@ -26,13 +27,16 @@ inline constexpr std::size_t kMetadataSlotBytes = 512;
 
 class QueueResourceProvider;
 
-// One queue's fixed resource lease: the queue-count credit plus one disjoint
-// C-slot partition of the Device-wide metadata FixedSizeAllocator, and the
-// queue's exactly C fixed 512-byte host metadata mirrors. No lease field ever
-// changes after reservation; reuse happens only through release and a later
-// reservation of the same geometry.
+// One queue's fixed resource lease: the queue-count credit, one disjoint
+// C-slot partition of the Device-wide metadata FixedSizeAllocator, the
+// queue's exactly C fixed host metadata mirrors, and optional C host status
+// cells for accelerator embedding. No lease field ever changes after
+// reservation; reuse happens only through release and a later reservation of
+// the same geometry.
 class QueueResourceLease final {
 public:
+    using StatusCellsDeleter = void (*)(void*) noexcept;
+
     QueueResourceLease() noexcept = default;
 
     QueueResourceLease(QueueResourceLease&& other) noexcept {
@@ -47,6 +51,9 @@ public:
             slot_count_ = std::exchange(other.slot_count_, 0);
             device_base_ = std::exchange(other.device_base_, nullptr);
             host_mirrors_ = std::move(other.host_mirrors_);
+            status_cells_ = std::exchange(other.status_cells_, nullptr);
+            status_cells_deleter_ = std::exchange(
+                    other.status_cells_deleter_, nullptr);
         }
         return *this;
     }
@@ -86,6 +93,16 @@ public:
                 + slot * kMetadataSlotBytes;
     }
 
+    // Queue-owned status cells used by accelerator embedding operations.
+    // Providers may leave this optional backing null while the operation is
+    // disabled for that backend.
+    [[nodiscard]] std::uint32_t* status_cells() const noexcept {
+        return static_cast<std::uint32_t*>(status_cells_);
+    }
+    [[nodiscard]] std::uint32_t* status_data(std::size_t slot) const noexcept {
+        return status_cells() == nullptr ? nullptr : status_cells() + slot;
+    }
+
 private:
     friend class QueueResourceProvider;
 
@@ -99,7 +116,10 @@ private:
     std::size_t slot_count_ = 0;
     void* device_base_ = nullptr;
     std::unique_ptr<std::byte[]> host_mirrors_;
+    void* status_cells_ = nullptr;
+    StatusCellsDeleter status_cells_deleter_ = nullptr;
 };
+
 
 // Device-boundary owner of the fixed queue-resource geometry. Concrete
 // standard-GPU Devices implement it; queue construction reserves through it
@@ -129,12 +149,12 @@ public:
 
     // Quarantine an entire unresolved queue lease at the Device boundary so
     // queue destruction cannot drop its final lifetime protection: the
-    // partition, the queue-count credit, the host mirrors, the completion
-    // resources, and the queue's own covering-proof handle stay retained
-    // until `reclaim` proves the retained queue safe (a drain of another
-    // queue is never sufficient). `reclaim` returns true when it proved
-    // completion and released everything; `discard` is a best-effort
-    // teardown used when the Device itself is being destroyed.
+    // partition, the queue-count credit, the host mirrors and optional status
+    // cells, the completion resources, and the queue's own covering-proof
+    // handle stay retained until `reclaim` proves the retained queue safe
+    // (a drain of another queue is never sufficient). `reclaim` returns true
+    // when it proved completion and released everything; `discard` is a
+    // best-effort teardown used when the Device itself is being destroyed.
     virtual void retain_unknown_lease(
             std::function<bool()> reclaim, std::function<void()> discard) = 0;
 
@@ -146,18 +166,21 @@ public:
 protected:
     QueueResourceProvider() = default;
 
-    // Providers publish reservations only through this sealed factory, so
-    // lease internals never leak to queue code or callers.
     [[nodiscard]] static QueueResourceLease make_lease(
             QueueResourceProvider& provider, std::size_t first_slot,
             std::size_t slot_count, void* device_base,
-            std::unique_ptr<std::byte[]> host_mirrors) noexcept {
+            std::unique_ptr<std::byte[]> host_mirrors,
+            void* status_cells = nullptr,
+            QueueResourceLease::StatusCellsDeleter status_cells_deleter =
+                    nullptr) noexcept {
         QueueResourceLease lease;
         lease.provider_ = &provider;
         lease.first_slot_ = first_slot;
         lease.slot_count_ = slot_count;
         lease.device_base_ = device_base;
         lease.host_mirrors_ = std::move(host_mirrors);
+        lease.status_cells_ = status_cells;
+        lease.status_cells_deleter_ = status_cells_deleter;
         return lease;
     }
 };
@@ -165,6 +188,11 @@ protected:
 // Defined after QueueResourceProvider is complete: release routes through
 // the owning provider's virtual.
 inline void QueueResourceLease::impl_release() noexcept {
+    if (status_cells_ != nullptr && status_cells_deleter_ != nullptr) {
+        status_cells_deleter_(status_cells_);
+    }
+    status_cells_ = nullptr;
+    status_cells_deleter_ = nullptr;
     if (provider_ != nullptr) {
         QueueResourceProvider* owner = std::exchange(provider_, nullptr);
         owner->release_queue_resources(first_slot_, slot_count_);
