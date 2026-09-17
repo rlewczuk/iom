@@ -481,11 +481,20 @@ namespace iom {
                         (*work)(sequence);
                     });
         }
+        // A fence factory produces the per-submission fence. Constant
+        // fences (a single `Fence` reused for every submission) wrap the
+        // existing constant in a factory that returns a copy of it; a
+        // backend whose fence depends on the assigned sequence (e.g. to
+        // carry the sequence through the registry entry for the parked
+        // seam) builds a fresh fence inside the factory.
+        using FenceFactory =
+                std::function<detail::Fence(std::uint64_t sequence)>;
+
         template <typename QueueWork>
         oid submit_copy(
                 const TensorView& source, const TensorView& destination,
                 detail::RegistryState& state, detail::QueueId queue_id,
-                const detail::Fence& fence, QueueWork queue_work) {
+                FenceFactory build_fence, QueueWork queue_work) {
             struct Prepared {
                 CopyRequest request;
                 detail::EntryRegistration entries;
@@ -503,13 +512,13 @@ namespace iom {
                     source, destination, identical_window(source, destination),
                     std::move(queue_work));
             return submit_prepared(
-                    [prepared, &state, queue_id, fence](
+                    [prepared, &state, queue_id, build_fence](
                             std::uint64_t sequence) {
                         prepared->entries = detail::register_copy_entries(
                                 state, queue_id, sequence,
                                 prepared->request.source.native_handle,
                                 prepared->request.destination.native_handle,
-                                fence);
+                                build_fence(sequence));
                     },
                     [prepared](std::uint64_t sequence) {
                         prepared->work(
@@ -530,6 +539,20 @@ namespace iom {
                     });
         }
 
+        // Constant-fence overload retained so existing callers that build
+        // the fence once per dispatch keep compiling unchanged.
+        template <typename QueueWork>
+        oid submit_copy(
+                const TensorView& source, const TensorView& destination,
+                detail::RegistryState& state, detail::QueueId queue_id,
+                const detail::Fence& fence, QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_copy(
+                    source, destination, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+
         /**
          * Shared prepared-ownership submission for operations with exactly
          * three owner-registered views and an optional leased workspace.
@@ -547,7 +570,7 @@ namespace iom {
                 const Request& request,
                 const std::array<detail::BinaryOwnerRegistration, 3>& owners,
                 detail::RegistryState& state, detail::QueueId queue_id,
-                const detail::Fence& fence, QueueWork queue_work) {
+                FenceFactory build_fence, QueueWork queue_work) {
             struct Prepared {
                 Request request;
                 detail::WorkspaceLease workspace_lease;
@@ -562,8 +585,9 @@ namespace iom {
             auto prepared = std::make_shared<Prepared>(
                     request, std::move(queue_work));
             return submit_prepared(
-                    [prepared, owners, &state, queue_id, fence](
+                    [prepared, owners, &state, queue_id, build_fence](
                             std::uint64_t sequence) {
+                        const detail::Fence fence = build_fence(sequence);
                         try {
                             if (prepared->request.workspace_requirements.bytes
                                     != 0) {
@@ -618,6 +642,21 @@ namespace iom {
                     });
         }
 
+        // Constant-fence overload retained so existing callers that build
+        // the fence once per dispatch keep compiling unchanged.
+        template <typename Request, typename QueueWork>
+        oid submit_three_owner_request(
+                const Request& request,
+                const std::array<detail::BinaryOwnerRegistration, 3>& owners,
+                detail::RegistryState& state, detail::QueueId queue_id,
+                const detail::Fence& fence, QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_three_owner_request(
+                    request, owners, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+
         // Admission path used by a ported RMS normalization hook. The
         // immutable request is captured first, then every distinct owner is
         // registered through the existing in-order prepare/register/dispatch/
@@ -627,7 +666,7 @@ namespace iom {
         template <typename QueueWork>
         oid submit_rmsnorm(
                 const RmsnormRequest& request, detail::RegistryState& state,
-                detail::QueueId queue_id, const detail::Fence& fence,
+                detail::QueueId queue_id, FenceFactory build_fence,
                 QueueWork queue_work) {
             struct Prepared {
                 RmsnormRequest request;
@@ -641,8 +680,9 @@ namespace iom {
             auto prepared = std::make_shared<Prepared>(
                     request, std::move(queue_work));
             return submit_prepared(
-                    [prepared, &state, queue_id, fence](
+                    [prepared, &state, queue_id, build_fence](
                             std::uint64_t sequence) {
+                        const detail::Fence fence = build_fence(sequence);
                         const std::array<detail::BinaryOwnerRegistration, 3>
                                 owners{{
                                         {prepared->request.x.owner_identity,
@@ -681,10 +721,24 @@ namespace iom {
                     });
         }
 
+        // Constant-fence overload retained so existing callers that build
+        // the fence once per dispatch keep compiling unchanged.
+        template <typename QueueWork>
+        oid submit_rmsnorm(
+                const RmsnormRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_rmsnorm(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+
         template <typename QueueWork>
         oid submit_binary(
                 const BinaryRequest& request, detail::RegistryState& state,
-                detail::QueueId queue_id, const detail::Fence& fence,
+                detail::QueueId queue_id, FenceFactory build_fence,
                 QueueWork queue_work) {
             return submit_three_owner_request(
                     request,
@@ -695,13 +749,27 @@ namespace iom {
                              request.rhs.native_handle},
                             {request.out.owner_identity,
                              request.out.native_handle}}},
-                    state, queue_id, fence, std::move(queue_work));
+                    state, queue_id, build_fence, std::move(queue_work));
+        }
+
+        // Constant-fence overload retained so existing callers that build
+        // the fence once per dispatch keep compiling unchanged.
+        template <typename QueueWork>
+        oid submit_binary(
+                const BinaryRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_binary(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
         }
 
         template <typename QueueWork>
         oid submit_embedding(
                 const EmbeddingRequest& request, detail::RegistryState& state,
-                detail::QueueId queue_id, const detail::Fence& fence,
+                detail::QueueId queue_id, FenceFactory build_fence,
                 QueueWork queue_work) {
             return submit_three_owner_request(
                     request,
@@ -712,7 +780,21 @@ namespace iom {
                              request.indices.native_handle},
                             {request.out.owner_identity,
                              request.out.native_handle}}},
-                    state, queue_id, fence, std::move(queue_work));
+                    state, queue_id, build_fence, std::move(queue_work));
+        }
+
+        // Constant-fence overload retained so existing callers that build
+        // the fence once per dispatch keep compiling unchanged.
+        template <typename QueueWork>
+        oid submit_embedding(
+                const EmbeddingRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_embedding(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
         }
 
         void complete(std::uint64_t sequence,

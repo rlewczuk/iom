@@ -289,6 +289,39 @@ if(TTNN_ENABLED)
         BACKEND_LIBRARY iom_ttnn
         RUNTIME_LIBRARIES TT::Metalium TTNN::TTNN
     )
+
+    # Regression for the HIGH R2-001 capacity-parked fence seam (task
+    # 006-tinyllama / shared-fenced-runtime). The single-credit admission
+    # queue forces the second submission to park deterministically; the
+    # parked source is destroyed while the head is still executing, the
+    # parked fence must return pending instead of success, and the
+    # worker must dispatch the parked task against the quarantined
+    # storage without UAF.
+    add_executable(iom_ttnn_parking_fence_tests
+        ttnn/test_ttnn_parking_fence.cpp
+    )
+    set_source_files_properties(ttnn/test_ttnn_parking_fence.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+    target_include_directories(iom_ttnn_parking_fence_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(iom_ttnn_parking_fence_tests
+        PRIVATE
+            doctest::doctest
+            iom_ttnn
+            libiom
+            TT::Metalium
+            TTNN::TTNN
+    )
+    add_test(
+        NAME iom_ttnn_parking_fence_tests
+        COMMAND iom_ttnn_parking_fence_tests
+    )
+    set_tests_properties(
+        iom_ttnn_parking_fence_tests PROPERTIES TIMEOUT 300
+    )
 endif()
 
 # Combined coexistence executable (change 0001-tensor-view / 15): one

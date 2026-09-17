@@ -16,7 +16,28 @@
 #include "embedding.hpp"
 namespace iom::ttnn_detail {
 
-[[nodiscard]] detail::Fence build_ttnn_fence(TtnnDevice& device) noexcept;
+// Builds the per-submission TTNN fence used by every queued submission
+// (copy, binary, embedding, rmsnorm). The capture carries the device
+// pointer, the queue's domain-specific execution marker pointer, and the
+// assigned submission sequence so `ttnn_fence_invoke` can gate the mesh
+// finish on the parked-seam marker (a submission whose native work has
+// not yet been fully enqueued must report `FenceResult::pending()` so
+// `release_or_quarantine` retains the storage until the mesh actually
+// runs).
+//
+// `executed_seq` must point at the marker for the submission's
+// execution domain: `caller_executed_seq_` for copy/embedding, whose
+// `execute()` runs synchronously on the submitter thread via
+// `worker_.submit_copy`; `worker_executed_seq_` for binary/rmsnorm, whose
+// `execute()` runs asynchronously on the staged worker's thread via
+// `worker_.submit_after_publish`. Keeping the markers distinct stops one
+// thread from over-advancing the marker for the other thread's
+// submissions and letting `ttnn_fence_invoke` return success for a
+// parked binary/rmsnorm whose native work has not yet been enqueued.
+[[nodiscard]] detail::Fence build_ttnn_fence(
+        TtnnDevice& device,
+        std::atomic<std::uint64_t>& executed_seq,
+        std::uint64_t sequence) noexcept;
 void finish_locked_mesh(
         tt::tt_metal::distributed::MeshDevice& device);
 void finish_locked(TtnnDevice& device);
@@ -162,13 +183,60 @@ private:
     detail::StagedWorker<Task> worker_;
     std::mutex fence_mutex_;
     std::atomic<std::uint64_t> last_finished_seq_{0};
-    // Highest sequence whose task finished executing with its outcome still
-    // registered (every native plane enqueued, or a determined no-op).
-    // Registration precedes native submission, so an outcome alone is not
-    // proof its work reached the mesh; complete_task's batch collection
-    // reads this marker, under outcome_mutex_, to stop the batch before
-    // any not-yet-executed sequence.
-    std::atomic<std::uint64_t> executed_seq_{0};
+    // Two per-domain execution markers (`caller_executed_seq_` and
+    // `worker_executed_seq_`). Each carries the highest sequence whose
+    // task finished executing on that domain's thread:
+    //   * caller_executed_seq_  - copy and embedding submissions, whose
+    //                              `execute()` runs synchronously on the
+    //                              submitter thread inside
+    //                              `worker_.submit_copy`. The mesh drain
+    //                              has already completed by the time the
+    //                              marker is advanced, so the corresponding
+    //                              outcome can be released on the same
+    //                              thread.
+    //   * worker_executed_seq_  - binary and rmsnorm submissions, whose
+    //                              `execute()` runs asynchronously on the
+    //                              staged worker's thread inside
+    //                              `worker_.submit_after_publish`. The
+    //                              marker only advances after the worker
+    //                              thread returns from the SDK launch.
+    // The markers are domain-local because the two threads can run
+    // interleaved: a higher caller-domain sequence can finish executing
+    // before a lower worker-domain sequence that was parked before it.
+    // A single shared marker would let `ttnn_fence_invoke` return
+    // success for the lower worker-domain sequence whose native work
+    // has not actually reached the mesh; per-domain markers stop the
+    // cross-domain overtake by isolating each fence's check to its
+    // own domain's progress.
+    //
+    // Each marker is advanced via `monotonic_max_store`, a CAS-loop
+    // replacement for `std::atomic::fetch_max` (C++26) that keeps the
+    // marker strictly non-decreasing. Today each domain runs on a
+    // single thread so plain stores would also be monotonic, but the
+    // repair requirement enforces the invariant defensively in case the
+    // queue is later parallelized.
+    std::atomic<std::uint64_t> caller_executed_seq_{0};
+    std::atomic<std::uint64_t> worker_executed_seq_{0};
+
+    // CAS-loop monotonic-max store. Replaces `std::atomic::fetch_max`
+    // (C++26) and keeps the marker strictly non-decreasing. Used for
+    // both per-domain execution markers so reordering on each domain
+    // can never regress the value.
+    static void monotonic_max_store(
+            std::atomic<std::uint64_t>& marker, std::uint64_t value,
+            std::memory_order order) noexcept {
+        std::uint64_t current =
+                marker.load(std::memory_order_relaxed);
+        while (current < value &&
+               !marker.compare_exchange_weak(
+                       current, value,
+                       order, std::memory_order_relaxed)) {
+            // CAS failed: `current` is refreshed by
+            // compare_exchange_weak; try again until either `value`
+            // is no longer greater than the marker or this thread
+            // wins the race.
+        }
+    }
 };
 
 }  // namespace iom

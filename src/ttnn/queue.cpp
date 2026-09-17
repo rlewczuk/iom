@@ -18,6 +18,22 @@ namespace {
 
 struct TtnnFenceCapture {
     TtnnDevice* device = nullptr;
+    // Pointer to the per-domain execution marker
+    // (`caller_executed_seq_` or `worker_executed_seq_`) the submission
+    // belongs to. The fence invoke compares the captured `sequence`
+    // against this marker to detect the parked-seam case described by
+    // the HIGH R2-001 finding; the per-domain split is what prevents a
+    // higher-sequence caller-domain task (copy/embedding, executed
+    // synchronously on the submitter thread) from advancing the marker
+    // for a lower-sequence worker-domain task (binary/rmsnorm, executed
+    // asynchronously on the staged worker) whose native work has not
+    // yet been enqueued.
+    std::atomic<std::uint64_t>* executed_seq = nullptr;
+    // Assigned submission sequence. When `executed_seq` has not advanced
+    // to this value the submission's native work has not yet been fully
+    // enqueued and a blind mesh finish() would report success for a
+    // submission that never reached the mesh.
+    std::uint64_t sequence = 0;
 };
 
 static_assert(sizeof(TtnnFenceCapture) <= detail::kFenceStorageBytes);
@@ -32,6 +48,21 @@ detail::FenceResult ttnn_fence_invoke(
     const auto& capture =
             *std::launder(reinterpret_cast<const TtnnFenceCapture*>(
                     fence.storage));
+    // Gate the mesh finish on the queue's executed marker. A submission
+    // whose native work has not been fully enqueued (capacity-parked
+    // beyond `admission_capacity_`, or in flight on the worker but
+    // pre-execution) is parked here: returning `pending()` lets
+    // `release_or_quarantine` keep its ttnn::Tensor planes alive so the
+    // later credit-driven dispatch sees live storage instead of freed
+    // DRAM. A blocking drain inside this helper is forbidden by contract
+    // (it is called from completion paths and quarantine drains); the
+    // caller re-fences after credits free and the worker executes.
+    const std::uint64_t executed = capture.executed_seq != nullptr
+            ? capture.executed_seq->load(std::memory_order_acquire)
+            : 0;
+    if (capture.sequence > executed) {
+        return detail::FenceResult::pending();
+    }
     try {
         std::lock_guard<std::mutex> lock(capture.device->api_mutex());
         capture.device->mesh().mesh_command_queue(0).finish();
@@ -41,9 +72,13 @@ detail::FenceResult ttnn_fence_invoke(
     }
 }
 
-detail::Fence build_ttnn_fence(TtnnDevice& device) noexcept {
+detail::Fence build_ttnn_fence(
+        TtnnDevice& device,
+        std::atomic<std::uint64_t>& executed_seq,
+        std::uint64_t sequence) noexcept {
     detail::Fence fence;
-    ::new (fence.storage) TtnnFenceCapture{&device};
+    ::new (fence.storage) TtnnFenceCapture{
+            &device, &executed_seq, sequence};
     fence.invoke = &ttnn_fence_invoke;
     return fence;
 }
@@ -123,9 +158,15 @@ oid TtnnQueue::copy_impl(
 #ifdef IOM_ENABLE_TESTING
     ttnn_detail::consume_copy_registration_fault();
 #endif
-    detail::Fence fence = ttnn_detail::build_ttnn_fence(*device_);
     return submit_copy(
-            source, destination, *state_, registry_queue_id_, fence,
+            source, destination, *state_, registry_queue_id_,
+            [this](std::uint64_t sequence) {
+                // Copy's `execute()` runs synchronously on the submitter
+                // thread inside `worker_.submit_copy`, so its fence is
+                // gated on the caller-domain marker.
+                return ttnn_detail::build_ttnn_fence(
+                        *device_, caller_executed_seq_, sequence);
+            },
             [this](std::uint64_t sequence,
                    const CopyRequest& captured,
                    detail::EntryRegistration entries) {
@@ -145,9 +186,15 @@ oid TtnnQueue::copy_impl(
 
 oid TtnnQueue::binary_impl(const BinaryRequest& request) {
     std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
-    detail::Fence fence = ttnn_detail::build_ttnn_fence(*device_);
     return submit_binary(
-            request, *state_, registry_queue_id_, fence,
+            request, *state_, registry_queue_id_,
+            [this](std::uint64_t sequence) {
+                // Binary's `execute()` runs asynchronously on the staged
+                // worker thread via `submit_after_publish`, so its fence
+                // is gated on the worker-domain marker.
+                return ttnn_detail::build_ttnn_fence(
+                        *device_, worker_executed_seq_, sequence);
+            },
             [this](std::uint64_t sequence, const BinaryRequest& captured,
                    detail::BinaryEntryRegistration entries) {
                 try {
@@ -202,9 +249,15 @@ oid TtnnQueue::binary_impl(const BinaryRequest& request) {
 }
 oid TtnnQueue::rmsnorm_impl(const RmsnormRequest& request) {
     std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
-    const detail::Fence fence = ttnn_detail::build_ttnn_fence(*device_);
     return submit_rmsnorm(
-            request, *state_, registry_queue_id_, fence,
+            request, *state_, registry_queue_id_,
+            [this](std::uint64_t sequence) {
+                // Rmsnorm's `execute()` runs asynchronously on the staged
+                // worker thread via `submit_after_publish`, so its fence
+                // is gated on the worker-domain marker.
+                return ttnn_detail::build_ttnn_fence(
+                        *device_, worker_executed_seq_, sequence);
+            },
             [this](std::uint64_t sequence, const RmsnormRequest& captured,
                    detail::BinaryEntryRegistration entries) {
                 Task task(sequence, captured, entries);
@@ -285,7 +338,14 @@ void TtnnQueue::execute_rmsnorm(Task& task) {
             it->second.native_work_submitted = submitted;
         }
     }
-    executed_seq_.store(task.sequence, std::memory_order_release);
+    // Rmsnorm executes asynchronously on the staged worker thread via
+    // `worker_.submit_after_publish`, so the marker advance is on the
+    // worker-domain atomic. `monotonic_max_store` keeps the marker
+    // monotonic even if a future change introduces a second writer on
+    // this thread.
+    monotonic_max_store(
+            worker_executed_seq_, task.sequence,
+            std::memory_order_release);
 }
 
 void TtnnQueue::execute(Task& task) {
@@ -349,7 +409,11 @@ void TtnnQueue::execute(Task& task) {
             if (completion_proven) {
                 publish_native_completion(task.sequence);
             }
-            executed_seq_.store(task.sequence, std::memory_order_release);
+            // Binary executes asynchronously on the worker thread, so
+            // the marker advance is on the worker-domain atomic.
+            monotonic_max_store(
+                    worker_executed_seq_, task.sequence,
+                    std::memory_order_release);
             return;
         } catch (...) {
             const std::exception_ptr submission_failure =
@@ -371,7 +435,11 @@ void TtnnQueue::execute(Task& task) {
             if (completion_proven) {
                 publish_native_completion(task.sequence);
             }
-            executed_seq_.store(task.sequence, std::memory_order_release);
+            // Binary catch path: same worker-domain marker as the
+            // success path above.
+            monotonic_max_store(
+                    worker_executed_seq_, task.sequence,
+                    std::memory_order_release);
             return;
         }
     }
@@ -486,8 +554,14 @@ void TtnnQueue::complete_task(
             batch.emplace_back(sequence, std::move(first->second));
             outcomes_.erase(first);
             has_outcome = true;
+            // Copy's execute runs synchronously on the caller thread, so
+            // its marker is caller_executed_seq_. The batch collection
+            // gathers contiguous outcomes up to that marker; mixing
+            // domains here is fine because only copy outcomes live in
+            // `outcomes_` (binary/rmsnorm/embedding keep their own
+            // outcome maps and complete on their own branches).
             const std::uint64_t executed =
-                    executed_seq_.load(std::memory_order_acquire);
+                    caller_executed_seq_.load(std::memory_order_acquire);
             std::uint64_t next = sequence + 1;
             for (auto it = outcomes_.upper_bound(sequence);
                  it != outcomes_.end() && it->first == next

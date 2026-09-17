@@ -90,9 +90,16 @@ WorkspaceRequirements TtnnQueue::embedding_workspace_requirements_impl(
 
 oid TtnnQueue::embedding_impl(const EmbeddingRequest& request) {
     std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
-    const detail::Fence fence = ttnn_detail::build_ttnn_fence(*device_);
     return submit_embedding(
-            request, *state_, registry_queue_id_, fence,
+            request, *state_, registry_queue_id_,
+            [this](std::uint64_t sequence) {
+                return ttnn_detail::build_ttnn_fence(
+                        // Embedding's `execute()` runs synchronously on
+                        // the submitter thread inside `worker_.submit_copy`,
+                        // so its fence is gated on the caller-domain
+                        // marker; this matches copy_impl's domain choice.
+                        *device_, caller_executed_seq_, sequence);
+            },
             [this](std::uint64_t sequence, const EmbeddingRequest& captured,
                    detail::BinaryEntryRegistration entries) {
                 std::size_t status_slot = 0;
@@ -144,10 +151,17 @@ oid TtnnQueue::embedding_impl(const EmbeddingRequest& request) {
                     // already-dispatched native work for any embedding whose
                     // admission credit was free at submit time. Embedding
                     // submissions parked behind max_in_flight_per_queue are
-                    // registered before they reach the worker, so their
-                    // operands can still be fence-proof released before
-                    // dispatch; that residual race is tracked as a separate
-                    // shared-layer task and is NOT fixed here.
+                    // registered before they reach the worker, but the
+                    // caller-domain executed-marker gate (see
+                    // src/ttnn/queue_internal.hpp's per-domain marker
+                    // rationale and src/ttnn/queue.cpp's ttnn_fence_invoke)
+                    // causes the parked submission's fence to return
+                    // FenceResult::pending() rather than success(); the
+                    // subsequent release_or_quarantine call therefore
+                    // takes the quarantine branch and retains the
+                    // ttnn::Tensor planes in TtnnNativeCleanupAction until
+                    // the later credit-driven dispatch consumes them. No
+                    // residual UAF survives the gate.
                     worker_.submit_copy(std::move(task));
                     status_acquired = false;
                 } catch (...) {
@@ -185,7 +199,7 @@ void TtnnQueue::execute_embedding(Task& task) {
             auto& outcome = embedding_outcomes_.at(task.sequence);
             outcome.native_work_submitted = submitted;
         }
-        executed_seq_.store(task.sequence, std::memory_order_release);
+        monotonic_max_store(caller_executed_seq_, task.sequence, std::memory_order_release);
         return;
     } catch (...) {
         const std::exception_ptr submission_failure =
@@ -198,7 +212,7 @@ void TtnnQueue::execute_embedding(Task& task) {
                 it->second.native_work_submitted = submitted;
             }
         }
-        executed_seq_.store(task.sequence, std::memory_order_release);
+        monotonic_max_store(caller_executed_seq_, task.sequence, std::memory_order_release);
     }
 }
 

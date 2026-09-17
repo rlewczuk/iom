@@ -45,7 +45,7 @@ void TtnnQueue::execute_copy(Task& task) {
         // An identical-window copy submits no native work. Its
         // registered entries are released by complete_task without a
         // device-wide finish.
-        executed_seq_.store(task.sequence, std::memory_order_release);
+        monotonic_max_store(caller_executed_seq_, task.sequence, std::memory_order_release);
         return;
     }
 
@@ -73,7 +73,7 @@ void TtnnQueue::execute_copy(Task& task) {
         }
         // Every plane is submitted and owned; complete_task performs one
         // mesh finish per ready batch of contiguous executed tasks.
-        executed_seq_.store(task.sequence, std::memory_order_release);
+        monotonic_max_store(caller_executed_seq_, task.sequence, std::memory_order_release);
         return;
     }
 
@@ -117,7 +117,7 @@ void TtnnQueue::execute_copy(Task& task) {
             it->second.retained_failure =
                     std::move(submission_failure);
         }
-        executed_seq_.store(task.sequence, std::memory_order_release);
+        monotonic_max_store(caller_executed_seq_, task.sequence, std::memory_order_release);
         return;
     }
     state_->registry.remove_entry_if_present(
