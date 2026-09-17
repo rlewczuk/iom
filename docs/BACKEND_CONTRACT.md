@@ -2758,10 +2758,12 @@ workspace failures, device rejection, accepted failures, and repeated waits.
 
 This is the operation-owned contract for `DeviceOps::rmsnorm`. The common
 facade, its admission rules, and its pure requirement query are declared and
-frozen here. CUDA and ROCm provide their own source-inspected launch wrappers
-over the shared core, and TTNN provides a preallocated BF16/F32 queue path;
-the remaining backends report the operation `Unsupported` exactly as section 9
-states above, and an unsupported port never counts as numerical conformance.
+frozen here. The CPU port has landed and queues all nine applicable floating
+leaves at the exact `{0, 1}` zero-workspace requirement; CUDA and ROCm provide
+their own source-inspected launch wrappers over the shared core, and TTNN
+provides a preallocated BF16/F32 queue path. The remaining backends report
+the operation `Unsupported` exactly as section 9 states above, and an
+unsupported port never counts as numerical conformance. The exact ABI is:
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,

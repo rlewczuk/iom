@@ -39,6 +39,38 @@ inline void store_bits(
     }
 }
 
+// Bit offset of one logical (plane, row, column) element inside the standard
+// 16x16 tiled owner storage: the checked owner-plane slot of the shared
+// layout helper scaled by the leaf width. Plane, row, and column are logical
+// indices, so no tile-padding element is ever addressed and a row's logical
+// features stay contiguous in the caller's view.
+inline std::size_t logical_element_bits(
+        const TensorSpec& spec, std::size_t plane, std::size_t row,
+        std::size_t column) {
+    return detail::standard_plane_slot(spec, plane, row, column)
+           * detail::leaf_bits(spec.data_type);
+}
+
+// Load/store one logical element through its packed bit offset. The offset
+// arithmetic is checked exactly as `standard_plane_slot` documents, so an
+// unvalidated plane, row, or column reports the established overflow instead
+// of computing an address.
+inline std::uint64_t load_logical_element(
+        const unsigned char* base, const TensorSpec& spec,
+        std::size_t plane, std::size_t row, std::size_t column) {
+    const std::size_t bits = detail::leaf_bits(spec.data_type);
+    return load_bits(
+            base, logical_element_bits(spec, plane, row, column), bits);
+}
+
+inline void store_logical_element(
+        unsigned char* base, const TensorSpec& spec, std::size_t plane,
+        std::size_t row, std::size_t column, std::uint64_t value) {
+    const std::size_t bits = detail::leaf_bits(spec.data_type);
+    store_bits(
+            base, logical_element_bits(spec, plane, row, column), bits, value);
+}
+
 inline void copy_value(
         unsigned char* destination, std::size_t destination_bit,
         const unsigned char* source, std::size_t source_bit,

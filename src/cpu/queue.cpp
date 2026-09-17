@@ -2,6 +2,7 @@
 #include "transfer_helpers.hpp"
 
 #include <array>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -141,6 +142,11 @@ private:
 
     using ScalarBinary = std::uint64_t (*) (
             DataType, std::uint64_t, std::uint64_t) noexcept;
+
+    // Named-format decode/encode of the nine applicable floating leaves,
+    // shared with the existing scalar codec; RMS normalization adds no
+    // second codec and no host numeric format of its own.
+    using RmsnormFormat = detail::scalar_add_detail::Format;
 
     static std::size_t source_plane(
             const DeviceOps::BinaryViewSnapshot& source,
@@ -435,6 +441,175 @@ private:
     WorkspaceRequirements embedding_workspace_requirements_impl(
             const TensorView&, const TensorView&, const TensorView&) override {
         return {0, 1};
+    }
+
+    // The nine applicable ordinary signed floating leaves. Recognized
+    // inapplicable leaves are rejected by common admission before this
+    // predicate is consulted, and an unknown enumeration value never reaches
+    // it either.
+    [[nodiscard]] bool rmsnorm_supported(DataType data_type) const override {
+        switch (data_type) {
+            case DataType::F4_E2M1:
+            case DataType::F6_E2M3:
+            case DataType::F6_E3M2:
+            case DataType::F8_E4M3FN:
+            case DataType::F8_E5M2:
+            case DataType::F16:
+            case DataType::BF16:
+            case DataType::F32:
+            case DataType::F64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    template <typename Carrier>
+    [[nodiscard]] static Carrier decode_element(
+            const unsigned char* base, const TensorSpec& spec,
+            const RmsnormFormat& format, std::size_t plane, std::size_t row,
+            std::size_t column) {
+        return static_cast<Carrier>(detail::scalar_add_detail::decode_small(
+                cpu_detail::load_logical_element(
+                        base, spec, plane, row, column),
+                format));
+    }
+
+    template <typename Carrier>
+    static void encode_element(
+            unsigned char* base, const TensorSpec& spec,
+            const RmsnormFormat& format, std::size_t plane, std::size_t row,
+            std::size_t column, Carrier value) {
+        // The result of a row is encoded exactly once, and a NaN result is
+        // stored in its canonical positive form by clearing the sign bit:
+        // NaN payloads and NaN signs are outside the contract, and the
+        // positive canonical form is the only one that also satisfies the
+        // published comparison for the narrow finite-only leaves, where a NaN
+        // saturates to a finite encoding instead of a NaN one.
+        if (std::isnan(value)) {
+            value = std::fabs(value);
+        }
+        cpu_detail::store_logical_element(
+                base, spec, plane, row, column,
+                detail::scalar_add_detail::encode_small(
+                        static_cast<long double>(value), format));
+    }
+
+    // One independent leading plane. Every row reduces exactly its own
+    // logical features in the accumulator domain of its leaf, and each
+    // dependent value is rounded there before the single destination encode.
+    template <typename Carrier>
+    static void rmsnorm_plane(
+            const RmsnormRequest& request, const RmsnormFormat& format,
+            std::size_t x_plane, std::size_t out_plane, std::size_t rows,
+            std::size_t features) {
+        const TensorSpec& x_spec = request.x.spec;
+        const TensorSpec& scale_spec = request.scale.spec;
+        const TensorSpec& out_spec = request.out.spec;
+        const auto* x_base =
+                static_cast<const unsigned char*>(request.x.native_handle);
+        const auto* scale_base =
+                static_cast<const unsigned char*>(request.scale.native_handle);
+        auto* out_base =
+                static_cast<unsigned char*>(request.out.native_handle);
+        const std::size_t scale_plane = request.scale.plane_offset;
+        const Carrier divisor = static_cast<Carrier>(features);
+        const Carrier epsilon = static_cast<Carrier>(request.epsilon);
+        for (std::size_t row = 0; row < rows; ++row) {
+            Carrier sum = static_cast<Carrier>(0);
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                const Carrier value = decode_element<Carrier>(
+                        x_base, x_spec, format, x_plane, row, feature);
+                sum = sum + value * value;
+            }
+            const Carrier mean = sum / divisor;
+            const Carrier shifted = mean + epsilon;
+            const Carrier root = std::sqrt(shifted);
+            const Carrier inverse = static_cast<Carrier>(1) / root;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                const Carrier value = decode_element<Carrier>(
+                        x_base, x_spec, format, x_plane, row, feature);
+                const Carrier scale = decode_element<Carrier>(
+                        scale_base, scale_spec, format, scale_plane, 0,
+                        feature);
+                const Carrier normalized = value * inverse;
+                encode_element<Carrier>(
+                        out_base, out_spec, format, out_plane, row, feature,
+                        normalized * scale);
+            }
+        }
+    }
+
+    // Walk every independent leading plane of `x` and `out` through their own
+    // view offset and leading strides, then reduce that plane's rows. Only
+    // the final two logical axes are addressed: rows are reduced over their
+    // own features, and no padding, other row, or other plane contributes.
+    template <typename Carrier>
+    static void rmsnorm_elements(const RmsnormRequest& request) {
+        const TensorSpec& spec = request.x.spec;
+        const std::span<const std::size_t> dimensions = spec.shape.dimensions();
+        const std::size_t rank = dimensions.size();
+        const std::size_t rows = dimensions[rank - 2];
+        const std::size_t features = dimensions[rank - 1];
+        const RmsnormFormat format =
+                detail::scalar_add_detail::format(spec.data_type);
+        const std::span<const std::size_t> x_strides = request.x.plane_strides;
+        const std::span<const std::size_t> out_strides =
+                request.out.plane_strides;
+        auto visit = [&](auto&& self, std::size_t axis, std::size_t x_plane,
+                         std::size_t out_plane) -> void {
+            if (axis + 2 == rank) {
+                rmsnorm_plane<Carrier>(
+                        request, format, x_plane, out_plane, rows, features);
+                return;
+            }
+            for (std::size_t index = 0; index < dimensions[axis]; ++index) {
+                self(self, axis + 1, x_plane + index * x_strides[axis],
+                     out_plane + index * out_strides[axis]);
+            }
+        };
+        visit(visit, 0, request.x.plane_offset, request.out.plane_offset);
+    }
+
+    // The value-captured immutable request is registered and retained by the
+    // shared admission path; the kernel itself runs only on the existing
+    // FIFO worker, with no workspace lease because RMS normalization
+    // consumes no raw workspace.
+    oid rmsnorm_impl(const RmsnormRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_rmsnorm(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this](std::uint64_t sequence, const RmsnormRequest& captured,
+                       detail::BinaryEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        if (captured.x.spec.data_type
+                                                == DataType::F64) {
+                                            rmsnorm_elements<double>(captured);
+                                        } else {
+                                            rmsnorm_elements<float>(captured);
+                                        }
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)detail::release_or_invalidate_binary_entries(
+                                            device_->registry_state().registry,
+                                            entries, static_cast<bool>(failure),
+                                            true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        throw;
+                    }
+                });
     }
 
     static void copy_elements(

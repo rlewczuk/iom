@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -405,6 +406,116 @@ private:
 };
 
 constexpr std::byte kSentinel{0x5A};
+
+// ---------------------------------------------------------------------------
+// CPU RMSNorm expectations. 1.0, 0.5, and -1.0 are exactly representable in
+// all nine applicable leaves, so every expected output below is a fixed raw
+// leaf encoding derived from the named format fields (sign, exponent, and
+// mantissa of `value = 2^(exponent - bias) * (1 + mantissa / 2^f)`) rather
+// than a tolerance-compared approximation.
+// ---------------------------------------------------------------------------
+
+struct RmsnormEncodings {
+    iom::DataType data_type;
+    std::uint64_t one;
+    std::uint64_t half;
+    std::uint64_t minus_one;
+};
+
+constexpr std::array<RmsnormEncodings, 9> kRmsnormEncodings{{
+        {iom::DataType::F4_E2M1, 0x2, 0x1, 0xA},
+        {iom::DataType::F6_E2M3, 0x08, 0x04, 0x28},
+        {iom::DataType::F6_E3M2, 0x0C, 0x08, 0x2C},
+        {iom::DataType::F8_E4M3FN, 0x38, 0x30, 0xB8},
+        {iom::DataType::F8_E5M2, 0x3C, 0x38, 0xBC},
+        {iom::DataType::F16, 0x3C00u, 0x3800u, 0xBC00u},
+        {iom::DataType::BF16, 0x3F80u, 0x3F00u, 0xBF80u},
+        {iom::DataType::F32, 0x3F800000u, 0x3F000000u, 0xBF800000u},
+        {iom::DataType::F64, 0x3FF0000000000000ull, 0x3FE0000000000000ull,
+         0xBFF0000000000000ull},
+}};
+
+const RmsnormEncodings& rmsnorm_encodings(iom::DataType type) {
+    for (const RmsnormEncodings& encodings : kRmsnormEncodings) {
+        if (encodings.data_type == type) {
+            return encodings;
+        }
+    }
+    REQUIRE_MESSAGE(false, "rmsnorm_encodings: unclassified leaf");
+    return kRmsnormEncodings[0];
+}
+
+std::vector<std::uint64_t> uniform_codes(
+        std::size_t elements, std::uint64_t code) {
+    return std::vector<std::uint64_t>(elements, code);
+}
+
+// Packed logical host payload holding one explicit raw leaf encoding per
+// element in row-major order, in the section-3 host convention the production
+// transfer path reads.
+std::vector<std::byte> packed_logical(
+        iom::DataType type, std::span<const std::uint64_t> values) {
+    const std::size_t bits = test_bits(type);
+    std::vector<std::byte> buffer(
+            (values.size() * bits + 7) / 8, std::byte{0});
+    auto* base = reinterpret_cast<unsigned char*>(buffer.data());
+    for (std::size_t linear = 0; linear < values.size(); ++linear) {
+        write_test_bits(base, linear * bits, bits, values[linear]);
+    }
+    return buffer;
+}
+
+// Braced call sites name one raw leaf encoding per logical element directly.
+std::vector<std::byte> packed_logical(
+        iom::DataType type, std::initializer_list<std::uint64_t> values) {
+    return packed_logical(
+            type, std::span<const std::uint64_t>(values.begin(), values.size()));
+}
+
+std::vector<std::byte> uniform_logical(
+        iom::DataType type, std::size_t elements, std::uint64_t code) {
+    return packed_logical(type, uniform_codes(elements, code));
+}
+
+std::uint64_t logical_code(
+        std::span<const std::byte> buffer, iom::DataType type,
+        std::size_t linear) {
+    const std::size_t bits = test_bits(type);
+    return read_test_bits(
+            reinterpret_cast<const unsigned char*>(buffer.data()),
+            linear * bits, bits);
+}
+
+// Expected full owner storage of an RMSNorm result: the caller's sentinel
+// everywhere except the logical elements of `view`, which receive one raw
+// encoding per element through the independent canonical tile-slot encoder.
+// Padding therefore must stay exactly as the caller left it.
+std::vector<std::byte> expected_rmsnorm_storage(
+        const iom::TensorView& view, const iom::TensorSpec& owner_spec,
+        std::span<const std::uint64_t> codes) {
+    std::vector<std::byte> storage(
+            owner_spec.tiled_storage_nbytes(), kSentinel);
+    iom_conformance::apply_standard_tiled_view(
+            view, owner_spec, packed_logical(owner_spec.data_type, codes),
+            storage);
+    return storage;
+}
+
+std::vector<std::byte> expected_rmsnorm_storage(
+        const iom::TensorView& view, const iom::TensorSpec& owner_spec,
+        std::initializer_list<std::uint64_t> codes) {
+    return expected_rmsnorm_storage(
+            view, owner_spec,
+            std::span<const std::uint64_t>(codes.begin(), codes.size()));
+}
+
+std::vector<std::byte> expected_uniform_rmsnorm_storage(
+        const iom::TensorView& view, const iom::TensorSpec& owner_spec,
+        std::uint64_t code) {
+    return expected_rmsnorm_storage(
+            view, owner_spec,
+            uniform_codes(view.spec().shape.element_count(), code));
+}
 
 }  // namespace
 
@@ -1226,8 +1337,6 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
     fill_storage(*attn, kSentinel);
     fill_storage(*rmsnorm_out, kSentinel);
     const std::vector<std::byte> attn_untouched = snapshot_storage(*attn);
-    const std::vector<std::byte> rmsnorm_out_untouched =
-            snapshot_storage(*rmsnorm_out);
 
     const iom::oid add_token = queue->add(x->view(), x->view(), y->view());
     const iom::oid mul_token = queue->mul(x->view(), x->view(), y->view());
@@ -1248,41 +1357,600 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
     CHECK_EQ(
             queue->linear(x->view(), w->view(), y->view()),
             iom::to_oid(iom::OidError::Unsupported));
-    // RMSNorm is declared and admitted by common code, but no CPU port has
-    // landed: the valid-shape request is unsupported, leaves its output
-    // untouched, and the pure requirement query reports the same capability
-    // through the established throwing error.
+    // RMSNorm is declared and admitted by common code, and the CPU port
+    // implements it: the valid-shape request is accepted, executed on the
+    // queue, and observed through the established wait path, while the pure
+    // requirement query reports the exact zero-scratch requirement. A row of
+    // ones with unit scale and `eps == 3` is exactly `1 / sqrt(1 + 3) = 0.5`
+    // in F32, so the accepted request also pins the consumer-visible result.
+    const RmsnormEncodings& f32 = rmsnorm_encodings(iom::DataType::F32);
+    x->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 16 * 16, f32.one));
+    scale->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 16, f32.one));
+    const iom::oid rmsnorm_token =
+            queue->rmsnorm(x->view(), scale->view(), rmsnorm_out->view(), 3.0f);
+    REQUIRE(iom::oid_is_token(rmsnorm_token));
+    CHECK_NOTHROW(queue->wait(rmsnorm_token));
     CHECK_EQ(
-            queue->rmsnorm(x->view(), scale->view(), rmsnorm_out->view(), 1e-6f),
-            iom::to_oid(iom::OidError::Unsupported));
-    CHECK_THROWS_AS(
-            (void)queue->rmsnorm_workspace_requirements(
-                    x->view(), scale->view(), rmsnorm_out->view(), 1e-6f),
-            std::runtime_error);
+            queue->rmsnorm_workspace_requirements(
+                    x->view(), scale->view(), rmsnorm_out->view(), 3.0f),
+            (iom::WorkspaceRequirements{0, 1}));
+    expect_storage_matches(
+            *rmsnorm_out,
+            expected_uniform_rmsnorm_storage(
+                    rmsnorm_out->view(), spec, f32.half));
     CHECK_EQ(
             queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
                         attn->view()),
             iom::to_oid(iom::OidError::Unsupported));
 
-    // A recognized inapplicable leaf with a valid shape is unsupported by
-    // common admission on every backend, independent of any port.
+    // A recognized inapplicable leaf with a valid shape stays unsupported by
+    // common admission on every backend, independent of any port, and leaves
+    // its output untouched.
     auto integer_x =
             device->create_tensor(make_spec({16, 16}, iom::DataType::I16));
     auto integer_scale =
             device->create_tensor(make_spec({1, 16}, iom::DataType::I16));
     auto integer_out =
             device->create_tensor(make_spec({16, 16}, iom::DataType::I16));
+    fill_storage(*integer_out, kSentinel);
+    const std::vector<std::byte> integer_out_untouched =
+            snapshot_storage(*integer_out);
     CHECK_EQ(
             queue->rmsnorm(
                     integer_x->view(), integer_scale->view(),
                     integer_out->view(), 1e-6f),
             iom::to_oid(iom::OidError::Unsupported));
+    expect_storage_matches(*integer_out, integer_out_untouched);
 
     expect_storage_matches(*attn, attn_untouched);
-    expect_storage_matches(*rmsnorm_out, rmsnorm_out_untouched);
 
-    // The four accepted binary operations consume the first four sequences.
+    // The four accepted binary operations consume the first four sequences
+    // and the accepted RMSNorm the fifth.
     const iom::oid probe = queue->copy(x->view(), y->view());
-    CHECK_EQ(token_sequence(probe), 5);
+    CHECK_EQ(token_sequence(probe), 6);
     queue->wait(probe);
+}
+
+// ---------------------------------------------------------------------------
+// CPU RMSNorm
+// ---------------------------------------------------------------------------
+
+TEST_CASE("CPU RMSNorm computes every applicable floating leaf in place") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    // Two independent leading planes, three rows, and a non-tile feature
+    // width. A row of ones with unit scale and `eps == 3` is exactly
+    // `1 / sqrt(1 + 3) = 0.5`, which all nine leaves represent, so each leaf's
+    // expectation is one fixed raw encoding.
+    constexpr std::size_t planes = 2;
+    constexpr std::size_t rows = 3;
+    constexpr std::size_t features = 17;
+    constexpr std::size_t elements = planes * rows * features;
+    for (const RmsnormEncodings& encodings : kRmsnormEncodings) {
+        const iom::TensorSpec spec =
+                make_spec({planes, rows, features}, encodings.data_type);
+        auto x = device->create_tensor(spec);
+        auto scale = device->create_tensor(
+                make_spec({1, features}, encodings.data_type));
+        auto out = device->create_tensor(spec);
+        x->view().copy_from_host(
+                uniform_logical(encodings.data_type, elements, encodings.one));
+        scale->view().copy_from_host(uniform_logical(
+                encodings.data_type, features, encodings.one));
+        fill_storage(*out, kSentinel);
+
+        const iom::oid token =
+                queue->rmsnorm(x->view(), scale->view(), out->view(), 3.0f);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        expect_storage_matches(
+                *out,
+                expected_uniform_rmsnorm_storage(
+                        out->view(), spec, encodings.half));
+    }
+}
+
+TEST_CASE("CPU RMSNorm reads only logical features of transformed views") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    // A sub-byte leaf in a four-plane owner whose padding is poisoned: `x` is
+    // filled with `0xFF` — every narrow-format padded element decodes to a
+    // large negative value — before its logical ones are copied in, so any
+    // padded contribution would be observable. Both requested windows are
+    // transformed leading slices, so their own plane offsets and strides must
+    // be honored.
+    constexpr std::size_t rows = 17;
+    constexpr std::size_t features = 17;
+    constexpr std::size_t window_planes = 2;
+    constexpr std::size_t elements = window_planes * rows * features;
+    const iom::TensorSpec owner_spec =
+            make_spec({4, rows, features}, iom::DataType::F4_E2M1);
+    const RmsnormEncodings& encodings =
+            rmsnorm_encodings(iom::DataType::F4_E2M1);
+    auto x_owner = device->create_tensor(owner_spec);
+    auto out_owner = device->create_tensor(owner_spec);
+    auto scale = device->create_tensor(
+            make_spec({1, features}, iom::DataType::F4_E2M1));
+    fill_storage(*x_owner, std::byte{0xFF});
+    fill_storage(*out_owner, kSentinel);
+
+    iom::TensorView x = x_owner->view().slice(0, 1, window_planes);
+    iom::TensorView out = out_owner->view().slice(0, 1, window_planes);
+    x.copy_from_host(uniform_logical(
+            iom::DataType::F4_E2M1, elements, encodings.one));
+    scale->view().copy_from_host(uniform_logical(
+            iom::DataType::F4_E2M1, features, encodings.one));
+
+    const iom::oid token = queue->rmsnorm(x, scale->view(), out, 3.0f);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
+
+    // Exactly the logical elements of the selected planes changed; the whole
+    // of planes 0 and 3 and every padded element of planes 1 and 2 still hold
+    // the sentinel the caller left there.
+    expect_storage_matches(
+            *out_owner,
+            expected_uniform_rmsnorm_storage(out, owner_spec, encodings.half));
+}
+
+TEST_CASE("CPU RMSNorm applies a signed non-unit scale to mixed magnitudes") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    // Every `|x|` pair makes each row's sum exactly 6.25, so `eps = 2.4375`
+    // gives the shared norm exactly `1 / sqrt(1.5625 + 2.4375) = 0.5` and each
+    // output is the exactly representable product of three factors: 2, 1, 0.25
+    // and 0.125 with both signs. The second row is the sign mirror of the
+    // first, so a row swap or a shared reduction across rows is observable.
+    const iom::TensorSpec spec = make_spec({2, 4}, iom::DataType::F32);
+    auto x = device->create_tensor(spec);
+    auto scale = device->create_tensor(make_spec({1, 4}, iom::DataType::F32));
+    auto out = device->create_tensor(spec);
+    x->view().copy_from_host(packed_logical(
+            iom::DataType::F32,
+            {0x40000000u, 0xBF000000u, 0x3F800000u, 0xBF800000u,
+             0xC0000000u, 0x3F000000u, 0xBF800000u, 0x3F800000u}));
+    scale->view().copy_from_host(packed_logical(
+            iom::DataType::F32,
+            {0x40000000u, 0xC0800000u, 0x3F000000u, 0xBE800000u}));
+    fill_storage(*out, kSentinel);
+
+    const iom::oid token =
+            queue->rmsnorm(x->view(), scale->view(), out->view(), 2.4375f);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
+    expect_storage_matches(
+            *out,
+            expected_rmsnorm_storage(
+                    out->view(), spec,
+                    {0x40000000u, 0x3F800000u, 0x3E800000u, 0x3E000000u,
+                     0xC0000000u, 0xBF800000u, 0xBE800000u, 0xBE000000u}));
+}
+
+TEST_CASE("CPU RMSNorm preserves signed zeros and row-local special values") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    // Row-local signed zeros and halves. `F = 4` with `|x| == 1` in every row
+    // makes the shared norm exactly `1 / sqrt(1 + 3) = 0.5`, so each output is
+    // the product of three exactly representable values and the sign of the
+    // zero produced by a zero scale is preserved.
+    {
+        const iom::TensorSpec spec = make_spec({2, 4}, iom::DataType::F32);
+        auto x = device->create_tensor(spec);
+        auto scale =
+                device->create_tensor(make_spec({1, 4}, iom::DataType::F32));
+        auto out = device->create_tensor(spec);
+        x->view().copy_from_host(packed_logical(
+                iom::DataType::F32,
+                {0x3F800000u, 0xBF800000u, 0x3F800000u, 0xBF800000u,
+                 0xBF800000u, 0x3F800000u, 0xBF800000u, 0x3F800000u}));
+        scale->view().copy_from_host(packed_logical(
+                iom::DataType::F32,
+                {0x3F800000u, 0xBF800000u, 0x00000000u, 0x80000000u}));
+        fill_storage(*out, kSentinel);
+
+        const iom::oid token =
+                queue->rmsnorm(x->view(), scale->view(), out->view(), 3.0f);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        expect_storage_matches(
+                *out,
+                expected_rmsnorm_storage(
+                        out->view(), spec,
+                        {0x3F000000u, 0x3F000000u, 0x00000000u, 0x00000000u,
+                         0xBF000000u, 0xBF000000u, 0x80000000u, 0x80000000u}));
+    }
+
+    // An all-zero row with a finite epsilon keeps signed zeros: the zero sum
+    // leaves a finite reciprocal square root, and each zero carries the
+    // product of its input and scale signs.
+    {
+        const iom::TensorSpec spec = make_spec({1, 4}, iom::DataType::F32);
+        auto x = device->create_tensor(spec);
+        auto scale =
+                device->create_tensor(make_spec({1, 4}, iom::DataType::F32));
+        auto out = device->create_tensor(spec);
+        x->view().copy_from_host(packed_logical(
+                iom::DataType::F32,
+                {0x00000000u, 0x80000000u, 0x00000000u, 0x80000000u}));
+        scale->view().copy_from_host(packed_logical(
+                iom::DataType::F32,
+                {0x3F800000u, 0xBF800000u, 0xBF800000u, 0x3F800000u}));
+        fill_storage(*out, kSentinel);
+
+        const iom::oid token =
+                queue->rmsnorm(x->view(), scale->view(), out->view(), 3.0f);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        expect_storage_matches(
+                *out,
+                expected_rmsnorm_storage(
+                        out->view(), spec,
+                        {0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u}));
+    }
+
+    // `eps == 0` on an all-zero row: the reciprocal square root is infinite
+    // and every output is a quiet NaN. F32 keeps the canonical quiet NaN
+    // encoding, while F4_E2M1 has no NaN encoding and saturates to its
+    // maximum finite value 6.
+    {
+        const RmsnormEncodings& f32 = rmsnorm_encodings(iom::DataType::F32);
+        const iom::TensorSpec spec = make_spec({1, 4}, iom::DataType::F32);
+        auto x = device->create_tensor(spec);
+        auto scale =
+                device->create_tensor(make_spec({1, 4}, iom::DataType::F32));
+        auto out = device->create_tensor(spec);
+        x->view().copy_from_host(
+                uniform_logical(iom::DataType::F32, 4, 0x00000000u));
+        scale->view().copy_from_host(uniform_logical(
+                iom::DataType::F32, 4, f32.one));
+        fill_storage(*out, kSentinel);
+
+        const iom::oid token =
+                queue->rmsnorm(x->view(), scale->view(), out->view(), 0.0f);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        expect_storage_matches(
+                *out,
+                expected_uniform_rmsnorm_storage(
+                        out->view(), spec, 0x7FC00000u));
+
+        const iom::TensorSpec narrow_spec =
+                make_spec({1, 4}, iom::DataType::F4_E2M1);
+        const RmsnormEncodings& narrow =
+                rmsnorm_encodings(iom::DataType::F4_E2M1);
+        auto narrow_x = device->create_tensor(narrow_spec);
+        auto narrow_scale = device->create_tensor(
+                make_spec({1, 4}, iom::DataType::F4_E2M1));
+        auto narrow_out = device->create_tensor(narrow_spec);
+        narrow_x->view().copy_from_host(
+                uniform_logical(iom::DataType::F4_E2M1, 4, 0x0));
+        narrow_scale->view().copy_from_host(uniform_logical(
+                iom::DataType::F4_E2M1, 4, narrow.one));
+        fill_storage(*narrow_out, kSentinel);
+
+        const iom::oid narrow_token = queue->rmsnorm(
+                narrow_x->view(), narrow_scale->view(), narrow_out->view(),
+                0.0f);
+        REQUIRE(iom::oid_is_token(narrow_token));
+        CHECK_NOTHROW(queue->wait(narrow_token));
+        // 0x7 is the maximum finite F4_E2M1 value, 6.
+        expect_storage_matches(
+                *narrow_out,
+                expected_uniform_rmsnorm_storage(
+                        narrow_out->view(), narrow_spec, 0x7u));
+    }
+
+    // Infinite features make their own row's sum infinite: the finite
+    // features of that row normalize to signed zeros and the infinite
+    // features become quiet NaNs before the scale multiply, while the
+    // sibling zero row keeps its signed zeros.
+    {
+        const iom::TensorSpec spec = make_spec({2, 4}, iom::DataType::F16);
+        auto x = device->create_tensor(spec);
+        auto scale =
+                device->create_tensor(make_spec({1, 4}, iom::DataType::F16));
+        auto out = device->create_tensor(spec);
+        x->view().copy_from_host(packed_logical(
+                iom::DataType::F16,
+                {0x7C00u, 0xFC00u, 0x3C00u, 0xBC00u,
+                 0x0000u, 0x8000u, 0x0000u, 0x8000u}));
+        scale->view().copy_from_host(
+                uniform_logical(iom::DataType::F16, 4, 0x3C00u));
+        fill_storage(*out, kSentinel);
+
+        const iom::oid token =
+                queue->rmsnorm(x->view(), scale->view(), out->view(), 1.0e-5f);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        expect_storage_matches(
+                *out,
+                expected_rmsnorm_storage(
+                        out->view(), spec,
+                        {0x7E00u, 0x7E00u, 0x0000u, 0x8000u,
+                         0x0000u, 0x8000u, 0x0000u, 0x8000u}));
+    }
+}
+
+TEST_CASE("CPU RMSNorm covers the tiled boundary extents with independent planes") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    // Rows and features immediately around the fixed 16x16 tile, with three
+    // independent leading planes: the divisor is the logical `F` in every
+    // case, so a row of ones with unit scale and `eps == 3` is exactly 0.5
+    // even when the feature run is not tile-aligned.
+    constexpr std::array<std::size_t, 4> kExtents = {1, 15, 16, 17};
+    constexpr std::size_t planes = 3;
+    for (const std::size_t rows : kExtents) {
+        for (const std::size_t features : kExtents) {
+            const iom::TensorSpec spec =
+                    make_spec({planes, rows, features}, iom::DataType::F32);
+            auto x = device->create_tensor(spec);
+            auto scale = device->create_tensor(
+                    make_spec({1, features}, iom::DataType::F32));
+            auto out = device->create_tensor(spec);
+            const std::size_t elements = planes * rows * features;
+            x->view().copy_from_host(uniform_logical(
+                    iom::DataType::F32, elements, 0x3F800000u));
+            scale->view().copy_from_host(uniform_logical(
+                    iom::DataType::F32, features, 0x3F800000u));
+            fill_storage(*out, kSentinel);
+
+            const iom::oid token =
+                    queue->rmsnorm(x->view(), scale->view(), out->view(), 3.0f);
+            REQUIRE(iom::oid_is_token(token));
+            CHECK_NOTHROW(queue->wait(token));
+            expect_storage_matches(
+                    *out,
+                    expected_uniform_rmsnorm_storage(
+                            out->view(), spec, 0x3F000000u));
+        }
+    }
+}
+
+TEST_CASE("CPU RMSNorm admission rejects before effects") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    const iom::TensorSpec spec = make_spec({2, 17, 33}, iom::DataType::F32);
+    auto x = device->create_tensor(spec);
+    auto scale =
+            device->create_tensor(make_spec({1, 33}, iom::DataType::F32));
+    auto out = device->create_tensor(spec);
+    x->view().copy_from_host(uniform_logical(
+            iom::DataType::F32, spec.shape.element_count(), 0x3F800000u));
+    scale->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 33, 0x3F800000u));
+    fill_storage(*out, kSentinel);
+    const std::vector<std::byte> untouched = snapshot_storage(*out);
+
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    const iom::oid overflow = iom::to_oid(iom::OidError::Overflow);
+
+    // `x` and `out` must agree on `[...,R,F]`, and `scale` must be exactly
+    // `[1,F]`; a rank-one scale cannot even be materialized.
+    auto mismatched =
+            device->create_tensor(make_spec({2, 17, 17}, iom::DataType::F32));
+    CHECK_EQ(
+            queue->rmsnorm(
+                    x->view(), scale->view(), mismatched->view(), 1e-6f),
+            invalid);
+    auto narrow_scale =
+            device->create_tensor(make_spec({1, 17}, iom::DataType::F32));
+    CHECK_EQ(
+            queue->rmsnorm(
+                    x->view(), narrow_scale->view(), out->view(), 1e-6f),
+            invalid);
+    auto plane_scale =
+            device->create_tensor(make_spec({3, 33}, iom::DataType::F32));
+    CHECK_EQ(
+            queue->rmsnorm(x->view(), plane_scale->view(), out->view(), 1e-6f),
+            invalid);
+
+    // Leaf type and quantization must match and stay applicable.
+    auto bf16_x =
+            device->create_tensor(make_spec({2, 17, 33}, iom::DataType::BF16));
+    CHECK_EQ(
+            queue->rmsnorm(bf16_x->view(), scale->view(), out->view(), 1e-6f),
+            invalid);
+    // CPU storage cannot materialize a grouped-quantized owner, so the
+    // non-`NONE` quantization probe mutates the specification copy that a view
+    // shares with its own owner — keeping both consistent — and restores it
+    // afterwards.
+    {
+        auto quantized_x = device->create_tensor(spec);
+        auto quantized_scale =
+                device->create_tensor(make_spec({1, 33}, iom::DataType::F32));
+        auto quantized_out = device->create_tensor(spec);
+        fill_storage(*quantized_out, kSentinel);
+        const std::vector<std::byte> quantized_untouched =
+                snapshot_storage(*quantized_out);
+        const auto set_quantization = [](iom::TensorView& view,
+                                         iom::QuantizationFormat quantization) {
+            const_cast<iom::TensorSpec&>(view.spec()).quantization =
+                    quantization;
+        };
+        const auto quantify_views = [&](iom::QuantizationFormat quantization) {
+            for (iom::TensorView* view :
+                 {&quantized_x->view(), &quantized_scale->view(),
+                  &quantized_out->view()}) {
+                set_quantization(*view, quantization);
+            }
+        };
+        quantify_views(iom::QuantizationFormat::GGML_Q4_0);
+        CHECK_EQ(
+                queue->rmsnorm(
+                        quantized_x->view(), quantized_scale->view(),
+                        quantized_out->view(), 1e-6f),
+                unsupported);
+        CHECK_THROWS_AS(
+                (void)queue->rmsnorm_workspace_requirements(
+                        quantized_x->view(), quantized_scale->view(),
+                        quantized_out->view(), 1e-6f),
+                std::runtime_error);
+        quantify_views(iom::QuantizationFormat::NONE);
+        expect_storage_matches(*quantized_out, quantized_untouched);
+    }
+    for (const iom::DataType leaf :
+         {iom::DataType::BOOL, iom::DataType::I16, iom::DataType::F8_E8M0}) {
+        auto leaf_x = device->create_tensor(make_spec({2, 17, 33}, leaf));
+        auto leaf_scale = device->create_tensor(make_spec({1, 33}, leaf));
+        auto leaf_out = device->create_tensor(make_spec({2, 17, 33}, leaf));
+        fill_storage(*leaf_out, kSentinel);
+        const std::vector<std::byte> leaf_untouched = snapshot_storage(*leaf_out);
+        CHECK_EQ(
+                queue->rmsnorm(
+                        leaf_x->view(), leaf_scale->view(), leaf_out->view(),
+                        1e-6f),
+                unsupported);
+        CHECK_THROWS_AS(
+                (void)queue->rmsnorm_workspace_requirements(
+                        leaf_x->view(), leaf_scale->view(), leaf_out->view(),
+                        1e-6f),
+                std::runtime_error);
+        expect_storage_matches(*leaf_out, leaf_untouched);
+    }
+
+    // A foreign device's storage never participates, even when it is another
+    // CPU reference device.
+    RecordingAllocator foreign_allocator;
+    auto foreign_device = iom::make_cpu_device(foreign_allocator);
+    auto foreign_x = foreign_device->create_tensor(spec);
+    CHECK_EQ(
+            queue->rmsnorm(foreign_x->view(), scale->view(), out->view(), 1e-6f),
+            invalid);
+
+    // Output storage must be disjoint from both inputs; RMSNorm consumes no
+    // raw workspace, so any supplied workspace with an owner is invalid even
+    // when its range is empty.
+    CHECK_EQ(
+            queue->rmsnorm(x->view(), scale->view(), x->view(), 1e-6f), invalid);
+    const std::unique_ptr<iom::RawWorkspace> workspace =
+            device->create_workspace(0);
+    CHECK_EQ(
+            queue->rmsnorm(
+                    x->view(), scale->view(), out->view(), 1e-6f,
+                    workspace->view()),
+            invalid);
+
+    // Epsilon must be finite and nonnegative.
+    for (const float epsilon :
+         {std::numeric_limits<float>::quiet_NaN(),
+          std::numeric_limits<float>::infinity(), -1.0f}) {
+        CHECK_EQ(
+                queue->rmsnorm(
+                        x->view(), scale->view(), out->view(), epsilon),
+                invalid);
+    }
+
+    // Malformed view metadata and checked overflow are rejected before any
+    // address arithmetic or output write. A second leading extent keeps the
+    // stride product itself overflowing instead of merely addressing outside
+    // the owner, which `validate_checked_view` rejects as invalid input.
+    {
+        const iom::TensorSpec wide_spec =
+                make_spec({3, 2, 17, 33}, iom::DataType::F32);
+        auto wide_x = device->create_tensor(wide_spec);
+        auto wide_out = device->create_tensor(wide_spec);
+
+        iom::TensorView malformed = wide_x->view();
+        const_cast<std::size_t*>(malformed.plane_strides().data())[0] = 0;
+        CHECK_EQ(
+                queue->rmsnorm(malformed, scale->view(), wide_out->view(), 1e-6f),
+                invalid);
+
+        iom::TensorView overflowed = wide_x->view();
+        const_cast<std::size_t*>(overflowed.plane_strides().data())[0] =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_EQ(
+                queue->rmsnorm(
+                        overflowed, scale->view(), wide_out->view(), 1e-6f),
+                overflow);
+    }
+
+    // Every rejection above wrote nothing and consumed no sequence: the first
+    // accepted submission still takes sequence 1, its result is the exact
+    // unit-scale one, and a completed token stays waitable.
+    expect_storage_matches(*out, untouched);
+    const iom::oid first =
+            queue->rmsnorm(x->view(), scale->view(), out->view(), 3.0f);
+    REQUIRE(iom::oid_is_token(first));
+    CHECK_EQ(token_sequence(first), 1);
+    CHECK_NOTHROW(queue->wait(first));
+    CHECK_NOTHROW(queue->wait(first));
+    expect_storage_matches(
+            *out, expected_uniform_rmsnorm_storage(
+                          out->view(), spec, 0x3F000000u));
+
+    // Read/read overlap between `x` and `scale` stays valid and registers one
+    // deduplicated owner.
+    auto shared_operand =
+            device->create_tensor(make_spec({1, 33}, iom::DataType::F32));
+    auto shared_out =
+            device->create_tensor(make_spec({1, 33}, iom::DataType::F32));
+    shared_operand->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 33, 0x3F800000u));
+    fill_storage(*shared_out, kSentinel);
+    const iom::oid aliased = queue->rmsnorm(
+            shared_operand->view(), shared_operand->view(),
+            shared_out->view(), 3.0f);
+    REQUIRE(iom::oid_is_token(aliased));
+    CHECK_EQ(token_sequence(aliased), 2);
+    CHECK_NOTHROW(queue->wait(aliased));
+    expect_storage_matches(
+            *shared_out, expected_uniform_rmsnorm_storage(
+                                 shared_out->view(), shared_out->view().spec(),
+                                 0x3F000000u));
+}
+
+TEST_CASE("CPU RMSNorm keeps queue order and repeatable waits") {
+    RecordingAllocator allocator;
+    auto device = iom::make_cpu_device(allocator);
+    auto queue = device->create_ops();
+
+    // A non-tile BF16 plane: the queued RMSNorm is followed by a copy of its
+    // own output, so the copy observes exactly the completed RMSNorm result
+    // and the two tokens keep FIFO order. Owning tensors stay alive across
+    // both waits, and a completed token is waitable repeatedly.
+    const iom::TensorSpec spec = make_spec({2, 17, 33}, iom::DataType::BF16);
+    auto x = device->create_tensor(spec);
+    auto scale =
+            device->create_tensor(make_spec({1, 33}, iom::DataType::BF16));
+    auto out = device->create_tensor(spec);
+    auto scratch = device->create_tensor(spec);
+    x->view().copy_from_host(uniform_logical(
+            iom::DataType::BF16, spec.shape.element_count(), 0x3F80u));
+    scale->view().copy_from_host(
+            uniform_logical(iom::DataType::BF16, 33, 0x3F80u));
+    fill_storage(*out, kSentinel);
+    fill_storage(*scratch, kSentinel);
+
+    const iom::oid rmsnorm_token =
+            queue->rmsnorm(x->view(), scale->view(), out->view(), 3.0f);
+    const iom::oid copy_token = queue->copy(out->view(), scratch->view());
+    REQUIRE(iom::oid_is_token(rmsnorm_token));
+    REQUIRE(iom::oid_is_token(copy_token));
+    CHECK_EQ(token_sequence(rmsnorm_token), 1);
+    CHECK_EQ(token_sequence(copy_token), 2);
+
+    queue->wait(copy_token);
+    queue->wait(rmsnorm_token);
+    CHECK_NOTHROW(queue->wait(rmsnorm_token));
+    const std::vector<std::byte> expected =
+            expected_uniform_rmsnorm_storage(out->view(), spec, 0x3F00u);
+    expect_storage_matches(*out, expected);
+    expect_storage_matches(*scratch, expected);
 }
