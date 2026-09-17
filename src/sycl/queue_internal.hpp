@@ -21,10 +21,11 @@ class SyclQueue final : public DeviceOps {
         std::uint64_t sequence = 0;
         bool no_op = false;
         std::optional<CopyRequest> copy_request;
+        std::optional<BinaryRequest> binary_request;
+        std::optional<EmbeddingRequest> embedding_request;
         std::shared_ptr<SyclFenceState> state;
         void* fence = nullptr;
         detail::EntryRegistration copy_entries;
-        std::optional<BinaryRequest> binary_request;
         detail::BinaryEntryRegistration binary_entries;
         // Immutable RMS normalization request captured by admission, plus the
         // common owner registrations retained until proven completion. RMS
@@ -39,6 +40,7 @@ class SyclQueue final : public DeviceOps {
         std::optional<detail::BinaryEntryRegistration> binary_entries;
         detail::WorkspaceLease workspace_lease;
         std::optional<detail::BinaryEntryRegistration> rmsnorm_entries;
+        bool is_embedding = false;
     };
 
 public:
@@ -64,6 +66,7 @@ public:
             const TensorView& source,
             TensorView& destination) override;
     oid binary_impl(const BinaryRequest& request) override;
+    oid embedding_impl(const EmbeddingRequest& request) override;
     oid rmsnorm_impl(const RmsnormRequest& request) override;
 
     // Immutable device capability of the implemented RMS normalization leaf
@@ -82,9 +85,21 @@ public:
     [[nodiscard]] WorkspaceRequirements binary_workspace_requirements(
             const BinaryRequest& request) override;
 
+    // Pure `{32, 32}` workspace requirement the SYCL gather reports: the
+    // caller-supplied range owns one uint32 status word plus reserved
+    // padding. Common validation precedes this hook so capability-stage
+    // `Unsupported` results never reach the host-side query.
+    [[nodiscard]] WorkspaceRequirements embedding_workspace_requirements_impl(
+            const TensorView& table, const TensorView& indices,
+            const TensorView& out) override {
+        (void)table; (void)indices; (void)out;
+        return {32, 32};
+    }
+
 private:
     void execute(Task& task);
     void execute_binary(Task& task);
+    void execute_embedding(Task& task);
     void execute_rmsnorm(Task& task);
     void complete_task(
             std::uint64_t sequence, std::exception_ptr callback_failure);

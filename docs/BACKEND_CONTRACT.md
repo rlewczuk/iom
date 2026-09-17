@@ -2574,13 +2574,11 @@ changing enabled-ROCm-only CMake. CPU-only and ROCm-disabled builds acquire no
 such dependency.
 #### TinyLlama forward layout — SYCL matrix feasibility
 
-This is a bounded feasibility record for the planned seven-operation ABI, not
-a declaration that those operations are implemented. The current SYCL queue
-still exposes only copy and binary execution, its neural conformance probes
-still return `Unsupported`, and no project conformance or profiler run is
-claimed here. A future port MUST preserve the signatures, pure requirement
-queries, validation precedence, owner rules, and producer-wait schedule above;
-SYCL types remain backend-private.
+This is a bounded feasibility record for the planned seven-operation ABI.
+Embedding lookup now has its device-native raw-word `parallel_for` port; the
+remaining neural operations remain unimplemented. A future port MUST preserve
+the signatures, pure requirement queries, validation precedence, owner rules,
+and producer-wait schedule above; SYCL types remain backend-private.
 
 The evidence layers are deliberately separate:
 
@@ -2681,7 +2679,7 @@ requirements, not their sum.
 
 | Planned operation | SYCL feasibility and concrete present blocker |
 | --- | --- |
-| Embedding gather | A tile-aware `parallel_for` can copy selected BF16 payload bits on device and preserve independent planes. Integral indices and device-discovered OOB values need checked device-side handling and an accepted retained error; a host scan/roundtrip is forbidden. No SYCL gather kernel exists today. |
+| Embedding gather | Implemented by `src/sycl/embedding.cpp` and `src/sycl/queue_embedding.cpp`: one native `parallel_for` work item owns each destination word, with queued status reset, gather, and four-byte host-USM status copy. Runtime conformance and Level Zero scheduling evidence remain execution obligations; no host scan, host task, or operand staging is permitted. |
 | Linear | Direct backend-private `joint_matrix` is feasible as tabulated. FP32 accumulator storage, explicit RNE pack, row/window predicates, head scatter, alias checks, and all non-tile/plane cases are unimplemented. |
 | RMSNorm reduction | BF16 loads, FP32 squares/reduction, normalization, and explicit BF16 result packing fit subgroup/work-group kernels and caller scratch. It is nonmatrix work; a matrix MAD substitute is unnecessary, and no native SYCL reduction port exists. |
 | RoPE trig | Device-local FP32 range reduction/trig and BF16 output packing fit an ordinary kernel over the tiled owner. It must preserve position `a+r`, pair boundaries, tails, aliases, and the queue error model. No native SYCL RoPE port exists. |
@@ -4046,11 +4044,12 @@ same in-order native queue, the status reset, the raw gather, exactly a
 four-byte device-to-host transfer of the status word, and the completion event.
 CUDA takes the status cell from queue-owned page-locked memory
 (`cudaHostAlloc`/`cudaFreeHost`); ROCm uses `hipHostMalloc`/`hipHostFree`; SYCL
-uses `malloc_host`/`free` in the exact context with event dependencies. SYCL
-MUST NOT claim portable physical pinning, MUST NOT use a `host_task` for the
-gather, and MUST NOT add a submission-side wait; its actual oneAPI behavior
-remains a future remote verification obligation. Native launch, copy, or event
-failure always takes precedence over the status word.
+uses `sycl::malloc_host`/`sycl::free` in the exact queue context with explicit
+event dependencies. Standard SYCL host USM is not claimed to be physically
+pinned or portably DMA-nonblocking. SYCL uses no `host_task` for the gather and
+adds no submission-side wait. Runtime conformance and configured Level Zero
+status-only traffic remain execution evidence, not an API guarantee. Native
+launch, copy, or event failure always takes precedence over the status word.
 
 The CUDA implementation is the standard raw-word path in
 `src/shared/standard_tiled_embedding.hpp`,

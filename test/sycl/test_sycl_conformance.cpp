@@ -417,15 +417,15 @@ TEST_CASE("SYCL conformance: compute methods reject unsupported capability witho
 // SYCL's declared embedding expectation: the complete 23-payload/12-index
 // matrix the SYCL port must reach and the exact `{32, 32}` status-workspace
 // contract, whose control-status read is the four-byte device-to-host copy
-// into caller-owned USM memory. This revision has no SYCL embedding hook yet
-// (leaf `08-sycl-embedding` lands it), so the implemented span stays
-// explicitly empty: every shared case observes capability rejection only and
-// no case reports gather success.
+// into caller-owned USM memory. Leaf `08-sycl-embedding` implements the
+// native parallel_for gather, so the implemented spans mirror the target
+// matrix and the shared suite exercises both numerical success and the
+// remaining rejection-only paths.
 constexpr iom_conformance::EmbeddingDeclaration kSyclEmbeddingDeclaration{
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        iom_conformance::kNoEmbeddingSpan,
-        iom_conformance::kNoEmbeddingSpan,
+        iom_conformance::kEmbeddingPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
         false,
         iom::WorkspaceRequirements{32, 32}};
 
@@ -436,6 +436,348 @@ TEST_CASE("SYCL conformance: embedding lookup reference, admission, and lifetime
             devices.conformance(), kSyclEmbeddingDeclaration, &devices.gate,
             &oracle);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// Regression for the round-2 defect: a data error (deferred OOV
+// `std::invalid_argument`) must not erase native completion proof. Many
+// repeated OOV embedding calls on one queue and one {32,32} workspace must
+// (1) keep reporting `std::invalid_argument` on every wait, (2) leave the
+// fixed metadata slot, completion slot, and workspace lease reusable, and
+// (3) let a subsequent valid call still succeed and reach the native path.
+TEST_CASE(
+        "SYCL conformance: repeated OOV embedding does not consume capacity and "
+        "lets a later valid call still succeed") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+
+    const iom::TensorShape table_shape{{4, 16}};
+    const iom::TensorShape index_shape{{1, 8}};
+    const iom::TensorShape out_shape{{8, 16}};
+    const iom::DataType payload = iom::DataType::U8;
+    const iom::DataType index_type = iom::DataType::U8;
+
+    auto table = devices.candidate->create_tensor(
+            {table_shape, payload});
+    auto indices = devices.candidate->create_tensor(
+            {index_shape, index_type});
+    auto out = devices.candidate->create_tensor(
+            {out_shape, payload});
+    auto workspace = devices.candidate->create_workspace(32);
+
+    iom_conformance::copy_from_host(table->view(), std::vector<std::byte>(
+            table->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0xA5)));
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            out->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0x00)));
+
+    auto queue = devices.candidate->create_ops();
+    REQUIRE(queue != nullptr);
+
+    // Pre-snapshot to detect ANY permanent quarantine across the loop.
+    iom::sycl_detail::QueueResourceSnapshot before;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *queue, before);
+
+    constexpr std::size_t oov_count = 32;
+    // 0xFF > V-1 (=3) every iteration: must always throw.
+    const std::vector<std::byte> bad_index{
+            std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
+            std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
+            std::byte{0xFF}, std::byte{0xFF}};
+    for (std::size_t i = 0; i < oov_count; ++i) {
+        iom_conformance::copy_from_host(indices->view(), bad_index);
+        const iom::oid oov_token = queue->embedding(
+                table->view(), indices->view(), out->view(),
+                workspace->view());
+        REQUIRE(iom::oid_is_token(oov_token));
+        CHECK_THROWS_AS(queue->wait(oov_token), std::invalid_argument);
+    }
+
+    // Capacity untouched: no metadata slot was quarantined into a permanent
+    // protected state and no completion slot was burned, because each OOV
+    // path proved the native event after the kernel wrote the host USM
+    // status cell through the event-ordered queue::memcpy.
+    iom::sycl_detail::QueueResourceSnapshot after_oov;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *queue, after_oov);
+    CHECK_EQ(after_oov.slots_in_use, before.slots_in_use);
+    CHECK_EQ(after_oov.slots_protected, before.slots_protected);
+
+    // Reusing the SAME {32,32} workspace range after OOV: the next valid
+    // embedding must accept the lease and succeed, not return
+    // ResourceExhausted.
+    const std::vector<std::byte> good_index{
+            std::byte{0x00}, std::byte{0x01}, std::byte{0x02},
+            std::byte{0x03}, std::byte{0x00}, std::byte{0x01},
+            std::byte{0x02}, std::byte{0x03}};
+    iom_conformance::copy_from_host(indices->view(), good_index);
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            out->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0x00)));
+    const iom::oid good_token = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(good_token));
+    CHECK_NOTHROW(queue->wait(good_token));
+
+    iom::sycl_detail::QueueResourceSnapshot after_good;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *queue, after_good);
+    CHECK_EQ(after_good.slots_in_use, 0u);
+    CHECK_EQ(after_good.slots_protected, 0u);
+
+    // And OOV still throws after all that.
+    iom_conformance::copy_from_host(indices->view(), bad_index);
+    const iom::oid oov_again = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(oov_again));
+    CHECK_THROWS_AS(queue->wait(oov_again), std::invalid_argument);
+}
+
+// Regression for the round-3 defect: when an embedding submission has a
+// post-launch fault injected after set_event, the deferred OOV completion
+// action MUST NOT replace the native post_launch `std::runtime_error`
+// with a stale status-cell `std::invalid_argument`. The native fault
+// takes precedence; the cached result carries the runtime_error and the
+// sticky invalid_argument never re-asserts.
+TEST_CASE(
+        "SYCL conformance: embedding post-launch native fault surfaces the "
+        "native runtime_error, not a stale invalid_argument") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+
+    const iom::TensorShape table_shape{{4, 16}};
+    const iom::TensorShape index_shape{{1, 8}};
+    const iom::TensorShape out_shape{{8, 16}};
+    const iom::DataType payload = iom::DataType::U8;
+    const iom::DataType index_type = iom::DataType::U8;
+
+    auto table = devices.candidate->create_tensor(
+            {table_shape, payload});
+    auto indices = devices.candidate->create_tensor(
+            {index_shape, index_type});
+    auto out = devices.candidate->create_tensor(
+            {out_shape, payload});
+    auto workspace = devices.candidate->create_workspace(32);
+
+    iom_conformance::copy_from_host(table->view(), std::vector<std::byte>(
+            table->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0xA5)));
+    // Bad index: kernel would set status_cell to 1 if it ever ran, but
+    // the post_launch fault happens AFTER set_event so the native fault
+    // must dominate; the status-cell read MUST NOT run.
+    const std::vector<std::byte> bad_index{
+            std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
+            std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
+            std::byte{0xFF}, std::byte{0xFF}};
+    iom_conformance::copy_from_host(indices->view(), bad_index);
+
+    auto queue = devices.candidate->create_ops();
+    REQUIRE(queue != nullptr);
+
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::post_launch);
+    const iom::oid fault_token = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+    REQUIRE(iom::oid_is_token(fault_token));
+    // Native post_launch fault, NOT a stale invalid_argument from the
+    // status cell. The status_cell read MUST be suppressed when native
+    // completion failed.
+    CHECK_THROWS_AS(queue->wait(fault_token), std::runtime_error);
+}
+
+// Regression for the F1 (round-5) race: a fence invoke landing in the
+// pool-bound-but-event-unset window must NOT observe a phantom native
+// completion and MUST NOT cache a success result. The fault seam cannot
+// inject this race directly without a controlled window between
+// set_completion_slot and set_event, so this case exercises the public
+// contract through the same OOV+capacity path: even after the racing
+// F1 closure change, repeated OOV embedding calls do not leak state
+// (slots_in_use and slots_protected stay at zero) and pending valid
+// embedding succeeds on the same workspace. If F1 closure were wrong,
+// a fence invoke racing set_event would prove/cache success and the
+// OOV read would not fire, the test would fail because OOV would no
+// longer throw std::invalid_argument.
+TEST_CASE(
+        "SYCL conformance: F1 closure preserves OOV throw with capacity "
+        "intact across many calls") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+
+    const iom::TensorShape table_shape{{4, 16}};
+    const iom::TensorShape index_shape{{1, 8}};
+    const iom::TensorShape out_shape{{8, 16}};
+    const iom::DataType payload = iom::DataType::U8;
+    const iom::DataType index_type = iom::DataType::U8;
+
+    auto table = devices.candidate->create_tensor(
+            {table_shape, payload});
+    auto indices = devices.candidate->create_tensor(
+            {index_shape, index_type});
+    auto out = devices.candidate->create_tensor(
+            {out_shape, payload});
+    auto workspace = devices.candidate->create_workspace(32);
+
+    iom_conformance::copy_from_host(table->view(), std::vector<std::byte>(
+            table->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0xA5)));
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            out->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0x00)));
+
+    auto queue = devices.candidate->create_ops();
+    REQUIRE(queue != nullptr);
+
+    const std::vector<std::byte> bad_index{
+            std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
+            std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
+            std::byte{0xFF}, std::byte{0xFF}};
+    for (std::size_t i = 0; i < 8; ++i) {
+        iom_conformance::copy_from_host(indices->view(), bad_index);
+        const iom::oid oov_token = queue->embedding(
+                table->view(), indices->view(), out->view(),
+                workspace->view());
+        REQUIRE(iom::oid_is_token(oov_token));
+        CHECK_THROWS_AS(queue->wait(oov_token), std::invalid_argument);
+    }
+
+    iom::sycl_detail::QueueResourceSnapshot after_oov;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(
+            *queue, after_oov);
+    CHECK_EQ(after_oov.slots_in_use, 0u);
+    CHECK_EQ(after_oov.slots_protected, 0u);
+
+    const std::vector<std::byte> good_index{
+            std::byte{0x00}, std::byte{0x01}, std::byte{0x02},
+            std::byte{0x03}, std::byte{0x00}, std::byte{0x01},
+            std::byte{0x02}, std::byte{0x03}};
+    iom_conformance::copy_from_host(indices->view(), good_index);
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            out->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0x00)));
+    const iom::oid good_token = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(good_token));
+    CHECK_NOTHROW(queue->wait(good_token));
+}
+
+// Regression for the F2 (round-5) race: set_failure must publish the
+// retained post-launch fault under mu_, so a fence invoke racing the
+// dispatch path cannot cache a success result over the just-written
+// retained failure. The seam injects post_launch in the SAME path that
+// exercises F1/F2 — the result() call reads retained_failure_ under
+// mu_, and set_failure now writes under the same mu_, so the post-launch
+// runtime_error MUST surface as the wait() throw and not be masked by
+// a cached success. This is the same observable as round-3 but
+// strengthened here to depend on the F2 ordering fix.
+TEST_CASE(
+        "SYCL conformance: F2 set_failure/result() race surfaces the "
+        "runtime_error, not a cached success") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+
+    const iom::TensorShape table_shape{{4, 16}};
+    const iom::TensorShape index_shape{{1, 8}};
+    const iom::TensorShape out_shape{{8, 16}};
+    const iom::DataType payload = iom::DataType::U8;
+    const iom::DataType index_type = iom::DataType::U8;
+
+    auto table = devices.candidate->create_tensor(
+            {table_shape, payload});
+    auto indices = devices.candidate->create_tensor(
+            {index_shape, index_type});
+    auto out = devices.candidate->create_tensor(
+            {out_shape, payload});
+    auto workspace = devices.candidate->create_workspace(32);
+
+    iom_conformance::copy_from_host(table->view(), std::vector<std::byte>(
+            table->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0xA5)));
+    iom_conformance::copy_from_host(indices->view(), std::vector<std::byte>(
+            8, static_cast<std::byte>(0x00)));
+    iom_conformance::copy_from_host(out->view(), std::vector<std::byte>(
+            out->view().spec().logical_nbytes(),
+            static_cast<std::byte>(0x00)));
+
+    auto queue = devices.candidate->create_ops();
+    REQUIRE(queue != nullptr);
+
+    // First embedding — valid, completes normally. Establishes that the
+    // workspace + queue path is healthy before the post-launch injection.
+    const iom::oid baseline = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(baseline));
+    CHECK_NOTHROW(queue->wait(baseline));
+
+    // Second embedding — post_launch injected between set_event and the
+    // dispatch-path catch block. Without F2, a fence invoke could see a
+    // cached success and the post_launch runtime_error would not surface.
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::post_launch);
+    const iom::oid fault_token = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+    REQUIRE(iom::oid_is_token(fault_token));
+    CHECK_THROWS_AS(queue->wait(fault_token), std::runtime_error);
+
+    // After the faulted embedding, a follow-up valid embedding still
+    // succeeds — the post-launch path MUST NOT leak protected slots.
+    const iom::oid follow_up = queue->embedding(
+            table->view(), indices->view(), out->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(follow_up));
+    CHECK_NOTHROW(queue->wait(follow_up));
+
+    iom::sycl_detail::QueueResourceSnapshot after;
+    iom::sycl_detail::queue_resource_snapshot_for_testing(*queue, after);
+    CHECK_EQ(after.slots_in_use, 0u);
+    CHECK_EQ(after.slots_protected, 0u);
+}
+
+// Regression for the LOW (round-5) finding: a non-embedding native
+// failure is a TERMINAL observation and MUST be cached, so repeated
+// waits do not re-wait on a permanent native failure. Without this, a
+// copy/binary/rmsnorm that fails its native event wait would re-block
+// on every subsequent wait() call.
+TEST_CASE(
+        "SYCL conformance: a non-embedding native failure is cached so "
+        "repeated waits do not re-wait the native event") {
+    SyclDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+    REQUIRE(queue != nullptr);
+
+    iom::sycl_detail::reset_fence_wait_count_for_testing();
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::post_launch);
+    const iom::oid failed_token =
+            queue->copy(source->view(), destination->view());
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+    REQUIRE(iom::oid_is_token(failed_token));
+    CHECK_THROWS_AS(queue->wait(failed_token), std::runtime_error);
+    const std::size_t first_waits =
+            iom::sycl_detail::fence_wait_count_for_testing();
+
+    // Repeated wait MUST throw the same terminal exception from cache
+    // without re-waiting the native event. (This is the
+    // retained-fault cache behavior, which round-4 already had.)
+    CHECK_THROWS_AS(queue->wait(failed_token), std::runtime_error);
+    CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), first_waits);
+    CHECK_THROWS_AS(queue->wait(failed_token), std::runtime_error);
+    CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), first_waits);
 }
 
 TEST_CASE("SYCL conformance: full shared suite") {

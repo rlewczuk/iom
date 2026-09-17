@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -19,6 +21,7 @@
 #include "runtime.hpp"
 #include "iom/detail/gpu_arena_config.hpp"
 #include "../shared/standard_tiled_copy.hpp"
+#include "../iom_internal.hpp"
 
 
 namespace iom::sycl_detail {
@@ -36,6 +39,45 @@ namespace iom::sycl_detail {
 namespace iom {
 
     namespace {
+        struct HostStatusHeader {
+            sycl::context* context = nullptr;
+        };
+
+        void free_host_status(void* status) noexcept {
+            if (status == nullptr) {
+                return;
+            }
+            auto* raw = static_cast<std::byte*>(status)
+                    - sizeof(HostStatusHeader);
+            auto* header = reinterpret_cast<HostStatusHeader*>(raw);
+            sycl::context* context = header->context;
+            try {
+                sycl::free(raw, *context);
+            } catch (...) {
+            }
+            delete context;
+        }
+
+        [[nodiscard]] void* allocate_host_status(
+                std::size_t count, const sycl::context& context) {
+            if (count > (std::numeric_limits<std::size_t>::max()
+                         - sizeof(HostStatusHeader))
+                            / sizeof(std::uint32_t)) {
+                throw std::overflow_error(
+                        "SYCL status-cell allocation overflows");
+            }
+            auto* context_copy = new sycl::context(context);
+            const std::size_t bytes = sizeof(HostStatusHeader)
+                    + count * sizeof(std::uint32_t);
+            void* raw = sycl::malloc_host(bytes, context);
+            if (raw == nullptr) {
+                delete context_copy;
+                throw std::bad_alloc();
+            }
+            ::new (raw) HostStatusHeader{context_copy};
+            return static_cast<std::byte*>(raw) + sizeof(HostStatusHeader);
+        }
+
         [[nodiscard]] std::vector<sycl::device> eligible_devices() {
             std::vector<sycl::device> devices = sycl::device::get_devices();
             devices.erase(
@@ -147,6 +189,9 @@ namespace iom {
     }
 
     detail::QueueResourceLease SyclDevice::reserve_queue_resources() {
+        if (!device_.has(sycl::aspect::usm_host_allocations)) {
+            throw detail::UnsupportedOperation();
+        }
         std::lock_guard<std::mutex> lock(bookkeeping_mutex_);
         const std::size_t slot_count = queue_slot_count_;
         std::vector<std::size_t> indices;
@@ -162,7 +207,6 @@ namespace iom {
                 metadata_allocator_->free(
                         metadata_allocator_->ptr_from_index(index));
             }
-            // Propagates std::bad_alloc for a fifth live queue.
             throw;
         }
         std::sort(indices.begin(), indices.end());
@@ -185,10 +229,18 @@ namespace iom {
             release_queue_resources_locked(base, slot_count);
             throw;
         }
+        void* status_cells = nullptr;
+        try {
+            status_cells = allocate_host_status(slot_count, *context_);
+        } catch (...) {
+            release_queue_resources_locked(base, slot_count);
+            throw;
+        }
         return make_lease(
                 *this, base, slot_count,
                 metadata_allocator_->ptr_from_index(base),
-                std::move(host_mirrors));
+                std::move(host_mirrors), status_cells,
+                &free_host_status);
     }
 
     void SyclDevice::release_queue_resources(

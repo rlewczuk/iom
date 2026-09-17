@@ -287,6 +287,10 @@ oid SyclQueue::binary_impl(const BinaryRequest& request) {
             });
 }
 void SyclQueue::execute(Task& task) {
+    if (task.embedding_request.has_value()) {
+        execute_embedding(task);
+        return;
+    }
     if (task.binary_request.has_value()) {
         execute_binary(task);
         return;
@@ -295,6 +299,7 @@ void SyclQueue::execute(Task& task) {
         execute_rmsnorm(task);
         return;
     }
+
     if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
         throw std::bad_alloc();
     }
@@ -413,17 +418,31 @@ void SyclQueue::complete_task(
                 : detail::FenceResult::success();
         combined_failure =
                 fence_result.failure ? fence_result.failure : callback_failure;
-        const bool fence_succeeded =
-                fence_result.succeeded && !fence_result.failure;
+        const bool completion_proven =
+                outcome.state != nullptr
+                && outcome.state->completion_proven();
+        const bool fence_succeeded = outcome.is_embedding
+                ? completion_proven
+                : fence_result.succeeded && !fence_result.failure;
         const bool failed = static_cast<bool>(combined_failure);
-        if (outcome.binary_entries.has_value()) {
+        if (outcome.is_embedding) {
+            // Embedding observes native completion proof independently of a
+            // retained semantic (OOV) failure: the kernel wrote the host USM
+            // status cell through event-ordered `queue::memcpy`. Copy,
+            // binary, and RMSNorm keep the strict semantic-failure-overrides
+            // -proof rule below.
+            const bool release_failed = !completion_proven;
+            (void)detail::release_or_invalidate_binary_entries(
+                    state_->registry, *outcome.binary_entries,
+                    release_failed, fence_succeeded);
+            detail::complete_workspace_lease(
+                    *state_, outcome.workspace_lease, completion_proven);
+        } else if (outcome.binary_entries.has_value()) {
             (void)detail::release_or_invalidate_binary_entries(
                     state_->registry, *outcome.binary_entries, failed,
                     fence_succeeded);
             detail::complete_workspace_lease(
-                    *state_, outcome.workspace_lease,
-                    outcome.state != nullptr
-                            && outcome.state->completion_proven());
+                    *state_, outcome.workspace_lease, completion_proven);
         } else if (outcome.rmsnorm_entries.has_value()) {
             // RMS normalization registers the same read/read-deduplicated
             // owner set but consumes no `RawWorkspace`, so only the owner

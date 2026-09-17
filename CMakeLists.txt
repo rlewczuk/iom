@@ -293,7 +293,10 @@ if(SYCL_ENABLED)
         src/sycl/device.cpp
         src/sycl/device_tensor.cpp
         src/sycl/copy.cpp
+        src/sycl/embedding.cpp
+        src/sycl/embedding.hpp
         src/sycl/queue_binary.cpp
+        src/sycl/queue_embedding.cpp
         src/sycl/queue_rmsnorm.cpp
         src/sycl/queue.cpp
         src/sycl/add.cpp
@@ -304,6 +307,8 @@ if(SYCL_ENABLED)
         src/sycl/queue_internal.hpp
         include/iom/sycl/device.hpp
         src/shared/standard_tiled_copy.inl
+        src/shared/standard_tiled_embedding.hpp
+        src/shared/standard_tiled_embedding.inl
         src/shared/standard_tiled_copy_metadata.inl
     )
 

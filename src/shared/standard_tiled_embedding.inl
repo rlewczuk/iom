@@ -114,6 +114,76 @@ IOM_GPU_DEVICE void embedding_merge_overlap(
     destination = (destination & ~mask) | ((part << destination_offset) & mask);
 }
 
+IOM_GPU_DEVICE void embedding_one_word(
+        const unsigned char* table, const unsigned char* indices,
+        unsigned char* output, std::uint32_t* status,
+        EmbeddingMetadata metadata, std::uint64_t global) {
+    const std::uint64_t logical_plane =
+            global / metadata.header.words_per_plane;
+    const std::uint64_t word_in_plane =
+            global % metadata.header.words_per_plane;
+    std::uint64_t index_plane = metadata.header.indices_plane;
+    std::uint64_t output_plane = metadata.header.output_plane;
+    std::uint64_t rest = logical_plane;
+    for (std::uint32_t axis = metadata.header.leading_rank; axis-- > 0;) {
+        const std::uint64_t coordinate =
+                rest % metadata.dimensions[axis];
+        rest /= metadata.dimensions[axis];
+        index_plane += coordinate * metadata.index_strides[axis];
+        output_plane += coordinate * metadata.output_strides[axis];
+    }
+
+    const std::uint64_t output_base = embedding_plane_slot(
+            output_plane, 0, 0, metadata.header.run,
+            metadata.header.features);
+    auto* output_words = reinterpret_cast<std::uint32_t*>(output)
+            + output_base * metadata.header.payload_bits / 32;
+    std::uint32_t destination = output_words[word_in_plane];
+    const std::uint64_t word_first_bit = word_in_plane * 32;
+    const std::uint64_t word_end_bit = word_first_bit + 32;
+    const std::uint64_t first_slot =
+            word_first_bit / metadata.header.payload_bits;
+    const std::uint64_t last_slot =
+            (word_end_bit + metadata.header.payload_bits - 1)
+            / metadata.header.payload_bits;
+    for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
+        const EmbeddingPhysicalCoordinate coordinate =
+                embedding_physical_coordinate(
+                        slot, metadata.header.run,
+                        metadata.header.features);
+        if (coordinate.row >= metadata.header.run
+                || coordinate.column >= metadata.header.features) {
+            continue;
+        }
+        const std::uint64_t destination_bit = embedding_plane_slot(
+                0, coordinate.row, coordinate.column,
+                metadata.header.run, metadata.header.features)
+                * metadata.header.payload_bits;
+        const std::uint64_t index_bit = embedding_plane_slot(
+                index_plane, 0, coordinate.row, 1,
+                metadata.header.run) * metadata.header.index_bits;
+        const std::uint64_t index = embedding_read_bits(
+                indices, index_bit, metadata.header.index_bits);
+        const bool negative = metadata.header.index_signed != 0
+                && ((index >> (metadata.header.index_bits - 1)) & 1u) != 0;
+        if (negative || index >= metadata.header.vocabulary) {
+            atomicOr(status, std::uint32_t{1});
+            continue;
+        }
+        const std::uint64_t source_bit = embedding_plane_slot(
+                metadata.header.table_plane, index, coordinate.column,
+                metadata.header.vocabulary,
+                metadata.header.features)
+                * metadata.header.payload_bits;
+        const std::uint64_t value = embedding_read_bits(
+                table, source_bit, metadata.header.payload_bits);
+        embedding_merge_overlap(
+                destination, value, destination_bit, word_first_bit,
+                word_end_bit, metadata.header.payload_bits);
+    }
+    output_words[word_in_plane] = destination;
+}
+
 IOM_GPU_GLOBAL void embedding_word_kernel(
         const unsigned char* table, const unsigned char* indices,
         unsigned char* output, std::uint32_t* status,
@@ -123,70 +193,8 @@ IOM_GPU_GLOBAL void embedding_word_kernel(
             metadata.header.plane_count * metadata.header.words_per_plane;
     for (std::uint64_t global = IOM_GPU_GLOBAL_INDEX; global < total_words;
          global += stride) {
-        const std::uint64_t logical_plane =
-                global / metadata.header.words_per_plane;
-        const std::uint64_t word_in_plane =
-                global % metadata.header.words_per_plane;
-        std::uint64_t index_plane = metadata.header.indices_plane;
-        std::uint64_t output_plane = metadata.header.output_plane;
-        std::uint64_t rest = logical_plane;
-        for (std::uint32_t axis = metadata.header.leading_rank; axis-- > 0;) {
-            const std::uint64_t coordinate =
-                    rest % metadata.dimensions[axis];
-            rest /= metadata.dimensions[axis];
-            index_plane += coordinate * metadata.index_strides[axis];
-            output_plane += coordinate * metadata.output_strides[axis];
-        }
-
-        const std::uint64_t output_base = embedding_plane_slot(
-                output_plane, 0, 0, metadata.header.run,
-                metadata.header.features);
-        auto* output_words = reinterpret_cast<std::uint32_t*>(output)
-                + output_base * metadata.header.payload_bits / 32;
-        std::uint32_t destination = output_words[word_in_plane];
-        const std::uint64_t word_first_bit = word_in_plane * 32;
-        const std::uint64_t word_end_bit = word_first_bit + 32;
-        const std::uint64_t first_slot =
-                word_first_bit / metadata.header.payload_bits;
-        const std::uint64_t last_slot =
-                (word_end_bit + metadata.header.payload_bits - 1)
-                / metadata.header.payload_bits;
-        for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
-            const EmbeddingPhysicalCoordinate coordinate =
-                    embedding_physical_coordinate(
-                            slot, metadata.header.run,
-                            metadata.header.features);
-            if (coordinate.row >= metadata.header.run
-                    || coordinate.column >= metadata.header.features) {
-                continue;
-            }
-            const std::uint64_t destination_bit = embedding_plane_slot(
-                    0, coordinate.row, coordinate.column,
-                    metadata.header.run, metadata.header.features)
-                    * metadata.header.payload_bits;
-            const std::uint64_t index_bit = embedding_plane_slot(
-                    index_plane, 0, coordinate.row, 1,
-                    metadata.header.run) * metadata.header.index_bits;
-            const std::uint64_t index = embedding_read_bits(
-                    indices, index_bit, metadata.header.index_bits);
-            const bool negative = metadata.header.index_signed != 0
-                    && ((index >> (metadata.header.index_bits - 1)) & 1u) != 0;
-            if (negative || index >= metadata.header.vocabulary) {
-                atomicOr(status, std::uint32_t{1});
-                continue;
-            }
-            const std::uint64_t source_bit = embedding_plane_slot(
-                    metadata.header.table_plane, index, coordinate.column,
-                    metadata.header.vocabulary,
-                    metadata.header.features)
-                    * metadata.header.payload_bits;
-            const std::uint64_t value = embedding_read_bits(
-                    table, source_bit, metadata.header.payload_bits);
-            embedding_merge_overlap(
-                    destination, value, destination_bit, word_first_bit,
-                    word_end_bit, metadata.header.payload_bits);
-        }
-        output_words[word_in_plane] = destination;
+        embedding_one_word(
+                table, indices, output, status, metadata, global);
     }
 }
 
