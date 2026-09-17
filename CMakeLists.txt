@@ -130,17 +130,25 @@ if(TTNN_ENABLED)
         message(FATAL_ERROR
                 "TTNN SDK is missing required TT::Metalium or TTNN::TTNN targets")
     endif()
+    if(NOT DEFINED ENV{TT_METAL_HOME}
+            OR NOT IS_DIRECTORY "$ENV{TT_METAL_HOME}/ttnn/cpp")
+        message(FATAL_ERROR
+                "TTNN_ENABLED requires TT_METAL_HOME/ttnn/cpp for "
+                "the preallocated RMSNorm adapter")
+    endif()
 
     add_library(iom_ttnn STATIC
         src/ttnn/device.cpp
         src/ttnn/queue.cpp
         src/ttnn/queue_copy.cpp
         src/ttnn/device_types.cpp
+        src/ttnn/rmsnorm_device_operation.cpp
         src/ttnn/device_internal.hpp
         src/ttnn/queue_internal.hpp
         src/ttnn/copy.cpp
         src/ttnn/testing.cpp
         src/ttnn/binary.cpp
+        src/ttnn/rmsnorm_device_operation.hpp
         src/ttnn/copy.hpp
         src/ttnn/registry_state.hpp
         src/ttnn/testing_internal.hpp
@@ -151,8 +159,10 @@ if(TTNN_ENABLED)
     target_include_directories(iom_ttnn
         PUBLIC
             ${PROJECT_SOURCE_DIR}/include
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/ttnn
+            "$ENV{TT_METAL_HOME}/ttnn/cpp"
     )
-
     target_link_libraries(iom_ttnn
         PRIVATE
             libiom

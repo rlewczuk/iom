@@ -418,9 +418,9 @@ must record that fact rather than adding an example.
 
 Other compute hooks (`silu`, `linear`, and `sdpa`) remain unsupported and
 return negative `Unsupported` before submission, mutation, or token acceptance.
-CUDA and ROCm now provide source-inspected RMSNorm launch wrappers over the
-shared core; the remaining backends keep reporting RMSNorm `Unsupported` until
-their own ports land.
+CUDA and ROCm provide source-inspected RMSNorm launch wrappers over the shared
+core, and TTNN now provides its preallocated BF16/F32 queue path; only
+backends without one of those ports keep reporting RMSNorm `Unsupported`.
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
@@ -2758,10 +2758,10 @@ workspace failures, device rejection, accepted failures, and repeated waits.
 
 This is the operation-owned contract for `DeviceOps::rmsnorm`. The common
 facade, its admission rules, and its pure requirement query are declared and
-frozen here. CUDA and ROCm now provide their own source-inspected launch
-wrappers over the shared core; the remaining backends report the operation
-`Unsupported` exactly as section 9 states above, and an unsupported port
-never counts as numerical conformance. The exact ABI is:
+frozen here. CUDA and ROCm provide their own source-inspected launch wrappers
+over the shared core, and TTNN provides a preallocated BF16/F32 queue path;
+the remaining backends report the operation `Unsupported` exactly as section 9
+states above, and an unsupported port never counts as numerical conformance.
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
@@ -2948,6 +2948,19 @@ floating leaves. `src/rocm/copy.hip` invokes the shared
 nonblocking stream, preserving the device-local logical-`F` reduction,
 FP32/FP64 accumulator domains, one destination encode, and zero-workspace
 queue protocol.
+**TTNN capability and implementation evidence.** `src/ttnn/device_types.cpp`
+classifies the complete RMSNorm matrix and `TtnnQueue` advertises only BF16
+and F32. `src/ttnn/queue.cpp` snapshots and registers all three native
+per-plane owners, submits one preallocated adapter launch for every mapped
+leading plane under the TTNN API mutex and mesh queue, and retains or
+quarantines those owners until native completion is proven. The adapter binds
+the caller's output plane directly, so no output relocation, host roundtrip,
+positive workspace, or hidden host arithmetic participates. Logical feature
+width alone reaches the preallocated primitive; physical tile padding and
+untouched planes remain outside the reduction and write mapping. The TTNN
+conformance driver owns the BF16/F32 capability probe and future bounded
+remote runtime gate.
+
 
 The common owner is `src/device_ops_rmsnorm.cpp` behind
 `include/iom/iom.hpp`. `test/test_iom.cpp` owns signature/cutover, query

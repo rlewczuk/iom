@@ -32,6 +32,7 @@ class TtnnQueue final : public DeviceOps {
         std::optional<ttnn_detail::CopySnapshot> destination;
         bool no_op = false;
         bool is_binary = false;
+        bool is_rmsnorm = false;
         DeviceOps::BinaryOperation operation =
                 DeviceOps::BinaryOperation::Add;
         ttnn_detail::BinaryRequest binary_request{
@@ -39,8 +40,10 @@ class TtnnQueue final : public DeviceOps {
                 {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
                 {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
                 TensorShape{{1, 1}}};
+        std::optional<RmsnormRequest> rmsnorm_request;
         void* fence = nullptr;
         detail::BinaryEntryRegistration binary_entries{};
+        detail::BinaryEntryRegistration rmsnorm_entries{};
         detail::WorkspaceLease workspace_lease{};
         detail::EntryId source_entry_id = 0;
         detail::EntryId destination_entry_id = 0;
@@ -70,11 +73,24 @@ class TtnnQueue final : public DeviceOps {
             : sequence(sequence_), is_binary(true), operation(operation_),
               binary_request(request), binary_entries(entries),
               workspace_lease(workspace_lease_) {}
+
+        Task(
+                std::uint64_t sequence_, const RmsnormRequest& request,
+                detail::BinaryEntryRegistration entries)
+            : sequence(sequence_), is_rmsnorm(true),
+              rmsnorm_request(request), rmsnorm_entries(entries) {}
     };
 
     struct BinaryOutcome {
         detail::BinaryEntryRegistration entries;
         detail::WorkspaceLease workspace_lease;
+        bool native_work_submitted = false;
+        bool native_completion_proven = false;
+        std::exception_ptr retained_failure;
+    };
+
+    struct RmsnormOutcome {
+        detail::BinaryEntryRegistration entries;
         bool native_work_submitted = false;
         bool native_completion_proven = false;
         std::exception_ptr retained_failure;
@@ -88,10 +104,13 @@ public:
             const TensorView& source,
             TensorView& destination) override;
     oid binary_impl(const BinaryRequest& request) override;
-
+    oid rmsnorm_impl(const RmsnormRequest& request) override;
+    [[nodiscard]] bool rmsnorm_supported(
+            DataType data_type) const override;
 private:
     void execute(Task& task);
     void execute_copy(Task& task);
+    void execute_rmsnorm(Task& task);
     void publish_native_completion(std::uint64_t sequence) noexcept;
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure);
@@ -100,6 +119,7 @@ private:
 
     TtnnDevice* device_;
     std::map<std::uint64_t, BinaryOutcome> binary_outcomes_;
+    std::map<std::uint64_t, RmsnormOutcome> rmsnorm_outcomes_;
     detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
     std::mutex submission_order_mutex_;

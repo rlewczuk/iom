@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "testing_internal.hpp"
+#include "rmsnorm_device_operation.hpp"
 
 namespace iom::ttnn_detail {
 namespace {
@@ -198,8 +198,99 @@ oid TtnnQueue::binary_impl(const BinaryRequest& request) {
                 }
             });
 }
+oid TtnnQueue::rmsnorm_impl(const RmsnormRequest& request) {
+    std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+    const detail::Fence fence = ttnn_detail::build_ttnn_fence(*device_);
+    return submit_rmsnorm(
+            request, *state_, registry_queue_id_, fence,
+            [this](std::uint64_t sequence, const RmsnormRequest& captured,
+                   detail::BinaryEntryRegistration entries) {
+                Task task(sequence, captured, entries);
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] = rmsnorm_outcomes_.emplace(
+                                sequence,
+                                RmsnormOutcome{task.rmsnorm_entries});
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    "duplicate TTNN RMSNorm sequence");
+                        }
+                    }
+                    worker_.submit_after_publish(std::move(task));
+                } catch (...) {
+                    bool rollback_outcome = false;
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        rollback_outcome =
+                                rmsnorm_outcomes_.erase(sequence) != 0;
+                    }
+                    if (rollback_outcome) {
+                        state_->registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(),
+                                        entries.count));
+                    }
+                    std::rethrow_exception(std::current_exception());
+                }
+            });
+}
+bool TtnnQueue::rmsnorm_supported(DataType data_type) const {
+    return ttnn_detail::rmsnorm_supported(data_type);
+}
+
+void TtnnQueue::execute_rmsnorm(Task& task) {
+    bool submitted = false;
+    std::exception_ptr submission_failure;
+    try {
+        std::lock_guard<std::mutex> api_lock(device_->api_mutex());
+        const RmsnormRequest& request = *task.rmsnorm_request;
+        const auto* const x_planes =
+                static_cast<const ttnn::Tensor*>(request.x.native_handle);
+        const auto* const scale_planes =
+                static_cast<const ttnn::Tensor*>(
+                        request.scale.native_handle);
+        auto* const out_planes =
+                static_cast<ttnn::Tensor*>(request.out.native_handle);
+        const std::size_t plane_count =
+                ttnn_detail::snapshot_plane_count(request.x.spec);
+        for (std::size_t index = 0; index < plane_count; ++index) {
+            const std::size_t x_plane =
+                    ttnn_detail::snapshot_owner_plane_at(
+                            request.x.spec, request.x.plane_offset,
+                            request.x.plane_strides, index);
+            const std::size_t out_plane =
+                    ttnn_detail::snapshot_owner_plane_at(
+                            request.out.spec, request.out.plane_offset,
+                            request.out.plane_strides, index);
+            // Mark the sequence as having potentially reached native code
+            // before invoking the adapter. If the SDK throws after accepting
+            // a launch, completion must take the conservative drain path.
+            submitted = true;
+            static_cast<void>(ttnn_detail::launch_preallocated_rmsnorm(
+                    device_->mesh(), static_cast<ttnn::QueueId>(0),
+                    x_planes[x_plane], scale_planes[request.scale.plane_offset],
+                    out_planes[out_plane], request.epsilon));
+        }
+    } catch (...) {
+        submission_failure = std::current_exception();
+    }
+    {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
+        const auto it = rmsnorm_outcomes_.find(task.sequence);
+        if (it != rmsnorm_outcomes_.end()) {
+            it->second.retained_failure = submission_failure;
+            it->second.native_work_submitted = submitted;
+        }
+    }
+    executed_seq_.store(task.sequence, std::memory_order_release);
+}
 
 void TtnnQueue::execute(Task& task) {
+    if (task.is_rmsnorm) {
+        execute_rmsnorm(task);
+        return;
+    }
     if (task.is_binary) {
         bool submitted = false;
         bool completion_proven = false;
@@ -293,16 +384,50 @@ void TtnnQueue::publish_native_completion(std::uint64_t sequence) noexcept {
 
 void TtnnQueue::complete_task(
         std::uint64_t sequence, std::exception_ptr failure) {
+    RmsnormOutcome rmsnorm_outcome;
+    bool is_rmsnorm = false;
     BinaryOutcome binary_outcome;
     bool is_binary = false;
     {
         std::lock_guard<std::mutex> lock(outcome_mutex_);
-        const auto it = binary_outcomes_.find(sequence);
-        if (it != binary_outcomes_.end()) {
-            binary_outcome = std::move(it->second);
-            binary_outcomes_.erase(it);
+        const auto rmsnorm_it = rmsnorm_outcomes_.find(sequence);
+        if (rmsnorm_it != rmsnorm_outcomes_.end()) {
+            rmsnorm_outcome = std::move(rmsnorm_it->second);
+            rmsnorm_outcomes_.erase(rmsnorm_it);
+            is_rmsnorm = true;
+        }
+        const auto binary_it = binary_outcomes_.find(sequence);
+        if (!is_rmsnorm && binary_it != binary_outcomes_.end()) {
+            binary_outcome = std::move(binary_it->second);
+            binary_outcomes_.erase(binary_it);
             is_binary = true;
         }
+    }
+    if (is_rmsnorm) {
+        detail::FenceResult fence_result = detail::FenceResult::success();
+        bool completion_proven = rmsnorm_outcome.native_completion_proven;
+        if (!rmsnorm_outcome.native_work_submitted) {
+            completion_proven = true;
+        }
+        if (rmsnorm_outcome.native_work_submitted && !completion_proven) {
+            fence_result = ttnn_detail::finish_native(*device_);
+            completion_proven =
+                    fence_result.succeeded && !fence_result.failure;
+            if (completion_proven) {
+                publish_native_completion(sequence);
+            }
+        }
+        const std::exception_ptr operation_failure =
+                failure ? failure : rmsnorm_outcome.retained_failure;
+        const bool fence_succeeded =
+                fence_result.succeeded && !fence_result.failure;
+        (void)detail::release_or_invalidate_binary_entries(
+                state_->registry, rmsnorm_outcome.entries,
+                static_cast<bool>(operation_failure) && !completion_proven,
+                fence_succeeded);
+        complete(sequence, operation_failure
+                ? operation_failure : fence_result.failure);
+        return;
     }
     if (is_binary) {
         detail::FenceResult fence_result = detail::FenceResult::success();

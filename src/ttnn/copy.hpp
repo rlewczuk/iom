@@ -18,6 +18,13 @@ struct CopySnapshot {
     std::size_t plane_offset;
     std::vector<std::size_t> plane_strides;
 };
+std::size_t snapshot_plane_count(const CopySnapshot&);
+std::size_t snapshot_plane_count(const TensorSpec&);
+std::size_t snapshot_owner_plane_at(
+        const CopySnapshot&, std::size_t index);
+std::size_t snapshot_owner_plane_at(
+        const TensorSpec&, std::size_t plane_offset,
+        std::span<const std::size_t> plane_strides, std::size_t index);
 void copy_planes(const CopySnapshot&, const ttnn::Tensor*, const CopySnapshot&, ttnn::Tensor*, bool&);
 std::size_t carrier_bytes(tt::tt_metal::DataType);
 std::size_t upload_slot_index(tt::tt_metal::DataType);

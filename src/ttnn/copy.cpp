@@ -85,7 +85,7 @@ namespace iom::ttnn_detail {
             }
             return plane;
         }
-        std::size_t snapshot_plane_count(const CopySnapshot& view) {
+        std::size_t snapshot_plane_count_impl(const CopySnapshot& view) {
             const std::span<const std::size_t> dimensions =
                     view.spec.shape.dimensions();
             std::size_t planes = 1;
@@ -95,7 +95,7 @@ namespace iom::ttnn_detail {
             return planes;
         }
 
-        std::size_t snapshot_owner_plane_at(
+        std::size_t snapshot_owner_plane_at_impl(
                 const CopySnapshot& view, std::size_t index) {
             const std::span<const std::size_t> dimensions =
                     view.spec.shape.dimensions();
@@ -107,6 +107,7 @@ namespace iom::ttnn_detail {
             }
             return plane;
         }
+
 
 
         // Native staging uses whole carrier cells; public logical encodings
@@ -260,6 +261,38 @@ namespace iom::ttnn_detail {
                     view.spec().shape.rank() - 1);
         }
     }  // namespace
+    std::size_t snapshot_plane_count(const CopySnapshot& view) {
+        return snapshot_plane_count_impl(view);
+    }
+
+    std::size_t snapshot_owner_plane_at(
+            const CopySnapshot& view, std::size_t index) {
+        return snapshot_owner_plane_at_impl(view, index);
+    }
+    std::size_t snapshot_plane_count(const TensorSpec& spec) {
+        const std::span<const std::size_t> dimensions =
+                spec.shape.dimensions();
+        std::size_t planes = 1;
+        for (std::size_t i = 0; i + 2 < dimensions.size(); ++i) {
+            planes *= dimensions[i];
+        }
+        return planes;
+    }
+
+    std::size_t snapshot_owner_plane_at(
+            const TensorSpec& spec, std::size_t plane_offset,
+            std::span<const std::size_t> plane_strides,
+            std::size_t index) {
+        const std::span<const std::size_t> dimensions =
+                spec.shape.dimensions();
+        const std::size_t leading_rank = dimensions.size() - 2;
+        std::size_t plane = plane_offset;
+        for (std::size_t k = leading_rank; k-- > 0;) {
+            plane += (index % dimensions[k]) * plane_strides[k];
+            index /= dimensions[k];
+        }
+        return plane;
+    }
 
     void region_from_host(
             tt::tt_metal::distributed::MeshDevice& device,

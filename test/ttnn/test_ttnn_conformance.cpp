@@ -892,12 +892,147 @@ TEST_CASE("TTNN conformance: deferred queue lifetime and stability") {
             *devices.candidate, iom::ttnn_supported_data_types());
 }
 
-TEST_CASE("TTNN conformance: compute methods reject capability without submitting") {
+TEST_CASE("TTNN conformance: compute capabilities and RMSNorm queue") {
     require_hardware();
     TtnnDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, iom::ttnn_supported_data_types(), nullptr,
-            "TTNN", true);
+            "TTNN", true, true);
+}
+TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
+    require_hardware();
+    TtnnDevices devices;
+
+    const auto run_identity = [&](iom::DataType type) {
+        const iom::TensorSpec input_spec{
+                iom::TensorShape{{2, 2, 17}}, type};
+        const iom::TensorSpec scale_spec{
+                iom::TensorShape{{1, 17}}, type};
+        auto input = devices.candidate->create_tensor(input_spec);
+        auto scale = devices.candidate->create_tensor(scale_spec);
+        auto output = devices.candidate->create_tensor(input_spec);
+
+        const std::size_t element_bytes = type == iom::DataType::BF16 ? 2 : 4;
+        const std::size_t input_elements = 2 * 2 * 17;
+        const std::size_t scale_elements = 17;
+        std::vector<std::byte> input_bytes(input_spec.logical_nbytes());
+        std::vector<std::byte> scale_bytes(scale_spec.logical_nbytes());
+        const std::uint16_t bf16_one = 0x3F80;
+        const std::uint32_t f32_one = 0x3F800000;
+        for (std::size_t index = 0; index < input_elements; ++index) {
+            const void* value = type == iom::DataType::BF16
+                    ? static_cast<const void*>(&bf16_one)
+                    : static_cast<const void*>(&f32_one);
+            std::memcpy(
+                    input_bytes.data() + index * element_bytes, value,
+                    element_bytes);
+        }
+        for (std::size_t index = 0; index < scale_elements; ++index) {
+            const void* value = type == iom::DataType::BF16
+                    ? static_cast<const void*>(&bf16_one)
+                    : static_cast<const void*>(&f32_one);
+            std::memcpy(
+                    scale_bytes.data() + index * element_bytes, value,
+                    element_bytes);
+        }
+        iom_conformance::copy_from_host(input->view(), input_bytes);
+        iom_conformance::copy_from_host(scale->view(), scale_bytes);
+        std::vector<std::byte> zero_output(input_spec.logical_nbytes());
+        iom_conformance::copy_from_host(output->view(), zero_output);
+
+        iom::TensorView input_plane = input->view().slice(0, 1, 1);
+        iom::TensorView output_plane = output->view().slice(0, 1, 1);
+        void* const output_handle = output_plane.native_handle();
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token = queue->rmsnorm(
+                input_plane, scale->view(), output_plane, 0.0F);
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+        CHECK_EQ(output_plane.native_handle(), output_handle);
+
+        std::vector<std::byte> observed(output_plane.spec().logical_nbytes());
+        iom_conformance::copy_to_host(output_plane, observed);
+        std::vector<std::byte> expected(observed.size(), std::byte{0});
+        for (std::size_t index = 0; index < observed.size();
+             index += element_bytes) {
+            const std::uint32_t value =
+                    type == iom::DataType::BF16 ? bf16_one : f32_one;
+            std::memcpy(expected.data() + index, &value, element_bytes);
+        }
+        CHECK(observed == expected);
+    };
+
+    run_identity(iom::DataType::BF16);
+    run_identity(iom::DataType::F32);
+
+    {
+        const iom::TensorSpec input_spec{
+                iom::TensorShape{{1, 1, 17}}, iom::DataType::F32};
+        const iom::TensorSpec scale_owner_spec{
+                iom::TensorShape{{2, 1, 17}}, iom::DataType::F32};
+        auto input = devices.candidate->create_tensor(input_spec);
+        auto scale_owner =
+                devices.candidate->create_tensor(scale_owner_spec);
+        auto output = devices.candidate->create_tensor(input_spec);
+
+        std::vector<float> input_values(17, 1.0F);
+        std::vector<float> scale_values(2 * 17, 2.0F);
+        std::fill(scale_values.begin() + 17, scale_values.end(), 3.0F);
+        std::vector<std::byte> input_bytes(input_spec.logical_nbytes());
+        std::vector<std::byte> scale_bytes(
+                scale_owner_spec.logical_nbytes());
+        std::memcpy(input_bytes.data(), input_values.data(),
+                    input_bytes.size());
+        std::memcpy(scale_bytes.data(), scale_values.data(),
+                    scale_bytes.size());
+        iom_conformance::copy_from_host(input->view(), input_bytes);
+        iom_conformance::copy_from_host(scale_owner->view(), scale_bytes);
+        std::vector<std::byte> zero_output(input_spec.logical_nbytes());
+        iom_conformance::copy_from_host(output->view(), zero_output);
+
+        const iom::TensorView transformed_scale =
+                scale_owner->view().select(0, 1);
+        CHECK_EQ(transformed_scale.plane_offset(), std::size_t{1});
+        auto queue = devices.candidate->create_ops();
+        const iom::oid token = queue->rmsnorm(
+                input->view(), transformed_scale, output->view(), 0.0F);
+        REQUIRE(iom::oid_is_token(token));
+        REQUIRE_NOTHROW(queue->wait(token));
+
+        std::vector<std::byte> observed(input_spec.logical_nbytes());
+        iom_conformance::copy_to_host(output->view(), observed);
+        for (std::size_t index = 0; index < input_values.size(); ++index) {
+            float observed_value = 0.0F;
+            std::memcpy(&observed_value, observed.data() +
+                                             index * sizeof(float),
+                        sizeof(float));
+            CHECK_EQ(observed_value, 3.0F);
+        }
+    }
+
+    const iom::DataType unsupported[] = {
+            iom::DataType::BOOL, iom::DataType::I2, iom::DataType::U2,
+            iom::DataType::I4, iom::DataType::U4, iom::DataType::I8,
+            iom::DataType::U8, iom::DataType::I16, iom::DataType::U16,
+            iom::DataType::I32, iom::DataType::U32, iom::DataType::I64,
+            iom::DataType::U64, iom::DataType::F4_E2M1,
+            iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+            iom::DataType::F16, iom::DataType::F64};
+    for (const iom::DataType type : unsupported) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{2, 16, 16}}, type};
+        const iom::TensorSpec scale_spec{
+                iom::TensorShape{{1, 16}}, type};
+        auto input = devices.candidate->create_tensor(spec);
+        auto scale = devices.candidate->create_tensor(scale_spec);
+        auto output = devices.candidate->create_tensor(spec);
+        auto queue = devices.candidate->create_ops();
+        CHECK_EQ(
+                queue->rmsnorm(
+                        input->view(), scale->view(), output->view(), 1e-6F),
+                iom::to_oid(iom::OidError::Unsupported));
+    }
 }
 
 // TTNN's declared embedding expectation: the explicitly temporary one-carrier
