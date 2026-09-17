@@ -81,16 +81,12 @@ bool consume_submission_fault(
 
 namespace iom::cuda_detail {
 
-// Conservative RMSNorm wrapper. The shared 16x16 tiled device operation is
-// compiled and explicitly instantiated below, but CUDA does not yet launch
-// it: the RMSNorm wrapper leaf replaces this body with the shared launch on
-// the queue's existing nonblocking stream. Until then the operation reports
-// the established Unsupported outcome instead of a stub success.
+// CUDA's RMSNorm leaf delegates to the shared logical-row kernel. The queue
+// supplies its already-created nonblocking stream and immutable descriptor;
+// this wrapper adds no stream, allocation, staging, or synchronization.
 void gpu_policy::launch_rmsnorm(
         cudaStream_t stream, const detail::RmsnormMetadata& metadata) {
-    static_cast<void>(stream);
-    static_cast<void>(metadata);
-    throw detail::UnsupportedOperation();
+    detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
 
 void inject_submission_fault_for_testing(

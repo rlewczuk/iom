@@ -249,7 +249,7 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     CudaDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CUDA", true);
+            &devices.gate, "CUDA", true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -284,7 +284,7 @@ TEST_CASE("CUDA conformance: full shared suite") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true);
+            &devices.gate, &oracle, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 

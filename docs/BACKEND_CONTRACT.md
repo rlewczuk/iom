@@ -416,11 +416,11 @@ must record that fact rather than adding an example.
 
 ### 9. Other compute capabilities
 
-Other compute hooks (`silu`, `linear`, `rmsnorm`, and `sdpa`) remain unsupported
-and return negative `Unsupported` before submission, mutation, or token
-acceptance. The RMS normalization ABI and its common admission contract are
-already frozen by [RMS normalization](#rms-normalization); every backend keeps
-reporting that operation `Unsupported` until its own port lands.
+Other compute hooks (`silu`, `linear`, and `sdpa`) remain unsupported and
+return negative `Unsupported` before submission, mutation, or token acceptance.
+CUDA and ROCm now provide source-inspected RMSNorm launch wrappers over the
+shared core; the remaining backends keep reporting RMSNorm `Unsupported` until
+their own ports land.
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
@@ -2242,7 +2242,7 @@ OID after a failure.
 | --- | --- |
 | gather | Contract-compatible device kernel for integral index payloads and bit-preserving BF16 table values; a device-discovered bad index must become an accepted retained failure. WMMA is irrelevant. A host index scan or round trip is forbidden. Current implementation remains blocked. |
 | matmul | Supported feasibility on the sampled CC 12.0 device by direct BF16/FP32 WMMA with tile-local standard-layout staging. Global owner layout, arbitrary `s`, transformed leading strides, and physical tails are incompatible with direct unguarded `load_matrix_sync`; the bounded staging above is required. |
-| reduction | Contract-compatible FP32 CUDA block/warp reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions must exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. Current kernels remain blocked. |
+| reduction | Contract-compatible FP32 CUDA block/warp reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions must exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. The CUDA RMSNorm wrapper is source-inspected; linear and softmax kernels remain blocked pending their own ports. |
 | trig | Contract-compatible CUDA device FP32/wide-domain sine and cosine with finite positive `theta`; it neither uses nor is evidenced by WMMA. A host math substitute is forbidden. Current RoPE kernel remains blocked. |
 | partial-tile copy | Existing CUDA standard-tiled copy machinery establishes device-local tile addressing, but not neural matrix support. A native port must use guarded logical loads/stores and neutral shared cells so owner padding, cache capacity tail, and rows outside `R` are unobservable. |
 | unary | Contract-compatible CUDA device FP32/wide-domain SiLU and BF16 RNE output. It is elementwise by design and is not an invalid matrix substitute. Current kernel remains blocked. |
@@ -4187,8 +4187,9 @@ driver supplies its own explicit expected payload and index spans, and common
 code never switches on backend kind. An unported backend keeps an empty
 embedding span and asserts `Unsupported` only; that rejection probe is not
 gather conformance. The existing copy/add/mul/sub/div suites and the `silu`,
-`linear`, `rmsnorm`, and `sdpa` `Unsupported` probes remain unchanged until
-their own operation leaves migrate them.
+`linear`, and `sdpa` `Unsupported` probes remain unchanged until their own
+operation leaves migrate them; RMSNorm now has backend-owned CUDA and ROCm
+launch wrappers, while its shared conformance helper remains task-owned.
 
 Each driver declares through `iom_conformance::EmbeddingDeclaration` the
 payload and index matrix its port must reach (with `staged` set exactly while
