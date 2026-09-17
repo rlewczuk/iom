@@ -2758,9 +2758,10 @@ workspace failures, device rejection, accepted failures, and repeated waits.
 
 This is the operation-owned contract for `DeviceOps::rmsnorm`. The common
 facade, its admission rules, and its pure requirement query are declared and
-frozen here; no backend port has landed yet, so every backend currently
-reports the operation `Unsupported` exactly as section 9 states above, and an
-unsupported port never counts as numerical conformance. The exact ABI is:
+frozen here. CUDA and ROCm now provide their own source-inspected launch
+wrappers over the shared core; the remaining backends report the operation
+`Unsupported` exactly as section 9 states above, and an unsupported port
+never counts as numerical conformance. The exact ABI is:
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
@@ -2930,12 +2931,23 @@ leading planes and rows, a logical-`F`-only traversal that never reads or
 writes tile padding, the frozen FP32 accumulator (FP64 for `F64`) with the
 special-value and signed-zero rules above, and exactly one
 round-to-nearest-even output encode with no host decode, hidden transfer, or
-hidden allocation. Each backend contributes only its own `gpu_policy`
-launcher, which must use the queue's already-created nonblocking stream.
-This core does not claim either backend enabled: until the CUDA and ROCm
-wrapper leaves implement those launch callbacks, both backends keep reporting
-`Unsupported` for every applicable leaf, and an unlaunched accepted request
-is a terminal failure rather than stub success.
+hidden allocation. Each backend contributes only its own `gpu_policy` launcher,
+which must use the queue's already-created nonblocking stream. The CUDA
+launcher in `src/cuda/copy.cu` calls the shared
+`launch_standard_tiled_rmsnorm` kernel directly on that stream, while
+`src/cuda/copy.hpp` advertises all nine applicable signed floating leaves.
+This source-inspected capability evidence does not claim hardware execution;
+the future CUDA conformance target owns that gate. ROCm supplies the
+corresponding wrapper in its backend leaf, while any backend without its own
+wrapper remains Unsupported.
+
+**ROCm capability and implementation evidence.** `src/rocm/copy.hpp` exposes
+the ROCm policy's immutable RMSNorm capability for the nine applicable
+floating leaves. `src/rocm/copy.hip` invokes the shared
+`launch_standard_tiled_rmsnorm` HIP kernel on the queue's existing
+nonblocking stream, preserving the device-local logical-`F` reduction,
+FP32/FP64 accumulator domains, one destination encode, and zero-workspace
+queue protocol.
 
 The common owner is `src/device_ops_rmsnorm.cpp` behind
 `include/iom/iom.hpp`. `test/test_iom.cpp` owns signature/cutover, query

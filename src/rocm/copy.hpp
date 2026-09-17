@@ -271,18 +271,16 @@ struct gpu_policy {
 
     // RMSNorm seams. The complete backend-parameterized device operation
     // lives in src/shared/standard_tiled_rmsnorm.inl; the ROCm RMSNorm
-    // wrapper leaf implements launch_rmsnorm in copy.hip to launch it on the
-    // queue's existing nonblocking stream. Until that wrapper lands the
-    // operation stays conservatively Unsupported: the capability predicate
-    // rejects every request before admission, and this callback reports the
-    // same terminal outcome instead of a stub success.
+    // wrapper leaf launches it on the queue's existing nonblocking stream.
+    // Common admission has already restricted this immutable capability
+    // predicate to the nine applicable floating leaves.
     [[nodiscard]] static constexpr const char* rmsnorm_kernel_operation()
             noexcept {
-        return "HIP kernel launch";
+        return "HIP RMSNorm kernel launch";
     }
 
     [[nodiscard]] static constexpr bool rmsnorm_supported() noexcept {
-        return false;
+        return true;
     }
 
     static void launch_rmsnorm(

@@ -80,16 +80,12 @@ bool consume_submission_fault(
 
 namespace iom::rocm_detail {
 
-// Conservative RMSNorm wrapper. The shared 16x16 tiled device operation is
-// compiled and explicitly instantiated below, but ROCm does not yet launch
-// it: the RMSNorm wrapper leaf replaces this body with the shared launch on
-// the queue's existing nonblocking stream. Until then the operation reports
-// the established Unsupported outcome instead of a stub success.
+// Launch the completed shared standard-tiled logical-F RMSNorm operation on
+// the queue's existing nonblocking stream. The wrapper performs no host
+// arithmetic, staging, allocation, or synchronization.
 void gpu_policy::launch_rmsnorm(
         hipStream_t stream, const detail::RmsnormMetadata& metadata) {
-    static_cast<void>(stream);
-    static_cast<void>(metadata);
-    throw detail::UnsupportedOperation();
+    detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
 
 void inject_submission_fault_for_testing(

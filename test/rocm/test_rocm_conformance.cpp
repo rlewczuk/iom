@@ -392,7 +392,7 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
             0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_compute_capability_conformance(
             *candidate, candidate->supported_data_types(), &gate, "ROCm",
-            true);
+            true, true);
     CHECK_FALSE(gate.armed());
 }
 
@@ -441,7 +441,7 @@ TEST_CASE("ROCm conformance: full shared suite") {
     HipStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate, &oracle, true);
+            &gate, &oracle, true, true);
     CHECK_FALSE(gate.armed());
 }
 
