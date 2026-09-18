@@ -610,7 +610,16 @@ inline void run_compute_capability_conformance(
         }
     }
     CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
-    CHECK_EQ(queue->linear(x->view(), w->view(), y->view()), unsupported);
+    // The frozen linear ABI selects row `s` for `R` rows of the rank-two
+    // HF-oriented `[O,I]` weight. The rank-three probe fixture supplies that
+    // weight as its first `[16,16]` plane, so the request stays
+    // valid-shaped and observes capability rejection rather than structural
+    // validation without allocating another tensor.
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view().select(0, 0), y->view(), 0, 16,
+                    iom::LinearOutputLayout::ordinary, 1, 16),
+            unsupported);
     // The valid-shape `[2,16,16]`/`[1,16]` RMS normalization request
     // exercises the operation's own capability. Focused callers can provide
     // an explicit expectation; the full backend suite observes either the

@@ -75,6 +75,14 @@ namespace iom {
 
     }  // namespace detail
     /**
+     * Explicit output mode of the linear projection. The mode is an
+     * argument and is never inferred from the output rank: `ordinary`
+     * writes `out[...,R,O]` and requires `H=1,D=O`, while `head_planar`
+     * writes `out[...,H,R,D]` and requires the checked equality `O=H*D`.
+     * Any other value is invalid input.
+     */
+    enum class LinearOutputLayout { ordinary, head_planar };
+    /**
      * One in-order asynchronous operation queue over caller-created tensor
      * views. Every OID-returning operation is a common `noexcept` facade:
      * it validates, maps failures, encodes tokens, and registers lifetimes
@@ -200,8 +208,70 @@ namespace iom {
                 const TensorView& table, const TensorView& indices,
                 const TensorView& out);
         oid silu(const TensorView& x, TensorView& y) noexcept;
-        oid linear(const TensorView& x, const TensorView& w,
-                   TensorView& y) noexcept;
+        /**
+         * Bias-free blocked linear projection of independently selected
+         * input rows. `x` is `[...,T,I]` with rank two through eight and
+         * `w` is the rank-two Hugging Face `[O,I]` weight shared unchanged
+         * by every independent leading plane: output coordinate `o`
+         * selects weight row `w[o,*]`, so no checkpoint weight is ever
+         * transposed. `LinearOutputLayout` selects the output layout
+         * explicitly and is never inferred from the output rank.
+         * `ordinary` writes `[...,R,O]` and requires `H=1,D=O`;
+         * `head_planar` writes `[...,H,R,D]`, requires the checked equality
+         * `O=H*D`, and inserts one head axis without exceeding rank eight.
+         * The input and output leading tuples must match exactly after
+         * excluding that inserted head axis; the rank-two weight has no
+         * leading tuple and implies no leading-state broadcast.
+         *
+         * `s` selects the first source row and `R` the projected row count:
+         * `R > 0`, `s <= T`, and `R <= T-s`, so `R` is never confused with,
+         * inferred from, or wrapped around `T`, `s`, or `O`. `H` and `D`
+         * are the head count and head width and are both nonzero. The two
+         * equations are `out[b,r,o] = sum_i x[b,s+r,i] * w[o,i]` and
+         * `out[b,h,r,d] = sum_i x[b,s+r,i] * w[h*D+d,i]`; only the newly
+         * computed selected rows are written, and the final untied LM head
+         * is ordinary mode with `s=T-1`, `R=1`, `H=1`, and `D=O`.
+         *
+         * Admission precedes any backend effect: nonzero extents and rank,
+         * the exact output shape and layout relation, the leading tuple,
+         * the selected row window, rank growth, exact queue device
+         * identity, live owner and stable native handle, selected-plane
+         * bounds and transformed strides, checked element, byte, address,
+         * plane, tile, stride, and `H*D` arithmetic, then conservative
+         * output/input overlap, one applicable leaf and
+         * `QuantizationFormat::NONE` for all three views, and the immutable
+         * backend capability. Read/read aliasing between `x` and `w` is
+         * valid, and exact aliases deduplicate their owner registration;
+         * output storage stays disjoint from both inputs and from the
+         * workspace. A supplied workspace is validated only against the
+         * requirement reported by `linear_workspace_requirements`, after
+         * that capability query: a positive requirement needs a live,
+         * sufficient, required-alignment range disjoint from every operand
+         * and the output, while a zero requirement neither validates nor
+         * leases an unused range. Negative results are synchronous errors
+         * that consume no token, and positive values are accepted tokens
+         * whose retained failures rethrow on every wait.
+         *
+         * `linear_workspace_requirements` is pure and deterministic: it
+         * runs exactly the same validation and consults the same backend
+         * capability without allocating, constructing a view snapshot or
+         * request, registering an owner, acquiring a lease, consuming a
+         * sequence, reading data, mutating queue state, or submitting, and
+         * without depending on queue occupancy or completion state. Both
+         * backend hooks default to `Unsupported`, so a backend advertises
+         * this operation only by overriding them, and the operation-owned
+         * Linear projections section of `docs/BACKEND_CONTRACT.md` remains
+         * the normative source for per-backend payload, workspace, status,
+         * and failure policy.
+         */
+        oid linear(const TensorView& x, const TensorView& w, TensorView& out,
+                   std::size_t s, std::size_t R, LinearOutputLayout layout,
+                   std::size_t H, std::size_t D,
+                   RawWorkspaceView workspace = {}) noexcept;
+        [[nodiscard]] WorkspaceRequirements linear_workspace_requirements(
+                const TensorView& x, const TensorView& w,
+                const TensorView& out, std::size_t s, std::size_t R,
+                LinearOutputLayout layout, std::size_t H, std::size_t D);
         /**
          * Common `noexcept` facade for RMS normalization. `x` and `out` have
          * identical logical `[...,R,F]` shape with rank two through eight and
@@ -269,6 +339,22 @@ namespace iom {
             bool broadcasts;
         };
         struct CopyViewSnapshot {
+            TensorSpec spec;
+            const Device* device_identity;
+            const Tensor* owner_identity;
+            void* native_handle;
+            std::size_t plane_offset;
+            std::vector<std::size_t> plane_strides;
+        };
+        /**
+         * Immutable admission snapshot of one linear projection operand:
+         * value-copied view metadata and the stable device, owner, and
+         * native-handle identities of that view. No callback may retain the
+         * caller's borrowed `TensorView` object, and snapshot values do not
+         * change when caller views or their backing metadata are mutated or
+         * destroyed.
+         */
+        struct LinearViewSnapshot {
             TensorSpec spec;
             const Device* device_identity;
             const Tensor* owner_identity;
@@ -347,6 +433,54 @@ namespace iom {
                   workspace_lease(other.workspace_lease) {}
         };
 
+        /**
+         * Immutable admission snapshot of one linear projection
+         * submission: value-copied view metadata and stable owner
+         * identities for the input, weight, and output operands, the
+         * validated row window `start_row`/`rows`, output mode `layout`,
+         * head scalars `heads`/`head_dim`, the validated caller workspace,
+         * the backend-reported requirement, and the workspace lease
+         * retained through proven completion. No callback may retain the
+         * caller's borrowed `TensorView` object, and no field changes after
+         * admission.
+         */
+        struct LinearRequest {
+            LinearViewSnapshot x;
+            LinearViewSnapshot w;
+            LinearViewSnapshot out;
+            std::size_t start_row;
+            std::size_t rows;
+            LinearOutputLayout layout;
+            std::size_t heads;
+            std::size_t head_dim;
+            RawWorkspaceView workspace;
+            WorkspaceRequirements workspace_requirements;
+            detail::WorkspaceLease workspace_lease;
+            LinearRequest(
+                    LinearViewSnapshot x_, LinearViewSnapshot w_,
+                    LinearViewSnapshot out_, std::size_t start_row_,
+                    std::size_t rows_, LinearOutputLayout layout_,
+                    std::size_t heads_, std::size_t head_dim_,
+                    RawWorkspaceView workspace_ = {},
+                    WorkspaceRequirements workspace_requirements_ = {},
+                    detail::WorkspaceLease workspace_lease_ = {})
+                : x(std::move(x_)), w(std::move(w_)), out(std::move(out_)),
+                  start_row(start_row_), rows(rows_), layout(layout_),
+                  heads(heads_), head_dim(head_dim_), workspace(workspace_),
+                  workspace_requirements(workspace_requirements_),
+                  workspace_lease(workspace_lease_) {}
+            LinearRequest(const LinearRequest&) = default;
+            LinearRequest& operator=(const LinearRequest&) = delete;
+            LinearRequest(LinearRequest&& other) noexcept
+                : x(std::move(other.x)), w(std::move(other.w)),
+                  out(std::move(other.out)), start_row(other.start_row),
+                  rows(other.rows), layout(other.layout),
+                  heads(other.heads), head_dim(other.head_dim),
+                  workspace(other.workspace),
+                  workspace_requirements(other.workspace_requirements),
+                  workspace_lease(other.workspace_lease) {}
+        };
+
         // Immutable host-side copy descriptor retained by admission. It
         // contains value-copied view metadata and stable owner identities; no
         // callback may retain the caller's borrowed view object.
@@ -398,8 +532,33 @@ namespace iom {
         virtual oid binary_impl(const BinaryRequest& request);
         virtual oid embedding_impl(const EmbeddingRequest& request);
         virtual oid silu_impl(const TensorView& x, TensorView& y);
-        virtual oid linear_impl(const TensorView& x, const TensorView& w,
-                                TensorView& y);
+        /**
+         * Immutable linear projection execution hook. It receives the
+         * already validated, admission-snapshotted request and queues the
+         * backend's own kernel for it; the default common implementation
+         * reports every request `Unsupported`, so a valid-shape linear
+         * request on an unported backend stays `Unsupported` before owner
+         * registration, sequence consumption, dispatch, or workspace
+         * leasing.
+         */
+        virtual oid linear_impl(const LinearRequest& request);
+        /**
+         * Backend hook behind `linear_workspace_requirements`. Receives the
+         * already fully validated views, row window, layout mode, and head
+         * scalars and must stay pure: no allocation, view snapshot or
+         * request construction, registration, lease, token/queue resource,
+         * submission, or retained view reference, and no dependence on free
+         * arena capacity, fragmentation, queue occupancy, or completion
+         * state. A backend that does not implement the operation throws
+         * `UnsupportedOperation` here, and common validation always precedes
+         * this capability decision.
+         */
+        [[nodiscard]] virtual WorkspaceRequirements
+                linear_workspace_requirements_impl(
+                        const TensorView& x, const TensorView& w,
+                        const TensorView& out, std::size_t s, std::size_t R,
+                        LinearOutputLayout layout, std::size_t H,
+                        std::size_t D);
         virtual oid rmsnorm_impl(const RmsnormRequest& request);
         /**
          * Immutable RMS normalization capability for one already validated
@@ -457,6 +616,27 @@ namespace iom {
         static void validate_copy(
                 const Device& device, const TensorView& source,
                 const TensorView& destination);
+        [[nodiscard]] static LinearViewSnapshot snapshot_linear_view(
+                const TensorView& view);
+        /**
+         * Complete common linear projection admission validation in the
+         * frozen contract order: recognized encodings, rank and nonzero
+         * extents, the exact output shape and layout relation, matching
+         * leading tuples, rank growth, the selected row window, then exact
+         * device identity, live owners, stable handles, selected-plane
+         * bounds and transformed strides with all checked arithmetic, then
+         * conservative output/input overlap, and finally one applicable
+         * leaf type with `QuantizationFormat::NONE` for all three views.
+         * Allocation-free and effect-free: it inspects live metadata only
+         * and builds no request or owned snapshot, so the pure requirement
+         * query shares exactly these checks. The backend capability is
+         * consulted afterwards by the operation's own hook.
+         */
+        static void validate_linear(
+                const Device& device, const TensorView& x,
+                const TensorView& w, const TensorView& out,
+                std::size_t s, std::size_t R, LinearOutputLayout layout,
+                std::size_t H, std::size_t D);
         static void validate_views(const Device& device,
                                    std::initializer_list<const TensorView*> views);
         [[nodiscard]] static bool identical_window(
@@ -792,6 +972,46 @@ namespace iom {
                 QueueWork queue_work) {
             const detail::Fence fence_copy = fence;
             return submit_embedding(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+
+        /**
+         * Shared prepared-ownership submission for one admitted linear
+         * projection: the distinct `x`, `w`, and `out` owners — with
+         * permitted read/read aliases deduplicated by the registration
+         * pass — and the optional leased workspace are retained through
+         * proven completion by the same all-or-nothing
+         * prepare/register/dispatch/rollback mechanism the binary and
+         * embedding paths use.
+         */
+        template <typename QueueWork>
+        oid submit_linear(
+                const LinearRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, FenceFactory build_fence,
+                QueueWork queue_work) {
+            return submit_three_owner_request(
+                    request,
+                    std::array<detail::BinaryOwnerRegistration, 3>{{
+                            {request.x.owner_identity,
+                             request.x.native_handle},
+                            {request.w.owner_identity,
+                             request.w.native_handle},
+                            {request.out.owner_identity,
+                             request.out.native_handle}}},
+                    state, queue_id, build_fence, std::move(queue_work));
+        }
+
+        // Constant-fence overload retained so existing callers that build
+        // the fence once per dispatch keep compiling unchanged.
+        template <typename QueueWork>
+        oid submit_linear(
+                const LinearRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_linear(
                     request, state, queue_id,
                     [fence_copy](std::uint64_t) { return fence_copy; },
                     std::move(queue_work));

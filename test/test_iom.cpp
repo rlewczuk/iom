@@ -28,6 +28,7 @@
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/alloc.hpp"
+#include "iom/cpu/device.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/tensor.hpp"
 
@@ -872,6 +873,13 @@ public:
         post_acceptance,
     };
 
+    enum class LinearFailure {
+        none,
+        bad_alloc,
+        dispatch_throw,
+        post_acceptance,
+    };
+
     struct Submission {
         std::uint64_t sequence;
         const char* op;
@@ -911,6 +919,20 @@ public:
     struct EmbeddingRecord {
         std::uint64_t sequence;
         std::array<AddViewRecord, 3> views;
+        iom::detail::BinaryEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
+        bool retained_failure;
+    };
+
+    struct LinearRecord {
+        std::uint64_t sequence;
+        std::array<AddViewRecord, 3> views;
+        std::size_t s;
+        std::size_t rows;
+        iom::LinearOutputLayout layout;
+        std::size_t heads;
+        std::size_t head_dim;
+        iom::WorkspaceRequirements workspace_requirements;
         iom::detail::BinaryEntryRegistration entries;
         iom::detail::WorkspaceLease workspace_lease;
         bool retained_failure;
@@ -986,6 +1008,40 @@ public:
     void set_embedding_requirements(
             iom::WorkspaceRequirements requirements) noexcept {
         embedding_requirements_ = requirements;
+    }
+
+    void set_linear_requirements(
+            iom::WorkspaceRequirements requirements) noexcept {
+        linear_requirements_ = requirements;
+    }
+
+    void inject_linear_failure(LinearFailure failure) noexcept {
+        next_linear_failure_ = failure;
+    }
+
+    [[nodiscard]] const std::vector<LinearRecord>& linear_records() const
+            noexcept {
+        return linear_records_;
+    }
+
+    // Plays the in-order completion of one accepted linear submission
+    // through the common DeviceOps machinery and releases or quarantines its
+    // owners, workspace lease, and entries exactly as a proven-completion
+    // worker would.
+    void finish_linear(std::uint64_t sequence) {
+        for (const LinearRecord& record : linear_records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_binary_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            iom::detail::complete_workspace_lease(
+                    registry_state_, record.workspace_lease, true);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake LINEAR sequence");
     }
 
     void inject_embedding_failure(EmbeddingFailure failure) noexcept {
@@ -1165,11 +1221,70 @@ protected:
         });
     }
 
-    iom::oid linear_impl(const iom::TensorView&, const iom::TensorView&,
-                         iom::TensorView&) override {
-        return submit([&](std::uint64_t sequence) {
-            submissions.push_back({sequence, "linear"});
-        });
+    iom::oid linear_impl(const LinearRequest& request) override {
+        const LinearFailure failure =
+                std::exchange(next_linear_failure_, LinearFailure::none);
+        if (failure == LinearFailure::bad_alloc) {
+            throw std::bad_alloc();
+        }
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_linear(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence,
+                        const LinearRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
+                    if (failure == LinearFailure::dispatch_throw) {
+                        throw std::runtime_error(
+                                "fake LINEAR post-link failure");
+                    }
+                    const auto record_view = [](const LinearViewSnapshot& view) {
+                        return AddViewRecord{
+                                view.spec,
+                                view.device_identity,
+                                view.owner_identity,
+                                view.native_handle,
+                                view.plane_offset,
+                                view.plane_strides,
+                                {},
+                                false,
+                                false,
+                                false};
+                    };
+                    LinearRecord record{
+                            sequence,
+                            {record_view(snapshot.x), record_view(snapshot.w),
+                             record_view(snapshot.out)},
+                            snapshot.start_row,
+                            snapshot.rows,
+                            snapshot.layout,
+                            snapshot.heads,
+                            snapshot.head_dim,
+                            snapshot.workspace_requirements,
+                            entries,
+                            snapshot.workspace_lease,
+                            failure == LinearFailure::post_acceptance};
+                    linear_records_.push_back(std::move(record));
+                    submissions.push_back({sequence, "linear"});
+                    if (failure == LinearFailure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake LINEAR retained failure")));
+                    }
+                });
+    }
+
+    // The pure requirement hook reports the fake backend's fixed policy and
+    // touches no view metadata, queue state, or allocation.
+    iom::WorkspaceRequirements linear_workspace_requirements_impl(
+            const iom::TensorView&, const iom::TensorView&,
+            const iom::TensorView&, std::size_t, std::size_t,
+            iom::LinearOutputLayout, std::size_t, std::size_t) override {
+        return linear_requirements_;
     }
 
     [[nodiscard]] bool rmsnorm_supported(
@@ -1255,6 +1370,9 @@ private:
     std::vector<EmbeddingRecord> embedding_records_;
     iom::WorkspaceRequirements embedding_requirements_{0, 1};
     EmbeddingFailure next_embedding_failure_ = EmbeddingFailure::none;
+    std::vector<LinearRecord> linear_records_;
+    iom::WorkspaceRequirements linear_requirements_{0, 1};
+    LinearFailure next_linear_failure_ = LinearFailure::none;
     bool admission_unavailable_ = false;
 
 };
@@ -2367,7 +2485,15 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
     static_assert(std::is_same_v<
         decltype(&DeviceOps::linear),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
-                                TensorView&) noexcept>);
+                                TensorView&, std::size_t, std::size_t,
+                                iom::LinearOutputLayout, std::size_t,
+                                std::size_t, iom::RawWorkspaceView) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::linear_workspace_requirements),
+        iom::WorkspaceRequirements (DeviceOps::*)(
+                const TensorView&, const TensorView&, const TensorView&,
+                std::size_t, std::size_t, iom::LinearOutputLayout,
+                std::size_t, std::size_t)>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::sub),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
@@ -2437,6 +2563,37 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         const TensorView&, const TensorView&, const TensorView&, float,
         iom::RawWorkspaceView>);
 
+    // The linear cutover keeps exactly the layout-aware argument list. The
+    // old three-view call form, any Tensor operand overload, and a
+    // requirement query receiving a workspace are gone: no overload, alias,
+    // compatibility shim, or re-export survives. The workspace view is
+    // named as an lvalue reference here because the by-value parameter
+    // cannot be initialized from an `is_invocable` rvalue: every
+    // `RawWorkspaceView` copy stays explicit, and the exact by-value
+    // signature is pinned above.
+    static_assert(std::is_invocable_v<
+        decltype(&DeviceOps::linear), DeviceOps*, const TensorView&,
+        const TensorView&, TensorView&, std::size_t, std::size_t,
+        iom::LinearOutputLayout, std::size_t, std::size_t,
+        const iom::RawWorkspaceView&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::linear), DeviceOps*, const TensorView&,
+        const TensorView&, TensorView&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::linear), DeviceOps*, const TensorView&,
+        const TensorView&, TensorView&, std::size_t, std::size_t,
+        std::size_t, std::size_t>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::linear), DeviceOps*, const iom::Tensor&,
+        const iom::Tensor&, iom::Tensor&, std::size_t, std::size_t,
+        iom::LinearOutputLayout, std::size_t, std::size_t,
+        const iom::RawWorkspaceView&>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::linear_workspace_requirements), DeviceOps*,
+        const TensorView&, const TensorView&, const TensorView&,
+        std::size_t, std::size_t, iom::LinearOutputLayout, std::size_t,
+        std::size_t, const iom::RawWorkspaceView&>);
+
     static_assert(!std::is_copy_constructible_v<DeviceOps>);
     static_assert(!std::is_move_constructible_v<DeviceOps>);
     static_assert(!std::is_copy_assignable_v<DeviceOps>);
@@ -2450,13 +2607,22 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     const FakeTensor& frozen = a;
     FakeTensor b = make_tensor(device, {2, 3, 16, 16});
     FakeTensor scale = make_tensor(device, {1, 16});
+    // The storage-range overlap rule needs owners whose declared storage is
+    // real, so the layout-aware linear call uses exactly sized buffers.
+    OwnedFakeTensor linear_x(device, {2, 3, 16, 16});
+    OwnedFakeTensor linear_w(device, {16, 16});
+    OwnedFakeTensor linear_out(device, {2, 3, 16, 16});
 
     CHECK(iom::oid_is_token(queue.copy(a.view(), b.view())));
     CHECK(iom::oid_is_token(queue.add(frozen.view(), a.view(), b.view())));
     CHECK(iom::oid_is_token(queue.mul(a.view(), frozen.view(), b.view())));
     CHECK(iom::oid_is_token(queue.silu(b.view(), b.view())));
     CHECK(queue.silu_aliased);
-    CHECK(iom::oid_is_token(queue.linear(a.view(), b.view(), b.view())));
+    // Linear prefers a distinct output: `linear_out` is only the output here,
+    // never an aliased weight.
+    CHECK(iom::oid_is_token(queue.linear(
+            linear_x.view(), linear_w.view(), linear_out.view(), 0, 16,
+            iom::LinearOutputLayout::ordinary, 1, 16)));
     CHECK(iom::oid_is_token(
             queue.rmsnorm(a.view(), scale.view(), b.view(), 1e-6F)));
     CHECK(iom::oid_is_token(queue.sdpa(a.view(), b.view(), b.view(), 2, 1, 16, b.view())));
@@ -3830,6 +3996,902 @@ TEST_CASE("Embedding snapshots live owners and retains accepted failures") {
         CHECK_EQ(queue.registered_at(ids.view().native_handle()), 1);
         CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
     }
+}
+
+namespace {
+
+// Every leaf the linear projection admits: the twelve integer leaves and the
+// nine ordinary signed floating leaves.
+constexpr std::initializer_list<iom::DataType> kLinearApplicableDataTypes = {
+    iom::DataType::I2, iom::DataType::U2,
+    iom::DataType::I4, iom::DataType::U4,
+    iom::DataType::I8, iom::DataType::U8,
+    iom::DataType::I16, iom::DataType::U16,
+    iom::DataType::I32, iom::DataType::U32,
+    iom::DataType::I64, iom::DataType::U64,
+    iom::DataType::F4_E2M1, iom::DataType::F6_E2M3,
+    iom::DataType::F6_E3M2, iom::DataType::F8_E4M3FN,
+    iom::DataType::F8_E5M2, iom::DataType::F16,
+    iom::DataType::BF16, iom::DataType::F32,
+    iom::DataType::F64,
+};
+
+// Recognized leaves with no linear semantics: BOOL is not a linear numeric
+// operand and `F8_E8M0` cannot represent a general signed result.
+constexpr std::initializer_list<iom::DataType> kLinearInapplicableDataTypes = {
+    iom::DataType::BOOL,
+    iom::DataType::F8_E8M0,
+};
+
+constexpr iom::LinearOutputLayout kOrdinary =
+        iom::LinearOutputLayout::ordinary;
+constexpr iom::LinearOutputLayout kHeadPlanar =
+        iom::LinearOutputLayout::head_planar;
+
+}  // namespace
+
+TEST_CASE("LinearOutputLayout exposes exactly the ordinary and head-planar modes") {
+    static_assert(std::is_enum_v<iom::LinearOutputLayout>);
+    static_assert(!std::is_convertible_v<int, iom::LinearOutputLayout>);
+    const std::array<iom::LinearOutputLayout, 2> modes{kOrdinary, kHeadPlanar};
+    CHECK(modes[0] != modes[1]);
+    CHECK_EQ(static_cast<std::size_t>(kOrdinary), std::size_t{0});
+    CHECK_EQ(static_cast<std::size_t>(kHeadPlanar), std::size_t{1});
+}
+
+TEST_CASE("Linear admission precedes capability and leaves unported hooks unsupported") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid overflow = iom::to_oid(iom::OidError::Overflow);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    UnportedQueue queue(device);
+
+    // A well-formed request in either layout against a backend whose hooks
+    // keep their Unsupported default reports the capability error through
+    // both the noexcept facade and the throwing query.
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor ordinary_out(device, {2, 4, 8});
+        OwnedFakeTensor planar_out(device, {2, 2, 3, 4});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), ordinary_out.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                unsupported);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), planar_out.view(), 1, 3,
+                        kHeadPlanar, 2, 4),
+                unsupported);
+        CHECK_THROWS_AS(
+                (void)queue.linear_workspace_requirements(
+                        x.view(), w.view(), ordinary_out.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                std::runtime_error);
+        CHECK_THROWS_AS(
+                (void)queue.linear_workspace_requirements(
+                        x.view(), w.view(), planar_out.view(), 1, 3,
+                        kHeadPlanar, 2, 4),
+                std::runtime_error);
+    }
+
+    // An unported capability is reported before otherwise unusable scratch is
+    // inspected: empty, undersized, misaligned, foreign, and dead ranges all
+    // still report Unsupported rather than InvalidArgument.
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        FakeWorkspace small(device, reinterpret_cast<void*>(0x6100), 16);
+        FakeWorkspace misaligned(
+                device, reinterpret_cast<void*>(0x6101), 64);
+        FakeWorkspace foreign_workspace(
+                foreign, reinterpret_cast<void*>(0x6100), 64);
+        const auto fail = [&](iom::RawWorkspaceView workspace) {
+            return queue.linear(
+                    x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8,
+                    workspace);
+        };
+        CHECK_EQ(fail(iom::RawWorkspaceView{}), unsupported);
+        CHECK_EQ(fail(small.view()), unsupported);
+        CHECK_EQ(fail(misaligned.view()), unsupported);
+        CHECK_EQ(fail(dead_workspace_view(device)), unsupported);
+        CHECK_EQ(fail(foreign_workspace.view()), unsupported);
+    }
+
+    // Structural, device, view, shape, mode, range, rank-growth, overflow,
+    // and alias errors keep their own categories and precede the capability
+    // decision.
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        const auto unknown = static_cast<iom::DataType>(127);
+        const_cast<iom::TensorSpec&>(x.owner().view().spec()).data_type =
+                unknown;
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        const auto unknown = static_cast<iom::QuantizationFormat>(127);
+        const_cast<iom::TensorSpec&>(w.owner().view().spec()).quantization =
+                unknown;
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        // The weight is exactly the rank-two HF-oriented matrix: a rank-three
+        // weight is never matched or broadcast.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {2, 8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        // The weight's input extent must equal the input's feature extent.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 17});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        const_cast<std::size_t*>(
+                out.owner().view().spec().shape.dimensions().data())[0] = 0;
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        // The output mode is a parameter and is never inferred: an
+        // unrecognized value is invalid input.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4,
+                        static_cast<iom::LinearOutputLayout>(3), 1, 8),
+                invalid);
+    }
+    {
+        // Ordinary mode is exactly `H=1,D=O`.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 2, 8),
+                invalid);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 7),
+                invalid);
+    }
+    {
+        // Head-planar mode requires the checked equality `O=H*D`.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 2, 4, 4});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kHeadPlanar, 2,
+                        5),
+                invalid);
+    }
+    {
+        // Rank growth: an ordinary rank-eight output stays valid, while the
+        // head axis that would make a rank-nine head-planar output is
+        // rejected rather than guessed.
+        OwnedFakeTensor x(device, {1, 1, 1, 1, 1, 1, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {1, 1, 1, 1, 1, 1, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                unsupported);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kHeadPlanar, 2,
+                        4),
+                invalid);
+    }
+    {
+        // Input and output leading tuples must match exactly, excluding the
+        // inserted head axis.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {3, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+        OwnedFakeTensor planar_out(device, {3, 2, 4, 4});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), planar_out.view(), 0, 4,
+                        kHeadPlanar, 2, 4),
+                invalid);
+    }
+    {
+        // The final output shape must be exactly `[...,R,O]` or
+        // `[...,H,R,D]`.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor run_mismatch(device, {2, 3, 8});
+        OwnedFakeTensor column_mismatch(device, {2, 4, 7});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), run_mismatch.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                invalid);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), column_mismatch.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                invalid);
+        OwnedFakeTensor planar_out(device, {2, 2, 3, 4});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), planar_out.view(), 0, 4,
+                        kHeadPlanar, 2, 4),
+                invalid);
+    }
+    {
+        // The independently selected row window: `s <= T`, `R > 0`, and
+        // `R <= T-s`, never wrapping and never inferred from `T` or `O`.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 5, 4, kOrdinary, 1, 8),
+                invalid);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 0, kOrdinary, 1, 8),
+                invalid);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 2, 3, kOrdinary, 1, 8),
+                invalid);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 4, 1, kOrdinary, 0, 8),
+                invalid);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 4, 1, kOrdinary, 1, 0),
+                invalid);
+    }
+    {
+        OwnedFakeTensor x(foreign, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        x.owner().use_storage_handle(nullptr);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        // Checked plane-addressing arithmetic overflows instead of wrapping.
+        OwnedFakeTensor x(device, {3, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {3, 4, 8});
+        const_cast<std::size_t*>(
+                x.owner().view().plane_strides().data())[0] =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                overflow);
+    }
+    {
+        // The `H*D` product is checked before it is compared with `O`.
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kHeadPlanar,
+                        std::numeric_limits<std::size_t>::max(), 2),
+                overflow);
+    }
+    {
+        // The output is disjoint from both inputs: the same owner is
+        // rejected even where the transformed windows appear disjoint, and a
+        // distinct owner that shares an input handle or intersects its
+        // storage range is rejected as well.
+        OwnedFakeTensor shared(device, {1, 4, 8});
+        OwnedFakeTensor w(device, {8, 8});
+        CHECK_EQ(
+                queue.linear(
+                        shared.view(), w.view(), shared.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                invalid);
+
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor weight(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        out.owner().use_storage_handle(x.view().native_handle());
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), weight.view(), out.view(), 0, 4, kOrdinary,
+                        1, 8),
+                invalid);
+
+        OwnedFakeTensor overlapping(device, {2, 4, 8});
+        overlapping.owner().use_storage_handle(
+                static_cast<std::byte*>(x.storage_base())
+                + x.storage_bytes() - 32);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), weight.view(), overlapping.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                invalid);
+    }
+
+    // Alias rejection precedes the leaf and capability decision, and device
+    // and overflow validation precede the inapplicable leaf: only the leaf
+    // class itself is a capability rejection.
+    {
+        OwnedFakeTensor shared(device, {1, 4, 8}, iom::DataType::BOOL);
+        OwnedFakeTensor w(device, {8, 8}, iom::DataType::BOOL);
+        CHECK_EQ(
+                queue.linear(
+                        shared.view(), w.view(), shared.view(), 0, 4,
+                        kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        OwnedFakeTensor x(foreign, {2, 4, 16}, iom::DataType::BOOL);
+        OwnedFakeTensor w(device, {8, 16}, iom::DataType::BOOL);
+        OwnedFakeTensor out(device, {2, 4, 8}, iom::DataType::BOOL);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                invalid);
+    }
+    {
+        OwnedFakeTensor x(device, {3, 4, 16}, iom::DataType::BOOL);
+        OwnedFakeTensor w(device, {8, 16}, iom::DataType::BOOL);
+        OwnedFakeTensor out(device, {3, 4, 8}, iom::DataType::BOOL);
+        const_cast<std::size_t*>(
+                x.owner().view().plane_strides().data())[0] =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                overflow);
+    }
+
+    // Recognized mixed, inapplicable, and non-NONE leaves are capability
+    // rejections rather than invalid input.
+    {
+        OwnedFakeTensor x(device, {2, 4, 16}, iom::DataType::F32);
+        OwnedFakeTensor w(device, {8, 16}, iom::DataType::F16);
+        OwnedFakeTensor out(device, {2, 4, 8}, iom::DataType::F32);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                unsupported);
+    }
+    for (const iom::DataType type : kLinearInapplicableDataTypes) {
+        CAPTURE(static_cast<int>(type));
+        OwnedFakeTensor x(device, {2, 4, 16}, type);
+        OwnedFakeTensor w(device, {8, 16}, type);
+        OwnedFakeTensor out(device, {2, 4, 8}, type);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                unsupported);
+    }
+    {
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        for (iom::TensorView* view : {&x.view(), &w.view(), &out.view()}) {
+            const_cast<iom::TensorSpec&>(view->spec()).quantization =
+                    iom::QuantizationFormat::OCP_MXFP4;
+        }
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                unsupported);
+    }
+
+    // Every rejection above is a negative synchronous result: nothing was
+    // registered, leased, or submitted, and no sequence was consumed, so the
+    // next accepted work still takes the very first sequence.
+    CHECK_EQ(token_sequence(queue.probe()), 1);
+}
+
+TEST_CASE("Linear accepts every applicable leaf in both layouts") {
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeQueue queue(device);
+    std::uint64_t expected_sequence = 1;
+
+    CHECK_EQ(kLinearApplicableDataTypes.size(), std::size_t{21});
+    for (const iom::DataType type : kLinearApplicableDataTypes) {
+        CAPTURE(static_cast<int>(type));
+        OwnedFakeTensor x(device, {2, 4, 16}, type);
+        OwnedFakeTensor w(device, {8, 16}, type);
+        OwnedFakeTensor out(device, {2, 4, 8}, type);
+        const iom::oid token = queue.linear(
+                x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(token_sequence(token), expected_sequence);
+        REQUIRE_EQ(queue.linear_records().size(), expected_sequence);
+        CHECK_EQ(queue.linear_records().back().entries.count, 3);
+        queue.finish_linear(expected_sequence);
+        CHECK_NOTHROW(queue.wait(token));
+        ++expected_sequence;
+
+        OwnedFakeTensor planar_out(device, {2, 2, 3, 4}, type);
+        const iom::oid planar = queue.linear(
+                x.view(), w.view(), planar_out.view(), 1, 3, kHeadPlanar, 2,
+                4);
+        REQUIRE(iom::oid_is_token(planar));
+        CHECK_EQ(token_sequence(planar), expected_sequence);
+        CHECK(queue.linear_records().back().layout == kHeadPlanar);
+        CHECK_EQ(queue.linear_records().back().heads, std::size_t{2});
+        CHECK_EQ(queue.linear_records().back().head_dim, std::size_t{4});
+        CHECK_EQ(queue.linear_records().back().s, std::size_t{1});
+        CHECK_EQ(queue.linear_records().back().rows, std::size_t{3});
+        queue.finish_linear(expected_sequence);
+        CHECK_NOTHROW(queue.wait(planar));
+        ++expected_sequence;
+    }
+    CHECK_EQ(expected_sequence, 1 + 2 * kLinearApplicableDataTypes.size());
+
+    for (const iom::DataType type : kLinearInapplicableDataTypes) {
+        CAPTURE(static_cast<int>(type));
+        OwnedFakeTensor x(device, {2, 4, 16}, type);
+        OwnedFakeTensor w(device, {8, 16}, type);
+        OwnedFakeTensor out(device, {2, 4, 8}, type);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                unsupported);
+    }
+    CHECK_EQ(
+            queue.linear_records().size(),
+            2 * kLinearApplicableDataTypes.size());
+    CHECK_EQ(token_sequence(queue.probe()), expected_sequence);
+
+    // The final untied LM head is ordinary mode with `s=T-1`, `R=1`, and
+    // `D=O`, and no row-extraction operation is involved.
+    {
+        FakeQueue head(device);
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor logits(device, {2, 1, 8});
+        const iom::oid token = head.linear(
+                x.view(), w.view(), logits.view(), 3, 1, kOrdinary, 1, 8);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(head.linear_records().back().s, std::size_t{3});
+        CHECK_EQ(head.linear_records().back().rows, std::size_t{1});
+        CHECK(head.linear_records().back().layout == kOrdinary);
+        CHECK_EQ(head.linear_records().back().head_dim, std::size_t{8});
+        head.finish_linear(token_sequence(token));
+        CHECK_NOTHROW(head.wait(token));
+    }
+}
+
+TEST_CASE("Linear workspace requirement queries are pure and deterministic") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    OwnedFakeTensor x(device, {2, 4, 16});
+    OwnedFakeTensor w(device, {8, 16});
+    OwnedFakeTensor out(device, {2, 4, 8});
+    const auto query = [&] {
+        return queue.linear_workspace_requirements(
+                x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8);
+    };
+
+    // The fake backend reports its own fixed zero-scratch policy verbatim.
+    CHECK(query() == iom::WorkspaceRequirements{0, 1});
+
+    // A positive fixed policy repeats identically and allocates nothing.
+    queue.set_linear_requirements({64, 32});
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements measured = query();
+    const std::size_t allocations = iom_test::disarm();
+    CHECK_EQ(allocations, 0);
+    CHECK(measured == iom::WorkspaceRequirements{64, 32});
+    CHECK(query() == iom::WorkspaceRequirements{64, 32});
+
+    // The query validates exactly as submission does and reports the
+    // established categories instead of mapping them through the facade. It
+    // never inspects or leases the caller's supplied range.
+    void* const base = reinterpret_cast<void*>(0x6200);
+    FakeWorkspace workspace(device, base, 64);
+    CHECK(query() == iom::WorkspaceRequirements{64, 32});
+    CHECK_EQ(queue.registered_at(base), 0);
+    OwnedFakeTensor foreign_x(foreign, {2, 4, 16});
+    CHECK_THROWS_AS(
+            (void)queue.linear_workspace_requirements(
+                    foreign_x.view(), w.view(), out.view(), 0, 4, kOrdinary,
+                    1, 8),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)queue.linear_workspace_requirements(
+                    x.view(), w.view(), out.view(), 0, 5, kOrdinary, 1, 8),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)queue.linear_workspace_requirements(
+                    x.view(), w.view(), out.view(), 0, 4, kHeadPlanar, 2, 5),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)queue.linear_workspace_requirements(
+                    x.view(), w.view(), out.view(), 0, 4, kHeadPlanar,
+                    std::numeric_limits<std::size_t>::max(), 2),
+            std::overflow_error);
+    OwnedFakeTensor boolean_x(device, {2, 4, 16}, iom::DataType::BOOL);
+    OwnedFakeTensor boolean_w(device, {8, 16}, iom::DataType::BOOL);
+    OwnedFakeTensor boolean_out(device, {2, 4, 8}, iom::DataType::BOOL);
+    CHECK_THROWS_AS(
+            (void)queue.linear_workspace_requirements(
+                    boolean_x.view(), boolean_w.view(), boolean_out.view(), 0,
+                    4, kOrdinary, 1, 8),
+            std::runtime_error);
+
+    // The query stays pure while accepted work is queued and its owners are
+    // retained: no record, registration, lease, submission, or sequence is
+    // created by the query itself.
+    queue.set_linear_requirements({0, 1});
+    const iom::oid token = queue.linear(
+            x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8);
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.linear_records().size(), std::size_t{1});
+    const std::size_t submissions = queue.submissions.size();
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements occupied = query();
+    CHECK_EQ(iom_test::disarm(), 0);
+    CHECK(occupied == iom::WorkspaceRequirements{0, 1});
+    CHECK_EQ(queue.linear_records().size(), std::size_t{1});
+    CHECK_EQ(queue.submissions.size(), submissions);
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 1);
+    CHECK_EQ(queue.registered_at(base), 0);
+    queue.finish_linear(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+}
+
+TEST_CASE("Linear leases positive workspace until its completion proof") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid exhausted = iom::to_oid(iom::OidError::ResourceExhausted);
+    const iom::oid device_error = iom::to_oid(iom::OidError::DeviceError);
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    queue.set_linear_requirements({32, 32});
+    OwnedFakeTensor x(device, {2, 4, 16});
+    OwnedFakeTensor w(device, {8, 16});
+    OwnedFakeTensor out(device, {2, 4, 8});
+
+    void* const base = reinterpret_cast<void*>(0x6300);
+    void* const second = reinterpret_cast<void*>(0x6320);
+    FakeWorkspace workspace(device, base, 64);
+    FakeWorkspace small(device, reinterpret_cast<void*>(0x6400), 16);
+    FakeWorkspace misaligned(device, reinterpret_cast<void*>(0x6501), 64);
+    FakeWorkspace foreign_workspace(
+            foreign, reinterpret_cast<void*>(0x6600), 64);
+
+    // Every unusable supplied range rejects before dispatch, registration,
+    // lease, or sequence consumption.
+    const auto submit = [&](iom::RawWorkspaceView scratch) {
+        return queue.linear(
+                x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8,
+                scratch);
+    };
+    CHECK_EQ(submit(iom::RawWorkspaceView{}), invalid);
+    CHECK_EQ(submit(small.view()), invalid);
+    CHECK_EQ(submit(misaligned.view()), invalid);
+    CHECK_EQ(submit(foreign_workspace.view()), invalid);
+    CHECK_EQ(submit(dead_workspace_view(device)), invalid);
+    CHECK(queue.linear_records().empty());
+    CHECK(queue.submissions.empty());
+    CHECK_EQ(queue.registered_at(base), 0);
+
+    // A live, aligned, sufficient, disjoint range is admitted and leased.
+    const iom::oid token = submit(workspace.view().subrange(0, 32));
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.linear_records().size(), std::size_t{1});
+    CHECK(queue.linear_records().back().workspace_requirements
+          == iom::WorkspaceRequirements{32, 32});
+    CHECK_EQ(queue.registered_at(base), 1);
+
+    // An overlapping live lease is bounded-resource exhaustion, and the
+    // rejected attempt leaves neither record nor lease behind.
+    CHECK_EQ(submit(workspace.view().subrange(0, 32)), exhausted);
+    CHECK_EQ(queue.linear_records().size(), std::size_t{1});
+    CHECK_EQ(queue.registered_at(base), 1);
+
+    // A disjoint aligned subrange of the same owner is independent.
+    const iom::oid disjoint = submit(workspace.view().subrange(32, 32));
+    REQUIRE(iom::oid_is_token(disjoint));
+    CHECK_EQ(queue.registered_at(second), 1);
+
+    // Proven completion releases both leases, and the whole range is reused.
+    queue.finish_linear(token_sequence(token));
+    CHECK_EQ(queue.registered_at(base), 0);
+    CHECK_NOTHROW(queue.wait(token));
+    queue.finish_linear(token_sequence(disjoint));
+    CHECK_NOTHROW(queue.wait(disjoint));
+    CHECK_EQ(queue.registered_at(second), 0);
+
+    // A post-link dispatch failure rolls back the registrations and the
+    // lease the admission had taken, abandons its sequence, and reports the
+    // failure without an accepted token.
+    const std::size_t records_before = queue.linear_records().size();
+    queue.inject_linear_failure(FakeQueue::LinearFailure::dispatch_throw);
+    CHECK_EQ(queue.registered_at(base), 0);
+    CHECK_EQ(submit(workspace.view().subrange(0, 32)), device_error);
+    CHECK_EQ(queue.linear_records().size(), records_before);
+    CHECK_EQ(queue.registered_at(base), 0);
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(w.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+
+    // The abandoned sequence is reusable and the released range with it.
+    CHECK_EQ(token_sequence(queue.probe()), 3);
+    const iom::oid reused = submit(workspace.view().subrange(0, 32));
+    REQUIRE(iom::oid_is_token(reused));
+    CHECK_EQ(queue.registered_at(base), 1);
+    queue.finish_linear(token_sequence(reused));
+    CHECK_NOTHROW(queue.wait(reused));
+    CHECK_EQ(queue.registered_at(base), 0);
+}
+
+TEST_CASE("Linear snapshots immutable metadata and retains distinct owners") {
+    FakeDevice device;
+    {
+        // The submitted transformed views are mutated and then destroyed
+        // after admission; the request keeps its own snapshot of offset,
+        // strides, shape, owner, and handle.
+        FakeQueue queue(device);
+        OwnedFakeTensor x_owner(device, {2, 3, 4, 16});
+        OwnedFakeTensor w_owner(device, {8, 16});
+        OwnedFakeTensor out_owner(device, {2, 3, 3, 8});
+        iom::oid token = 0;
+        std::vector<std::size_t> x_strides;
+        std::size_t x_offset = 0;
+        std::optional<iom::TensorSpec> x_spec;
+        {
+            iom::TensorView x_view = x_owner.view().select(0, 1);
+            iom::TensorView out_view = out_owner.view().select(0, 1);
+            x_strides = strides_of(x_view);
+            x_offset = x_view.plane_offset();
+            x_spec = x_view.spec();
+            token = queue.linear(
+                    x_view, w_owner.view(), out_view, 0, 3, kOrdinary, 1, 8);
+            REQUIRE(iom::oid_is_token(token));
+            const_cast<std::size_t*>(x_view.plane_strides().data())[0] = 999;
+            const_cast<std::size_t*>(out_view.plane_strides().data())[0] =
+                    999;
+        }
+        const FakeQueue::LinearRecord& record =
+                queue.linear_records().back();
+        CHECK(record.views[0].spec == x_spec);
+        CHECK_EQ(record.views[0].plane_offset, x_offset);
+        CHECK(record.views[0].plane_strides == x_strides);
+        CHECK_EQ(record.views[0].owner, &x_owner.owner());
+        CHECK_EQ(record.views[1].owner, &w_owner.owner());
+        CHECK_EQ(record.views[2].owner, &out_owner.owner());
+        CHECK_EQ(record.views[0].handle, x_owner.storage_base());
+        CHECK_EQ(record.views[1].handle, w_owner.storage_base());
+        CHECK_EQ(record.views[2].handle, out_owner.storage_base());
+        CHECK_EQ(record.views[0].device, &device);
+        CHECK_EQ(record.entries.count, 3);
+        CHECK_EQ(queue.registered_at(x_owner.storage_base()), 1);
+        CHECK_EQ(queue.registered_at(w_owner.storage_base()), 1);
+        CHECK_EQ(queue.registered_at(out_owner.storage_base()), 1);
+
+        // The owners stay registered until proven completion, and the token
+        // is repeat-waitable.
+        queue.finish_linear(token_sequence(token));
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_NOTHROW(queue.wait(token));
+        CHECK_EQ(queue.registered_at(x_owner.storage_base()), 0);
+        CHECK_EQ(queue.registered_at(w_owner.storage_base()), 0);
+        CHECK_EQ(queue.registered_at(out_owner.storage_base()), 0);
+    }
+    {
+        // One owner serves both `x` and `w`: the permitted read/read alias
+        // registers that owner exactly once, and the output owner once.
+        FakeQueue queue(device);
+        OwnedFakeTensor shared(device, {8, 8}, iom::DataType::U32);
+        OwnedFakeTensor out(device, {8, 8}, iom::DataType::U32);
+        const iom::oid token = queue.linear(
+                shared.view(), shared.view(), out.view(), 0, 8, kOrdinary, 1,
+                8);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(queue.linear_records().back().entries.count, 2);
+        CHECK_EQ(queue.registered_at(shared.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
+        queue.finish_linear(token_sequence(token));
+        CHECK_EQ(queue.registered_at(shared.view().native_handle()), 0);
+        CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+        CHECK_NOTHROW(queue.wait(token));
+    }
+    {
+        // A bounded-resource admission failure consumes no token, sequence,
+        // registration, or lease.
+        FakeQueue queue(device);
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        queue.inject_linear_failure(FakeQueue::LinearFailure::bad_alloc);
+        CHECK_EQ(
+                queue.linear(
+                        x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8),
+                iom::to_oid(iom::OidError::ResourceExhausted));
+        CHECK(queue.linear_records().empty());
+        CHECK(queue.submissions.empty());
+        CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+        CHECK_EQ(token_sequence(queue.probe()), 1);
+    }
+    {
+        // An accepted queued failure stays a positive token, is rethrown
+        // with the same category on every wait, and leaves the unusable
+        // output without any rollback guarantee. The unknown completion
+        // keeps the owners quarantined.
+        FakeQueue queue(device);
+        OwnedFakeTensor x(device, {2, 4, 16});
+        OwnedFakeTensor w(device, {8, 16});
+        OwnedFakeTensor out(device, {2, 4, 8});
+        queue.inject_linear_failure(FakeQueue::LinearFailure::post_acceptance);
+        const iom::oid token = queue.linear(
+                x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8);
+        REQUIRE(iom::oid_is_token(token));
+        queue.finish_linear(token_sequence(token));
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            CHECK_THROWS_WITH_AS(
+                    queue.wait(token), "fake LINEAR retained failure",
+                    std::runtime_error);
+        }
+        CHECK_EQ(queue.registered_at(x.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(w.view().native_handle()), 1);
+        CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
+    }
+}
+
+TEST_CASE("Linear zero requirement neither validates nor leases an unused range") {
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+    OwnedFakeTensor x(device, {2, 4, 16});
+    OwnedFakeTensor w(device, {8, 16});
+    OwnedFakeTensor out(device, {2, 4, 8});
+
+    void* const foreign_base = reinterpret_cast<void*>(0x6700);
+    void* const small_base = reinterpret_cast<void*>(0x6740);
+    FakeWorkspace foreign_workspace(foreign, foreign_base, 64);
+    FakeWorkspace small(device, small_base, 8);
+
+    const iom::oid empty_token = queue.linear(
+            x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8);
+    const iom::oid dead_token = queue.linear(
+            x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8,
+            dead_workspace_view(device));
+    const iom::oid foreign_token = queue.linear(
+            x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8,
+            foreign_workspace.view());
+    const iom::oid small_token = queue.linear(
+            x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8,
+            small.view());
+    REQUIRE(iom::oid_is_token(empty_token));
+    REQUIRE(iom::oid_is_token(dead_token));
+    REQUIRE(iom::oid_is_token(foreign_token));
+    REQUIRE(iom::oid_is_token(small_token));
+
+    // The unused ranges stay unregistered and unleaed.
+    CHECK_EQ(queue.registered_at(foreign_base), 0);
+    CHECK_EQ(queue.registered_at(small_base), 0);
+
+    queue.finish_linear(token_sequence(empty_token));
+    queue.finish_linear(token_sequence(dead_token));
+    queue.finish_linear(token_sequence(foreign_token));
+    queue.finish_linear(token_sequence(small_token));
+    CHECK_NOTHROW(queue.wait(empty_token));
+    CHECK_NOTHROW(queue.wait(dead_token));
+    CHECK_NOTHROW(queue.wait(foreign_token));
+    CHECK_NOTHROW(queue.wait(small_token));
+
+    CHECK(queue.linear_workspace_requirements(
+                  x.view(), w.view(), out.view(), 0, 4, kOrdinary, 1, 8)
+          == iom::WorkspaceRequirements{0, 1});
+    CHECK_EQ(queue.linear_records().size(), std::size_t{4});
+}
+
+TEST_CASE("Linear keeps the unported CPU backend explicitly unsupported") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid overflow = iom::to_oid(iom::OidError::Overflow);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+
+    // The real reference CPU backend, exercising the shared facade and both
+    // default hooks through its own queue.
+    alignas(32) std::array<std::byte, 32768> arena{};
+    iom::LinearAllocator allocator(arena.data(), arena.size(), 32);
+    const std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
+    auto x = device->create_tensor(make_spec({1, 4, 8}, iom::DataType::F32));
+    auto w = device->create_tensor(make_spec({8, 8}, iom::DataType::F32));
+    auto out = device->create_tensor(make_spec({1, 4, 8}, iom::DataType::F32));
+    auto heads = device->create_tensor(
+            make_spec({1, 2, 3, 4}, iom::DataType::F32));
+    const std::unique_ptr<iom::DeviceOps> queue = device->create_ops();
+
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8),
+            unsupported);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), heads->view(), 1, 3, kHeadPlanar, 2,
+                    4),
+            unsupported);
+    CHECK_THROWS_AS(
+            (void)queue->linear_workspace_requirements(
+                    x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8),
+            std::runtime_error);
+
+    // Structural, range, mode, and checked-arithmetic rejections keep their
+    // own categories before the capability decision.
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 2, 4, kOrdinary, 1, 8),
+            invalid);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 0, 0, kOrdinary, 1, 8),
+            invalid);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 0, 4,
+                    static_cast<iom::LinearOutputLayout>(3), 1, 8),
+            invalid);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 0, 4, kHeadPlanar,
+                    std::numeric_limits<std::size_t>::max(), 2),
+            overflow);
+
+    // Every rejection consumed no sequence: the first accepted work still
+    // takes the very first sequence.
+    const iom::oid copied = queue->copy(x->view(), out->view());
+    CHECK_EQ(token_sequence(copied), 1);
+    CHECK_NOTHROW(queue->wait(copied));
 }
 
 TEST_CASE("DeviceOps queue ids lease exclusively across threads and are reused after release") {

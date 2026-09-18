@@ -1355,7 +1355,9 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
             queue->silu(x->view(), y->view()),
             iom::to_oid(iom::OidError::Unsupported));
     CHECK_EQ(
-            queue->linear(x->view(), w->view(), y->view()),
+            queue->linear(
+                    x->view(), w->view(), y->view(), 0, 16,
+                    iom::LinearOutputLayout::ordinary, 1, 16),
             iom::to_oid(iom::OidError::Unsupported));
     // RMSNorm is declared and admitted by common code, and the CPU port
     // implements it: the valid-shape request is accepted, executed on the
