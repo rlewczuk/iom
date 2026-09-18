@@ -407,11 +407,12 @@ TEST_CASE("SYCL conformance: deferred queue lifetime and stability") {
 
 TEST_CASE("SYCL conformance: compute methods reject unsupported capability without submitting") {
     SyclDevices devices;
-    // RMS normalization has a landed SYCL port, so the shared probe queues it
-    // through the real path; SiLU, linear, and SDPA stay `Unsupported`.
+    // RMS normalization and linear projections have landed SYCL ports, so the
+    // shared probe queues their exact expectations through the real path;
+    // SiLU and SDPA stay `Unsupported`.
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "SYCL", true, true);
+            &devices.gate, "SYCL", true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -784,10 +785,12 @@ TEST_CASE(
 TEST_CASE("SYCL conformance: full shared suite") {
     SyclDevices devices;
     SyclStorageOracle oracle(*devices.candidate_context);
+    // The one shared suite observes the landed binary, RMS normalization, and
+    // linear capabilities through its own probe with explicit expectations.
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true);
+            &devices.gate, &oracle, true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -795,11 +798,12 @@ TEST_CASE("SYCL conformance: full shared suite") {
 // through the twenty-leaf scalar path plus the native BF16 specialization, the
 // frozen `{0, 1}` scratch path for the scalar leaves, the documented aligned
 // `A32(P*pad16(R)*pad16(O)*4)` BF16 path, and the genuine device
-// `sycl::aspect::fp64` gate for `F64`. No linear port exists at this revision,
-// so the implemented span is empty and every declared leaf stays a capability
-// rejection; the declared gate is asserted in both directions regardless, so a
-// port that later queues `F64` on a device without the aspect fails here
-// instead of silently claiming support.
+// `sycl::aspect::fp64` gate for `F64`. The twenty scalar leaves are queued by
+// the operation-local in-order `parallel_for` path, so the implemented span is
+// exactly that matrix; `BF16` awaits its separate native specialization and
+// stays a capability rejection. The declared gate is asserted in both
+// directions regardless, so a port that queues `F64` on a device without the
+// aspect fails here instead of silently claiming support.
 TEST_CASE("SYCL conformance: linear projection reference, admission, and lifetime") {
     SyclDevices devices;
     SyclStorageOracle oracle(*devices.candidate_context);
@@ -810,7 +814,7 @@ TEST_CASE("SYCL conformance: linear projection reference, admission, and lifetim
             iom_conformance::kLinearLeafSpan,
             iom_conformance::kLinearScalarLeafSpan,
             iom_conformance::kLinearNativeBf16Span,
-            iom_conformance::kNoLinearSpan,
+            iom_conformance::kLinearScalarLeafSpan,
             {},
             iom_conformance::LinearWorkspacePath::zero,
             iom_conformance::LinearWorkspacePath::sycl_bf16};

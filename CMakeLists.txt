@@ -299,6 +299,7 @@ if(SYCL_ENABLED)
         src/sycl/queue_binary.cpp
         src/sycl/queue_embedding.cpp
         src/sycl/queue_rmsnorm.cpp
+        src/sycl/queue_linear.cpp
         src/sycl/queue.cpp
         src/sycl/add.cpp
         src/sycl/runtime.hpp
@@ -330,6 +331,10 @@ if(SYCL_ENABLED)
     target_compile_options(iom_sycl
         PRIVATE
             -fsycl
+            # The contract forbids flush-to-zero and fast-math, so the port's
+            # own translation units keep IEEE subnormal and NaN/infinity
+            # behavior instead of inheriting the compiler's fast default model.
+            -ffp-model=precise
     )
 
     target_link_options(iom_sycl

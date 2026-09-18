@@ -299,6 +299,10 @@ void SyclQueue::execute(Task& task) {
         execute_rmsnorm(task);
         return;
     }
+    if (task.linear_request.has_value()) {
+        execute_linear(task);
+        return;
+    }
 
     if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
         throw std::bad_alloc();
@@ -449,6 +453,14 @@ void SyclQueue::complete_task(
             // entries are released or invalidated.
             (void)detail::release_or_invalidate_binary_entries(
                     state_->registry, *outcome.rmsnorm_entries, failed,
+                    fence_succeeded);
+        } else if (outcome.linear_entries.has_value()) {
+            // Linear projections register the same read/read-deduplicated
+            // owner set as RMS normalization, and every implemented scalar
+            // leaf reports the `{0, 1}` requirement, so no lease exists to
+            // retire: only the owner entries are released or invalidated.
+            (void)detail::release_or_invalidate_binary_entries(
+                    state_->registry, *outcome.linear_entries, failed,
                     fence_succeeded);
         } else {
             (void)detail::release_or_invalidate_entries(

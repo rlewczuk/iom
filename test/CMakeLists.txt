@@ -240,7 +240,11 @@ if(SYCL_ENABLED)
         SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/sycl ${IOM_SYCL_INCLUDE_DIR}
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/sycl ${IOM_SYCL_INCLUDE_DIR}
         COMPILE_DEFINITIONS IOM_ENABLE_TESTING
-        COMPILE_OPTIONS -fsycl
+        # The conformance oracle's scalar recurrence runs in the host process,
+        # whose FP environment the compiler's default model sets to FTZ/DAZ;
+        # the contract forbids fast-math and flush-to-zero, so this target
+        # keeps IEEE FP32 subnormals and NaN/infinity classes observable.
+        COMPILE_OPTIONS -fsycl -ffp-model=precise
         LINK_OPTIONS -fsycl
         BACKEND_LIBRARY iom_sycl
         RUNTIME_LIBRARIES

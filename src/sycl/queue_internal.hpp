@@ -32,6 +32,11 @@ class SyclQueue final : public DeviceOps {
         // normalization consumes no `RawWorkspace`, so no lease is carried.
         std::optional<RmsnormRequest> rmsnorm_request;
         detail::BinaryEntryRegistration rmsnorm_entries;
+        // Immutable linear projection request captured by admission, plus the
+        // common owner registrations retained until proven completion. The
+        // scalar leaves consume no `RawWorkspace`, so no lease is carried.
+        std::optional<LinearRequest> linear_request;
+        detail::BinaryEntryRegistration linear_entries;
     };
 
     struct SyclSequenceOutcome {
@@ -41,6 +46,11 @@ class SyclQueue final : public DeviceOps {
         detail::WorkspaceLease workspace_lease;
         std::optional<detail::BinaryEntryRegistration> rmsnorm_entries;
         bool is_embedding = false;
+        // Trailing so every existing aggregate initialization of this outcome
+        // keeps its own field order. Linear registers the same deduplicated
+        // owner set as RMS normalization and carries no lease, because its
+        // scalar leaves always report the `{0, 1}` zero-scratch requirement.
+        std::optional<detail::BinaryEntryRegistration> linear_entries;
     };
 
 public:
@@ -68,6 +78,20 @@ public:
     oid binary_impl(const BinaryRequest& request) override;
     oid embedding_impl(const EmbeddingRequest& request) override;
     oid rmsnorm_impl(const RmsnormRequest& request) override;
+    oid linear_impl(const LinearRequest& request) override;
+
+    /**
+     * Pure capability decision of the implemented linear scalar leaf set:
+     * exactly the twenty non-`BF16` applicable leaves, with `F64` queueable
+     * only when the selected device reports `sycl::aspect::fp64`. The common
+     * facade consults this hook for both the call and the pure requirement
+     * query, so an unimplemented leaf and an absent aspect are `Unsupported`
+     * before any queue effect.
+     */
+    [[nodiscard]] WorkspaceRequirements linear_workspace_requirements_impl(
+            const TensorView& x, const TensorView& w, const TensorView& out,
+            std::size_t s, std::size_t R, LinearOutputLayout layout,
+            std::size_t H, std::size_t D) override;
 
     // Immutable device capability of the implemented RMS normalization leaf
     // set: the eight non-`F64` applicable float leaves are always queueable,
@@ -101,6 +125,13 @@ private:
     void execute_binary(Task& task);
     void execute_embedding(Task& task);
     void execute_rmsnorm(Task& task);
+    void execute_linear(Task& task);
+
+    // Immutable capability predicate of the linear scalar leaf set, shared by
+    // the pure requirement query and the admitted execution hook so the query
+    // and the call can never disagree about `F64`.
+    [[nodiscard]] bool linear_leaf_supported(
+            DataType data_type) const noexcept;
     void complete_task(
             std::uint64_t sequence, std::exception_ptr callback_failure);
 
