@@ -2,6 +2,12 @@
 
 #include <sycl/sycl.hpp>
 
+#if defined(SYCL_EXT_ONEAPI_MATRIX) && SYCL_EXT_ONEAPI_MATRIX == 1
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#define IOM_SYCL_TEST_BF16_MATRIX 1
+#endif
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -794,38 +800,105 @@ TEST_CASE("SYCL conformance: full shared suite") {
     CHECK_FALSE(devices.gate.armed());
 }
 
+// ---------------------------------------------------------------------------
+// SYCL native BF16 linear projection.
+// ---------------------------------------------------------------------------
+
+// The device fact behind SYCL's native BF16 linear specialization, queried here
+// independently of the port and of its capability predicate: the pinned
+// extension revision, the Intel matrix aspect, subgroup 16, and a
+// BF16/BF16/FP32 combination covering both M shapes the row decomposition
+// queues. A device that does not expose the fact keeps `BF16` a capability
+// rejection rather than a conformance claim, exactly like the `F64` aspect
+// gate.
+[[nodiscard]] bool sycl_bf16_matrix_available(const sycl::device& device) {
+#if defined(IOM_SYCL_TEST_BF16_MATRIX)
+    if (!device.has(sycl::aspect::ext_intel_matrix)) {
+        return false;
+    }
+    const std::vector<std::size_t> subgroup_sizes =
+            device.get_info<sycl::info::device::sub_group_sizes>();
+    if (std::find(
+                subgroup_sizes.begin(), subgroup_sizes.end(), std::size_t{16})
+            == subgroup_sizes.end()) {
+        return false;
+    }
+    namespace matrix = sycl::ext::oneapi::experimental::matrix;
+    const std::vector<matrix::combination> combinations = device.get_info<
+            sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+    const auto covers = [&combinations](std::size_t rows) {
+        for (const matrix::combination& combination : combinations) {
+            if (combination.atype != matrix::matrix_type::bf16
+                    || combination.btype != matrix::matrix_type::bf16
+                    || combination.ctype != matrix::matrix_type::fp32
+                    || combination.dtype != matrix::matrix_type::fp32) {
+                continue;
+            }
+            const bool rows_covered = combination.msize == 0
+                    ? rows <= combination.max_msize
+                    : combination.msize == rows;
+            const bool columns_covered = combination.nsize == 0
+                    ? std::size_t{16} <= combination.max_nsize
+                    : combination.nsize == std::size_t{16};
+            const bool inner_covered = combination.ksize == 0
+                    ? std::size_t{16} <= combination.max_ksize
+                    : combination.ksize == std::size_t{16};
+            if (rows_covered && columns_covered && inner_covered) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return covers(16) && covers(1);
+#else
+    (void)device;
+    return false;
+#endif  // defined(IOM_SYCL_TEST_BF16_MATRIX)
+}
+
 // SYCL's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, the
 // frozen `{0, 1}` scratch path for the scalar leaves, the documented aligned
-// `A32(P*pad16(R)*pad16(O)*4)` BF16 path, and the genuine device
-// `sycl::aspect::fp64` gate for `F64`. The twenty scalar leaves are queued by
-// the operation-local in-order `parallel_for` path, so the implemented span is
-// exactly that matrix; `BF16` awaits its separate native specialization and
-// stays a capability rejection. The declared gate is asserted in both
-// directions regardless, so a port that queues `F64` on a device without the
-// aspect fails here instead of silently claiming support.
+// `A32(P*pad16(R)*pad16(O)*4)` BF16 path, and the two genuine runtime device
+// facts: the `sycl::aspect::fp64` gate for `F64` and the queried subgroup-16
+// BF16/BF16/FP32 `joint_matrix` facility the native BF16 specialization
+// requires. Both gates are asserted in both directions regardless, so a port
+// that queues a gated leaf on a device that does not expose the fact fails
+// here instead of silently claiming support.
 TEST_CASE("SYCL conformance: linear projection reference, admission, and lifetime") {
     SyclDevices devices;
     SyclStorageOracle oracle(*devices.candidate_context);
     const sycl::device native_device =
             devices.candidate_context->get_devices().front();
     const bool fp64_available = native_device.has(sycl::aspect::fp64);
+    const bool bf16_matrix_available =
+            sycl_bf16_matrix_available(native_device);
     iom_conformance::LinearDeclaration declaration{
             iom_conformance::kLinearLeafSpan,
             iom_conformance::kLinearScalarLeafSpan,
             iom_conformance::kLinearNativeBf16Span,
-            iom_conformance::kLinearScalarLeafSpan,
+            iom_conformance::kLinearLeafSpan,
             {},
             iom_conformance::LinearWorkspacePath::zero,
             iom_conformance::LinearWorkspacePath::sycl_bf16};
-    declaration.device_available = [fp64_available](iom::DataType leaf) {
-        return leaf != iom::DataType::F64 || fp64_available;
-    };
+    declaration.device_available =
+            [fp64_available, bf16_matrix_available](iom::DataType leaf) {
+                if (leaf == iom::DataType::F64) {
+                    return fp64_available;
+                }
+                if (leaf == iom::DataType::BF16) {
+                    return bf16_matrix_available;
+                }
+                return true;
+            };
     iom_conformance::run_linear_conformance(
             devices.conformance(), declaration, &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
     // The gate is the device's own immutable fact, not a port statement.
     CHECK_EQ(declaration.device_available(iom::DataType::F64), fp64_available);
+    CHECK_EQ(
+            declaration.device_available(iom::DataType::BF16),
+            bf16_matrix_available);
     CHECK(declaration.device_available(iom::DataType::F32));
 }
 
