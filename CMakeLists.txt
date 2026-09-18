@@ -227,12 +227,16 @@ if(CUDA_ENABLED)
     # `wmma` BF16-input/FP32-accumulate route, and its device statements exist
     # only in images of an architecture at or above the documented BF16 WMMA
     # floor. The toolkit default is a single pre-floor PTX image, so the archs
-    # are pinned here: `80` is the floor, `90` and `120` keep the accelerated
-    # images ahead of the JIT for the current datacenter and consumer devices,
-    # and `75` keeps the images the previous default produced for the scalar
-    # path. An image without the statements reports the leaf `Unsupported`,
-    # never a fallback, and an explicit `IOM_CUDA_ARCHITECTURES` overrides the
-    # list for an environment that needs a different one.
+    # are pinned here: `80` is the floor, `90` keeps the accelerated image for
+    # Hopper, `120` covers GeForce Blackwell, and `75` keeps the images the
+    # previous default produced for the scalar path. Covered families are
+    # therefore Turing `sm_75`, Ampere `sm_80`, Hopper `sm_90`, and GeForce
+    # Blackwell `sm_120`; datacenter Blackwell `sm_100`/`sm_101` images are NOT
+    # pinned and such devices need the explicit `IOM_CUDA_ARCHITECTURES`
+    # override below. An image without the statements reports the leaf
+    # `Unsupported`, never a fallback, and an explicit
+    # `IOM_CUDA_ARCHITECTURES` overrides the list for an environment that needs
+    # a different one.
     if(NOT DEFINED IOM_CUDA_ARCHITECTURES)
         set(IOM_CUDA_ARCHITECTURES "75;80;90")
         if(NOT CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)

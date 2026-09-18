@@ -418,11 +418,14 @@ must record that fact rather than adding an example.
 
 `silu` and `sdpa` remain unsupported and return negative `Unsupported` before
 submission, mutation, or token acceptance. The `linear` hooks are owned by
-[Linear projections](#linear-projections): the CUDA port queues the twenty
-non-BF16 applicable leaves on the shared tiled scalar projection and `BF16` on
-its native `<mma.h>` BF16-input/FP32-accumulate WMMA specialization, whose
-availability is a runtime device and loaded-image fact, while a backend
-without its own linear port keeps reporting `Unsupported`. CUDA and ROCm
+[Linear projections](#linear-projections): CPU, CUDA, ROCm, and SYCL implement
+all twenty-one applicable leaves — the twenty non-BF16 leaves on the shared
+scalar projection path plus `BF16` on the scalar recurrence on CPU and on a
+separate native specialization on CUDA, ROCm, and SYCL, whose availability is a
+runtime device and loaded-image fact — while TTNN implements the mandatory
+`BF16` leaf alone on its direct Metalium route and explicitly rejects the other
+twenty applicable leaves after structural validation. A backend without its own
+linear port keeps reporting `Unsupported`. CUDA and ROCm
 provide source-inspected RMSNorm launch wrappers over the shared core, and
 TTNN now provides its preallocated BF16/F32 queue path; only backends without
 one of those ports keep reporting RMSNorm `Unsupported`.
@@ -1912,12 +1915,16 @@ For the table, **blocked/native route present** means that installed TTNN and
 Metalium expose the necessary matrix mechanism on the observed Blackhole, but
 the current IOM port correctly remains `Unsupported` until the operation
 implements that route, proves its precision, ownership, queue, and lifetime
-behavior, and passes its native gates.
+behavior, and passes its native gates. The two linear rows are **implemented**
+at this revision: the mandatory `BF16` leaf runs on the direct Metalium route
+recorded in [Linear projections](#linear-projections) and the twenty other
+applicable leaves are explicit capability rejections, so those rows no longer
+carry that blocker; the QK and PV rows still do.
 
 | Product | Logical `R=1` | `R=15` | `R=16` | `R=17` | Required native mapping and present blocker |
 | --- | --- | --- | --- | --- | --- |
-| ordinary linear | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | Per `b`, multiply selected `x[b,s:s+R,I]` by transposed shared `w[O,I]` and write exactly `out[b,R,O]`. Non-tile I/O and every leading plane are valid only with tail-masked readers. High-level transpose/no-temporary behavior and full accumulation fidelity are unproved. |
-| head-planar linear | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | The same product writes `out[b,h,R,d]` from weight row `h*D+d`, after checked `O=H*D`; no padded-column head shuffle is permitted. A custom writer or caller-owned checked rearrangement is required because IOM stores each head plane separately. |
+| ordinary linear | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | Per `b`, multiply selected `x[b,s:s+R,I]` by transposed shared `w[O,I]` and write exactly `out[b,R,O]`. Non-tile I/O and every leading plane are valid with the tail-masked readers of the landed route; no high-level transpose and no hidden temporary. |
+| head-planar linear | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | The same product writes `out[b,h,R,d]` from weight row `h*D+d`, after checked `O=H*D`; the landed writer scatters logical head columns without padded-column shuffling. |
 | SDPA QK | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | For each `b,h`, BF16 `q[b,h,R,D]` multiplies the logical transpose of `k[b,g(h),0:L,D]` into FP32 scores `[R,L]`, followed by FP32 scale and causal/prefix mask. Non-tile D/L and GQA require custom address generation; TTNN's high-level output and FP32-accumulation contract are unproved. |
 | SDPA PV | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | Explicit RNE-rounded BF16 `P[b,h,R,L]` multiplies `v[b,g(h),0:L,D]` with FP32 accumulation and writes or merges exactly `out[b,R,h*D+d]`. It may not fuse away the probability store, read masked V, or create repeated KV heads; the current positive-workspace and numerical paths are absent. |
 
@@ -2002,7 +2009,7 @@ facts, which is another reason its optional output is not yet adopted.
 | Planned facade | Installed facility and contract disposition |
 | --- | --- |
 | embedding | `ttnn::embedding` declares an optional output, but installed evidence does not verify every integral index carrier, bit-preserving BF16 payload, independent IOM planes, transformed mappings, no hidden temporary, or IOM queue/lifetime behavior. A bounded device-local gather can use the same owner/writer rules; current support is blocked, not replaced by a host index scan. |
-| linear | Native matrix hardware and lower-level destination buffers make the route feasible as specified above. Current support is blocked on implementation, proven accumulation/RNE, optional-output or direct-writer ownership, and any required positive workspace. |
+| linear | Implemented for the mandatory `BF16` leaf by the direct per-plane Metalium route: tail-masked readers, the native matrix facility with FP32 accumulation, and one RNE BF16 writer per output tile row, with checked `O=H*D` head-planar scatter, no high-level transpose, no hidden temporary, and the pure `{0, 1}` requirement query. The twenty other applicable leaves are explicit capability rejections; the executed evidence is recorded in [Linear projections](#linear-projections). |
 | rmsnorm | Installed `sum`/`mean`/`max` reductions return tensors and do not expose caller output, while unary `rsqrt` has an optional output. Composing them would allocate intermediates and does not prove logical-tail exclusion or wide reduction. A backend-private fused row reduction is required; current support is blocked. |
 | rope | Installed unary `sin` and `cos` accept optional outputs, but composing transpose/arithmetic wrappers can allocate and does not prove FP32 angle/trig behavior or split-half pairing. A device-local kernel must write caller output, mask tails, and use `a+r`; current support is blocked. |
 | cache append | Installed slice/data-movement APIs expose optional outputs, and Metalium readers/writers can address tiles, but partial native32 updates must preserve every cell outside `[a,a+R)`, including other logical rows and physical padding, without host staging. Exact destination-window, queue, and alias behavior is unproved; current support is blocked. |
@@ -2329,7 +2336,7 @@ OID after a failure.
 | --- | --- |
 | gather | Contract-compatible device kernel for integral index payloads and bit-preserving BF16 table values; a device-discovered bad index must become an accepted retained failure. WMMA is irrelevant. A host index scan or round trip is forbidden. Current implementation remains blocked. |
 | matmul | Supported feasibility on the sampled CC 12.0 device by direct BF16/FP32 WMMA with tile-local standard-layout staging. Global owner layout, arbitrary `s`, transformed leading strides, and physical tails are incompatible with direct unguarded `load_matrix_sync`; the bounded staging above is required. |
-| reduction | Contract-compatible FP32 CUDA block/warp reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions must exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. The CUDA RMSNorm wrapper is source-inspected; linear and softmax kernels remain blocked pending their own ports. |
+| reduction | Contract-compatible FP32 CUDA block/warp reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions must exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. The CUDA RMSNorm wrapper is source-inspected, the linear accumulation helpers are implemented through the landed port (see [Linear projections](#linear-projections)), and the softmax kernel remains blocked pending its own SDPA port. |
 | trig | Contract-compatible CUDA device FP32/wide-domain sine and cosine with finite positive `theta`; it neither uses nor is evidenced by WMMA. A host math substitute is forbidden. Current RoPE kernel remains blocked. |
 | partial-tile copy | Existing CUDA standard-tiled copy machinery establishes device-local tile addressing, but not neural matrix support. A native port must use guarded logical loads/stores and neutral shared cells so owner padding, cache capacity tail, and rows outside `R` are unobservable. |
 | unary | Contract-compatible CUDA device FP32/wide-domain SiLU and BF16 RNE output. It is elementwise by design and is not an invalid matrix substitute. Current kernel remains blocked. |
@@ -2527,7 +2534,7 @@ not that the operation is currently implemented.
 
 | Product/mode | Logical `R` | Physical mapping | Result |
 | --- | ---: | --- | --- |
-| ordinary linear | 1 | `M=16`, `K=Ip`, `N=Op`; store only row 0 and `o<O` | Feasible on checked gfx1201 WMMA; current facade remains `Unsupported`. |
+| ordinary linear | 1 | `M=16`, `K=Ip`, `N=Op`; store only row 0 and `o<O` | Feasible on checked gfx1201 WMMA and implemented by the ROCm native `BF16` specialization on that device (see [Linear projections](#linear-projections)); the twenty scalar leaves use the shared raw-word kernel. |
 | ordinary linear | 15 | `M=16`; row 15 is neutral padding and is never logical | Feasible, including non-tile `I/O` and independent planes. |
 | ordinary linear | 16 | one logical M tile | Feasible, including non-tile `I/O`. |
 | ordinary linear | 17 | `M=32`; rows 17..31 are neutral padding | Feasible; padded rows are discarded, not extra tokens. |
@@ -2661,11 +2668,15 @@ changing enabled-ROCm-only CMake. CPU-only and ROCm-disabled builds acquire no
 such dependency.
 #### TinyLlama forward layout — SYCL matrix feasibility
 
-This is a bounded feasibility record for the planned seven-operation ABI.
-Embedding lookup now has its device-native raw-word `parallel_for` port; the
-remaining neural operations remain unimplemented. A future port MUST preserve
-the signatures, pure requirement queries, validation precedence, owner rules,
-and producer-wait schedule above; SYCL types remain backend-private.
+This is the bounded feasibility record for the seven-operation ABI. Embedding
+lookup has its device-native raw-word `parallel_for` port, and linear
+projections are implemented as the twenty non-BF16 leaves on the
+operation-local in-order path plus the native BF16 `joint_matrix` route with
+explicit RNE packing, recorded in [Linear projections](#linear-projections).
+RMSNorm, RoPE, cache append, SiLU, and SDPA remain unimplemented. A future port
+MUST preserve the signatures, pure requirement queries, validation precedence,
+owner rules, and producer-wait schedule above; SYCL types remain
+backend-private.
 
 The evidence layers are deliberately separate:
 
@@ -2676,7 +2687,7 @@ The evidence layers are deliberately separate:
 | Installed runtime and device | Required `sycl-ls` enumeration reported two Level Zero V2 devices, each `Intel(R) Arc(TM) Pro B60 Graphics 20.1.0`, driver `1.15.38646+7`, PCI device `8086:e211`, architecture `intel_gpu_bmg_g21`, and subgroup sizes `16,32`. PCI inventory reported the in-kernel `xe` driver on Linux `7.0.0-31-generic`. The selected device reports `aspect::ext_intel_matrix=true` and maximum work-group size 1024. | An eligible Level Zero XMX device and subgroup 16 are installed. The eventual queue MUST bind one exact enumerated device, not an OpenCL or other-device fallback. |
 | Documented native capability | The installed `matrix_combinations` query returned 53 combinations per B60. For `A=BF16,B=BF16,C=FP32,D=FP32`, it returned continuous `M<=8,N=16,K=16`, exact `16x16x16`, and exact `1x64x16`, `32x64x16`, `1x64x32`, and `32x64x32`. It also returned BF16-output variants, but this contract does not rely on their conversion rounding. | `M=1`, `M=16`, and a `16+1` decomposition are legal with BF16 inputs and FP32 accumulation; N/K tails require physical padding or tile decomposition. |
 | Bounded sample | A removed standalone sample allocated device USM, required subgroup 16, invoked `joint_matrix_load`, `joint_matrix_mad`, and `joint_matrix_store`, and checked all-one BF16 products. Separate Level Zero executions printed `BF16xBF16->FP32 1x16x16 PASS` and `16x16x16 PASS`. | Representative native XMX execution exists for the row shapes used below. It does not implement IOM linear, QK, or PV and is not conformance or profiler evidence. |
-| Production evidence | Not run: IOM linear, QK, PV, masking, softmax, RNE packing, head merge, all shape cases, conformance, tuning, and profiling. | The SYCL port remains blocked/unimplemented. Inventory or the sample cannot close a native-operation gate. |
+| Production evidence (2026-09-14 snapshot) | Not run at that date: IOM linear, QK, PV, masking, softmax, RNE packing, head merge, all shape cases, conformance, tuning, and profiling. | At that date the SYCL port was blocked/unimplemented, and inventory or the sample cannot close a native-operation gate. The linear portion is since superseded by the implemented port and its executed record in [Linear projections](#linear-projections); QK, PV, masking, softmax, RNE packing, head merge, and the remaining operations are still unrun. |
 
 These conclusions use the
 [experimental matrix extension at revision `cf12c378`](https://github.com/intel/llvm/blob/cf12c3783cc6a7adaf76e54c6a4f11f81ec8599b/sycl/doc/extensions/experimental/sycl_ext_matrix/sycl_ext_oneapi_matrix.asciidoc),
@@ -2696,11 +2707,12 @@ validation. A future kernel MUST require subgroup 16 explicitly; subgroup 32
 was enumerated but was not sampled as a matrix execution shape.
 
 **Product/row decision.** Let `p16(x)` mean checked round-up to 16. Every
-entry below is *native-shape feasible on the enumerated B60, production port
-blocked*: the device query supports the decomposition and the two primitive M
-shapes executed, but the complete operation has not. The blocked result must
-remain `Unsupported` until that product's real SYCL implementation and native
-tests land.
+entry below is *native-shape feasible on the enumerated B60*: the device query
+supports the decomposition and the two primitive M shapes executed. The two
+linear rows are now implemented by the landed SYCL linear port and evidenced
+in [Linear projections](#linear-projections); the QK and PV rows remain
+unlanded production ports, and each such product must keep returning
+`Unsupported` until its real SYCL implementation and native tests land.
 
 | Product | logical `R=1` | logical `R=15` | logical `R=16` | logical `R=17` |
 | --- | --- | --- | --- | --- |
@@ -2767,7 +2779,7 @@ requirements, not their sum.
 | Planned operation | SYCL feasibility and concrete present blocker |
 | --- | --- |
 | Embedding gather | Implemented by `src/sycl/embedding.cpp` and `src/sycl/queue_embedding.cpp`: one native `parallel_for` work item owns each destination word, with queued status reset, gather, and four-byte host-USM status copy. Runtime conformance and Level Zero scheduling evidence remain execution obligations; no host scan, host task, or operand staging is permitted. |
-| Linear | Direct backend-private `joint_matrix` is feasible as tabulated. FP32 accumulator storage, explicit RNE pack, row/window predicates, head scatter, alias checks, and all non-tile/plane cases are unimplemented. |
+| Linear | Implemented by `src/sycl/queue_linear.cpp` and `src/sycl/queue_internal.hpp`: the twenty non-BF16 leaves queue an operation-local in-order `parallel_for` with the pure `{0, 1}` requirement query and an `aspect::fp64` device gate on `F64`, and `BF16` uses the backend-private subgroup-16 `joint_matrix` BF16/BF16/FP32 route with one explicit RNE BF16 pack/scatter kernel per output tile row over the caller-owned alignment-32 `A32(P*pad16(R)*pad16(O)*4)` product scratch, covering ordinary and head-planar output over every transformed leading plane and both `M=16` and single-row tails. It returns `Unsupported` before submission when `ext_intel_matrix`, subgroup 16, or the BF16/FP32 matrix combination is absent. Executed device facts and per-`R` conclusions are recorded in [Linear projections](#linear-projections). |
 | RMSNorm reduction | BF16 loads, FP32 squares/reduction, normalization, and explicit BF16 result packing fit subgroup/work-group kernels and caller scratch. It is nonmatrix work; a matrix MAD substitute is unnecessary, and no native SYCL reduction port exists. |
 | RoPE trig | Device-local FP32 range reduction/trig and BF16 output packing fit an ordinary kernel over the tiled owner. It must preserve position `a+r`, pair boundaries, tails, aliases, and the queue error model. No native SYCL RoPE port exists. |
 | Cache partial-tile copy | A device-local predicated tile copy can append only `[a,a+R)` while preserving untouched/padded cache bytes. Source/destination overlap, capacity C, initialized-prefix publication, and separate K/V OIDs remain as specified. Existing generic copy is not this cache operation. |
@@ -2806,10 +2818,10 @@ head-planar, GQA, or logical-row contracts. Convenience or broad GEMM tuning
 does not justify that dependency, and a library cannot create matrix hardware
 when the required combination is absent.
 
-A future SYCL linear-projection leaf is the first consumer and should share the
-same minimal backend-private matrix facility with the later SYCL SDPA leaf.
-That consumer must make enabled-SYCL configuration fail clearly if the pinned
-compiler/header contract is absent, and runtime queries must return
+The landed SYCL linear-projection leaf is the first consumer of this facility
+and shares the same minimal backend-private matrix route with the later SYCL
+SDPA leaf. That consumer makes enabled-SYCL configuration fail clearly if the
+pinned compiler/header contract is absent, and its runtime queries return
 `Unsupported` before submission when the feature macro is not 1,
 `ext_intel_matrix` or subgroup 16 is absent, no BF16/BF16/FP32 combination
 covers the chosen tile, or stride/alignment cannot be satisfied. Disabled
@@ -4309,9 +4321,10 @@ framework, model fixture, checkpoint, or network dependency is permitted. Each
 driver supplies its own explicit expected payload and index spans, and common
 code never switches on backend kind. An unported backend keeps an empty
 embedding span and asserts `Unsupported` only; that rejection probe is not
-gather conformance. The existing copy/add/mul/sub/div suites and the `silu`,
-`linear`, and `sdpa` `Unsupported` probes remain unchanged until their own
-operation leaves migrate them; RMSNorm now has backend-owned CUDA and ROCm
+gather conformance. The existing copy/add/mul/sub/div suites and the `silu`
+and `sdpa` `Unsupported` probes remain unchanged until their own operation
+leaves migrate them; the `linear` probes were migrated by the five linear
+leaves, and RMSNorm now has backend-owned CUDA and ROCm
 launch wrappers, while its shared conformance helper remains task-owned.
 
 Each driver declares through `iom_conformance::EmbeddingDeclaration` the
@@ -4696,9 +4709,14 @@ signed zero agree with the recurrence. The behavior is independent of
 `fp32_dest_acc_en`, so it is an unpack/multiply property of the facility rather
 than a port or destination-accumulate defect. The shared `BF16` fixture
 deliberately places `x = 3.38953e38` and `w = +inf` in the same inner row, so
-`canonical I=3 O=10 H=2 D=5 T=19 s=2 R=1 ordinary` fails exactly one of its
-assertions on this backend while 1,505,991 of the TTNN conformance target's
-1,505,992 assertions pass. A port whose facility cannot express these classes
+`canonical I=3 O=10 H=2 D=5 T=19 s=2 R=1 ordinary` exercises both declared
+limitations on this backend: the elements those declarations cover are
+observed and counted rather than asserted, and every other element of that case
+is still compared under the unchanged tolerances. Before the declarations
+existed, a strict run of the same case failed exactly one of its assertions
+with 1,505,991 of the TTNN conformance target's 1,505,992 assertions passing;
+that pre-declaration measurement is the history that motivated the two `false`
+flags, not the current state of the suite. A port whose facility cannot express these classes
 records the measured limitation in its `LinearDeclaration`
 (`nonfinite_classes_asserted = false`) instead of failing conformance: the
 shared comparison then still checks every finite expectation under the
@@ -4711,12 +4729,18 @@ further below; CPU, CUDA, ROCm, and SYCL keep both defaults (`true`) and their
 unchanged class and finite assertions, so these two exceptions are TTNN-only
 and no other backend may carry them.
 Until a developer decision changes the fixture, the obligation, or the
-facility, the TTNN `BF16` linear leaf is implemented and exercised with its
-nonfinite class limitation recorded, and it is not reported as supported
-numerical conformance for those classes. The residual subnormal-operand
-deviation recorded below still fails one finite expectation of the shared
-`BF16` fixture, so the port remains short of full numerical conformance until
-a developer decision addresses that second facility limitation.
+facility, the TTNN `BF16` linear leaf is implemented and exercised with both
+measured limitations recorded, and it is not reported as supported numerical
+conformance for the affected classes and elements. The residual
+subnormal-operand deviation recorded below is the finite deviation the
+`subnormal_operands_preserved = false` declaration observes rather than
+asserts, so the port remains short of full numerical conformance for that
+element until a developer decision addresses that second facility limitation.
+At the five-backend gate revision the TTNN conformance target passes `47/47`
+cases with `1,859,192/1,859,192` assertions, of which the linear projection
+case contributes `1,449,065`; that case also requires both declarations to stay
+live (`skips.nonfinite_elements > 0` and `skips.subnormal_elements > 0`), so
+the two flags cannot rot into dead declarations.
 
 **Facility class expressibility (measured).** Probing one `32x32x32` matrix
 operation per case through this same route, with `MathFidelity::HiFi4` under
@@ -4861,9 +4885,10 @@ The cases live in the shared header
 framework, model fixture, checkpoint, or network dependency is permitted, and
 common code never switches on backend kind. An unported backend keeps an empty
 linear span and asserts `Unsupported` for every applicable leaf; that rejection
-probe is not projection conformance. The existing `linear` `Unsupported`
-probes and the copy/add/mul/sub/div suites remain until the operation's own
-leaf migrates them.
+probe is not projection conformance. Each of the five ports migrated its own
+`linear` `Unsupported` probe when it landed, so no driver keeps a blanket
+linear rejection probe today, while the unrelated copy/add/mul/sub/div suites
+remain unchanged.
 
 The fixture provenance and case links of that header are:
 
@@ -4949,6 +4974,44 @@ facility statement above rests on the executed probe and the traced kernel
 dispatches of the submitted OIDs rather than on a hardware instruction
 counter.
 
+The executed SYCL native `BF16` record of this revision is the following
+observation, collected on the configured SYCL host from the SYCL native `BF16`
+leaf's own task worktree at commit `ed92ff6`, which is this gate's revision,
+and re-observed here by the gate's own runs of the same production route:
+
+| Field | Observation |
+| --- | --- |
+| Backend, device | SYCL over Level Zero V2, `Intel(R) Arc(TM) Pro B60 Graphics`, architecture `intel_gpu_bmg_g21`, driver `1.15.38646+7`, subgroup sizes `16,32`, `ext_intel_matrix` present, PCI `8086:e211` |
+| Toolchain | Intel oneAPI DPC++/C++ Compiler `2026.1.0`, `-ffp-model=precise`; `ocloc` `26.22.38646.7` |
+| Evidence commands | The leaf's production-queue evidence driver (`record:` lines) invoked through `csw-remote-exec` with `csw-remote-sync` immediately before it and `flock -w 300` plus remote-side `timeout --kill-after=30s`; the gate then re-ran `./build/test/iom_sycl_conformance_tests` directly and through `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_(conformance\|smoke)_tests$'` |
+| Layout, dimensions | `x[...,T,I]` and HF `w[O,I]`: `P=1, T=19, I=3, O=10, s=2`; ordinary `H=1, D=10`; head-planar `H=2, D=5`; `R in {1,15,16,17}` |
+| Padded dimensions | `pad16(R)/pad16(I)/pad16(O)`: `16/16/16` for `R in {1,15,16}` and `32/16/16` for `R=17` |
+| Scratch | alignment `32`; `1024` bytes for `R in {1,15,16}` and `2048` bytes for `R=17`, exactly the reported `A32(P*pad16(R)*pad16(O)*4)` |
+| Kernel symbols | `LinearBf16MadKernel<16ul>`, `LinearBf16TailKernel<1ul>`, `LinearBf16TailKernel<16ul>`, and `LinearBf16PackKernel`, traced as `4/4/2/8` occurrences over the eight evidence submissions, one pack per output tile row |
+| Facility | The selected device reports `ext_intel_matrix`, subgroup `16`, and the BF16/BF16/FP32 combination; the executed route is the subgroup-16 `joint_matrix` MAD path with an explicit RNE BF16 pack, not a host or elementwise substitute |
+| ISA confirmation | Attempted and unavailable: `clang-offload-extract` on the built conformance binary yields ten `sycl-spir64` SPIR-V images, and `ocloc compile -spirv_input -device bmg` followed by `ocloc disasm` on each reports `dpas=0` and no `LinearBf16` symbol text (`ocloc 26.22.38646.7`), so the record rests on the traced dispatch and the device facts rather than on disassembly |
+
+| `R` | Layout | `pad16(R)/pad16(I)/pad16(O)` | Scratch (bytes, alignment) | Accepted OID | Wait |
+| ---: | --- | --- | --- | ---: | --- |
+| 1 | ordinary | `16/16/16` | `1024, 32` | `36028797018963969` | `ok` |
+| 1 | head-planar | `16/16/16` | `1024, 32` | `36028797018963970` | `ok` |
+| 15 | ordinary | `16/16/16` | `1024, 32` | `36028797018963971` | `ok` |
+| 15 | head-planar | `16/16/16` | `1024, 32` | `36028797018963972` | `ok` |
+| 16 | ordinary | `16/16/16` | `1024, 32` | `36028797018963973` | `ok` |
+| 16 | head-planar | `16/16/16` | `1024, 32` | `36028797018963974` | `ok` |
+| 17 | ordinary | `32/16/16` | `2048, 32` | `36028797018963975` | `ok` |
+| 17 | head-planar | `32/16/16` | `2048, 32` | `36028797018963976` | `ok` |
+
+Per-`R` conclusion: `R=1`, `15`, `16`, and `17` are each supported on both
+layouts; every submission returned its positive accepted OID and completed its
+wait, and each is covered by the traced dispatch symbols above. The gate's own
+re-run of the same production route at this revision holds the same result: the
+filtered linear projection case passes `1/1` case with
+`5,670,248/5,670,248` assertions including both crossing-factorization shapes,
+the full target passes `29/29` cases with `5,905,415/5,905,415` assertions, and
+`ctest` passes `2/2` including the smoke target, all with the Level Zero GPU
+enumerated before the run.
+
 #### Native matrix evidence obligations
 
 Native matrix work is evidenced by execution, not by inspection or analogy.
@@ -4983,8 +5046,73 @@ per output plane), and `linear_writer`. Real accepted submissions: `R=1`,
 `R=15`, `R=16`, and `R=17` each returned a positive OID (queue 1, sequence 1:
 `36028797018963969`) and completed with zero mismatches against an independent
 host FP64 reference under the contract's BF16 bound; the shared canonical
-`R=1` case reached the device and failed only the nonfinite element recorded
-above.
+`R=1` case reaches the device with exactly the elements the two declared
+facility limitations cover observed and counted rather than asserted, which
+the TTNN driver pins with `skips.nonfinite_elements > 0` and
+`skips.subnormal_elements > 0`.
+
+#### Same-revision five-backend gate evidence
+
+The closing Linear-projections gate ran every backend's conformance target and
+its direct binary at one revision, from one prepared task worktree, and
+recorded the device, runtime, and toolchain identity of each run. The CPU pair
+ran locally; every accelerator pair used exact-worktree `csw-remote`
+sync/exec with a fresh sync immediately before each execution, remote-side
+`timeout --kill-after=30s`, and a bounded hardware lock, and the TTNN pair kept
+its 300-second bound. The observed results are:
+
+| Backend | Commands | Device / runtime identity | Observed result |
+| --- | --- | --- | --- |
+| CPU | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_backend_conformance_cpu_tests$'` and the direct `./build/test/iom_backend_conformance_cpu_tests` | Local host CPU, C++20 release build | `24/24` cases, `5,934,262/5,934,262` assertions, `1/1` CTest pass |
+| CUDA | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_cuda_conformance_tests$'` and the direct binary on remote `bv1` | `NVIDIA GeForce RTX 5090`, compute capability `12.0`, driver `595.71.05`, `nvcc` release `13.2` build `V13.2.78` | `31/31` cases, `5,954,449/5,954,449` assertions, `1/1` CTest pass |
+| ROCm | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_rocm_conformance_tests$'` and the direct binary on remote `bv2` | `gfx1201` (`AMD Radeon AI PRO R9700`), HIP `7.15.26333-0000000`, AMD clang `23.0.0git` | `32/32` cases, `5,945,213/5,945,213` assertions at the recorded run (one other identical run reported `5,945,212`; no case failed in any run), `1/1` CTest pass |
+| SYCL | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_(conformance\|smoke)_tests$'` and the direct binary on remote `bh2` | Level Zero V2 `Intel(R) Arc(TM) Pro B60 Graphics`, oneAPI DPC++/C++ `2026.1.0`, `ocloc` `26.22.38646.7` | `29/29` cases, `5,905,415/5,905,415` assertions, `2/2` CTest pass including the smoke target |
+| TTNN | `ctest --test-dir build/ttnn --output-on-failure --timeout 300 -R '^iom_ttnn_conformance_tests$'` and the direct binary on remote `bv1` | Blackhole device 0, UMD firmware bundle `19.13.1`, TT-Metalium `v0.76.0-dev20260801-268-g06994d4afda` | `47/47` cases, `1,859,192/1,859,192` assertions, `1/1` CTest pass |
+
+CPU, CUDA, ROCm, and SYCL therefore demonstrate all twenty-one applicable
+leaves at this revision, and TTNN demonstrates the mandatory `BF16` leaf with
+the twenty other applicable leaves explicitly rejected after structural
+validation. No planned, rejection-only, storage-only, compile-only, or
+unsupported probe is counted as a pass anywhere in that table.
+
+**Crossing-factorization obligation.** The two additive head-planar crossing
+cases (`H=2 D=9 O=18` and `H=4 D=5 O=20`, `T=19`, `s=2`, `R=17`, every
+declared leaf) exist because the earlier fixture set's only head stride,
+`H=2 D=5`, never crossed a packed 16-column boundary and therefore left a real
+head-planar scatter defect invisible. This gate re-verified every backend
+against the independent FP64 oracle with those cases included; a filtered run
+of the shared linear projection case with successful-assertion reporting
+prints each case's label in its observed comparison contexts, so the cases are
+observably executed rather than skipped:
+
+| Backend | Crossing-case contexts (`H=2 D=9 O=18` / `H=4 D=5 O=20`) | Filtered linear case result |
+| --- | --- | --- |
+| CPU | `39,234` / `43,710` | `1/1` case, `5,676,263/5,676,263` assertions |
+| CUDA | `39,045` / `43,521` | `1/1` case, `5,670,287/5,670,287` assertions |
+| ROCm | `39,045` / `43,521` | `1/1` case, `5,670,297/5,670,297` assertions |
+| SYCL | `39,045` / `43,521` | `1/1` case, `5,670,248/5,670,248` assertions |
+| TTNN (`BF16`, its declared span) | `2,484` / `2,784` | `1/1` case, `1,449,065/1,449,065` assertions |
+
+No backend reported a crossing-case mismatch, so no case, tolerance, or
+declaration was weakened or re-scoped at this gate, and the TTNN row stays
+inside TTNN's documented mandatory-`BF16` exception. The `R=1`, `15`, `16`,
+and `17` native-facility records above remain the per-backend execution
+records for those logical runs.
+
+**TTNN per-leaf scope (observed at this revision).** A temporary `_local`
+probe driven through `csw-remote` on the TTNN host submitted the canonical
+ordinary `I=3, O=10, T=19, s=2, R=17, H=1, D=10` request for all twenty-one
+applicable leaves through the real queue and OID path. `BF16` returned the pure
+`{0, 1}` requirement, accepted the positive OID `36028797018963969`, completed
+its wait, and wrote the output; each of the other twenty leaves returned
+`Unsupported` from both the pure query and the submission (negative OID), and
+no leaf returned any other category — `accepted=1 rejected=20 other=0`. With
+`R=0`, the implemented `BF16` leaf and a rejected non-`BF16` leaf both return
+`InvalidArgument` rather than the capability rejection, so structural
+validation precedes the dtype/backend capability decision exactly as this
+contract requires. The device stores `22` leaves (`F8_E8M0` excluded), so the
+twenty rejections are capability statements about an implemented port, not
+storage-only observations; the probe was removed after the run.
 
 #### Implementation references and delivery prerequisites
 
@@ -5019,5 +5147,9 @@ Implementers need these existing sources and seams:
 described above. The per-backend linear kernels, launch wrappers, and
 capability predicates are owned by their own ports, which replace only their
 own hooks and migrate their own `Unsupported` probe as each declared leaf is
-actually implemented. This section claims no build, kernel, profiler, hardware,
-or runtime validation of the operation itself on any backend.
+actually implemented. The executed records this section carries — the ROCm and
+SYCL native `BF16` observations, the TTNN `BF16` evidence, and the
+same-revision five-backend gate table — are observations at their named
+revisions; the CUDA and TTNN native records referenced above live in their own
+matrix-feasibility subsections, and nothing here extends a recorded result to
+an unexercised shape, device, leaf, or revision.
