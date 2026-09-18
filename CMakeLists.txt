@@ -150,6 +150,11 @@ if(TTNN_ENABLED)
         src/ttnn/embedding.cpp
         src/ttnn/embedding.hpp
         src/ttnn/kernels/embedding.cpp
+        src/ttnn/linear.cpp
+        src/ttnn/linear.hpp
+        src/ttnn/kernels/linear_reader.cpp
+        src/ttnn/kernels/linear_compute.cpp
+        src/ttnn/kernels/linear_writer.cpp
         src/ttnn/testing.cpp
         src/ttnn/binary.cpp
         src/ttnn/rmsnorm_device_operation.hpp
@@ -162,11 +167,17 @@ if(TTNN_ENABLED)
 
     set_source_files_properties(
         src/ttnn/kernels/embedding.cpp
+        src/ttnn/kernels/linear_reader.cpp
+        src/ttnn/kernels/linear_compute.cpp
+        src/ttnn/kernels/linear_writer.cpp
         PROPERTIES HEADER_FILE_ONLY TRUE
     )
     target_compile_definitions(iom_ttnn
         PRIVATE
             IOM_TTNN_EMBEDDING_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/embedding.cpp"
+            IOM_TTNN_LINEAR_READER_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/linear_reader.cpp"
+            IOM_TTNN_LINEAR_COMPUTE_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/linear_compute.cpp"
+            IOM_TTNN_LINEAR_WRITER_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/linear_writer.cpp"
     )
 
     target_include_directories(iom_ttnn

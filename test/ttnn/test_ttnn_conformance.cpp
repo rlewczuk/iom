@@ -898,7 +898,7 @@ TEST_CASE("TTNN conformance: compute capabilities and RMSNorm queue") {
     TtnnDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, iom::ttnn_supported_data_types(), nullptr,
-            "TTNN", true, true);
+            "TTNN", true, true, false);
 }
 TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
     require_hardware();
@@ -1062,23 +1062,48 @@ TEST_CASE("TTNN conformance: embedding lookup reference, admission, and lifetime
 // native path, the frozen `{0, 1}` direct-reader/direct-writer scratch path, and
 // an explicit rejection for the other twenty applicable leaves, whose encoded
 // carriers its native TILE compute cannot consume without the forbidden host
-// staging. No linear port exists at this revision, so the implemented span is
-// empty and even the declared BF16 leaf stays a capability rejection here.
+// staging. The direct Metalium route is implemented, so the BF16 leaf is the
+// declared implemented span and the twenty other applicable leaves stay
+// capability rejections. Two measured native-facility limitations are recorded
+// instead of being asserted, exactly as the Linear projections section's
+// `Observed TTNN nonfinite limitation`, `Facility class expressibility`, and
+// `Facility subnormal handling` notes state: (1) the facility cannot express
+// the contract's nonfinite result classes — `inf*inf`, `max_finite*inf`,
+// `inf*max_finite`, and `1.7e38*1.7e38` return `+0` instead of an infinity,
+// `inf*0`, `0*inf`, and `inf + (-inf)` return `+0` instead of `NaN`, every NaN
+// operand returns `+inf`, and no tested operand encoding produces a NaN output
+// at all; and (2) it flushes subnormal operands before the multiply — `1.0`
+// times the largest BF16 subnormal (`0x007f`, `1.16631e-38`) returns `+0`
+// where the FP32 rule gives `1.16631e-38`, and `max_finite` times it returns
+// `+0` where the rule gives `3.95325`, while `0x0080` (`1.17549e-38`) and
+// `0x0100` both agree. Every element those two limitations do not affect keeps
+// the unchanged contract tolerances.
 const iom_conformance::LinearDeclaration kTtnnLinearDeclaration{
         iom_conformance::kLinearTtnnLeafSpan,
         iom_conformance::kNoLinearSpan,
         iom_conformance::kLinearNativeBf16Span,
-        iom_conformance::kNoLinearSpan,
+        iom_conformance::kLinearNativeBf16Span,
         {},
         iom_conformance::LinearWorkspacePath::zero,
-        iom_conformance::LinearWorkspacePath::zero};
+        iom_conformance::LinearWorkspacePath::zero,
+        false,
+        false};
 
 TEST_CASE("TTNN conformance: linear projection reference, admission, and lifetime") {
     require_hardware();
     TtnnDevices devices;
     TtnnStorageOracle oracle;
+    iom_conformance::LinearComparisonRecord skips;
     iom_conformance::run_linear_conformance(
-            devices.conformance(), kTtnnLinearDeclaration, nullptr, &oracle);
+            devices.conformance(), kTtnnLinearDeclaration, nullptr, &oracle,
+            &skips);
+    // Both declared facility limitations must be exercised by the shared BF16
+    // fixture rather than being dead declarations: the canonical fixture
+    // carries nonfinite ladder operands and subnormal operands, so a run that
+    // never observes one of them means the declaration no longer matches what
+    // this port is measured to do.
+    CHECK(skips.nonfinite_elements > 0);
+    CHECK(skips.subnormal_elements > 0);
 }
 
 TEST_CASE("TTNN embedding owners survive accepted dispatch before wait") {
@@ -1136,7 +1161,7 @@ TEST_CASE("TTNN conformance: full shared suite") {
     TtnnStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices.conformance(), supported.subspan(0, 1), nullptr, &oracle,
-            true);
+            true, std::nullopt, false);
 }
 
 TEST_CASE("TTNN conformance: binary MUL SUB and floating DIV values through real queue") {

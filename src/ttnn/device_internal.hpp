@@ -19,6 +19,7 @@ namespace iom::ttnn_detail {
 
 [[nodiscard]] bool is_supported(DataType type);
 [[nodiscard]] bool rmsnorm_supported(DataType type) noexcept;
+[[nodiscard]] bool linear_supported(DataType type) noexcept;
 [[nodiscard]] tt::tt_metal::DataType native_dtype(DataType type);
 [[nodiscard]] std::size_t carrier_factor(DataType type);
 [[nodiscard]] std::invalid_argument invalid_ordinal(

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rmsnorm_device_operation.hpp"
+#include "../iom_internal.hpp"
 
 namespace iom::ttnn_detail {
 namespace {
@@ -124,6 +125,7 @@ TtnnQueue::TtnnQueue(TtnnDevice& device)
           registry_queue_id_(detail::allocate_queue_id(*state_)),
           embedding_status_(device.queue_config().max_in_flight_per_queue),
           embedding_program_(device.mesh()),
+          linear_program_(device.mesh()),
           worker_(
                   detail::StagedWorker<Task>::Callbacks{
                           [this](Task& task) { execute(task); },
@@ -294,6 +296,86 @@ bool TtnnQueue::rmsnorm_supported(DataType data_type) const {
     return ttnn_detail::rmsnorm_supported(data_type);
 }
 
+oid TtnnQueue::linear_impl(const LinearRequest& request) {
+    // The common admission already validated the complete request and the
+    // capability query already rejected every leaf this native path does not
+    // implement; the queue repeats the leaf decision so a direct call can
+    // never reach the native program for another carrier.
+    if (!ttnn_detail::linear_supported(request.x.spec.data_type)) {
+        throw detail::UnsupportedOperation();
+    }
+    std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+    return submit_linear(
+            request, *state_, registry_queue_id_,
+            [this](std::uint64_t sequence) {
+                // Linear's `execute()` runs asynchronously on the staged
+                // worker thread via `submit_after_publish`, so its fence is
+                // gated on the worker-domain marker.
+                return ttnn_detail::build_ttnn_fence(
+                        *device_, worker_executed_seq_, sequence);
+            },
+            [this](std::uint64_t sequence, const LinearRequest& captured,
+                   detail::BinaryEntryRegistration entries) {
+                ttnn_detail::LinearNativeRequest internal{
+                        {captured.x.spec, captured.x.native_handle,
+                         captured.x.plane_offset, captured.x.plane_strides},
+                        {captured.w.spec, captured.w.native_handle,
+                         captured.w.plane_offset, captured.w.plane_strides},
+                        {captured.out.spec, captured.out.native_handle,
+                         captured.out.plane_offset,
+                         captured.out.plane_strides},
+                        captured.start_row, captured.rows, captured.layout,
+                        captured.heads, captured.head_dim};
+                Task task(sequence, std::move(internal), entries);
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] = linear_outcomes_.emplace(
+                                sequence,
+                                LinearOutcome{
+                                        task.binary_entries,
+                                        captured.workspace_lease});
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    "duplicate TTNN linear sequence");
+                        }
+                    }
+                    worker_.submit_after_publish(std::move(task));
+                } catch (...) {
+                    bool rollback_outcome = false;
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        rollback_outcome =
+                                linear_outcomes_.erase(sequence) != 0;
+                    }
+                    if (rollback_outcome) {
+                        state_->registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(),
+                                        entries.count));
+                        detail::complete_workspace_lease(
+                                *state_, captured.workspace_lease, true);
+                    }
+                    std::rethrow_exception(std::current_exception());
+                }
+            });
+}
+
+WorkspaceRequirements TtnnQueue::linear_workspace_requirements_impl(
+        const TensorView& x, const TensorView&, const TensorView&,
+        std::size_t, std::size_t, LinearOutputLayout, std::size_t,
+        std::size_t) {
+    // BF16 is the only leaf the direct native route implements, so the other
+    // twenty applicable leaves stay capability rejections. The frozen direct
+    // reader/writer route owns no packed operand or product region, so the
+    // requirement is exactly `{0, 1}`: pure, allocation-free, and independent
+    // of queue occupancy or completion state.
+    if (!ttnn_detail::linear_supported(x.spec().data_type)) {
+        throw detail::UnsupportedOperation();
+    }
+    return WorkspaceRequirements{0, 1};
+}
+
 void TtnnQueue::execute_rmsnorm(Task& task) {
     bool submitted = false;
     std::exception_ptr submission_failure;
@@ -348,7 +430,39 @@ void TtnnQueue::execute_rmsnorm(Task& task) {
             std::memory_order_release);
 }
 
+void TtnnQueue::execute_linear(Task& task) {
+    bool submitted = false;
+    std::exception_ptr submission_failure;
+    try {
+        std::lock_guard<std::mutex> api_lock(device_->api_mutex());
+        const ttnn_detail::LinearNativeRequest& request =
+                *task.linear_request;
+        ttnn_detail::linear_planes(
+                device_->mesh(), linear_program_, request, submitted);
+    } catch (...) {
+        submission_failure = std::current_exception();
+    }
+    {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
+        const auto it = linear_outcomes_.find(task.sequence);
+        if (it != linear_outcomes_.end()) {
+            it->second.retained_failure = submission_failure;
+            it->second.native_work_submitted = submitted;
+        }
+    }
+    // Linear executes asynchronously on the staged worker thread via
+    // `worker_.submit_after_publish`, so the marker advance is on the
+    // worker-domain atomic.
+    monotonic_max_store(
+            worker_executed_seq_, task.sequence,
+            std::memory_order_release);
+}
+
 void TtnnQueue::execute(Task& task) {
+    if (task.is_linear) {
+        execute_linear(task);
+        return;
+    }
     if (task.is_rmsnorm) {
         execute_rmsnorm(task);
         return;
@@ -472,6 +586,8 @@ void TtnnQueue::complete_task(
     bool is_rmsnorm = false;
     BinaryOutcome binary_outcome;
     bool is_binary = false;
+    LinearOutcome linear_outcome;
+    bool is_linear = false;
     {
         std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto rmsnorm_it = rmsnorm_outcomes_.find(sequence);
@@ -480,8 +596,14 @@ void TtnnQueue::complete_task(
             rmsnorm_outcomes_.erase(rmsnorm_it);
             is_rmsnorm = true;
         }
+        const auto linear_it = linear_outcomes_.find(sequence);
+        if (!is_rmsnorm && linear_it != linear_outcomes_.end()) {
+            linear_outcome = std::move(linear_it->second);
+            linear_outcomes_.erase(linear_it);
+            is_linear = true;
+        }
         const auto binary_it = binary_outcomes_.find(sequence);
-        if (!is_rmsnorm && binary_it != binary_outcomes_.end()) {
+        if (!is_rmsnorm && !is_linear && binary_it != binary_outcomes_.end()) {
             binary_outcome = std::move(binary_it->second);
             binary_outcomes_.erase(binary_it);
             is_binary = true;
@@ -509,6 +631,40 @@ void TtnnQueue::complete_task(
                 state_->registry, rmsnorm_outcome.entries,
                 static_cast<bool>(operation_failure) && !completion_proven,
                 fence_succeeded);
+        complete(sequence, operation_failure
+                ? operation_failure : fence_result.failure);
+        return;
+    }
+    if (is_linear) {
+        detail::FenceResult fence_result = detail::FenceResult::success();
+        bool completion_proven = linear_outcome.native_completion_proven;
+        // A post-publication failure before the first native program reached
+        // the mesh has no outstanding device work to fence. Treat that empty
+        // path as proven so accepted owners and the workspace lease remain
+        // reusable.
+        if (!linear_outcome.native_work_submitted) {
+            completion_proven = true;
+        }
+        if (linear_outcome.native_work_submitted && !completion_proven) {
+            fence_result = ttnn_detail::finish_native(*device_);
+            completion_proven =
+                    fence_result.succeeded && !fence_result.failure;
+            if (completion_proven) {
+                publish_native_completion(sequence);
+            }
+        }
+        const std::exception_ptr operation_failure =
+                failure ? failure : linear_outcome.retained_failure;
+        const bool fence_succeeded =
+                fence_result.succeeded && !fence_result.failure;
+        // Owners are released only after the covering fence, and a proven
+        // data failure leaves them invalidated rather than reusable.
+        (void)detail::release_or_invalidate_binary_entries(
+                state_->registry, linear_outcome.entries,
+                static_cast<bool>(operation_failure) && !completion_proven,
+                fence_succeeded);
+        detail::complete_workspace_lease(
+                *state_, linear_outcome.workspace_lease, completion_proven);
         complete(sequence, operation_failure
                 ? operation_failure : fence_result.failure);
         return;

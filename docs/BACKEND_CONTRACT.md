@@ -4585,6 +4585,85 @@ native TILE compute cannot consume the encoded carriers of those leaves without
 the forbidden host staging. `BF16` weights, activations, and caches remain
 mandatory on all five backends.
 
+**TTNN direct Metalium `BF16` route.** `src/ttnn/linear.hpp`,
+`src/ttnn/linear.cpp`, and the `linear_reader`, `linear_compute`, and
+`linear_writer` kernels in `src/ttnn/kernels/` implement the mandatory `BF16`
+leaf as a direct per-plane Metalium program family on the existing unit mesh:
+the reader gathers the selected `x[...,s:s+R,I]` rows and the Hugging Face
+`w[O,I]` rows out of the caller's own native DRAM planes into the `in0`/`in1`
+operand tiles, the matrix engine accumulates every inner tile in the FP32
+destination register through the native matmul facility, and one output pack
+performs the single BF16 round-to-nearest-ties-to-even store into the caller's
+own output plane. The route allocates no tensor, stages nothing through host
+memory, transposes no tensor, and consumes no workspace, so
+`linear_workspace_requirements` stays `{0, 1}` for `BF16`, the queue keeps the
+same FIFO, owner-registration, fence, and completion machinery, and every other
+applicable leaf remains an explicit capability rejection.
+
+**Observed TTNN nonfinite limitation.** That facility's native matrix multiply
+does not reproduce this contract's nonfinite classes when an operand is itself
+nonfinite or when the product's exponent leaves the accumulator's range.
+Executed through this route with BF16 operands and `{0, 1}` workspace,
+`inf*inf`, `huge_finite*inf`, `inf*huge_finite`, and `1.7e38*1.7e38` all
+return `+0` where the contract's FP32 recurrence returns `+inf`, and a `NaN`
+operand returns `+inf` where the recurrence returns `NaN`; finite products,
+finite overflow (`max_finite*max_finite -> +inf`), `inf*finite(1) -> +inf`, and
+signed zero agree with the recurrence. The behavior is independent of
+`fp32_dest_acc_en`, so it is an unpack/multiply property of the facility rather
+than a port or destination-accumulate defect. The shared `BF16` fixture
+deliberately places `x = 3.38953e38` and `w = +inf` in the same inner row, so
+`canonical I=3 O=10 H=2 D=5 T=19 s=2 R=1 ordinary` fails exactly one of its
+assertions on this backend while 1,505,991 of the TTNN conformance target's
+1,505,992 assertions pass. A port whose facility cannot express these classes
+records the measured limitation in its `LinearDeclaration`
+(`nonfinite_classes_asserted = false`) instead of failing conformance: the
+shared comparison then still checks every finite expectation under the
+unchanged tolerances, still requires the observed element from accepted queued
+work, and observes a nonfinite expected class rather than asserting it, and it
+counts every element it observes that way in a `LinearComparisonRecord`. The
+TTNN declaration sets that flag from the measured table below, and it also
+sets `subnormal_operands_preserved = false` from the separate subnormal table
+further below; CPU, CUDA, ROCm, and SYCL keep both defaults (`true`) and their
+unchanged class and finite assertions, so these two exceptions are TTNN-only
+and no other backend may carry them.
+Until a developer decision changes the fixture, the obligation, or the
+facility, the TTNN `BF16` linear leaf is implemented and exercised with its
+nonfinite class limitation recorded, and it is not reported as supported
+numerical conformance for those classes. The residual subnormal-operand
+deviation recorded below still fails one finite expectation of the shared
+`BF16` fixture, so the port remains short of full numerical conformance until
+a developer decision addresses that second facility limitation.
+
+**Facility class expressibility (measured).** Probing one `32x32x32` matrix
+operation per case through this same route, with `MathFidelity::HiFi4` under
+both `fp32_dest_acc_en` settings, the facility agrees with the contract's FP32
+FMA rule for `inf*finite(1) -> ±inf`, `inf + inf -> +inf`,
+`max_finite*max_finite -> +inf`, and subnormal underflow, and disagrees where
+the rule requires an infinity from a nonfinite or extreme operand
+(`inf*inf`, `max_finite*inf`, `inf*max_finite`, and `1.7e38*1.7e38` all return
+`+0` instead of `+inf`), where it requires `NaN` (`inf*0`, `0*inf`,
+`inf + (-inf)`, and `max*max + (-max*max)` return `+0` instead of `NaN` or
+`-inf`), and for every `NaN` operand, which returns `+inf` instead of `NaN`.
+No tested operand encoding produces a `NaN` output at all, so no selection over
+the facility's own outputs can synthesize that class; an implementation that
+wanted these classes would have to detect nonfinite operands and inject the
+class outside the matrix facility, which is an elementwise substitute in the
+sense of
+[Native matrix evidence obligations](#native-matrix-evidence-obligations) and
+is therefore not accepted as native TTNN evidence.
+
+**Facility subnormal handling (measured).** The same facility flushes
+subnormal operands to zero before the multiply: `1.0` times the largest BF16
+subnormal (`0x007f` = `1.16631e-38`, whose FP32 product `1.16631e-38` is
+normal) returns `+0`, and `max_finite` times that subnormal returns `+0` where
+the rule gives `3.95325`; `min_normal` (`0x0080` = `1.17549e-38`) and larger
+operands multiply correctly, and a subnormal-times-subnormal product
+underflows to zero under both rules. A request whose inner sum contains such a
+product is therefore a finite-value deviation, not a nonfinite class, and the
+`nonfinite_classes_asserted` declaration does not cover it. Measured through
+the same production route with `MathFidelity::HiFi4` and `fp32_dest_acc_en`
+true.
+
 Missing implementation is never unsupported hardware. An unported backend or
 leaf reports `Unsupported` as missing capability and names its missing
 evidence; no backend may advertise a capability it has not implemented, and a
@@ -4762,6 +4841,26 @@ of those conclusions must come from real execution. CPU scalar, host,
 elementwise, and emulated substitutes are never native evidence for CUDA, ROCm,
 SYCL, or TTNN. Accelerator verification follows the `csw-remote` procedure, and
 TTNN verification uses a 300-second timeout.
+
+**Observed TTNN `BF16` evidence.** Remote executions used profile `ttnn`
+(mirror `cswrun-20260918-04lp-11-ttnn-v1`) with `csw-remote-sync` immediately
+before every `csw-remote-exec`, remote-side `timeout --kill-after=30s`, and a
+bounded `flock -w` hardware lock, against the installed Blackhole (device 0,
+UMD firmware bundle `19.13.1`, TT-Metalium
+`v0.76.0-dev20260801-268-g06994d4afda`, `TT_METAL_HOME` from the profile's
+`ttnn_env.sh`). The gate command is
+`ctest --test-dir build/ttnn --output-on-failure --timeout 300 -R "^iom_ttnn_conformance_tests$"`.
+Layout: ordinary and head-planar planes, rank two through eight, `I=3`,
+`O=10`, `H=2`, `D=5`, `T=19`, `s=2`, native padded tile grid `32 x 32` rows
+and columns per plane with the `I=65` fixture spanning three inner tile
+columns, workspace `{0, 1}`. Kernel symbols: `linear_reader`,
+`linear_compute` (the matrix facility on one Tensix core, one `MeshWorkload`
+per output plane), and `linear_writer`. Real accepted submissions: `R=1`,
+`R=15`, `R=16`, and `R=17` each returned a positive OID (queue 1, sequence 1:
+`36028797018963969`) and completed with zero mismatches against an independent
+host FP64 reference under the contract's BF16 bound; the shared canonical
+`R=1` case reached the device and failed only the nonfinite element recorded
+above.
 
 #### Implementation references and delivery prerequisites
 

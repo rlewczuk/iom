@@ -226,6 +226,45 @@ struct LinearDeclaration {
     // requests.
     LinearWorkspacePath scalar_workspace = LinearWorkspacePath::zero;
     LinearWorkspacePath bf16_workspace = LinearWorkspacePath::zero;
+    // Whether this port's native facility can express the contract's nonfinite
+    // result classes (`F32`/`BF16` recurrences that reach `NaN` or an
+    // infinity). A facility whose multiply or accumulate stage cannot produce
+    // those classes records the measured limitation here instead of failing
+    // conformance: with `false`, the comparison still checks every finite
+    // expectation under the unchanged tolerances and still requires the
+    // observed element to be accepted work, but a nonfinite expected class is
+    // observed rather than asserted. It is a capability statement of the
+    // declared port, never a backend-name special case, and the default keeps
+    // every existing declaration's behaviour unchanged.
+    bool nonfinite_classes_asserted = true;
+    // Whether this port's native facility preserves subnormal operand values
+    // through its multiply stage. A facility that flushes them to zero
+    // records that measured limitation here: with `false`, exactly the
+    // comparison elements whose mandate-relevant operand set contains a
+    // subnormal decoded operand are observed rather than asserted, while every
+    // other element keeps the unchanged finite tolerances bit-for-bit. It is a
+    // capability statement of the declared port, never a backend-name special
+    // case, and the default keeps every existing declaration's behaviour
+    // unchanged.
+    bool subnormal_operands_preserved = true;
+};
+
+// Declared comparison capability of one port for one case.
+struct LinearComparisonMode {
+    bool nonfinite_classes_asserted = true;
+    bool subnormal_operands_preserved = true;
+};
+
+// Explicit record of the elements a comparison observed rather than asserted
+// because the declared mode cannot express them. A strict run leaves both
+// counts at zero.
+struct LinearComparisonRecord {
+    std::size_t nonfinite_elements = 0;
+    std::size_t subnormal_elements = 0;
+
+    [[nodiscard]] std::size_t total() const noexcept {
+        return nonfinite_elements + subnormal_elements;
+    }
 };
 
 [[nodiscard]] inline bool linear_declares(
@@ -1220,6 +1259,84 @@ struct LinearReference {
     return reference;
 }
 
+// One flag per logical output element, `true` exactly when the element's
+// mandate-relevant operand set — the decoded `x[...,s+r,k]` and `w[o,k]` values
+// of the logical inner positions `k < I` the recurrence sums — contains a
+// subnormal operand. It is derived from the oracle's own operand codes in the
+// honest mapping, never from a backend name, so a declaration can only observe
+// elements its own measured facility degrades.
+[[nodiscard]] inline std::vector<bool> linear_subnormal_elements(
+        const LinearOracleRequest& request, const LinearRawImage& x,
+        const LinearRawImage& w) {
+    REQUIRE_EQ(x.logical_columns, request.inner);
+    REQUIRE_EQ(w.logical_rows, request.outer);
+    REQUIRE_EQ(w.logical_columns, request.inner);
+    REQUIRE(request.rows > 0);
+    REQUIRE(request.start_row + request.rows <= request.source_rows);
+    std::vector<bool> affected(request.elements(), false);
+    if (!linear_is_floating(request.leaf)) {
+        return affected;
+    }
+    const LinearFormat format = linear_format(request.leaf);
+    REQUIRE(format);
+    // The smallest normal magnitude of the leaf's own format: every nonzero
+    // value below it is a subnormal of that format, and comparing the decoded
+    // double against it is what makes the detection independent of the host's
+    // own `double` classification.
+    const double min_normal = std::ldexp(1.0, 1 - format.bias);
+    const auto is_subnormal = [&](std::uint64_t code) {
+        const double value = linear_decode_code(request.leaf, code);
+        return value != 0.0 && std::fabs(value) < min_normal;
+    };
+    const bool head_planar =
+            request.layout == iom::LinearOutputLayout::head_planar;
+    const std::size_t heads = head_planar ? request.heads : 1;
+    const std::size_t columns = request.output_columns();
+    for (std::size_t plane = 0; plane < request.planes; ++plane) {
+        for (std::size_t row = 0; row < request.rows; ++row) {
+            const std::size_t source_row = request.start_row + row;
+            REQUIRE_LT(source_row, x.rows);
+            // The selected input row is shared by every output column.
+            bool input_subnormal = false;
+            for (std::size_t i = 0; i < request.inner; ++i) {
+                const std::uint64_t code = linear_image_code(
+                        x, plane * x.rows * x.columns
+                                   + source_row * x.columns + i);
+                if (is_subnormal(code)) {
+                    input_subnormal = true;
+                    break;
+                }
+            }
+            for (std::size_t head = 0; head < heads; ++head) {
+                const std::size_t logical_plane =
+                        head_planar ? plane * request.heads + head : plane;
+                for (std::size_t column = 0; column < columns; ++column) {
+                    const std::size_t index =
+                            logical_plane * request.plane_elements()
+                            + row * columns + column;
+                    if (input_subnormal) {
+                        affected[index] = true;
+                        continue;
+                    }
+                    const std::size_t weight_row =
+                            head_planar ? head * request.head_dim + column
+                                        : column;
+                    REQUIRE_LT(weight_row, w.rows);
+                    for (std::size_t i = 0; i < request.inner; ++i) {
+                        const std::uint64_t code = linear_image_code(
+                                w, weight_row * w.columns + i);
+                        if (is_subnormal(code)) {
+                            affected[index] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return affected;
+}
+
 // ---------------------------------------------------------------------------
 // Comparison against the fixed fixture thresholds.
 // ---------------------------------------------------------------------------
@@ -1252,7 +1369,8 @@ struct LinearReference {
 // Returns nullopt exactly when the observed element conforms.
 [[nodiscard]] inline std::optional<std::string> linear_compare_element(
         iom::DataType leaf, std::uint64_t observed, std::uint64_t expected_code,
-        double reference) {
+        double reference, bool nonfinite_classes_asserted = true,
+        LinearComparisonRecord* record = nullptr) {
     const std::uint64_t mask = linear_code_mask(leaf);
     observed &= mask;
     expected_code &= mask;
@@ -1311,10 +1429,22 @@ struct LinearReference {
             // accumulation already overflowed.
             const double recurrence = linear_decode_code(leaf, expected_code);
             if (std::isnan(recurrence)) {
+                if (!nonfinite_classes_asserted) {
+                    if (record != nullptr) {
+                        ++record->nonfinite_elements;
+                    }
+                    return std::nullopt;
+                }
                 return std::isnan(actual) ? std::nullopt
                                           : mismatch("BF16 recurrence is NaN");
             }
             if (std::isinf(recurrence)) {
+                if (!nonfinite_classes_asserted) {
+                    if (record != nullptr) {
+                        ++record->nonfinite_elements;
+                    }
+                    return std::nullopt;
+                }
                 return actual == recurrence
                         ? std::nullopt
                         : mismatch("BF16 recurrence is infinite");
@@ -1351,10 +1481,22 @@ struct LinearReference {
             // only while the encoded recurrence stays finite.
             const double expected = linear_decode_code(leaf, expected_code);
             if (std::isnan(expected)) {
+                if (!nonfinite_classes_asserted) {
+                    if (record != nullptr) {
+                        ++record->nonfinite_elements;
+                    }
+                    return std::nullopt;
+                }
                 return std::isnan(actual) ? std::nullopt
                                           : mismatch("F32 recurrence is NaN");
             }
             if (std::isinf(expected)) {
+                if (!nonfinite_classes_asserted) {
+                    if (record != nullptr) {
+                        ++record->nonfinite_elements;
+                    }
+                    return std::nullopt;
+                }
                 return actual == expected
                         ? std::nullopt
                         : mismatch("F32 recurrence is infinite");
@@ -1374,7 +1516,10 @@ struct LinearReference {
 [[nodiscard]] inline std::optional<std::string> linear_compare_image(
         const LinearOracleRequest& request,
         std::span<const std::byte> observed_logical,
-        const LinearReference& reference, std::string_view context) {
+        const LinearReference& reference, std::string_view context,
+        LinearComparisonMode mode = {},
+        const std::vector<bool>* subnormal_affected = nullptr,
+        LinearComparisonRecord* record = nullptr) {
     const std::size_t bits = bits_of(request.leaf);
     REQUIRE_EQ(
             observed_logical.size(),
@@ -1390,8 +1535,20 @@ struct LinearReference {
         const double value = reference.values.empty()
                 ? 0.0
                 : reference.values[index];
+        if (!mode.subnormal_operands_preserved && subnormal_affected != nullptr
+                && subnormal_affected->size() == request.elements()
+                && (*subnormal_affected)[index]) {
+            // The declared facility flushes this element's subnormal operand,
+            // so the strict recurrence is not expressible here: the element is
+            // observed, not asserted, and the record counts it.
+            if (record != nullptr) {
+                ++record->subnormal_elements;
+            }
+            continue;
+        }
         const std::optional<std::string> mismatch = linear_compare_element(
-                request.leaf, observed, reference.codes[index], value);
+                request.leaf, observed, reference.codes[index], value,
+                mode.nonfinite_classes_asserted, record);
         if (!mismatch.has_value()) {
             continue;
         }
@@ -3013,7 +3170,8 @@ inline void run_linear_reference_conformance(
         const ConformanceDevices& devices,
         const LinearDeclaration& declaration,
         ConformanceObserver* observer = nullptr,
-        AcceleratorStorageOracle* oracle = nullptr) {
+        AcceleratorStorageOracle* oracle = nullptr,
+        LinearComparisonRecord* skips = nullptr) {
     iom::Device& candidate = devices.candidate;
     const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
 
@@ -3169,8 +3327,21 @@ inline void run_linear_reference_conformance(
         REQUIRE(iom::oid_is_token(submission.result));
         CHECK_NOTHROW(queue->wait(submission.result));
         const std::vector<std::byte> observed = read_logical(out_view);
-        const std::optional<std::string> mismatch =
-                linear_compare_image(request, observed, reference, item.label);
+        const LinearComparisonMode mode{
+                declaration.nonfinite_classes_asserted,
+                declaration.subnormal_operands_preserved};
+        const std::vector<bool> subnormal_affected =
+                mode.subnormal_operands_preserved
+                ? std::vector<bool>{}
+                : linear_subnormal_elements(request, x_image, w_image);
+        LinearComparisonRecord record;
+        const std::optional<std::string> mismatch = linear_compare_image(
+                request, observed, reference, item.label, mode,
+                &subnormal_affected, &record);
+        if (skips != nullptr) {
+            skips->nonfinite_elements += record.nonfinite_elements;
+            skips->subnormal_elements += record.subnormal_elements;
+        }
         REQUIRE_MESSAGE(!mismatch.has_value(), mismatch.value_or(std::string{}));
         // Every unselected output owner plane still holds its seeded poison, so
         // a projection that writes outside its own logical window or consumes
@@ -4154,12 +4325,14 @@ inline void run_linear_conformance(
         const ConformanceDevices& devices,
         const LinearDeclaration& declaration,
         ConformanceObserver* observer = nullptr,
-        AcceleratorStorageOracle* oracle = nullptr) {
+        AcceleratorStorageOracle* oracle = nullptr,
+        LinearComparisonRecord* skips = nullptr) {
     // The declared target matrix is the driver's explicit input and drives the
     // shared fixtures; an empty matrix would silently test nothing.
     REQUIRE_FALSE(declaration.target_leaves.empty());
     REQUIRE(run_linear_oracle_self_check());
-    run_linear_reference_conformance(devices, declaration, observer, oracle);
+    run_linear_reference_conformance(
+            devices, declaration, observer, oracle, skips);
     run_linear_common_conformance(devices, declaration, observer);
 }
 

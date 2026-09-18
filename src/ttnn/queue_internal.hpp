@@ -14,6 +14,7 @@
 #include "device_internal.hpp"
 #include "copy.hpp"
 #include "embedding.hpp"
+#include "linear.hpp"
 namespace iom::ttnn_detail {
 
 // Builds the per-submission TTNN fence used by every queued submission
@@ -57,6 +58,7 @@ class TtnnQueue final : public DeviceOps {
         bool no_op = false;
         bool is_binary = false;
         bool is_rmsnorm = false;
+        bool is_linear = false;
         bool is_embedding = false;
         DeviceOps::BinaryOperation operation =
                 DeviceOps::BinaryOperation::Add;
@@ -66,6 +68,7 @@ class TtnnQueue final : public DeviceOps {
                 {TensorSpec{TensorShape{{1, 1}}, DataType::I32}, nullptr, 0, {}},
                 TensorShape{{1, 1}}};
         std::optional<RmsnormRequest> rmsnorm_request;
+        std::optional<ttnn_detail::LinearNativeRequest> linear_request;
         void* fence = nullptr;
         detail::BinaryEntryRegistration binary_entries{};
         detail::BinaryEntryRegistration rmsnorm_entries{};
@@ -108,6 +111,13 @@ class TtnnQueue final : public DeviceOps {
 
         Task(
                 std::uint64_t sequence_,
+                ttnn_detail::LinearNativeRequest request_,
+                detail::BinaryEntryRegistration entries)
+            : sequence(sequence_), is_linear(true),
+              linear_request(std::move(request_)), binary_entries(entries) {}
+
+        Task(
+                std::uint64_t sequence_,
                 ttnn_detail::EmbeddingNativeRequest request_,
                 detail::BinaryEntryRegistration entries,
                 std::size_t embedding_slot_)
@@ -132,6 +142,14 @@ class TtnnQueue final : public DeviceOps {
         std::exception_ptr retained_failure;
     };
 
+    struct LinearOutcome {
+        detail::BinaryEntryRegistration entries;
+        detail::WorkspaceLease workspace_lease;
+        bool native_work_submitted = false;
+        bool native_completion_proven = false;
+        std::exception_ptr retained_failure;
+    };
+
     struct EmbeddingOutcome {
         detail::BinaryEntryRegistration entries;
         detail::WorkspaceLease workspace_lease;
@@ -150,6 +168,12 @@ public:
     oid rmsnorm_impl(const RmsnormRequest& request) override;
     [[nodiscard]] bool rmsnorm_supported(
             DataType data_type) const override;
+    oid linear_impl(const LinearRequest& request) override;
+    [[nodiscard]] WorkspaceRequirements linear_workspace_requirements_impl(
+            const TensorView& x, const TensorView& w,
+            const TensorView& out, std::size_t s, std::size_t R,
+            LinearOutputLayout layout, std::size_t H,
+            std::size_t D) override;
     oid embedding_impl(const EmbeddingRequest& request) override;
     [[nodiscard]] WorkspaceRequirements
             embedding_workspace_requirements_impl(
@@ -160,6 +184,7 @@ private:
     void execute(Task& task);
     void execute_copy(Task& task);
     void execute_rmsnorm(Task& task);
+    void execute_linear(Task& task);
     void execute_embedding(Task& task);
     void publish_native_completion(std::uint64_t sequence) noexcept;
     void complete_task(
@@ -172,6 +197,7 @@ private:
     TtnnDevice* device_;
     std::map<std::uint64_t, BinaryOutcome> binary_outcomes_;
     std::map<std::uint64_t, RmsnormOutcome> rmsnorm_outcomes_;
+    std::map<std::uint64_t, LinearOutcome> linear_outcomes_;
     std::map<std::uint64_t, EmbeddingOutcome> embedding_outcomes_;
     detail::RegistryState* state_;
     detail::QueueId registry_queue_id_;
@@ -180,6 +206,7 @@ private:
     std::map<std::uint64_t, detail::SequenceOutcome> outcomes_;
     ttnn_detail::EmbeddingStatusResources embedding_status_;
     ttnn_detail::EmbeddingProgram embedding_program_;
+    ttnn_detail::LinearProgram linear_program_;
     detail::StagedWorker<Task> worker_;
     std::mutex fence_mutex_;
     std::atomic<std::uint64_t> last_finished_seq_{0};

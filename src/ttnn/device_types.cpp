@@ -99,6 +99,40 @@ bool rmsnorm_supported(DataType type) noexcept {
     }
     return false;
 }
+bool linear_supported(DataType type) noexcept {
+    // BF16 is the mandatory linear leaf and the only one the native matrix
+    // path implements: native TILE compute consumes exactly the BF16 carrier
+    // of the caller's own planes, while the other twenty applicable leaves
+    // would need the forbidden host or elementwise staging.
+    switch (type) {
+        case DataType::BF16:
+            return true;
+        case DataType::BOOL:
+        case DataType::I2:
+        case DataType::U2:
+        case DataType::I4:
+        case DataType::U4:
+        case DataType::I8:
+        case DataType::U8:
+        case DataType::I16:
+        case DataType::U16:
+        case DataType::I32:
+        case DataType::U32:
+        case DataType::I64:
+        case DataType::U64:
+        case DataType::F4_E2M1:
+        case DataType::F6_E2M3:
+        case DataType::F6_E3M2:
+        case DataType::F8_E4M3FN:
+        case DataType::F8_E5M2:
+        case DataType::F8_E8M0:
+        case DataType::F16:
+        case DataType::F32:
+        case DataType::F64:
+            return false;
+    }
+    return false;
+}
 
 std::size_t carrier_factor(DataType type) {
     return detail::leaf_bits(type) > 32 ? 2 : 1;
