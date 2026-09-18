@@ -4835,13 +4835,12 @@ TEST_CASE("Linear zero requirement neither validates nor leases an unused range"
     CHECK_EQ(queue.linear_records().size(), std::size_t{4});
 }
 
-TEST_CASE("Linear keeps the unported CPU backend explicitly unsupported") {
+TEST_CASE("CPU linear projections execute on the real queue with fixed result categories") {
     const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
     const iom::oid overflow = iom::to_oid(iom::OidError::Overflow);
-    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
 
-    // The real reference CPU backend, exercising the shared facade and both
-    // default hooks through its own queue.
+    // The real reference CPU backend, exercising the shared facade and the CPU
+    // port through its own queue.
     alignas(32) std::array<std::byte, 32768> arena{};
     iom::LinearAllocator allocator(arena.data(), arena.size(), 32);
     const std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
@@ -4852,22 +4851,82 @@ TEST_CASE("Linear keeps the unported CPU backend explicitly unsupported") {
             make_spec({1, 2, 3, 4}, iom::DataType::F32));
     const std::unique_ptr<iom::DeviceOps> queue = device->create_ops();
 
+    // The pure query reports the exact zero-scratch requirement of both
+    // layouts and consumes nothing.
+    CHECK(queue->linear_workspace_requirements(
+                  x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8)
+          == iom::WorkspaceRequirements{0, 1});
+    CHECK(queue->linear_workspace_requirements(
+                  x->view(), w->view(), heads->view(), 1, 3, kHeadPlanar, 2, 4)
+          == iom::WorkspaceRequirements{0, 1});
+
+    // The recorded zero requirement admits only the empty default view: a
+    // supplied owner is invalid input, and the CPU device still refuses to
+    // create positive raw workspace at all.
+    const std::unique_ptr<iom::RawWorkspace> empty_workspace =
+            device->create_workspace(0);
     CHECK_EQ(
             queue->linear(
-                    x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8),
-            unsupported);
-    CHECK_EQ(
-            queue->linear(
-                    x->view(), w->view(), heads->view(), 1, 3, kHeadPlanar, 2,
-                    4),
-            unsupported);
-    CHECK_THROWS_AS(
-            (void)queue->linear_workspace_requirements(
-                    x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8),
-            std::runtime_error);
+                    x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8,
+                    empty_workspace->view()),
+            invalid);
+    CHECK_THROWS_AS(device->create_workspace(1), std::invalid_argument);
+
+    // A deterministic input pattern and an identity weight: the projection of
+    // the selected rows reproduces exactly those input rows, in both layouts.
+    std::vector<float> x_values(4 * 8);
+    for (std::size_t index = 0; index < x_values.size(); ++index) {
+        x_values[index] = static_cast<float>(index) - 7.5f;
+    }
+    std::vector<std::byte> x_bytes(x_values.size() * sizeof(float));
+    std::memcpy(x_bytes.data(), x_values.data(), x_bytes.size());
+    std::vector<float> identity(8 * 8, 0.0f);
+    for (std::size_t index = 0; index < 8; ++index) {
+        identity[index * 8 + index] = 1.0f;
+    }
+    std::vector<std::byte> w_bytes(identity.size() * sizeof(float));
+    std::memcpy(w_bytes.data(), identity.data(), w_bytes.size());
+    x->view().copy_from_host(x_bytes);
+    w->view().copy_from_host(w_bytes);
+
+    const iom::oid ordinary_token = queue->linear(
+            x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8);
+    REQUIRE(iom::oid_is_token(ordinary_token));
+    CHECK_EQ(token_sequence(ordinary_token), 1);
+    CHECK_NOTHROW(queue->wait(ordinary_token));
+    std::vector<std::byte> ordinary_bytes(out->view().spec().logical_nbytes());
+    out->view().copy_to_host(ordinary_bytes);
+    CHECK(ordinary_bytes == x_bytes);
+
+    const iom::oid planar_token = queue->linear(
+            x->view(), w->view(), heads->view(), 1, 3, kHeadPlanar, 2, 4);
+    REQUIRE(iom::oid_is_token(planar_token));
+    CHECK_EQ(token_sequence(planar_token), 2);
+    CHECK_NOTHROW(queue->wait(planar_token));
+    CHECK_NOTHROW(queue->wait(planar_token));
+    std::vector<std::byte> planar_bytes(
+            heads->view().spec().logical_nbytes());
+    heads->view().copy_to_host(planar_bytes);
+    // Head-planar `out[h,r,d]` selects weight row `h*4+d`, so the identity
+    // weight reproduces the selected rows again, column by column.
+    for (std::size_t head = 0; head < 2; ++head) {
+        for (std::size_t row = 0; row < 3; ++row) {
+            for (std::size_t column = 0; column < 4; ++column) {
+                const std::size_t source =
+                        ((1 + row) * 8) + head * 4 + column;
+                const std::size_t destination = ((head * 3) + row) * 4 + column;
+                float observed = 0.0f;
+                std::memcpy(
+                        &observed,
+                        planar_bytes.data() + destination * sizeof(float),
+                        sizeof(float));
+                CHECK_EQ(observed, x_values[source]);
+            }
+        }
+    }
 
     // Structural, range, mode, and checked-arithmetic rejections keep their
-    // own categories before the capability decision.
+    // own categories before any effect.
     CHECK_EQ(
             queue->linear(
                     x->view(), w->view(), out->view(), 2, 4, kOrdinary, 1, 8),
@@ -4887,10 +4946,10 @@ TEST_CASE("Linear keeps the unported CPU backend explicitly unsupported") {
                     std::numeric_limits<std::size_t>::max(), 2),
             overflow);
 
-    // Every rejection consumed no sequence: the first accepted work still
-    // takes the very first sequence.
+    // Every rejection consumed no sequence: the accepted copy still follows
+    // the two accepted projections in FIFO order.
     const iom::oid copied = queue->copy(x->view(), out->view());
-    CHECK_EQ(token_sequence(copied), 1);
+    CHECK_EQ(token_sequence(copied), 3);
     CHECK_NOTHROW(queue->wait(copied));
 }
 

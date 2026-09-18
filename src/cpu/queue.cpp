@@ -612,6 +612,255 @@ private:
                 });
     }
 
+    // ------------------------------------------------------------------
+    // Linear projection: an asynchronous, in-order scalar dot product over
+    // caller-owned tiled storage. Nothing below allocates: the operation owns
+    // no tensor, staging, or scratch range, and the admitted request was
+    // already captured by value. Every element is addressed through the
+    // shared checked layout helpers and only logical `I`/`O` coordinates are
+    // touched, so no padding element is ever read and every output padding bit
+    // keeps its caller-provided value.
+
+    using LinearFormat = detail::scalar_add_detail::Format;
+
+    // One projected element of an integer leaf. Every multiply and every add
+    // reduces modulo `2^N` in unsigned arithmetic, which is the contract's
+    // stepwise form of the exact sum: no step depends on signed overflow and
+    // no value is ever cast to an out-of-range signed type. The stored code is
+    // the two's-complement bit pattern of the accumulated value.
+    static void linear_integer_element(
+            const LinearRequest& request, std::size_t x_plane,
+            std::size_t source_row, std::size_t weight_row,
+            std::size_t out_plane, std::size_t out_row,
+            std::size_t out_column) {
+        const TensorSpec& x_spec = request.x.spec;
+        const std::size_t bits = detail::leaf_bits(x_spec.data_type);
+        const std::size_t features = x_spec.shape.dimensions().back();
+        const std::uint64_t mask = bits == 64
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (std::uint64_t{1} << bits) - 1;
+        const auto* x_base =
+                static_cast<const unsigned char*>(request.x.native_handle);
+        const auto* w_base =
+                static_cast<const unsigned char*>(request.w.native_handle);
+        std::uint64_t accumulator = 0;
+        for (std::size_t first = 0; first < features;
+             first += TensorSpec::TILE) {
+            const std::size_t remaining = features - first;
+            const std::size_t extent = remaining < TensorSpec::TILE
+                    ? remaining : TensorSpec::TILE;
+            const std::size_t x_bit = cpu_detail::logical_element_bits(
+                    x_spec, x_plane, source_row, first);
+            const std::size_t w_bit = cpu_detail::logical_element_bits(
+                    request.w.spec, request.w.plane_offset, weight_row, first);
+            for (std::size_t index = 0; index < extent; ++index) {
+                const std::uint64_t lhs = cpu_detail::load_bits(
+                        x_base, x_bit + index * bits, bits) & mask;
+                const std::uint64_t rhs = cpu_detail::load_bits(
+                        w_base, w_bit + index * bits, bits) & mask;
+                accumulator = (accumulator + lhs * rhs) & mask;
+            }
+        }
+        cpu_detail::store_logical_element(
+                static_cast<unsigned char*>(request.out.native_handle),
+                request.out.spec, out_plane, out_row, out_column,
+                accumulator);
+    }
+
+    // One projected element of a floating leaf. The recurrence starts at `+0`,
+    // visits increasing `i`, performs one correctly rounded fused
+    // multiply-add per step, and encodes the accumulated sum exactly once with
+    // the existing named-format rules. Every floating leaf below `F64` decodes
+    // exactly into FP32, and `F64` accumulates in FP64 with no narrowing.
+    template <typename Carrier>
+    static void linear_float_element(
+            const LinearRequest& request, const LinearFormat& format,
+            std::size_t x_plane, std::size_t source_row,
+            std::size_t weight_row, std::size_t out_plane,
+            std::size_t out_row, std::size_t out_column) {
+        const TensorSpec& x_spec = request.x.spec;
+        const std::size_t bits = detail::leaf_bits(x_spec.data_type);
+        const std::size_t features = x_spec.shape.dimensions().back();
+        const auto* x_base =
+                static_cast<const unsigned char*>(request.x.native_handle);
+        const auto* w_base =
+                static_cast<const unsigned char*>(request.w.native_handle);
+        Carrier accumulator = static_cast<Carrier>(0);
+        for (std::size_t first = 0; first < features;
+             first += TensorSpec::TILE) {
+            const std::size_t remaining = features - first;
+            const std::size_t extent = remaining < TensorSpec::TILE
+                    ? remaining : TensorSpec::TILE;
+            const std::size_t x_bit = cpu_detail::logical_element_bits(
+                    x_spec, x_plane, source_row, first);
+            const std::size_t w_bit = cpu_detail::logical_element_bits(
+                    request.w.spec, request.w.plane_offset, weight_row, first);
+            for (std::size_t index = 0; index < extent; ++index) {
+                const Carrier lhs = static_cast<Carrier>(
+                        detail::scalar_add_detail::decode_small(
+                                cpu_detail::load_bits(
+                                        x_base, x_bit + index * bits, bits),
+                                format));
+                const Carrier rhs = static_cast<Carrier>(
+                        detail::scalar_add_detail::decode_small(
+                                cpu_detail::load_bits(
+                                        w_base, w_bit + index * bits, bits),
+                                format));
+                accumulator = std::fma(lhs, rhs, accumulator);
+            }
+        }
+        cpu_detail::store_logical_element(
+                static_cast<unsigned char*>(request.out.native_handle),
+                request.out.spec, out_plane, out_row, out_column,
+                detail::scalar_add_detail::encode_small(
+                        static_cast<long double>(accumulator), format));
+    }
+
+    // Walk every independent leading plane of `x` and `out` through their own
+    // selected plane offset and own transformed leading strides, then every
+    // selected source row from `start_row` and every head. `ordinary` projects
+    // one output column per weight row; `head_planar` projects the `D` columns
+    // of each of the `H` head planes the output view inserts, selecting the
+    // weight row `h*D+d` and addressing the head plane through the output
+    // view's own head stride.
+    template <typename ProjectElement>
+    static void linear_planes(
+            const LinearRequest& request, ProjectElement&& project_element) {
+        const std::span<const std::size_t> dimensions =
+                request.x.spec.shape.dimensions();
+        const std::size_t leading_rank = dimensions.size() - 2;
+        const std::size_t outer = request.w.spec.shape.dimensions()[0];
+        const bool head_planar =
+                request.layout == LinearOutputLayout::head_planar;
+        const std::size_t heads = head_planar ? request.heads : 1;
+        const std::size_t head_dim = head_planar ? request.head_dim : outer;
+        // Only head-planar mode inserts the head axis between the leading
+        // tuple and the row axis, so only that mode has a head stride.
+        const std::size_t head_stride =
+                head_planar ? request.out.plane_strides[leading_rank] : 0;
+        const auto project = [&](std::size_t x_plane, std::size_t out_plane) {
+            for (std::size_t row = 0; row < request.rows; ++row) {
+                const std::size_t source_row = request.start_row + row;
+                for (std::size_t head = 0; head < heads; ++head) {
+                    const std::size_t head_plane =
+                            out_plane + head * head_stride;
+                    for (std::size_t column = 0; column < head_dim; ++column) {
+                        project_element(
+                                x_plane, source_row,
+                                head * head_dim + column, head_plane, row,
+                                column);
+                    }
+                }
+            }
+        };
+        auto visit = [&](auto&& self, std::size_t axis, std::size_t x_plane,
+                         std::size_t out_plane) -> void {
+            if (axis == leading_rank) {
+                project(x_plane, out_plane);
+                return;
+            }
+            for (std::size_t index = 0; index < dimensions[axis]; ++index) {
+                self(self, axis + 1,
+                     x_plane + index * request.x.plane_strides[axis],
+                     out_plane + index * request.out.plane_strides[axis]);
+            }
+        };
+        visit(visit, 0, request.x.plane_offset, request.out.plane_offset);
+    }
+
+    template <typename Carrier>
+    static void linear_floating_elements(const LinearRequest& request) {
+        const LinearFormat format =
+                detail::scalar_add_detail::format(request.x.spec.data_type);
+        linear_planes(
+                request,
+                [&request, format](
+                        std::size_t x_plane, std::size_t source_row,
+                        std::size_t weight_row, std::size_t out_plane,
+                        std::size_t out_row, std::size_t out_column) {
+                    linear_float_element<Carrier>(
+                            request, format, x_plane, source_row, weight_row,
+                            out_plane, out_row, out_column);
+                });
+    }
+
+    static void linear_elements(const LinearRequest& request) {
+        const DataType data_type = request.x.spec.data_type;
+        if (data_type == DataType::F64) {
+            linear_floating_elements<double>(request);
+            return;
+        }
+        if (detail::scalar_add_detail::format(data_type).bits != 0) {
+            linear_floating_elements<float>(request);
+            return;
+        }
+        linear_planes(
+                request,
+                [&request](
+                        std::size_t x_plane, std::size_t source_row,
+                        std::size_t weight_row, std::size_t out_plane,
+                        std::size_t out_row, std::size_t out_column) {
+                    linear_integer_element(
+                            request, x_plane, source_row, weight_row, out_plane,
+                            out_row, out_column);
+                });
+    }
+
+    // The recorded contract reports exactly `{0, 1}`, so the empty default
+    // view is the only admissible raw workspace and a supplied owner is
+    // invalid input, here and before any owner registration or sequence
+    // consumption. The kernel itself runs only on the existing FIFO worker,
+    // and the captured value snapshot keeps every distinct owner registered
+    // until that sequence's completion is proven.
+    oid linear_impl(const LinearRequest& request) override {
+        if (!request.workspace.empty()) {
+            throw std::invalid_argument(
+                    "CPU linear projection consumes no raw workspace");
+        }
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_linear(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this](std::uint64_t sequence, const LinearRequest& captured,
+                       detail::BinaryEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        linear_elements(captured);
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)detail::release_or_invalidate_binary_entries(
+                                            device_->registry_state().registry,
+                                            entries,
+                                            static_cast<bool>(failure), true);
+                                    detail::complete_workspace_lease(
+                                            device_->registry_state(),
+                                            captured.workspace_lease, true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        detail::complete_workspace_lease(
+                                device_->registry_state(),
+                                captured.workspace_lease, true);
+                        throw;
+                    }
+                });
+    }
+
+    WorkspaceRequirements linear_workspace_requirements_impl(
+            const TensorView&, const TensorView&, const TensorView&,
+            std::size_t, std::size_t, LinearOutputLayout, std::size_t,
+            std::size_t) override {
+        return {0, 1};
+    }
+
     static void copy_elements(
             const CopyViewSnapshot& source,
             const CopyViewSnapshot& destination) {

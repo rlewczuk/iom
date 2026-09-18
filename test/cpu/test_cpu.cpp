@@ -1318,9 +1318,10 @@ TEST_CASE("CPU copies move logical planes without touching padding") {
 }
 
 // ---------------------------------------------------------------------------
-// CPU supports all four binary operations while retaining Unsupported for
-// unrelated compute hooks.
-TEST_CASE("CPU supports binary operations and rejects other compute capabilities") {
+// CPU supports all four binary operations and the layout-aware linear
+// projection while retaining Unsupported for unrelated compute hooks.
+// ---------------------------------------------------------------------------
+TEST_CASE("CPU supports binary and linear operations and rejects other compute capabilities") {
     RecordingAllocator allocator;
     auto device = iom::make_cpu_device(allocator);
     auto queue = device->create_ops();
@@ -1354,20 +1355,64 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
     CHECK_EQ(
             queue->silu(x->view(), y->view()),
             iom::to_oid(iom::OidError::Unsupported));
+
+    // Linear is implemented by the CPU port: the accepted request executes on
+    // the existing FIFO worker without any allocator traffic, and a following
+    // copy consumes the next sequence and observes the projected storage. A
+    // row of ones times a weight row of ones over sixteen features is exactly
+    // sixteen in F32, so the accepted request also pins the consumer-visible
+    // result while every padding byte of both owners stays the caller's.
+    constexpr std::uint64_t kF32Sixteen = 0x41800000u;
+    const RmsnormEncodings& f32 = rmsnorm_encodings(iom::DataType::F32);
+    auto linear_copy = device->create_tensor(spec);
+    const std::size_t allocator_events = allocator.events.size();
+    x->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 16 * 16, f32.one));
+    w->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 16 * 16, f32.one));
+    CHECK_EQ(
+            queue->linear_workspace_requirements(
+                    x->view(), w->view(), y->view(), 0, 16,
+                    iom::LinearOutputLayout::ordinary, 1, 16),
+            (iom::WorkspaceRequirements{0, 1}));
+    const iom::oid linear_token = queue->linear(
+            x->view(), w->view(), y->view(), 0, 16,
+            iom::LinearOutputLayout::ordinary, 1, 16);
+    REQUIRE(iom::oid_is_token(linear_token));
+    const iom::oid linear_consumer =
+            queue->copy(y->view(), linear_copy->view());
+    REQUIRE(iom::oid_is_token(linear_consumer));
+    CHECK_EQ(
+            token_sequence(linear_consumer), token_sequence(linear_token) + 1);
+    queue->wait(linear_consumer);
+    CHECK_EQ(allocator.events.size(), allocator_events);
+    expect_storage_matches(
+            *y,
+            expected_uniform_rmsnorm_storage(y->view(), spec, kF32Sixteen));
+    expect_storage_matches(
+            *linear_copy,
+            expected_uniform_rmsnorm_storage(
+                    linear_copy->view(), spec, kF32Sixteen));
+
+    // The reported zero requirement admits only the empty default view: a
+    // supplied owner is invalid input, and the CPU device still refuses to
+    // create positive raw workspace at all.
+    const std::unique_ptr<iom::RawWorkspace> empty_workspace =
+            device->create_workspace(0);
     CHECK_EQ(
             queue->linear(
                     x->view(), w->view(), y->view(), 0, 16,
-                    iom::LinearOutputLayout::ordinary, 1, 16),
-            iom::to_oid(iom::OidError::Unsupported));
+                    iom::LinearOutputLayout::ordinary, 1, 16,
+                    empty_workspace->view()),
+            iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_THROWS_AS(device->create_workspace(1), std::invalid_argument);
+
     // RMSNorm is declared and admitted by common code, and the CPU port
     // implements it: the valid-shape request is accepted, executed on the
     // queue, and observed through the established wait path, while the pure
     // requirement query reports the exact zero-scratch requirement. A row of
     // ones with unit scale and `eps == 3` is exactly `1 / sqrt(1 + 3) = 0.5`
     // in F32, so the accepted request also pins the consumer-visible result.
-    const RmsnormEncodings& f32 = rmsnorm_encodings(iom::DataType::F32);
-    x->view().copy_from_host(
-            uniform_logical(iom::DataType::F32, 16 * 16, f32.one));
     scale->view().copy_from_host(
             uniform_logical(iom::DataType::F32, 16, f32.one));
     const iom::oid rmsnorm_token =
@@ -1408,10 +1453,11 @@ TEST_CASE("CPU supports binary operations and rejects other compute capabilities
 
     expect_storage_matches(*attn, attn_untouched);
 
-    // The four accepted binary operations consume the first four sequences
-    // and the accepted RMSNorm the fifth.
+    // The four accepted binary operations consume the first four sequences,
+    // the accepted linear projection and its consumer the fifth and sixth, and
+    // the accepted RMSNorm the seventh, so the probe copy is the eighth.
     const iom::oid probe = queue->copy(x->view(), y->view());
-    CHECK_EQ(token_sequence(probe), 6);
+    CHECK_EQ(token_sequence(probe), 8);
     queue->wait(probe);
 }
 

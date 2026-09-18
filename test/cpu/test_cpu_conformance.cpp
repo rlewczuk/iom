@@ -237,7 +237,7 @@ TEST_CASE("CPU conformance: all binary operations through the real queue") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true);
+            &devices.gate, nullptr, true, std::nullopt, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -274,7 +274,7 @@ TEST_CASE("CPU conformance: binary operations are supported") {
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CPU", true);
+            &devices.gate, "CPU", true, std::nullopt, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -304,16 +304,15 @@ TEST_CASE("CPU conformance: embedding lookup reference, admission, and lifetime"
 
 // CPU's declared linear expectation: the complete 21-leaf applicable matrix,
 // one scalar recurrence covering every applicable leaf (including BF16, whose
-// CPU path is that same recurrence), and the fixed `{0, 1}` scratch path. No
-// linear port exists at this revision, so the implemented span is empty: the
-// suite exercises the independent reference and the whole common admission
-// contract while every declared leaf stays a capability rejection, and a
-// capability rejection is never projection conformance.
+// CPU path is that same recurrence), and the fixed `{0, 1}` scratch path. The
+// CPU port implements that whole matrix, so the implemented span is the
+// complete applicable leaf span and every declared leaf is compared
+// numerically against the independent reference.
 const iom_conformance::LinearDeclaration kCpuLinearDeclaration{
         iom_conformance::kLinearLeafSpan,
         iom_conformance::kLinearLeafSpan,
         iom_conformance::kNoLinearSpan,
-        iom_conformance::kNoLinearSpan,
+        iom_conformance::kLinearLeafSpan,
         {},
         iom_conformance::LinearWorkspacePath::zero,
         iom_conformance::LinearWorkspacePath::zero};
@@ -332,7 +331,7 @@ TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true);
+            &devices.gate, nullptr, true, std::nullopt, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
