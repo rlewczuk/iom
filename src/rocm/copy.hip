@@ -71,6 +71,7 @@ bool consume_submission_fault(
 #include "../shared/standard_tiled_embedding.inl"
 #include "../shared/standard_tiled_add.inl"
 #include "../shared/standard_tiled_rmsnorm.inl"
+#include "../shared/standard_tiled_linear.inl"
 #undef IOM_GPU_BARRIER
 #undef IOM_GPU_SHARED
 #undef IOM_GPU_GLOBAL_INDEX
@@ -87,6 +88,15 @@ namespace iom::rocm_detail {
 void gpu_policy::launch_rmsnorm(
         hipStream_t stream, const detail::RmsnormMetadata& metadata) {
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
+}
+
+// Launch the completed shared standard-tiled scalar linear projection on the
+// queue's existing nonblocking stream. The wrapper performs no host
+// arithmetic, staging, allocation, synchronization, or fallback: the kernel
+// reads and writes device storage directly.
+void gpu_policy::launch_linear(
+        hipStream_t stream, const detail::LinearMetadata& metadata) {
+    detail::launch_standard_tiled_linear<gpu_policy>(stream, metadata);
 }
 
 void inject_submission_fault_for_testing(
@@ -235,5 +245,9 @@ namespace iom::detail {
 template void launch_standard_tiled_rmsnorm<iom::rocm_detail::gpu_policy>(
         iom::rocm_detail::gpu_policy::stream_type stream,
         const RmsnormMetadata& metadata);
+
+template void launch_standard_tiled_linear<iom::rocm_detail::gpu_policy>(
+        iom::rocm_detail::gpu_policy::stream_type stream,
+        const LinearMetadata& metadata);
 
 }  // namespace iom::detail

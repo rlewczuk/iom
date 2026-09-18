@@ -393,7 +393,7 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
             0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_compute_capability_conformance(
             *candidate, candidate->supported_data_types(), &gate, "ROCm",
-            true, true);
+            true, true, true);
     CHECK_FALSE(gate.armed());
 }
 
@@ -427,16 +427,17 @@ TEST_CASE("ROCm conformance: embedding lookup reference, admission, and lifetime
 // ROCm's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, the
 // frozen `{0, 1}` scratch path for the scalar leaves, and the exact aligned
-// `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)` BF16 path. No
-// linear port exists at this revision, so the implemented span is empty: the
-// suite exercises the independent reference and the common admission contract,
-// including the positive-scratch lease policy, while every declared leaf stays
-// a capability rejection.
+// `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)` BF16 path. This
+// revision ports the twenty scalar leaves: the shared raw-word scalar kernel
+// executes the integer modulo-2^N dot and the `+0`-started FP32/FP64 fused
+// recurrence on the real device, so `implemented_leaves` is exactly the
+// non-BF16 span. BF16 stays a capability rejection until the separate native
+// BF16 specialization lands, and no BF16 evidence is claimed here.
 const iom_conformance::LinearDeclaration kRocmLinearDeclaration{
         iom_conformance::kLinearLeafSpan,
         iom_conformance::kLinearScalarLeafSpan,
         iom_conformance::kLinearNativeBf16Span,
-        iom_conformance::kNoLinearSpan,
+        iom_conformance::kLinearScalarLeafSpan,
         {},
         iom_conformance::LinearWorkspacePath::zero,
         iom_conformance::LinearWorkspacePath::rocm_bf16};
@@ -520,7 +521,7 @@ TEST_CASE("ROCm conformance: full shared suite") {
     HipStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate, &oracle, true, true);
+            &gate, &oracle, true, true, true);
     CHECK_FALSE(gate.armed());
 }
 

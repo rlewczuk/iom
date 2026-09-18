@@ -23,6 +23,10 @@ namespace iom::detail {
 // (src/shared/standard_tiled_rmsnorm.inl). The ROCm translation unit is the
 // only place where its definition is needed.
 struct RmsnormMetadata;
+// Device descriptor of the shared 16x16 tiled scalar linear projection
+// (src/shared/standard_tiled_linear.inl). Like the RMSNorm descriptor it is
+// only needed inside the ROCm translation unit.
+struct LinearMetadata;
 }  // namespace iom::detail
 
 namespace iom::rocm_detail {
@@ -302,6 +306,46 @@ struct gpu_policy {
 
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
+
+    // Linear projection seams. The complete backend-parameterized device
+    // operation lives in src/shared/standard_tiled_linear.inl; the ROCm
+    // wrapper below launches it on the queue's existing nonblocking stream.
+    // Common admission has already restricted this immutable capability
+    // predicate to the twenty-one applicable leaves, and this scalar path
+    // implements exactly the twenty non-BF16 leaves. BF16 is not advertised
+    // here: the native-BF16 specialization is a separate leaf, so a BF16
+    // request stays `Unsupported` until that path lands.
+    [[nodiscard]] static constexpr const char* linear_kernel_operation()
+            noexcept {
+        return "HIP linear kernel launch";
+    }
+
+    [[nodiscard]] static constexpr bool linear_supported(
+            DataType type) noexcept {
+        switch (type) {
+            case DataType::I2: case DataType::U2:
+            case DataType::I4: case DataType::U4:
+            case DataType::I8: case DataType::U8:
+            case DataType::I16: case DataType::U16:
+            case DataType::I32: case DataType::U32:
+            case DataType::I64: case DataType::U64:
+            case DataType::F4_E2M1:
+            case DataType::F6_E2M3: case DataType::F6_E3M2:
+            case DataType::F8_E4M3FN: case DataType::F8_E5M2:
+            case DataType::F16:
+            case DataType::F32:
+            case DataType::F64:
+                return true;
+            case DataType::BF16:
+            case DataType::BOOL:
+            case DataType::F8_E8M0:
+                return false;
+        }
+        return false;
+    }
+
+    static void launch_linear(
+            stream_type stream, const detail::LinearMetadata& metadata);
 
     [[nodiscard]] static constexpr const char* backend_label() noexcept {
 

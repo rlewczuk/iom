@@ -4732,12 +4732,19 @@ The fixture provenance and case links of that header are:
   aligned BF16 sum, or the SYCL `A32(P*pad16(R)*pad16(O)*4)` range), the leaves
   this revision implements, and — on SYCL — the `sycl::aspect::fp64` device
   fact that gates `F64`, so a capability expectation is never an echo of an
-  implementation report; and
-- no backend implements linear at this revision, so every driver declares an
-  empty implemented span, the suite observes capability rejection for every
-  declared leaf and never reports projection success, and the common admission,
-  ownership, workspace, queue-order, and failure cases run against a
-  declaration-driven common double next to the host-only reference self-check.
+  implementation report;
+- ROCm implements the twenty non-BF16 leaves through the shared raw-word
+  scalar kernel and declares exactly that implemented span, so the suite runs
+  the independent reference numerically on the real device, while `BF16` stays
+  a capability rejection until the separate native BF16 specialization lands
+  and no BF16 numeric evidence is claimed here;
+- the ROCm per-leaf device evidence is complete for the nineteen leaves whose
+  comparison policy is exact or bounded; the `F32` threshold cases await
+  reconciliation of the shared fixture's special-value ladder with the mandated
+  FP32 accumulator and are reported separately rather than claimed here; and
+- the common admission, ownership, workspace, queue-order, and failure cases
+  run against a declaration-driven common double next to the host-only
+  reference self-check.
 
 #### Native matrix evidence obligations
 
