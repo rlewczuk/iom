@@ -250,7 +250,7 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     CudaDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CUDA", true, true);
+            &devices.gate, "CUDA", true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -277,16 +277,18 @@ TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime
 
 // CUDA's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, and
-// the frozen `{0, 1}` scratch path for both. No linear port exists at this
-// revision, so the implemented span is empty: the suite exercises the
-// independent reference and the common admission contract while every declared
-// leaf stays a capability rejection, and a capability rejection is never
-// projection conformance.
+// the frozen `{0, 1}` scratch path for both. This revision's port queues
+// exactly the twenty non-BF16 scalar leaves, so the implemented span is that
+// scalar span: the suite compares the independent reference against real
+// device results for those leaves and keeps `BF16` an explicit capability
+// rejection until the native specialization lands. No declared linear leaf is
+// gated on a runtime CUDA device fact, so the availability predicate stays
+// empty.
 const iom_conformance::LinearDeclaration kCudaLinearDeclaration{
         iom_conformance::kLinearLeafSpan,
         iom_conformance::kLinearScalarLeafSpan,
         iom_conformance::kLinearNativeBf16Span,
-        iom_conformance::kNoLinearSpan,
+        iom_conformance::kLinearScalarLeafSpan,
         {},
         iom_conformance::LinearWorkspacePath::zero,
         iom_conformance::LinearWorkspacePath::zero};
@@ -298,6 +300,163 @@ TEST_CASE("CUDA conformance: linear projection reference, admission, and lifetim
     iom_conformance::run_linear_conformance(
             devices.conformance(), kCudaLinearDeclaration, &devices.gate,
             &oracle);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// Focused CUDA observations of the scalar linear path that the shared suite
+// cannot make through its backend-neutral declaration: an accepted submission
+// runs on the queue's own in-order stream and is visible to the next
+// submission without any host wait, the pure query reports the frozen `{0, 1}`
+// requirement while a supplied owner range is invalid input before any
+// effect, exactly the twenty non-BF16 applicable leaves are carried by this
+// port, and a retained post-acceptance failure keeps its positive OID, its
+// sequence, and the same error on every wait while its operands stay reusable.
+TEST_CASE("CUDA linear keeps queue stream order, leaf capability, and retained failures") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    const iom::LinearOutputLayout ordinary = iom::LinearOutputLayout::ordinary;
+    const iom::TensorSpec x_spec{
+            iom::TensorShape{{2, 19, 3}}, iom::DataType::U8};
+    const iom::TensorSpec w_spec{
+            iom::TensorShape{{3, 3}}, iom::DataType::U8};
+    const iom::TensorSpec out_spec{
+            iom::TensorShape{{2, 17, 3}}, iom::DataType::U8};
+    auto x = devices.candidate->create_tensor(x_spec);
+    auto w = devices.candidate->create_tensor(w_spec);
+    auto out = devices.candidate->create_tensor(out_spec);
+    auto copied = devices.candidate->create_tensor(out_spec);
+    auto queue = devices.candidate->create_ops();
+
+    // The port needs no raw workspace, so the pure query reports exactly
+    // `{0, 1}` and a supplied owner range is `InvalidArgument` before any
+    // sequence, registration, or output effect.
+    CHECK_EQ(
+            queue->linear_workspace_requirements(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 3),
+            (iom::WorkspaceRequirements{0, 1}));
+    auto scratch = devices.candidate->create_workspace(64);
+    const iom::oid supplied =
+            queue->linear(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 3,
+                    scratch->view());
+    CHECK_EQ(supplied, iom::to_oid(iom::OidError::InvalidArgument));
+    CHECK_EQ(
+            queue->linear_workspace_requirements(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 3),
+            (iom::WorkspaceRequirements{0, 1}));
+
+    // An exact identity weight makes the projection a pure row transport, so
+    // a copy submitted behind it on the same queue observes the completed
+    // selected rows without any oracle and without a host wait.
+    std::vector<std::byte> x_bytes(x_spec.logical_nbytes());
+    for (std::size_t index = 0; index < x_bytes.size(); ++index) {
+        x_bytes[index] = std::byte{static_cast<unsigned char>(index * 7 + 1)};
+    }
+    std::vector<std::byte> w_identity(w_spec.logical_nbytes());
+    w_identity[0] = std::byte{1};
+    w_identity[4] = std::byte{1};
+    w_identity[8] = std::byte{1};
+    iom_conformance::copy_from_host(x->view(), x_bytes);
+    iom_conformance::copy_from_host(w->view(), w_identity);
+    std::vector<std::byte> expected(out_spec.logical_nbytes());
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+        for (std::size_t row = 0; row < 17; ++row) {
+            for (std::size_t column = 0; column < 3; ++column) {
+                expected[(plane * 17 + row) * 3 + column] =
+                        x_bytes[(plane * 19 + (2 + row)) * 3 + column];
+            }
+        }
+    }
+    const iom::oid projection =
+            queue->linear(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 3);
+    REQUIRE(iom::oid_is_token(projection));
+    const iom::oid transport = queue->copy(out->view(), copied->view());
+    REQUIRE(iom::oid_is_token(transport));
+    CHECK_EQ(
+            iom_conformance::token_sequence(transport),
+            iom_conformance::token_sequence(projection) + 1);
+    CHECK_NOTHROW(queue->wait(transport));
+    CHECK_NOTHROW(queue->wait(projection));
+    iom_conformance::require_logical_bytes(
+            copied->view(), expected, "FIFO projection transport");
+    iom_conformance::require_logical_bytes(
+            x->view(), x_bytes, "projection left its input unchanged");
+
+    // Exactly the twenty non-BF16 applicable leaves are queued; the native
+    // BF16 specialization of this operation does not exist yet, and the two
+    // recognized inapplicable leaves stay `Unsupported` on every backend.
+    const iom::TensorSpec leaf_spec{
+            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    for (const iom::DataType leaf : iom_conformance::kLinearScalarLeafSpan) {
+        CAPTURE(static_cast<int>(leaf));
+        auto leaf_x = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, leaf});
+        auto leaf_w = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, leaf});
+        auto leaf_out = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, leaf});
+        CHECK_EQ(
+                queue->linear_workspace_requirements(
+                        leaf_x->view(), leaf_w->view(), leaf_out->view(), 0,
+                        16, ordinary, 1, 16),
+                (iom::WorkspaceRequirements{0, 1}));
+        const iom::oid token = queue->linear(
+                leaf_x->view(), leaf_w->view(), leaf_out->view(), 0, 16,
+                ordinary, 1, 16);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+    }
+    for (const iom::DataType leaf :
+         {iom::DataType::BF16, iom::DataType::BOOL,
+          iom::DataType::F8_E8M0}) {
+        CAPTURE(static_cast<int>(leaf));
+        auto leaf_x = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, leaf});
+        auto leaf_w = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, leaf});
+        auto leaf_out = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, leaf});
+        CHECK_THROWS_AS(
+                (void)queue->linear_workspace_requirements(
+                        leaf_x->view(), leaf_w->view(), leaf_out->view(), 0,
+                        16, ordinary, 1, 16),
+                std::runtime_error);
+        CHECK_EQ(
+                queue->linear(
+                        leaf_x->view(), leaf_w->view(), leaf_out->view(), 0, 16,
+                        ordinary, 1, 16),
+                iom::to_oid(iom::OidError::Unsupported));
+    }
+    {
+        // A recognized non-`NONE` quantization format is a capability
+        // rejection for the same request, after structural validation.
+        const iom_conformance::LinearQuantizationQualification qualification(
+                *x, *w, *out);
+        CHECK_EQ(
+                queue->linear(
+                        x->view(), w->view(), out->view(), 2, 17, ordinary, 1,
+                        3),
+                iom::to_oid(iom::OidError::Unsupported));
+    }
+
+    // A retained post-acceptance failure keeps the accepted OID positive,
+    // consumes its sequence, repeats the same error on every wait, and leaves
+    // the operands reusable for a following submission.
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::event_record);
+    const iom::oid failed = queue->linear(
+            x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 3);
+    REQUIRE(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+    const iom::oid recovered = queue->linear(
+            x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 3);
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+    iom_conformance::require_logical_bytes(
+            out->view(), expected, "recovered projection transport");
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -353,7 +512,7 @@ TEST_CASE("CUDA conformance: full shared suite") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true);
+            &devices.gate, &oracle, true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 

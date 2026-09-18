@@ -71,6 +71,7 @@ bool consume_submission_fault(
 #include "../shared/standard_tiled_embedding.inl"
 #include "../shared/standard_tiled_add.inl"
 #include "../shared/standard_tiled_rmsnorm.inl"
+#include "../shared/standard_tiled_linear.inl"
 
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_BARRIER
@@ -88,6 +89,51 @@ namespace iom::cuda_detail {
 void gpu_policy::launch_rmsnorm(
         cudaStream_t stream, const detail::RmsnormMetadata& metadata) {
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
+}
+
+// CUDA's scalar linear projection delegates to the shared tiled projection
+// kernel under the same boundary rules: the queue's own stream, one uploaded
+// fixed descriptor, no staging, no allocation, and no synchronization.
+void gpu_policy::launch_linear(
+        cudaStream_t stream, const detail::LinearMetadata& metadata) {
+    detail::launch_standard_tiled_linear<gpu_policy>(stream, metadata);
+}
+
+// The scalar CUDA projection carries exactly the twelve integer leaves and the
+// eight ordinary signed floating leaves — the twenty non-BF16 applicable
+// leaves. `BF16` is applicable but belongs to its own native specialization, so
+// it stays a capability rejection here rather than a missing-implementation
+// masquerade; `BOOL`, `F8_E8M0`, and non-`NONE` quantization never reach this
+// predicate because common admission classifies them first.
+bool gpu_policy::linear_supported(DataType data_type) noexcept {
+    switch (data_type) {
+        case DataType::I2:
+        case DataType::U2:
+        case DataType::I4:
+        case DataType::U4:
+        case DataType::I8:
+        case DataType::U8:
+        case DataType::I16:
+        case DataType::U16:
+        case DataType::I32:
+        case DataType::U32:
+        case DataType::I64:
+        case DataType::U64:
+        case DataType::F4_E2M1:
+        case DataType::F6_E2M3:
+        case DataType::F6_E3M2:
+        case DataType::F8_E4M3FN:
+        case DataType::F8_E5M2:
+        case DataType::F16:
+        case DataType::F32:
+        case DataType::F64:
+            return true;
+        case DataType::BOOL:
+        case DataType::F8_E8M0:
+        case DataType::BF16:
+            return false;
+    }
+    return false;
 }
 
 void inject_submission_fault_for_testing(
@@ -236,5 +282,8 @@ namespace iom::detail {
 template void launch_standard_tiled_rmsnorm<iom::cuda_detail::gpu_policy>(
         iom::cuda_detail::gpu_policy::stream_type stream,
         const RmsnormMetadata& metadata);
+template void launch_standard_tiled_linear<iom::cuda_detail::gpu_policy>(
+        iom::cuda_detail::gpu_policy::stream_type stream,
+        const LinearMetadata& metadata);
 
 }  // namespace iom::detail

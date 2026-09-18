@@ -25,6 +25,9 @@ namespace iom::detail {
 // (src/shared/standard_tiled_rmsnorm.inl). The CUDA translation unit is the
 // only place where its definition is needed.
 struct RmsnormMetadata;
+// Device descriptor of the shared tiled scalar linear projection
+// (src/shared/standard_tiled_linear.inl), declared for the same reason.
+struct LinearMetadata;
 }  // namespace iom::detail
 
 namespace iom::cuda_detail {
@@ -304,6 +307,28 @@ struct gpu_policy {
 
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
+
+    // Linear projection capability of this scalar CUDA path: exactly the
+    // twelve integer leaves and the eight ordinary signed floating leaves, the
+    // twenty non-BF16 applicable leaves. `BF16` is applicable but stays
+    // unimplemented until its own native specialization lands, and the
+    // inapplicable `BOOL`/`F8_E8M0` leaves and non-`NONE` quantization never
+    // reach this predicate. `F64` uses the device's native double-precision
+    // arithmetic, which every CUDA device of this toolchain provides, so no
+    // declared linear leaf is gated on a runtime device fact.
+    [[nodiscard]] static bool linear_supported(DataType data_type) noexcept;
+
+    // The CUDA wrapper of the shared tiled scalar projection
+    // (src/shared/standard_tiled_linear.inl). It supplies the queue's
+    // already-created nonblocking stream and adds no stream, allocation,
+    // staging, or synchronization of its own.
+    static void launch_linear(
+            stream_type stream, const detail::LinearMetadata& metadata);
+
+    [[nodiscard]] static constexpr const char* linear_kernel_operation()
+            noexcept {
+        return "CUDA linear kernel launch";
+    }
 
     [[nodiscard]] static constexpr const char* backend_label() noexcept {
         return "CUDA";

@@ -190,6 +190,8 @@ class GpuQueue final : public DeviceOps {
         bool is_rmsnorm = false;
         std::optional<RmsnormRequest> rmsnorm_request;
         detail::BinaryEntryRegistration rmsnorm_entries{};
+        bool is_linear = false;
+        std::optional<LinearRequest> linear_request;
         detail::EntryRegistration entries{};
         typename EventRing::Submission* submission = nullptr;
         std::shared_ptr<CompletionState> completion;
@@ -221,6 +223,7 @@ class GpuQueue final : public DeviceOps {
         bool is_binary = false;
         bool is_rmsnorm = false;
         bool is_embedding = false;
+        bool is_linear = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -263,6 +266,18 @@ public:
             const TensorView& table, const TensorView& indices,
             const TensorView& out) override;
     oid embedding_impl(const EmbeddingRequest& request) override;
+
+    // Linear projection consumes the immutable common request and the common
+    // owner-registration output; the shared branch adds no admission of its
+    // own and reuses the fixed metadata, event, worker, and metadata-lease
+    // resources above. The capability stays the backend policy's until its
+    // linear wrapper lands, so a leaf this policy does not implement reports
+    // `Unsupported` here before any registration, credit, or metadata work.
+    WorkspaceRequirements linear_workspace_requirements_impl(
+            const TensorView& x, const TensorView& w, const TensorView& out,
+            std::size_t s, std::size_t R, LinearOutputLayout layout,
+            std::size_t H, std::size_t D) override;
+    oid linear_impl(const LinearRequest& request) override;
 private:
     void execute(Task& task);
 

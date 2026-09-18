@@ -543,7 +543,8 @@ inline void run_compute_capability_conformance(
         ConformanceObserver* observer = nullptr,
         std::string_view backend_label = {},
         bool binary_supported = false,
-        std::optional<bool> rmsnorm_supported = std::nullopt) {
+        std::optional<bool> rmsnorm_supported = std::nullopt,
+        std::optional<bool> linear_supported = std::nullopt) {
     const iom::TensorSpec spec{iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     auto x = candidate.create_tensor(spec);
     auto y = candidate.create_tensor(spec);
@@ -611,15 +612,29 @@ inline void run_compute_capability_conformance(
     }
     CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
     // The frozen linear ABI selects row `s` for `R` rows of the rank-two
-    // HF-oriented `[O,I]` weight. The rank-three probe fixture supplies that
-    // weight as its first `[16,16]` plane, so the request stays
-    // valid-shaped and observes capability rejection rather than structural
-    // validation without allocating another tensor.
-    CHECK_EQ(
+    // HF-oriented `[O,I]` weight: the rank-three probe fixture supplies that
+    // weight as its first `[16,16]` plane, so the request stays valid-shaped
+    // and exercises the operation's own capability rather than structural
+    // validation without allocating another tensor. Focused callers can
+    // provide an explicit expectation; the full backend suite observes either
+    // the supported token or the established Unsupported result.
+    const iom::oid linear_token =
             queue->linear(
                     x->view(), w->view().select(0, 0), y->view(), 0, 16,
-                    iom::LinearOutputLayout::ordinary, 1, 16),
-            unsupported);
+                    iom::LinearOutputLayout::ordinary, 1, 16);
+    if (!linear_supported.has_value()) {
+        if (iom::oid_is_token(linear_token)) {
+            CHECK_NOTHROW(queue->wait(linear_token));
+        } else {
+            CHECK_EQ(linear_token, unsupported);
+        }
+    } else if (*linear_supported) {
+        REQUIRE(iom::oid_is_token(linear_token));
+        CHECK_NOTHROW(queue->wait(linear_token));
+    } else {
+        CHECK_EQ(linear_token, unsupported);
+    }
+    const bool linear_submitted = iom::oid_is_token(linear_token);
     // The valid-shape `[2,16,16]`/`[1,16]` RMS normalization request
     // exercises the operation's own capability. Focused callers can provide
     // an explicit expectation; the full backend suite observes either the
@@ -654,7 +669,8 @@ inline void run_compute_capability_conformance(
     const iom::oid probe = queue->copy(x->view(), scratch->view());
     CHECK_EQ(
             token_sequence(probe),
-            (binary_supported ? 4 : 0) + (rmsnorm_submitted ? 1 : 0) + 1);
+            (binary_supported ? 4 : 0) + (rmsnorm_submitted ? 1 : 0)
+                    + (linear_submitted ? 1 : 0) + 1);
     queue->wait(probe);
     queue.reset();
 
@@ -672,7 +688,8 @@ inline void run_backend_conformance(
         ConformanceObserver* observer = nullptr,
         AcceleratorStorageOracle* oracle = nullptr,
         bool binary_supported = false,
-        std::optional<bool> rmsnorm_supported = std::nullopt) {
+        std::optional<bool> rmsnorm_supported = std::nullopt,
+        std::optional<bool> linear_supported = std::nullopt) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
     run_async_copy_conformance(devices, supported_types, observer, oracle);
     run_copy_error_conformance(devices, supported_types, observer);
@@ -683,6 +700,6 @@ inline void run_backend_conformance(
     run_memory_contract_conformance(devices);
     run_compute_capability_conformance(
             devices.candidate, supported_types, observer, {}, binary_supported,
-            rmsnorm_supported);
+            rmsnorm_supported, linear_supported);
 }
 }  // namespace iom_conformance

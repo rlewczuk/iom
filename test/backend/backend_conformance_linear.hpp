@@ -1305,6 +1305,20 @@ struct LinearReference {
             return mismatch("exact encoded scalar recurrence");
         }
         case iom::DataType::BF16: {
+            // A recurrence that left the finite range is compared by class
+            // from its own encoded code: the FP64 equation can stay finite,
+            // or even take the other sign, where the mandated FP32
+            // accumulation already overflowed.
+            const double recurrence = linear_decode_code(leaf, expected_code);
+            if (std::isnan(recurrence)) {
+                return std::isnan(actual) ? std::nullopt
+                                          : mismatch("BF16 recurrence is NaN");
+            }
+            if (std::isinf(recurrence)) {
+                return actual == recurrence
+                        ? std::nullopt
+                        : mismatch("BF16 recurrence is infinite");
+            }
             const double quantized = linear_decode_code(
                     leaf, linear_encode_value(leaf, reference));
             if (std::isnan(quantized)) {
@@ -1328,8 +1342,25 @@ struct LinearReference {
             }
             return mismatch("BF16 bound");
         }
-        case iom::DataType::F32:
+        case iom::DataType::F32: {
+            // The FP32 recurrence is this contract's definition of an `F32`
+            // result and can legitimately leave the finite range: a fixture
+            // pair like `FLT_MAX * FLT_MAX` overflows to infinity while the
+            // FP64 equation stays finite. A nonfinite expected class is
+            // therefore compared by class, and the relative threshold applies
+            // only while the encoded recurrence stays finite.
+            const double expected = linear_decode_code(leaf, expected_code);
+            if (std::isnan(expected)) {
+                return std::isnan(actual) ? std::nullopt
+                                          : mismatch("F32 recurrence is NaN");
+            }
+            if (std::isinf(expected)) {
+                return actual == expected
+                        ? std::nullopt
+                        : mismatch("F32 recurrence is infinite");
+            }
             return relative(1e-5);
+        }
         case iom::DataType::F64:
             return relative(1e-12);
         default:

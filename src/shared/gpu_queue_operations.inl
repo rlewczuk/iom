@@ -265,6 +265,104 @@ oid GpuQueue<Policy>::embedding_impl(const EmbeddingRequest& request) {
 }
 
 template <typename Policy>
+WorkspaceRequirements GpuQueue<Policy>::linear_workspace_requirements_impl(
+        const TensorView& x, const TensorView&, const TensorView&,
+        std::size_t, std::size_t, LinearOutputLayout, std::size_t,
+        std::size_t) {
+    // The pure capability and scratch decision. Every ported GPU policy
+    // consumes no raw workspace for the linear projection, so the reported
+    // requirement is exactly `{0, 1}`; a leaf this policy does not implement
+    // is the established capability rejection and never inspects scratch.
+    // Nothing here allocates, registers, leases, snapshots, submits, or
+    // examines queue state.
+    if (!Policy::linear_supported(x.spec().data_type)) {
+        throw detail::UnsupportedOperation();
+    }
+    return WorkspaceRequirements{0, 1};
+}
+
+template <typename Policy>
+oid GpuQueue<Policy>::linear_impl(const LinearRequest& request) {
+    std::lock_guard<std::mutex> submission_lock(
+            submission_order_mutex_);
+    // The capability decision is repeated here for defense in depth: the
+    // common facade consults the pure query first, and this branch must never
+    // dispatch a leaf the policy's scalar path does not carry. Descriptor
+    // arithmetic is validated before common acceptance, and the metadata slot
+    // itself is acquired only by the dispatching head.
+    if (!Policy::linear_supported(request.x.spec.data_type)) {
+        throw detail::UnsupportedOperation();
+    }
+    // The frozen per-path scratch table reports `{0, 1}` for every leaf this
+    // scalar path carries, and a zero requirement admits only the empty
+    // `RawWorkspaceView{}`: a supplied owner range is invalid input rather
+    // than ignored scratch. The check is driven by the admitted requirement,
+    // so a policy with a positive linear requirement stays unaffected.
+    if (request.workspace_requirements.bytes == 0
+            && !request.workspace.empty()) {
+        throw std::invalid_argument(
+                "LINEAR consumes no raw workspace, so the supplied "
+                "workspace view must be empty");
+    }
+    (void)detail::make_linear_metadata(request);
+    auto completion = std::make_shared<CompletionState>();
+    const detail::Fence fence = build_fence(completion);
+    return submit_linear(
+            request, *registry_state_, registry_queue_id_, fence,
+            [this, completion](
+                    std::uint64_t sequence,
+                    const LinearRequest& captured,
+                    detail::BinaryEntryRegistration entries) {
+                auto submission = state_->try_acquire();
+                if (submission == nullptr) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                const auto metadata_slot = metadata_pool_->try_acquire();
+                if (!metadata_slot.has_value()) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                MetadataLease metadata_lease{
+                        metadata_pool_.get(), *metadata_slot};
+                completion->bind(submission);
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] =
+                                outcomes_.try_emplace(sequence);
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    std::string("duplicate ")
+                                    + Policy::backend_label()
+                                    + " outstanding-work sequence");
+                        }
+                        it->second.binary_entries = entries;
+                        it->second.workspace_lease =
+                                captured.workspace_lease;
+                        it->second.completion = completion;
+                        it->second.is_linear = true;
+                    }
+                    Task task;
+                    task.sequence = sequence;
+                    task.is_linear = true;
+                    task.linear_request.emplace(captured);
+                    task.binary_entries = entries;
+                    task.submission = submission.get();
+                    task.completion = completion;
+                    task.fence = task.submission;
+                    task.metadata_lease = std::move(metadata_lease);
+                    worker_.submit_copy(std::move(task));
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        outcomes_.erase(sequence);
+                    }
+                    completion->clear();
+                    throw;
+                }
+            });
+}
+
+template <typename Policy>
 void GpuQueue<Policy>::execute(Task& task) {
     task.fence = task.submission;
     std::exception_ptr retained_failure;
@@ -445,6 +543,35 @@ void GpuQueue<Policy>::execute(Task& task) {
                     state_->event_of(*task.submission), stream_);
             event_recorded = true;
             state_->mark_event_recorded(*task.submission);
+        } else if (task.is_linear) {
+            const LinearRequest& request = *task.linear_request;
+            const std::size_t metadata_bytes =
+                    detail::linear_metadata_storage_bytes(
+                            request.x.spec.shape.rank());
+            const std::size_t metadata_slot = task.metadata_lease.slot;
+            task.submission->attach_metadata_slot(metadata_slot);
+            task.metadata_lease.handoff();
+            detail::write_linear_metadata(
+                    metadata_pool_->host_data(metadata_slot),
+                    metadata_pool_->device_data(metadata_slot), request);
+            // The fixed metadata partition is uploaded on the queue's own
+            // stream, so the device operation reads leading extents, plane
+            // offsets, and plane strides without a device-to-host round trip.
+            // From here on the fixed event resource is only reusable through
+            // a proven completion.
+            native_work_submitted = true;
+            Policy::copy_from_host(
+                    stream_, metadata_pool_->device_data(metadata_slot),
+                    metadata_pool_->host_data(metadata_slot), metadata_bytes);
+            const detail::LinearMetadata metadata =
+                    *reinterpret_cast<const detail::LinearMetadata*>(
+                            metadata_pool_->host_data(metadata_slot));
+            Policy::launch_linear(stream_, metadata);
+            Policy::check_kernel(Policy::linear_kernel_operation());
+            Policy::record_event(
+                    state_->event_of(*task.submission), stream_);
+            event_recorded = true;
+            state_->mark_event_recorded(*task.submission);
         } else {
             execute_copy();
         }
@@ -520,7 +647,7 @@ void GpuQueue<Policy>::complete_task(
         failure = result.failure;
     }
     const bool failed = static_cast<bool>(failure);
-    if (outcome.is_binary || outcome.is_embedding) {
+    if (outcome.is_binary || outcome.is_embedding || outcome.is_linear) {
         (void)detail::release_or_invalidate_binary_entries(
                 registry_state_->registry, outcome.binary_entries,
                 failed, completion_proven);
