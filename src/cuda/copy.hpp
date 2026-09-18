@@ -42,10 +42,46 @@ enum class SubmissionFault {
     stream_synchronize,
     registration,
     outcome_insertion,
+    // Capability fault point: the runtime BF16 WMMA facility fact is a
+    // property of the exact device and of the loaded image, so an injected
+    // absence is the only way the unsupported-device capability path is
+    // observable on a device that has the facility.
+    bf16_wmma_facility,
 };
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
 [[nodiscard]] bool consume_submission_fault(
         SubmissionFault fault) noexcept;
+
+// ---------------------------------------------------------------------------
+// Runtime BF16 WMMA facility of one exact CUDA device. The native BF16 linear
+// specialization of src/cuda/linear.cu is a direct `<mma.h>`
+// BF16-input/FP32-accumulate route, so its capability is a runtime fact and
+// never a claim read off the compiled source or a disassembly: it requires
+// both the device's BF16 tensor-core facility (compute capability 8.0 or
+// newer) and a loaded image of that specialization that was compiled with the
+// BF16 WMMA statements. A device or a build without either reports the
+// established `Unsupported` before any launch, and no fallback of any kind is
+// substituted.
+// ---------------------------------------------------------------------------
+
+// The architecture the loadable image of the native BF16 specialization was
+// compiled for, or zero when the current device has no loadable image at all.
+// The value comes from the loaded image itself (the runtime reports the
+// arch-dependent device constant of the module it loaded), so a `compute_75`
+// JIT image reports a pre-Ampere arch and can never be mistaken for the
+// specialization.
+[[nodiscard]] unsigned int linear_bf16_wmma_image_arch() noexcept;
+
+// True exactly when this device provides the facility the native
+// specialization requires. The query performs no allocation, submission, or
+// queue-state change, and its result is captured once per queue.
+[[nodiscard]] bool linear_bf16_wmma_facility(CUdevice device) noexcept;
+
+// The native BF16 specialization of the shared linear descriptor
+// (src/cuda/linear.cu). Only that translation unit includes `<mma.h>`; this
+// seam stays vendor-neutral, exactly like `launch_linear`.
+void launch_linear_bf16(
+        cudaStream_t stream, const detail::LinearMetadata& metadata);
 
 #ifdef IOM_ENABLE_TESTING
 // Counters over the policy's native queue-resource lifecycle. Queue setup
@@ -308,20 +344,23 @@ struct gpu_policy {
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
 
-    // Linear projection capability of this scalar CUDA path: exactly the
-    // twelve integer leaves and the eight ordinary signed floating leaves, the
-    // twenty non-BF16 applicable leaves. `BF16` is applicable but stays
-    // unimplemented until its own native specialization lands, and the
-    // inapplicable `BOOL`/`F8_E8M0` leaves and non-`NONE` quantization never
-    // reach this predicate. `F64` uses the device's native double-precision
-    // arithmetic, which every CUDA device of this toolchain provides, so no
-    // declared linear leaf is gated on a runtime device fact.
+    // Linear projection capability: exactly the twenty non-BF16 applicable
+    // leaves on the shared tiled scalar path plus `BF16` on the native
+    // specialization of src/cuda/linear.cu. The inapplicable `BOOL`/`F8_E8M0`
+    // leaves and non-`NONE` quantization never reach this predicate, and `F64`
+    // uses the device's native double-precision arithmetic, which every CUDA
+    // device of this toolchain provides. `BF16` is the one leaf whose
+    // availability is a runtime device fact rather than a property of this
+    // build: this policy is the queue policy of a device that has the BF16
+    // WMMA facility, and `gpu_policy_scalar_linear` below is the exact queue
+    // policy of a device that does not.
     [[nodiscard]] static bool linear_supported(DataType data_type) noexcept;
 
-    // The CUDA wrapper of the shared tiled scalar projection
+    // The CUDA wrapper of the shared tiled projection
     // (src/shared/standard_tiled_linear.inl). It supplies the queue's
-    // already-created nonblocking stream and adds no stream, allocation,
-    // staging, or synchronization of its own.
+    // already-created nonblocking stream, dispatches the `BF16` leaf to the
+    // native WMMA specialization, and adds no stream, allocation, staging, or
+    // synchronization of its own.
     static void launch_linear(
             stream_type stream, const detail::LinearMetadata& metadata);
 
@@ -333,6 +372,18 @@ struct gpu_policy {
     [[nodiscard]] static constexpr const char* backend_label() noexcept {
         return "CUDA";
     }
+};
+
+// The queue policy of a CUDA device whose resolved runtime BF16 WMMA facility
+// is absent, for example a device below compute capability 8.0 or a loaded
+// image without the specialization. The shared queue template is instantiated
+// once per capability variant, so such a device reports the established
+// `Unsupported` for `BF16` before registration, credit, metadata, or launch —
+// never a scalar, emulated, or host substitute — while every other leaf keeps
+// the established scalar path unchanged. The fact is resolved once, at queue
+// creation, and no submission re-reads it.
+struct gpu_policy_scalar_linear final : gpu_policy {
+    [[nodiscard]] static bool linear_supported(DataType data_type) noexcept;
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
 
@@ -350,7 +401,8 @@ void region_to_host(
         std::span<std::byte> destination, bool& resource_poisoned);
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, detail::QueueResourceProvider& resource_provider,
-        CUcontext context, detail::RegistryState& registry_state);
+        CUcontext context, detail::RegistryState& registry_state,
+        bool bf16_wmma_facility);
 
 #ifdef IOM_ENABLE_TESTING
 // Observed fixed resource geometry of one live queue: the reserved

@@ -699,6 +699,38 @@ struct LinearFormat {
     }
 }
 
+// The fixture magnitude of one special-ladder position of one leaf.
+//
+// `linear_ladder_code` is the codec's own ladder and keeps its exact
+// saturation, midpoint, infinity, NaN, subnormal, and signed-zero boundaries
+// for `run_linear_codec_self_check`. A linear fixture must additionally keep
+// every *finite* product and every partial accumulation inside the FP32 finite
+// range, because the mandated FP32 fused-multiply-add recurrence and the FP64
+// equation rounded once to BF16 must agree in class on every fixture element:
+// BF16 spans the FP32 exponent range, so a fixture that placed the format's
+// largest finite magnitude in both operands would overflow an intermediate
+// partial sum while the FP64 equation stayed finite or even took the opposite
+// infinity, and no reassociating native BF16 reduction can reproduce that
+// per-step overflow. The one offending position is therefore scaled to `2^48`:
+// its square is `2^96` and the longest fixture inner extent sums at most
+// `2^102`, still seven orders of magnitude below the FP32 maximum.
+[[nodiscard]] inline std::uint64_t linear_fixture_special_code(
+        iom::DataType leaf, std::size_t position) {
+    if (leaf == iom::DataType::BF16) {
+        // `2^48` in the BF16 encoding: bias 127 plus 48, zero fraction.
+        constexpr std::size_t kBF16FixtureLargeExponent = 48;
+        const std::uint64_t magnitude =
+                static_cast<std::uint64_t>(kBF16FixtureLargeExponent + 127)
+                << 7;
+        switch (position % 12) {
+            case 7: return magnitude;
+            case 8: return (std::uint64_t{1} << 15) | magnitude;
+            default: break;
+        }
+    }
+    return linear_ladder_code(leaf, position);
+}
+
 // Deterministic code of one logical fixture cell. Every third cell takes the
 // next position of the leaf's special ladder (so every fixture carries the
 // leaf's special classes), and the remaining cells take an ordinary salted
@@ -708,7 +740,7 @@ struct LinearFormat {
         iom::DataType leaf, std::size_t index, std::uint64_t salt,
         bool specials = true) {
     if (specials && index % 3 == 2) {
-        return linear_ladder_code(
+        return linear_fixture_special_code(
                 leaf, (index / 3 + static_cast<std::size_t>(salt))
                               % linear_ladder_size(leaf));
     }

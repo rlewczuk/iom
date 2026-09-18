@@ -205,6 +205,7 @@ if(CUDA_ENABLED)
         src/cuda/device_internal.hpp
         src/cuda/copy.cu
         src/cuda/copy.hpp
+        src/cuda/linear.cu
         src/cuda/driver.cpp
         src/cuda/driver.hpp
         src/shared/metadata_slot_pool.hpp
@@ -217,12 +218,31 @@ if(CUDA_ENABLED)
         src/shared/standard_tiled_embedding.hpp
         src/shared/standard_tiled_embedding.inl
         src/shared/standard_tiled_copy_metadata.inl
+        src/shared/standard_tiled_linear.inl
+        src/shared/scalar_binary_codec.hpp
         include/iom/cuda/device.hpp
     )
 
+    # The native BF16 linear specialization (src/cuda/linear.cu) is a direct
+    # `wmma` BF16-input/FP32-accumulate route, and its device statements exist
+    # only in images of an architecture at or above the documented BF16 WMMA
+    # floor. The toolkit default is a single pre-floor PTX image, so the archs
+    # are pinned here: `80` is the floor, `90` and `120` keep the accelerated
+    # images ahead of the JIT for the current datacenter and consumer devices,
+    # and `75` keeps the images the previous default produced for the scalar
+    # path. An image without the statements reports the leaf `Unsupported`,
+    # never a fallback, and an explicit `IOM_CUDA_ARCHITECTURES` overrides the
+    # list for an environment that needs a different one.
+    if(NOT DEFINED IOM_CUDA_ARCHITECTURES)
+        set(IOM_CUDA_ARCHITECTURES "75;80;90")
+        if(NOT CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+            string(APPEND IOM_CUDA_ARCHITECTURES ";120")
+        endif()
+    endif()
     set_target_properties(iom_cuda PROPERTIES
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES "${IOM_CUDA_ARCHITECTURES}"
     )
 
     target_include_directories(iom_cuda

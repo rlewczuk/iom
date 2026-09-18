@@ -16,6 +16,11 @@ struct DriverCalls {
     CUresult (*init)(unsigned int) = &cuInit;
     CUresult (*device_get_count)(int*) = &cuDeviceGetCount;
     CUresult (*device_get)(CUdevice*, int) = &cuDeviceGet;
+    // The runtime capability query behind the native BF16 WMMA facility fact:
+    // no context needs to be current for it, so the fact belongs to the exact
+    // device and not to whatever context a calling thread happens to hold.
+    CUresult (*device_get_attribute)(int*, CUdevice_attribute, CUdevice)
+            = &cuDeviceGetAttribute;
 };
 
 extern DriverCalls driver_calls;

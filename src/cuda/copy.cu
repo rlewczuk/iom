@@ -91,21 +91,29 @@ void gpu_policy::launch_rmsnorm(
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
 
-// CUDA's scalar linear projection delegates to the shared tiled projection
-// kernel under the same boundary rules: the queue's own stream, one uploaded
-// fixed descriptor, no staging, no allocation, and no synchronization.
+// CUDA's linear projection dispatches the native BF16 specialization on its
+// own immutable descriptor leaf and delegates every other leaf to the shared
+// tiled projection kernel under the same boundary rules: the queue's own
+// stream, one uploaded fixed descriptor, no staging, no allocation, and no
+// synchronization. `BF16` reaches this dispatch only on a queue whose device
+// resolved the BF16 WMMA facility, so the specialization is never entered on a
+// device or build without it.
 void gpu_policy::launch_linear(
         cudaStream_t stream, const detail::LinearMetadata& metadata) {
+    if (metadata.type == static_cast<std::uint32_t>(DataType::BF16)) {
+        launch_linear_bf16(stream, metadata);
+        return;
+    }
     detail::launch_standard_tiled_linear<gpu_policy>(stream, metadata);
 }
 
-// The scalar CUDA projection carries exactly the twelve integer leaves and the
-// eight ordinary signed floating leaves — the twenty non-BF16 applicable
-// leaves. `BF16` is applicable but belongs to its own native specialization, so
-// it stays a capability rejection here rather than a missing-implementation
-// masquerade; `BOOL`, `F8_E8M0`, and non-`NONE` quantization never reach this
-// predicate because common admission classifies them first.
-bool gpu_policy::linear_supported(DataType data_type) noexcept {
+namespace {
+
+// The twenty non-BF16 applicable linear leaves this CUDA translation unit
+// carries: the twelve integer leaves and the eight ordinary signed floating
+// leaves. `BOOL`, `F8_E8M0`, and non-`NONE` quantization never reach a
+// capability predicate because common admission classifies them first.
+[[nodiscard]] bool scalar_linear_supported(DataType data_type) noexcept {
     switch (data_type) {
         case DataType::I2:
         case DataType::U2:
@@ -134,6 +142,53 @@ bool gpu_policy::linear_supported(DataType data_type) noexcept {
             return false;
     }
     return false;
+}
+
+}  // namespace
+
+// The queue policy of a device with the resolved BF16 WMMA facility carries
+// all twenty-one applicable leaves: the twenty above plus `BF16` on the native
+// specialization. `BF16` is applicable and implemented, so it is never a
+// missing-implementation rejection here; a device without the facility uses
+// `gpu_policy_scalar_linear`, whose predicate keeps it `Unsupported`.
+bool gpu_policy::linear_supported(DataType data_type) noexcept {
+    return scalar_linear_supported(data_type) || data_type == DataType::BF16;
+}
+
+// The scalar-only variant: the same twenty leaves, and `BF16` explicitly
+// unsatisfied because this queue's device has no BF16 WMMA facility.
+bool gpu_policy_scalar_linear::linear_supported(
+        DataType data_type) noexcept {
+    return scalar_linear_supported(data_type);
+}
+
+// The runtime BF16 WMMA facility of one exact device. Both facts are required:
+// the device attribute that documents the BF16 tensor-core route (compute
+// capability 8.0 or newer) and a loadable image of the native specialization
+// that was actually compiled with its BF16 WMMA statements. Compile success or
+// the presence of `mma.h` is never consulted, and a failed query is a
+// conservative absence rather than a claim.
+bool linear_bf16_wmma_facility(CUdevice device) noexcept {
+#ifdef IOM_ENABLE_TESTING
+    if (consume_submission_fault(SubmissionFault::bf16_wmma_facility)) {
+        return false;
+    }
+#else
+    static_cast<void>(device);
+#endif
+    int major = 0;
+    int minor = 0;
+    if (driver_calls.device_get_attribute(
+                &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device)
+                != CUDA_SUCCESS
+            || driver_calls.device_get_attribute(
+                       &minor,
+                       CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device)
+                    != CUDA_SUCCESS
+            || major < 8) {
+        return false;
+    }
+    return linear_bf16_wmma_image_arch() >= 800;
 }
 
 void inject_submission_fault_for_testing(
@@ -235,20 +290,36 @@ void region_to_host(
 std::unique_ptr<DeviceOps> make_queue(
         const Device& device,
         detail::QueueResourceProvider& resource_provider, CUcontext context,
-        detail::RegistryState& registry_state) {
-    return std::make_unique<detail::GpuQueue<gpu_policy>>(
+        detail::RegistryState& registry_state, bool bf16_wmma_facility) {
+    // The queue's policy is chosen once, from the runtime device fact, and
+    // never re-read by a submission: a device with the BF16 WMMA facility
+    // queues the native specialization, and a device without it keeps every
+    // other leaf on the established scalar path and reports `BF16`
+    // `Unsupported`.
+    if (bf16_wmma_facility) {
+        return std::make_unique<detail::GpuQueue<gpu_policy>>(
+                device, resource_provider, context, registry_state);
+    }
+    return std::make_unique<detail::GpuQueue<gpu_policy_scalar_linear>>(
             device, resource_provider, context, registry_state);
 }
 
 #ifdef IOM_ENABLE_TESTING
-void queue_resource_snapshot_for_testing(
+namespace {
+
+// The observed fixed resource geometry of one live queue, for either
+// capability variant. Each variant is a distinct instantiation of the shared
+// queue template, so both are tried before the queue is rejected as foreign.
+template <typename Policy>
+[[nodiscard]] bool queue_resource_snapshot_of(
         DeviceOps& queue, QueueResourceSnapshot& snapshot) {
-    auto* gpu_queue = dynamic_cast<detail::GpuQueue<gpu_policy>*>(&queue);
+    auto* gpu_queue = dynamic_cast<detail::GpuQueue<Policy>*>(&queue);
     if (gpu_queue == nullptr) {
-        throw std::logic_error("queue is not a live CUDA GpuQueue");
+        return false;
     }
     detail::MetadataSlotPool& pool = gpu_queue->metadata_pool_for_testing();
-    EventRingState& ring = gpu_queue->event_ring_for_testing();
+    typename detail::EventRingState<Policy>& ring =
+            gpu_queue->event_ring_for_testing();
     snapshot.slot_count = pool.slot_count();
     snapshot.device_base = pool.device_base();
     snapshot.slot_stride = pool.slot_stride();
@@ -256,6 +327,19 @@ void queue_resource_snapshot_for_testing(
     snapshot.events_in_use = ring.in_use_count_for_testing();
     snapshot.slots_in_use = pool.in_use_count();
     snapshot.slots_protected = pool.protected_count();
+    return true;
+}
+
+}  // namespace
+
+void queue_resource_snapshot_for_testing(
+        DeviceOps& queue, QueueResourceSnapshot& snapshot) {
+    if (queue_resource_snapshot_of<gpu_policy>(queue, snapshot)
+            || queue_resource_snapshot_of<gpu_policy_scalar_linear>(
+                    queue, snapshot)) {
+        return;
+    }
+    throw std::logic_error("queue is not a live CUDA GpuQueue");
 }
 
 void reclaim_retained_queue_leases_for_testing(Device& device) {

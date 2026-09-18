@@ -149,8 +149,12 @@ std::span<const iom::DataType>
 
 std::unique_ptr<DeviceOps> CudaDevice::create_ops() {
     activate();
+    // The native BF16 linear capability is a runtime fact of this exact device
+    // and of the image the driver loaded for it, so it is resolved here, once
+    // per queue, and never re-read from a submission thread.
     return cuda_detail::make_queue(
-            *this, *this, context_, registry_state_);
+            *this, *this, context_, registry_state_,
+            cuda_detail::linear_bf16_wmma_facility(device_));
 }
 
 std::size_t CudaDevice::queue_slot_count() const noexcept {

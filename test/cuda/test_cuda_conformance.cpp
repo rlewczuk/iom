@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <memory>
 #include <new>
@@ -72,6 +73,77 @@ private:
 // quarantined operand (512 MiB), and the fixture also keeps a foreign
 // device alive with the same budget.
 constexpr std::size_t kConformanceArenaBytes = 640u * 1024 * 1024;
+
+// The device ordinal every CUDA conformance fixture selects. The declaration's
+// runtime BF16 fact is a property of that exact ordinal.
+constexpr std::uint32_t kCudaConformanceOrdinal = 0;
+
+// The driver's own statement of one device's BF16 WMMA fact, read from the
+// runtime API and never from a production helper: the native BF16 linear
+// specialization requires the device's BF16 tensor-core facility, which is
+// compute capability 8.0 or newer. The compiled-image half of the fact is a
+// build property, not a device one, so it is not restated here.
+[[nodiscard]] bool cuda_bf16_wmma_device_fact(std::uint32_t ordinal) {
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(
+                &major, cudaDevAttrComputeCapabilityMajor,
+                static_cast<int>(ordinal))
+                != cudaSuccess
+            || cudaDeviceGetAttribute(
+                       &minor, cudaDevAttrComputeCapabilityMinor,
+                       static_cast<int>(ordinal))
+                    != cudaSuccess) {
+        return false;
+    }
+    return major >= 8;
+}
+
+// One execution-connected native evidence record of a submitted BF16
+// projection. The record carries the runtime device and toolchain facts, the
+// fixture geometry and its padded extent, the accepted OID and its sequence,
+// the kernel symbol, and the launch geometry the profiler run must observe for
+// exactly this submission, so an observed native matrix instruction can be
+// attributed to this execution and to no other.
+struct CudaBf16NativeRecord {
+    const char* backend = "CUDA";
+    const char* layout = "ordinary";
+    std::size_t planes = 0;
+    std::size_t source_rows = 0;
+    std::size_t inner = 0;
+    std::size_t outer = 0;
+    std::size_t heads = 0;
+    std::size_t head_dim = 0;
+    std::size_t start_row = 0;
+    std::size_t rows = 0;
+    std::size_t padded_rows = 0;
+    std::size_t padded_columns = 0;
+    std::size_t padded_inner = 0;
+    std::size_t blocks = 0;
+    iom::oid token = 0;
+    bool supported = false;
+};
+
+// Emits one record as stable `key=value` lines. The suite's own assertion is
+// the numeric comparison; this emission is the native evidence artifact the
+// profiler command is recorded beside, and it names the exact submission the
+// profiler must attribute its observed instruction to.
+void emit_cuda_bf16_record(const CudaBf16NativeRecord& record) {
+    std::printf(
+            "cuda-linear-bf16-record backend=%s layout=%s P=%zu T=%zu I=%zu "
+            "O=%zu H=%zu D=%zu s=%zu R=%zu Rp=%zu Op=%zu Ip=%zu blocks=%zu "
+            "oid=%llu sequence=%llu kernel=%s facility=%s image_arch=%u\n",
+            record.backend, record.layout, record.planes, record.source_rows,
+            record.inner, record.outer, record.heads, record.head_dim,
+            record.start_row, record.rows, record.padded_rows,
+            record.padded_columns, record.padded_inner, record.blocks,
+            static_cast<unsigned long long>(record.token),
+            static_cast<unsigned long long>(
+                    iom_conformance::token_sequence(record.token)),
+            "standard_tiled_linear_bf16_kernel",
+            record.supported ? "bf16-wmma-supported" : "unsupported",
+            iom::cuda_detail::linear_bf16_wmma_image_arch());
+}
 
 struct CudaDevices {
     iom_conformance::TrafficGate gate;
@@ -277,19 +349,22 @@ TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime
 
 // CUDA's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, and
-// the frozen `{0, 1}` scratch path for both. This revision's port queues
-// exactly the twenty non-BF16 scalar leaves, so the implemented span is that
-// scalar span: the suite compares the independent reference against real
-// device results for those leaves and keeps `BF16` an explicit capability
-// rejection until the native specialization lands. No declared linear leaf is
-// gated on a runtime CUDA device fact, so the availability predicate stays
-// empty.
+// the frozen `{0, 1}` scratch path for both. This revision's port queues all
+// twenty-one leaves, so the implemented span is the complete target matrix: the
+// suite compares the independent reference against real device results for
+// every leaf, and the `BF16` comparison runs only where the selected device
+// exposes the runtime BF16 WMMA facility. A device without that facility keeps
+// `BF16` a capability rejection instead of a numerical claim, which is the
+// genuine device fact and never a missing-implementation masquerade.
 const iom_conformance::LinearDeclaration kCudaLinearDeclaration{
         iom_conformance::kLinearLeafSpan,
         iom_conformance::kLinearScalarLeafSpan,
         iom_conformance::kLinearNativeBf16Span,
-        iom_conformance::kLinearScalarLeafSpan,
-        {},
+        iom_conformance::kLinearLeafSpan,
+        [](iom::DataType leaf) {
+            return leaf != iom::DataType::BF16
+                    || cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal);
+        },
         iom_conformance::LinearWorkspacePath::zero,
         iom_conformance::LinearWorkspacePath::zero};
 
@@ -383,11 +458,14 @@ TEST_CASE("CUDA linear keeps queue stream order, leaf capability, and retained f
     iom_conformance::require_logical_bytes(
             x->view(), x_bytes, "projection left its input unchanged");
 
-    // Exactly the twenty non-BF16 applicable leaves are queued; the native
-    // BF16 specialization of this operation does not exist yet, and the two
-    // recognized inapplicable leaves stay `Unsupported` on every backend.
-    const iom::TensorSpec leaf_spec{
-            iom::TensorShape{{16, 16}}, iom::DataType::F32};
+    // Every applicable leaf of this revision is queued through the real queue:
+    // the twenty leaves on the shared tiled scalar projection and `BF16` on the
+    // native WMMA specialization when this device exposes the facility. The two
+    // recognized inapplicable leaves stay `Unsupported` on every backend, and a
+    // device without the facility keeps `BF16` the established explicit
+    // rejection rather than any substitute.
+    const bool bf16_facility =
+            cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal);
     for (const iom::DataType leaf : iom_conformance::kLinearScalarLeafSpan) {
         CAPTURE(static_cast<int>(leaf));
         auto leaf_x = devices.candidate->create_tensor(iom::TensorSpec{
@@ -407,9 +485,39 @@ TEST_CASE("CUDA linear keeps queue stream order, leaf capability, and retained f
         REQUIRE(iom::oid_is_token(token));
         CHECK_NOTHROW(queue->wait(token));
     }
+    {
+        auto leaf_x = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, iom::DataType::BF16});
+        auto leaf_w = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, iom::DataType::BF16});
+        auto leaf_out = devices.candidate->create_tensor(iom::TensorSpec{
+                iom::TensorShape{{16, 16}}, iom::DataType::BF16});
+        if (bf16_facility) {
+            CHECK_EQ(
+                    queue->linear_workspace_requirements(
+                            leaf_x->view(), leaf_w->view(), leaf_out->view(),
+                            0, 16, ordinary, 1, 16),
+                    (iom::WorkspaceRequirements{0, 1}));
+            const iom::oid token = queue->linear(
+                    leaf_x->view(), leaf_w->view(), leaf_out->view(), 0, 16,
+                    ordinary, 1, 16);
+            REQUIRE(iom::oid_is_token(token));
+            CHECK_NOTHROW(queue->wait(token));
+        } else {
+            CHECK_THROWS_AS(
+                    (void)queue->linear_workspace_requirements(
+                            leaf_x->view(), leaf_w->view(), leaf_out->view(),
+                            0, 16, ordinary, 1, 16),
+                    std::runtime_error);
+            CHECK_EQ(
+                    queue->linear(
+                            leaf_x->view(), leaf_w->view(), leaf_out->view(),
+                            0, 16, ordinary, 1, 16),
+                    iom::to_oid(iom::OidError::Unsupported));
+        }
+    }
     for (const iom::DataType leaf :
-         {iom::DataType::BF16, iom::DataType::BOOL,
-          iom::DataType::F8_E8M0}) {
+         {iom::DataType::BOOL, iom::DataType::F8_E8M0}) {
         CAPTURE(static_cast<int>(leaf));
         auto leaf_x = devices.candidate->create_tensor(iom::TensorSpec{
                 iom::TensorShape{{16, 16}}, leaf});
@@ -457,6 +565,298 @@ TEST_CASE("CUDA linear keeps queue stream order, leaf capability, and retained f
     CHECK_NOTHROW(queue->wait(recovered));
     iom_conformance::require_logical_bytes(
             out->view(), expected, "recovered projection transport");
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// The unsupported-device capability path of the native BF16 specialization,
+// observed on a device that has the facility: the runtime fact is injected
+// absent for exactly one queue creation, so that queue reports the established
+// `Unsupported` for `BF16` in both directions — the pure query throws and the
+// submission returns the negative OID with no output effect and no consumed
+// sequence — while every other leaf on the same queue keeps the established
+// scalar path and still computes its real result. The injection is a capability
+// fact and not a hardware claim: `BF16` never substitutes a scalar, elementwise,
+// cuBLAS, or host route, and a fresh queue resolves the device truth again.
+TEST_CASE("CUDA BF16 linear is Unsupported on a device without the WMMA facility") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    const iom::LinearOutputLayout ordinary = iom::LinearOutputLayout::ordinary;
+    const iom::TensorSpec x_spec{
+            iom::TensorShape{{2, 19, 3}}, iom::DataType::BF16};
+    const iom::TensorSpec w_spec{
+            iom::TensorShape{{10, 3}}, iom::DataType::BF16};
+    const iom::TensorSpec out_spec{
+            iom::TensorShape{{2, 17, 10}}, iom::DataType::BF16};
+    auto x = devices.candidate->create_tensor(x_spec);
+    auto w = devices.candidate->create_tensor(w_spec);
+    auto out = devices.candidate->create_tensor(out_spec);
+    const std::vector<std::byte> out_poison = iom_conformance::linear_logical_image(
+            iom::DataType::BF16, out_spec.shape.element_count(), 0x51A7ull,
+            true);
+    iom_conformance::copy_from_host(x->view(), std::vector<std::byte>(
+            x_spec.logical_nbytes(), std::byte{0x3C}));
+    iom_conformance::copy_from_host(w->view(), std::vector<std::byte>(
+            w_spec.logical_nbytes(), std::byte{0x3C}));
+    iom_conformance::copy_from_host(out->view(), out_poison);
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::bf16_wmma_facility);
+    auto queue = devices.candidate->create_ops();
+    CHECK_THROWS_AS(
+            (void)queue->linear_workspace_requirements(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 10),
+            std::runtime_error);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 10),
+            iom::to_oid(iom::OidError::Unsupported));
+    iom_conformance::require_logical_bytes(
+            out->view(), out_poison,
+            "an unsupported BF16 submission changed the output");
+
+    // The same queue and the same three operand shapes carry the scalar path:
+    // an `F32` projection of the identical request on that queue is accepted
+    // and computes its real result, so the rejection belongs to the `BF16`
+    // leaf and never to a disabled queue.
+    const iom::TensorSpec scalar_x{
+            iom::TensorShape{{2, 19, 3}}, iom::DataType::F32};
+    const iom::TensorSpec scalar_w{
+            iom::TensorShape{{3, 3}}, iom::DataType::F32};
+    const iom::TensorSpec scalar_out{
+            iom::TensorShape{{2, 17, 3}}, iom::DataType::F32};
+    auto scalar_x_owner = devices.candidate->create_tensor(scalar_x);
+    auto scalar_w_owner = devices.candidate->create_tensor(scalar_w);
+    auto scalar_out_owner = devices.candidate->create_tensor(scalar_out);
+    const std::vector<std::byte> scalar_x_bytes =
+            iom_conformance::linear_logical_image(
+                    iom::DataType::F32, scalar_x.shape.element_count(),
+                    0x2A40ull, false);
+    std::vector<std::byte> scalar_w_bytes(
+            scalar_w.logical_nbytes(), std::byte{0});
+    // An exact identity weight turns the projection into a row transport, so
+    // the scalar path of this queue is numerically observable without a second
+    // reference implementation. The four bytes are the IEEE-754
+    // single-precision encoding of `1.0`, the same carrier every standard
+    // backend stores.
+    const std::byte unity[4] = {
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x80},
+            std::byte{0x3F}};
+    const auto set_weight = [&scalar_w_bytes, &unity](
+                                    std::size_t row, std::size_t column) {
+        const std::size_t index = row * 3 + column;
+        for (std::size_t byte = 0; byte < 4; ++byte) {
+            scalar_w_bytes[index * 4 + byte] = unity[byte];
+        }
+    };
+    for (std::size_t index = 0; index < 3; ++index) {
+        set_weight(index, index);
+    }
+    std::vector<std::byte> scalar_expected(scalar_out.logical_nbytes());
+    const std::size_t element_bytes = 4;
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+        for (std::size_t row = 0; row < 17; ++row) {
+            for (std::size_t column = 0; column < 3; ++column) {
+                const std::size_t source =
+                        ((plane * 19) + 2 + row) * 3 + column;
+                const std::size_t destination =
+                        ((plane * 17) + row) * 3 + column;
+                std::copy_n(
+                        scalar_x_bytes.data() + source * element_bytes,
+                        element_bytes,
+                        scalar_expected.data()
+                                + destination * element_bytes);
+            }
+        }
+    }
+    iom_conformance::copy_from_host(scalar_x_owner->view(), scalar_x_bytes);
+    iom_conformance::copy_from_host(scalar_w_owner->view(), scalar_w_bytes);
+    const iom::oid scalar_token = queue->linear(
+            scalar_x_owner->view(), scalar_w_owner->view(),
+            scalar_out_owner->view(), 2, 17, ordinary, 1, 3);
+    REQUIRE(iom::oid_is_token(scalar_token));
+    CHECK_NOTHROW(queue->wait(scalar_token));
+    iom_conformance::require_logical_bytes(
+            scalar_out_owner->view(), scalar_expected,
+            "the scalar path of a facility-less queue still projects");
+    CHECK_FALSE(devices.gate.armed());
+
+    // A fresh queue resolves the device's own truth again: the injected
+    // absence was consumed by exactly one creation.
+    if (cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal)) {
+        auto recovered_queue = devices.candidate->create_ops();
+        const iom::oid recovered = recovered_queue->linear(
+                x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 10);
+        REQUIRE(iom::oid_is_token(recovered));
+        CHECK_NOTHROW(recovered_queue->wait(recovered));
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// The execution-connected native evidence runs of the BF16 specialization: the
+// canonical non-square fixture through the real queue/OID path for `R=1`, `15`,
+// `16`, and `17` in both layouts. Every run is compared against the shared
+// independent reference and emits its own record — runtime device and toolchain
+// facts, geometry and padded extent, the exercised submission with its accepted
+// OID, the kernel symbol, and the launch geometry — so a profiler observation
+// of the native matrix instruction is attributed to exactly these executions.
+// A device without the facility reports the absence instead of claiming the
+// evidence:
+//
+//   ncu --kernel-name regex:standard_tiled_linear_bf16_kernel --launch-count 8 \
+//       --print-source sass <build>/test/iom_cuda_conformance_tests \
+//       --test-case="CUDA BF16 native evidence*"
+TEST_CASE("CUDA BF16 native evidence: WMMA projections for R=1,15,16,17") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    if (!cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal)) {
+        std::printf(
+                "cuda-linear-bf16-record backend=CUDA facility=unsupported "
+                "reason=device-without-bf16-wmma\n");
+        std::printf(
+                "cuda-linear-bf16-environment backend=CUDA device_facility="
+                "unsupported: a device below compute capability 8.0 reports "
+                "the native evidence unavailable instead of claiming it\n");
+        return;
+    }
+    CudaDevices devices;
+    int device_index = 0;
+    REQUIRE(cudaGetDevice(&device_index) == cudaSuccess);
+    cudaDeviceProp properties{};
+    REQUIRE(cudaGetDeviceProperties(&properties, device_index) == cudaSuccess);
+    int runtime_version = 0;
+    int driver_version = 0;
+    REQUIRE(cudaRuntimeGetVersion(&runtime_version) == cudaSuccess);
+    REQUIRE(cudaDriverGetVersion(&driver_version) == cudaSuccess);
+    std::printf(
+            "cuda-linear-bf16-environment backend=CUDA device=%s "
+            "compute_capability=%d.%d runtime=%d driver=%d image_arch=%u\n",
+            properties.name, properties.major, properties.minor,
+            runtime_version, driver_version,
+            iom::cuda_detail::linear_bf16_wmma_image_arch());
+
+    const iom::LinearOutputLayout layouts[2] = {
+            iom::LinearOutputLayout::ordinary,
+            iom::LinearOutputLayout::head_planar};
+    const std::size_t run_rows[4] = {1, 15, 16, 17};
+    for (const iom::LinearOutputLayout layout : layouts) {
+        for (const std::size_t rows : run_rows) {
+            CAPTURE(static_cast<int>(layout));
+            CAPTURE(rows);
+            const std::size_t planes = 2;
+            const std::size_t source_rows = 19;
+            const std::size_t inner = 3;
+            const std::size_t outer = 10;
+            const std::size_t start_row = 2;
+            const std::size_t columns =
+                    layout == iom::LinearOutputLayout::head_planar ? 5 : outer;
+            // The submission's `H`/`D`: ordinary mode is exactly `H=1`,
+            // `D=O`, and head-planar mode is the checked `O=H*D` with the
+            // head axis inserted into the output.
+            const std::size_t heads =
+                    layout == iom::LinearOutputLayout::head_planar ? 2 : 1;
+            const std::size_t head_dim = columns;
+            std::vector<std::size_t> x_dimensions{planes, source_rows, inner};
+            std::vector<std::size_t> out_dimensions{planes};
+            if (layout == iom::LinearOutputLayout::head_planar) {
+                out_dimensions.push_back(heads);
+            }
+            out_dimensions.push_back(rows);
+            out_dimensions.push_back(columns);
+            auto x_owner = devices.candidate->create_tensor(
+                    iom::TensorSpec{
+                            iom::TensorShape{std::move(x_dimensions)},
+                            iom::DataType::BF16});
+            auto w_owner = devices.candidate->create_tensor(iom::TensorSpec{
+                    iom::TensorShape{{outer, inner}}, iom::DataType::BF16});
+            auto out_owner = devices.candidate->create_tensor(
+                    iom::TensorSpec{
+                            iom::TensorShape{std::move(out_dimensions)},
+                            iom::DataType::BF16});
+
+            const std::uint64_t salt =
+                    0x6F00ull + rows * 0x10ull + (heads == 2 ? 1ull : 0ull);
+            const std::vector<std::byte> x_bytes =
+                    iom_conformance::linear_logical_image(
+                            iom::DataType::BF16,
+                            x_owner->view().spec().shape.element_count(), salt,
+                            true);
+            const std::vector<std::byte> w_bytes =
+                    iom_conformance::linear_logical_image(
+                            iom::DataType::BF16,
+                            w_owner->view().spec().shape.element_count(),
+                            salt ^ 0x1234ull, true);
+            const std::vector<std::byte> out_poison =
+                    iom_conformance::linear_logical_image(
+                            iom::DataType::BF16,
+                            out_owner->view().spec().shape.element_count(),
+                            salt ^ 0x4321ull, true);
+            const std::vector<std::byte> x_view_bytes =
+                    iom_conformance::linear_view_image(
+                            x_owner->view(), x_bytes);
+            const iom_conformance::LinearRawImage x_image =
+                    iom_conformance::linear_padded_image(
+                            iom::DataType::BF16, planes,
+                            iom_conformance::linear_pad16(source_rows),
+                            iom_conformance::linear_pad16(inner), source_rows,
+                            inner, x_view_bytes, salt ^ 0x0F0Full);
+            const iom_conformance::LinearRawImage w_image =
+                    iom_conformance::linear_padded_image(
+                            iom::DataType::BF16, 1,
+                            iom_conformance::linear_pad16(outer),
+                            iom_conformance::linear_pad16(inner), outer, inner,
+                            w_bytes, salt ^ 0xF0F0ull);
+            const iom_conformance::LinearOracleRequest request{
+                    iom::DataType::BF16, planes, source_rows, inner, outer,
+                    start_row, rows, heads, head_dim, layout};
+            const iom_conformance::LinearReference reference =
+                    iom_conformance::linear_reference(
+                            request, x_image, w_image);
+
+            iom_conformance::copy_from_host(x_owner->view(), x_bytes);
+            iom_conformance::copy_from_host(w_owner->view(), w_bytes);
+            iom_conformance::copy_from_host(out_owner->view(), out_poison);
+            auto queue = devices.candidate->create_ops();
+            const iom::oid token = queue->linear(
+                    x_owner->view(), w_owner->view(), out_owner->view(),
+                    start_row, rows, layout, heads, head_dim);
+            REQUIRE(iom::oid_is_token(token));
+            CHECK_NOTHROW(queue->wait(token));
+            const std::optional<std::string> mismatch =
+                    iom_conformance::linear_compare_image(
+                            request, iom_conformance::read_logical(
+                                             out_owner->view()),
+                            reference,
+                            std::string("native evidence ")
+                                    + (layout
+                                               == iom::LinearOutputLayout::
+                                                          head_planar
+                                       ? "head_planar"
+                                       : "ordinary"));
+            REQUIRE_MESSAGE(!mismatch.has_value(), mismatch.value_or(""));
+
+            const std::size_t row_tiles = (rows + 15) / 16;
+            const std::size_t column_tiles = (columns + 15) / 16;
+            const std::size_t units = planes * heads * row_tiles * column_tiles;
+            CudaBf16NativeRecord record;
+            record.layout = layout == iom::LinearOutputLayout::head_planar
+                    ? "head_planar"
+                    : "ordinary";
+            record.planes = planes;
+            record.source_rows = source_rows;
+            record.inner = inner;
+            record.outer = outer;
+            record.heads = heads;
+            record.head_dim = head_dim;
+            record.start_row = start_row;
+            record.rows = rows;
+            record.padded_rows = iom_conformance::linear_pad16(rows);
+            record.padded_columns = iom_conformance::linear_pad16(columns);
+            record.padded_inner = iom_conformance::linear_pad16(inner);
+            record.blocks = units < 65535 ? units : 65535;
+            record.token = token;
+            record.supported = true;
+            emit_cuda_bf16_record(record);
+        }
+    }
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -1087,3 +1487,5 @@ TEST_CASE("CUDA conformance: workspace requirement queries are pure and exact") 
                     foreign_tensor->view(), rhs->view(), out->view()),
             std::invalid_argument);
 }
+
+

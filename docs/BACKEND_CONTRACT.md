@@ -416,11 +416,16 @@ must record that fact rather than adding an example.
 
 ### 9. Other compute capabilities
 
-Other compute hooks (`silu`, `linear`, and `sdpa`) remain unsupported and
-return negative `Unsupported` before submission, mutation, or token acceptance.
-CUDA and ROCm provide source-inspected RMSNorm launch wrappers over the shared
-core, and TTNN now provides its preallocated BF16/F32 queue path; only
-backends without one of those ports keep reporting RMSNorm `Unsupported`.
+`silu` and `sdpa` remain unsupported and return negative `Unsupported` before
+submission, mutation, or token acceptance. The `linear` hooks are owned by
+[Linear projections](#linear-projections): the CUDA port queues the twenty
+non-BF16 applicable leaves on the shared tiled scalar projection and `BF16` on
+its native `<mma.h>` BF16-input/FP32-accumulate WMMA specialization, whose
+availability is a runtime device and loaded-image fact, while a backend
+without its own linear port keeps reporting `Unsupported`. CUDA and ROCm
+provide source-inspected RMSNorm launch wrappers over the shared core, and
+TTNN now provides its preallocated BF16/F32 queue path; only backends without
+one of those ports keep reporting RMSNorm `Unsupported`.
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
@@ -2044,14 +2049,93 @@ this assessment.
 #### TinyLlama forward layout — CUDA matrix feasibility
 
 This is a bounded capability record for the planned interfaces above, not a
-CUDA neural implementation or a support claim. The current CUDA neural probes
-remain `Unsupported` before submission. On the inventoried device the native
-CUDA Toolkit route is **supported for implementation feasibility** for
-ordinary and head-planar linear, QK, and PV at every required row count.
-Production status is nevertheless **blocked** until the operation-owning CUDA
-ports supply runtime numerical, conformance, and profiler evidence. A device
-below compute capability 8.0 is **unsupported** for this BF16 WMMA route; it
-does not earn a fallback pass.
+CUDA neural implementation or a support claim; each interface-owning port
+carries its own evidence. On the inventoried device the native CUDA Toolkit
+route is **supported for implementation feasibility** for ordinary and
+head-planar linear, QK, and PV at every required row count. Production status
+is **closed for linear** — the operation-owning port supplies the runtime
+numerical, conformance, and execution-connected evidence recorded in
+[Linear native evidence](#linear-native-evidence) — and remains **blocked for
+QK, PV, RoPE, SiLU, and SDPA** until their own ports supply the same evidence.
+A device below compute capability 8.0 is **unsupported** for this BF16 WMMA
+route; it does not earn a fallback pass.
+
+##### Linear native evidence
+
+Recorded on 2026-09-18 through the configured `cuda` `csw-remote` profile from
+the exact `run-task/006-tinyllama--04-linear-projections--06-cuda-native-bf16`
+worktree, mirror `lp-cuda-bf16-a1`, host `bv1`. This record covers the native
+BF16 linear specialization (`src/cuda/linear.cu`) only; it makes no QK, PV,
+RoPE, SiLU, or SDPA claim.
+
+- **Backend, device, and toolchain.** CUDA; NVIDIA GeForce RTX 5090, compute
+  capability 12.0, driver 595.71.05; `nvcc` release 13.2 (`V13.2.78`); runtime
+  and driver API 13020 as reported by `cudaRuntimeGetVersion` and
+  `cudaDriverGetVersion` inside the conformance binary. The CUDA target pins
+  `CUDA_ARCHITECTURES=75;80;90;120`, and the loaded image of the specialization
+  reports its own architecture at runtime through the arch-dependent device
+  constant of `src/cuda/linear.cu` (`linear_bf16_wmma_image_arch() = 1200`), so
+  the executed image is the sm_120 one and not a pre-Ampere JIT image.
+- **Kernel and exercised submissions.** Symbol
+  `standard_tiled_linear_bf16_kernel` (CUDA-local `__global__`, eight warps of
+  32 lanes, one warp per `(plane, head, row tile, column tile)` unit, launched
+  by `launch_linear_bf16` on the queue's own in-order stream). The
+  conformance binary emitted one record per required row run from the real
+  queue/OID path (`cuda-linear-bf16-record ...` lines of
+  `test/cuda/test_cuda_conformance.cpp`), each with `P=2`, `T=19`, `I=3`,
+  `O=10`, `s=2`, padded `Rp/Op/Ip = 16/16/16` for `R=1,15,16` and `32/16/16`
+  for `R=17`, accepted OID `36028797018963969` at sequence 1 of its fresh
+  queue, and launch geometry `blocks=2/2/2/4` (ordinary, `H=1,D=10`) and
+  `blocks=4/4/4/8` (head-planar, `H=2,D=5`) for `R=1,15,16,17`; every run was
+  compared element-by-element against the shared independent reference and
+  passed. A device below compute capability 8.0, or a build whose loaded image
+  carries no BF16 WMMA statements, reports the leaf `Unsupported` instead of
+  producing a record, and the difference is verified through the injected
+  capability fact in
+  `test/cuda/test_cuda_conformance.cpp` (`CUDA BF16 linear is Unsupported on a
+  device without the WMMA facility`).
+- **Observed native facility.** The executed `wmma` BF16/FP32 operation behaves
+  as the tensor-core datapath and not as any per-step FP32 accumulation: for
+  the discriminative product set `{+4.014e38, +4.014e38, -7.603e38}` (every
+  product beyond `FLT_MAX`, exact sum `4.256e37`) the device returns
+  `0x1p+125 = 4.2535e37`, while every left-to-right or tree FP32 accumulation
+  order of the same products overflows to `±Inf`; BF16-subnormal products are
+  preserved (`2^-133` exactly, no flush-to-zero), `NaN` multiplicands admit
+  `NaN`, and `(+Inf, -Inf)` products give `NaN` while `+Inf` plus a finite
+  product stays `+Inf`. The compiled image of that kernel contains
+  `HMMA.16816.F32.BF16` (`cuobjdump -sass build/libiom_cuda.a`, six
+  occurrences across the three architectures at or above the floor and none in
+  the sm_75 image). The disassembly is supplementary here: capability is
+  decided at runtime from the device attribute and the loaded image, never from
+  compilation or disassembly presence.
+- **Profiler.** `ncu` 2026.1.1.0 is installed, but counter collection is denied
+  to this account (`ERR_NVGPUCTRPERM`; no passwordless root), so no
+  counter-based instruction-level observation was obtained. `nsys` 2026.4.1
+  does run: `nsys profile --force-overwrite=true -o /tmp/lp-nsys` around the
+  native-evidence test case, read back with
+  `nsys stats --report cuda_gpu_kern_sum`, reports the executed symbol
+  `iom::cuda_detail::<unnamed>::standard_tiled_linear_bf16_kernel(iom::detail::LinearMetadata)`
+  with eight instances — one per recorded submission, in the same order as the
+  eight emitted records — beside the shared copy and gather kernels. The record
+  therefore reports the executed kernel, its loaded image architecture, and the
+  observed facility behaviour above, and claims no counter-based instruction
+  observation; the missing counters are a host-permission limitation, not a
+  device or implementation result.
+- **Fixture class agreement.** The complete BF16 case matrix (33 cases, 45023
+  reference elements) is scanned for the invariant that the mandated FP32
+  fused-multiply-add recurrence and the FP64 equation rounded once to BF16
+  agree in class and satisfy the frozen threshold:
+  `class_disagreements=0`, `threshold_failures=0`. The scan is what motivated
+  the fixture scale constraint recorded on `linear_fixture_special_code` in
+  `test/backend/backend_conformance_linear.hpp`, which scales the BF16
+  saturation-magnitude ladder position to `2^48`; before that constraint
+  exactly one element (the LM-head case, element 11) disagreed, `+inf` against
+  `-inf`, because no reassociating native reduction reproduces per-step FP32
+  overflow.
+- **Conclusion.** Supported on this device and this loaded image for `R=1`,
+  `15`, `16`, and `17` in ordinary and head-planar mode, each established by an
+  executed submission whose output was compared against the independent
+  reference; a device without the facility reports `Unsupported`.
 
 ##### Evidence boundary and installed capability
 
