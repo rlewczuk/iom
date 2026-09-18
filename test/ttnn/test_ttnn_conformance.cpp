@@ -25,6 +25,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_embedding.hpp"
+#include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -1055,6 +1056,29 @@ TEST_CASE("TTNN conformance: embedding lookup reference, admission, and lifetime
     iom_conformance::run_embedding_conformance(
             devices.conformance(), kTtnnEmbeddingDeclaration, nullptr,
             &oracle);
+}
+
+// TTNN's declared linear expectation: the mandatory BF16 leaf alone through the
+// native path, the frozen `{0, 1}` direct-reader/direct-writer scratch path, and
+// an explicit rejection for the other twenty applicable leaves, whose encoded
+// carriers its native TILE compute cannot consume without the forbidden host
+// staging. No linear port exists at this revision, so the implemented span is
+// empty and even the declared BF16 leaf stays a capability rejection here.
+const iom_conformance::LinearDeclaration kTtnnLinearDeclaration{
+        iom_conformance::kLinearTtnnLeafSpan,
+        iom_conformance::kNoLinearSpan,
+        iom_conformance::kLinearNativeBf16Span,
+        iom_conformance::kNoLinearSpan,
+        {},
+        iom_conformance::LinearWorkspacePath::zero,
+        iom_conformance::LinearWorkspacePath::zero};
+
+TEST_CASE("TTNN conformance: linear projection reference, admission, and lifetime") {
+    require_hardware();
+    TtnnDevices devices;
+    TtnnStorageOracle oracle;
+    iom_conformance::run_linear_conformance(
+            devices.conformance(), kTtnnLinearDeclaration, nullptr, &oracle);
 }
 
 TEST_CASE("TTNN embedding owners survive accepted dispatch before wait") {

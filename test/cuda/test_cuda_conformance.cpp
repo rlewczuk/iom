@@ -19,6 +19,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_embedding.hpp"
+#include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -270,6 +271,32 @@ TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime
     CudaStorageOracle oracle;
     iom_conformance::run_embedding_conformance(
             devices.conformance(), kCudaEmbeddingDeclaration, &devices.gate,
+            &oracle);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// CUDA's declared linear expectation: the complete 21-leaf applicable matrix
+// through the twenty-leaf scalar path plus the native BF16 specialization, and
+// the frozen `{0, 1}` scratch path for both. No linear port exists at this
+// revision, so the implemented span is empty: the suite exercises the
+// independent reference and the common admission contract while every declared
+// leaf stays a capability rejection, and a capability rejection is never
+// projection conformance.
+const iom_conformance::LinearDeclaration kCudaLinearDeclaration{
+        iom_conformance::kLinearLeafSpan,
+        iom_conformance::kLinearScalarLeafSpan,
+        iom_conformance::kLinearNativeBf16Span,
+        iom_conformance::kNoLinearSpan,
+        {},
+        iom_conformance::LinearWorkspacePath::zero,
+        iom_conformance::LinearWorkspacePath::zero};
+
+TEST_CASE("CUDA conformance: linear projection reference, admission, and lifetime") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    iom_conformance::run_linear_conformance(
+            devices.conformance(), kCudaLinearDeclaration, &devices.gate,
             &oracle);
     CHECK_FALSE(devices.gate.armed());
 }

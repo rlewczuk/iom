@@ -4690,7 +4690,7 @@ invalid `layout` values, row-window violations, rank growth, workspace
 liveness, size, alignment, device, overlap, and lease rejections, an accepted
 failure with repeated waits, and scratch reuse after proven drain.
 
-The cases live in the planned shared header
+The cases live in the shared header
 `test/backend/backend_conformance_linear.hpp` and run through the existing
 `iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
 `iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
@@ -4701,6 +4701,43 @@ linear span and asserts `Unsupported` for every applicable leaf; that rejection
 probe is not projection conformance. The existing `linear` `Unsupported`
 probes and the copy/add/mul/sub/div suites remain until the operation's own
 leaf migrates them.
+
+The fixture provenance and case links of that header are:
+
+- the independent raw/scalar reference decodes and encodes every named leaf
+  itself, implements the unsigned modulo-`2^N` integer dot and the `+0`-started
+  increasing-`i` correctly rounded FP32 fused-multiply-add recurrence (`FP64`
+  for `F64`) with exactly one final encode, derives the row window, head
+  coordinate, and Hugging Face weight row itself, and provides the independent
+  FP64 evaluation behind the BF16, F32, and F64 thresholds; it calls no
+  production codec, address mapper, admission, linear, CPU, or backend helper;
+- the deliberate negative variants are `transposed_weight`, `head_order`,
+  `head_repeat`, `wrong_row_window`, `mixed_plane`, `padding_dependent`,
+  `tile_tail`, and `numeric_reencode`; the self-check asserts for every
+  applicable leaf that each is detected — bit-exactly where the thresholds
+  compare exact bits, and as a demonstrated model difference where a threshold
+  admits a bounded deviation — and that each coincides with the reference on a
+  fixture where the perturbation is genuinely invisible, so detection is
+  selective rather than unconditional;
+- the shared case matrix supplies the canonical `I=3, O=10, H=2, D=5, T=19,
+  s=2` fixture across `R=1, 15, 16, 17` in both layouts, the `I=65` and `I=33`
+  inner tails across 16-wide inner tiles and 32-wide inner groups, the LM-head
+  `s = input_run - 1, R = 1` `[1, V]` request, the leading-plane profiles of
+  rank two through eight with distinct per-operand plane offsets, leading
+  transforms, and strides, deliberately poisoned native padding, and per-leaf
+  special-class fixtures whose zero, signed, subnormal, infinity, and NaN
+  classes match each leaf's own encoding;
+- each driver passes an explicit declaration of its target leaf matrix, its
+  scalar and native-BF16 paths, its exact scratch path (`{0, 1}`, the ROCm
+  aligned BF16 sum, or the SYCL `A32(P*pad16(R)*pad16(O)*4)` range), the leaves
+  this revision implements, and — on SYCL — the `sycl::aspect::fp64` device
+  fact that gates `F64`, so a capability expectation is never an echo of an
+  implementation report; and
+- no backend implements linear at this revision, so every driver declares an
+  empty implemented span, the suite observes capability rejection for every
+  declared leaf and never reports projection success, and the common admission,
+  ownership, workspace, queue-order, and failure cases run against a
+  declaration-driven common double next to the host-only reference self-check.
 
 #### Native matrix evidence obligations
 
@@ -4748,8 +4785,9 @@ Implementers need these existing sources and seams:
   `test/backend/backend_conformance_other.hpp`, and the five
   `test/<backend>/test_<backend>_conformance.cpp` drivers.
 
-These files are planned targets and do not exist yet:
-`test/backend/backend_conformance_linear.hpp`. The per-backend linear kernels,
-launch wrappers, and capability predicates are owned by their own ports, which
-replace only their own hooks. This section claims no build, kernel, profiler,
-hardware, or runtime validation on any backend.
+`test/backend/backend_conformance_linear.hpp` is the shared conformance header
+described above. The per-backend linear kernels, launch wrappers, and
+capability predicates are owned by their own ports, which replace only their
+own hooks and migrate their own `Unsupported` probe as each declared leaf is
+actually implemented. This section claims no build, kernel, profiler, hardware,
+or runtime validation of the operation itself on any backend.

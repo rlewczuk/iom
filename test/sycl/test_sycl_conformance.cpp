@@ -19,6 +19,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_embedding.hpp"
+#include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
@@ -788,6 +789,40 @@ TEST_CASE("SYCL conformance: full shared suite") {
             devices.candidate->supported_data_types().subspan(0, 1),
             &devices.gate, &oracle, true, true);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// SYCL's declared linear expectation: the complete 21-leaf applicable matrix
+// through the twenty-leaf scalar path plus the native BF16 specialization, the
+// frozen `{0, 1}` scratch path for the scalar leaves, the documented aligned
+// `A32(P*pad16(R)*pad16(O)*4)` BF16 path, and the genuine device
+// `sycl::aspect::fp64` gate for `F64`. No linear port exists at this revision,
+// so the implemented span is empty and every declared leaf stays a capability
+// rejection; the declared gate is asserted in both directions regardless, so a
+// port that later queues `F64` on a device without the aspect fails here
+// instead of silently claiming support.
+TEST_CASE("SYCL conformance: linear projection reference, admission, and lifetime") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    const sycl::device native_device =
+            devices.candidate_context->get_devices().front();
+    const bool fp64_available = native_device.has(sycl::aspect::fp64);
+    iom_conformance::LinearDeclaration declaration{
+            iom_conformance::kLinearLeafSpan,
+            iom_conformance::kLinearScalarLeafSpan,
+            iom_conformance::kLinearNativeBf16Span,
+            iom_conformance::kNoLinearSpan,
+            {},
+            iom_conformance::LinearWorkspacePath::zero,
+            iom_conformance::LinearWorkspacePath::sycl_bf16};
+    declaration.device_available = [fp64_available](iom::DataType leaf) {
+        return leaf != iom::DataType::F64 || fp64_available;
+    };
+    iom_conformance::run_linear_conformance(
+            devices.conformance(), declaration, &devices.gate, &oracle);
+    CHECK_FALSE(devices.gate.armed());
+    // The gate is the device's own immutable fact, not a port statement.
+    CHECK_EQ(declaration.device_available(iom::DataType::F64), fp64_available);
+    CHECK(declaration.device_available(iom::DataType::F32));
 }
 
 TEST_CASE("SYCL conformance: RMS normalization capability follows the device FP64 aspect") {

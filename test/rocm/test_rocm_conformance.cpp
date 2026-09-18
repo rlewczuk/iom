@@ -26,6 +26,7 @@
 
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_embedding.hpp"
+#include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -420,6 +421,40 @@ TEST_CASE("ROCm conformance: embedding lookup reference, admission, and lifetime
     HipStorageOracle oracle;
     iom_conformance::run_embedding_conformance(
             devices, kRocmEmbeddingDeclaration, &gate, &oracle);
+    CHECK_FALSE(gate.armed());
+}
+
+// ROCm's declared linear expectation: the complete 21-leaf applicable matrix
+// through the twenty-leaf scalar path plus the native BF16 specialization, the
+// frozen `{0, 1}` scratch path for the scalar leaves, and the exact aligned
+// `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)` BF16 path. No
+// linear port exists at this revision, so the implemented span is empty: the
+// suite exercises the independent reference and the common admission contract,
+// including the positive-scratch lease policy, while every declared leaf stays
+// a capability rejection.
+const iom_conformance::LinearDeclaration kRocmLinearDeclaration{
+        iom_conformance::kLinearLeafSpan,
+        iom_conformance::kLinearScalarLeafSpan,
+        iom_conformance::kLinearNativeBf16Span,
+        iom_conformance::kNoLinearSpan,
+        {},
+        iom_conformance::LinearWorkspacePath::zero,
+        iom_conformance::LinearWorkspacePath::rocm_bf16};
+
+TEST_CASE("ROCm conformance: linear projection reference, admission, and lifetime") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
+    iom_conformance::run_linear_conformance(
+            devices, kRocmLinearDeclaration, &gate, &oracle);
     CHECK_FALSE(gate.armed());
 }
 

@@ -11,6 +11,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_embedding.hpp"
+#include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -299,6 +300,31 @@ TEST_CASE("CPU conformance: embedding lookup reference, admission, and lifetime"
     // ever be handed positive CPU scratch.
     CHECK_THROWS_AS(
             devices.candidate->create_workspace(1), std::invalid_argument);
+}
+
+// CPU's declared linear expectation: the complete 21-leaf applicable matrix,
+// one scalar recurrence covering every applicable leaf (including BF16, whose
+// CPU path is that same recurrence), and the fixed `{0, 1}` scratch path. No
+// linear port exists at this revision, so the implemented span is empty: the
+// suite exercises the independent reference and the whole common admission
+// contract while every declared leaf stays a capability rejection, and a
+// capability rejection is never projection conformance.
+const iom_conformance::LinearDeclaration kCpuLinearDeclaration{
+        iom_conformance::kLinearLeafSpan,
+        iom_conformance::kLinearLeafSpan,
+        iom_conformance::kNoLinearSpan,
+        iom_conformance::kNoLinearSpan,
+        {},
+        iom_conformance::LinearWorkspacePath::zero,
+        iom_conformance::LinearWorkspacePath::zero};
+
+TEST_CASE("CPU conformance: linear projection reference, admission, and lifetime") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    iom_conformance::run_linear_conformance(
+            devices.conformance(), kCpuLinearDeclaration, &devices.gate,
+            &oracle);
+    CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("CPU conformance: full shared suite composes every shared case") {
