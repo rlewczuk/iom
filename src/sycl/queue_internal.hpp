@@ -16,6 +16,14 @@
 
 namespace iom::sycl_detail {
 
+// Immutable device capability of the native `BF16` linear specialization,
+// computed once by the queue from its exact native device and published as
+// `SyclQueue::bf16_linear_supported_`. It is defined next to the BF16 kernels
+// in `queue_linear.cpp`; a device that cannot prove the queried subgroup-16
+// BF16/BF16/FP32 facility is `Unsupported` rather than emulated.
+[[nodiscard]] bool bf16_linear_device_capable(
+        const sycl::device& device) noexcept;
+
 class SyclQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence = 0;
@@ -34,7 +42,9 @@ class SyclQueue final : public DeviceOps {
         detail::BinaryEntryRegistration rmsnorm_entries;
         // Immutable linear projection request captured by admission, plus the
         // common owner registrations retained until proven completion. The
-        // scalar leaves consume no `RawWorkspace`, so no lease is carried.
+        // twenty scalar leaves consume no `RawWorkspace`, while the native
+        // `BF16` specialization carries the positive product-scratch lease
+        // captured with the request.
         std::optional<LinearRequest> linear_request;
         detail::BinaryEntryRegistration linear_entries;
     };
@@ -48,8 +58,10 @@ class SyclQueue final : public DeviceOps {
         bool is_embedding = false;
         // Trailing so every existing aggregate initialization of this outcome
         // keeps its own field order. Linear registers the same deduplicated
-        // owner set as RMS normalization and carries no lease, because its
-        // scalar leaves always report the `{0, 1}` zero-scratch requirement.
+        // owner set as RMS normalization; the scalar leaves report the
+        // `{0, 1}` zero-scratch requirement and therefore carry an empty
+        // lease, while the native `BF16` specialization leases its product
+        // scratch through proven completion in the shared field above.
         std::optional<detail::BinaryEntryRegistration> linear_entries;
     };
 
@@ -62,6 +74,12 @@ public:
     [[nodiscard]] SyclCompletionPool&
             completion_pool_for_testing() noexcept {
         return *completion_pool_;
+    }
+    // Immutable capability the native `BF16` linear specialization was
+    // constructed with, so a driver can assert that the port's own decision
+    // agrees with the device facts it queries independently.
+    [[nodiscard]] bool bf16_linear_supported_for_testing() const noexcept {
+        return bf16_linear_supported_;
     }
 #endif
 
@@ -81,12 +99,16 @@ public:
     oid linear_impl(const LinearRequest& request) override;
 
     /**
-     * Pure capability decision of the implemented linear scalar leaf set:
-     * exactly the twenty non-`BF16` applicable leaves, with `F64` queueable
-     * only when the selected device reports `sycl::aspect::fp64`. The common
-     * facade consults this hook for both the call and the pure requirement
-     * query, so an unimplemented leaf and an absent aspect are `Unsupported`
-     * before any queue effect.
+     * Pure capability decision and exact raw-workspace requirement of the
+     * implemented linear leaf set: the twenty non-`BF16` scalar leaves report
+     * the `{0, 1}` zero-scratch path, `F64` is queueable only when the
+     * selected device reports `sycl::aspect::fp64`, and `BF16` is queueable
+     * only when the selected device proves the queried subgroup-16
+     * BF16/BF16/FP32 `joint_matrix` facility, in which case it reports the
+     * checked alignment-32 `A32(P*pad16(R)*pad16(O)*4)` product scratch. The
+     * common facade consults this hook for both the call and the pure
+     * requirement query, so an unimplemented leaf, an absent aspect, and an
+     * absent device matrix facility are `Unsupported` before any queue effect.
      */
     [[nodiscard]] WorkspaceRequirements linear_workspace_requirements_impl(
             const TensorView& x, const TensorView& w, const TensorView& out,
@@ -171,6 +193,13 @@ private:
     // Immutable capability of the selected native device, published to the
     // common RMS normalization facade through `rmsnorm_supported`.
     const bool fp64_supported_ = false;
+    // Immutable capability of the same exact device for the native `BF16`
+    // linear specialization: the Intel matrix aspect, subgroup 16, and the
+    // BF16/BF16/FP32 combination family the row decomposition queues. It is
+    // computed once from device facts, is never an echo of a compilation or a
+    // bounded sample, and gates both the pure requirement query and the
+    // submission before any queue effect.
+    const bool bf16_linear_supported_ = false;
     sycl::queue queue_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;

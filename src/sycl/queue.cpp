@@ -140,6 +140,8 @@ SyclQueue::SyclQueue(
           completion_pool_(std::make_shared<SyclCompletionPool>(
                   resource_provider.queue_slot_count())),
           fp64_supported_(native_device.has(sycl::aspect::fp64)),
+          bf16_linear_supported_(
+                  bf16_linear_device_capable(native_device)),
           queue_(make_queue_with_fault_check(context, native_device)),
           worker_(
                   detail::StagedWorker<Task>::Callbacks{
@@ -456,12 +458,16 @@ void SyclQueue::complete_task(
                     fence_succeeded);
         } else if (outcome.linear_entries.has_value()) {
             // Linear projections register the same read/read-deduplicated
-            // owner set as RMS normalization, and every implemented scalar
-            // leaf reports the `{0, 1}` requirement, so no lease exists to
-            // retire: only the owner entries are released or invalidated.
+            // owner set as RMS normalization. The twenty scalar leaves report
+            // the `{0, 1}` requirement and carry no lease, while the native
+            // `BF16` specialization leases its product scratch through proven
+            // completion — an empty lease matches no record and retires
+            // nothing.
             (void)detail::release_or_invalidate_binary_entries(
                     state_->registry, *outcome.linear_entries, failed,
                     fence_succeeded);
+            detail::complete_workspace_lease(
+                    *state_, outcome.workspace_lease, completion_proven);
         } else {
             (void)detail::release_or_invalidate_entries(
                     state_->registry, outcome.common, failed,
