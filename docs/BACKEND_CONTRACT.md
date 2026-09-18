@@ -4896,18 +4896,58 @@ The fixture provenance and case links of that header are:
   this revision implements, and — on SYCL — the `sycl::aspect::fp64` device
   fact that gates `F64`, so a capability expectation is never an echo of an
   implementation report;
-- ROCm implements the twenty non-BF16 leaves through the shared raw-word
-  scalar kernel and declares exactly that implemented span, so the suite runs
-  the independent reference numerically on the real device, while `BF16` stays
-  a capability rejection until the separate native BF16 specialization lands
-  and no BF16 numeric evidence is claimed here;
-- the ROCm per-leaf device evidence is complete for the nineteen leaves whose
-  comparison policy is exact or bounded; the `F32` threshold cases await
-  reconciliation of the shared fixture's special-value ladder with the mandated
-  FP32 accumulator and are reported separately rather than claimed here; and
+- ROCm implements all twenty-one applicable leaves: the twenty non-BF16
+  leaves through the shared raw-word scalar kernel and `BF16` through the
+  native specialization in `src/rocm/copy.hip` (checked caller workspace,
+  direct GFX12 wave32 BF16 WMMA with FP32 accumulation, one RNE BF16
+  scatter), and declares exactly that implemented span, so the suite runs the
+  independent reference numerically on the real device for every applicable
+  leaf;
+- the ROCm per-leaf device evidence is complete for all twenty-one applicable
+  leaves under the shared fixture set and comparison policy; the `F32` and
+  `BF16` non-finite-class reconciliation authorized for the shared fixture is
+  part of the gate this leaf ran, and no leaf is reported separately as
+  unclaimed here; and
 - the common admission, ownership, workspace, queue-order, and failure cases
   run against a declaration-driven common double next to the host-only
   reference self-check.
+
+The executed ROCm native `BF16` record of this revision is the following
+observation, collected from this leaf's task worktree (worktree base
+`3421f67fb6817e97444353bb03343ac33b02b24d`) on the configured `rocm` host:
+
+| Field | Observation |
+| --- | --- |
+| Backend, device | ROCm, `gfx1201` (Radeon AI PRO R9700), wave32, ordinal 0 |
+| Toolchain | HIP `7.15.26333-0000000`, AMD clang `23.0.0git`; `hipRuntimeGetVersion` `71526333` |
+| Profiler | `rocprofv3` version `1.3.5`, git revision `6b0e43f341195e203754e08f850e437ff2fc09f9` |
+| Profiler command | `rocprofv3 --kernel-trace --output-format csv -d prof -o evi -- <evidence driver>` |
+| Layout, dimensions | `x[...,T,I]` and HF `w[O,I]`: `P=1, T=19, I=3, O=10, s=2`; ordinary `H=1, D=10` and head-planar `H=2, D=5`; `R in {1,15,16,17}` |
+| Padded dimensions | `pad16(R)/pad16(I)/pad16(O)`: `16/16/16` for `R in {1,15,16}` and `32/16/16` for `R=17` |
+| Kernel symbols | `linear_bf16_pack_kernel`, `linear_bf16_wmma_kernel`, `linear_bf16_scatter_kernel` (`iom::detail`, one dispatch of each per accepted submission; `9/9/9` dispatches for the eight fixture submissions plus one wider submission) |
+| Facility | `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` executed in the same session as the submissions and verified against the exact `16x16x16` product (`facility_probe` `pass`, `worst_deviation=0`); the fixture products themselves are compared against the FP64-derived reference by the shared suite |
+
+| `R` | Layout | `pad16(R)/pad16(I)/pad16(O)` | Workspace (bytes, alignment) | Accepted OID | Observed facility |
+| ---: | --- | --- | --- | ---: | --- |
+| 1 | ordinary | `16/16/16` | `1024, 32` | `36028797018963969` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 1 | head-planar | `16/16/16` | `1024, 32` | `36028797018963970` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 15 | ordinary | `16/16/16` | `1024, 32` | `36028797018963971` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 15 | head-planar | `16/16/16` | `1024, 32` | `36028797018963972` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 16 | ordinary | `16/16/16` | `1024, 32` | `36028797018963973` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 16 | head-planar | `16/16/16` | `1024, 32` | `36028797018963974` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 17 | ordinary | `32/16/16` | `2048, 32` | `36028797018963975` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+| 17 | head-planar | `32/16/16` | `2048, 32` | `36028797018963976` | native WMMA kernel + sampled-facility probe, `facility_probe` `pass` |
+
+The unsupported device is reported separately: the installed `gfx1036`
+(ordinal 1) returns `Unsupported` for `BF16` from both the pure requirement
+query and submission, and only the twenty scalar leaves stay available there.
+`rocprofv3` 1.3.5 supports neither PC sampling nor SPM counter collection on
+this `gfx1201` agent (`Given PC sampling configuration is not supported on
+any of the agents`, `rocprofiler_iterate_agent_supported_counters failed ...
+Agent HW architecture is not supported, no counter metrics found`), so the
+facility statement above rests on the executed probe and the traced kernel
+dispatches of the submitted OIDs rather than on a hardware instruction
+counter.
 
 #### Native matrix evidence obligations
 

@@ -2989,6 +2989,30 @@ struct LinearLeadingCase {
                 add(std::move(item));
             }
         }
+        // The crossing head stride: a head-planar factorization whose head
+        // stride `D` is not a multiple of the 16-wide packed outer tile, so a
+        // head's logical columns cross that tile boundary inside the packed
+        // product. A scatter that copies one contiguous packed run per row is
+        // observably wrong here, while the canonical `H=2, D=5` factorization
+        // never crosses. Both shapes are added so the boundary is covered on
+        // either side of the packed tile.
+        for (const std::array<std::size_t, 3>& crossing :
+             {std::array<std::size_t, 3>{2, 9, 18},
+              std::array<std::size_t, 3>{4, 5, 20}}) {
+            LinearCase item;
+            item.label = "crossing head stride H="
+                    + std::to_string(crossing[0]) + " D="
+                    + std::to_string(crossing[1]) + " O="
+                    + std::to_string(crossing[2]) + " T=19 s=2 R=17 "
+                      "head_planar";
+            item.leaf = leaf;
+            item.heads = crossing[0];
+            item.head_dim = crossing[1];
+            item.outer = crossing[2];
+            item.rows = 17;
+            item.layout = iom::LinearOutputLayout::head_planar;
+            add(std::move(item));
+        }
         // The non-tile inner extent: `I=65` spans five 16-wide inner tiles and
         // three 32-wide inner groups, and `I=33` crosses a 32-wide group with a
         // one-wide tail. Both keep the inner tail, the accumulation order, and

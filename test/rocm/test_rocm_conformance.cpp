@@ -3,6 +3,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <initializer_list>
@@ -427,20 +428,339 @@ TEST_CASE("ROCm conformance: embedding lookup reference, admission, and lifetime
 // ROCm's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, the
 // frozen `{0, 1}` scratch path for the scalar leaves, and the exact aligned
-// `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)` BF16 path. This
-// revision ports the twenty scalar leaves: the shared raw-word scalar kernel
-// executes the integer modulo-2^N dot and the `+0`-started FP32/FP64 fused
-// recurrence on the real device, so `implemented_leaves` is exactly the
-// non-BF16 span. BF16 stays a capability rejection until the separate native
-// BF16 specialization lands, and no BF16 evidence is claimed here.
+// `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)` BF16 path. Both
+// paths are implemented: the shared raw-word scalar kernel executes the
+// integer modulo-2^N dot and the `+0`-started FP32/FP64 fused recurrence, and
+// the native BF16 specialization executes direct GFX12 wave32 WMMA with FP32
+// accumulation and one RNE BF16 scatter on a device whose checked facility
+// permits it, so `implemented_leaves` is the complete 21-leaf span.
 const iom_conformance::LinearDeclaration kRocmLinearDeclaration{
         iom_conformance::kLinearLeafSpan,
         iom_conformance::kLinearScalarLeafSpan,
         iom_conformance::kLinearNativeBf16Span,
-        iom_conformance::kLinearScalarLeafSpan,
+        iom_conformance::kLinearLeafSpan,
         {},
         iom_conformance::LinearWorkspacePath::zero,
         iom_conformance::LinearWorkspacePath::rocm_bf16};
+
+// Native BF16 availability of one ROCm ordinal, stated independently of the
+// port: the checked route is the GFX12 wave32 BF16-to-FP32 WMMA facility, so
+// only the GFX12 ASIC ids carrying that 128-bit wave32 operand form on a
+// wave32 device are supported. Every other ordinal, including the installed
+// gfx1036, must report `Unsupported` for the leaf rather than fail later.
+[[nodiscard]] bool rocm_native_bf16_ordinal(int ordinal) {
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, ordinal) != hipSuccess) {
+        return false;
+    }
+    if (properties.warpSize != 32) {
+        return false;
+    }
+    const std::string_view architecture{properties.gcnArchName};
+    return architecture.starts_with("gfx1200")
+            || architecture.starts_with("gfx1201");
+}
+
+TEST_CASE("ROCm conformance: native BF16 linear caller workspace and WMMA launch evidence") {
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    // The checked host exposes the GFX12 device at ordinal 0. An unavailable
+    // facility is a configuration failure, never a silently skipped case.
+    REQUIRE(rocm_native_bf16_ordinal(0));
+
+    const iom::LinearOutputLayout ordinary = iom::LinearOutputLayout::ordinary;
+    const iom::LinearOutputLayout head_planar =
+            iom::LinearOutputLayout::head_planar;
+    auto x = candidate->create_tensor(iom_conformance::linear_spec(
+            {19, 3}, iom::DataType::BF16));
+    auto w = candidate->create_tensor(iom_conformance::linear_spec(
+            {10, 3}, iom::DataType::BF16));
+    iom_conformance::copy_from_host(
+            x->view(),
+            iom_conformance::linear_logical_image(
+                    iom::DataType::BF16, 19 * 3, 0x5A));
+    iom_conformance::copy_from_host(
+            w->view(),
+            iom_conformance::linear_logical_image(
+                    iom::DataType::BF16, 10 * 3, 0xC3));
+    auto queue = candidate->create_ops();
+
+    // The frozen four row runs through the real queue: the query reports the
+    // exact aligned sum, the accepted submission leases the range, and the
+    // execution reaches the native kernel and never the scalar recurrence.
+    for (const std::size_t rows : {1u, 15u, 16u, 17u}) {
+        CAPTURE(rows);
+        auto out = candidate->create_tensor(iom_conformance::linear_spec(
+                {rows, 10}, iom::DataType::BF16));
+        const iom::WorkspaceRequirements requirement =
+                queue->linear_workspace_requirements(
+                        x->view(), w->view(), out->view(), 2, rows, ordinary,
+                        1, 10);
+        const iom::WorkspaceRequirements expected =
+                iom_conformance::linear_expected_workspace(
+                        kRocmLinearDeclaration, iom::DataType::BF16,
+                        iom_conformance::LinearShape{1, rows, 3, 10});
+        CHECK_EQ(requirement.bytes, expected.bytes);
+        CHECK_EQ(requirement.alignment, std::size_t{32});
+        auto workspace = candidate->create_workspace(requirement.bytes);
+        const std::size_t native_before =
+                iom::rocm_detail::linear_native_bf16_launch_count_for_testing
+                        .load();
+        const std::size_t scalar_before =
+                iom::rocm_detail::linear_scalar_launch_count_for_testing
+                        .load();
+        const iom::oid token = queue->linear(
+                x->view(), w->view(), out->view(), 2, rows, ordinary, 1, 10,
+                workspace->view().subrange(0, requirement.bytes));
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_EQ(
+                iom::rocm_detail::linear_native_bf16_launch_count_for_testing
+                        .load(),
+                native_before + 1);
+        CHECK_EQ(
+                iom::rocm_detail::linear_scalar_launch_count_for_testing
+                        .load(),
+                scalar_before);
+        // Proven completion released the lease, so the same range is reusable.
+        const iom::oid reused = queue->linear(
+                x->view(), w->view(), out->view(), 2, rows, ordinary, 1, 10,
+                workspace->view().subrange(0, requirement.bytes));
+        REQUIRE(iom::oid_is_token(reused));
+        CHECK_NOTHROW(queue->wait(reused));
+    }
+    // Head-planar shares the product and inserts the head axis, so it uses the
+    // same native path with `O = H*D` as the packed column extent.
+    {
+        auto out = candidate->create_tensor(iom_conformance::linear_spec(
+                {2, 16, 5}, iom::DataType::BF16));
+        const iom::WorkspaceRequirements requirement =
+                queue->linear_workspace_requirements(
+                        x->view(), w->view(), out->view(), 2, 16, head_planar,
+                        2, 5);
+        const iom::WorkspaceRequirements expected =
+                iom_conformance::linear_expected_workspace(
+                        kRocmLinearDeclaration, iom::DataType::BF16,
+                        iom_conformance::LinearShape{1, 16, 3, 10});
+        CHECK_EQ(requirement.bytes, expected.bytes);
+        CHECK_EQ(requirement.alignment, std::size_t{32});
+        auto workspace = candidate->create_workspace(requirement.bytes);
+        const std::size_t native_before =
+                iom::rocm_detail::linear_native_bf16_launch_count_for_testing
+                        .load();
+        const iom::oid token = queue->linear(
+                x->view(), w->view(), out->view(), 2, 16, head_planar, 2, 5,
+                workspace->view().subrange(0, requirement.bytes));
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_EQ(
+                iom::rocm_detail::linear_native_bf16_launch_count_for_testing
+                        .load(),
+                native_before + 1);
+    }
+    // Every unusable caller range is rejected before any effect, and the
+    // accepted range still works afterwards.
+    {
+        auto out = candidate->create_tensor(iom_conformance::linear_spec(
+                {17, 10}, iom::DataType::BF16));
+        const iom::WorkspaceRequirements requirement =
+                queue->linear_workspace_requirements(
+                        x->view(), w->view(), out->view(), 2, 17, ordinary, 1,
+                        10);
+        REQUIRE(requirement.bytes > 32);
+        const iom::oid invalid =
+                iom::to_oid(iom::OidError::InvalidArgument);
+        auto workspace = candidate->create_workspace(requirement.bytes);
+        auto foreign_workspace =
+                foreign->create_workspace(requirement.bytes);
+        const auto submit = [&](iom::RawWorkspaceView scratch) {
+            return queue->linear(
+                    x->view(), w->view(), out->view(), 2, 17, ordinary, 1, 10,
+                    scratch);
+        };
+        CHECK_EQ(submit(iom::RawWorkspaceView{}), invalid);
+        CHECK_EQ(
+                submit(workspace->view().subrange(
+                        0, requirement.bytes - 32)),
+                invalid);
+        CHECK_EQ(
+                submit(foreign_workspace->view().subrange(
+                        0, requirement.bytes)),
+                invalid);
+        {
+            const iom_conformance::LinearConformanceWorkspace misaligned(
+                    *candidate, reinterpret_cast<void*>(0x5401),
+                    requirement.bytes + 64);
+            CHECK_EQ(submit(misaligned.view()), invalid);
+        }
+        {
+            const iom_conformance::LinearConformanceWorkspace overlapping(
+                    *candidate, x->view().native_handle(),
+                    requirement.bytes + 64);
+            CHECK_EQ(submit(overlapping.view()), invalid);
+        }
+        const iom::RawWorkspaceView dead =
+                iom_conformance::linear_dead_workspace_view(
+                        *candidate, reinterpret_cast<void*>(0x5600),
+                        requirement.bytes + 64);
+        CHECK_EQ(submit(dead), invalid);
+        const iom::oid accepted = submit(
+                workspace->view().subrange(0, requirement.bytes));
+        REQUIRE(iom::oid_is_token(accepted));
+        CHECK_NOTHROW(queue->wait(accepted));
+    }
+}
+
+TEST_CASE("ROCm conformance: native BF16 head-planar crossing factorization matches the reference") {
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    REQUIRE(rocm_native_bf16_ordinal(0));
+    auto queue = candidate->create_ops();
+    constexpr std::size_t kSourceRows = 19;
+    constexpr std::size_t kInner = 3;
+    constexpr std::size_t kStartRow = 2;
+    constexpr std::size_t kRows = 17;
+    // Both factorizations place a head's logical columns across a packed
+    // 16-column boundary, so the boundary-crossing copy runs on the device and
+    // its accepted OID must have reached the native kernel.
+    for (const std::array<std::size_t, 2>& crossing :
+         {std::array<std::size_t, 2>{2, 9},
+          std::array<std::size_t, 2>{4, 5}}) {
+        const std::size_t heads = crossing[0];
+        const std::size_t head_dim = crossing[1];
+        const std::size_t outer = heads * head_dim;
+        CAPTURE(heads);
+        CAPTURE(head_dim);
+        auto x = candidate->create_tensor(iom_conformance::linear_spec(
+                {kSourceRows, kInner}, iom::DataType::BF16));
+        auto w = candidate->create_tensor(iom_conformance::linear_spec(
+                {outer, kInner}, iom::DataType::BF16));
+        auto out = candidate->create_tensor(iom_conformance::linear_spec(
+                {heads, kRows, head_dim}, iom::DataType::BF16));
+        const std::vector<std::byte> x_bytes =
+                iom_conformance::linear_logical_image(
+                        iom::DataType::BF16, kSourceRows * kInner, 0x71);
+        const std::vector<std::byte> w_bytes =
+                iom_conformance::linear_logical_image(
+                        iom::DataType::BF16, outer * kInner, 0x93);
+        const std::vector<std::byte> out_poison =
+                iom_conformance::linear_logical_image(
+                        iom::DataType::BF16, heads * kRows * head_dim, 0xB5);
+        iom_conformance::copy_from_host(x->view(), x_bytes);
+        iom_conformance::copy_from_host(w->view(), w_bytes);
+        iom_conformance::copy_from_host(out->view(), out_poison);
+        const iom_conformance::LinearRawImage x_image =
+                iom_conformance::linear_padded_image(
+                        iom::DataType::BF16, 1,
+                        iom_conformance::linear_pad16(kSourceRows),
+                        iom_conformance::linear_pad16(kInner), kSourceRows,
+                        kInner, x_bytes, 0x0F0Full);
+        const iom_conformance::LinearRawImage w_image =
+                iom_conformance::linear_padded_image(
+                        iom::DataType::BF16, 1,
+                        iom_conformance::linear_pad16(outer),
+                        iom_conformance::linear_pad16(kInner), outer, kInner,
+                        w_bytes, 0xF0F0ull);
+        const iom_conformance::LinearOracleRequest request{
+                iom::DataType::BF16, 1, kSourceRows, kInner, outer, kStartRow,
+                kRows, heads, head_dim, iom::LinearOutputLayout::head_planar};
+        const iom_conformance::LinearReference reference =
+                iom_conformance::linear_reference(request, x_image, w_image);
+        const iom::WorkspaceRequirements requirement =
+                queue->linear_workspace_requirements(
+                        x->view(), w->view(), out->view(), kStartRow, kRows,
+                        iom::LinearOutputLayout::head_planar, heads, head_dim);
+        CHECK_EQ(
+                requirement.bytes,
+                iom_conformance::linear_expected_workspace(
+                        kRocmLinearDeclaration, iom::DataType::BF16,
+                        iom_conformance::LinearShape{1, kRows, kInner, outer})
+                        .bytes);
+        auto workspace = candidate->create_workspace(requirement.bytes);
+        const std::size_t native_before =
+                iom::rocm_detail::linear_native_bf16_launch_count_for_testing
+                        .load();
+        const iom::oid token = queue->linear(
+                x->view(), w->view(), out->view(), kStartRow, kRows,
+                iom::LinearOutputLayout::head_planar, heads, head_dim,
+                workspace->view().subrange(0, requirement.bytes));
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_EQ(
+                iom::rocm_detail::linear_native_bf16_launch_count_for_testing
+                        .load(),
+                native_before + 1);
+        const std::vector<std::byte> observed =
+                iom_conformance::read_logical(out->view());
+        const std::optional<std::string> mismatch =
+                iom_conformance::linear_compare_image(
+                        request, observed, reference,
+                        "native BF16 crossing head stride");
+        REQUIRE_MESSAGE(!mismatch.has_value(), mismatch.value_or(std::string{}));
+    }
+}
+
+TEST_CASE("ROCm conformance: native BF16 linear capability follows the checked device") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    REQUIRE(device_count >= 1);
+    const iom::LinearOutputLayout ordinary = iom::LinearOutputLayout::ordinary;
+    std::size_t supported = 0;
+    for (int ordinal = 0; ordinal < device_count; ++ordinal) {
+        hipDeviceProp_t properties{};
+        REQUIRE(hipGetDeviceProperties(&properties, ordinal) == hipSuccess);
+        CAPTURE(ordinal);
+        CAPTURE(properties.gcnArchName);
+        const bool expected = rocm_native_bf16_ordinal(ordinal);
+        auto device = iom::make_rocm_device(
+                static_cast<std::uint32_t>(ordinal),
+                iom::DeviceMemoryConfig{8u * 1024 * 1024});
+        auto queue = device->create_ops();
+        auto x = device->create_tensor(iom_conformance::linear_spec(
+                {17, 3}, iom::DataType::BF16));
+        auto w = device->create_tensor(iom_conformance::linear_spec(
+                {10, 3}, iom::DataType::BF16));
+        auto out = device->create_tensor(iom_conformance::linear_spec(
+                {15, 10}, iom::DataType::BF16));
+        if (expected) {
+            ++supported;
+            const iom::WorkspaceRequirements requirement =
+                    queue->linear_workspace_requirements(
+                            x->view(), w->view(), out->view(), 2, 15,
+                            ordinary, 1, 10);
+            CHECK(requirement.bytes > 0);
+            CHECK_EQ(requirement.alignment, std::size_t{32});
+            continue;
+        }
+        // A device without the proven facility rejects the leaf as a
+        // capability, before any token, registration, or scratch inspection,
+        // while the scalar leaves stay available on that same device.
+        CHECK_THROWS_AS(
+                (void)queue->linear_workspace_requirements(
+                        x->view(), w->view(), out->view(), 2, 15, ordinary, 1,
+                        10),
+                std::runtime_error);
+        CHECK_EQ(
+                queue->linear(
+                        x->view(), w->view(), out->view(), 2, 15, ordinary, 1,
+                        10),
+                iom::to_oid(iom::OidError::Unsupported));
+        auto scalar_x = device->create_tensor(iom_conformance::linear_spec(
+                {17, 3}, iom::DataType::F16));
+        auto scalar_w = device->create_tensor(iom_conformance::linear_spec(
+                {10, 3}, iom::DataType::F16));
+        auto scalar_out = device->create_tensor(iom_conformance::linear_spec(
+                {15, 10}, iom::DataType::F16));
+        const iom::WorkspaceRequirements scalar =
+                queue->linear_workspace_requirements(
+                        scalar_x->view(), scalar_w->view(),
+                        scalar_out->view(), 2, 15, ordinary, 1, 10);
+        CHECK_EQ(scalar.bytes, std::size_t{0});
+    }
+    CHECK_GE(supported, std::size_t{1});
+}
 
 TEST_CASE("ROCm conformance: linear projection reference, admission, and lifetime") {
     iom_conformance::TrafficGate gate;

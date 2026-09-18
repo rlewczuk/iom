@@ -54,6 +54,12 @@ extern std::atomic<std::size_t> event_create_count_for_testing;
 extern std::atomic<std::size_t> event_destroy_count_for_testing;
 extern std::atomic<std::size_t> stream_create_count_for_testing;
 extern std::atomic<std::size_t> stream_destroy_count_for_testing;
+// Counters over the dispatched linear path. A BF16 submission that reached
+// the queue must increment the native counter exactly once and never the
+// scalar counter, so the conformance evidence connects an accepted OID to
+// the executed native kernel instead of trusting the source text.
+extern std::atomic<std::size_t> linear_native_bf16_launch_count_for_testing;
+extern std::atomic<std::size_t> linear_scalar_launch_count_for_testing;
 #endif  // IOM_ENABLE_TESTING
 
 [[nodiscard]] inline std::runtime_error hip_error(
@@ -311,10 +317,12 @@ struct gpu_policy {
     // operation lives in src/shared/standard_tiled_linear.inl; the ROCm
     // wrapper below launches it on the queue's existing nonblocking stream.
     // Common admission has already restricted this immutable capability
-    // predicate to the twenty-one applicable leaves, and this scalar path
-    // implements exactly the twenty non-BF16 leaves. BF16 is not advertised
-    // here: the native-BF16 specialization is a separate leaf, so a BF16
-    // request stays `Unsupported` until that path lands.
+    // predicate to the twenty-one applicable leaves, and this port carries
+    // every one of them: the shared scalar path covers the twenty non-BF16
+    // leaves and the native BF16 specialization in this translation unit
+    // covers `BF16`. `linear_supported` is therefore a compile-time leaf
+    // statement only; the device fact behind the native leaf (the proven
+    // GFX12 wave32 WMMA facility) is the separate runtime gate below.
     [[nodiscard]] static constexpr const char* linear_kernel_operation()
             noexcept {
         return "HIP linear kernel launch";
@@ -333,16 +341,34 @@ struct gpu_policy {
             case DataType::F6_E2M3: case DataType::F6_E3M2:
             case DataType::F8_E4M3FN: case DataType::F8_E5M2:
             case DataType::F16:
+            case DataType::BF16:
             case DataType::F32:
             case DataType::F64:
                 return true;
-            case DataType::BF16:
             case DataType::BOOL:
             case DataType::F8_E8M0:
                 return false;
         }
         return false;
     }
+
+    // Native BF16 capability of one exact device ordinal: the linear
+    // projection's native path is direct GFX12 wave32 WMMA, so a device
+    // without that proven facility is `Unsupported` rather than a queued
+    // failure. The predicate reads the ordinal's immutable device
+    // properties and allocates, registers, leases, submits, and
+    // synchronizes nothing, so the pure requirement query stays pure.
+    [[nodiscard]] static bool linear_native_bf16_available(
+            context_type device_ordinal) noexcept;
+
+    // Exact `{bytes, alignment}` of one admitted native-BF16 linear request:
+    // alignment 32 over the checked path-specific sum
+    // `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)`, whose two
+    // terms are the packed input and packed product regions. Every product,
+    // `pad16`, byte conversion, alignment round-up, and addition is checked
+    // and rejects with the established overflow category.
+    [[nodiscard]] static WorkspaceRequirements linear_native_bf16_requirements(
+            const TensorView& x, const TensorView& w, std::size_t rows);
 
     static void launch_linear(
             stream_type stream, const detail::LinearMetadata& metadata);

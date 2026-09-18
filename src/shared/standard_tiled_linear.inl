@@ -77,6 +77,13 @@ struct LinearMetadata {
     const std::uint64_t* dims;
     const std::uint64_t* x_strides;
     const std::uint64_t* out_strides;
+    // Validated caller workspace range and its admitted byte count. A
+    // `{0, 1}` path carries the empty view, so both fields are zero there and
+    // a packed-scratch specialization reads them only after the common
+    // workspace contract admitted a positive requirement. The range is
+    // caller-owned staging: it carries no control word.
+    unsigned char* scratch;
+    std::uint64_t scratch_bytes;
     std::uint64_t start_row;
     std::uint64_t rows;
     std::uint64_t source_rows;
@@ -100,7 +107,7 @@ static_assert(std::is_trivially_copyable_v<LinearMetadata>);
 // the head-axis `out` stride — and must fit one 512-byte metadata slot
 // (alignment 32). A future overflow requires an intentional ABI/spec update,
 // never automatic slot growth.
-static_assert(sizeof(LinearMetadata) == 152);
+static_assert(sizeof(LinearMetadata) == 168);
 static_assert(
         sizeof(LinearMetadata) + (3 * (8 - 2) + 1) * sizeof(std::uint64_t)
         <= kMetadataSlotBytes);
@@ -193,6 +200,11 @@ template <typename Request>
     metadata.w = static_cast<const unsigned char*>(
             request.w.native_handle);
     metadata.out = static_cast<unsigned char*>(request.out.native_handle);
+    metadata.scratch = static_cast<unsigned char*>(
+            detail::WorkspaceValidation::address(request.workspace));
+    metadata.scratch_bytes = linear_metadata_u64(
+            request.workspace_requirements.bytes,
+            "LINEAR metadata workspace bytes overflow");
     metadata.start_row = linear_metadata_u64(
             request.start_row, "LINEAR metadata row start overflows");
     metadata.rows = linear_metadata_u64(
