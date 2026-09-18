@@ -266,17 +266,33 @@ oid GpuQueue<Policy>::embedding_impl(const EmbeddingRequest& request) {
 
 template <typename Policy>
 WorkspaceRequirements GpuQueue<Policy>::linear_workspace_requirements_impl(
-        const TensorView& x, const TensorView&, const TensorView&,
-        std::size_t, std::size_t, LinearOutputLayout, std::size_t,
+        const TensorView& x, const TensorView& w, const TensorView&,
+        std::size_t, std::size_t R, LinearOutputLayout, std::size_t,
         std::size_t) {
-    // The pure capability and scratch decision. Every ported GPU policy
-    // consumes no raw workspace for the linear projection, so the reported
-    // requirement is exactly `{0, 1}`; a leaf this policy does not implement
-    // is the established capability rejection and never inspects scratch.
-    // Nothing here allocates, registers, leases, snapshots, submits, or
-    // examines queue state.
-    if (!Policy::linear_supported(x.spec().data_type)) {
+    const DataType leaf = x.spec().data_type;
+    // The pure capability and scratch decision. A leaf this policy does not
+    // carry is the established capability rejection and never inspects
+    // scratch. Nothing here allocates, registers, leases, snapshots,
+    // submits, or examines queue state.
+    if (!Policy::linear_supported(leaf)) {
         throw detail::UnsupportedOperation();
+    }
+    // Optional native-BF16 seam. A policy that declares the two native
+    // members owns its own packed-scratch formula and its own immutable
+    // device gate; a policy without them keeps the frozen `{0, 1}`
+    // zero-scratch decision for every leaf it carries, so this seam adds no
+    // second capability convention to a scalar-only port. A device without
+    // the proven facility is a capability rejection, never a queued failure.
+    if constexpr (requires {
+                      Policy::linear_native_bf16_available(context_);
+                      Policy::linear_native_bf16_requirements(x, w, R);
+                  }) {
+        if (leaf == DataType::BF16) {
+            if (!Policy::linear_native_bf16_available(context_)) {
+                throw detail::UnsupportedOperation();
+            }
+            return Policy::linear_native_bf16_requirements(x, w, R);
+        }
     }
     return WorkspaceRequirements{0, 1};
 }
@@ -287,22 +303,34 @@ oid GpuQueue<Policy>::linear_impl(const LinearRequest& request) {
             submission_order_mutex_);
     // The capability decision is repeated here for defense in depth: the
     // common facade consults the pure query first, and this branch must never
-    // dispatch a leaf the policy's scalar path does not carry. Descriptor
-    // arithmetic is validated before common acceptance, and the metadata slot
-    // itself is acquired only by the dispatching head.
-    if (!Policy::linear_supported(request.x.spec.data_type)) {
+    // dispatch a leaf the policy's scalar or native path does not carry.
+    // Descriptor arithmetic is validated before common acceptance, and the
+    // metadata slot itself is acquired only by the dispatching head.
+    const DataType leaf = request.x.spec.data_type;
+    if (!Policy::linear_supported(leaf)) {
         throw detail::UnsupportedOperation();
     }
-    // The frozen per-path scratch table reports `{0, 1}` for every leaf this
-    // scalar path carries, and a zero requirement admits only the empty
-    // `RawWorkspaceView{}`: a supplied owner range is invalid input rather
-    // than ignored scratch. The check is driven by the admitted requirement,
-    // so a policy with a positive linear requirement stays unaffected.
-    if (request.workspace_requirements.bytes == 0
-            && !request.workspace.empty()) {
+    if constexpr (requires { Policy::linear_native_bf16_available(context_); }) {
+        if (leaf == DataType::BF16
+                && !Policy::linear_native_bf16_available(context_)) {
+            throw detail::UnsupportedOperation();
+        }
+    }
+    // The admitted requirement decides the workspace rule: a zero
+    // requirement admits only the empty `RawWorkspaceView{}`, while a
+    // positive one requires the caller's validated range, which the common
+    // facade already checked for liveness, exact-device identity, size,
+    // alignment, and disjointness from every operand and the output.
+    if (request.workspace_requirements.bytes == 0) {
+        if (!request.workspace.empty()) {
+            throw std::invalid_argument(
+                    "LINEAR consumes no raw workspace, so the supplied "
+                    "workspace view must be empty");
+        }
+    } else if (request.workspace.empty()) {
         throw std::invalid_argument(
-                "LINEAR consumes no raw workspace, so the supplied "
-                "workspace view must be empty");
+                "LINEAR positive scratch requirement needs a non-empty "
+                "workspace view");
     }
     (void)detail::make_linear_metadata(request);
     auto completion = std::make_shared<CompletionState>();
