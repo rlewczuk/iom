@@ -87,6 +87,7 @@ set(IOM_SOURCES
         src/mmap.cpp
         src/safetensors.cpp
         src/model.cpp
+        src/chat_format.cpp
         src/alloc.cpp
 )
 
@@ -97,6 +98,7 @@ set(IOM_HEADERS
         include/iom/cpu/device.hpp
         include/iom/mmap.hpp
         include/iom/safetensors.hpp
+        include/iom/chat_format.hpp
         include/iom/model.hpp
         include/iom/alloc.hpp
         include/iom/device.hpp
