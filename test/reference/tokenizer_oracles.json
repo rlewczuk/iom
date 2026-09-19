@@ -1,0 +1,3706 @@
+{
+  "chat": {
+    "cases": [
+      {
+        "add_generation_prompt": false,
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "ids": [],
+        "messages": [],
+        "name": "empty_chat",
+        "rendered_bytes": [],
+        "template_label": "distribution",
+        "template_source": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+      },
+      {
+        "add_generation_prompt": false,
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "ids": [
+          259,
+          63,
+          127,
+          120,
+          118,
+          261,
+          270,
+          127,
+          65,
+          13,
+          2,
+          259,
+          13
+        ],
+        "messages": [
+          {
+            "content": "",
+            "role": "user"
+          }
+        ],
+        "name": "empty_user",
+        "rendered_bytes": [
+          60,
+          124,
+          117,
+          115,
+          101,
+          114,
+          124,
+          62,
+          10,
+          60,
+          47,
+          115,
+          62,
+          10
+        ],
+        "template_label": "distribution",
+        "template_source": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+      },
+      {
+        "add_generation_prompt": false,
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "ids": [
+          259,
+          63,
+          127,
+          118,
+          124,
+          118,
+          119,
+          261,
+          112,
+          127,
+          65,
+          13,
+          118,
+          124,
+          118,
+          119,
+          261,
+          112,
+          2,
+          259,
+          13,
+          63,
+          127,
+          120,
+          118,
+          261,
+          270,
+          127,
+          65,
+          13,
+          267,
+          2,
+          259,
+          13
+        ],
+        "messages": [
+          {
+            "content": "system",
+            "role": "system"
+          },
+          {
+            "content": "hello",
+            "role": "user"
+          }
+        ],
+        "name": "system_user_no_generation",
+        "rendered_bytes": [
+          60,
+          124,
+          115,
+          121,
+          115,
+          116,
+          101,
+          109,
+          124,
+          62,
+          10,
+          115,
+          121,
+          115,
+          116,
+          101,
+          109,
+          60,
+          47,
+          115,
+          62,
+          10,
+          60,
+          124,
+          117,
+          115,
+          101,
+          114,
+          124,
+          62,
+          10,
+          104,
+          101,
+          108,
+          108,
+          111,
+          60,
+          47,
+          115,
+          62,
+          10
+        ],
+        "template_label": "distribution",
+        "template_source": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+      },
+      {
+        "add_generation_prompt": true,
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "ids": [
+          259,
+          63,
+          127,
+          118,
+          124,
+          118,
+          119,
+          261,
+          112,
+          127,
+          65,
+          13,
+          118,
+          124,
+          118,
+          119,
+          261,
+          112,
+          2,
+          259,
+          13,
+          63,
+          127,
+          120,
+          118,
+          261,
+          270,
+          127,
+          65,
+          13,
+          267,
+          2,
+          259,
+          13,
+          63,
+          127,
+          100,
+          118,
+          118,
+          108,
+          118,
+          119,
+          100,
+          113,
+          119,
+          127,
+          65,
+          13
+        ],
+        "messages": [
+          {
+            "content": "system",
+            "role": "system"
+          },
+          {
+            "content": "hello",
+            "role": "user"
+          }
+        ],
+        "name": "system_user_generation",
+        "rendered_bytes": [
+          60,
+          124,
+          115,
+          121,
+          115,
+          116,
+          101,
+          109,
+          124,
+          62,
+          10,
+          115,
+          121,
+          115,
+          116,
+          101,
+          109,
+          60,
+          47,
+          115,
+          62,
+          10,
+          60,
+          124,
+          117,
+          115,
+          101,
+          114,
+          124,
+          62,
+          10,
+          104,
+          101,
+          108,
+          108,
+          111,
+          60,
+          47,
+          115,
+          62,
+          10,
+          60,
+          124,
+          97,
+          115,
+          115,
+          105,
+          115,
+          116,
+          97,
+          110,
+          116,
+          124,
+          62,
+          10
+        ],
+        "template_label": "distribution",
+        "template_source": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+      },
+      {
+        "add_generation_prompt": false,
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "ids": [
+          259,
+          63,
+          127,
+          120,
+          118,
+          261,
+          270,
+          127,
+          65,
+          13,
+          267,
+          2,
+          259,
+          13,
+          63,
+          127,
+          100,
+          118,
+          118,
+          108,
+          118,
+          119,
+          100,
+          113,
+          119,
+          127,
+          65,
+          13,
+          275,
+          2,
+          259,
+          13
+        ],
+        "messages": [
+          {
+            "content": "hello",
+            "role": "user"
+          },
+          {
+            "content": "world",
+            "role": "assistant"
+          }
+        ],
+        "name": "assistant_content",
+        "rendered_bytes": [
+          60,
+          124,
+          117,
+          115,
+          101,
+          114,
+          124,
+          62,
+          10,
+          104,
+          101,
+          108,
+          108,
+          111,
+          60,
+          47,
+          115,
+          62,
+          10,
+          60,
+          124,
+          97,
+          115,
+          115,
+          105,
+          115,
+          116,
+          97,
+          110,
+          116,
+          124,
+          62,
+          10,
+          119,
+          111,
+          114,
+          108,
+          100,
+          60,
+          47,
+          115,
+          62,
+          10
+        ],
+        "template_label": "distribution",
+        "template_source": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+      },
+      {
+        "add_generation_prompt": true,
+        "default_rendered_bytes": [
+          60,
+          124,
+          117,
+          115,
+          101,
+          114,
+          124,
+          62,
+          10,
+          104,
+          101,
+          108,
+          108,
+          111,
+          60,
+          47,
+          115,
+          62,
+          10,
+          60,
+          124,
+          97,
+          115,
+          115,
+          105,
+          115,
+          116,
+          97,
+          110,
+          116,
+          124,
+          62,
+          10
+        ],
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "fallback_detected": false,
+        "ids": [
+          259,
+          82,
+          89,
+          72,
+          85,
+          85,
+          76,
+          71,
+          72,
+          98,
+          88,
+          86,
+          72,
+          85,
+          61,
+          267,
+          13,
+          82,
+          89,
+          72,
+          85,
+          85,
+          76,
+          71,
+          72,
+          98,
+          74,
+          72,
+          81,
+          72,
+          85,
+          68,
+          87,
+          76,
+          82,
+          81,
+          61
+        ],
+        "messages": [
+          {
+            "content": "hello",
+            "role": "user"
+          }
+        ],
+        "name": "fixed_override",
+        "override_selected": true,
+        "rendered_bytes": [
+          79,
+          86,
+          69,
+          82,
+          82,
+          73,
+          68,
+          69,
+          95,
+          85,
+          83,
+          69,
+          82,
+          58,
+          104,
+          101,
+          108,
+          108,
+          111,
+          10,
+          79,
+          86,
+          69,
+          82,
+          82,
+          73,
+          68,
+          69,
+          95,
+          71,
+          69,
+          78,
+          69,
+          82,
+          65,
+          84,
+          73,
+          79,
+          78,
+          58
+        ],
+        "selection_proof": {
+          "differs_from_distribution": true,
+          "generation_literal_present": true,
+          "user_literal_present": true
+        },
+        "template_label": "fixed_override",
+        "template_source": "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'OVERRIDE_USER:' + message['content'] + '\\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'OVERRIDE_GENERATION:' }}{% endif %}"
+      }
+    ],
+    "configuration": {
+      "bos_token": "<s>",
+      "chat_template": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}",
+      "clean_up_tokenization_spaces": false,
+      "eos_token": "</s>",
+      "pad_token": "</s>",
+      "unk_token": "<unk>"
+    },
+    "fixed_override_template": "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'OVERRIDE_USER:' + message['content'] + '\\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'OVERRIDE_GENERATION:' }}{% endif %}"
+  },
+  "descriptor": {
+    "added_tokens": [
+      {
+        "content": "<unk>",
+        "id": 0,
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "content": "<s>",
+        "id": 1,
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "content": "</s>",
+        "id": 2,
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      }
+    ],
+    "byte_fallback": {
+      "count": 256,
+      "first_id": 3,
+      "piece_format": "<0xHH>",
+      "values": "0x00 through 0xFF in ascending order"
+    },
+    "decoder": "Sequence(Replace('▁', ' '), ByteFallback, Fuse, Strip(' ', 1, 0))",
+    "filler": {
+      "count": 31715,
+      "first_id": 285,
+      "index_origin": 0,
+      "prefix": "<reserved_",
+      "suffix": ">",
+      "width": 5
+    },
+    "fixed_test_pieces": [
+      "▁",
+      "h",
+      "e",
+      "l",
+      "o",
+      "he",
+      "ll",
+      "llo",
+      "hello",
+      "▁hello",
+      "w",
+      "r",
+      "d",
+      "wo",
+      "wor",
+      "worl",
+      "world",
+      "▁world",
+      "é",
+      "ø",
+      "世",
+      "界",
+      "▁héllø",
+      "▁世界",
+      "!",
+      "?"
+    ],
+    "merges": [
+      {
+        "left": "h",
+        "rank": 0,
+        "result": "he",
+        "right": "e"
+      },
+      {
+        "left": "l",
+        "rank": 1,
+        "result": "ll",
+        "right": "l"
+      },
+      {
+        "left": "ll",
+        "rank": 2,
+        "result": "llo",
+        "right": "o"
+      },
+      {
+        "left": "he",
+        "rank": 3,
+        "result": "hello",
+        "right": "llo"
+      },
+      {
+        "left": "▁",
+        "rank": 4,
+        "result": "▁hello",
+        "right": "hello"
+      },
+      {
+        "left": "w",
+        "rank": 5,
+        "result": "wo",
+        "right": "o"
+      },
+      {
+        "left": "wo",
+        "rank": 6,
+        "result": "wor",
+        "right": "r"
+      },
+      {
+        "left": "wor",
+        "rank": 7,
+        "result": "worl",
+        "right": "l"
+      },
+      {
+        "left": "worl",
+        "rank": 8,
+        "result": "world",
+        "right": "d"
+      },
+      {
+        "left": "▁",
+        "rank": 9,
+        "result": "▁world",
+        "right": "world"
+      }
+    ],
+    "model_options": {
+      "byte_fallback": true,
+      "continuing_subword_prefix": null,
+      "dropout": null,
+      "end_of_word_suffix": null,
+      "fuse_unk": true,
+      "type": "BPE",
+      "unk_token": "<unk>"
+    },
+    "normalizer": "Sequence(Prepend('▁'), Replace(' ', '▁'))",
+    "post_processor": "TemplateProcessing(single='<s> A', pair='<s> A <s>:1 B:1')",
+    "pre_tokenizer": null,
+    "recipe_version": "synthetic-bpe-v1",
+    "special_tokens": [
+      {
+        "id": 0,
+        "piece": "<unk>"
+      },
+      {
+        "id": 1,
+        "piece": "<s>"
+      },
+      {
+        "id": 2,
+        "piece": "</s>"
+      }
+    ],
+    "tokenizer_schema_version": "1.0",
+    "vocab_size": 32000
+  },
+  "generator": {
+    "name": "tinyllama-tokenizer-oracle-generator",
+    "serialization": {
+      "encoding": "UTF-8",
+      "ensure_ascii": false,
+      "indent": 2,
+      "newline": "\\n",
+      "sort_keys": true
+    },
+    "version": "1"
+  },
+  "official_distribution": {
+    "enabled": false
+  },
+  "provenance": {
+    "manifest_generation": {
+      "command": [
+        "python3",
+        "test/reference/tokenizer_reference.py",
+        "manifest",
+        "--model-dir",
+        "<MODEL_DIR>",
+        "--output",
+        "<OUTPUT>"
+      ]
+    },
+    "manifest_identity": {
+      "artifacts": {
+        "generation_config.json": {
+          "name": "generation_config.json",
+          "sha256": "18046d04f5bd8b4998095ecabdd17a1bf0053d9acdccead4a05be4a3575f3c5c",
+          "size": 124
+        },
+        "special_tokens_map.json": {
+          "name": "special_tokens_map.json",
+          "sha256": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db",
+          "size": 551
+        },
+        "tokenizer.json": {
+          "name": "tokenizer.json",
+          "sha256": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+          "size": 1842767
+        },
+        "tokenizer.model": {
+          "name": "tokenizer.model",
+          "sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+          "size": 499723
+        },
+        "tokenizer_config.json": {
+          "name": "tokenizer_config.json",
+          "sha256": "7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a",
+          "size": 1289
+        }
+      },
+      "packages": {
+        "jinja2": "3.1.2",
+        "sentencepiece": "0.1.99",
+        "tokenizers": "0.14.1",
+        "transformers": "4.35.0"
+      },
+      "runtime": {
+        "implementation": "CPython",
+        "version": "3.11.16"
+      }
+    }
+  },
+  "raw_text": {
+    "cases": [
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": []
+            }
+          ],
+          "ids": [
+            1
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1
+          ],
+          "type_ids": [
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": []
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": []
+              }
+            ],
+            "ids": [],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [],
+            "type_ids": [],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": []
+              }
+            ],
+            "ids": [
+              1
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1
+            ],
+            "type_ids": [
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "",
+        "input_bytes": [],
+        "is_pair": false,
+        "name": "empty"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                32
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                32
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            259,
+            259
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  32
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  32
+                ]
+              }
+            ],
+            "ids": [
+              259,
+              259
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  32
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  32
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              259,
+              259
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": " ",
+        "input_bytes": [
+          32
+        ],
+        "is_pair": false,
+        "name": "one_ascii_space"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                32,
+                32
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                32,
+                32
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            259,
+            259,
+            259
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  32,
+                  32
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  32,
+                  32
+                ]
+              }
+            ],
+            "ids": [
+              259,
+              259,
+              259
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  32,
+                  32
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  32,
+                  32
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              259,
+              259,
+              259
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "  ",
+        "input_bytes": [
+          32,
+          32
+        ],
+        "is_pair": false,
+        "name": "two_ascii_spaces"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            268
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0
+          ],
+          "type_ids": [
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0
+            ],
+            "type_ids": [
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "hello",
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "is_pair": false,
+        "name": "ascii_word"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            268,
+            268
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              268,
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              268,
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "hello hello",
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111,
+          32,
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "is_pair": false,
+        "name": "repeated_merge"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                9
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                9
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            259,
+            12
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  9
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  9
+                ]
+              }
+            ],
+            "ids": [
+              259,
+              12
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  9
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  9
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              259,
+              12
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "\t",
+        "input_bytes": [
+          9
+        ],
+        "is_pair": false,
+        "name": "tab"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                10
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                10
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            259,
+            13
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  10
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  10
+                ]
+              }
+            ],
+            "ids": [
+              259,
+              13
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  10
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  10
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              259,
+              13
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "\n",
+        "input_bytes": [
+          10
+        ],
+        "is_pair": false,
+        "name": "newline"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                195,
+                169,
+                108,
+                108,
+                195,
+                184,
+                32,
+                228,
+                184,
+                150,
+                231,
+                149,
+                140
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                195,
+                169,
+                108,
+                108,
+                195,
+                184,
+                32,
+                228,
+                184,
+                150,
+                231,
+                149,
+                140
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            259,
+            260,
+            277,
+            265,
+            278,
+            259,
+            279,
+            280
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  195,
+                  169,
+                  108,
+                  108,
+                  195,
+                  184,
+                  32,
+                  228,
+                  184,
+                  150,
+                  231,
+                  149,
+                  140
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  195,
+                  169,
+                  108,
+                  108,
+                  195,
+                  184,
+                  32,
+                  228,
+                  184,
+                  150,
+                  231,
+                  149,
+                  140
+                ]
+              }
+            ],
+            "ids": [
+              259,
+              260,
+              277,
+              265,
+              278,
+              259,
+              279,
+              280
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  195,
+                  169,
+                  108,
+                  108,
+                  195,
+                  184,
+                  32,
+                  228,
+                  184,
+                  150,
+                  231,
+                  149,
+                  140
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  195,
+                  169,
+                  108,
+                  108,
+                  195,
+                  184,
+                  32,
+                  228,
+                  184,
+                  150,
+                  231,
+                  149,
+                  140
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              259,
+              260,
+              277,
+              265,
+              278,
+              259,
+              279,
+              280
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "héllø 世界",
+        "input_bytes": [
+          104,
+          195,
+          169,
+          108,
+          108,
+          195,
+          184,
+          32,
+          228,
+          184,
+          150,
+          231,
+          149,
+          140
+        ],
+        "is_pair": false,
+        "name": "unicode_héllø_世界"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                240,
+                159,
+                153,
+                130
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                240,
+                159,
+                153,
+                130
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            259,
+            243,
+            162,
+            156,
+            133
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  240,
+                  159,
+                  153,
+                  130
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  240,
+                  159,
+                  153,
+                  130
+                ]
+              }
+            ],
+            "ids": [
+              259,
+              243,
+              162,
+              156,
+              133
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  240,
+                  159,
+                  153,
+                  130
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  240,
+                  159,
+                  153,
+                  130
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              259,
+              243,
+              162,
+              156,
+              133
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "🙂",
+        "input_bytes": [
+          240,
+          159,
+          153,
+          130
+        ],
+        "is_pair": false,
+        "name": "emoji_byte_fallback"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                60,
+                117,
+                110,
+                107,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                60,
+                115,
+                62,
+                60,
+                47,
+                115,
+                62
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            0,
+            268,
+            1,
+            2
+          ],
+          "round_trip": {
+            "checked_decode_options": null,
+            "designated_lossless": false,
+            "matches_input": null
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  117,
+                  110,
+                  107,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  60,
+                  115,
+                  62,
+                  60,
+                  47,
+                  115,
+                  62
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              0,
+              268,
+              1,
+              2
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  60,
+                  117,
+                  110,
+                  107,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  60,
+                  115,
+                  62,
+                  60,
+                  47,
+                  115,
+                  62
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              0,
+              268,
+              1,
+              2
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "<unk>hello<s></s>",
+        "input_bytes": [
+          60,
+          117,
+          110,
+          107,
+          62,
+          104,
+          101,
+          108,
+          108,
+          111,
+          60,
+          115,
+          62,
+          60,
+          47,
+          115,
+          62
+        ],
+        "is_pair": false,
+        "name": "adjacent_added_tokens"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            268
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            1,
+            0
+          ],
+          "type_ids": [
+            0,
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0
+            ],
+            "type_ids": [
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "hello",
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "is_pair": false,
+        "name": "single_special_true"
+      },
+      {
+        "encode": {
+          "add_special_tokens": false,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            268
+          ],
+          "round_trip": {
+            "checked_decode_options": {
+              "skip_special_tokens": true
+            },
+            "designated_lossless": true,
+            "matches_input": true
+          },
+          "special_tokens_mask": [
+            0
+          ],
+          "type_ids": [
+            0
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": false
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              0
+            ],
+            "type_ids": [
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": {
+                "skip_special_tokens": true
+              },
+              "designated_lossless": true,
+              "matches_input": true
+            },
+            "special_tokens_mask": [
+              1,
+              0
+            ],
+            "type_ids": [
+              0,
+              0
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": "hello",
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "is_pair": false,
+        "name": "single_special_false"
+      },
+      {
+        "encode_options": {
+          "add_special_tokens": [
+            false,
+            true
+          ]
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "error_category": "invalid_utf8",
+            "error_type": "TypeError",
+            "status": "rejected"
+          },
+          {
+            "add_special_tokens": true,
+            "error_category": "invalid_utf8",
+            "error_type": "TypeError",
+            "status": "rejected"
+          }
+        ],
+        "expected_error_category": "invalid_utf8",
+        "input_bytes": [
+          240,
+          40,
+          140,
+          40
+        ],
+        "input_encoding": "raw_bytes",
+        "is_pair": false,
+        "name": "invalid_utf8",
+        "status": "rejected"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                60,
+                115,
+                62
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": []
+            }
+          ],
+          "ids": [
+            1,
+            1
+          ],
+          "round_trip": {
+            "checked_decode_options": null,
+            "designated_lossless": false,
+            "matches_input": null
+          },
+          "special_tokens_mask": [
+            1,
+            1
+          ],
+          "type_ids": [
+            0,
+            1
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": []
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": []
+              }
+            ],
+            "ids": [],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [],
+            "type_ids": [],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  60,
+                  115,
+                  62
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": []
+              }
+            ],
+            "ids": [
+              1,
+              1
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              1,
+              1
+            ],
+            "type_ids": [
+              0,
+              1
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": {
+          "first": "",
+          "second": ""
+        },
+        "input_bytes": {
+          "first": [],
+          "second": []
+        },
+        "is_pair": true,
+        "name": "pair_empty_empty"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            1,
+            268
+          ],
+          "round_trip": {
+            "checked_decode_options": null,
+            "designated_lossless": false,
+            "matches_input": null
+          },
+          "special_tokens_mask": [
+            1,
+            1,
+            0
+          ],
+          "type_ids": [
+            0,
+            1,
+            1
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              0
+            ],
+            "type_ids": [
+              1
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              1,
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              1,
+              1,
+              0
+            ],
+            "type_ids": [
+              0,
+              1,
+              1
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": {
+          "first": "",
+          "second": "hello"
+        },
+        "input_bytes": {
+          "first": [],
+          "second": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ]
+        },
+        "is_pair": true,
+        "name": "pair_empty_text"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                60,
+                115,
+                62
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            268,
+            1
+          ],
+          "round_trip": {
+            "checked_decode_options": null,
+            "designated_lossless": false,
+            "matches_input": null
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            1
+          ],
+          "type_ids": [
+            0,
+            0,
+            1
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              268
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              0
+            ],
+            "type_ids": [
+              0
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  60,
+                  115,
+                  62
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              268,
+              1
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              1
+            ],
+            "type_ids": [
+              0,
+              0,
+              1
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": {
+          "first": "hello",
+          "second": ""
+        },
+        "input_bytes": {
+          "first": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "second": []
+        },
+        "is_pair": true,
+        "name": "pair_text_empty"
+      },
+      {
+        "encode": {
+          "add_special_tokens": true,
+          "decode_observations": [
+            {
+              "decode_options": {
+                "skip_special_tokens": false
+              },
+              "decoded_bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                60,
+                115,
+                62,
+                32,
+                119,
+                111,
+                114,
+                108,
+                100
+              ]
+            },
+            {
+              "decode_options": {
+                "skip_special_tokens": true
+              },
+              "decoded_bytes": [
+                104,
+                101,
+                108,
+                108,
+                111,
+                32,
+                119,
+                111,
+                114,
+                108,
+                100
+              ]
+            }
+          ],
+          "ids": [
+            1,
+            268,
+            1,
+            276
+          ],
+          "round_trip": {
+            "checked_decode_options": null,
+            "designated_lossless": false,
+            "matches_input": null
+          },
+          "special_tokens_mask": [
+            1,
+            0,
+            1,
+            0
+          ],
+          "type_ids": [
+            0,
+            0,
+            1,
+            1
+          ],
+          "type_ids_available": true
+        },
+        "encode_options": {
+          "add_special_tokens": true
+        },
+        "encodings": [
+          {
+            "add_special_tokens": false,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  119,
+                  111,
+                  114,
+                  108,
+                  100
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  119,
+                  111,
+                  114,
+                  108,
+                  100
+                ]
+              }
+            ],
+            "ids": [
+              268,
+              276
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              0,
+              0
+            ],
+            "type_ids": [
+              0,
+              1
+            ],
+            "type_ids_available": true
+          },
+          {
+            "add_special_tokens": true,
+            "decode_observations": [
+              {
+                "decode_options": {
+                  "skip_special_tokens": false
+                },
+                "decoded_bytes": [
+                  60,
+                  115,
+                  62,
+                  32,
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  60,
+                  115,
+                  62,
+                  32,
+                  119,
+                  111,
+                  114,
+                  108,
+                  100
+                ]
+              },
+              {
+                "decode_options": {
+                  "skip_special_tokens": true
+                },
+                "decoded_bytes": [
+                  104,
+                  101,
+                  108,
+                  108,
+                  111,
+                  32,
+                  119,
+                  111,
+                  114,
+                  108,
+                  100
+                ]
+              }
+            ],
+            "ids": [
+              1,
+              268,
+              1,
+              276
+            ],
+            "round_trip": {
+              "checked_decode_options": null,
+              "designated_lossless": false,
+              "matches_input": null
+            },
+            "special_tokens_mask": [
+              1,
+              0,
+              1,
+              0
+            ],
+            "type_ids": [
+              0,
+              0,
+              1,
+              1
+            ],
+            "type_ids_available": true
+          }
+        ],
+        "input": {
+          "first": "hello",
+          "second": "world"
+        },
+        "input_bytes": {
+          "first": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "second": [
+            119,
+            111,
+            114,
+            108,
+            100
+          ]
+        },
+        "is_pair": true,
+        "name": "pair_text_text"
+      }
+    ],
+    "tokenizer_source": "generated synthetic descriptor"
+  }
+}
