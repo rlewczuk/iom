@@ -1209,6 +1209,24 @@ route; it remains a blocked pre-port observation and MUST NOT be read as
 forbidding the queried workspace. Hidden or unaccounted staging remains
 forbidden.
 
+##### CUDA cache-row append implementation boundary
+CUDA's cache-row append leaf is implemented in `src/cuda/copy.cu` through the
+common `DeviceOps::cache_append` admission and queue path. It launches one
+direct device kernel over destination packed words, with one writer per word,
+the existing 16x16 tiled plane mapping, transformed leading-plane offsets and
+strides, and checked 64-bit metadata. Logical rows `[a,a+R)` are copied
+without conversion; untouched rows, tile padding, and unrelated leading
+planes remain read-modify-write preserved. The CUDA policy advertises all 23
+storage leaves, including BF16, for `QuantizationFormat::NONE` and requires
+the frozen zero-workspace query `{0,1}`.
+
+The CUDA conformance driver exercises this leaf through the independent cache
+append reference, transformed-view, ordering, workspace, owner-lifetime, and
+accepted-failure cases, including launch and event-record failure retention.
+Those runtime results require the configured CUDA profile; this implementation
+statement is not a substitute for execution-connected hardware evidence.
+
+
 ##### Cache append queue, session, and lifetime boundaries
 K and V MUST use separate `cache_append` submissions with distinct cache
 owners; there is no atomic two-cache call. Cache append owns no initialized

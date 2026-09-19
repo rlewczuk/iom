@@ -26,6 +26,8 @@
 #include "backend/backend_conformance_rope.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_cache_append.hpp"
+
 #include "iom/cpu/device.hpp"
 #include "iom/cuda/device.hpp"
 #include "cuda/copy.hpp"
@@ -347,6 +349,139 @@ TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime
             &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
+
+TEST_CASE("CUDA conformance: cache append reference, admission, and lifetime") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    iom_conformance::CacheAppendFaultSeam fault_seam{
+            [](iom::DeviceOps&) {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::third_plane_launch);
+            }};
+    iom_conformance::CacheAppendConformanceConfig config{
+            devices.conformance(),
+            devices.candidate->supported_data_types(),
+            &oracle,
+            fault_seam,
+            {},
+            nullptr,
+            true};
+    iom_conformance::run_cache_append_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA cache append retains launch failures") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    constexpr iom::DataType type = iom::DataType::F32;
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{1, 1, 1, 17}}, type};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{1, 1, 17, 17}}, type};
+    auto source = devices.candidate->create_tensor(source_spec);
+    auto destination = devices.candidate->create_tensor(destination_spec);
+    const std::vector<std::byte> source_bytes =
+            iom_conformance::encode_cache_append_logical(source_spec, 0x761);
+    const std::vector<std::byte> destination_before =
+            iom_conformance::encode_logical(destination_spec, 0x762);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(
+            destination->view(), destination_before);
+    auto queue = devices.candidate->create_ops();
+
+    try {
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::third_plane_launch);
+        const iom::oid token =
+                queue->cache_append(source->view(), destination->view(), 1);
+        REQUIRE(iom::oid_is_token(token));
+        iom_conformance::expect_repeated_runtime_failure(*queue, token);
+    } catch (...) {
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::none);
+        throw;
+    }
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+    iom_conformance::require_logical_bytes(
+            destination->view(), destination_before,
+            "cache append launch failure leaves destination unchanged");
+
+    auto recovery_destination =
+            devices.candidate->create_tensor(destination_spec);
+    const std::vector<std::byte> recovery_before =
+            iom_conformance::encode_logical(destination_spec, 0x763);
+    iom_conformance::copy_from_host(
+            recovery_destination->view(), recovery_before);
+    const iom::oid recovery = queue->cache_append(
+            source->view(), recovery_destination->view(), 1);
+    REQUIRE(iom::oid_is_token(recovery));
+    CHECK_NOTHROW(queue->wait(recovery));
+    CHECK_NOTHROW(queue->wait(recovery));
+    iom_conformance::require_logical_bytes(
+            recovery_destination->view(),
+            iom_conformance::cache_append_expected_logical(
+                    source_spec, destination_spec, 1, source_bytes,
+                    recovery_before),
+            "cache append recovered after launch failure");
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA cache append retains event-record failures") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    constexpr iom::DataType type = iom::DataType::F32;
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{1, 1, 1, 17}}, type};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{1, 1, 17, 17}}, type};
+    auto source = devices.candidate->create_tensor(source_spec);
+    auto destination = devices.candidate->create_tensor(destination_spec);
+    const std::vector<std::byte> source_bytes =
+            iom_conformance::encode_cache_append_logical(source_spec, 0x751);
+    const std::vector<std::byte> destination_before =
+            iom_conformance::encode_logical(destination_spec, 0x752);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(
+            destination->view(), destination_before);
+    auto queue = devices.candidate->create_ops();
+
+    try {
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::event_record);
+        const iom::oid token =
+                queue->cache_append(source->view(), destination->view(), 1);
+        REQUIRE(iom::oid_is_token(token));
+        iom_conformance::expect_repeated_runtime_failure(*queue, token);
+    } catch (...) {
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::none);
+        throw;
+    }
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    auto recovery_destination =
+            devices.candidate->create_tensor(destination_spec);
+    const std::vector<std::byte> recovery_before =
+            iom_conformance::encode_logical(destination_spec, 0x753);
+    iom_conformance::copy_from_host(
+            recovery_destination->view(), recovery_before);
+    const iom::oid recovery = queue->cache_append(
+            source->view(), recovery_destination->view(), 1);
+    REQUIRE(iom::oid_is_token(recovery));
+    CHECK_NOTHROW(queue->wait(recovery));
+    CHECK_NOTHROW(queue->wait(recovery));
+    iom_conformance::require_logical_bytes(
+            recovery_destination->view(),
+            iom_conformance::cache_append_expected_logical(
+                    source_spec, destination_spec, 1, source_bytes,
+                    recovery_before),
+            "cache append recovered after event-record failure");
+    CHECK_FALSE(devices.gate.armed());
+}
+
 
 // CUDA's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, and
