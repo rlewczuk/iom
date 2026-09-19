@@ -101,6 +101,7 @@ set(IOM_HEADERS
         include/iom/alloc.hpp
         include/iom/device.hpp
         include/iom/tensor.hpp
+        include/iom/token_selection.hpp
 )
 
 

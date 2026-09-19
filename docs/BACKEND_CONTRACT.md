@@ -1463,65 +1463,95 @@ terminality is proved; otherwise it remains retained or quarantined. Token
 commit is separate from physical cache initialization, and no failed cache
 prefix may be published.
 
-The planned signatures and queries above are not current API declarations.
+The planned neural signatures and queries above are not current API
+declarations.
 The existing neural hooks remain `Unsupported` until their real operation
 ports land; this subsection changes no facade, kernel, queue, session, or
 selector implementation.
 
 #### TinyLlama forward layout — Final-logits selection and ownership
 
-This subsection freezes the planned synchronous selection boundary for the
-final untied LM-head result described by
+This subsection freezes and publishes the backend-neutral synchronous selection
+boundary for the final untied LM-head result described by
 [Embedding and projection boundaries](#tinyllama-forward-layout--embedding-and-projection-boundaries).
-It does not declare or implement the interface. The exact target ABI is:
+The public seam is:
 
 ```cpp
+struct TokenSelectorScratch {
+    std::span<std::byte> host;
+    RawWorkspaceView device;
+};
+
+struct TokenSelectorScratchRequirements {
+    std::size_t host_bytes;
+    WorkspaceRequirements device;
+};
+
 class TokenSelector {
 public:
     virtual ~TokenSelector() = default;
+    virtual TokenSelectorScratchRequirements scratch_requirements(
+            const TensorView&, std::size_t) const = 0;
     virtual std::size_t select(
-            DeviceOps& queue,
-            const TensorView& logits,
-            std::size_t valid_vocabulary,
-            oid producer,
-            std::span<const std::size_t> history) = 0;
+            DeviceOps&, const TensorView&, std::size_t, oid,
+            std::span<const std::size_t>, TokenSelectorScratch) = 0;
 };
 ```
 
-`select` is deliberately not `noexcept`. Invalid input, readiness, runtime,
-and device-data failures are delivered with standard exceptions. The method
-returns one token ID only after the producing work and all selector work have
-completed successfully; it exposes no asynchronous selection result or
-selector OID.
+`scratch_requirements(logits, valid_vocabulary)` is a pure query over the
+supplied view and extent. It MUST perform no allocation, transfer, queue
+reservation, wait, submission, owner registration, or data mutation. A
+concrete implementation defines its own host byte count, device
+`WorkspaceRequirements`, alignment, placement, and admission details; this
+seam mandates no host transfer, staging direction, vendor type, scratch
+capacity, or backend capability.
+
+`TokenSelectorScratch` is a per-call descriptor. Its `host` span and `device`
+`RawWorkspaceView` refer only to caller-provisioned reusable storage. They
+MUST remain live through the synchronous `select` return and MAY be reused
+only after that call completes. The selector MAY write its scratch during the
+call but MUST NOT retain either span, the `RawWorkspaceView`, or any hidden
+scratch allocation after return. No persistent selector ownership is implied.
+
+`select` is synchronous and deliberately not `noexcept`. Its arguments are,
+in order, the queue, logits, valid vocabulary, producing OID, complete
+history span, and caller-owned scratch descriptor. Invalid input, readiness,
+runtime, and device-data failures are delivered with standard exceptions. The
+method returns one token ID only after the producing work and all selector
+work have completed successfully; it exposes no asynchronous selection result
+or selector OID.
 
 `logits` MUST be a borrowed const BF16 view with exact logical rank-two shape
 `[1,V]`, where both dimensions are nonzero. The view and its live storage
-owner MUST belong to the exact device served by `queue`. `valid_vocabulary`
+owner MUST belong to the exact device served by the queue. `valid_vocabulary`
 MUST be nonzero and exactly equal the logical `V`; the only selectable IDs are
 `[0,V)`. Physical 16x16 tile padding, and any physical row or feature outside
-that logical extent, MUST NOT be read as a candidate or included in validation
-of logit values.
+that logical extent, MUST NOT be read as a candidate or included in
+validation of logit values.
 
-`producer` MUST be positive and MUST identify work actually submitted by this
-same live `DeviceOps` queue. An OID from a different queue is invalid even when
-both queues serve the same backend device; zero, negative, foreign, future,
-skipped, reserved-but-never-submitted, and otherwise unsubmitted values remain
-invalid under the existing queue contract. The session MUST successfully wait
-for every direct prerequisite before submitting a dependent final projection.
-Selection itself MUST then successfully observe `queue.wait(producer)` before
-using the logits. Positive admission alone is not readiness. An already
-successful wait does not remove this requirement because successful waits are
-repeatable. If the producer has a retained completion failure, this call
-rethrows it, and every later wait for that OID rethrows the same failure.
+The producing `oid` MUST be positive and MUST identify work actually
+submitted by this same live `DeviceOps` queue. An OID from a different queue
+is invalid even when both queues serve the same backend device; zero,
+negative, foreign, future, skipped, reserved-but-never-submitted, and
+otherwise unsubmitted values remain invalid under the existing queue
+contract. The session MUST successfully wait for every direct prerequisite
+before submitting a dependent final projection. Selection itself MUST then
+successfully observe `queue.wait(producer)` before using the logits. Positive
+admission alone is not readiness. An already successful wait does not remove
+this requirement because successful waits are repeatable. If the producer has
+a retained completion failure, this call rethrows it, and every later wait
+for that OID rethrows the same failure.
 
 The queue, logits view, logits storage owner, and the storage owner's exact
-device identity MUST remain live and unchanged throughout the call. `history`
-is likewise borrowed only for the call. The selector MUST NOT retain the
-queue, either borrowed view, either span, or any referenced storage after
-return. Selection MUST NOT mutate logits, history, KV storage, or any owner
-identity. A concrete selector that needs scratch MAY write only
-caller-provisioned reusable setup storage; that implementation sibling owns
-the scratch size, alignment, placement, and lifetime contract.
+device identity MUST remain live and unchanged throughout the call.
+`history` is likewise borrowed only for the call, and the caller-provisioned
+scratch storage remains live until return. The selector MUST NOT retain the
+queue, either borrowed view, either span, the scratch descriptor, or any
+referenced storage after return. Selection MUST NOT mutate logits, history,
+KV storage, or any owner identity. The selector MAY mutate only the supplied
+scratch storage. Scratch placement, capacity, alignment, and lifetime are
+caller/implementation boundaries described by the requirements query, not
+hidden ownership in this abstract seam.
 
 No full-vocabulary host transfer is required by this seam. Backend-neutral
 `DeviceOps` and `TensorView` access is sufficient, and the concrete selector
@@ -1579,11 +1609,12 @@ Failure ownership and no-mutation behavior are normative:
 - A producer readiness/completion failure, selector runtime failure, or
   nonfinite logical logit is a selector-call failure. It returns no ID; the
   session commits no token and does not change history or initialized cache
-  state. Session poisoning and draining of already accepted OIDs remain the
-  session's responsibility.
-- A deterministic injected selector may replace greedy behavior only in
-  tests. If it returns an ID outside `[0,V)`, the session rejects that result
-  before history, generated count, or cache mutation. Injection cannot bypass
+  state. Supplied scratch may contain partial private work after a failure,
+  but the selector retains no scratch ownership. Session poisoning and
+  draining of already accepted OIDs remain the session's responsibility.
+- A deterministic injected selector MAY replace greedy behavior only in tests.
+  If it returns an ID outside `[0,V)`, the session rejects that result before
+  history, generated count, or cache mutation. Injection cannot bypass
   producing-OID readiness, ID-range validation, history ownership, or cache
   rules.
 
@@ -1592,12 +1623,12 @@ scratch may contain partial private work after a failure, but logits, history,
 KV contents, owner identities, committed-token count, and initialized cache
 length remain unmodified by selection.
 
-This is a planned-only contract. It adds no public selector header, source,
+This public seam adds no concrete greedy selector, selector source, permanent
 test target, session implementation, transfer strategy, allocation, facade,
-kernel, or current-support claim, and it does not migrate the existing neural
-hooks from `Unsupported`. The future selector sibling owns the concrete
-greedy implementation, deterministic oracle, and any exact reusable scratch
-requirement.
+kernel, or current-support claim. Existing neural hooks remain `Unsupported`
+until their real operation ports land; the concrete selector sibling owns the
+deterministic implementation, oracle, and any exact reusable scratch
+requirements.
 #### TinyLlama forward layout — Session sizing and lifetime
 
 This subsection is the normative bounded-storage plan for the planned
