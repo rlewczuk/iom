@@ -52,6 +52,7 @@ add_executable(iom_tests
         test_iom.cpp
         test_mmap.cpp
         test_safetensors.cpp
+        test_tokenizer.cpp
         test_model_loading.cpp
         test_chat_format.cpp
         test_alloc.cpp
