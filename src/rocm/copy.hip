@@ -501,6 +501,15 @@ void gpu_policy::launch_rmsnorm(
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
 
+// The SiLU queue descriptor is present so a future ROCm wrapper can bind the
+// common producer without changing admission or completion ownership. This
+// leaf deliberately keeps the policy unported and reports Unsupported.
+void gpu_policy::launch_silu(
+        hipStream_t, const detail::SiluMetadata& metadata) {
+    static_cast<void>(metadata);
+    throw detail::UnsupportedOperation();
+}
+
 // Launch the completed shared standard-tiled scalar linear projection, or the
 // native BF16 specialization, on the queue's existing nonblocking stream. The
 // wrapper performs no host arithmetic, staging, allocation, synchronization,

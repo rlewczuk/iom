@@ -91,6 +91,15 @@ void gpu_policy::launch_rmsnorm(
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
 
+// The SiLU queue descriptor is present so a future CUDA wrapper can bind the
+// common producer without changing admission or completion ownership. This
+// leaf deliberately keeps the policy unported and reports Unsupported.
+void gpu_policy::launch_silu(
+        cudaStream_t, const detail::SiluMetadata& metadata) {
+    static_cast<void>(metadata);
+    throw detail::UnsupportedOperation();
+}
+
 // CUDA's linear projection dispatches the native BF16 specialization on its
 // own immutable descriptor leaf and delegates every other leaf to the shared
 // tiled projection kernel under the same boundary rules: the queue's own
