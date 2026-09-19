@@ -16,6 +16,24 @@ target_link_libraries(iom_scalar_add_tests
 
 add_test(NAME iom_scalar_add_tests COMMAND iom_scalar_add_tests)
 
+add_executable(iom_scalar_silu_tests
+        backend/test_scalar_silu.cpp
+)
+
+target_include_directories(iom_scalar_silu_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}
+)
+
+target_link_libraries(iom_scalar_silu_tests
+    PRIVATE
+        doctest::doctest
+        libiom
+)
+
+add_test(NAME iom_scalar_silu_tests COMMAND iom_scalar_silu_tests)
+
 # Opt-in real-checkpoint loading verification (change 0006-tinyllama /
 # 02-configuration-weight-loading). Default OFF: an ordinary configuration
 # compiles and runs the whole suite without any model artifact, hardcoded path,
