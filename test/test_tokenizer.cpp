@@ -1,10 +1,14 @@
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "iom/tokenizer.hpp"
 #include "tokenizer_fixture.hpp"
@@ -222,4 +226,110 @@ TEST_CASE("Tokenizer validates vocabulary IDs special pieces and merge cross ref
     expect_invalid(duplicate_merge, "merge-duplicate", "model.merges[10]");
 }
 
+TEST_CASE("Tokenizer encodes empty whitespace and ranked merge cases exactly") {
+    TempDir directory("encode-basic");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    CHECK(owner->encode("", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{});
+    CHECK(owner->encode("", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1});
+    CHECK(owner->encode(" ", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 259});
+    CHECK(owner->encode("  ", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 259, 259});
+    CHECK(owner->encode("hello", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{268});
+    CHECK(owner->encode("hello", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 268});
+    CHECK(owner->encode("hello hello", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{268, 268});
+    CHECK(owner->encode("hello hello", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 268, 268});
+    CHECK(owner->encode("\t", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 12});
+    CHECK(owner->encode("\n", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 13});
+}
+
+TEST_CASE("Tokenizer encodes Unicode scalars bytes and ordinary role markers") {
+    TempDir directory("encode-unicode");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    CHECK(owner->encode("héllø 世界", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 260, 277, 265, 278, 259, 279, 280});
+    CHECK(owner->encode("héllø 世界", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{
+                  1, 259, 260, 277, 265, 278, 259, 279, 280});
+    std::string u_d7ff(3, '\0');
+    u_d7ff[0] = static_cast<char>(0xED);
+    u_d7ff[1] = static_cast<char>(0x9F);
+    u_d7ff[2] = static_cast<char>(0xBF);
+    CHECK(owner->encode(u_d7ff, iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 240, 162, 194});
+    CHECK(owner->encode(u_d7ff, iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 259, 240, 162, 194});
+    CHECK(owner->encode("🙂", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 243, 162, 156, 133});
+    CHECK(owner->encode("<|user|>", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{
+                  259, 63, 127, 120, 118, 261, 270, 127, 65});
+    CHECK(owner->encode("!", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 283});
+}
+
+TEST_CASE("Tokenizer segments added tokens and applies only the single BOS template") {
+    TempDir directory("encode-specials");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    CHECK(owner->encode("<unk>hello<s></s>", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{0, 268, 1, 2});
+    CHECK(owner->encode("<unk>hello<s></s>", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 0, 268, 1, 2});
+    CHECK(owner->encode("<s>", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{1});
+    CHECK(owner->encode("<s>", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 1});
+    CHECK(owner->encode("</s>", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 2});
+}
+
+TEST_CASE("Tokenizer rejects invalid UTF-8 before publishing an encode result") {
+    TempDir directory("encode-invalid-utf8");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    std::string invalid(4, '\0');
+    invalid[0] = static_cast<char>(0xF0);
+    invalid[1] = static_cast<char>(0x28);
+    invalid[2] = static_cast<char>(0x8C);
+    invalid[3] = static_cast<char>(0x28);
+    for (const bool add_special_tokens : {false, true}) {
+        std::vector<std::uint32_t> published{777};
+        bool rejected = false;
+        std::string message;
+        try {
+            const auto actual =
+                    owner->encode(invalid, iom::EncodeOptions{add_special_tokens});
+            published = actual;
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            message = error.what();
+        }
+        CHECK(rejected);
+        CHECK(published == std::vector<std::uint32_t>{777});
+        CHECK(message.find("Tokenizer::encode") != std::string::npos);
+        CHECK(message.find("invalid UTF-8") != std::string::npos);
+        CHECK(message.find("byte 1") != std::string::npos);
+        CHECK(message.find("expected") != std::string::npos);
+        CHECK(message.find("actual") != std::string::npos);
+    }
+}
 }  // namespace

@@ -1,11 +1,14 @@
 #include "iom/tokenizer.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -235,6 +238,40 @@ struct TokenPairHash {
     }
 };
 
+constexpr std::size_t kNoBpeIndex = std::numeric_limits<std::size_t>::max();
+
+struct BpeNode {
+    std::uint32_t id = 0;
+    std::size_t previous = kNoBpeIndex;
+    std::size_t next = kNoBpeIndex;
+    std::size_t generation = 0;
+    bool alive = true;
+};
+
+struct BpeHeapEntry {
+    std::size_t rank = 0;
+    std::size_t left = kNoBpeIndex;
+    std::size_t right = kNoBpeIndex;
+    std::size_t left_generation = 0;
+    std::size_t right_generation = 0;
+    std::uint32_t left_id = 0;
+    std::uint32_t right_id = 0;
+};
+
+struct BpeHeapCompare {
+    bool operator()(const BpeHeapEntry& lhs,
+                    const BpeHeapEntry& rhs) const noexcept {
+        if (lhs.rank != rhs.rank) {
+            return lhs.rank > rhs.rank;
+        }
+        if (lhs.left != rhs.left) {
+            return lhs.left > rhs.left;
+        }
+        return lhs.right > rhs.right;
+    }
+};
+
+
 struct AddedTokenState {
     std::uint32_t id = 0;
     std::string content;
@@ -263,6 +300,18 @@ struct NormalizerState {
     std::string replace_content;
 };
 
+struct EncodingTables {
+    const std::unordered_map<std::string, std::uint32_t>& vocabulary;
+    const std::vector<std::string>& byte_pieces;
+    const std::unordered_map<TokenPair, std::size_t, TokenPairHash>&
+            merge_ranks;
+    const std::unordered_map<TokenPair, std::uint32_t, TokenPairHash>&
+            merge_result_ids;
+    const NormalizerState& normalizer;
+    bool fuse_unk = true;
+    bool byte_fallback = true;
+};
+
 struct DecoderState {
     std::string replace_pattern;
     std::string replace_content;
@@ -285,6 +334,8 @@ struct ParsedState {
     bool fuse_unk = true;
     bool byte_fallback = true;
     std::unordered_map<TokenPair, std::size_t, TokenPairHash> merge_ranks;
+    std::unordered_map<TokenPair, std::uint32_t, TokenPairHash>
+            merge_result_ids;
     std::vector<TokenPair> merges_by_rank;
 };
 
@@ -680,6 +731,7 @@ void validate_vocabulary_and_merges(const Json& document,
                      merges);
     }
     state.merge_ranks.reserve(merges.size());
+    state.merge_result_ids.reserve(merges.size());
     state.merges_by_rank.reserve(merges.size());
     std::size_t rank = 0;
     for (std::size_t index = 0; index < merges.size(); ++index) {
@@ -718,7 +770,8 @@ void validate_vocabulary_and_merges(const Json& document,
         result.reserve(first.size() + second.size());
         result += first;
         result += second;
-        if (state.vocabulary.find(result) == state.vocabulary.end()) {
+        const auto result_it = state.vocabulary.find(result);
+        if (result_it == state.vocabulary.end()) {
             reject(path, field,
                    "a merge whose concatenated result exists in model.vocab", text);
         }
@@ -727,6 +780,7 @@ void validate_vocabulary_and_merges(const Json& document,
             reject(path, field, "a unique merge pair and rank", text);
         }
         state.merge_ranks.emplace(pair, rank);
+        state.merge_result_ids.emplace(pair, result_it->second);
         state.merges_by_rank.push_back(pair);
         if (rank == std::numeric_limits<std::size_t>::max()) {
             throw std::overflow_error("tokenizer " + path.string() +
@@ -782,6 +836,7 @@ struct Tokenizer::Impl {
           fuse_unk(state.fuse_unk),
           byte_fallback(state.byte_fallback),
           merge_ranks(std::move(state.merge_ranks)),
+          merge_result_ids(std::move(state.merge_result_ids)),
           merges_by_rank(std::move(state.merges_by_rank)) {}
 
     std::vector<std::string> vocabulary_by_id;
@@ -797,8 +852,464 @@ struct Tokenizer::Impl {
     bool fuse_unk = true;
     bool byte_fallback = true;
     std::unordered_map<TokenPair, std::size_t, TokenPairHash> merge_ranks;
+    std::unordered_map<TokenPair, std::uint32_t, TokenPairHash>
+            merge_result_ids;
     std::vector<TokenPair> merges_by_rank;
+    std::vector<std::uint32_t> encode(
+            std::string_view text, EncodeOptions options) const;
+
 };
+
+std::string utf8_byte_description(std::uint8_t byte) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::string result = "0x00";
+    result[2] = digits[(byte >> 4) & 0x0F];
+    result[3] = digits[byte & 0x0F];
+    return result;
+}
+
+[[noreturn]] void reject_encode_utf8(
+        std::size_t offset, std::string_view expected,
+        std::string_view actual) {
+    throw std::invalid_argument(
+            "Tokenizer::encode: invalid UTF-8 at byte " +
+            std::to_string(offset) + "; expected " + std::string(expected) +
+            "; actual " + std::string(actual));
+}
+
+void validate_encode_utf8(std::string_view text) {
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        const auto lead = static_cast<std::uint8_t>(text[offset]);
+        std::size_t length = 0;
+        std::string_view expected_lead;
+        if (lead <= 0x7F) {
+            length = 1;
+        } else if (lead >= 0xC2 && lead <= 0xDF) {
+            length = 2;
+            expected_lead = "a valid 2-byte UTF-8 sequence";
+        } else if (lead == 0xE0) {
+            length = 3;
+            expected_lead =
+                    "a 3-byte UTF-8 sequence with second byte 0xA0..0xBF";
+        } else if ((lead >= 0xE1 && lead <= 0xEC) || lead == 0xED ||
+                   (lead >= 0xEE && lead <= 0xEF)) {
+            length = 3;
+            expected_lead = "a valid 3-byte UTF-8 sequence";
+        } else if (lead == 0xF0) {
+            length = 4;
+            expected_lead =
+                    "a 4-byte UTF-8 sequence with second byte 0x90..0xBF";
+        } else if (lead >= 0xF1 && lead <= 0xF3) {
+            length = 4;
+            expected_lead = "a valid 4-byte UTF-8 sequence";
+        } else if (lead == 0xF4) {
+            length = 4;
+            expected_lead =
+                    "a 4-byte UTF-8 sequence with second byte 0x80..0x8F";
+        } else {
+            reject_encode_utf8(offset, "a UTF-8 leading byte",
+                                utf8_byte_description(lead));
+        }
+
+        if (text.size() - offset < length) {
+            reject_encode_utf8(
+                    text.size(), expected_lead.empty() ? "continuation bytes"
+                                                        : expected_lead,
+                    "end-of-input");
+        }
+
+        const auto second = [&]() -> std::uint8_t {
+            if (length == 1) {
+                return 0;
+            }
+            return static_cast<std::uint8_t>(text[offset + 1]);
+        }();
+        if (length > 1) {
+            std::uint8_t second_min = 0x80;
+            std::uint8_t second_max = 0xBF;
+            if (lead == 0xE0) {
+                second_min = 0xA0;
+            } else if (lead == 0xED) {
+                second_max = 0x9F;
+            } else if (lead == 0xF0) {
+                second_min = 0x90;
+            } else if (lead == 0xF4) {
+                second_max = 0x8F;
+            }
+            if (second < second_min || second > second_max) {
+                const std::string expected =
+                        "a continuation byte in " +
+                        utf8_byte_description(second_min) + ".." +
+                        utf8_byte_description(second_max);
+                reject_encode_utf8(offset + 1, expected,
+                                   utf8_byte_description(second));
+            }
+        }
+        for (std::size_t index = 1; index < length; ++index) {
+            const auto byte =
+                    static_cast<std::uint8_t>(text[offset + index]);
+            if (byte < 0x80 || byte > 0xBF) {
+                reject_encode_utf8(offset + index, "a continuation byte",
+                                   utf8_byte_description(byte));
+            }
+        }
+        offset += length;
+    }
+}
+
+std::size_t encode_checked_add(
+        std::size_t left, std::size_t right, std::string_view context) {
+    if (right > std::numeric_limits<std::size_t>::max() - left) {
+        throw std::overflow_error(
+                "Tokenizer::encode: " + std::string(context) +
+                " size overflows");
+    }
+    return left + right;
+}
+
+std::size_t encode_checked_mul(
+        std::size_t left, std::size_t right, std::string_view context) {
+    if (left != 0 &&
+        right > std::numeric_limits<std::size_t>::max() / left) {
+        throw std::overflow_error(
+                "Tokenizer::encode: " + std::string(context) +
+                " size overflows");
+    }
+    return left * right;
+}
+
+template <typename T>
+void encode_checked_reserve(
+        std::vector<T>& values, std::size_t size, std::string_view context) {
+    if (size > values.max_size()) {
+        throw std::overflow_error(
+                "Tokenizer::encode: " + std::string(context) +
+                " size overflows");
+    }
+    values.reserve(size);
+}
+
+void encode_checked_append(
+        std::string& target, std::string_view value,
+        std::string_view context) {
+    if (value.size() > target.max_size() - target.size()) {
+        throw std::overflow_error(
+                "Tokenizer::encode: " + std::string(context) +
+                " size overflows");
+    }
+    target.append(value);
+}
+
+void encode_checked_push(
+        std::vector<std::uint32_t>& result, std::uint32_t id) {
+    if (result.size() >= result.max_size()) {
+        throw std::overflow_error(
+                "Tokenizer::encode: result vector size overflows");
+    }
+    result.push_back(id);
+}
+
+void append_bpe_node(
+        std::vector<BpeNode>& nodes, std::uint32_t id) {
+    if (nodes.size() >= nodes.max_size()) {
+        throw std::overflow_error(
+                "Tokenizer::encode: BPE symbol count overflows");
+    }
+    const std::size_t index = nodes.size();
+    nodes.push_back(BpeNode{id, index == 0 ? kNoBpeIndex : index - 1,
+                            kNoBpeIndex, 0, true});
+    if (index != 0) {
+        nodes[index - 1].next = index;
+    }
+}
+
+std::size_t encode_utf8_scalar_length(
+        std::string_view text, std::size_t offset) {
+    if (offset >= text.size()) {
+        throw std::logic_error(
+                "Tokenizer::encode: normalized UTF-8 offset is out of range");
+    }
+    const auto lead = static_cast<std::uint8_t>(text[offset]);
+    if (lead <= 0x7F) {
+        return 1;
+    }
+    if (lead <= 0xDF) {
+        return 2;
+    }
+    if (lead <= 0xEF) {
+        return 3;
+    }
+    if (lead <= 0xF4) {
+        return 4;
+    }
+    throw std::logic_error(
+            "Tokenizer::encode: normalized text is not valid UTF-8");
+}
+
+std::string normalize_encode_span(
+        std::string_view plain, const NormalizerState& normalizer) {
+    const std::size_t initial_size = encode_checked_add(
+            plain.size(), normalizer.prepend.size(), "normalized input");
+    std::string normalized;
+    if (initial_size > normalized.max_size()) {
+        throw std::overflow_error(
+                "Tokenizer::encode: normalized input size overflows");
+    }
+    normalized.reserve(initial_size);
+    encode_checked_append(normalized, normalizer.prepend, "normalized input");
+
+    const std::string_view pattern = normalizer.replace_pattern;
+    const std::string_view replacement = normalizer.replace_content;
+    std::size_t offset = 0;
+    while (offset < plain.size()) {
+        if (!pattern.empty() && pattern.size() <= plain.size() - offset &&
+            plain.compare(offset, pattern.size(), pattern) == 0) {
+            encode_checked_append(normalized, replacement, "normalized input");
+            offset += pattern.size();
+        } else {
+            encode_checked_append(
+                    normalized, plain.substr(offset, 1), "normalized input");
+            ++offset;
+        }
+    }
+    return normalized;
+}
+
+void append_encode_initial_symbols(
+        std::string_view normalized, const EncodingTables& tables,
+        std::vector<BpeNode>& nodes) {
+    encode_checked_reserve(nodes, normalized.size(), "BPE symbol");
+    std::size_t offset = 0;
+    while (offset < normalized.size()) {
+        const std::size_t length =
+                encode_utf8_scalar_length(normalized, offset);
+        const std::string_view scalar = normalized.substr(offset, length);
+        const auto found = tables.vocabulary.find(std::string(scalar));
+        if (found != tables.vocabulary.end()) {
+            append_bpe_node(nodes, found->second);
+        } else if (tables.byte_fallback) {
+            for (std::size_t index = 0; index < length; ++index) {
+                const std::size_t byte = static_cast<std::uint8_t>(
+                        normalized[offset + index]);
+                if (byte >= tables.byte_pieces.size()) {
+                    throw std::logic_error(
+                            "Tokenizer::encode: byte fallback table is incomplete");
+                }
+                const auto byte_found =
+                        tables.vocabulary.find(tables.byte_pieces[byte]);
+                if (byte_found == tables.vocabulary.end()) {
+                    throw std::logic_error(
+                            "Tokenizer::encode: byte fallback piece is missing");
+                }
+                append_bpe_node(nodes, byte_found->second);
+            }
+        } else if (!tables.fuse_unk || nodes.empty() ||
+                   nodes.back().id != kUnkId) {
+            append_bpe_node(nodes, kUnkId);
+        }
+        offset += length;
+    }
+}
+
+void apply_encode_bpe(
+        std::vector<BpeNode>& nodes, const EncodingTables& tables) {
+    if (nodes.empty()) {
+        return;
+    }
+
+    const std::size_t heap_push_limit =
+            encode_checked_mul(nodes.size(), 3, "BPE merge heap");
+    std::vector<BpeHeapEntry> heap_storage;
+    encode_checked_reserve(
+            heap_storage, heap_push_limit, "BPE merge heap");
+    std::priority_queue<BpeHeapEntry, std::vector<BpeHeapEntry>,
+                        BpeHeapCompare>
+            heap(BpeHeapCompare{}, std::move(heap_storage));
+    std::size_t heap_pushes = 0;
+
+    const auto queue_pair = [&](std::size_t left_index,
+                                std::size_t right_index) {
+        if (left_index == kNoBpeIndex || right_index == kNoBpeIndex) {
+            return;
+        }
+        if (left_index >= nodes.size() || right_index >= nodes.size()) {
+            throw std::logic_error(
+                    "Tokenizer::encode: BPE linked-symbol index is invalid");
+        }
+        const BpeNode& left = nodes[left_index];
+        const BpeNode& right = nodes[right_index];
+        if (!left.alive || !right.alive || left.next != right_index ||
+            right.previous != left_index) {
+            return;
+        }
+        const TokenPair pair{left.id, right.id};
+        const auto rank = tables.merge_ranks.find(pair);
+        if (rank == tables.merge_ranks.end()) {
+            return;
+        }
+        if (tables.merge_result_ids.find(pair) ==
+            tables.merge_result_ids.end()) {
+            throw std::logic_error(
+                    "Tokenizer::encode: validated BPE merge has no result ID");
+        }
+        if (heap_pushes >= heap_push_limit) {
+            throw std::overflow_error(
+                    "Tokenizer::encode: BPE merge heap entry count overflows");
+        }
+        ++heap_pushes;
+        heap.push(BpeHeapEntry{rank->second, left_index, right_index,
+                               left.generation, right.generation, left.id,
+                               right.id});
+    };
+
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        queue_pair(index, nodes[index].next);
+    }
+
+    while (!heap.empty()) {
+        const BpeHeapEntry entry = heap.top();
+        heap.pop();
+        if (entry.left >= nodes.size() || entry.right >= nodes.size()) {
+            continue;
+        }
+        BpeNode& left = nodes[entry.left];
+        BpeNode& right = nodes[entry.right];
+        if (!left.alive || !right.alive || left.next != entry.right ||
+            right.previous != entry.left ||
+            left.generation != entry.left_generation ||
+            right.generation != entry.right_generation ||
+            left.id != entry.left_id || right.id != entry.right_id) {
+            continue;
+        }
+        const TokenPair pair{left.id, right.id};
+        const auto result = tables.merge_result_ids.find(pair);
+        if (result == tables.merge_result_ids.end()) {
+            throw std::logic_error(
+                    "Tokenizer::encode: validated BPE merge result disappeared");
+        }
+        if (left.generation == std::numeric_limits<std::size_t>::max()) {
+            throw std::overflow_error(
+                    "Tokenizer::encode: BPE generation arithmetic overflows");
+        }
+        const std::size_t next = right.next;
+        const std::size_t previous = left.previous;
+        left.id = result->second;
+        left.next = next;
+        ++left.generation;
+        right.alive = false;
+        right.previous = kNoBpeIndex;
+        right.next = kNoBpeIndex;
+        if (next != kNoBpeIndex) {
+            if (next >= nodes.size()) {
+                throw std::logic_error(
+                        "Tokenizer::encode: BPE successor index is invalid");
+            }
+            nodes[next].previous = entry.left;
+        }
+        queue_pair(previous, entry.left);
+        queue_pair(entry.left, next);
+    }
+}
+
+void append_encode_plain_span(
+        std::string_view plain, const EncodingTables& tables,
+        std::vector<std::uint32_t>& result) {
+    if (plain.empty()) {
+        return;
+    }
+    const std::string normalized =
+            normalize_encode_span(plain, tables.normalizer);
+    std::vector<BpeNode> nodes;
+    append_encode_initial_symbols(normalized, tables, nodes);
+    apply_encode_bpe(nodes, tables);
+    std::size_t index = nodes.empty() ? kNoBpeIndex : 0;
+    std::size_t visited = 0;
+    while (index != kNoBpeIndex) {
+        if (index >= nodes.size() || !nodes[index].alive ||
+            visited >= nodes.size()) {
+            throw std::logic_error(
+                    "Tokenizer::encode: BPE linked-symbol traversal is invalid");
+        }
+        encode_checked_push(result, nodes[index].id);
+        ++visited;
+        index = nodes[index].next;
+    }
+}
+
+std::vector<std::uint32_t> Tokenizer::Impl::encode(
+        std::string_view text, EncodeOptions options) const {
+    validate_encode_utf8(text);
+
+    std::vector<std::uint32_t> result;
+    const std::size_t reserve_size =
+            encode_checked_add(text.size(), 2, "result");
+    encode_checked_reserve(result, reserve_size, "result");
+
+    const EncodingTables tables{vocabulary, byte_pieces, merge_ranks,
+                                merge_result_ids, normalizer, fuse_unk,
+                                byte_fallback};
+
+    if (options.add_special_tokens) {
+        bool sequence_seen = false;
+        for (const TemplateItemState& item : single_template) {
+            if (!item.special) {
+                if (item.id != "A") {
+                    throw std::logic_error(
+                            "Tokenizer::encode: single template sequence is not A");
+                }
+                sequence_seen = true;
+                break;
+            }
+            const auto special = special_tokens.find(item.id);
+            if (special == special_tokens.end()) {
+                throw std::logic_error(
+                        "Tokenizer::encode: single template special token is missing");
+            }
+            for (const std::uint32_t id : special->second.ids) {
+                encode_checked_push(result, id);
+            }
+        }
+        if (!sequence_seen) {
+            throw std::logic_error(
+                    "Tokenizer::encode: single template has no sequence");
+        }
+    }
+
+    std::size_t plain_start = 0;
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        std::size_t match_index = kNoBpeIndex;
+        std::size_t match_length = 0;
+        std::uint32_t match_id = 0;
+        for (const AddedTokenState& token : added_tokens) {
+            if (token.content.size() <= text.size() - offset &&
+                text.compare(offset, token.content.size(), token.content) == 0 &&
+                token.content.size() > match_length) {
+                match_index = offset;
+                match_length = token.content.size();
+                match_id = token.id;
+            }
+        }
+        if (match_index == kNoBpeIndex) {
+            ++offset;
+            continue;
+        }
+        append_encode_plain_span(
+                text.substr(plain_start, match_index - plain_start),
+                tables, result);
+        encode_checked_push(result, match_id);
+        offset = encode_checked_add(offset, match_length, "input");
+        plain_start = offset;
+    }
+    append_encode_plain_span(text.substr(plain_start), tables, result);
+    return result;
+}
+
+std::vector<std::uint32_t> Tokenizer::encode(
+        std::string_view text, EncodeOptions options) const {
+    return impl_->encode(text, options);
+}
 
 Tokenizer::Tokenizer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
