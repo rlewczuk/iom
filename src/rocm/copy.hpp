@@ -23,7 +23,7 @@ namespace iom::detail {
 // (src/shared/standard_tiled_rmsnorm.inl). The ROCm translation unit is the
 // only place where its definition is needed.
 struct RmsnormMetadata;
-// Device descriptor of the shared 16x16 tiled scalar linear projection
+// Device descriptor of the shared tiled scalar linear projection
 // (src/shared/standard_tiled_linear.inl). Like the RMSNorm descriptor it is
 // only needed inside the ROCm translation unit.
 struct LinearMetadata;
@@ -31,6 +31,9 @@ struct LinearMetadata;
 // operation is intentionally unported here; the descriptor preserves the
 // callback seam without retaining a borrowed TensorView.
 struct SiluMetadata;
+// Device descriptor of the shared tiled RoPE operation
+// (src/shared/standard_tiled_rope.inl).
+struct RopeMetadata;
 }  // namespace iom::detail
 
 namespace iom::rocm_detail {
@@ -331,6 +334,20 @@ struct gpu_policy {
     [[nodiscard]] static constexpr const char* silu_kernel_operation()
             noexcept {
         return "HIP SiLU kernel launch";
+    }
+
+    // RoPE remains an explicit Unsupported policy stub until the independent
+    // ROCm wrapper leaf enables the shared standard-tiled launch.
+    [[nodiscard]] static constexpr bool rope_supported() noexcept {
+        return false;
+    }
+
+    static void launch_rope(
+            stream_type stream, const detail::RopeMetadata& metadata);
+
+    [[nodiscard]] static constexpr const char* rope_kernel_operation()
+            noexcept {
+        return "HIP RoPE kernel launch";
     }
 
     // Linear projection seams. The complete backend-parameterized device

@@ -75,6 +75,7 @@ bool consume_submission_fault(
 #include "../shared/standard_tiled_add.inl"
 #include "../shared/standard_tiled_rmsnorm.inl"
 #include "../shared/standard_tiled_linear.inl"
+#include "../shared/standard_tiled_rope.inl"
 
 #include "../shared/gpu_queue.hpp"
 
@@ -510,6 +511,15 @@ void gpu_policy::launch_silu(
     throw detail::UnsupportedOperation();
 }
 
+// The shared Rope facility is compiled into this translation unit, but the
+// queue policy remains an explicit Unsupported stub until the independent
+// ROCm wrapper leaf enables its launch.
+void gpu_policy::launch_rope(
+        hipStream_t, const detail::RopeMetadata& metadata) {
+    static_cast<void>(metadata);
+    throw detail::UnsupportedOperation();
+}
+
 // Launch the completed shared standard-tiled scalar linear projection, or the
 // native BF16 specialization, on the queue's existing nonblocking stream. The
 // wrapper performs no host arithmetic, staging, allocation, synchronization,
@@ -742,5 +752,8 @@ template void launch_standard_tiled_rmsnorm<iom::rocm_detail::gpu_policy>(
 template void launch_standard_tiled_linear<iom::rocm_detail::gpu_policy>(
         iom::rocm_detail::gpu_policy::stream_type stream,
         const LinearMetadata& metadata);
+template void launch_standard_tiled_rope<iom::rocm_detail::gpu_policy>(
+        iom::rocm_detail::gpu_policy::stream_type stream,
+        const RopeMetadata& metadata);
 
 }  // namespace iom::detail
