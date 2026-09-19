@@ -862,6 +862,11 @@ public:
         internal,
         post_acceptance,
     };
+    enum class SiluFailure {
+        none,
+        post_acceptance,
+    };
+
 
     enum class RmsnormFailure {
         none,
@@ -897,6 +902,27 @@ public:
         bool broadcast_columns;
         bool broadcasts;
     };
+    struct SiluViewRecord {
+        std::size_t rank;
+        std::array<std::size_t, 8> dimensions;
+        std::array<std::size_t, 8> plane_strides;
+        std::size_t plane_offset;
+        iom::DataType data_type;
+        iom::QuantizationFormat quantization;
+        const iom::Device* device;
+        const iom::Tensor* owner;
+        void* handle;
+    };
+
+    struct SiluRecord {
+        std::uint64_t sequence;
+        SiluViewRecord x;
+        SiluViewRecord y;
+        iom::WorkspaceRequirements workspace_requirements;
+        iom::detail::BinaryEntryRegistration entries;
+        bool retained_failure;
+    };
+
 
     struct BinaryRecord {
         std::uint64_t sequence;
@@ -964,6 +990,15 @@ public:
     [[nodiscard]] const std::vector<BinaryRecord>& add_records() const noexcept {
         return add_records_;
     }
+    void inject_silu_failure(SiluFailure failure) noexcept {
+        next_silu_failure_ = failure;
+    }
+
+    [[nodiscard]] const std::vector<SiluRecord>& silu_records() const
+            noexcept {
+        return silu_records_;
+    }
+
 
     [[nodiscard]] const std::vector<RmsnormRecord>& rmsnorm_records() const
             noexcept {
@@ -990,6 +1025,20 @@ public:
         }
         throw std::invalid_argument("unknown fake ADD sequence");
     }
+    void finish_silu(std::uint64_t sequence) {
+        for (const SiluRecord& record : silu_records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_binary_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake SILU sequence");
+    }
+
 
     void finish_rmsnorm(std::uint64_t sequence) {
         for (const RmsnormRecord& record : rmsnorm_records_) {
@@ -1075,7 +1124,6 @@ public:
 
     // Successfully queued operations in submission order.
     std::vector<Submission> submissions;
-    bool silu_aliased = false;
 
     // A view-less submission used to observe queue identity and sequence
     // allocation directly.
@@ -1214,11 +1262,49 @@ protected:
                 });
     }
 
-    iom::oid silu_impl(const iom::TensorView& x, iom::TensorView& y) override {
-        silu_aliased = &x == &y;
-        return submit([&](std::uint64_t sequence) {
-            submissions.push_back({sequence, "silu"});
-        });
+    iom::WorkspaceRequirements silu_workspace_requirements_impl(
+            const SiLURequest&) override {
+        return {0, 1};
+    }
+
+    iom::oid silu_impl(const SiLURequest& request) override {
+        const SiluFailure failure =
+                std::exchange(next_silu_failure_, SiluFailure::none);
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_silu(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence,
+                        const SiLURequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
+                    const auto record_view = [](const SiLUViewSnapshot& view) {
+                        return SiluViewRecord{
+                                view.rank,
+                                view.dimensions,
+                                view.plane_strides,
+                                view.plane_offset,
+                                view.data_type,
+                                view.quantization,
+                                view.device_identity,
+                                view.owner_identity,
+                                view.native_handle};
+                    };
+                    silu_records_.push_back(SiluRecord{
+                            sequence, record_view(snapshot.x),
+                            record_view(snapshot.y),
+                            snapshot.workspace_requirements, entries,
+                            failure == SiluFailure::post_acceptance});
+                    submissions.push_back({sequence, "silu"});
+                    if (failure == SiluFailure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake SILU retained failure")));
+                    }
+                });
     }
 
     iom::oid linear_impl(const LinearRequest& request) override {
@@ -1365,7 +1451,9 @@ private:
             iom::detail::allocate_queue_id(registry_state_);
     std::vector<BinaryRecord> add_records_;
     std::vector<RmsnormRecord> rmsnorm_records_;
+    std::vector<SiluRecord> silu_records_;
     AddFailure next_add_failure_ = AddFailure::none;
+    SiluFailure next_silu_failure_ = SiluFailure::none;
     RmsnormFailure next_rmsnorm_failure_ = RmsnormFailure::none;
     std::vector<EmbeddingRecord> embedding_records_;
     iom::WorkspaceRequirements embedding_requirements_{0, 1};
@@ -1384,6 +1472,7 @@ private:
  */
 class UnportedQueue final : public iom::DeviceOps {
 public:
+    using iom::DeviceOps::complete;
     explicit UnportedQueue(const iom::Device& device)
             : iom::DeviceOps(device) {}
 
@@ -2587,7 +2676,12 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
                                 TensorView&, iom::RawWorkspaceView) noexcept>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::silu),
-        iom::oid (DeviceOps::*)(const TensorView&, TensorView&) noexcept>);
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&,
+                                iom::RawWorkspaceView) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::silu_workspace_requirements),
+        iom::WorkspaceRequirements (DeviceOps::*)(
+                const TensorView&, const TensorView&)>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::linear),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
@@ -2642,12 +2736,20 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
                                 const TensorView&, size_t, size_t, size_t,
                                 TensorView&) noexcept>);
 
-    // silu deliberately accepts the same window as const input and mutable
-    // output; a const view is refused as an output.
+    // SiLU's exact ABI carries a workspace view for compatibility with
+    // admitted callers, while its zero-capacity contract deliberately
+    // ignores that view.
     static_assert(std::is_invocable_v<
+        decltype(&DeviceOps::silu), DeviceOps*, const TensorView&, TensorView&,
+        const iom::RawWorkspaceView&>);
+    static_assert(!std::is_invocable_v<
         decltype(&DeviceOps::silu), DeviceOps*, const TensorView&, TensorView&>);
     static_assert(!std::is_invocable_v<
-        decltype(&DeviceOps::silu), DeviceOps*, TensorView&, const TensorView&>);
+        decltype(&DeviceOps::silu_workspace_requirements), DeviceOps*,
+        const TensorView&, const TensorView&, iom::RawWorkspaceView>);
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::silu), DeviceOps*, const iom::Tensor&,
+        iom::Tensor&, const iom::RawWorkspaceView&>);
 
     // No Tensor operand overload survives the cutover: Tensor does not
     // convert to TensorView.
@@ -2734,7 +2836,10 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     FakeTensor b = make_tensor(device, {2, 3, 16, 16});
     FakeTensor scale = make_tensor(device, {1, 16});
     // The storage-range overlap rule needs owners whose declared storage is
-    // real, so the layout-aware linear call uses exactly sized buffers.
+    // real, so the layout-aware linear and SiLU calls use exactly sized
+    // buffers.
+    OwnedFakeTensor silu_x(device, {2, 3, 16, 16});
+    OwnedFakeTensor silu_y(device, {2, 3, 16, 16});
     OwnedFakeTensor linear_x(device, {2, 3, 16, 16});
     OwnedFakeTensor linear_w(device, {16, 16});
     OwnedFakeTensor linear_out(device, {2, 3, 16, 16});
@@ -2742,8 +2847,7 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     CHECK(iom::oid_is_token(queue.copy(a.view(), b.view())));
     CHECK(iom::oid_is_token(queue.add(frozen.view(), a.view(), b.view())));
     CHECK(iom::oid_is_token(queue.mul(a.view(), frozen.view(), b.view())));
-    CHECK(iom::oid_is_token(queue.silu(b.view(), b.view())));
-    CHECK(queue.silu_aliased);
+    CHECK(iom::oid_is_token(queue.silu(silu_x.view(), silu_y.view())));
     // Linear prefers a distinct output: `linear_out` is only the output here,
     // never an aliased weight.
     CHECK(iom::oid_is_token(queue.linear(
@@ -2761,6 +2865,164 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     REQUIRE(queue.submissions.size() == 8);
     CHECK_EQ(queue.submissions.back().sequence, 8);
 }
+TEST_CASE("SiLU admission uses a pure query and fixed immutable snapshots") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    OwnedFakeTensor x(device, {2, 3, 17, 33});
+    OwnedFakeTensor y(device, {2, 3, 17, 33});
+    const void* const x_handle = x.view().native_handle();
+    const void* const y_handle = y.view().native_handle();
+
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements requirements =
+            queue.silu_workspace_requirements(x.view(), y.view());
+    const std::size_t query_allocations = iom_test::disarm();
+    CHECK(requirements == (iom::WorkspaceRequirements{0, 1}));
+    CHECK_EQ(query_allocations, 0);
+    CHECK(queue.silu_records().empty());
+    CHECK(queue.submissions.empty());
+
+    // The zero-capacity operation deliberately ignores a supplied,
+    // nonempty workspace, including its owner and address.
+    FakeWorkspace workspace(
+            device, reinterpret_cast<void*>(0x100000), 64);
+    iom::oid token = 0;
+    {
+        iom::TensorView temporary_x = x.view();
+        iom::TensorView temporary_y = y.view();
+        token = queue.silu(temporary_x, temporary_y, workspace.view());
+    }
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.silu_records().size(), 1);
+    const FakeQueue::SiluRecord& record = queue.silu_records().back();
+    CHECK_EQ(record.x.rank, std::size_t{4});
+    CHECK_EQ(record.x.dimensions[0], std::size_t{2});
+    CHECK_EQ(record.x.dimensions[1], std::size_t{3});
+    CHECK_EQ(record.x.dimensions[2], std::size_t{17});
+    CHECK_EQ(record.x.dimensions[3], std::size_t{33});
+    CHECK_EQ(record.x.plane_strides[0], std::size_t{3});
+    CHECK_EQ(record.x.plane_strides[1], std::size_t{1});
+    CHECK_EQ(record.x.plane_offset, std::size_t{0});
+    CHECK(record.x.device == &device);
+    CHECK(record.x.owner == x.view().owner_identity());
+    CHECK(record.x.handle == x_handle);
+    CHECK(record.y.handle == y_handle);
+    CHECK(record.workspace_requirements
+          == (iom::WorkspaceRequirements{0, 1}));
+    CHECK_EQ(record.entries.count, std::size_t{2});
+    CHECK_EQ(queue.registered_at(x_handle), 1);
+    CHECK_EQ(queue.registered_at(y_handle), 1);
+    CHECK_EQ(
+            queue.registered_at(reinterpret_cast<void*>(0x100000)),
+            0);
+
+    queue.finish_silu(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_EQ(queue.registered_at(x_handle), 0);
+    CHECK_EQ(queue.registered_at(y_handle), 0);
+}
+
+TEST_CASE("SiLU admission rejects malformed and aliased inputs before effects") {
+    const iom::oid invalid =
+            iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported =
+            iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    FakeQueue queue(device);
+
+    OwnedFakeTensor alias_x(device, {2, 3, 17, 33});
+    CHECK_EQ(queue.silu(alias_x.view(), alias_x.view()), invalid);
+
+    OwnedFakeTensor overlap_x(device, {2, 3, 17, 33});
+    OwnedFakeTensor overlap_y(device, {2, 3, 17, 33});
+    overlap_y.owner().use_storage_handle(
+            static_cast<unsigned char*>(overlap_x.storage_base()) + 32);
+    CHECK_EQ(queue.silu(overlap_x.view(), overlap_y.view()), invalid);
+
+    OwnedFakeTensor shape_x(device, {2, 3, 17, 33});
+    OwnedFakeTensor shape_y(device, {2, 4, 17, 33});
+    CHECK_EQ(queue.silu(shape_x.view(), shape_y.view()), invalid);
+    CHECK_THROWS_AS(
+            static_cast<void>(
+                    queue.silu_workspace_requirements(
+                            shape_x.view(), shape_y.view())),
+            std::invalid_argument);
+
+    OwnedFakeTensor bool_x(device, {2, 3, 17, 33}, iom::DataType::BOOL);
+    OwnedFakeTensor bool_y(device, {2, 3, 17, 33}, iom::DataType::BOOL);
+    CHECK_EQ(queue.silu(bool_x.view(), bool_y.view()), unsupported);
+
+    OwnedFakeTensor unknown_x(device, {2, 3, 17, 33});
+    OwnedFakeTensor unknown_y(device, {2, 3, 17, 33});
+    const auto unknown = static_cast<iom::DataType>(127);
+    const_cast<iom::TensorSpec&>(unknown_x.view().spec()).data_type =
+            unknown;
+    const_cast<iom::TensorSpec&>(unknown_y.view().spec()).data_type =
+            unknown;
+    CHECK_EQ(queue.silu(unknown_x.view(), unknown_y.view()), invalid);
+
+    OwnedFakeTensor malformed_x(device, {2, 3, 17, 33});
+    OwnedFakeTensor malformed_y(device, {2, 3, 17, 33});
+    iom::TensorView malformed = malformed_x.view();
+    const_cast<std::size_t*>(malformed.plane_strides().data())[0] = 0;
+    CHECK_EQ(queue.silu(malformed, malformed_y.view()), invalid);
+
+    OwnedFakeTensor foreign_x(foreign, {2, 3, 17, 33});
+    OwnedFakeTensor foreign_y(device, {2, 3, 17, 33});
+    CHECK_EQ(queue.silu(foreign_x.view(), foreign_y.view()), invalid);
+
+    CHECK(queue.silu_records().empty());
+    CHECK(queue.submissions.empty());
+    const iom::oid probe = queue.probe();
+    REQUIRE(iom::oid_is_token(probe));
+    CHECK_EQ(token_sequence(probe), 1);
+    queue.complete(token_sequence(probe));
+    CHECK_NOTHROW(queue.wait(probe));
+}
+
+TEST_CASE("SiLU defaults reject before admission and retained failures repeat") {
+    const iom::oid unsupported =
+            iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    OwnedFakeTensor x(device, {2, 3, 17, 33});
+    OwnedFakeTensor y(device, {2, 3, 17, 33});
+    FakeWorkspace foreign_workspace(
+            foreign, reinterpret_cast<void*>(0x200000), 64);
+
+    UnportedQueue unported(device);
+    CHECK_EQ(
+            unported.silu(x.view(), y.view(), foreign_workspace.view()),
+            unsupported);
+    CHECK_THROWS_AS(
+            static_cast<void>(
+                    unported.silu_workspace_requirements(
+                            x.view(), y.view())),
+            std::runtime_error);
+    const iom::oid unported_probe = unported.probe();
+    REQUIRE(iom::oid_is_token(unported_probe));
+    CHECK_EQ(token_sequence(unported_probe), 1);
+    unported.complete(token_sequence(unported_probe));
+    CHECK_NOTHROW(unported.wait(unported_probe));
+
+    FakeQueue failing(device);
+    failing.inject_silu_failure(FakeQueue::SiluFailure::post_acceptance);
+    const iom::oid failed = failing.silu(x.view(), y.view());
+    REQUIRE(iom::oid_is_token(failed));
+    failing.finish_silu(token_sequence(failed));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        CHECK_THROWS_WITH_AS(
+                failing.wait(failed), "fake SILU retained failure",
+                std::runtime_error);
+    }
+    REQUIRE_EQ(failing.silu_records().size(), 1);
+    CHECK(failing.silu_records().back().retained_failure);
+    CHECK_EQ(failing.registered_at(x.view().native_handle()), 1);
+    CHECK_EQ(failing.registered_at(y.view().native_handle()), 1);
+}
+
 
 TEST_CASE("ADD accepts every numeric NONE leaf through immutable fake snapshots") {
     FakeDevice device;

@@ -209,7 +209,16 @@ namespace iom {
         [[nodiscard]] WorkspaceRequirements embedding_workspace_requirements(
                 const TensorView& table, const TensorView& indices,
                 const TensorView& out);
-        oid silu(const TensorView& x, TensorView& y) noexcept;
+        oid silu(const TensorView& x, TensorView& y,
+                 RawWorkspaceView workspace = {}) noexcept;
+        /**
+         * Pure zero-workspace requirement query for SiLU. It validates both
+         * views and invokes the backend capability hook with fixed-size
+         * value snapshots, without allocating, registering owners, leasing
+         * workspace, consuming a queue sequence, or submitting work.
+         */
+        [[nodiscard]] WorkspaceRequirements silu_workspace_requirements(
+                const TensorView& x, const TensorView& y);
         /**
          * Bias-free blocked linear projection of independently selected
          * input rows. `x` is `[...,T,I]` with rank two through eight and
@@ -617,13 +626,67 @@ namespace iom {
         };
 
 
+        /**
+         * Fixed-size immutable SiLU view metadata captured before admission.
+         * The bounded arrays avoid heap allocation in the pure requirement
+         * query while preserving every rank, extent, leading plane stride,
+         * selected plane, encoding, and stable owner identity needed by a
+         * deferred backend callback.
+         */
+        struct SiLUViewSnapshot {
+            std::size_t rank = 0;
+            std::array<std::size_t, 8> dimensions{};
+            std::array<std::size_t, 8> plane_strides{};
+            std::size_t plane_offset = 0;
+            DataType data_type = DataType::BOOL;
+            QuantizationFormat quantization = QuantizationFormat::NONE;
+            const Device* device_identity = nullptr;
+            const Tensor* owner_identity = nullptr;
+            void* native_handle = nullptr;
+
+            [[nodiscard]] std::span<const std::size_t>
+                    shape_dimensions() const noexcept {
+                return {dimensions.data(), rank};
+            }
+            [[nodiscard]] std::span<const std::size_t>
+                    leading_plane_strides() const noexcept {
+                const std::size_t leading =
+                        rank >= 2 ? rank - 2 : 0;
+                return {plane_strides.data(), leading};
+            }
+        };
+
+        /**
+         * Immutable, value-copied SiLU admission request. The caller's
+         * borrowed TensorView and RawWorkspaceView never reach a callback;
+         * zero-capacity workspace is represented solely by the copied
+         * requirement.
+         */
+        struct SiLURequest {
+            SiLUViewSnapshot x;
+            SiLUViewSnapshot y;
+            WorkspaceRequirements workspace_requirements{0, 1};
+
+            SiLURequest(
+                    SiLUViewSnapshot x_, SiLUViewSnapshot y_,
+                    WorkspaceRequirements workspace_requirements_ = {0, 1})
+                : x(std::move(x_)), y(std::move(y_)),
+                  workspace_requirements(workspace_requirements_) {}
+            SiLURequest(const SiLURequest&) = default;
+            SiLURequest& operator=(const SiLURequest&) = delete;
+            SiLURequest(SiLURequest&&) noexcept = default;
+        };
+
         DeviceOps();
         explicit DeviceOps(const Device& device);
         virtual oid copy_impl(
                 const TensorView& source, TensorView& destination);
         virtual oid binary_impl(const BinaryRequest& request);
         virtual oid embedding_impl(const EmbeddingRequest& request);
-        virtual oid silu_impl(const TensorView& x, TensorView& y);
+        virtual oid silu_impl(const SiLURequest& request);
+        [[nodiscard]] virtual WorkspaceRequirements
+                silu_workspace_requirements_impl(
+                        const SiLURequest& request);
         /**
          * Immutable linear projection execution hook. It receives the
          * already validated, admission-snapshotted request and queues the
@@ -729,6 +792,8 @@ namespace iom {
                 const TensorView& view,
                 const detail::CheckedViewFacts& facts);
 
+        [[nodiscard]] static SiLUViewSnapshot snapshot_silu_view(
+                const TensorView& view);
         /**
          * Complete common linear projection admission validation in the
          * frozen contract order: recognized encodings, rank and nonzero
@@ -948,12 +1013,84 @@ namespace iom {
                     std::move(queue_work));
         }
 
+        // Admission path used by a ported SiLU hook. The fixed-size request
+        // is captured first, then both distinct owners are registered
+        // transactionally through the existing FIFO prepare/dispatch/rollback
+        // machinery until proven completion. SiLU consumes no raw workspace.
+        template <typename QueueWork>
+        oid submit_silu(
+                const SiLURequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, FenceFactory build_fence,
+                QueueWork queue_work) {
+            struct Prepared {
+                SiLURequest request;
+                detail::BinaryEntryRegistration entries;
+                std::function<void(
+                        std::uint64_t, const SiLURequest&,
+                        detail::BinaryEntryRegistration)> work;
+                Prepared(const SiLURequest& request_, QueueWork work_)
+                    : request(request_), work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    request, std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, build_fence](
+                            std::uint64_t sequence) {
+                        const detail::Fence fence = build_fence(sequence);
+                        const std::array<detail::BinaryOwnerRegistration, 2>
+                                owners{{
+                                        {prepared->request.x.owner_identity,
+                                         prepared->request.x.native_handle},
+                                        {prepared->request.y.owner_identity,
+                                         prepared->request.y.native_handle},
+                                }};
+                        try {
+                            prepared->entries = detail::register_binary_entries(
+                                    state, queue_id, sequence, owners, fence);
+                        } catch (...) {
+                            if (prepared->entries.count != 0) {
+                                state.registry.remove_entries(
+                                        std::span<const detail::EntryId>(
+                                                prepared->entries.entries.data(),
+                                                prepared->entries.count));
+                                prepared->entries = {};
+                            }
+                            throw;
+                        }
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.count != 0) {
+                            state.registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            prepared->entries.entries.data(),
+                                            prepared->entries.count));
+                        }
+                    });
+        }
+
+        template <typename QueueWork>
+        oid submit_silu(
+                const SiLURequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_silu(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
         // Admission path used by a ported RMS normalization hook. The
         // immutable request is captured first, then every distinct owner is
         // registered through the existing in-order prepare/register/dispatch/
         // rollback machinery until proven completion. RMS normalization
         // consumes no raw workspace, so no lease is acquired and only the
         // read/read `x`/`scale` identities are deduplicated.
+
         template <typename QueueWork>
         oid submit_rmsnorm(
                 const RmsnormRequest& request, detail::RegistryState& state,
