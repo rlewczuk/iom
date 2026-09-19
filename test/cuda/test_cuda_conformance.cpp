@@ -334,7 +334,6 @@ constexpr iom_conformance::EmbeddingDeclaration kCudaEmbeddingDeclaration{
         iom_conformance::kEmbeddingIdSpan,
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        false,
         iom::WorkspaceRequirements{32, 32}};
 
 TEST_CASE("CUDA conformance: embedding lookup reference, admission, and lifetime") {

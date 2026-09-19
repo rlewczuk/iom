@@ -434,7 +434,6 @@ constexpr iom_conformance::EmbeddingDeclaration kSyclEmbeddingDeclaration{
         iom_conformance::kEmbeddingIdSpan,
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        false,
         iom::WorkspaceRequirements{32, 32}};
 
 TEST_CASE("SYCL conformance: embedding lookup reference, admission, and lifetime") {

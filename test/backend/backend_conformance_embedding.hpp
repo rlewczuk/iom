@@ -78,34 +78,25 @@ inline constexpr std::array<iom::DataType, 12> kEmbeddingIdSpan = {
         iom::DataType::I64, iom::DataType::U64,
 };
 
-// The explicitly temporary one-carrier TTNN expectation: 19 payload leaves
-// (all except `F8_E8M0`, `I64`, `U64`, and `F64`) and the 10 narrow index
-// leaves (all except `I64` and `U64`). The wide-carrier leaf replaces both
-// with the final TTNN 22/12 matrix, so a staged span is a temporary
-// intermediate declaration and never final support.
-inline constexpr std::array<iom::DataType, 19>
-        kEmbeddingStagedTtnnPayloadSpan = {
-                iom::DataType::BOOL,
-                iom::DataType::I2, iom::DataType::U2,
-                iom::DataType::I4, iom::DataType::U4,
-                iom::DataType::I8, iom::DataType::U8,
-                iom::DataType::I16, iom::DataType::U16,
-                iom::DataType::I32, iom::DataType::U32,
-                iom::DataType::F4_E2M1,
-                iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-                iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
-                iom::DataType::F16, iom::DataType::BF16,
-                iom::DataType::F32,
-        };
-
-inline constexpr std::array<iom::DataType, 10>
-        kEmbeddingStagedTtnnIdSpan = {
-                iom::DataType::I2, iom::DataType::U2,
-                iom::DataType::I4, iom::DataType::U4,
-                iom::DataType::I8, iom::DataType::U8,
-                iom::DataType::I16, iom::DataType::U16,
-                iom::DataType::I32, iom::DataType::U32,
-        };
+// The final TTNN native expectation: every payload leaf its native carrier
+// table can store, which is all 23 contract leaves except `F8_E8M0`, and the
+// complete 12-leaf integral index matrix. Double-carrier leaves occupy two
+// consecutive native UInt32 columns per logical element, so the span is a
+// declaration of supported behavior, never of a storage probe.
+inline constexpr std::array<iom::DataType, 22> kEmbeddingTtnnPayloadSpan = {
+        iom::DataType::BOOL,
+        iom::DataType::I2, iom::DataType::U2,
+        iom::DataType::I4, iom::DataType::U4,
+        iom::DataType::I8, iom::DataType::U8,
+        iom::DataType::I16, iom::DataType::U16,
+        iom::DataType::I32, iom::DataType::U32,
+        iom::DataType::I64, iom::DataType::U64,
+        iom::DataType::F4_E2M1,
+        iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+        iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
+        iom::DataType::F16, iom::DataType::BF16,
+        iom::DataType::F32, iom::DataType::F64,
+};
 
 // `BOOL` and the ten floating leaves are recognized but inapplicable as index
 // semantics: the operation capability stage reports them as `Unsupported`.
@@ -125,7 +116,8 @@ inline constexpr std::span<const iom::DataType> kNoEmbeddingSpan{};
 // One driver's explicit embedding declaration.
 struct EmbeddingDeclaration {
     // The complete payload and index matrix this port is expected to reach.
-    // The TTNN driver passes the staged matrix here and sets `staged`.
+    // The TTNN driver passes `kEmbeddingTtnnPayloadSpan` and the full
+    // `kEmbeddingIdSpan` here.
     std::span<const iom::DataType> target_payloads;
     std::span<const iom::DataType> target_ids;
     // The leaves this revision's backend port implements and the suite
@@ -133,10 +125,6 @@ struct EmbeddingDeclaration {
     // capability rejection only and never reports gather success.
     std::span<const iom::DataType> implemented_payloads;
     std::span<const iom::DataType> implemented_ids;
-    // True exactly while `target_payloads`/`target_ids` are an explicitly
-    // temporary staged matrix that the port's next leaf must replace with the
-    // final matrix. It never advertises support.
-    bool staged = false;
     // The exact workspace requirement the port reports for an applicable
     // request: `{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and TTNN.
     // A positive range is an exact live device owner whose first status word
@@ -315,6 +303,24 @@ enum class EmbeddingOracleVariant {
     return splitmix64(splitmix64(salt + plane) + row) % vocabulary;
 }
 
+// Contiguous row-major host encoding of one specification's logical bytes from
+// an explicit raw code per logical element. The salted pattern above reaches
+// every bit class of a 32-bit leaf within a normal fixture; a double-carrier
+// leaf's NaN payload, sign bit, high-word-only value, or `2^53` crossing is
+// guaranteed only by directed codes.
+[[nodiscard]] inline std::vector<std::byte> encode_logical_codes(
+        const iom::TensorSpec& spec,
+        const std::function<std::uint64_t(std::size_t)>& code) {
+    const std::size_t bits = bits_of(spec.data_type);
+    const std::size_t count = spec.shape.element_count();
+    std::vector<std::byte> buffer(spec.logical_nbytes(), std::byte{0});
+    auto* base = reinterpret_cast<unsigned char*>(buffer.data());
+    for (std::size_t linear = 0; linear < count; ++linear) {
+        write_bits(base, linear * bits, bits, code(linear));
+    }
+    return buffer;
+}
+
 // One integral index leaf's own domain. `nonnegative_max` is the largest code
 // that leaf represents as a nonnegative value, so every fixture code stays
 // representable in the leaf's width.
@@ -413,6 +419,12 @@ struct EmbeddingCase {
     // Exact index code of one index owner plane and row. Omitted for the valid
     // fixtures, which use `embedding_valid_code`.
     std::function<std::uint64_t(std::size_t, std::size_t)> code;
+    // Exact raw code of one logical row-major table element. Omitted for the
+    // shared fixtures, whose salted pattern covers the leaf's width; directed
+    // codes exist for the double-carrier leaves, where a numeric decode, a
+    // dropped high word, or a lost NaN/sign payload would survive a random
+    // pattern of the same width.
+    std::function<std::uint64_t(std::size_t)> table_code;
     // True for the accepted out-of-vocabulary and negative-ID fixtures: the
     // output is unspecified and is never compared.
     bool out_of_vocabulary = false;
@@ -1009,6 +1021,83 @@ struct EmbeddingLeadingCase {
         add(std::move(item));
     }
 
+    // Directed double-carrier payload codes. A 64-bit element owns two
+    // consecutive native carrier columns, so a numeric decode, a dropped high
+    // word, or a lost sign or NaN payload stays observable only with codes
+    // chosen for those classes; a salted pattern of the same width exercises
+    // them by chance. The odd `F=33` and `R=17` cross the 16-column face and
+    // 32-column tile boundaries of the doubled native column space, and the
+    // table's own padding is never a logical feature.
+    for (const iom::DataType payload :
+         {iom::DataType::I64, iom::DataType::U64, iom::DataType::F64}) {
+        if (!embedding_declares(payload_leaves, payload)) {
+            continue;
+        }
+        EmbeddingCase item;
+        item.label = "directed wide codes for payload leaf " +
+                std::to_string(static_cast<int>(payload));
+        item.payload = payload;
+        item.id_type = default_id;
+        item.vocabulary = embedding_vocabulary_for(default_id, 17);
+        item.features = 33;
+        item.run = 17;
+        item.table_code = [payload](std::size_t element) {
+            constexpr std::uint64_t kDirected[] = {
+                    0x0000000000000000ull,  // both carrier words zero
+                    0x8000000000000007ull,  // sign bit and high-word payload
+                    0x7FF8000000000ABCull,  // positive quiet NaN code
+                    0xFFF0000000000001ull,  // negative signaling NaN code
+                    0x0020000000000001ull,  // 2^53 + 1, above 2^53
+                    0xFFFFFFFFFFFFFFFFull,  // both carrier words set
+                    0x00000000FFFFFFFFull,  // low-word-only value
+                    0xFFFFFFFF00000000ull,  // high-word-only value
+                    0x0000000100000000ull,  // 2^32: the first high-word count
+                    0x0000000100000002ull,  // high word set, small low word
+            };
+            if (element < sizeof(kDirected) / sizeof(kDirected[0])) {
+                return kDirected[element];
+            }
+            return element_pattern(payload, element, 0x77C0DEull);
+        };
+        add(std::move(item));
+    }
+
+    // High-word-only outliers of the double-carrier index leaves. The low word
+    // alone is a valid small ID, so an implementation that narrows before the
+    // range check gathers the wrong row instead of rejecting: each fixture is
+    // a positive accepted token and a deferred data failure.
+    for (const iom::DataType id_type :
+         {iom::DataType::I64, iom::DataType::U64}) {
+        if (!embedding_declares(id_leaves, id_type)) {
+            continue;
+        }
+        EmbeddingCase item;
+        item.label = "high-word-only outlier index leaf " +
+                std::to_string(static_cast<int>(id_type));
+        item.payload = default_payload;
+        item.id_type = id_type;
+        item.vocabulary = embedding_vocabulary_for(id_type, 5);
+        item.run = 4;
+        item.out_of_vocabulary = true;
+        item.code = [](std::size_t, std::size_t row) {
+            switch (row) {
+                case 1:
+                    // Low word `2` is a valid ID below `V = 5`.
+                    return std::uint64_t{0x0000000100000002ull};
+                case 2:
+                    // The sign bit alone: `I64_MIN`, negative for `I64` and
+                    // `>= V` for `U64`.
+                    return std::uint64_t{0x8000000000000000ull};
+                case 3:
+                    // Zero low word with an all-ones high word.
+                    return std::uint64_t{0xFFFFFFFF00000000ull};
+                default:
+                    return std::uint64_t{0};
+            }
+        };
+        add(std::move(item));
+    }
+
     // Run boundaries.
     for (const std::size_t run : {1u, 15u, 16u, 17u}) {
         EmbeddingCase item;
@@ -1456,8 +1545,9 @@ inline void run_embedding_reference_conformance(
                 ? item.transform(out_owner->view())
                 : iom::TensorView{out_owner->view()};
 
-        const std::vector<std::byte> table_view_bytes =
-                encode_logical(table_view.spec(), item.salt);
+        const std::vector<std::byte> table_view_bytes = item.table_code
+                ? encode_logical_codes(table_view.spec(), item.table_code)
+                : encode_logical(table_view.spec(), item.salt);
         const std::vector<std::byte> table_poison = encode_logical(
                 specs.table_owner, item.salt ^ 0xAE5Eull);
         const std::vector<std::byte> out_poison = encode_logical(

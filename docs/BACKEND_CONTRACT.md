@@ -3986,11 +3986,12 @@ valid logical output MUST NOT depend on padding or uninitialized storage.
 Payload elements are copied as raw codes. Subbyte payloads are addressed at
 their logical bit width, so a standard-storage implementation reads and writes
 packed fields while a native-carrier implementation such as TTNN uses one whole
-carrier cell per logical element and masks only its logical width. A 64-bit
-payload occupies paired low/high `uint32` words, never floating arithmetic and
-never a shift by 64. Only `QuantizationFormat::NONE` is in scope: every other
-recognized quantization format is `Unsupported`, and this operation adds no
-quantization or storage format.
+carrier cell per logical element and masks only its logical width — and, for a
+64-bit element, two consecutive carrier cells holding the low and the high
+`uint32` word. A 64-bit payload occupies paired low/high `uint32` words, never
+floating arithmetic and never a shift by 64. Only `QuantizationFormat::NONE` is
+in scope: every other recognized quantization format is `Unsupported`, and this
+operation adds no quantization or storage format.
 
 #### Payload and index classification
 
@@ -4031,19 +4032,35 @@ which leaves that backend implements.
 | CUDA | all 23 | all 12 | `NONE` only |
 | ROCm | all 23 | all 12 | `NONE` only |
 | SYCL | all 23 | all 12 | `NONE` only |
-| TTNN (staged native) | 19: all except `F8_E8M0`, `I64`, `U64`, `F64` | 10: all except `I64`, `U64` | `NONE` only |
-| TTNN (final, pending wide carriers) | 22: all except `F8_E8M0` | all 12 | `NONE` only |
+| TTNN (native) | 22: all except `F8_E8M0` | all 12 | `NONE` only |
 The CPU implementation covers all 23 payload and 12 integral index leaves for
 `QuantizationFormat::NONE`. It reports `{0,1}`, rejects positive
 `RawWorkspace` creation, executes gathers on the existing asynchronous FIFO
 worker with raw bit helpers, and defers queued negative or out-of-vocabulary
 IDs as repeatable `std::invalid_argument` failures after acceptance.
 
-The TTNN staged-native row is implemented by the first port and is explicitly
-non-final. It uses one-carrier native storage for its 19 payload leaves and 10
-index leaves; the immediately following double-carrier work completes the
-required 22/12 matrix. Until that work lands, the final row remains a target,
-not an advertised implementation.
+The TTNN native row is final. Its 22 payload leaves and all 12 integral index
+leaves use the same carrier layout: one native `UInt32` column per logical
+element for every leaf of at most 32 bits, and two consecutive native columns —
+low word at column `2*f`, high word at `2*f+1` — for the `I64`, `U64`, and
+`F64` payloads and the `I64` and `U64` indices. A wide row index is valid only
+when its high word is zero and its low word is below `V`, which is the same
+condition as "nonnegative and `< V`" for a signed leaf whose sign bit lives in
+the high word. `F8_E8M0` remains an unsupported payload leaf, and the backend's
+carrier table does not store it.
+
+The TTNN native row is measured on the configured TTNN device by
+`iom_ttnn_conformance_tests` in `test/ttnn/test_ttnn_conformance.cpp`. With the
+final declaration above, `ctest --test-dir build/ttnn --output-on-failure
+--timeout 300 -R '^iom_ttnn_conformance_tests$'` passed 1/1 in 55.66 s on the
+TTNN host (`bv1`, mirror `l11-wide-final-a1`), and a direct run of the same
+binary reported `test cases: 48 | 48 passed`, `assertions: 1863947 | 1863947
+passed`, and `Status: SUCCESS!` with a warm JIT cache. Those runs instantiate
+the 22 declared payload leaves with `U32` indices, all 12 index leaves with
+`BF16` payload, the targeted mixed 64-bit pairs, every directed 64-bit
+raw-code fixture, the high-word-only out-of-vocabulary fixtures, and the
+focused double-carrier case whose gathering, deferred failure, and proven
+status/workspace reuse all cross the doubled column space.
 
 No backend may advertise a capability it has not implemented. An `Unsupported`
 result, a storage-only observation, or a rejection-only probe is never
@@ -4263,19 +4280,23 @@ byte = (((r % 32) / 16 * 2 + (c % 32) / 16) * 256
 ```
 
 and the second, wide carrier of a 64-bit element is the following logical
-column. Each dispatch supplies runtime words for `V`, `R`, `F`, the native
-table, index, and output addresses, the carrier widths, the signed index width,
-the padded column count, and the status owner's base, page size, and subrange;
-native data pages stay 1024, 2048, or 4096 bytes and the status owner uses its
-own full page size. Each logical feature copies its raw carrier bytes from the
-table row's physical tile position to the output position, while physical
-padding stays non-logical. Index values are checked inside the data-movement
-core before any NoC page arithmetic, and the core accumulates a monotone
-invalid-ID flag that it publishes with the required NoC barrier, so ordered
-plane launches preserve earlier flags without a cross-core atomic protocol.
-Leading planes are iterated on the host from the immutable submission snapshots,
-without reading values or allocating a plane list, and native submission reuses
-the existing unit-mesh device mutex.
+column, which stays inside the same 16x16 face whenever the pair starts there.
+Each dispatch supplies runtime words for `V`, `R`, `F`, the native table, index,
+and output addresses, the carrier widths, the payload and index widths, the
+signed index marker, the native carrier factor of the table and index planes
+(one column per logical element, two for a 64-bit leaf), the padded column
+count, and the status owner's base, page size, and subrange; native data pages
+stay 1024, 2048, or 4096 bytes and the status owner uses its own full page size.
+Each logical feature copies its raw carrier cells from the table row's physical
+tile position to the output position, while physical padding stays non-logical.
+Index values are checked inside the data-movement core before any NoC page
+arithmetic: a 64-bit index reads both carrier words, treats a nonzero high word
+as out of range, and never narrows a rejected value to an addressable row. The
+core accumulates a monotone invalid-ID flag that it publishes with the required
+NoC barrier, so ordered plane launches preserve earlier flags without a
+cross-core atomic protocol. Leading planes are iterated on the host from the
+immutable submission snapshots, without reading values or allocating a plane
+list, and native submission reuses the existing unit-mesh device mutex.
 
 The public `ttnn::embedding` operator is not suitable for this contract: it is
 `ROW_MAJOR`/`BF16`-only, performs layout conversion, and leaves out-of-range IDs
@@ -4303,14 +4324,20 @@ rows; runs `R=1`, `15`, `16`, and `17`; non-tile feature sizes `F=1`, `15`,
 `17`, `31`, and `33`; table `V` boundaries; a selected rank-two table view;
 independent leading transforms, offsets, steps, and permutations through rank
 8; and poisoned native and output padding whose bytes never change valid
-output. Failure coverage MUST include malformed structure, wrong device, stale
-registration, alias and overlap, dtype and non-`NONE` quantization, checked
-overflow, workspace liveness, size, alignment, device, overlap, and lease,
-a producer copy to embedding to consumer FIFO case, negative, `>= V`, `U64_MAX`,
-and signed sign-bit IDs without narrowing, repeated waits, and status and
-workspace reuse after proven drain. Small index widths keep `V` inside that
-representation's nonnegative domain, and a positive out-of-vocabulary fixture
-chooses a representable ID code.
+output. Every declared 64-bit payload also carries a directed raw-code fixture
+(both carrier words set, sign bit, NaN payload, `2^53` crossing, high-word-only
+and low-word-only values) with an odd non-tile feature count, because a salted
+pattern of that width reaches those classes only by chance. Failure coverage
+MUST include malformed structure, wrong device, stale registration, alias and
+overlap, dtype and non-`NONE` quantization, checked overflow, workspace
+liveness, size, alignment, device, overlap, and lease, a producer copy to
+embedding to consumer FIFO case, negative, `>= V`, `U64_MAX`, and signed
+sign-bit IDs without narrowing, repeated waits, and status and workspace reuse
+after proven drain. A 64-bit index additionally carries a high-word-only
+outlier whose low word alone is a valid small ID, so a truncated comparison
+addresses a valid row instead of failing. Small index widths keep `V` inside
+that representation's nonnegative domain, and a positive out-of-vocabulary
+fixture chooses a representable ID code.
 
 The cases live in the shared header
 `test/backend/backend_conformance_embedding.hpp` and run through the existing
@@ -4328,18 +4355,15 @@ leaves, and RMSNorm now has backend-owned CUDA and ROCm
 launch wrappers, while its shared conformance helper remains task-owned.
 
 Each driver declares through `iom_conformance::EmbeddingDeclaration` the
-payload and index matrix its port must reach (with `staged` set exactly while
-that declaration is the explicitly temporary intermediate matrix), the leaves
-this revision implements (both spans empty for an unported port), and its exact
-workspace requirement (`{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and
-TTNN). The matrix drives the shared fixtures, so a case exists exactly for a
-leaf the port must reach; `iom_conformance::kEmbeddingPayloadSpan`,
-`iom_conformance::kEmbeddingIdSpan`,
-`iom_conformance::kEmbeddingStagedTtnnPayloadSpan`, and
-`iom_conformance::kEmbeddingStagedTtnnIdSpan` are the standard 23/12 and the
-explicitly temporary staged TTNN 19/10 declarations, and
-`iom_conformance::kNoEmbeddingSpan` is the empty implemented span of an
-unported port. Entry points are
+payload and index matrix its port must reach, the leaves this revision
+implements (both spans empty for an unported port), and its exact workspace
+requirement (`{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and TTNN). The
+matrix drives the shared fixtures, so a case exists exactly for a leaf the port
+must reach; `iom_conformance::kEmbeddingPayloadSpan`,
+`iom_conformance::kEmbeddingIdSpan`, and
+`iom_conformance::kEmbeddingTtnnPayloadSpan` are the standard 23/12 matrix and
+the final TTNN 22/12 native row, and `iom_conformance::kNoEmbeddingSpan` is the
+empty implemented span of an unported port. Entry points are
 `iom_conformance::run_embedding_conformance` (self-check, declared request
 cases, and common admission/ownership/queue/failure cases),
 `iom_conformance::run_embedding_oracle_self_check`,
@@ -4393,11 +4417,9 @@ Implementers need these existing sources and seams:
   `test/<backend>/test_<backend>_conformance.cpp` drivers, and
   `test/CMakeLists.txt`.
 
-These files are planned targets and do not exist yet:
-`src/shared/standard_tiled_embedding.hpp` and
-`src/shared/standard_tiled_embedding.inl`, and the TTNN embedding sources
-(`src/ttnn/embedding.hpp`, `src/ttnn/embedding.cpp`,
-`src/ttnn/kernels/embedding.cpp`, and `src/ttnn/queue_embedding.cpp`).
+The shared raw-word embedding sources, the TTNN carrier/queue/workspace
+sources, and the five conformance drivers named above are the delivered
+implementation and test surface of this section.
 
 The genuine prerequisites and the final closure are producer/consumer
 relationships, not a fixed serial backend order:
@@ -4406,7 +4428,7 @@ relationships, not a fixed serial backend order:
    and requirement-query declarations with `Unsupported` defaults;
 2. the independent raw-bit reference and the shared embedding conformance
    header, before any backend claims numerical conformance;
-3. the per-backend port, which for TTNN additionally requires the caller-owned
+3. the per-backend port, which for TTNN required the caller-owned
    positive workspace and its 32-byte status owner before the native
    one-carrier port, and then the double-carrier completion; and
 4. the shared five-backend gate, which closes Embedding lookup before linear

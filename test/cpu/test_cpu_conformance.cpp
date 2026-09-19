@@ -285,7 +285,6 @@ constexpr iom_conformance::EmbeddingDeclaration kCpuEmbeddingDeclaration{
         iom_conformance::kEmbeddingIdSpan,
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        false,
         iom::WorkspaceRequirements{0, 1}};
 
 TEST_CASE("CPU conformance: embedding lookup reference, admission, and lifetime") {
