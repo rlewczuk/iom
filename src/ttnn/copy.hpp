@@ -84,7 +84,14 @@ std::size_t snapshot_owner_plane_at(
 std::size_t snapshot_owner_plane_at(
         const TensorSpec&, std::size_t plane_offset,
         std::span<const std::size_t> plane_strides, std::size_t index);
-void copy_planes(const CopySnapshot&, const ttnn::Tensor*, const CopySnapshot&, ttnn::Tensor*, bool&);
+void copy_planes(
+        TtnnDevice&, const CopySnapshot&, const ttnn::Tensor*,
+        const CopySnapshot&, ttnn::Tensor*, bool&);
+void padded_logical_copy(
+        std::span<std::byte>, std::span<const std::byte>,
+        tt::tt_metal::DataType, std::size_t, std::size_t, std::size_t,
+        std::size_t, std::size_t, std::size_t, std::size_t, std::size_t,
+        std::size_t);
 std::size_t carrier_bytes(tt::tt_metal::DataType);
 std::size_t upload_slot_index(tt::tt_metal::DataType);
 std::size_t padded_cell_index(

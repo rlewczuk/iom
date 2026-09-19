@@ -20,7 +20,11 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 namespace iom::ttnn_detail {
+
+    void finish_locked_mesh(
+            tt::tt_metal::distributed::MeshDevice& device);
 
     std::size_t carrier_bytes(tt::tt_metal::DataType type) {
         switch (type) {
@@ -190,10 +194,11 @@ namespace iom::ttnn_detail {
             }
         }
 
-        template <typename T>
+        template <typename T, typename Lease>
         void raw_upload_typed(
-                ttnn::Tensor& plane, TtnnWorkspaceLease& workspace,
-                std::size_t bytes) {
+                ttnn::Tensor& plane, Lease& workspace,
+                std::size_t bytes, std::size_t submission_index = 0,
+                unsigned char* submitted = nullptr) {
             if (bytes % sizeof(T) != 0) {
                 throw std::logic_error(
                         "TTNN raw plane bytes do not match carrier width");
@@ -208,8 +213,12 @@ namespace iom::ttnn_detail {
                     plane.padded_shape(), plane.dtype(),
                     tt::tt_metal::Layout::TILE);
 #ifdef IOM_ENABLE_TESTING
-            ::iom::ttnn_detail::fail_host_transfer_submission_at(0);
+            ::iom::ttnn_detail::fail_host_transfer_submission_at(
+                    submission_index);
 #endif
+            if (submitted != nullptr) {
+                *submitted = 1;
+            }
             ttnn::copy_to_device(host_tiled, plane);
         }
     }  // namespace
@@ -443,10 +452,13 @@ namespace iom::ttnn_detail {
         void submit_download_plane(
                 tt::tt_metal::distributed::MeshCommandQueue& queue,
                 const ttnn::Tensor& plane, std::byte* staging,
-                std::size_t plane_index) {
+                std::size_t plane_index, bool* submitted = nullptr) {
 #ifdef IOM_ENABLE_TESTING
             ::iom::ttnn_detail::fail_host_transfer_submission_at(plane_index);
 #endif
+            if (submitted != nullptr) {
+                *submitted = true;
+            }
             ttnn::copy_to_host(
                     queue, plane, staging, std::nullopt, /*blocking=*/false);
         }
@@ -483,6 +495,96 @@ namespace iom::ttnn_detail {
             }
         }
 
+    }  // namespace
+        // Copy only addressed logical carrier cells between complete padded
+        // plane images.  The caller owns the transfer leases; this helper is
+        // deliberately unaware of device tensors and never initializes the
+        // destination image.
+        void padded_logical_copy(
+                std::span<std::byte> destination,
+                std::span<const std::byte> source,
+                tt::tt_metal::DataType dtype,
+                std::size_t source_padded_rows,
+                std::size_t source_padded_columns,
+                std::size_t destination_padded_rows,
+                std::size_t destination_padded_columns,
+                std::size_t source_row_offset,
+                std::size_t destination_row_offset,
+                std::size_t rows, std::size_t columns,
+                std::size_t factor) {
+            const std::size_t carrier_size = carrier_bytes(dtype);
+            if (factor == 0
+                    || columns
+                            > std::numeric_limits<std::size_t>::max()
+                                    / factor) {
+                throw std::overflow_error(
+                        "TTNN padded logical copy column range overflows");
+            }
+            if (source_padded_rows == 0 || source_padded_columns == 0
+                    || destination_padded_rows == 0
+                    || destination_padded_columns == 0
+                    || source_padded_rows % 32 != 0
+                    || source_padded_columns % 32 != 0
+                    || destination_padded_rows % 32 != 0
+                    || destination_padded_columns % 32 != 0) {
+                throw std::invalid_argument(
+                        "TTNN padded logical copy requires complete TILE images");
+            }
+            const std::size_t source_elements = checked_product(
+                    source_padded_rows, source_padded_columns,
+                    "padded source element count");
+            const std::size_t destination_elements = checked_product(
+                    destination_padded_rows, destination_padded_columns,
+                    "padded destination element count");
+            const std::size_t source_bytes = checked_product(
+                    source_elements, carrier_size, "padded source byte count");
+            const std::size_t destination_bytes = checked_product(
+                    destination_elements, carrier_size,
+                    "padded destination byte count");
+            if (source.size() < source_bytes
+                    || destination.size() < destination_bytes) {
+                throw std::invalid_argument(
+                        "TTNN padded logical copy image is truncated");
+            }
+            if (source_row_offset > source_padded_rows
+                    || rows > source_padded_rows - source_row_offset
+                    || destination_row_offset > destination_padded_rows
+                    || rows > destination_padded_rows - destination_row_offset
+                    || columns * factor > source_padded_columns
+                    || columns * factor > destination_padded_columns) {
+                throw std::invalid_argument(
+                        "TTNN padded logical copy range is out of bounds");
+            }
+            const std::size_t source_tile_columns =
+                    source_padded_columns / 32;
+            const std::size_t destination_tile_columns =
+                    destination_padded_columns / 32;
+            for (std::size_t row = 0; row < rows; ++row) {
+                for (std::size_t column = 0; column < columns; ++column) {
+                    for (std::size_t part = 0; part < factor; ++part) {
+                        const std::size_t source_column =
+                                column * factor + part;
+                        const std::size_t destination_column =
+                                source_column;
+                        const std::size_t source_index = padded_cell_index(
+                                source_row_offset + row, source_column,
+                                source_tile_columns);
+                        const std::size_t destination_index =
+                                padded_cell_index(
+                                        destination_row_offset + row,
+                                        destination_column,
+                                        destination_tile_columns);
+                        std::memcpy(
+                                destination.data()
+                                        + destination_index * carrier_size,
+                                source.data() + source_index * carrier_size,
+                                carrier_size);
+                    }
+                }
+            }
+        }
+
+    namespace {
         std::size_t view_rows(const TensorView& view) {
             return view.spec().shape.dimension(
                     view.spec().shape.rank() - 2);
@@ -637,21 +739,279 @@ namespace iom::ttnn_detail {
         }
     }
     void copy_planes(
-            const CopySnapshot& source, const ttnn::Tensor* source_planes,
+            TtnnDevice& device, const CopySnapshot& source,
+            const ttnn::Tensor* source_planes,
             const CopySnapshot& destination,
             ttnn::Tensor* destination_planes,
             bool& any_submitted) {
         any_submitted = false;
         const std::size_t count = snapshot_plane_count(source);
+        const std::span<const std::size_t> source_dimensions =
+                source.spec.shape.dimensions();
+        const std::span<const std::size_t> destination_dimensions =
+                destination.spec.shape.dimensions();
+        if (source_dimensions.size() < 2
+                || destination_dimensions.size() != source_dimensions.size()
+                || source.spec.data_type != destination.spec.data_type) {
+            throw std::invalid_argument(
+                    "TTNN padded logical copy specifications do not match");
+        }
+        for (std::size_t index = 0; index < source_dimensions.size();
+             ++index) {
+            if (source_dimensions[index] != destination_dimensions[index]) {
+                throw std::invalid_argument(
+                        "TTNN padded logical copy shapes do not match");
+            }
+        }
+        const std::size_t rows =
+                source_dimensions[source_dimensions.size() - 2];
+        const std::size_t columns =
+                source_dimensions[source_dimensions.size() - 1];
+        const std::size_t factor = carrier_factor(source.spec.data_type);
+        const std::size_t native_columns = checked_product(
+                columns, factor, "logical native column count");
+        if (count > std::numeric_limits<std::size_t>::max() / 2) {
+            throw std::overflow_error(
+                    "TTNN padded logical copy submission index overflows");
+        }
+        const std::size_t upload_submission_base = count * 2;
+
+        struct PlaneTransfer {
+            const ttnn::Tensor* source = nullptr;
+            ttnn::Tensor* destination = nullptr;
+            std::size_t source_bytes = 0;
+            std::size_t destination_bytes = 0;
+            std::size_t source_offset = 0;
+            std::size_t destination_offset = 0;
+            std::size_t source_rows = 0;
+            std::size_t source_columns = 0;
+            std::size_t destination_rows = 0;
+            std::size_t destination_columns = 0;
+        };
+        std::vector<PlaneTransfer> transfers;
+        transfers.reserve(count);
+        std::size_t total_download_bytes = 0;
+        bool needs_staging = false;
         for (std::size_t index = 0; index < count; ++index) {
-#ifdef IOM_ENABLE_TESTING
-            ::iom::ttnn_detail::fail_copy_planes_submission_at(index);
-#endif
-            ttnn::copy(
-                    source_planes[snapshot_owner_plane_at(source, index)],
+            const ttnn::Tensor& source_plane =
+                    source_planes[snapshot_owner_plane_at(source, index)];
+            ttnn::Tensor& destination_plane =
                     destination_planes[
-                            snapshot_owner_plane_at(destination, index)]);
-            any_submitted = true;
+                            snapshot_owner_plane_at(destination, index)];
+            auto* const plane_device = source_plane.device();
+            if (plane_device != &device.mesh()
+                    || destination_plane.device() != &device.mesh()
+                    || source_plane.dtype() != destination_plane.dtype()) {
+                throw std::invalid_argument(
+                        "TTNN padded logical copy device or dtype mismatch");
+            }
+            const std::size_t source_bytes =
+                    padded_plane_bytes(source_plane);
+            const std::size_t destination_bytes =
+                    padded_plane_bytes(destination_plane);
+            const std::size_t source_rows = static_cast<std::size_t>(
+                    source_plane.padded_shape()[-2]);
+            const std::size_t source_columns = static_cast<std::size_t>(
+                    source_plane.padded_shape()[-1]);
+            const std::size_t destination_rows = static_cast<std::size_t>(
+                    destination_plane.padded_shape()[-2]);
+            const std::size_t destination_columns = static_cast<std::size_t>(
+                    destination_plane.padded_shape()[-1]);
+            needs_staging =
+                    needs_staging
+                    || source_rows != rows || source_columns != native_columns
+                    || destination_rows != rows
+                    || destination_columns != native_columns;
+            if (source_bytes
+                            > std::numeric_limits<std::size_t>::max()
+                                    - destination_bytes
+                    || source_bytes + destination_bytes
+                            > std::numeric_limits<std::size_t>::max()
+                                    - total_download_bytes) {
+                throw std::overflow_error(
+                        "TTNN padded logical copy staging size overflows");
+            }
+            const std::size_t source_offset = total_download_bytes;
+            total_download_bytes += source_bytes;
+            const std::size_t destination_offset = total_download_bytes;
+            total_download_bytes += destination_bytes;
+            transfers.push_back(PlaneTransfer{
+                    &source_plane,
+                    &destination_plane,
+                    source_bytes,
+                    destination_bytes,
+                    source_offset,
+                    destination_offset,
+                    source_rows,
+                    source_columns,
+                    destination_rows,
+                    destination_columns});
+        }
+
+        if (!needs_staging) {
+            for (std::size_t index = 0; index < count; ++index) {
+#ifdef IOM_ENABLE_TESTING
+                ::iom::ttnn_detail::fail_copy_planes_submission_at(index);
+#endif
+                const PlaneTransfer& transfer = transfers[index];
+                ttnn::copy(*transfer.source, *transfer.destination);
+                any_submitted = true;
+            }
+            return;
+        }
+
+        TtnnHostStaging& staging = device.host_staging();
+        auto& queue = device.mesh().mesh_command_queue(0);
+        if (staging.download_retired()) {
+            queue.finish();
+            staging.reclaim_download();
+        }
+        TtnnHostStaging::DownloadLease download =
+                staging.acquire_download(total_download_bytes);
+        std::vector<TtnnHostStaging::UploadLease> uploads;
+        uploads.reserve(count);
+        try {
+            for (const PlaneTransfer& transfer : transfers) {
+                uploads.emplace_back(staging.acquire_upload(
+                        upload_slot_index(transfer.destination->dtype()),
+                        transfer.destination_bytes));
+            }
+        } catch (...) {
+            download.discard();
+            for (auto& upload : uploads) upload.release();
+            throw;
+        }
+
+        std::vector<unsigned char> upload_submitted(count, 0);
+        bool download_drained = false;
+        bool upload_drained = false;
+        try {
+            for (std::size_t index = 0; index < count; ++index) {
+#ifdef IOM_ENABLE_TESTING
+                ::iom::ttnn_detail::fail_copy_planes_submission_at(index);
+#endif
+                const PlaneTransfer& transfer = transfers[index];
+                submit_download_plane(
+                        queue, *transfer.source,
+                        download.data() + transfer.source_offset, index * 2,
+                        &any_submitted);
+                submit_download_plane(
+                        queue, *transfer.destination,
+                        download.data() + transfer.destination_offset,
+                        index * 2 + 1, &any_submitted);
+            }
+            // The queue completion path owns the counted copy fence. This
+            // private drain is required before the host patch.
+            queue.finish();
+            download_drained = true;
+
+            for (std::size_t index = 0; index < count; ++index) {
+                const PlaneTransfer& transfer = transfers[index];
+                TtnnHostStaging::UploadLease& upload = uploads[index];
+                std::memcpy(
+                        upload.data(),
+                        download.data() + transfer.destination_offset,
+                        transfer.destination_bytes);
+                padded_logical_copy(
+                        std::span<std::byte>(
+                                upload.data(), transfer.destination_bytes),
+                        std::span<const std::byte>(
+                                download.data() + transfer.source_offset,
+                                transfer.source_bytes),
+                        transfer.source->dtype(), transfer.source_rows,
+                        transfer.source_columns, transfer.destination_rows,
+                        transfer.destination_columns, 0, 0, rows, columns,
+                        factor);
+                switch (transfer.destination->dtype()) {
+                    case tt::tt_metal::DataType::BFLOAT16:
+                        raw_upload_typed<bfloat16>(
+                                *transfer.destination, upload,
+                                transfer.destination_bytes,
+                                upload_submission_base + index,
+                                &upload_submitted[index]);
+                        break;
+                    case tt::tt_metal::DataType::FLOAT32:
+                        raw_upload_typed<float>(
+                                *transfer.destination, upload,
+                                transfer.destination_bytes,
+                                upload_submission_base + index,
+                                &upload_submitted[index]);
+                        break;
+                    case tt::tt_metal::DataType::UINT32:
+                        raw_upload_typed<std::uint32_t>(
+                                *transfer.destination, upload,
+                                transfer.destination_bytes,
+                                upload_submission_base + index,
+                                &upload_submitted[index]);
+                        break;
+                    case tt::tt_metal::DataType::INT32:
+                        raw_upload_typed<std::int32_t>(
+                                *transfer.destination, upload,
+                                transfer.destination_bytes,
+                                upload_submission_base + index,
+                                &upload_submitted[index]);
+                        break;
+                    case tt::tt_metal::DataType::UINT16:
+                        raw_upload_typed<std::uint16_t>(
+                                *transfer.destination, upload,
+                                transfer.destination_bytes,
+                                upload_submission_base + index,
+                                &upload_submitted[index]);
+                        break;
+                    case tt::tt_metal::DataType::UINT8:
+                        raw_upload_typed<std::uint8_t>(
+                                *transfer.destination, upload,
+                                transfer.destination_bytes,
+                                upload_submission_base + index,
+                                &upload_submitted[index]);
+                        break;
+                    default:
+                        throw std::invalid_argument(
+                                "TTNN padded logical copy has no carrier");
+                }
+            }
+            queue.finish();
+            upload_drained = true;
+            download.release();
+            for (auto& upload : uploads) upload.release();
+            staging.reclaim_retired_uploads();
+        } catch (...) {
+            const std::exception_ptr failure = std::current_exception();
+            bool any_upload_submitted = false;
+            for (const unsigned char submitted : upload_submitted) {
+                any_upload_submitted =
+                        any_upload_submitted || submitted != 0;
+            }
+            bool upload_drain_succeeded = upload_drained;
+            if ((any_submitted || any_upload_submitted)
+                    && !upload_drain_succeeded) {
+                try {
+                    queue.finish();
+                    upload_drain_succeeded = true;
+                } catch (...) {
+                }
+            }
+            const bool download_drain_succeeded =
+                    download_drained || upload_drain_succeeded;
+            if (download_drain_succeeded) {
+                download.discard();
+            } else if (any_submitted) {
+                download.retire();
+            } else {
+                download.discard();
+            }
+            for (std::size_t index = 0; index < count; ++index) {
+                if (upload_submitted[index] != 0
+                        && !upload_drain_succeeded) {
+                    uploads[index].retire();
+                } else {
+                    uploads[index].release();
+                }
+            }
+            if (upload_drain_succeeded) {
+                staging.reclaim_retired_uploads();
+            }
+            std::rethrow_exception(failure);
         }
     }
 

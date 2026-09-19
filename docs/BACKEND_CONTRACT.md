@@ -1217,6 +1217,9 @@ preservation “without host staging” is superseded for this operation by that
 route; it remains a blocked pre-port observation and MUST NOT be read as
 forbidding the queried workspace. Hidden or unaccounted staging remains
 forbidden.
+TTNN also keeps an internal `padded_logical_copy` helper that is purely
+byte-preserving and does not change `cache_append` semantics or add a public
+copy overload or generic staging facility.
 
 ##### CUDA cache-row append implementation boundary
 CUDA's cache-row append leaf is implemented in `src/cuda/copy.cu` through the
