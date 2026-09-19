@@ -48,11 +48,34 @@ class VerifierTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *args], env=self.env,
                               text=True, capture_output=True, check=True, timeout=15).stdout.strip()
 
-    def command(self, program, *args, ok=True):
+    def command(self, program, *args, ok=True, expected=None):
         process = subprocess.run([str(program), "--repo", str(self.repo), *args], env=self.env,
                                  text=True, capture_output=True, timeout=20)
-        self.assertEqual(process.returncode, 0 if ok else 2, process.stdout + process.stderr)
+        expected = (0 if ok else 2) if expected is None else expected
+        self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
         return json.loads(process.stdout)
+
+    def advance_integration(self, name="integration.txt", content="advance\n"):
+        path = self.repo / name
+        path.write_text(content, encoding="utf-8")
+        self.git("add", name)
+        self.git("commit", "-qm", f"advance {name}")
+        return self.git("rev-parse", "HEAD")
+
+    def assessment_packet(self, verified, complexity="simple", **overrides):
+        review = verified["review"]
+        receipt = verified["receipt"]
+        packet = {
+            "commit": receipt["commit"],
+            "base": receipt["base"],
+            "worktree": receipt["worktree"],
+            "reviewed_commit": review["reviewed_commit"],
+            "rebase_digest": review["rebase_digest"],
+            "complexity": complexity,
+            "evidence": "Local value reconciliation preserves the value prefix and consumer contract.",
+        }
+        packet.update(overrides)
+        return packet
 
     def ready(self, name="leaf"):
         task = "example/" + name
@@ -76,9 +99,9 @@ class VerifierTests(unittest.TestCase):
         return {"commands": [{"name": "behavior", "argv": [sys.executable, "-c", code],
                               "timeout_seconds": timeout}], "total_timeout_seconds": 10}
 
-    def verify(self, task, plan=None, ok=True):
+    def verify(self, task, plan=None, ok=True, expected=None):
         return self.command(VERIFY, "verify", task, "--plan", json.dumps(plan or self.plan(task)),
-                            "--summary", "Persisted value verified", ok=ok)
+                            "--summary", "Persisted value verified", ok=ok, expected=expected)
 
     def status(self, task):
         return self.command(VERIFY, "status", task)
@@ -111,6 +134,16 @@ class VerifierTests(unittest.TestCase):
 
     def integrate(self, task, ok=True):
         return self.command(VERIFY, "integrate", task, ok=ok)
+    def assess(self, task, packet, ok=True):
+        return self.command(VERIFY, "assess-rebase", task, "--packet", json.dumps(packet), ok=ok)
+
+    def counted_plan(self, task, marker, code=None, timeout=5):
+        code = code or (
+            f"from pathlib import Path; p=Path({str(marker)!r}); "
+            "p.write_text((p.read_text() if p.exists() else '') + 'run\\n'); "
+            f"assert Path({(Path(task).name + '.txt')!r}).read_text().startswith('value')"
+        )
+        return self.plan(task, code, timeout)
 
     @staticmethod
     def finding():
@@ -291,22 +324,6 @@ class VerifierTests(unittest.TestCase):
         text = Path(accepted["review_file"]).read_text()
         self.assertIn(original["commit"], text)
         self.assertIn(fixed["commit"], text)
-
-    def test_only_exact_round_user_waiver_unblocks_two_availability_failures(self):
-        task, _ = self.ready()
-        receipt = self.verify(task)["receipt"]
-        packet = self.packet(task, receipt)
-        for reviewer in packet["reviewers"]:
-            reviewer.update(status="quota", raw_report="provider quota exhausted", error="provider quota exhausted")
-        waiting = self.review(task, packet, ok=False)
-        self.assertEqual(waiting["code"], "waiver_required")
-        self.integrate(task, ok=False)
-        packet["waiver"] = {"commit": receipt["commit"], "round": packet["round"],
-                             "consent": "Proceed without review for this commit", "source": "fixture developer response"}
-        self.review(task, packet)
-        self.integrate(task)
-        self.assertEqual(self.lifecycle(task), "done")
-
     def test_parallel_gates_do_not_hold_repository_lock(self):
         tasks = [self.ready("first")[0], self.ready("second")[0]]
         release = self.root / "release"
@@ -325,15 +342,27 @@ class VerifierTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, stdout + stderr)
             self.assertEqual(json.loads(stdout)["code"], "verified")
 
-    def test_concurrent_integration_rejects_stale_base_then_replays(self):
+    def test_concurrent_integration_reuses_review_after_clean_rebase(self):
         tasks = [self.ready("first")[0], self.ready("second")[0]]
         packets = {}
+        plans = {}
+        markers = {}
+        conformance_markers = {}
         for task in tasks:
-            receipt = self.verify(task)["receipt"]
+            marker = self.root / (Path(task).name + "-gates")
+            markers[task] = marker
+            plans[task] = self.counted_plan(task, marker)
+            plans[task]["commands"][0]["name"] = "unit"
+            conformance_markers[task] = self.root / (Path(task).name + "-conformance")
+            conformance = self.counted_plan(task, conformance_markers[task])["commands"][0]
+            conformance["name"] = "conformance"
+            plans[task]["commands"].append(conformance)
+            receipt = self.verify(task, plans[task])["receipt"]
             packets[task] = self.packet(task, receipt)
             self.review(task, packets[task])
         processes = [subprocess.Popen([str(VERIFY), "--repo", str(self.repo), "integrate", task],
-                                     env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for task in tasks]
+                                      env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for task in tasks]
         outputs = []
         for process in processes:
             stdout, stderr = process.communicate(timeout=15)
@@ -341,14 +370,180 @@ class VerifierTests(unittest.TestCase):
             outputs.append(json.loads(stdout))
         self.assertEqual({outcome["code"] for outcome in outputs}, {"integrated", "needs_verification"})
         stale = tasks[next(index for index, outcome in enumerate(outputs) if not outcome["ok"])]
-        receipt = self.verify(stale)["receipt"]
-        self.review(stale, packets[stale], ok=False)
-        self.integrate(stale, ok=False)
-        self.review(stale, self.packet(stale, receipt))
+        old_packet = packets[stale]
+        receipt = self.verify(stale, plans[stale])
+        self.assertEqual(receipt["review"]["action"], "reuse")
+        rejected = self.review(stale, old_packet, ok=False)
+        self.assertEqual(rejected["code"], "stale_review")
+        self.assertTrue(self.status(stale)["state"]["reviews_done"])
         self.integrate(stale)
-        self.assertTrue(all(self.lifecycle(task) == "done" for task in tasks))
-        self.assertEqual((self.repo / "first.txt").read_text(), "value\n")
+        self.assertEqual(self.lifecycle(stale), "done")
+        self.assertEqual(len(markers[stale].read_text().splitlines()), 2)
+        self.assertEqual(conformance_markers[stale].read_text().splitlines(), ["run", "run"])
+        self.assertEqual(self.status(stale)["state"]["review_round"], 1)
         self.assertEqual((self.repo / "second.txt").read_text(), "value\n")
+
+        self.assertEqual((self.repo / "first.txt").read_text(), "value\n")
+
+    def test_unreviewed_candidate_is_blocked_and_first_dual_review_is_persistent(self):
+        task, _ = self.ready()
+        verified = self.verify(task)
+        self.assertEqual(verified["review"]["action"], "review_required")
+        self.integrate(task, ok=False)
+        self.assertNotEqual(self.lifecycle(task), "done")
+        state = self.status(task)["state"]
+        self.assertFalse(state.get("reviews_done", False))
+        accepted = self.review(task, self.packet(task, verified["receipt"]))
+        self.assertTrue(accepted["ok"])
+        state = self.status(task)["state"]
+        self.assertTrue(state["reviews_done"])
+        self.assertEqual(state["review_round"], 1)
+        self.integrate(task)
+
+    def test_plan_change_runs_fresh_gates_but_keeps_review_for_metadata_only_commit(self):
+        task, _ = self.ready()
+        marker = self.root / "plan-gates"
+        original = self.counted_plan(task, marker)
+        first = self.verify(task, original)
+        self.review(task, self.packet(task, first["receipt"]))
+        self.env["GIT_COMMITTER_DATE"] = "2001-01-01T00:00:00+0000"
+        self.amend(task)
+        changed = self.counted_plan(task, marker, code=(
+            f"from pathlib import Path; p=Path({str(marker)!r}); "
+            "p.write_text((p.read_text() if p.exists() else '') + 'changed\\n'); "
+            f"assert Path({(Path(task).name + '.txt')!r}).read_text() == 'value\\n'"
+        ))
+        rebound = self.verify(task, changed)
+        self.assertEqual(rebound["receipt"]["tree"], first["receipt"]["tree"])
+        self.assertNotEqual(rebound["receipt"]["commit"], first["receipt"]["commit"])
+        self.assertEqual(rebound["review"]["action"], "reuse")
+        self.assertEqual(len(marker.read_text().splitlines()), 2)
+        self.assertEqual(self.status(task)["state"]["review_round"], 1)
+        self.integrate(task)
+
+    def test_repeated_clean_rebases_retain_one_review_but_source_edits_require_review(self):
+        task, wt = self.ready()
+        first = self.verify(task)
+        self.review(task, self.packet(task, first["receipt"]))
+        self.advance_integration("advance-one.txt")
+        replayed = self.verify(task)
+        self.assertEqual(replayed["review"]["action"], "reuse")
+        self.advance_integration("advance-two.txt")
+        replayed_again = self.verify(task)
+        self.assertEqual(replayed_again["review"]["action"], "reuse")
+        history = self.status(task)["helper"]["rebase_history"]
+        self.assertEqual(len(history), 2)
+        self.assertEqual(self.status(task)["state"]["review_round"], 1)
+        edited, edited_wt = self.ready("edited")
+        approved = self.verify(edited)
+        self.review(edited, self.packet(edited, approved["receipt"]))
+        self.advance_integration("advance-edited.txt")
+        (edited_wt / "edited.txt").write_text("value changed before replay\n", encoding="utf-8")
+        self.amend(edited)
+        changed = self.verify(edited)
+        self.assertEqual(changed["review"]["action"], "review_required")
+        self.integrate(edited, ok=False)
+
+        post, post_wt = self.ready("post")
+        approved = self.verify(post)
+        self.review(post, self.packet(post, approved["receipt"]))
+        self.advance_integration("advance-post.txt")
+        replayed = self.verify(post)
+        self.assertEqual(replayed["review"]["action"], "reuse")
+        (post_wt / "post.txt").write_text("value changed after replay\n", encoding="utf-8")
+        self.amend(post)
+        changed = self.verify(post)
+        self.assertEqual(changed["review"]["action"], "review_required")
+        self.integrate(post, ok=False)
+
+
+    def test_rebase_conflict_requires_assessment_and_simple_assessment_reuses_review(self):
+        task, wt = self.ready()
+        initial = self.verify(task)
+        self.review(task, self.packet(task, initial["receipt"]))
+        onto = self.advance_integration("leaf.txt", "integration version\n")
+        conflict = self.verify(task, expected=3)
+        self.assertEqual(conflict["code"], "repair_needed")
+        self.assertEqual(conflict["onto"], onto)
+        self.assertEqual(conflict["conflicts"], ["leaf.txt"])
+        (wt / "leaf.txt").write_text("value resolved\n", encoding="utf-8")
+        continued = self.command(WORKER, "continue-rebase", task)
+        self.assertTrue(continued["rebased"])
+        self.assertIsNone(self.status(task)["helper"]["pending_rebase"])
+        self.amend(task)
+        verified = self.verify(task)
+        self.assertEqual(verified["review"]["action"], "assessment_required")
+        history = self.status(task)["helper"]["rebase_history"]
+        self.assertTrue(history[-1]["conflicted"])
+        self.assertIn("leaf.txt", history[-1]["conflicts"])
+        self.integrate(task, ok=False)
+        self.assess(task, self.assessment_packet(verified, commit=initial["receipt"]["commit"]), ok=False)
+        stale = self.assessment_packet(verified, reviewed_commit="0" * 40)
+        self.assess(task, stale, ok=False)
+        mismatched = self.assessment_packet(verified, rebase_digest="not-the-rebase")
+        self.assess(task, mismatched, ok=False)
+        self.integrate(task, ok=False)
+        accepted = self.assess(task, self.assessment_packet(verified))
+        self.assertEqual(accepted["review"]["action"], "reuse")
+        self.assertEqual(self.status(task)["state"]["review_round"], 1)
+        self.advance_integration("after-simple.txt")
+        self.assertEqual(self.verify(task)["review"]["action"], "reuse")
+        self.integrate(task)
+        self.assertEqual((self.repo / "leaf.txt").read_text(), "value resolved\n")
+
+    def test_complex_conflict_assessment_requires_fresh_pair(self):
+        task, wt = self.ready("complex")
+        initial = self.verify(task)
+        self.review(task, self.packet(task, initial["receipt"]))
+        self.advance_integration("complex.txt", "base advance\n")
+        conflict = self.verify(task, expected=3)
+        self.assertEqual(conflict["conflicts"], ["complex.txt"])
+        (wt / "complex.txt").write_text("value restructured\n", encoding="utf-8")
+        self.command(WORKER, "continue-rebase", task)
+        self.amend(task)
+        verified = self.verify(task)
+        self.assertEqual(verified["review"]["action"], "assessment_required")
+        complex_result = self.assess(task, self.assessment_packet(
+            verified, "complex", evidence="Resolution changes the component's algorithm and execution structure."))
+        self.assertEqual(complex_result["review"]["action"], "review_required")
+        self.integrate(task, ok=False)
+        self.advance_integration("after-complex.txt")
+        self.assertEqual(self.verify(task)["review"]["action"], "review_required")
+        current = self.status(task)["state"]["verification_receipt"]
+        accepted = self.review(task, self.packet(task, current))
+        self.assertTrue(accepted["ok"])
+        self.integrate(task)
+
+    def test_rebased_gate_failure_blocks_even_previously_approved_work(self):
+        task, _ = self.ready()
+        initial = self.verify(task)
+        self.review(task, self.packet(task, initial["receipt"]))
+        self.advance_integration()
+        failed = self.verify(task, self.plan(task, "raise SystemExit(17)"), ok=False)
+        self.assertEqual(failed["code"], "gate_failed")
+        self.integrate(task, ok=False)
+        self.assertNotEqual(self.lifecycle(task), "done")
+        self.assertEqual(self.verify(task)["review"]["action"], "reuse")
+        self.integrate(task)
+
+    def test_exact_commit_exceptions_do_not_transfer_across_rebase(self):
+        for reduced_coverage in (False, True):
+            with self.subTest(reduced_coverage=reduced_coverage):
+                task, _ = self.ready("reduced" if reduced_coverage else "waived")
+                initial = self.verify(task)
+                packet = self.packet(task, initial["receipt"])
+                for reviewer in packet["reviewers"][1 if reduced_coverage else 0:]:
+                    reviewer.update(status="quota", raw_report="provider quota exhausted",
+                                    error="provider quota exhausted")
+                if not reduced_coverage:
+                    packet["waiver"] = {"commit": initial["receipt"]["commit"], "round": packet["round"],
+                                       "consent": "Proceed without review for this commit",
+                                       "source": "fixture developer response"}
+                self.review(task, packet)
+                self.assertFalse(self.status(task)["state"]["reviews_done"])
+                self.advance_integration(Path(task).name + "-advance.txt")
+                self.assertEqual(self.verify(task)["review"]["action"], "review_required")
+                self.integrate(task, ok=False)
 
     def test_fast_forward_metadata_failure_recovers_without_another_merge(self):
         task, wt = self.ready()
