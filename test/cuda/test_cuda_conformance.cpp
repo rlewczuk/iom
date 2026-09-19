@@ -23,6 +23,7 @@
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
+#include "backend/backend_conformance_rope.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "iom/cpu/device.hpp"
@@ -935,6 +936,17 @@ TEST_CASE("CUDA conformance: RMSNorm reference, admission, and lifetime") {
             "cuda_detail::SubmissionFault::event_record",
             {}};
     iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA conformance: rotary position encoding reference and storage") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    iom_conformance::rope_reference::run_rope_conformance(
+            *devices.candidate,
+            iom_conformance::rope_reference::kRopeCudaExpectedSupported,
+            oracle);
     CHECK_FALSE(devices.gate.armed());
 }
 

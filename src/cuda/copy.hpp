@@ -367,10 +367,12 @@ struct gpu_policy {
         return "CUDA SiLU kernel launch";
     }
 
-    // RoPE remains an explicit Unsupported policy stub until the independent
-    // CUDA wrapper leaf enables the shared standard-tiled launch.
+    // CUDA uses the shared standard-tiled RoPE kernel on the queue's
+    // already-created nonblocking stream.  Common admission and the queue
+    // retain the immutable request, metadata slot, owner leases, and
+    // completion proof; this policy contributes only the launch boundary.
     [[nodiscard]] static constexpr bool rope_supported() noexcept {
-        return false;
+        return true;
     }
 
     static void launch_rope(
