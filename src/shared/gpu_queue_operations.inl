@@ -122,6 +122,85 @@ oid GpuQueue<Policy>::binary_impl(const BinaryRequest& request) {
                 }
             });
 }
+template <typename Policy>
+WorkspaceRequirements
+GpuQueue<Policy>::cache_append_workspace_requirements(
+        const CacheAppendRequest&) {
+    if constexpr (requires(
+                          typename Policy::stream_type stream,
+                          const CacheAppendRequest& request) {
+                      Policy::launch_cache_append(stream, request);
+                  }) {
+        // CUDA and ROCm direct append paths use no common scratch. A policy
+        // that has not yet added its native launcher remains explicitly
+        // unsupported rather than acquiring resources in the shared queue.
+        return {0, 1};
+    } else {
+        throw detail::UnsupportedOperation();
+    }
+}
+
+template <typename Policy>
+oid GpuQueue<Policy>::cache_append_impl(
+        const CacheAppendRequest& request) {
+    if constexpr (requires(
+                          typename Policy::stream_type stream,
+                          const CacheAppendRequest& candidate) {
+                      Policy::launch_cache_append(stream, candidate);
+                  }) {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        auto completion = std::make_shared<CompletionState>();
+        const detail::Fence fence = build_fence(completion);
+        return submit_cache_append(
+                request, *registry_state_, registry_queue_id_, fence,
+                [this, completion](
+                        std::uint64_t sequence,
+                        const CacheAppendRequest& captured,
+                        detail::BinaryEntryRegistration entries) {
+                    auto submission = state_->try_acquire();
+                    if (submission == nullptr) {
+                        throw detail::AdmissionResourceUnavailable{};
+                    }
+                    completion->bind(submission);
+                    try {
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            const auto [it, inserted] =
+                                    outcomes_.try_emplace(sequence);
+                            if (!inserted) {
+                                throw std::logic_error(
+                                        "duplicate GPU cache append sequence");
+                            }
+                            it->second.cache_append_entries = entries;
+                            it->second.workspace_lease =
+                                    captured.workspace_lease;
+                            it->second.completion = completion;
+                            it->second.is_cache_append = true;
+                        }
+                        Task task;
+                        task.sequence = sequence;
+                        task.is_cache_append = true;
+                        task.cache_append_request.emplace(captured);
+                        task.cache_append_entries = entries;
+                        task.submission = submission.get();
+                        task.completion = completion;
+                        task.fence = task.submission;
+                        worker_.submit_copy(std::move(task));
+                    } catch (...) {
+                        {
+                            std::lock_guard<std::mutex> lock(outcome_mutex_);
+                            outcomes_.erase(sequence);
+                        }
+                        completion->clear();
+                        throw;
+                    }
+                });
+    } else {
+        static_cast<void>(request);
+        throw detail::UnsupportedOperation();
+    }
+}
 
 template <typename Policy>
 oid GpuQueue<Policy>::rmsnorm_impl(const RmsnormRequest& request) {
@@ -492,6 +571,28 @@ void GpuQueue<Policy>::execute(Task& task) {
                     state_->event_of(*task.submission), stream_);
             event_recorded = true;
             state_->mark_event_recorded(*task.submission);
+        } else if (task.is_cache_append) {
+            const CacheAppendRequest& request =
+                    *task.cache_append_request;
+            if constexpr (requires(
+                                  typename Policy::stream_type stream,
+                                  const CacheAppendRequest& candidate) {
+                              Policy::launch_cache_append(stream, candidate);
+                          }) {
+                native_work_submitted = true;
+                Policy::launch_cache_append(stream_, request);
+                if constexpr (requires {
+                                  Policy::after_cache_append_launch();
+                              }) {
+                    Policy::after_cache_append_launch();
+                }
+                Policy::record_event(
+                        state_->event_of(*task.submission), stream_);
+                event_recorded = true;
+                state_->mark_event_recorded(*task.submission);
+            } else {
+                throw detail::UnsupportedOperation();
+            }
         } else if (task.is_rmsnorm) {
             const RmsnormRequest& request = *task.rmsnorm_request;
             const std::size_t metadata_bytes =
@@ -675,7 +776,15 @@ void GpuQueue<Policy>::complete_task(
         failure = result.failure;
     }
     const bool failed = static_cast<bool>(failure);
-    if (outcome.is_binary || outcome.is_embedding || outcome.is_linear) {
+    if (outcome.is_cache_append) {
+        (void)detail::release_or_invalidate_binary_entries(
+                registry_state_->registry, outcome.cache_append_entries,
+                failed, completion_proven);
+        detail::complete_workspace_lease(
+                *registry_state_, outcome.workspace_lease,
+                completion_proven);
+    } else if (outcome.is_binary || outcome.is_embedding
+            || outcome.is_linear) {
         (void)detail::release_or_invalidate_binary_entries(
                 registry_state_->registry, outcome.binary_entries,
                 failed, completion_proven);

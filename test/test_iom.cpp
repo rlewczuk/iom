@@ -1580,6 +1580,110 @@ private:
     bool next_failure_ = false;
 };
 
+class CacheAppendQueue final : public iom::DeviceOps {
+public:
+    enum class Failure {
+        none,
+        post_acceptance,
+    };
+
+    struct Record {
+        std::uint64_t sequence;
+        iom::DeviceOps::CacheAppendRequest request;
+        iom::detail::BinaryEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
+        bool retained_failure;
+    };
+
+    explicit CacheAppendQueue(const iom::Device& device)
+            : iom::DeviceOps(device) {}
+
+    using iom::DeviceOps::cache_append_workspace_requirements;
+    using iom::DeviceOps::commit_failure;
+    using iom::DeviceOps::complete;
+
+    void set_requirements(
+            iom::WorkspaceRequirements requirements) noexcept {
+        requirements_ = requirements;
+    }
+
+    void inject_failure(Failure failure) noexcept {
+        next_failure_ = failure;
+    }
+
+    [[nodiscard]] const std::vector<Record>& records() const noexcept {
+        return records_;
+    }
+
+    [[nodiscard]] std::size_t query_count() const noexcept {
+        return query_count_;
+    }
+
+    [[nodiscard]] std::size_t registered_at(const void* address) const {
+        return registry_state_.registry
+                .snapshot_for(const_cast<void*>(address))
+                .size();
+    }
+
+    void finish(std::uint64_t sequence) {
+        for (const Record& record : records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_binary_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, true);
+            iom::detail::complete_workspace_lease(
+                    registry_state_, record.workspace_lease, true);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake cache append sequence");
+    }
+
+protected:
+    iom::WorkspaceRequirements cache_append_workspace_requirements(
+            const CacheAppendRequest&) override {
+        ++query_count_;
+        return requirements_;
+    }
+
+    iom::oid cache_append_impl(
+            const CacheAppendRequest& request) override {
+        const Failure failure =
+                std::exchange(next_failure_, Failure::none);
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_cache_append(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence,
+                        const CacheAppendRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
+                    records_.push_back(Record{
+                            sequence, snapshot, entries,
+                            snapshot.workspace_lease,
+                            failure == Failure::post_acceptance});
+                    if (failure == Failure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake cache append retained failure")));
+                    }
+                });
+    }
+
+private:
+    iom::detail::RegistryState registry_state_;
+    iom::detail::QueueId registry_queue_id_ =
+            iom::detail::allocate_queue_id(registry_state_);
+    std::vector<Record> records_;
+    iom::WorkspaceRequirements requirements_{0, 1};
+    Failure next_failure_ = Failure::none;
+    std::size_t query_count_ = 0;
+};
 
 class InlineQueue final : public iom::DeviceOps {
 public:
@@ -2702,6 +2806,16 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         decltype(&DeviceOps::div),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
                                 TensorView&, iom::RawWorkspaceView) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::cache_append),
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&,
+                                std::size_t, iom::RawWorkspaceView) noexcept>);
+    static_assert(std::is_same_v<
+        decltype(static_cast<iom::WorkspaceRequirements (DeviceOps::*)(
+                const TensorView&, const TensorView&, std::size_t)>(
+                &DeviceOps::cache_append_workspace_requirements)),
+        iom::WorkspaceRequirements (DeviceOps::*)(
+                const TensorView&, const TensorView&, std::size_t)>);
     static_assert(std::is_same_v<
         decltype(&DeviceOps::embedding),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
@@ -3840,6 +3954,135 @@ TEST_CASE("Unported RMSNorm hooks reject before workspace inspection or effects"
     CHECK_EQ(token_sequence(probe), 1);
     CHECK_NOTHROW(queue.wait(probe));
 }
+TEST_CASE("Unported cache append rejects ranges before capability and effects") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    InlineQueue queue(device);
+    OwnedFakeTensor source(device, {2, 3, 5, 17});
+    OwnedFakeTensor destination(device, {2, 3, 8, 17});
+    OwnedFakeTensor probe_destination(device, {2, 3, 5, 17});
+    FakeWorkspace foreign_workspace(
+            foreign, reinterpret_cast<void*>(0x4800), 64);
+
+    // The explicit offset checks are ordered before capability dispatch.
+    CHECK_EQ(
+            queue.cache_append(
+                    source.view(), destination.view(), 9),
+            invalid);
+    CHECK_EQ(
+            queue.cache_append(
+                    source.view(), destination.view(), 4),
+            invalid);
+    CHECK_EQ(
+            queue.cache_append(
+                    source.view(), destination.view(), 2),
+            unsupported);
+    CHECK_EQ(
+            queue.cache_append(
+                    source.view(), destination.view(), 2,
+                    foreign_workspace.view()),
+            unsupported);
+    CHECK_THROWS_AS(
+            (void)queue.cache_append_workspace_requirements(
+                    source.view(), destination.view(), 2),
+            std::runtime_error);
+    // Every declared leaf is opaque to common admission and reaches the
+    // unported capability hook rather than being treated as arithmetic.
+    UnportedQueue opaque_queue(device);
+    for (const iom::DataType data_type : kAllDataTypes) {
+        OwnedFakeTensor typed_source(
+                device, {2, 3, 5, 17}, data_type);
+        OwnedFakeTensor typed_destination(
+                device, {2, 3, 8, 17}, data_type);
+        CHECK_EQ(
+                opaque_queue.cache_append(
+                        typed_source.view(), typed_destination.view(), 2),
+                unsupported);
+    }
+
+
+    // Both rejected calls leave the queue sequence untouched.
+    const iom::oid probe =
+            queue.copy(source.view(), probe_destination.view());
+    REQUIRE(iom::oid_is_token(probe));
+    CHECK_EQ(token_sequence(probe), 1);
+    CHECK_NOTHROW(queue.wait(probe));
+}
+TEST_CASE("Cache append snapshots operands and retains workspace through completion") {
+    FakeDevice device;
+    CacheAppendQueue queue(device);
+    queue.set_requirements({64, 32});
+    OwnedFakeTensor source(device, {2, 3, 5, 17});
+    OwnedFakeTensor destination(device, {2, 3, 8, 17});
+    FakeWorkspace workspace(
+            device, reinterpret_cast<void*>(0x6000), 128);
+
+
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements queried =
+            queue.cache_append_workspace_requirements(
+                    source.view(), destination.view(), 2);
+    const std::size_t query_allocations = iom_test::disarm();
+    CHECK(queried == iom::WorkspaceRequirements{64, 32});
+    CHECK_EQ(query_allocations, std::size_t{0});
+    CHECK_EQ(queue.query_count(), std::size_t{1});
+
+    iom::oid accepted = 0;
+    {
+        iom::TensorView source_view = source.view();
+        iom::TensorView destination_view = destination.view();
+        accepted = queue.cache_append(
+                source_view, destination_view, 2, workspace.view());
+    }
+    REQUIRE(iom::oid_is_token(accepted));
+    REQUIRE_EQ(queue.records().size(), std::size_t{1});
+    const CacheAppendQueue::Record& record = queue.records().back();
+    CHECK_EQ(record.request.a, std::size_t{2});
+    CHECK_EQ(record.request.source.rank, std::size_t{4});
+    CHECK_EQ(record.request.source.dimensions[2], std::size_t{5});
+    CHECK_EQ(record.request.destination.dimensions[2], std::size_t{8});
+    CHECK_EQ(record.request.workspace_requirements.bytes, std::size_t{64});
+    CHECK_EQ(record.entries.count, std::size_t{2});
+    CHECK_EQ(queue.registered_at(source.view().native_handle()), std::size_t{1});
+    CHECK_EQ(
+            queue.registered_at(destination.view().native_handle()),
+            std::size_t{1});
+
+    // A second submission cannot overlap the retained workspace lease.
+    CHECK_EQ(
+            queue.cache_append(
+                    source.view(), destination.view(), 2, workspace.view()),
+            iom::to_oid(iom::OidError::ResourceExhausted));
+
+    queue.finish(token_sequence(accepted));
+    CHECK_EQ(queue.registered_at(source.view().native_handle()), std::size_t{0});
+    CHECK_EQ(
+            queue.registered_at(destination.view().native_handle()),
+            std::size_t{0});
+
+    CacheAppendQueue failing(device);
+    failing.set_requirements({64, 32});
+    failing.inject_failure(CacheAppendQueue::Failure::post_acceptance);
+    const iom::oid failed = failing.cache_append(
+            source.view(), destination.view(), 2, workspace.view());
+    REQUIRE(iom::oid_is_token(failed));
+    failing.finish(token_sequence(failed));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        CHECK_THROWS_WITH_AS(
+                failing.wait(failed),
+                "fake cache append retained failure",
+                std::runtime_error);
+    }
+    CHECK_EQ(
+            failing.registered_at(source.view().native_handle()),
+            std::size_t{1});
+    CHECK_EQ(
+            failing.registered_at(destination.view().native_handle()),
+            std::size_t{1});
+}
+
 
 namespace {
 
@@ -6856,10 +7099,14 @@ TEST_CASE(
     const iom::RawWorkspaceView full = workspace.view();
 
     // Live, correctly sized, aligned, and disjoint from every operand.
-    CHECK(iom::detail::WorkspaceValidation::validated(
-                  device, full, 64, 32, operands) == full);
-    CHECK(iom::detail::WorkspaceValidation::validated(
-                  device, full, 64, 32, {}) == full);
+    const iom::RawWorkspaceView validated =
+            iom::detail::WorkspaceValidation::validated(
+                    device, full, 64, 32, operands);
+    CHECK(validated == full);
+    const iom::RawWorkspaceView validated_without_operands =
+            iom::detail::WorkspaceValidation::validated(
+                    device, full, 64, 32, {});
+    CHECK(validated_without_operands == full);
 
     // Foreign device and dead owner.
     CHECK_THROWS_AS(
