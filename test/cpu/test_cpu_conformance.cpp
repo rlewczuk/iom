@@ -14,6 +14,8 @@
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
+#include "backend/backend_conformance_rope.hpp"
+
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "iom/alloc.hpp"
@@ -85,6 +87,20 @@ struct CpuDevices {
         return {*reference, *candidate, *foreign};
     }
 };
+// Submit only derived temporary views so the worker can only succeed by using
+// the value-captured snapshot. The source owner is released by the caller
+// before the dependent copy is waited, exercising registry retention.
+iom::oid submit_temporary_rope(
+        iom::DeviceOps& queue, iom::Tensor& source,
+        iom::Tensor& destination) {
+    return queue.rope(
+            source.view().slice(0, 0, 1),
+            const_cast<iom::TensorView&>(
+                    static_cast<const iom::TensorView&>(
+                            destination.view().slice(0, 0, 1))),
+            0, 10000.0);
+}
+
 
 }  // namespace
 
@@ -354,6 +370,105 @@ TEST_CASE("CPU conformance: RMSNorm reference, admission, and lifetime") {
     iom_conformance::run_rmsnorm_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
+// The CPU port covers the complete nine-leaf RoPE span. The runner owns the
+// independent split-half oracle and exercises transformed views, tails,
+// poisoned padding, absolute positions, and the fixed zero-workspace query
+// through the real asynchronous CPU queue.
+TEST_CASE("CPU conformance: RoPE reference, admission, and lifetime") {
+    CpuDevices devices;
+    iom_conformance::rope_reference::run_rope_conformance(
+            *devices.candidate,
+            iom_conformance::rope_reference::kRopeCpuExpectedSupported);
+    CHECK_FALSE(devices.gate.armed());
+}
+TEST_CASE("CPU conformance: RoPE keeps inapplicable leaves explicitly unsupported") {
+    CpuDevices devices;
+    auto queue = devices.candidate->create_ops();
+    for (const iom::DataType data_type
+            : iom_conformance::rope_reference::kRopeUnsupportedDataTypes) {
+        const iom::TensorSpec leaf_shape{
+                iom::TensorShape{{1, 1, 1, 16}}, data_type};
+        auto source = devices.candidate->create_tensor(leaf_shape);
+        auto destination = devices.candidate->create_tensor(leaf_shape);
+        CHECK_EQ(
+                queue->rope(source->view(), destination->view(), 0, 1.0),
+                iom::to_oid(iom::OidError::Unsupported));
+        CHECK_THROWS_AS(
+                (void)queue->rope_workspace_requirements(
+                        source->view(), destination->view(), 0, 1.0),
+                std::runtime_error);
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU RoPE retains owners and preserves FIFO ordering for temporary views") {
+    CpuDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{2, 3, 17, 18}}, iom::DataType::F32};
+    std::unique_ptr<iom::Tensor> source =
+            devices.candidate->create_tensor(spec);
+    std::unique_ptr<iom::Tensor> first =
+            devices.candidate->create_tensor(spec);
+    std::unique_ptr<iom::Tensor> second =
+            devices.candidate->create_tensor(spec);
+    const std::vector<std::byte> pattern =
+            iom_conformance::encode_logical(spec, 0xC0DE);
+    const std::vector<std::byte> zero(
+            spec.logical_nbytes(), std::byte{0});
+    iom_conformance::copy_from_host(source->view(), pattern);
+    iom_conformance::copy_from_host(first->view(), zero);
+    iom_conformance::copy_from_host(second->view(), zero);
+
+    const iom::TensorView first_slice = first->view().slice(0, 0, 1);
+    const iom::TensorView second_slice = second->view().slice(0, 0, 1);
+    const std::size_t slice_bytes = first_slice.spec().logical_nbytes();
+    const std::vector<std::byte> expected_slice(
+            pattern.begin(),
+            pattern.begin() + static_cast<std::ptrdiff_t>(slice_bytes));
+
+    auto queue = devices.candidate->create_ops();
+    const iom::oid rope_token =
+            submit_temporary_rope(*queue, *source, *first);
+    REQUIRE(iom::oid_is_token(rope_token));
+    // The worker must retain source's owner registration after this reset.
+    source.reset();
+
+    const iom::oid copy_token = queue->copy(
+            first_slice,
+            const_cast<iom::TensorView&>(
+                    static_cast<const iom::TensorView&>(second_slice)));
+    REQUIRE(iom::oid_is_token(copy_token));
+    REQUIRE_NOTHROW(queue->wait(copy_token));
+    CHECK_NOTHROW(queue->wait(rope_token));
+    CHECK_NOTHROW(queue->wait(copy_token));
+
+    const std::vector<std::byte> observed_first =
+            iom_conformance::read_logical(first_slice);
+    const std::vector<std::byte> observed_second =
+            iom_conformance::read_logical(second_slice);
+    CHECK(observed_second == observed_first);
+
+    // Position zero is an encoded-bit identity. Checking each head's first
+    // logical row also proves that the temporary-view slice addressed the
+    // expected independent head planes rather than a contiguous owner base.
+    const std::size_t rank = first_slice.spec().shape.rank();
+    const std::size_t heads = first_slice.spec().shape.dimension(rank - 3);
+    const std::size_t rows = first_slice.spec().shape.dimension(rank - 2);
+    const std::size_t width = first_slice.spec().shape.dimension(rank - 1);
+    const std::size_t row_bytes = width * sizeof(float);
+    const std::size_t head_bytes = rows * row_bytes;
+    for (std::size_t head = 0; head < heads; ++head) {
+        const std::size_t offset = head * head_bytes;
+        for (std::size_t byte = 0; byte < row_bytes; ++byte) {
+            CHECK_EQ(observed_first[offset + byte], expected_slice[offset + byte]);
+        }
+    }
+    CHECK_FALSE(devices.gate.armed());
+    // CPU has no fault-injection seam for an accepted worker failure; repeat
+    // waits above cover the successful retained-completion path.
+}
+
+
 
 TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     CpuDevices devices;
