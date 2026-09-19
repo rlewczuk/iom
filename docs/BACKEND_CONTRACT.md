@@ -1187,6 +1187,14 @@ MUST return `Unsupported` for a recognized but unported capability.
 | CPU / CUDA / ROCm / SYCL (standard tiled) | support all 23 storage leaves | zero workspace (`{0, 1}`); direct existing tiled writes through the 16x16 mapping |
 | TTNN (native) | store 22 leaves, excluding `F8_E8M0` | positive, explicit caller-owned host workspace containing one complete padded source-plane image plus one complete padded destination-plane image reused serially; deferred native padded-byte download/patch/upload using the existing 32x32 tile/four-face mapping |
 
+The SYCL standard-tiled path uses the exact-device in-order queue and one
+native `parallel_for` over destination words after the fixed immutable
+descriptor upload. It advertises all 23 opaque leaves, including `BF16` and
+`F8_E8M0`, with `QuantizationFormat::NONE`, reports `{0, 1}`, and performs no
+payload staging, caller-workspace lease, or host payload round trip. A missing
+Level Zero GPU or another unsupported SYCL runtime is reported through the
+common unsupported/resource-exhaustion categories; this path is never emulated.
+
 BF16 is mandatory on all five backends, and `QuantizationFormat::NONE` is the
 only applicable quantization format. No route may zero storage, convert or
 re-encode payloads, allocate hidden workspace, or use native partial-row or

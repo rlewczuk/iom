@@ -31,10 +31,12 @@ class SyclQueue final : public DeviceOps {
         std::optional<CopyRequest> copy_request;
         std::optional<BinaryRequest> binary_request;
         std::optional<EmbeddingRequest> embedding_request;
+        std::optional<CacheAppendRequest> cache_append_request;
         std::shared_ptr<SyclFenceState> state;
         void* fence = nullptr;
         detail::EntryRegistration copy_entries;
         detail::BinaryEntryRegistration binary_entries;
+        detail::BinaryEntryRegistration cache_append_entries;
         // Immutable RMS normalization request captured by admission, plus the
         // common owner registrations retained until proven completion. RMS
         // normalization consumes no `RawWorkspace`, so no lease is carried.
@@ -65,6 +67,7 @@ class SyclQueue final : public DeviceOps {
         // deduplicated owner sets; both currently consume no raw workspace.
         std::optional<detail::BinaryEntryRegistration> linear_entries;
         std::optional<detail::BinaryEntryRegistration> rope_entries;
+        std::optional<detail::BinaryEntryRegistration> cache_append_entries;
     };
 
 public:
@@ -97,6 +100,10 @@ public:
             const TensorView& source,
             TensorView& destination) override;
     oid binary_impl(const BinaryRequest& request) override;
+    [[nodiscard]] WorkspaceRequirements
+            cache_append_workspace_requirements(
+                    const CacheAppendRequest& request) override;
+    oid cache_append_impl(const CacheAppendRequest& request) override;
     oid embedding_impl(const EmbeddingRequest& request) override;
     oid rmsnorm_impl(const RmsnormRequest& request) override;
     oid linear_impl(const LinearRequest& request) override;
@@ -152,11 +159,11 @@ public:
 private:
     void execute(Task& task);
     void execute_binary(Task& task);
+    void execute_cache_append(Task& task);
     void execute_embedding(Task& task);
     void execute_rmsnorm(Task& task);
     void execute_linear(Task& task);
     void execute_rope(Task& task);
-
     // Immutable capability predicate of the linear scalar leaf set, shared by
     // the pure requirement query and the admitted execution hook so the query
     // and the call can never disagree about `F64`.
