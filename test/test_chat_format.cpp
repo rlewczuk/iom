@@ -1,7 +1,10 @@
 #include <doctest/doctest.h>
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -10,8 +13,11 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "iom/chat_format.hpp"
+#include "iom/tokenizer.hpp"
+#include "tokenizer_fixture.hpp"
 
 namespace {
 
@@ -128,6 +134,67 @@ std::string format_invalid_reason(
 
 
 }  // namespace
+
+using iom_tokenizer_test::write_tokenizer;
+
+std::string distribution_template() {
+    return "{% for message in messages %}\n"
+           "{% if message['role'] == 'user' %}\n"
+           "{{ '<|user|>\\n' + message['content'] + eos_token }}\n"
+           "{% elif message['role'] == 'system' %}\n"
+           "{{ '<|system|>\\n' + message['content'] + eos_token }}\n"
+           "{% elif message['role'] == 'assistant' %}\n"
+           "{{ '<|assistant|>\\n' + message['content'] + eos_token }}\n"
+           "{% endif %}\n"
+           "{% if loop.last and add_generation_prompt %}\n"
+           "{{ '<|assistant|>' }}\n"
+           "{% endif %}\n"
+           "{% endfor %}";
+}
+
+std::string fixed_override_template() {
+    return "{% for message in messages %}"
+           "{% if message['role'] == 'system' %}"
+           "{{ 'OVERRIDE_SYSTEM:' + message['content'] + eos_token }}\n"
+           "{% elif message['role'] == 'user' %}"
+           "{{ 'OVERRIDE_USER:' + message['content'] + eos_token }}\n"
+           "{% elif message['role'] == 'assistant' %}"
+           "{{ 'OVERRIDE_ASSISTANT:' + message['content'] + eos_token }}\n"
+           "{% endif %}"
+           "{% if loop.last and add_generation_prompt %}"
+           "{{ 'OVERRIDE_GENERATION:' }}"
+           "{% endif %}"
+           "{% endfor %}";
+}
+
+void write_composition_artifact(const TempDir& directory) {
+    write_tokenizer(directory.path());
+    write_config(directory, valid_config(distribution_template()));
+}
+
+void check_prompt_encoding(
+        const iom::Tokenizer& tokenizer, std::string_view rendered,
+        const std::vector<std::uint32_t>& expected_without_specials,
+        const std::vector<std::uint32_t>& expected_with_specials,
+        std::string_view decoded_without_specials,
+        std::string_view decoded_skip_specials,
+        std::string_view decoded_with_specials) {
+    const auto without_specials =
+            tokenizer.encode(rendered, iom::EncodeOptions{false});
+    CHECK(without_specials == expected_without_specials);
+    CHECK(tokenizer.decode(without_specials, iom::DecodeOptions{false})
+          == decoded_without_specials);
+    CHECK(tokenizer.decode(without_specials, iom::DecodeOptions{true})
+          == decoded_skip_specials);
+
+    const auto with_specials =
+            tokenizer.encode(rendered, iom::EncodeOptions{true});
+    CHECK(with_specials == expected_with_specials);
+    CHECK(tokenizer.decode(with_specials, iom::DecodeOptions{false})
+          == decoded_with_specials);
+    CHECK(tokenizer.decode(with_specials, iom::DecodeOptions{true})
+          == decoded_skip_specials);
+}
 
 TEST_CASE("Chat format loads the validated default and formats owned literals") {
     const TempDir directory("default");
@@ -314,4 +381,281 @@ TEST_CASE("Chat format rejects invalid message input before rendering") {
 
     const iom::ChatMessageView valid_message[] = {{"user", "x"}};
     CHECK(formatter->format(valid_message, false) == "<|user|>\nx</s>\n");
+}
+
+TEST_CASE("Chat format composes raw and structured owner paths") {
+    const TempDir directory("composition");
+    write_composition_artifact(directory);
+
+    const auto tokenizer = iom::load_tokenizer(directory.path());
+    const auto formatter = iom::load_chat_formatter(directory.path());
+    REQUIRE(tokenizer != nullptr);
+    REQUIRE(formatter != nullptr);
+
+    // Raw text bypasses the formatter and retains the tokenizer's own BOS
+    // policy.
+    CHECK(tokenizer->encode("hello", iom::EncodeOptions{false})
+          == std::vector<std::uint32_t>{268});
+    CHECK(tokenizer->encode("hello", iom::EncodeOptions{true})
+          == std::vector<std::uint32_t>{1, 268});
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{268}, {})
+          == "hello");
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1, 268}, {})
+          == "<s> hello");
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1, 268},
+                            iom::DecodeOptions{true})
+          == "hello");
+
+    CHECK(tokenizer->encode("<s>", iom::EncodeOptions{false})
+          == std::vector<std::uint32_t>{1});
+    CHECK(tokenizer->encode("<s>", iom::EncodeOptions{true})
+          == std::vector<std::uint32_t>{1, 1});
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1}, {}) == "<s>");
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1, 1}, {})
+          == "<s><s>");
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1, 1},
+                            iom::DecodeOptions{true})
+          == "");
+
+    const std::span<const iom::ChatMessageView> empty_messages;
+    CHECK(formatter->format(empty_messages, false) == "");
+    CHECK(formatter->format(empty_messages, true) == "");
+    CHECK(tokenizer->encode("", iom::EncodeOptions{false})
+          == std::vector<std::uint32_t>{});
+    CHECK(tokenizer->encode("", iom::EncodeOptions{true})
+          == std::vector<std::uint32_t>{1});
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{}, {}) == "");
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1}, {}) == "<s>");
+    CHECK(tokenizer->decode(std::vector<std::uint32_t>{1},
+                            iom::DecodeOptions{true})
+          == "");
+
+    const iom::ChatMessageView system_user[] = {
+            {"system", "system"},
+            {"user", "hello"},
+    };
+    const std::string system_user_rendered =
+            formatter->format(system_user, false);
+    CHECK(system_user_rendered
+          == "<|system|>\nsystem</s>\n<|user|>\nhello</s>\n");
+    check_prompt_encoding(
+            *tokenizer, system_user_rendered,
+            std::vector<std::uint32_t>{
+                    259, 63, 127, 118, 124, 118, 119, 261, 112, 127, 65,
+                    13,  118, 124, 118, 119, 261, 112, 2,   259, 13,  63,
+                    127, 120, 118, 261, 270, 127, 65,  13,  267, 2,   259,
+                    13},
+            std::vector<std::uint32_t>{
+                    1,   259, 63, 127, 118, 124, 118, 119, 261, 112, 127,
+                    65,  13,  118, 124, 118, 119, 261, 112, 2, 259, 13,
+                    63,  127, 120, 118, 261, 270, 127, 65, 13, 267, 2,
+                    259, 13},
+            "<|system|>\nsystem</s> \n<|user|>\nhello</s> \n",
+            "<|system|>\nsystem \n<|user|>\nhello \n",
+            "<s> <|system|>\nsystem</s> \n<|user|>\nhello</s> \n");
+
+    const std::string system_user_generation =
+            formatter->format(system_user, true);
+    CHECK(system_user_generation
+          == "<|system|>\nsystem</s>\n"
+             "<|user|>\nhello</s>\n"
+             "<|assistant|>\n");
+    check_prompt_encoding(
+            *tokenizer, system_user_generation,
+            std::vector<std::uint32_t>{
+                    259, 63, 127, 118, 124, 118, 119, 261, 112, 127, 65,
+                    13,  118, 124, 118, 119, 261, 112, 2,   259, 13,  63,
+                    127, 120, 118, 261, 270, 127, 65,  13,  267, 2,   259,
+                    13,  63,  127, 100, 118, 118, 108, 118, 119, 100, 113,
+                    119, 127, 65, 13},
+            std::vector<std::uint32_t>{
+                    1,   259, 63, 127, 118, 124, 118, 119, 261, 112, 127,
+                    65,  13,  118, 124, 118, 119, 261, 112, 2, 259, 13,
+                    63,  127, 120, 118, 261, 270, 127, 65, 13, 267, 2,
+                    259, 13, 63, 127, 100, 118, 118, 108, 118, 119, 100,
+                    113, 119, 127, 65, 13},
+            "<|system|>\nsystem</s> \n<|user|>\nhello</s> \n"
+            "<|assistant|>\n",
+            "<|system|>\nsystem \n<|user|>\nhello \n"
+            "<|assistant|>\n",
+            "<s> <|system|>\nsystem</s> \n<|user|>\nhello</s> \n"
+            "<|assistant|>\n");
+
+    const iom::ChatMessageView assistant_messages[] = {
+            {"user", "hello"},
+            {"assistant", "world"},
+    };
+    const std::string assistant_rendered =
+            formatter->format(assistant_messages, false);
+    CHECK(assistant_rendered
+          == "<|user|>\nhello</s>\n"
+             "<|assistant|>\nworld</s>\n");
+    check_prompt_encoding(
+            *tokenizer, assistant_rendered,
+            std::vector<std::uint32_t>{
+                    259, 63, 127, 120, 118, 261, 270, 127, 65,  13,  267,
+                    2,   259, 13,  63, 127, 100, 118, 118, 108, 118, 119,
+                    100, 113, 119, 127, 65, 13, 275, 2, 259, 13},
+            std::vector<std::uint32_t>{
+                    1,   259, 63, 127, 120, 118, 261, 270, 127, 65, 13,
+                    267, 2,   259, 13, 63, 127, 100, 118, 118, 108, 118,
+                    119, 100, 113, 119, 127, 65, 13, 275, 2, 259, 13},
+            "<|user|>\nhello</s> \n<|assistant|>\nworld</s> \n",
+            "<|user|>\nhello \n<|assistant|>\nworld \n",
+            "<s> <|user|>\nhello</s> \n<|assistant|>\nworld</s> \n");
+
+    const iom::ChatMessageView literal_message[] = {{"user", "<s>"}};
+    const std::string literal_rendered =
+            formatter->format(literal_message, false);
+    CHECK(literal_rendered == "<|user|>\n<s></s>\n");
+    check_prompt_encoding(
+            *tokenizer, literal_rendered,
+            std::vector<std::uint32_t>{
+                    259, 63, 127, 120, 118, 261, 270, 127, 65, 13, 1, 2,
+                    259, 13},
+            std::vector<std::uint32_t>{
+                    1, 259, 63, 127, 120, 118, 261, 270, 127, 65, 13, 1,
+                    2, 259, 13},
+            "<|user|>\n<s></s> \n",
+            "<|user|>\n \n",
+            "<s> <|user|>\n<s></s> \n");
+}
+
+TEST_CASE("Chat format composes formatter override and generation policy") {
+    const TempDir directory("composition-override");
+    write_composition_artifact(directory);
+
+    const auto tokenizer = iom::load_tokenizer(directory.path());
+    const auto default_formatter = iom::load_chat_formatter(directory.path());
+    const auto override_formatter =
+            iom::load_chat_formatter(directory.path(), fixed_override_template());
+    REQUIRE(tokenizer != nullptr);
+    REQUIRE(default_formatter != nullptr);
+    REQUIRE(override_formatter != nullptr);
+
+    const iom::ChatMessageView message[] = {{"user", "hello"}};
+    const std::string default_rendered =
+            default_formatter->format(message, true);
+    const std::string override_rendered =
+            override_formatter->format(message, false);
+    const std::string override_generation =
+            override_formatter->format(message, true);
+    CHECK(default_rendered
+          == "<|user|>\nhello</s>\n<|assistant|>\n");
+    CHECK(override_rendered == "OVERRIDE_USER:hello</s>\n");
+    CHECK(override_generation
+          == "OVERRIDE_USER:hello</s>\nOVERRIDE_GENERATION:");
+    CHECK(default_rendered != override_generation);
+    CHECK(override_rendered.find("</s>") != std::string::npos);
+    CHECK(override_generation.find("</s>") != std::string::npos);
+
+    check_prompt_encoding(
+            *tokenizer, override_rendered,
+            std::vector<std::uint32_t>{
+                    259, 82, 89, 72, 85, 85, 76, 71, 72, 98, 88, 86, 72,
+                    85, 61, 267, 2, 259, 13},
+            std::vector<std::uint32_t>{
+                    1, 259, 82, 89, 72, 85, 85, 76, 71, 72, 98, 88, 86, 72,
+                    85, 61, 267, 2, 259, 13},
+            "OVERRIDE_USER:hello</s> \n", "OVERRIDE_USER:hello \n",
+            "<s> OVERRIDE_USER:hello</s> \n");
+    check_prompt_encoding(
+            *tokenizer, override_generation,
+            std::vector<std::uint32_t>{
+                    259, 82, 89, 72, 85, 85, 76, 71, 72, 98, 88, 86, 72,
+                    85, 61, 267, 2, 259, 13, 82, 89, 72, 85, 85, 76, 71,
+                    72, 98, 74, 72, 81, 72, 85, 68, 87, 76, 82, 81, 61},
+            std::vector<std::uint32_t>{
+                    1, 259, 82, 89, 72, 85, 85, 76, 71, 72, 98, 88, 86,
+                    72, 85, 61, 267, 2, 259, 13, 82, 89, 72, 85, 85, 76,
+                    71, 72, 98, 74, 72, 81, 72, 85, 68, 87, 76, 82, 81,
+                    61},
+            "OVERRIDE_USER:hello</s> \nOVERRIDE_GENERATION:",
+            "OVERRIDE_USER:hello \nOVERRIDE_GENERATION:",
+            "<s> OVERRIDE_USER:hello</s> \nOVERRIDE_GENERATION:");
+
+    const std::string literal_override =
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{ 'S:' + message['content'] + eos_token }}"
+            "{% elif message['role'] == 'user' %}"
+            "{{ '<s>' + message['content'] + eos_token }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ 'A:' + message['content'] + eos_token }}"
+            "{% endif %}"
+            "{% endfor %}";
+    const auto literal_formatter =
+            iom::load_chat_formatter(directory.path(), literal_override);
+    REQUIRE(literal_formatter != nullptr);
+    const std::string literal_rendered =
+            literal_formatter->format(message, false);
+    CHECK(literal_rendered == "<s>hello</s>");
+    check_prompt_encoding(
+            *tokenizer, literal_rendered,
+            std::vector<std::uint32_t>{1, 268, 2},
+            std::vector<std::uint32_t>{1, 1, 268, 2},
+            "<s> hello</s>", "hello", "<s><s> hello</s>");
+}
+
+TEST_CASE("Chat format retains contextual boundary failures atomically") {
+    const TempDir directory("composition-errors");
+    write_composition_artifact(directory);
+    const auto tokenizer = iom::load_tokenizer(directory.path());
+    const auto formatter = iom::load_chat_formatter(directory.path());
+    REQUIRE(tokenizer != nullptr);
+    REQUIRE(formatter != nullptr);
+
+    std::unique_ptr<iom::ChatFormatter> malformed_formatter;
+    std::string malformed_reason;
+    try {
+        malformed_formatter = iom::load_chat_formatter(
+                directory.path(), std::string_view("{% for"));
+    } catch (const std::invalid_argument& error) {
+        malformed_reason = error.what();
+    }
+    CHECK(malformed_formatter == nullptr);
+    CHECK(malformed_reason.find("template_override") != std::string::npos);
+    CHECK(malformed_reason.find("byte offset") != std::string::npos);
+
+    const iom::ChatMessageView invalid_role[] = {{"User", "x"}};
+    std::string published_format = "sentinel";
+    std::string role_reason;
+    try {
+        published_format = formatter->format(invalid_role, false);
+    } catch (const std::invalid_argument& error) {
+        role_reason = error.what();
+    }
+    CHECK(published_format == "sentinel");
+    CHECK(role_reason.find("field 'role'") != std::string::npos);
+    CHECK(role_reason.find("User") != std::string::npos);
+
+    const std::string invalid_bytes("\xC3\x28", 2);
+    const iom::ChatMessageView invalid_content[] = {
+            {"user", invalid_bytes}};
+    published_format = "sentinel";
+    std::string content_reason;
+    try {
+        published_format = formatter->format(invalid_content, false);
+    } catch (const std::invalid_argument& error) {
+        content_reason = error.what();
+    }
+    CHECK(published_format == "sentinel");
+    CHECK(content_reason.find("field 'content'") != std::string::npos);
+    CHECK(content_reason.find("valid UTF-8") != std::string::npos);
+
+    const std::array<std::uint32_t, 3> invalid_ids = {
+            267, std::numeric_limits<std::uint32_t>::max(), 267};
+    std::string published_decode = "sentinel";
+    std::string decode_reason;
+    try {
+        published_decode = tokenizer->decode(invalid_ids, {});
+    } catch (const std::invalid_argument& error) {
+        decode_reason = error.what();
+    }
+    CHECK(published_decode == "sentinel");
+    CHECK(decode_reason.find("index 1") != std::string::npos);
+    CHECK(decode_reason.find(
+                  std::to_string(std::numeric_limits<std::uint32_t>::max()))
+          != std::string::npos);
+    CHECK(decode_reason.find("0..31999") != std::string::npos);
 }
