@@ -1,0 +1,50 @@
+{
+  "artifacts": {
+    "generation_config.json": {
+      "name": "generation_config.json",
+      "sha256": "18046d04f5bd8b4998095ecabdd17a1bf0053d9acdccead4a05be4a3575f3c5c",
+      "size": 124
+    },
+    "special_tokens_map.json": {
+      "name": "special_tokens_map.json",
+      "sha256": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db",
+      "size": 551
+    },
+    "tokenizer.json": {
+      "name": "tokenizer.json",
+      "sha256": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+      "size": 1842767
+    },
+    "tokenizer.model": {
+      "name": "tokenizer.model",
+      "sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+      "size": 499723
+    },
+    "tokenizer_config.json": {
+      "name": "tokenizer_config.json",
+      "sha256": "7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a",
+      "size": 1289
+    }
+  },
+  "generation": {
+    "command": [
+      "python3",
+      "test/reference/tokenizer_reference.py",
+      "manifest",
+      "--model-dir",
+      "<MODEL_DIR>",
+      "--output",
+      "<OUTPUT>"
+    ]
+  },
+  "packages": {
+    "jinja2": "3.1.2",
+    "sentencepiece": "0.1.99",
+    "tokenizers": "0.14.1",
+    "transformers": "4.35.0"
+  },
+  "runtime": {
+    "implementation": "CPython",
+    "version": "3.11.16"
+  }
+}
