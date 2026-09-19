@@ -643,7 +643,7 @@ that every backend currently stores or computes that leaf.
 | `F32` | applicable | inapplicable | applicable | applicable | Bit-preserving payload and ordinary signed real arithmetic. |
 | `F64` | applicable | inapplicable | applicable | applicable | Bit-preserving payload and ordinary signed real arithmetic; it is not silently narrowed to FP32. |
 
-Embedding payload/cache copy therefore has all 23 applicable leaves.
+Embedding payload and cache append therefore have all 23 applicable leaves.
 Embedding IDs have exactly the 12 integer leaves (`I2`, `U2`, `I4`, `U4`,
 `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, and `U64`): negative signed
 IDs and every ID greater than or equal to vocabulary size `V` are invalid,
@@ -655,9 +655,12 @@ floating leaves. `F8_E8M0` MUST NOT be promoted to a general signed numeric
 result.
 
 Semantic applicability is independent of native storage or arithmetic
-capability. The 23 stored leaves on the standard CPU, CUDA, ROCm, and SYCL
-paths, and TTNN's 22 stored leaves excluding `F8_E8M0` plus its encoded-carrier
-limits, are capability evidence rather than permission to narrow this table.
+capability. For cache append, all 23 leaves are opaque storage payloads; a
+backend capability row may reject a recognized leaf only after the common
+structural and arithmetic admission checks. The 23 stored leaves on the
+standard CPU, CUDA, ROCm, and SYCL paths, and TTNN's 22 stored leaves
+excluding `F8_E8M0` plus its encoded-carrier limits, are capability evidence
+rather than permission to narrow this common classification.
 Each operation contract MUST enumerate a backend implementation or a justified
 limitation for every applicable dtype. BF16 weights, activations, and caches
 are mandatory for TinyLlama on all five backends: CPU, CUDA, ROCm, SYCL, and
@@ -665,8 +668,8 @@ TTNN. Integer linear accumulation, overflow behavior, and any conversion
 before a kernel belong to the [Linear projections](#linear-projections)
 contract; this table does not infer integer normalization or silently mean
 “all floats.” Only `QuantizationFormat::NONE` is applicable; every other
-quantization format is rejected.
- 
+quantization format is rejected. For cache append, only
+`QuantizationFormat::NONE` is applicable to opaque payload storage.
 ##### SiLU-specific semantic, scalar, and numerical policy
 
 SiLU has exactly 23 classified input/output leaves. Its semantic partition is
@@ -710,6 +713,7 @@ are exact checks in addition to those ceilings. The shared SiLU reference and
 all named behavior cases are owned by the planned
 `test/backend/backend_conformance_silu.hpp` suite described by the
 [SiLU activation](#silu-activation) contract below.
+
 
 ##### Storage, rounding, masking, and nonfinite values
 
@@ -953,16 +957,19 @@ WorkspaceRequirements rope_workspace_requirements(
         double theta);
 ```
 
-The two facades have exactly the same semantic arguments in the stated order.
-`a` is an explicit absolute position and `theta` is an explicit runtime
-scalar; neither is inferred from a session, cursor, cache, or model state.
+The RoPE facade and its query have exactly the same semantic arguments in
+the stated order. `a` is an explicit absolute position and `theta` is an
+explicit runtime scalar; neither is inferred from a session, cursor, cache,
+or model state.
 `x` and `out` MUST have identical logical shape `[...,H,R,D]`, rank three
 through eight, identical nonzero leading dimensions, `H > 0`, `R > 0`, and
-positive even `D`. Every logical output element is written from its
-corresponding input under the two views' independent valid offset and
-leading-stride mappings. Tile padding and uninitialized physical slots are not
-logical values. Q and K are separate calls, so unequal Q/K head counts are
-valid and there is no cross-request Q/K alias category.
+positive even `D`. In particular, an odd `D` for RoPE is `InvalidArgument`.
+Every logical output element is written from its corresponding input under the
+two views' independent valid offset and leading-stride mappings. Tile padding
+and uninitialized physical slots are not logical values. Q and K are separate
+calls, so unequal Q/K head counts are valid and there is no cross-request Q/K
+alias category.
+
 
 For every leading coordinate tuple `b`, head `h`, run index `r`, and
 `0 <= j < D/2`, the frozen split-half equation is:
@@ -1091,77 +1098,172 @@ positions, use consecutive absolute positions with no tile-boundary reset,
 skipped position, or reused cursor. The common leaf owns no cache/session
 initialized length.
 
+##### Cache append
+
+The complete cache-append public surface is exactly:
+
+```cpp
+oid cache_append(
+        const TensorView& source, TensorView& destination, std::size_t a,
+        RawWorkspaceView workspace = {}) noexcept;
+WorkspaceRequirements cache_append_workspace_requirements(
+        const TensorView& source, const TensorView& destination,
+        std::size_t a);
+```
+The repository header uses the `std::size_t` spelling for the required
+`size_t` parameter type; the declarations above match that exact public ABI.
+
+A successful cache-append requirements query is not a runtime support result;
+it reports only the deterministic requirements of the validated request.
+
 For cache append, `source` MUST have shape `[...,H,R,D]` and `destination`
-shape `[...,H,C,D]`, each of rank three through eight and with every extent
-nonzero. Their leading tuples, `H`, `D`, dtype, quantization, and exact device
-MUST match; `R` is the independent source length and `C` is cache capacity.
-Admission MUST check `a <= C`, then `R <= C-a`, along with all byte,
-stride, address, and range arithmetic before effects. For every logical
-coordinate it writes
+MUST have shape `[...,H,C,D]`. Both operands MUST have operation rank `3..8`
+and every extent MUST be nonzero. Their complete leading tuples, `H`, `D`,
+dtype, quantization, and exact device MUST match; `R` is the independent
+source length and `C` is cache capacity. Leading planes are complete
+coordinates, never broadcast or implicitly shared.
+
+This operation-specific rank rule is narrower than the general
+`TensorView` and other-facade rank rule of `2..8`, which remains unchanged
+elsewhere in this document. Cache append does not inflate a singleton output
+rank or broadcast any leading plane.
+
+Admission first validates structurally readable views, operation rank and
+extents, live owner/device identity, transformed leading mappings, and the
+checked view, stride, and plane-address metadata needed to obtain `C` and
+`R`. These structural checks precede the cache-window checks and every
+observable effect. Within the operation-specific window check, check `a <= C`
+first; only then check `R <= C-a`. After those checks, perform append-specific
+checked element, byte, storage-range, and workspace arithmetic. All malformed
+view, range, and arithmetic checks MUST finish before owner registration,
+sequence consumption, output mutation, or submission. The subtraction form is
+required so that an out-of-range `a` is rejected without forming an
+overflowing `a+R`.
+
+The only logical write is exactly
 
 ```text
 destination[b,h,a+r,d] = source[b,h,r,d]
 ```
 
-for `0 <= r < R` and MUST leave every other logical destination row unchanged.
-The copy is bit-preserving: it performs no numerical conversion or rounding
-and is semantically valid for every payload leaf that the exact device supports
-for storage. Unused tile padding MUST remain unchanged and, like the
-uninitialized cache tail, is not logical data and MUST NOT be read as an
-initialized value. Transformed leading offsets and strides of source and
-destination MUST be honored independently, including partial final tiles.
+for every complete leading coordinate `b`, head `h`, `0 <= r < R`, and
+`0 <= d < D`. Every other logical destination row and every physical padding
+cell in every affected or unaffected plane MUST remain unchanged. The copy is
+opaque and bit-preserving for all 23 existing payload leaves: it performs no
+arithmetic, conversion, re-encoding, or rounding, and it does not read
+uninitialized logical rows or padding as initialized data. Independent
+transformed leading offsets and strides MUST be honored for both operands,
+including partial final tiles.
 
-The boundary cases are normative. With exact-end capacity `C=a+R`, the cases
-`(a,R,C)=(1,1,2)`, `(15,15,30)`, `(16,16,32)`, and `(17,17,34)` write exactly
-rows `[a,C)` and preserve every row `[0,a)`; there is no special behavior at
-`R=1`, `R=15`, `R=16`, or `R=17`, nor at positions 15, 16, and 17. With
-capacity larger than `a+R`, rows `[0,a)` and `[a+R,C)` likewise remain
-untouched. `a>C`, `R>C-a`, or overflow while evaluating a position or storage
-range MUST be rejected before mutation. Exact-end append is valid, while
-padding after a partial tile and every uninitialized logical row remain
-excluded from initialized length.
+The boundary cases are normative and MUST be observable with independent
+offsets and row lengths `1`, `15`, `16`, and `17`. With exact-end capacity
+`C=a+R`, the cases `(a,R,C)=(1,1,2)`, `(15,15,30)`, `(16,16,32)`, and
+`(17,17,34)` write exactly rows `[a,C)` and preserve every row `[0,a)`.
+There is no special behavior at any of those row lengths or at positions
+`15`, `16`, and `17`. With capacity larger than `a+R`, rows `[0,a)` and
+`[a+R,C)` and all physical padding remain untouched. `a>C`, `R>C-a`, or
+overflow in any position or storage range is rejected before mutation.
+Exact-end append is valid, while padding after a partial tile and every
+uninitialized logical row remain excluded from initialized length.
 
+Source/destination overlap MUST be rejected, including overlap discovered
+through transformed views, intersecting backing ranges, or identical native
+handles. Read/read overlap elsewhere is harmless when all shape rules hold.
+No operand, output, or temporary tensor may be allocated, relocated, silently
+converted, or moved through hidden or unaccounted host staging. Standard tiled
+paths write directly; the explicit caller-owned TTNN padded-plane workspace
+described below is the accounted transfer path.
+
+##### Cache append five-backend feasibility
+
+The following concise table records implementation feasibility, not current
+runtime support. A port MUST advertise only the leaves it has implemented and
+MUST return `Unsupported` for a recognized but unported capability.
+
+| Backend path | Storage leaves | Query workspace and required route |
+| --- | --- | --- |
+| CPU / CUDA / ROCm / SYCL (standard tiled) | support all 23 storage leaves | zero workspace (`{0, 1}`); direct existing tiled writes through the 16x16 mapping |
+| TTNN (native) | store 22 leaves, excluding `F8_E8M0` | positive, explicit caller-owned host workspace containing one complete padded source-plane image plus one complete padded destination-plane image reused serially; deferred native padded-byte download/patch/upload using the existing 32x32 tile/four-face mapping |
+
+BF16 is mandatory on all five backends, and `QuantizationFormat::NONE` is the
+only applicable quantization format. No route may zero storage, convert or
+re-encode payloads, allocate hidden workspace, or use native partial-row or
+partial-matrix evidence in place of the complete logical mapping. TTNN
+workspace synchronization MUST be proven before its lease is released.
+
+For cache append, the explicit positive caller-owned TTNN padded-plane
+workspace above is the accounted staging route. The pre-existing TTNN
+capability note that describes partial native32 updates as requiring
+preservation “without host staging” is superseded for this operation by that
+route; it remains a blocked pre-port observation and MUST NOT be read as
+forbidding the queried workspace. Hidden or unaccounted staging remains
+forbidden.
+
+##### Cache append queue, session, and lifetime boundaries
 K and V MUST use separate `cache_append` submissions with distinct cache
-owners; there is no atomic two-cache operation. Neither RoPE nor cache append
-owns initialized length `L`, reset, clearing, growth, or session failure
-policy. The session MAY publish `L=a+R` only after both K and V append OIDs
-have been successfully waited. Positive admission alone is insufficient, and
-the session MUST NOT submit a dependent consumer of a failed producer.
-Attention receives the initialized length explicitly and MUST NOT infer it
-from capacity or padding.
+owners; there is no atomic two-cache call. Cache append owns no initialized
+length, reset, clearing, growth, or session failure policy. The session MAY
+publish `initializedL = a + R` only after both append OIDs have successfully
+completed their waits. Positive admission alone is insufficient. If either
+accepted append fails, the session MUST publish no new initialized length and
+MUST submit no dependent consumer; it MUST NOT expose uninitialized cache
+capacity or physical padding as a readable prefix. Attention receives the
+initialized length explicitly and MUST NOT infer it from capacity or padding.
 
-New output and workspace storage MUST be disjoint from every input and from
-each other. Cache source and destination overlap MUST be rejected. Read/read
-overlap is harmless where all shape rules hold. No operand, output, or
-temporary tensor may be allocated, relocated, or silently converted, and
-neither operation may introduce a host round trip. Workspace is caller-owned
-through proven completion; a supplied range is checked only at submission for
-the exact device, the query's exact required size and alignment, overlap,
-freshness, and lease availability.
+All cache destination and workspace storage MUST be disjoint from every input
+and from each other. Cache source/destination overlap is rejected under the
+transformed-view and native-handle rules above. Workspace is caller-owned
+through proven completion; the supplied range is checked at submission for the
+exact device, the query's exact required size and alignment, overlap,
+freshness, and lease availability. The pure query itself does not inspect the
+supplied workspace or mutate queue state. No operand, output, or temporary
+tensor may be allocated, relocated, or silently converted, and cache append
+introduces no hidden or unaccounted host round trip; the explicit caller-owned
+TTNN padded-plane workspace above is the sole accounted host transfer.
 
-Both facades MUST validate malformed views, rank and dimensions, leading
-tuples, dtype, device, quantization, aliases, scalar finiteness, ranges,
-workspace, and checked arithmetic before effects. Host-checkable invalid input
-maps to `InvalidArgument`, arithmetic overflow to `Overflow`, and a recognized
-but unsupported leaf to `Unsupported` only after earlier validation.
-In particular, an odd `D` for RoPE is `InvalidArgument`.
-Pre-acceptance resource or runtime failures use the established OID error
-categories. A pre-submit failure mutates no output, registers no owner, and
-consumes no sequence. Each operation snapshots required metadata without
-retaining borrowed views. Once accepted, a positive OID is never replaced by a
-negative result: completion failure is retained and rethrown on every wait.
+##### Cache append admission, errors, and snapshots
 
+The cache query and submission MUST validate malformed views, operation rank
+and dimensions, complete leading tuples, dtype, exact device, quantization,
+aliases, ranges, workspace, and checked arithmetic before effects. A malformed
+request maps to `InvalidArgument=-1`; a recognized unsupported dtype or
+capability maps to `Unsupported=-2` only after those earlier checks;
+checked arithmetic or sequence exhaustion maps to `Overflow=-3`; bounded
+resources or lease failure map to `ResourceExhausted=-4`; a
+pre-acceptance runtime failure maps to `DeviceError=-5`; and any other
+failure maps to `InternalError=-6`. A pre-acceptance failure mutates no
+output, registers no owner, and consumes no sequence. Once accepted, a
+positive OID remains positive; an accepted completion failure is retained
+and rethrown by every repeated wait.
+
+Cache append performs no device-data out-of-vocabulary or nonfinite-policy
+scan because every payload leaf is opaque. If an accepted device/runtime
+failure is reported, the affected cache output is unusable, the session is
+poisoned, and every wait for that OID MUST retain and rethrow the same
+failure; the session MUST NOT publish a new initialized length or submit a
+dependent consumer.
+
+Submission snapshots tensor specs, exact device/owner/native-handle identity,
+independent leading offsets and strides, scalar values including `a`, and the
+workspace range. It retains the operand owners and workspace lease through
+proven completion, but never retains borrowed `TensorView` objects beyond
+submission.
+
+##### Cache append delivery and coverage
 Future delivery order is contract, independent reference, and all-five
-feasibility, followed by CPU, CUDA, ROCm, SYCL, and TTNN closure for RoPE; only
-then does cache append follow the same sequence. Each operation's five-backend
-gate MUST close before the next operation begins. CPU feasibility is scalar or
-wide arithmetic over existing tiled storage; this planned contract makes no
-native accelerator or profiler claim. The operation-specific RoPE and Cache
-row append siblings own detailed support, numerical, snapshot/hook, and
-conformance rules. Their shared regression coverage MUST extend the existing
+feasibility, followed by CPU, CUDA, ROCm, SYCL, and TTNN closure for RoPE;
+only then does cache append follow the same sequence. Each operation's
+five-backend gate MUST close before the next operation begins. CPU feasibility
+is scalar or wide arithmetic over existing tiled storage; the table above
+makes no current support, native accelerator, or profiler claim. The
+operation-specific cache-row append implementation leaves own detailed
+capability, numerical, snapshot/hook, and native evidence.
+
+Its shared regression coverage MUST extend the existing byte-level
 copy/storage suite and independent physical oracle for applicable payload
-leaves, transformed leading mappings, partial tiles and padding, aliases,
-overflow, accepted failures and repeat waits, and the `1/15/16/17` cases.
+leaves, transformed leading planes, partial tiles and padding, aliases,
+overflow, no-side-effect admission failures, accepted failures and repeat
+waits, and the exact `1/15/16/17` offsets and row-length cases.
 #### TinyLlama forward layout — Causal grouped-query attention
 
 This subsection freezes the planned TinyLlama caller boundary for the
@@ -1330,8 +1432,7 @@ oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
 oid rope(const TensorView& x, TensorView& out, std::size_t a, double theta,
          RawWorkspaceView workspace = {}) noexcept;
 oid cache_append(const TensorView& source, TensorView& destination,
-                 std::size_t a,
-                 RawWorkspaceView workspace = {}) noexcept;
+                 std::size_t a, RawWorkspaceView workspace = {}) noexcept;
 oid silu(const TensorView& x, TensorView& out,
          RawWorkspaceView workspace = {}) noexcept;
 oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
@@ -1381,10 +1482,11 @@ WorkspaceRequirements sdpa_workspace_requirements(
 
 A query MUST be deterministic for the supplied values and current backend
 capability. It MUST validate operation support; every operand and output spec;
-rank `2..8`; nonzero dimensions; exact queue-device identity; live owners;
-leading-view bounds and strides; scalar, range, and mode values; output shape;
-aliases; checked element, byte, address, plane, tile, and stride arithmetic;
-and backend capability. It MUST NOT allocate, register an owner, acquire a
+the general rank rule `2..8`; the cache_append exception rank `3..8`;
+nonzero dimensions; exact queue-device identity; live owners; leading-view
+bounds and strides; scalar, range, and mode values; output shape; aliases;
+checked element, byte, address, plane, tile, and stride arithmetic; and
+backend capability. It MUST NOT allocate, register an owner, acquire a
 lease, reserve a queue credit or token, submit backend work, inspect queue
 occupancy or free-arena capacity, or depend on prior completion. A successful
 query reserves nothing. The actual supplied workspace is deliberately not a
@@ -1405,15 +1507,24 @@ effects, or backend work, a facade MUST validate, in order:
    including liveness, exact-device identity, size, alignment, overlap, and
    lease availability.
 
-A malformed request returns `InvalidArgument=-1`; a well-formed but unsupported
-operation or matching input returns `Unsupported=-2`; checked arithmetic or
-sequence exhaustion returns `Overflow=-3`; bounded resource or lease failure
-returns `ResourceExhausted=-4`; a pre-acceptance runtime failure returns
-`DeviceError=-5`; and any other unclassified failure returns
+For `cache_append`, structural validation of the views, owners, and checked
+plane/stride/address metadata precedes the operation-specific window checks.
+Once `C` and `R` are safely known, those checks are ordered as `a <= C` first
+and then `R <= C-a`; append-specific checked element, byte, storage-range,
+and workspace arithmetic follows them and completes before any owner
+registration, sequence consumption, mutation, or submission.
+
+A malformed request returns `InvalidArgument=-1`; a well-formed but
+unsupported operation or matching input returns `Unsupported=-2`; checked
+arithmetic or sequence exhaustion returns `Overflow=-3`; bounded resource or
+lease failure returns `ResourceExhausted=-4`; a pre-acceptance runtime failure
+returns `DeviceError=-5`; and any other unclassified failure returns
 `InternalError=-6`. An admission failure accepts no OID and causes no backend
-effect. Zero is never accepted. Every positive result is an accepted submitted
-token; it proves admission only, not successful initialization of output or
-cache data. Device-data out-of-vocabulary or nonfinite-policy failures MAY be
+effect. Zero is never accepted. Every positive result is an accepted
+submitted token; it proves admission only, not successful initialization of
+output or cache data. A completion failure accepted after submission remains
+observable and every wait for that OID MUST retain and rethrow the same
+failure. Device-data out-of-vocabulary or nonfinite-policy failures MAY be
 accepted without a hidden host round trip. Their output is unusable, their
 session is poisoned, and every wait for that OID MUST retain and rethrow the
 same failure.
@@ -4536,11 +4647,12 @@ and copies live in `test/backend/backend_conformance_copy_storage.hpp` and the
 independent `AcceleratorStorageOracle`; model loading and weight realization
 live in `test/backend/backend_conformance_model_loading.hpp` with its
 `test/model_loading_fixture.hpp` checkpoint fixture, registered for CPU as the
-`iom_backend_conformance_cpu_tests` case `CPU model loading*`. Backend-local
-targets are
-`iom_cpu_conformance_tests`, `iom_cuda_conformance_tests`,
+`CPU model loading*`. Backend-local targets are
+`iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
 `iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
-`iom_ttnn_conformance_tests`, registered by `add_iom_backend_tests`.
+`iom_ttnn_conformance_tests`. The accelerator targets are registered by
+`add_iom_backend_tests`; the CPU conformance executable is created directly
+in `test/CMakeLists.txt` and is not created through that helper.
 `test/backend/test_backend_coexistence.cpp` and target
 `iom_backend_coexistence_tests` provide the combined coexistence gate.
 
@@ -4552,16 +4664,27 @@ special values, accepted failures and repeat waits, and stored-result `mul`
 composition. Existing backend drivers remain the future consumers of that
 shared header; no second SiLU test project is permitted.
 
+Planned shared cache append coverage belongs in
+`test/backend/backend_conformance_copy_storage.hpp`: its planned shared
+byte-level reference (independent of production mapping) will exercise the
+source/destination mapping, transformed leading planes, padding and cache-tail
+isolation, aliases, checked overflow, no-side-effect admission failures,
+accepted failures and repeat waits, and the exact offsets and row lengths
+`1/15/16/17`. The independent physical oracle remains
+`test/backend/backend_conformance_oracle.hpp`; these are future cases, not a
+claim that the current backend drivers already contain or have run them.
+
 Each backend driver exercises ADD, MUL, SUB, and DIV through its real queue for
 every required leaf, as well as unsupported domains, validation precedence,
 broadcasting, transformed mappings, exact aliases, owner deduplication, repeat
 waits, and retained failures. CPU may complete inline; accelerator queues and
 TTNN staging/emulation preserve the same contract without SDK dtype narrowing.
 
-CMake registration uses `add_iom_backend_tests` to create smoke and
-conformance targets. Drivers provide allocator/context setup, CPU reference,
-foreign-device identity checks, hardware gating, and native storage oracles;
-enabled hardware runs and never skips.
+CMake registration uses `add_iom_backend_tests` for the accelerator smoke and
+conformance targets; `iom_backend_conformance_cpu_tests` is created and
+registered directly in `test/CMakeLists.txt`. Drivers provide allocator/context
+setup, CPU reference, foreign-device identity checks, hardware gating, and
+native storage oracles; enabled hardware runs and never skips.
 
 ### 13. Contract source map
 
@@ -4591,6 +4714,29 @@ Use these sources when changing or extending the contract:
   capability, numerical, queue/lifetime, and MLP composition contract:
   [SiLU activation](#silu-activation), `src/shared/scalar_binary_codec.hpp`,
   and the planned shared `test/backend/backend_conformance_silu.hpp` cases;
+- cache append public facade, common admission, and current API/lifetime tests:
+  `include/iom/iom.hpp` (`DeviceOps::cache_append` and
+  `DeviceOps::cache_append_workspace_requirements`),
+  `src/device_ops_cache_append.cpp`
+  (`snapshot_cache_append_view`, `validate_cache_append`, and the queue
+  handoff), and `test/test_iom.cpp` (ABI, query purity, precedence,
+  no-side-effect, snapshot, workspace-retention, and retained-failure cases);
+- cache append's common workspace, queue, and neural-hook precedent:
+  `include/iom/iom.hpp` (`detail::WorkspaceValidation` and the current neural
+  `DeviceOps` hooks), `src/device_ops.cpp` (`WorkspaceValidation::validated`,
+  `encode_token`, `wait`, completion/failure retention, drain, and sequence
+  helpers);
+- transformed leading offsets and strides:
+  `src/tensor_view.cpp` (`TensorView::slice`, `select`, `permute`, and
+  `reshape_leading`);
+- standard direct tiled mapping:
+  `src/shared/standard_tiled_copy.inl` (`plane_slot`,
+  `physical_coordinate`, and `copy_tiled_to_tiled_word`) and
+  `src/shared/standard_tiled_copy_metadata.inl`;
+- TTNN padded-byte carrier mapping and workspace seams:
+  `src/ttnn/copy.cpp` (`padded_cell_index`, `submit_download_plane`,
+  `assemble_download_plane`, and `region_to_host`) and
+  `src/ttnn/device.cpp`;
 - storage, transfer, copy, and physical oracle:
   `test/backend/backend_conformance_copy_storage.hpp`,
   `test/backend/backend_conformance_oracle.hpp`;
