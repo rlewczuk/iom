@@ -1,0 +1,2284 @@
+{
+  "corpus": {
+    "pair_cases": [
+      {
+        "comparison": {
+          "fast_decoded_bytes": {
+            "skip_special_tokens_false": [
+              60,
+              115,
+              62
+            ],
+            "skip_special_tokens_true": []
+          },
+          "fast_ids": [
+            1
+          ],
+          "fast_type_ids": [
+            0
+          ],
+          "reason": "fast pair output is recorded exactly; SentencePiece has no comparable pair operation",
+          "reason_code": "sentencepiece-no-pair-api",
+          "slow_decoded_bytes": {
+            "first": [],
+            "second": []
+          },
+          "slow_ids": null,
+          "slow_type_ids": null,
+          "status": "not-comparable",
+          "type_ids": {
+            "fast": [
+              0
+            ],
+            "slow": null,
+            "status": "not-exposed"
+          }
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62
+              ],
+              "status": "ok",
+              "text": "<s>"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [],
+              "status": "ok",
+              "text": ""
+            }
+          },
+          "ids": [
+            1
+          ],
+          "type_ids": [
+            0
+          ]
+        },
+        "input_bytes": [
+          [],
+          []
+        ],
+        "input_text": [
+          "",
+          ""
+        ],
+        "kind": "pair",
+        "name": "pair_empty_empty",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default per sequence"
+          },
+          "input_encoding": "utf-8"
+        },
+        "slow": {
+          "first": {
+            "decode": {
+              "bytes": [],
+              "status": "ok",
+              "text": ""
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1
+            ]
+          },
+          "pair_encoding": {
+            "category": "pair-api-unavailable",
+            "decoded_bytes": null,
+            "ids": null,
+            "message": "SentencePieceProcessor exposes single-sequence encode only",
+            "status": "not-exposed",
+            "type_ids": null
+          },
+          "second": {
+            "decode": {
+              "bytes": [],
+              "status": "ok",
+              "text": ""
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1
+            ]
+          }
+        },
+        "status": "not-comparable"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": {
+            "skip_special_tokens_false": [
+              60,
+              115,
+              62,
+              60,
+              115,
+              62,
+              32,
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "skip_special_tokens_true": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ]
+          },
+          "fast_ids": [
+            1,
+            1,
+            22172
+          ],
+          "fast_type_ids": [
+            0,
+            1,
+            1
+          ],
+          "reason": "fast pair output is recorded exactly; SentencePiece has no comparable pair operation",
+          "reason_code": "sentencepiece-no-pair-api",
+          "slow_decoded_bytes": {
+            "first": [],
+            "second": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ]
+          },
+          "slow_ids": null,
+          "slow_type_ids": null,
+          "status": "not-comparable",
+          "type_ids": {
+            "fast": [
+              0,
+              1,
+              1
+            ],
+            "slow": null,
+            "status": "not-exposed"
+          }
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "<s><s> hello"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            }
+          },
+          "ids": [
+            1,
+            1,
+            22172
+          ],
+          "type_ids": [
+            0,
+            1,
+            1
+          ]
+        },
+        "input_bytes": [
+          [],
+          [
+            104,
+            101,
+            108,
+            108,
+            111
+          ]
+        ],
+        "input_text": [
+          "",
+          "hello"
+        ],
+        "kind": "pair",
+        "name": "pair_empty_text",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default per sequence"
+          },
+          "input_encoding": "utf-8"
+        },
+        "slow": {
+          "first": {
+            "decode": {
+              "bytes": [],
+              "status": "ok",
+              "text": ""
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1
+            ]
+          },
+          "pair_encoding": {
+            "category": "pair-api-unavailable",
+            "decoded_bytes": null,
+            "ids": null,
+            "message": "SentencePieceProcessor exposes single-sequence encode only",
+            "status": "not-exposed",
+            "type_ids": null
+          },
+          "second": {
+            "decode": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1,
+              22172
+            ]
+          }
+        },
+        "status": "not-comparable"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": {
+            "skip_special_tokens_false": [
+              60,
+              115,
+              62,
+              32,
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "skip_special_tokens_true": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ]
+          },
+          "fast_ids": [
+            1,
+            22172
+          ],
+          "fast_type_ids": [
+            0,
+            0
+          ],
+          "reason": "fast pair output is recorded exactly; SentencePiece has no comparable pair operation",
+          "reason_code": "sentencepiece-no-pair-api",
+          "slow_decoded_bytes": {
+            "first": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "second": []
+          },
+          "slow_ids": null,
+          "slow_type_ids": null,
+          "status": "not-comparable",
+          "type_ids": {
+            "fast": [
+              0,
+              0
+            ],
+            "slow": null,
+            "status": "not-exposed"
+          }
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "<s> hello"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            }
+          },
+          "ids": [
+            1,
+            22172
+          ],
+          "type_ids": [
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          []
+        ],
+        "input_text": [
+          "hello",
+          ""
+        ],
+        "kind": "pair",
+        "name": "pair_text_empty",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default per sequence"
+          },
+          "input_encoding": "utf-8"
+        },
+        "slow": {
+          "first": {
+            "decode": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1,
+              22172
+            ]
+          },
+          "pair_encoding": {
+            "category": "pair-api-unavailable",
+            "decoded_bytes": null,
+            "ids": null,
+            "message": "SentencePieceProcessor exposes single-sequence encode only",
+            "status": "not-exposed",
+            "type_ids": null
+          },
+          "second": {
+            "decode": {
+              "bytes": [],
+              "status": "ok",
+              "text": ""
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1
+            ]
+          }
+        },
+        "status": "not-comparable"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": {
+            "skip_special_tokens_false": [
+              60,
+              115,
+              62,
+              32,
+              104,
+              101,
+              108,
+              108,
+              111,
+              60,
+              115,
+              62,
+              32,
+              119,
+              111,
+              114,
+              108,
+              100
+            ],
+            "skip_special_tokens_true": [
+              104,
+              101,
+              108,
+              108,
+              111,
+              32,
+              119,
+              111,
+              114,
+              108,
+              100
+            ]
+          },
+          "fast_ids": [
+            1,
+            22172,
+            1,
+            3186
+          ],
+          "fast_type_ids": [
+            0,
+            0,
+            1,
+            1
+          ],
+          "reason": "fast pair output is recorded exactly; SentencePiece has no comparable pair operation",
+          "reason_code": "sentencepiece-no-pair-api",
+          "slow_decoded_bytes": {
+            "first": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "second": [
+              119,
+              111,
+              114,
+              108,
+              100
+            ]
+          },
+          "slow_ids": null,
+          "slow_type_ids": null,
+          "status": "not-comparable",
+          "type_ids": {
+            "fast": [
+              0,
+              0,
+              1,
+              1
+            ],
+            "slow": null,
+            "status": "not-exposed"
+          }
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                60,
+                115,
+                62,
+                32,
+                119,
+                111,
+                114,
+                108,
+                100
+              ],
+              "status": "ok",
+              "text": "<s> hello<s> world"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111,
+                32,
+                119,
+                111,
+                114,
+                108,
+                100
+              ],
+              "status": "ok",
+              "text": "hello world"
+            }
+          },
+          "ids": [
+            1,
+            22172,
+            1,
+            3186
+          ],
+          "type_ids": [
+            0,
+            0,
+            1,
+            1
+          ]
+        },
+        "input_bytes": [
+          [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          [
+            119,
+            111,
+            114,
+            108,
+            100
+          ]
+        ],
+        "input_text": [
+          "hello",
+          "world"
+        ],
+        "kind": "pair",
+        "name": "pair_text_text",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default per sequence"
+          },
+          "input_encoding": "utf-8"
+        },
+        "slow": {
+          "first": {
+            "decode": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1,
+              22172
+            ]
+          },
+          "pair_encoding": {
+            "category": "pair-api-unavailable",
+            "decoded_bytes": null,
+            "ids": null,
+            "message": "SentencePieceProcessor exposes single-sequence encode only",
+            "status": "not-exposed",
+            "type_ids": null
+          },
+          "second": {
+            "decode": {
+              "bytes": [
+                119,
+                111,
+                114,
+                108,
+                100
+              ],
+              "status": "ok",
+              "text": "world"
+            },
+            "encode_options": {
+              "adds_bos": true,
+              "extra_options": "bos"
+            },
+            "ids": [
+              1,
+              3186
+            ]
+          }
+        },
+        "status": "not-comparable"
+      }
+    ],
+    "pair_order": [
+      "pair_empty_empty",
+      "pair_empty_text",
+      "pair_text_empty",
+      "pair_text_text"
+    ],
+    "text_cases": [
+      {
+        "comparison": {
+          "fast_decoded_bytes": [],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62
+              ],
+              "status": "ok",
+              "text": "<s>"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [],
+              "status": "ok",
+              "text": ""
+            }
+          },
+          "ids": [
+            1
+          ],
+          "type_ids": [
+            0
+          ]
+        },
+        "input_bytes": [],
+        "input_text": "",
+        "kind": "text",
+        "name": "empty",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [],
+            "status": "ok",
+            "text": ""
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            32
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            32
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                32
+              ],
+              "status": "ok",
+              "text": "<s>  "
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                32
+              ],
+              "status": "ok",
+              "text": " "
+            }
+          },
+          "ids": [
+            1,
+            259
+          ],
+          "type_ids": [
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          32
+        ],
+        "input_text": " ",
+        "kind": "text",
+        "name": "one_ascii_space",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              32
+            ],
+            "status": "ok",
+            "text": " "
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            259
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            32,
+            32
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            32,
+            32
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                32,
+                32
+              ],
+              "status": "ok",
+              "text": "<s>   "
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                32,
+                32
+              ],
+              "status": "ok",
+              "text": "  "
+            }
+          },
+          "ids": [
+            1,
+            1678
+          ],
+          "type_ids": [
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          32,
+          32
+        ],
+        "input_text": "  ",
+        "kind": "text",
+        "name": "two_ascii_spaces",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              32,
+              32
+            ],
+            "status": "ok",
+            "text": "  "
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            1678
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "<s> hello"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            }
+          },
+          "ids": [
+            1,
+            22172
+          ],
+          "type_ids": [
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "input_text": "hello",
+        "kind": "text",
+        "name": "ascii_word",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "status": "ok",
+            "text": "hello"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            22172
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            32,
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            32,
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "<s> hello hello"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello hello"
+            }
+          },
+          "ids": [
+            1,
+            22172,
+            22172
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111,
+          32,
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "input_text": "hello hello",
+        "kind": "text",
+        "name": "repeated_merge",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              104,
+              101,
+              108,
+              108,
+              111,
+              32,
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "status": "ok",
+            "text": "hello hello"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            22172,
+            22172
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            9
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            9
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                9
+              ],
+              "status": "ok",
+              "text": "<s> \t"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                9
+              ],
+              "status": "ok",
+              "text": "\t"
+            }
+          },
+          "ids": [
+            1,
+            29871,
+            12
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          9
+        ],
+        "input_text": "\t",
+        "kind": "text",
+        "name": "tab",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              9
+            ],
+            "status": "ok",
+            "text": "\t"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            29871,
+            12
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            10
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            10
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                10
+              ],
+              "status": "ok",
+              "text": "<s> \n"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                10
+              ],
+              "status": "ok",
+              "text": "\n"
+            }
+          },
+          "ids": [
+            1,
+            29871,
+            13
+          ],
+          "type_ids": [
+            0,
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          10
+        ],
+        "input_text": "\n",
+        "kind": "text",
+        "name": "newline",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              10
+            ],
+            "status": "ok",
+            "text": "\n"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            29871,
+            13
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            104,
+            195,
+            169,
+            108,
+            108,
+            195,
+            184,
+            32,
+            228,
+            184,
+            150,
+            231,
+            149,
+            140
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            104,
+            195,
+            169,
+            108,
+            108,
+            195,
+            184,
+            32,
+            228,
+            184,
+            150,
+            231,
+            149,
+            140
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                195,
+                169,
+                108,
+                108,
+                195,
+                184,
+                32,
+                228,
+                184,
+                150,
+                231,
+                149,
+                140
+              ],
+              "status": "ok",
+              "text": "<s> héllø 世界"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                195,
+                169,
+                108,
+                108,
+                195,
+                184,
+                32,
+                228,
+                184,
+                150,
+                231,
+                149,
+                140
+              ],
+              "status": "ok",
+              "text": "héllø 世界"
+            }
+          },
+          "ids": [
+            1,
+            22500,
+            645,
+            30077,
+            29871,
+            30793,
+            30967
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          104,
+          195,
+          169,
+          108,
+          108,
+          195,
+          184,
+          32,
+          228,
+          184,
+          150,
+          231,
+          149,
+          140
+        ],
+        "input_text": "héllø 世界",
+        "kind": "text",
+        "name": "unicode_héllø_世界",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              104,
+              195,
+              169,
+              108,
+              108,
+              195,
+              184,
+              32,
+              228,
+              184,
+              150,
+              231,
+              149,
+              140
+            ],
+            "status": "ok",
+            "text": "héllø 世界"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            22500,
+            645,
+            30077,
+            29871,
+            30793,
+            30967
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            240,
+            159,
+            153,
+            130
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            240,
+            159,
+            153,
+            130
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                240,
+                159,
+                153,
+                130
+              ],
+              "status": "ok",
+              "text": "<s> 🙂"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                240,
+                159,
+                153,
+                130
+              ],
+              "status": "ok",
+              "text": "🙂"
+            }
+          },
+          "ids": [
+            1,
+            29871,
+            243,
+            162,
+            156,
+            133
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          240,
+          159,
+          153,
+          130
+        ],
+        "input_text": "🙂",
+        "kind": "text",
+        "name": "emoji_byte_fallback",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              240,
+              159,
+              153,
+              130
+            ],
+            "status": "ok",
+            "text": "🙂"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            29871,
+            243,
+            162,
+            156,
+            133
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "decoded_bytes": {
+            "fast_skip_special_tokens_false": [
+              60,
+              115,
+              62,
+              60,
+              117,
+              110,
+              107,
+              62,
+              32,
+              104,
+              101,
+              108,
+              108,
+              111,
+              60,
+              115,
+              62,
+              60,
+              47,
+              115,
+              62
+            ],
+            "fast_skip_special_tokens_true": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "slow": [
+              60,
+              117,
+              110,
+              107,
+              62,
+              104,
+              101,
+              108,
+              108,
+              111,
+              60,
+              115,
+              62,
+              60,
+              47,
+              115,
+              62
+            ]
+          },
+          "fast_ids": [
+            1,
+            0,
+            22172,
+            1,
+            2
+          ],
+          "reason": "fast added-token segmentation and slow protobuf-piece segmentation are different API surfaces",
+          "reason_code": "added-token-atomicity",
+          "slow_ids": [
+            1,
+            529,
+            2960,
+            29958,
+            12199,
+            29966,
+            29879,
+            2565,
+            29879,
+            29958
+          ],
+          "status": "not-comparable"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                60,
+                117,
+                110,
+                107,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111,
+                60,
+                115,
+                62,
+                60,
+                47,
+                115,
+                62
+              ],
+              "status": "ok",
+              "text": "<s><unk> hello<s></s>"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            }
+          },
+          "ids": [
+            1,
+            0,
+            22172,
+            1,
+            2
+          ],
+          "type_ids": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          60,
+          117,
+          110,
+          107,
+          62,
+          104,
+          101,
+          108,
+          108,
+          111,
+          60,
+          115,
+          62,
+          60,
+          47,
+          115,
+          62
+        ],
+        "input_text": "<unk>hello<s></s>",
+        "kind": "text",
+        "name": "adjacent_added_tokens",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              60,
+              117,
+              110,
+              107,
+              62,
+              104,
+              101,
+              108,
+              108,
+              111,
+              60,
+              115,
+              62,
+              60,
+              47,
+              115,
+              62
+            ],
+            "status": "ok",
+            "text": "<unk>hello<s></s>"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            529,
+            2960,
+            29958,
+            12199,
+            29966,
+            29879,
+            2565,
+            29879,
+            29958
+          ]
+        },
+        "status": "not-comparable"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=true",
+          "slow_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                60,
+                115,
+                62,
+                32,
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "<s> hello"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            }
+          },
+          "ids": [
+            1,
+            22172
+          ],
+          "type_ids": [
+            0,
+            0
+          ]
+        },
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "input_text": "hello",
+        "kind": "text",
+        "name": "single_special_true",
+        "options": {
+          "add_special_tokens": true,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": "bos"
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "status": "ok",
+            "text": "hello"
+          },
+          "encode_options": {
+            "adds_bos": true,
+            "extra_options": "bos"
+          },
+          "ids": [
+            1,
+            22172
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "fast_ids_equal_slow_ids": true,
+          "policy": "fast.skip_special_tokens=false",
+          "slow_decoded_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "status": "agree"
+        },
+        "fast": {
+          "decode": {
+            "skip_special_tokens_false": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            },
+            "skip_special_tokens_true": {
+              "bytes": [
+                104,
+                101,
+                108,
+                108,
+                111
+              ],
+              "status": "ok",
+              "text": "hello"
+            }
+          },
+          "ids": [
+            22172
+          ],
+          "type_ids": [
+            0
+          ]
+        },
+        "input_bytes": [
+          104,
+          101,
+          108,
+          108,
+          111
+        ],
+        "input_text": "hello",
+        "kind": "text",
+        "name": "single_special_false",
+        "options": {
+          "add_special_tokens": false,
+          "decode_policy": {
+            "fast": [
+              false,
+              true
+            ],
+            "slow": "SentencePieceProcessor.DecodeIds default"
+          },
+          "input_encoding": "utf-8",
+          "slow_encode_extra_options": ""
+        },
+        "slow": {
+          "decode": {
+            "bytes": [
+              104,
+              101,
+              108,
+              108,
+              111
+            ],
+            "status": "ok",
+            "text": "hello"
+          },
+          "encode_options": {
+            "adds_bos": false,
+            "extra_options": ""
+          },
+          "ids": [
+            22172
+          ]
+        },
+        "status": "agree"
+      },
+      {
+        "comparison": {
+          "fast_status": "rejected",
+          "reason": "invalid UTF-8 bytes are outside the comparable text contract; each API outcome is recorded independently and no acceptance or rejection is certified as equivalent",
+          "reason_code": "raw-bytes-fast-rejects-slow-accepts",
+          "slow_status": "accepted",
+          "status": "not-comparable"
+        },
+        "fast": {
+          "category": "invalid-utf8",
+          "decoded_bytes": null,
+          "exception_type": "ValueError",
+          "ids": null,
+          "message": "text input must of type `str` (single example), `List[str]` (batch or single pretokenized example) or `List[List[str]]` (batch of pretokenized examples).",
+          "status": "rejected"
+        },
+        "input_bytes": [
+          240,
+          40,
+          140,
+          40
+        ],
+        "kind": "text",
+        "name": "invalid_utf8",
+        "options": {
+          "add_special_tokens": false,
+          "input_encoding": "utf-8",
+          "invalid_input_policy": "pass the original bytes to each API; comparator never replacement-decodes them",
+          "raw_bytes_passed_to_apis": true
+        },
+        "slow": {
+          "category": "bytes-accepted",
+          "decode": {
+            "bytes": [
+              239,
+              191,
+              189,
+              40,
+              239,
+              191,
+              189,
+              40
+            ],
+            "status": "ok",
+            "text": "�(�("
+          },
+          "decoded_bytes": [
+            239,
+            191,
+            189,
+            40,
+            239,
+            191,
+            189,
+            40
+          ],
+          "ids": [
+            29871,
+            30140,
+            29898,
+            30140,
+            29898
+          ],
+          "status": "accepted"
+        },
+        "status": "not-comparable"
+      }
+    ],
+    "text_order": [
+      "empty",
+      "one_ascii_space",
+      "two_ascii_spaces",
+      "ascii_word",
+      "repeated_merge",
+      "tab",
+      "newline",
+      "unicode_héllø_世界",
+      "emoji_byte_fallback",
+      "adjacent_added_tokens",
+      "single_special_true",
+      "single_special_false",
+      "invalid_utf8"
+    ],
+    "version": "tinyllama-tokenizer-corpus-v1"
+  },
+  "generation": {
+    "command": [
+      "python3",
+      "test/reference/crosscheck_tokenizer_model.py",
+      "--model-dir",
+      "<MODEL_DIR>",
+      "--output",
+      "<OUTPUT>"
+    ],
+    "generator_version": "1"
+  },
+  "generator": {
+    "name": "crosscheck_tokenizer_model",
+    "version": "1"
+  },
+  "interpretation": {
+    "fast_vocabulary_size": 32000,
+    "generation_pad_id": 0,
+    "notes": [
+      "tokenizer pad ID 2 is EOS (</s>) for this distribution",
+      "generation pad ID 0 is independent generation metadata",
+      "SentencePiece pad_id -1 and <pad> lookup are protobuf metadata, not tokenizer padding"
+    ],
+    "sentencepiece_pad_id": -1,
+    "sentencepiece_pad_piece_lookup_id": 0,
+    "sentencepiece_pad_piece_lookup_is_declared_padding": false,
+    "slow_vocabulary_size": 32000,
+    "tokenizer_bos_id": 1,
+    "tokenizer_eos_id": 2,
+    "tokenizer_pad_id": 2,
+    "tokenizer_pad_token": "</s>"
+  },
+  "known_limitations": [
+    {
+      "affected_cases": [
+        "adjacent_added_tokens"
+      ],
+      "code": "added-token-atomicity",
+      "description": "tokenizer.json recognizes <unk>, <s>, and </s> as atomic added tokens; SentencePieceProcessor exposes only protobuf pieces and cannot reproduce that added-token segmentation"
+    },
+    {
+      "affected_cases": [],
+      "code": "generation-padding-separation",
+      "description": "generation_config.json pad_token_id 0 is generation metadata and is not tokenizer-model equivalence evidence"
+    },
+    {
+      "affected_cases": [
+        "invalid_utf8"
+      ],
+      "code": "invalid-utf8-api-surface",
+      "description": "the fast tokenizer rejects the original invalid UTF-8 bytes while the pinned SentencePiece binding accepts a bytes object; both raw outcomes are recorded as not-comparable and neither is treated as a replacement-decoded equivalence"
+    },
+    {
+      "affected_cases": [
+        "empty",
+        "one_ascii_space",
+        "two_ascii_spaces",
+        "ascii_word",
+        "repeated_merge",
+        "tab",
+        "newline",
+        "unicode_héllø_世界",
+        "emoji_byte_fallback",
+        "adjacent_added_tokens",
+        "single_special_true",
+        "pair_empty_empty",
+        "pair_empty_text",
+        "pair_text_empty",
+        "pair_text_text"
+      ],
+      "code": "sentencepiece-bos-policy",
+      "description": "SentencePiece does not add BOS by default; this report selects the explicit bos encode option for the comparable special=true case and records the selected option per observation"
+    },
+    {
+      "affected_cases": [
+        "empty",
+        "one_ascii_space",
+        "two_ascii_spaces",
+        "ascii_word",
+        "repeated_merge",
+        "tab",
+        "newline",
+        "unicode_héllø_世界",
+        "emoji_byte_fallback",
+        "adjacent_added_tokens",
+        "single_special_true",
+        "pair_empty_empty",
+        "pair_empty_text",
+        "pair_text_empty",
+        "pair_text_text"
+      ],
+      "code": "sentencepiece-decode-policy",
+      "description": "SentencePieceProcessor has no skip_special_tokens argument and drops control symbols during DecodeIds; fast retained and skipped decodes are both recorded, with skipped output used for comparison"
+    },
+    {
+      "affected_cases": [
+        "pair_empty_empty",
+        "pair_empty_text",
+        "pair_text_empty",
+        "pair_text_text"
+      ],
+      "code": "sentencepiece-no-pair-api",
+      "description": "SentencePieceProcessor exposes single-sequence encoding only; pair IDs and type IDs therefore cannot be compared"
+    },
+    {
+      "affected_cases": [
+        "pair_empty_empty",
+        "pair_empty_text",
+        "pair_text_empty",
+        "pair_text_text"
+      ],
+      "code": "sentencepiece-no-type-ids",
+      "description": "TemplateProcessing type IDs are a fast-tokenizer surface and are not exposed by SentencePieceProcessor"
+    },
+    {
+      "affected_cases": [],
+      "code": "sentencepiece-padding-metadata",
+      "description": "A visible <pad> protobuf lookup or SentencePiece pad_id is not the tokenizer padding semantic; this distribution uses tokenizer pad ID 2 (EOS)"
+    }
+  ],
+  "provenance": {
+    "artifacts": {
+      "generation_config.json": {
+        "name": "generation_config.json",
+        "sha256": "18046d04f5bd8b4998095ecabdd17a1bf0053d9acdccead4a05be4a3575f3c5c",
+        "size": 124
+      },
+      "special_tokens_map.json": {
+        "name": "special_tokens_map.json",
+        "sha256": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db",
+        "size": 551
+      },
+      "tokenizer.json": {
+        "name": "tokenizer.json",
+        "sha256": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+        "size": 1842767
+      },
+      "tokenizer.model": {
+        "name": "tokenizer.model",
+        "sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+        "size": 499723
+      },
+      "tokenizer_config.json": {
+        "name": "tokenizer_config.json",
+        "sha256": "7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a",
+        "size": 1289
+      }
+    },
+    "generation": {
+      "command": [
+        "python3",
+        "test/reference/tokenizer_reference.py",
+        "manifest",
+        "--model-dir",
+        "<MODEL_DIR>",
+        "--output",
+        "<OUTPUT>"
+      ]
+    },
+    "packages": {
+      "jinja2": "3.1.2",
+      "sentencepiece": "0.1.99",
+      "tokenizers": "0.14.1",
+      "transformers": "4.35.0"
+    },
+    "runtime": {
+      "implementation": "CPython",
+      "version": "3.11.16"
+    }
+  },
+  "report_version": "tinyllama-tokenizer-model-equivalence-v1",
+  "result": {
+    "disagreements": [],
+    "status": "pass"
+  }
+}
