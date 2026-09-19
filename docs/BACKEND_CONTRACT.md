@@ -4178,8 +4178,16 @@ cell per fixed queue metadata slot and releases it through `cudaFreeHost` only
 when that queue-resource lease is proven safe. The worker interprets the cell
 only after event proof and caches a queued `std::invalid_argument`; native
 launch, transfer, and event failures retain precedence. These are inspected
-source/API facts. CUDA build, device, allocation, and control-transfer runtime
-validation remain future verification obligations.
+source/API facts, and the closing five-backend gate executed them on the
+configured CUDA device: `ctest --test-dir build --output-on-failure --timeout
+300 -R '^iom_cuda_conformance_tests$'` passed `1/1`, the direct binary reported
+`31/31` cases with `5,956,331/5,956,331` assertions, and its embedding cases
+alone reported `2/2` cases with `117,047/117,047` assertions on
+`NVIDIA GeForce RTX 5090` (compute capability `12.0`, driver `595.71.05`,
+`nvcc` release `13.2` build `V13.2.78`). The status reset, bounded gather, and
+single four-byte status transfer are exercised by the deferred invalid-ID,
+repeated-wait, and status-reuse cases those runs contain; the exact commands,
+mirror, and observed results are recorded in the same-revision evidence below.
 
 The ROCm implementation uses the same shared raw-word metadata and gather
 kernel. `src/rocm/copy.hip` enqueues the metadata upload, device status reset,
@@ -4187,9 +4195,15 @@ bounded 256-thread HIP gather, exactly one four-byte `hipMemcpyAsync` status
 transfer, and the completion event on the queue stream. `src/rocm/device.cpp`
 reserves one page-locked `hipHostMalloc` status cell per fixed queue metadata
 slot and releases it through `hipHostFree` only after the queue-resource lease
-has proven completion. These are inspected source/API facts; the ROCm build,
-device, allocation, and control-transfer runtime results are recorded only by
-the remote verification gate.
+has proven completion. These are inspected source/API facts, and the closing
+five-backend gate executed them on the configured ROCm device: `ctest
+--test-dir build --output-on-failure --timeout 300 -R
+'^iom_rocm_conformance_tests$'` passed `1/1`, the direct binary reported `32/32`
+cases with `5,947,095/5,947,095` assertions, and its embedding cases alone
+reported `2/2` cases with `117,046/117,046` assertions on `gfx1201`
+(`AMD Radeon AI PRO R9700`, HIP `7.15.26333-0000000`, AMD clang `23.0.0git`),
+including the deferred invalid-ID and repeated-wait cases that require the
+four-byte `hipMemcpyAsync` status transfer.
 
 TTNN transfers the entire 32-byte control packet. Its positive workspace is one
 real owning replicated DRAM `MeshBuffer` on the existing unit mesh, whose native
@@ -4378,6 +4392,107 @@ Every rule in this section MUST be observable through the shared conformance
 suite or through a focused native lifetime and control-transfer scenario; tests
 assert behavior rather than field forwarding, source text, or incidental message
 wording.
+
+#### Same-revision five-backend gate evidence
+
+The closing Embedding gate ran every backend's existing conformance target and
+its direct binary at one revision — `5f839f10`, prepared worktree
+`.work/006-tinyllama/03-embedding-lookup/12-embedding-five-backend-gate` — and
+recorded the device, runtime, and toolchain identity of each run. The CPU pair
+ran locally; every accelerator pair used exact-worktree `csw-remote` sync/exec
+with a fresh sync immediately before each execution, a unique per-profile
+mirror, remote-side `timeout --kill-after=30s`, and a bounded hardware lock,
+and the TTNN invocation kept its 300-second CTest bound. No `.cswd` metadata
+was copied to any host. Every row below is a real run: nothing in it is
+compile-only, storage-only, rejection-only, or skipped.
+
+| Backend | Commands (mirror) | Device / runtime identity | Observed result |
+| --- | --- | --- | --- |
+| CPU | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_backend_conformance_cpu_tests$'` and `./build/test/iom_backend_conformance_cpu_tests` | Local host CPU, `g++` `15.2.0`, CMake `4.0.2`, release build | `1/1` CTest pass in `10.93 s`; `24/24` cases, `5,936,189/5,936,189` assertions; the embedding case alone `1/1` case, `118,307/118,307` assertions |
+| CUDA | both commands on remote host `bv1` (mirror `csw03emb12-a1-cuda`) | `NVIDIA GeForce RTX 5090`, compute capability `12.0`, driver `595.71.05`, `nvcc` release `13.2` build `V13.2.78` | `1/1` CTest pass in `16.33 s`; `31/31` cases, `5,956,331/5,956,331` assertions; embedding cases `2/2` cases, `117,047/117,047` assertions |
+| ROCm | both commands on remote host `bv2` (mirror `csw03emb12-a1-rocm`) | `gfx1201` (`AMD Radeon AI PRO R9700`), HIP `7.15.26333-0000000`, AMD clang `23.0.0git` | `1/1` CTest pass in `20.78 s`; `32/32` cases, `5,947,095/5,947,095` assertions; embedding cases `2/2` cases, `117,046/117,046` assertions |
+| SYCL | both commands on remote host `bv2` through the outside-checkout profile override with an empty `REMOTE_SETUP`, `set +u; source /opt/intel/oneapi/setvars.sh; set -u` and a `sycl-ls` GPU enumeration in every remote call (mirror `csw03emb12-a1-sycl`) | Level Zero V2 `Intel(R) Arc(TM) Pro B60 Graphics`, oneAPI DPC++/C++ `2026.1.0`, `ocloc` `26.22.38646.7` | `1/1` CTest pass in `6.83 s`; `29/29` cases, `5,907,297/5,907,297` assertions; embedding cases `4/4` cases, `117,124/117,124` assertions |
+| TTNN | `ctest --test-dir build/ttnn --output-on-failure --timeout 300 -R '^iom_ttnn_conformance_tests$'` and the direct binary on remote host `bv1` (mirror `csw03emb12-a1-ttnn`) | Blackhole device 0, UMD firmware bundle `19.13.1`, TT-Metalium `v0.76.0-dev20260801-268-g06994d4afda` (`06994d4afda`) | `1/1` CTest pass in `33.63 s`; `48/48` cases, `1,863,947/1,863,947` assertions; embedding cases `3/3` cases, `116,723/116,723` assertions |
+
+Each sync and exec pair, with its exact argv and observed exit status, is
+retained in
+`.cswd/tasks/006-tinyllama/03-embedding-lookup/12-embedding-five-backend-gate/remote.log`;
+the remote-side logs named there hold the full run output.
+
+**Matrix closure.** The four standard drivers declare and reach the complete
+23-payload and 12-index matrix through `kEmbeddingPayloadSpan` and
+`kEmbeddingIdSpan`, and the TTNN driver declares and reaches its 22-payload,
+12-index native row through `kEmbeddingTtnnPayloadSpan`. This gate adds no case,
+no span, and no second test project: the runs above are the existing shared
+cases plus each driver's own native cases. `BF16` and `R=1`, `15`, `16`, and
+`17` execute on every backend inside those declared cases, because the derived
+fixtures pair every declared payload leaf with `U32` indices, pair the declared
+`BF16` payload with every index leaf, and vary `R`, the feature extent, the
+vocabulary, and the leading planes with `BF16` as the default payload. TTNN's
+only payload outside its row is `F8_E8M0`: the canonical TTNN storage span omits
+it, the storage case asserts that `create_tensor` throws for it while all
+twenty-two other leaves succeed, and the embedding declaration therefore holds
+no `F8_E8M0` case. No other leaf, shape, or backend was excluded, and no
+`Unsupported`-only, storage-only, or compile-only observation is counted
+anywhere in the table.
+
+**Lifetime, workspace, and queue obligations observed by the same runs.** The
+shared `run_embedding_conformance` cases behind every row above cover the
+independent raw-bit oracle and its deliberate wrong-row, transposed,
+padded-table, numeric-re-encoding, and plane-blind negative variants; the
+declared request matrix with repeated IDs, first and last vocabulary rows,
+non-tile features, vocabulary boundaries, independent leading offsets, steps,
+and permutations through rank eight, a selected rank-two table plane, and
+poisoned native and output padding; accepted out-of-vocabulary and negative IDs
+including the `U64_MAX`, `I64_MIN`, and high-word-only classes, together with
+the directed 64-bit payload codes that cross `2^53` and carry both carrier
+words; repeated waits caching the same `std::invalid_argument`; the pure
+requirement query with no record, submission, registration, lease, or sequence
+consumption; positive-workspace validation, disjoint-range coexistence,
+overlapping live lease, stale and foreign range, and proven-completion reuse;
+output/input alias and overlap rejection with input/input read aliasing allowed;
+the producer copy to embedding to output consumer FIFO order; and
+unknown-completion quarantine with release only after native proof. The declared
+workspace rows are `{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and TTNN,
+whose first `uint32` is the bounds status (`0` valid, `1` invalid ID) and whose
+remaining 28 bytes are reserved control padding the caller neither initializes
+nor polls.
+
+**Status-transfer and execution-style evidence.** The standard accelerators
+transfer exactly four status bytes: the shared
+`src/shared/gpu_queue_operations.inl` path that CUDA and ROCm instantiate resets
+the device status word, launches the bounded gather, copies back
+`sizeof(std::uint32_t)` through `cudaMemcpyAsync`/`hipMemcpyAsync`, and records
+the completion event in FIFO order on the in-order queue. On SYCL the run
+executes the native gather declared in `src/sycl/embedding.cpp`: the status
+reset and the four-byte status copy are queue submissions that explicitly
+depend on the preceding event in `src/sycl/queue_embedding.cpp`, the built
+conformance binary carries the `launch_embedding_words` kernel symbol
+(31 occurrences) and no `host_task` occurrence, and the only `host_task` in the
+whole source tree is the unrelated SYCL binary-operation host realization in
+`src/sycl/queue_binary.cpp`. The deferred device-side invalid-ID failures the
+run asserts are reachable only when the native kernel writes the status word
+and the event-ordered copy delivers it, because no host scan of queued indices
+exists on this path. TTNN transfers the complete 32-byte control packet, and
+its run observed the raw Metal route rather than a high-level operator: with the
+Metalium build logger enabled (`TT_METAL_LOGGER_LEVEL=debug
+TT_METAL_LOGGER_TYPES=BuildKernels`) the focused TTNN embedding cases report
+`JIT build cache hit:
+.../kernels/embedding/16918367578600865223/ncrisc/ncrisck.o`, so the
+data-movement (`ncrisc`) kernel built from `src/ttnn/kernels/embedding.cpp` is
+what the device executes; `EmbeddingProgram` creates the program, circular
+buffer, and reader kernel through `CreateProgram`/`CreateKernel` and dispatches
+them with `EnqueueMeshWorkload`, and the status owner is read back as exactly
+`BufferRegion{owner_offset, 32}` through `enqueue_read_shards`. The public
+`ttnn::embedding` operator appears nowhere in the tree, so no high-level,
+host-emulated, or BF16-only substitution took place.
+
+**No defect.** Every recorded run passed with zero failures, so this gate
+corrected no normative statement, weakened no comparison, and changed no case,
+span, declaration, or implementation file: the section, the shared header, and
+the five drivers already match the exercised behavior, and the previously
+completed ports were revalidated by these same runs rather than by an unrun
+obligation.
 
 #### Implementation references and delivery prerequisites
 
