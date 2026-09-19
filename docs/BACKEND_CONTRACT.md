@@ -1195,6 +1195,15 @@ payload staging, caller-workspace lease, or host payload round trip. A missing
 Level Zero GPU or another unsupported SYCL runtime is reported through the
 common unsupported/resource-exhaustion categories; this path is never emulated.
 
+The ROCm cache-append port is implemented for all 23 standard opaque storage
+leaves, including `BOOL`, packed 2/4/6/8-bit fields, `BF16`, and raw `F64`.
+Its policy is a direct HIP raw-word kernel on the queue's existing nonblocking
+stream with the exact `{0, 1}` requirement: it performs no host staging,
+conversion, hidden allocation, or numerical/matrix operation. Installed HIP
+compiler and device properties are checked facts; hardware/runtime behavior is
+claimed only from the configured `csw-remote` ROCm build and conformance
+evidence, not inferred from this capability statement.
+
 BF16 is mandatory on all five backends, and `QuantizationFormat::NONE` is the
 only applicable quantization format. No route may zero storage, convert or
 re-encode payloads, allocate hidden workspace, or use native partial-row or

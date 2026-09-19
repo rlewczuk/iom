@@ -26,7 +26,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_rope.hpp"
 
-#include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_cache_append.hpp"
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -48,6 +48,42 @@ namespace {
 // quarantined operand (512 MiB), and fixtures also keep a foreign device
 // alive with the same budget.
 constexpr std::size_t kConformanceArenaBytes = 640u * 1024 * 1024;
+class HostAllocator final : public iom::Allocator {
+public:
+    explicit HostAllocator(const iom_conformance::TrafficGate& gate)
+            : gate_(gate) {}
+
+    void* alloc(std::size_t size) override {
+        CHECK_MESSAGE(
+                !gate_.armed(),
+                "tensor storage allocated inside a transfer, transform, or operation");
+        void* pointer = ::operator new(size, std::align_val_t(32));
+        live_.insert(pointer);
+        ++traffic_;
+        return pointer;
+    }
+
+    void free(void* buffer) override {
+        CHECK_MESSAGE(
+                !gate_.armed(),
+                "tensor storage freed inside a transfer, transform, or operation");
+        const auto found = live_.find(buffer);
+        REQUIRE_MESSAGE(
+                found != live_.end(),
+                "allocator freed an address it never handed out");
+        live_.erase(found);
+        ++traffic_;
+        ::operator delete(buffer, std::align_val_t(32));
+    }
+
+    void reset() override { ++traffic_; }
+
+private:
+    const iom_conformance::TrafficGate& gate_;
+    std::unordered_set<void*> live_;
+    std::size_t traffic_ = 0;
+};
+
 
 const char* g_executable_path = nullptr;
 
@@ -298,6 +334,204 @@ TEST_CASE("ROCm conformance: copy validation fails before writes and sequences")
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm conformance: cache append reference, admission, ordering, and lifetime") {
+    iom_conformance::TrafficGate gate;
+    HostAllocator reference_allocator{gate};
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
+    const iom_conformance::CacheAppendFaultSeam fault_seam{
+            [](iom::DeviceOps&) {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::third_plane_launch);
+            }};
+    const iom_conformance::CacheAppendConformanceConfig config{
+            devices,
+            candidate->supported_data_types(),
+            &oracle,
+            fault_seam,
+            {},
+            &gate,
+            true};
+    iom_conformance::run_cache_append_conformance(config);
+    CHECK_FALSE(gate.armed());
+}
+
+
+TEST_CASE("ROCm cache append retained event failure recovers after reset") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{1, 1, 1, 17}}, iom::DataType::F32};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{1, 1, 17, 17}}, iom::DataType::F32};
+    auto source = device->create_tensor(source_spec);
+    auto destination = device->create_tensor(destination_spec);
+    const std::vector<std::byte> source_bytes =
+            iom_conformance::encode_cache_append_logical(source_spec, 0x781);
+    const std::vector<std::byte> before =
+            iom_conformance::encode_logical(destination_spec, 0x782);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(destination->view(), before);
+
+    auto queue = device->create_ops();
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::event_record);
+    const iom::oid failed =
+            queue->cache_append(source->view(), destination->view(), 1);
+    REQUIRE(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+
+    auto recovered_destination = device->create_tensor(destination_spec);
+    const std::vector<std::byte> recovery_before =
+            iom_conformance::encode_logical(destination_spec, 0x783);
+    iom_conformance::copy_from_host(
+            recovered_destination->view(), recovery_before);
+    auto recovery_queue = device->create_ops();
+    const iom::oid recovered = recovery_queue->cache_append(
+            source->view(), recovered_destination->view(), 1);
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(recovery_queue->wait(recovered));
+    CHECK_NOTHROW(recovery_queue->wait(recovered));
+    iom_conformance::require_logical_bytes(
+            recovered_destination->view(),
+            iom_conformance::cache_append_expected_logical(
+                    source_spec, destination_spec, 1, source_bytes,
+                    recovery_before),
+            "ROCm cache append event-record recovery");
+}
+
+TEST_CASE("ROCm cache append retained launch failure recovers after reset") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{2, 1, 1, 33}}, iom::DataType::F32};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{2, 1, 33, 33}}, iom::DataType::F32};
+    auto source = device->create_tensor(source_spec);
+    auto destination = device->create_tensor(destination_spec);
+    const std::vector<std::byte> source_bytes =
+            iom_conformance::encode_cache_append_logical(source_spec, 0x791);
+    const std::vector<std::byte> before =
+            iom_conformance::encode_logical(destination_spec, 0x792);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(destination->view(), before);
+
+    auto queue = device->create_ops();
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::third_plane_launch);
+    const iom::oid failed =
+            queue->cache_append(source->view(), destination->view(), 15);
+    REQUIRE(iom::oid_is_token(failed));
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+
+    auto recovered_destination = device->create_tensor(destination_spec);
+    const std::vector<std::byte> recovery_before =
+            iom_conformance::encode_logical(destination_spec, 0x793);
+    iom_conformance::copy_from_host(
+            recovered_destination->view(), recovery_before);
+    auto recovery_queue = device->create_ops();
+    const iom::oid recovered = recovery_queue->cache_append(
+            source->view(), recovered_destination->view(), 15);
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(recovery_queue->wait(recovered));
+    CHECK_NOTHROW(recovery_queue->wait(recovered));
+    iom_conformance::require_logical_bytes(
+            recovered_destination->view(),
+            iom_conformance::cache_append_expected_logical(
+                    source_spec, destination_spec, 15, source_bytes,
+                    recovery_before),
+            "ROCm cache append launch-failure recovery");
+}
+
+TEST_CASE("ROCm cache append queue teardown quarantines pending operands") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{3, 16, 16}}, iom::DataType::U8};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{3, 64, 16}}, iom::DataType::U8};
+    auto source = device->create_tensor(source_spec);
+    auto destination = device->create_tensor(destination_spec);
+    iom_conformance::copy_from_host(
+            source->view(),
+            iom_conformance::encode_cache_append_logical(source_spec, 0x7a1));
+    iom_conformance::copy_from_host(
+            destination->view(),
+            iom_conformance::encode_logical(destination_spec, 0x7a2));
+    const void* source_address = source->view().native_handle();
+    const void* destination_address = destination->view().native_handle();
+    {
+        auto queue = device->create_ops();
+        for (int i = 0; i < 4; ++i) {
+            CHECK(iom::oid_is_token(
+                    queue->cache_append(
+                            source->view(), destination->view(), 1)));
+        }
+        iom::rocm_detail::inject_submission_fault_for_testing(
+                iom::rocm_detail::SubmissionFault::third_plane_launch);
+        const iom::oid failure =
+                queue->cache_append(source->view(), destination->view(), 1);
+        CHECK(iom::oid_is_token(failure));
+        queue.reset();
+    }
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+    source.reset();
+    destination.reset();
+    auto fresh_source = device->create_tensor(source_spec);
+    auto fresh_destination = device->create_tensor(destination_spec);
+    CHECK_NE(fresh_source->view().native_handle(), source_address);
+    CHECK_NE(fresh_source->view().native_handle(), destination_address);
+    CHECK_NE(fresh_destination->view().native_handle(), source_address);
+    CHECK_NE(fresh_destination->view().native_handle(), destination_address);
+}
+
+TEST_CASE("ROCm cache append retains source through pre-wait destruction") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{32, 1, 8192, 128}}, iom::DataType::U8};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{32, 1, 16384, 128}}, iom::DataType::U8};
+    auto source = device->create_tensor(source_spec);
+    auto destination = device->create_tensor(destination_spec);
+    const std::vector<std::byte> source_bytes =
+            iom_conformance::encode_cache_append_logical(source_spec, 0x7b1);
+    const std::vector<std::byte> destination_before =
+            iom_conformance::encode_logical(destination_spec, 0x7b2);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(
+            destination->view(), destination_before);
+
+    auto queue = device->create_ops();
+    const iom::oid token =
+            queue->cache_append(source->view(), destination->view(), 17);
+    REQUIRE(iom::oid_is_token(token));
+    source.reset();
+    auto fresh_source = device->create_tensor(source_spec);
+    iom_conformance::copy_from_host(
+            fresh_source->view(),
+            iom_conformance::encode_cache_append_logical(
+                    source_spec, 0x7b3));
+    CHECK_NOTHROW(queue->wait(token));
+    iom_conformance::require_logical_bytes(
+            destination->view(),
+            iom_conformance::cache_append_expected_logical(
+                    source_spec, destination_spec, 17, source_bytes,
+                    destination_before),
+            "ROCm cache append source owner retention");
+    fresh_source.reset();
+}
 TEST_CASE("ROCm copy reservation failures roll back before native work") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(16 * 1024 * 1024);
