@@ -352,6 +352,82 @@ void validate_utf8_and_line_endings(std::string_view source,
     }
 }
 
+[[noreturn]] void reject_message_role(std::size_t message_index,
+                                      std::string_view role) {
+    throw std::invalid_argument(
+            "invalid chat message at index " + std::to_string(message_index)
+            + " field 'role' requires the role string system, user, or assistant; actual '"
+            + std::string(role) + "'");
+}
+
+[[nodiscard]] std::size_t message_role_index(std::string_view role,
+                                             std::size_t message_index) {
+    if (role == "system") return 0;
+    if (role == "user") return 1;
+    if (role == "assistant") return 2;
+    reject_message_role(message_index, role);
+}
+
+[[noreturn]] void reject_message_content(std::size_t message_index,
+                                         std::size_t byte_offset,
+                                         std::string_view actual) {
+    throw std::invalid_argument(
+            "invalid chat message at index " + std::to_string(message_index)
+            + " field 'content' requires valid UTF-8 at byte offset "
+            + std::to_string(byte_offset) + "; actual " + std::string(actual));
+}
+
+void validate_message_content(std::string_view content,
+                              std::size_t message_index) {
+    for (std::size_t offset = 0; offset < content.size();) {
+        const auto byte = static_cast<unsigned char>(content[offset]);
+        if (byte <= 0x7F) {
+            ++offset;
+            continue;
+        }
+
+        std::size_t length = 0;
+        std::uint32_t code_point = 0;
+        if (byte >= 0xC2 && byte <= 0xDF) {
+            length = 2;
+            code_point = byte & 0x1F;
+        } else if (byte >= 0xE0 && byte <= 0xEF) {
+            length = 3;
+            code_point = byte & 0x0F;
+        } else if (byte >= 0xF0 && byte <= 0xF4) {
+            length = 4;
+            code_point = byte & 0x07;
+        } else {
+            reject_message_content(message_index, offset,
+                                   "an invalid lead byte");
+        }
+
+        if (length > content.size() - offset) {
+            reject_message_content(message_index, offset,
+                                   "a truncated sequence");
+        }
+        for (std::size_t index = 1; index < length; ++index) {
+            const auto continuation =
+                    static_cast<unsigned char>(content[offset + index]);
+            if ((continuation & 0xC0) != 0x80) {
+                reject_message_content(message_index, offset + index,
+                                       "a non-continuation byte");
+            }
+            code_point = (code_point << 6) | (continuation & 0x3F);
+        }
+        if ((length == 3 && code_point < 0x800)
+            || (length == 4 && code_point < 0x10000)
+            || code_point > 0x10FFFF
+            || (code_point >= 0xD800 && code_point <= 0xDFFF)) {
+            reject_message_content(
+                    message_index, offset,
+                    "an overlong, surrogate, or out-of-range sequence");
+        }
+        offset += length;
+    }
+}
+
+
 [[nodiscard]] std::size_t find_tag_end(std::string_view source,
                                        std::size_t begin,
                                        std::string_view closing,
@@ -1182,34 +1258,25 @@ ChatFormatter::~ChatFormatter() = default;
 std::string ChatFormatter::format(
         std::span<const ChatMessageView> messages,
         bool add_generation_prompt) const {
-    std::string output;
+    if (messages.empty()) {
+        return {};
+    }
+
+    const std::size_t max_output_size = std::string{}.max_size();
     std::size_t output_size = 0;
     const auto add_size = [&](std::size_t size) {
-        if (size > output.max_size() - output_size) {
+        if (size > max_output_size - output_size) {
             throw std::overflow_error("chat format output size overflows");
         }
         output_size += size;
     };
+
     add_size(impl_->prefix.size());
-    add_size(impl_->post_loop.size());
-    add_size(impl_->suffix.size());
-    if (add_generation_prompt && !impl_->generation_inside_loop) {
-        add_size(impl_->generation.size());
-    }
     for (std::size_t message_index = 0; message_index < messages.size();
          ++message_index) {
         const ChatMessageView& message = messages[message_index];
         const std::size_t index =
-                message.role == "system"
-                        ? 0
-                        : message.role == "user" ? 1
-                                                 : message.role == "assistant" ? 2
-                                                                                : 3;
-        if (index == 3) {
-            throw std::invalid_argument(
-                    "chat message role must be system, user, or assistant; actual "
-                    + std::string(message.role));
-        }
+                message_role_index(message.role, message_index);
         const RoleAffix& affix = impl_->role_affixes[index];
         add_size(affix.before_content.size());
         add_size(message.content.size());
@@ -1221,16 +1288,26 @@ std::string ChatFormatter::format(
         }
         add_size(impl_->iteration_tail_after_generation.size());
     }
+    add_size(impl_->post_loop.size());
+    if (add_generation_prompt && !impl_->generation_inside_loop) {
+        add_size(impl_->generation.size());
+    }
+    add_size(impl_->suffix.size());
+
+    for (std::size_t message_index = 0; message_index < messages.size();
+         ++message_index) {
+        validate_message_content(messages[message_index].content,
+                                 message_index);
+    }
+
+    std::string output;
     output.reserve(output_size);
     output.append(impl_->prefix);
     for (std::size_t message_index = 0; message_index < messages.size();
          ++message_index) {
         const ChatMessageView& message = messages[message_index];
         const std::size_t index =
-                message.role == "system"
-                        ? 0
-                        : message.role == "user" ? 1
-                                                 : 2;
+                message_role_index(message.role, message_index);
         const RoleAffix& affix = impl_->role_affixes[index];
         output.append(affix.before_content);
         output.append(message.content);

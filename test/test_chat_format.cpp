@@ -48,6 +48,22 @@ std::string compact_template() {
     return R"({% for message in messages %}{% if message['role'] == 'system' %}{{ '<|system|>\n' + message['content'] + eos_token }}{% elif message['role'] == 'user' %}{{ '<|user|>\n' + message['content'] + eos_token }}{% elif message['role'] == 'assistant' %}{{ '<|assistant|>\n' + message['content'] + eos_token }}{% endif %}{% if loop.last and add_generation_prompt %}{{ '<|assistant|>\n' }}{% endif %}{% endfor %})";
 }
 
+std::string sentence_template() {
+    return "{% for message in messages %}"
+           "{% if message['role'] == 'system' %}"
+           "{{ '<|system|>\\n' + message['content'] + eos_token }}\n"
+           "{% elif message['role'] == 'user' %}"
+           "{{ '<|user|>\\n' + message['content'] + eos_token }}\n"
+           "{% elif message['role'] == 'assistant' %}"
+           "{{ '<|assistant|>\\n' + message['content'] + eos_token }}\n"
+           "{% endif %}"
+           "{% if loop.last and add_generation_prompt %}"
+           "{{ '<|assistant|>\\n' }}"
+           "{% endif %}"
+           "{% endfor %}";
+}
+
+
 nlohmann::json token_metadata(std::string content, bool special = true) {
     return nlohmann::json{{"content", std::move(content)},
                           {"lstrip", false},
@@ -98,6 +114,18 @@ std::string invalid_reason(const TempDir& directory,
     }
     return {};
 }
+
+std::string format_invalid_reason(
+        const iom::ChatFormatter& formatter,
+        std::span<const iom::ChatMessageView> messages) {
+    try {
+        (void)formatter.format(messages, false);
+    } catch (const std::invalid_argument& error) {
+        return error.what();
+    }
+    return {};
+}
+
 
 }  // namespace
 
@@ -215,4 +243,75 @@ TEST_CASE("Chat format rejects unknown render roles") {
     const auto formatter = iom::load_chat_formatter(directory.path());
     const iom::ChatMessageView message[] = {{"tool", "ignored"}};
     CHECK_THROWS_AS(formatter->format(message, false), std::invalid_argument);
+}
+
+TEST_CASE("Chat format renders sentence-style messages with exact line feeds") {
+    const TempDir directory("render-sentences");
+    write_config(directory, valid_config(sentence_template()));
+    const auto formatter = iom::load_chat_formatter(directory.path());
+
+    const iom::ChatMessageView one_user[] = {{"user", "x"}};
+    CHECK(formatter->format(one_user, false) == "<|user|>\nx</s>\n");
+    CHECK(formatter->format(one_user, true)
+          == "<|user|>\nx</s>\n<|assistant|>\n");
+
+    const iom::ChatMessageView messages[] = {{"system", "rules"},
+                                             {"user", "hello"},
+                                             {"assistant", "answer"}};
+    CHECK(formatter->format(messages, false)
+          == "<|system|>\nrules</s>\n"
+             "<|user|>\nhello</s>\n"
+             "<|assistant|>\nanswer</s>\n");
+
+    const iom::ChatMessageView empty_user[] = {{"user", ""}};
+    CHECK(formatter->format(empty_user, false) == "<|user|>\n</s>\n");
+    CHECK(formatter->format(empty_user, true)
+          == "<|user|>\n</s>\n<|assistant|>\n");
+    CHECK(formatter->format(one_user, false) == "<|user|>\nx</s>\n");
+}
+
+TEST_CASE("Chat format renders a valid override with independent owner state") {
+    const TempDir directory("render-override");
+    const std::string override_template =
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{ 'S:' + message['content'] + eos_token }}\n"
+            "{% elif message['role'] == 'user' %}"
+            "{{ 'U:' + message['content'] + eos_token }}\n"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ 'A:' + message['content'] + eos_token }}\n"
+            "{% endif %}"
+            "{% if loop.last and add_generation_prompt %}"
+            "{{ 'A:\\n' }}"
+            "{% endif %}"
+            "{% endfor %}";
+    write_config(directory, valid_config("not compiled"));
+    const auto formatter =
+            iom::load_chat_formatter(directory.path(), override_template);
+    const iom::ChatMessageView message[] = {{"user", "hello"}};
+    CHECK(formatter->format(message, false) == "U:hello</s>\n");
+    CHECK(formatter->format(message, true) == "U:hello</s>\nA:\n");
+    CHECK(formatter->format(message, false) == "U:hello</s>\n");
+}
+
+TEST_CASE("Chat format rejects invalid message input before rendering") {
+    const TempDir directory("render-validation");
+    write_config(directory, valid_config(sentence_template()));
+    const auto formatter = iom::load_chat_formatter(directory.path());
+
+    const iom::ChatMessageView invalid_role[] = {{"User", "x"}};
+    const std::string role_error =
+            format_invalid_reason(*formatter, invalid_role);
+    CHECK(role_error.find("field 'role'") != std::string::npos);
+    CHECK(role_error.find("User") != std::string::npos);
+
+    const std::string invalid_bytes("\xC3\x28", 2);
+    const iom::ChatMessageView invalid_content[] = {{"user", invalid_bytes}};
+    const std::string content_error =
+            format_invalid_reason(*formatter, invalid_content);
+    CHECK(content_error.find("field 'content'") != std::string::npos);
+    CHECK(content_error.find("valid UTF-8") != std::string::npos);
+
+    const iom::ChatMessageView valid_message[] = {{"user", "x"}};
+    CHECK(formatter->format(valid_message, false) == "<|user|>\nx</s>\n");
 }
