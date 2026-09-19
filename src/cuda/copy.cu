@@ -101,13 +101,12 @@ void gpu_policy::launch_silu(
     throw detail::UnsupportedOperation();
 }
 
-// The shared Rope facility is compiled into this translation unit, but the
-// queue policy remains an explicit Unsupported stub until the independent
-// CUDA wrapper leaf enables its launch.
+// CUDA's RoPE leaf delegates to the shared packed-word-owned kernel.  The
+// queue supplies its immutable descriptor and already-created nonblocking
+// stream; no second stream, staging, allocation, or synchronization is added.
 void gpu_policy::launch_rope(
-        cudaStream_t, const detail::RopeMetadata& metadata) {
-    static_cast<void>(metadata);
-    throw detail::UnsupportedOperation();
+        cudaStream_t stream, const detail::RopeMetadata& metadata) {
+    detail::launch_standard_tiled_rope<gpu_policy>(stream, metadata);
 }
 
 // CUDA's linear projection dispatches the native BF16 specialization on its
