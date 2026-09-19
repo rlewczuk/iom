@@ -108,6 +108,7 @@ namespace iom {
         DeviceOps(DeviceOps&&) = delete;
         DeviceOps& operator=(DeviceOps&&) = delete;
         virtual ~DeviceOps();
+        [[nodiscard]] const Device& device() const;
         /**
          * Observe accepted work in queue order. A negative, zero, foreign,
          * future, skipped/reserved-but-never-submitted, or otherwise
