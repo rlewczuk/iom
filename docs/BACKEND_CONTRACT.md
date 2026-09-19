@@ -666,6 +666,50 @@ before a kernel belong to the [Linear projections](#linear-projections)
 contract; this table does not infer integer normalization or silently mean
 “all floats.” Only `QuantizationFormat::NONE` is applicable; every other
 quantization format is rejected.
+ 
+##### SiLU-specific semantic, scalar, and numerical policy
+
+SiLU has exactly 23 classified input/output leaves. Its semantic partition is
+independent of whether a backend can store or compute a particular applicable
+format:
+
+| Leaf group | Leaves | SiLU classification | Reason |
+| --- | --- | --- | --- |
+| Boolean | `BOOL` | unsupported/inapplicable | A boolean is not a signed real-valued transcendental operand or result. |
+| Integer | `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64` | unsupported/inapplicable | SiLU does not invent integer arithmetic or implicitly convert an integer operand to real arithmetic. |
+| Low-precision floating | `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2` | applicable | These are signed real-valued formats; their named codec controls finite saturation and representable special classes. |
+| Standard floating | `F16`, `BF16`, `F32`, `F64` | applicable | These are signed real-valued formats; `F64` remains an FP64 contract and is not silently narrowed. |
+| Exponent-only | `F8_E8M0` | unsupported/inapplicable | An unsigned exponent-only encoding is not a general signed SiLU value. |
+
+The operation's independent scalar/raw reference decodes and encodes through
+the named-format rules in `src/shared/scalar_binary_codec.hpp`: finite-only
+`F4`/`F6` encodings do not acquire invented infinities or NaNs,
+`F8_E4M3FN` has NaN but no infinity, and the other applicable leaves retain
+their declared IEEE classes, subnormals, signed zero, saturation, and
+round-to-nearest, ties-to-even (RNE) encoding behavior. The reference computes
+SiLU in the required wide domain and performs exactly one target-format encode
+at the output boundary; production code is never its sole oracle.
+
+For finite inputs the reference uses `x / (1 + exp(-x))` with the stable
+negative branch `t = exp(x/2); y = ((x*t)*t)/(1+t*t)` (the written
+left-associated numerator is normative), and a nonnegative branch
+`x/(1+exp(-x))`. The alternative `x*exp(x)/(1+exp(x))` is permitted only
+when it preserves every required representable tail. `+infinity` maps to
+`+infinity`, `-infinity` to negative zero, signed zeros retain their signs,
+and NaN maps to NaN without payload or sign equality. Finite inputs never
+produce NaN; a negative finite result that rounds to zero retains its negative
+sign. Intermediates are FP32 through `F32` and FP64 for `F64`, with no FTZ or
+fast-math tail erasure. The `F32` input `-104` and `F64` input `-746` retain
+nonzero negative subnormal tails.
+
+The independent comparison ceilings are one target-format ULP for
+`F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, and `BF16`;
+four ULP for `F32`; and eight ULP for `F64`. Special-value classes,
+signed-zero signs, exact zero behavior, and the two underflow-tail fixtures
+are exact checks in addition to those ceilings. The shared SiLU reference and
+all named behavior cases are owned by the planned
+`test/backend/backend_conformance_silu.hpp` suite described by the
+[SiLU activation](#silu-activation) contract below.
 
 ##### Storage, rounding, masking, and nonfinite values
 
@@ -710,12 +754,13 @@ accumulation.
 
 Ordinary floating values follow their mathematically defined IEEE classes.
 Masking MUST exclude inaccessible values entirely; admission MUST NOT scan
-generically for nonfinite values or force a host transfer. Before kernels are
-implemented, the owning operation contracts MUST fix nonfinite tensor
-behavior, exact SiLU infinity and signed-zero rules, finite-format
-saturation/NaN handling, the supported RoPE position/trigonometric domain, and
-per-dtype tolerances. TinyLlama model parameters require positive finite
-epsilon and finite positive theta. RMSNorm with `eps=0` may yield NaN for a
+The owning operation contracts fix nonfinite tensor behavior, exact SiLU
+infinity and signed-zero rules, finite-format saturation/NaN handling, the
+supported RoPE position/trigonometric domain, and per-dtype tolerances. The
+[SiLU activation](#silu-activation) section below fixes the SiLU values and
+reference ceilings; TinyLlama model parameters require positive finite
+epsilon and finite positive theta.
+RMSNorm with `eps=0` may yield NaN for a
 zero row, and the final selector rejects every otherwise-valid nonfinite logit.
 No NaN payload equality is promised.
 
@@ -800,12 +845,13 @@ For the model's BF16 boundary, squares, reduction, reciprocal square root, and
 scale multiplication use FP32 or a demonstrated sufficiently wide equivalent,
 then the result is rounded once to the output leaf.
 
-SiLU requires rank 2 through 8, identical input/output shapes, and independent
-leading planes. It computes stable `x * sigmoid(x)` as one wide computation and
-rounds once to the output leaf. The MLP MUST compose that stored result with
-the existing binary operation as
-`mul(SiLU(gate), up, product)`—in that operand order—and MUST NOT add a fused
-SiLU-times-multiply operation.
+The operation-specific [SiLU activation](#silu-activation) contract requires
+rank 2 through 8, identical input/output shapes, independent leading planes,
+and the element equation `y[b,r,f] = x[b,r,f] / (1 + exp(-x[b,r,f]))`.
+It evaluates that equation stably in one wide computation and rounds once to
+the output leaf. The MLP MUST compose that stored result with the existing
+binary operation as `mul(SiLU(gate), up, product)`—in that operand order—and
+MUST NOT add a fused SiLU-times-multiply operation.
 
 Each requirement query returns `WorkspaceRequirements`, is deterministic and
 pure, and has the same semantic arguments as its operation except for a const
@@ -3189,6 +3235,213 @@ registration-lifetime, workspace, and repeat-wait coverage;
 the valid-shape `Unsupported` probes. Backend kernels and their
 backend-specific launch code remain owned by their own ports.
 
+#### SiLU activation
+
+This is the operation-owned contract for the planned `DeviceOps::silu`.
+The common facade currently keeps a well-formed SiLU request
+`Unsupported` until an actual backend port lands; that runtime status does
+not weaken the final semantic or capability matrix below, and an unsupported
+probe is not numerical conformance. The exact public surface is:
+
+```cpp
+oid silu(const TensorView& x, TensorView& y,
+         RawWorkspaceView workspace = {}) noexcept;
+WorkspaceRequirements silu_workspace_requirements(
+        const TensorView& x, const TensorView& y);
+```
+
+The requirement query has the same semantic tensor arguments as submission,
+with no workspace argument. It is a pure requirement query, not a support
+probe: it performs no allocation, owner registration, lease acquisition,
+sequence reservation, queue submission, queue or arena inspection, data read,
+or output mutation. It may perform only the operation's throwing structural,
+dtype, capability, alias, and checked-arithmetic validation, and it is
+deterministic for the same complete tensor arguments and immutable device
+capability.
+
+1. **Logical mapping and equation.** `x` and `y` MUST have the same complete
+   rank-two through rank-eight shape `[...,R,F]`, with every extent nonzero.
+   `R` is the logical run extent and `F` is the logical feature extent. For
+   every complete leading-plane tuple `b`, every `0 <= r < R`, and every
+   `0 <= f < F`, SiLU evaluates each element exactly once:
+
+   ```text
+   y[b,r,f] = x[b,r,f] / (1 + exp(-x[b,r,f]))
+   ```
+
+   Every leading plane is independent. There is no leading-plane or feature
+   broadcast, reduction, transposition, row extraction, hidden state,
+   session state, or cross-element dependence.
+
+2. **Tensor, view, and padding boundaries.** Both views MUST use the supported
+   TILE layout, the same dtype, and `QuantizationFormat::NONE`, and they MUST
+   belong to the exact same device identity. `y` is caller-owned output with
+   no owner or storage in common with `x`; exact aliases and every partial
+   overlap, including overlap exposed by transformed view ranges, are
+   rejected. Only logical elements are read from `x` and written to `y`.
+   Physical `16x16` TILE padding and every unused storage cell are outside
+   the equation and MUST NOT be read as inputs or modified. Poisoning input
+   padding MUST NOT change logical output, and poisoning output padding MUST
+   remain unobservable.
+
+3. **Semantic dtype classification.** The complete SiLU classification is
+   the following 23-leaf table. Applicability is semantic and is not a claim
+   that every backend stores or computes every applicable leaf.
+
+   | Leaf | Semantic SiLU class | CPU | CUDA | ROCm | SYCL | TTNN |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | `BOOL` | Unsupported/inapplicable: not a signed real-valued transcendental operand or result | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I2` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U2` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I4` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U4` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I8` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U8` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I16` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U16` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I32` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U32` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I64` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U64` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `F4_E2M1` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | `F6_E2M3` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | `F6_E3M2` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | `F8_E4M3FN` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | `F8_E5M2` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | `F8_E8M0` | Unsupported/inapplicable: unsigned exponent-only encoding is not a signed real value | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `F16` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | `BF16` | Applicable signed real format | Supported | Supported | Supported | Supported | Supported |
+   | `F32` | Applicable signed real format | Supported | Supported | Supported | Supported | Supported |
+   | `F64` | Applicable signed real format; never silently narrowed | Supported | Supported | Supported | Supported only with `aspect::fp64`; otherwise `Unsupported` — device fp64 unavailable | `Unsupported` — no contract-compatible TTNN representation/math path |
+
+   CPU, CUDA, and ROCm therefore support all nine applicable leaves. SYCL
+   supports the eight applicable leaves other than `F64` unconditionally and
+   supports `F64` only when the device provides `aspect::fp64`; unavailable
+   device FP64 is an explicit `Unsupported` capability. TTNN supports only
+   `BF16` and `F32`; every other applicable leaf is `Unsupported` for the
+   named lack of a contract-compatible representation or math path. `BOOL`,
+   all 12 integer leaves, and `F8_E8M0` remain `Unsupported` on every backend
+   because they are semantically inapplicable. An unknown `DataType` enum is
+   `InvalidArgument`, not a capability result. A recognized but unsupported
+   applicable leaf returns `Unsupported` with the named capability reason only
+   after structural admission checks. Only `QuantizationFormat::NONE` is in
+   scope; an unknown quantization enum is `InvalidArgument`, and a recognized
+   non-`NONE` format is `Unsupported`.
+
+4. **Zero workspace and pure requirements.** Every backend's
+   `silu_workspace_requirements(x, y)` returns exactly `{0, 1}`. Since the
+   required capacity is zero, a supplied nonempty `RawWorkspaceView` is
+   ignored: its owner, device, address, size, alignment, overlap, and
+   liveness are not validated, and it is neither leased nor retained. This
+   is the zero-capacity path of `WorkspaceValidation::validated` in
+   `src/device_ops.cpp`. No implementation may hide an allocation, scratch
+   buffer, staging transfer, or host round trip behind this contract.
+
+5. **Admission and errors.** Before sequence consumption, owner
+   registration, allocation, output mutation, or submission, admission MUST
+   validate every host-known fact: rank and nonzero dimensions; complete
+   shape equality and leading-plane tuples; TILE layout and `NONE`
+   quantization; known dtype enum and backend capability; exact device
+   identity; live owner and native-view identity; input/output disjoint
+   storage including transformed-view ranges; and checked element, tile,
+   byte, stride, plane, address, and other size arithmetic. The zero-capacity
+   workspace rule above is the only workspace exception. No pre-acceptance
+   failure may enqueue work, mutate output, register an owner, allocate, or
+   consume a sequence.
+
+   The `noexcept` facade maps pre-acceptance failures through the common
+   categories `InvalidArgument=-1`, `Unsupported=-2`, `Overflow=-3`,
+   `ResourceExhausted=-4`, `DeviceError=-5`, and `InternalError=-6`. A
+   positive OID denotes accepted work. The request copies all needed tensor
+   metadata—shape, dtype, quantization, offsets, strides, device identity,
+   owner identity, native-view identity, and validated bounds—rather than
+   retaining borrowed `TensorView` objects. Caller-owned operand and output
+   resources remain retained until proven completion, and temporary views may
+   be destroyed immediately after submission.
+
+6. **Queue, ownership, and accepted failures.** SiLU follows the established
+   in-order asynchronous queue protocol. An accepted device-side failure
+   remains attached to its positive OID, and every repeated wait observes the
+   same failure; callers follow the common drain/reset rules before destroying
+   resources. The contract does not promise rollback or unchanged output
+   after an accepted failure. SiLU owns no session or model state and performs
+   no operation-level synchronization beyond its queue submission.
+
+7. **Stable finite arithmetic.** Mathematical SiLU is
+   `x / (1 + exp(-x))`. For negative finite `x`, the independent reference
+   and every conforming implementation use the underflow-safe form
+   `t = exp(x/2); y = ((x*t)*t)/(1+t*t)`, with the numerator evaluated in
+   the written left-associated order so `t*t` is not rounded to zero before
+   multiplication by `x`. A nonnegative finite branch may use
+   `x/(1+exp(-x))`. `x*exp(x)/(1+exp(x))` is permitted only where it preserves
+   every required representable tail; naive `inf/inf` behavior MUST NOT select
+   policy.
+
+8. **Special values and named scalar formats.** Representable special values
+   are handled before finite arithmetic: `+infinity` maps to `+infinity`,
+   `-infinity` maps to negative zero, signed `+0` and `-0` are preserved,
+   and NaN maps to NaN without a payload or sign-equality promise. `F4_E2M1`,
+   `F6_E2M3`, and `F6_E3M2` represent no nonfinite values;
+   `F8_E4M3FN` represents NaN but no infinity. Finite inputs never produce
+   NaN. If a negative finite result rounds to zero, its negative sign is
+   retained. Saturation, subnormal, signed-zero, and representable special
+   classes reuse the named-format codec rules; finite-only formats never gain
+   invented nonfinite encodings.
+
+9. **Intermediates, rounding, and tolerance.** Applicable leaves through
+   `F32` use at least FP32 intermediates, while `F64` uses FP64 intermediates.
+   FTZ and fast-math behavior that erases required tails are non-conforming.
+   Exactly one RNE output encoding/store occurs at the operation boundary; the
+   target format is not used as an intermediate. Supported `F32` input
+   `x=-104` MUST retain a nonzero negative subnormal tail, and supported
+   `F64` input `x=-746` MUST retain a nonzero negative subnormal tail.
+
+   The independent reference uses one target-format ULP as the ceiling for
+   `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, and
+   `BF16`; four ULP for `F32`; and eight ULP for `F64`. Special-value classes,
+   signed-zero signs, exact zero behavior, and the two underflow-tail fixtures
+   require exact class/sign checks in addition to those ceilings. The
+   independent scalar/raw reference is linked to
+   `src/shared/scalar_binary_codec.hpp` and MUST NOT use production SiLU as
+   its sole oracle.
+
+10. **Shared SiLU conformance map.** The planned shared header
+    `test/backend/backend_conformance_silu.hpp` owns the following named
+    cases; every rule above MUST be observable through one of them, and an
+    unsupported backend keeps an explicit `Unsupported` probe rather than
+    counting rejection as conformance:
+
+    | Shared case | Required coverage |
+    | --- | --- |
+    | `api_and_query_purity_zero_workspace` | Exact ABI and pure query; deterministic `{0, 1}` requirements; nonempty workspace ignored without validation, leasing, retention, or state effects. |
+    | `shape_rank_planes_runs_and_padding` | Rank 2..8, complete `[...,R,F]` mapping, independent leading planes, logical runs `R=1,15,16,17`, non-tile feature sizes, TILE padding poisoning, and output-padding isolation. |
+    | `dtype_classification_and_backend_matrix` | All 23 leaves, semantic inapplicability versus capability, `NONE` quantization, CPU/CUDA/ROCm nine-leaf support, SYCL eight-plus-conditional-F64 support, and TTNN `BF16`/`F32` only. |
+    | `admission_alias_device_owner_and_overflow` | Shape/layout/dtype/device/owner/native-view admission, exact aliases and partial overlaps, transformed-view disjointness, checked element/tile/byte/stride/plane/address overflow, and negative OID categories. |
+    | `stable_finite_reference_and_tails` | Independent scalar/raw reference, stable finite branches, FP32/FP64 intermediates, one output encode, no FTZ, `F32 -104` and `F64 -746` tails, and 1/4/8-ULP ceilings. |
+    | `special_values_signed_zero_and_rounding` | Infinity and NaN classes, signed zeros, negative-zero underflow, finite-only format limits, saturation/subnormals, exact class/sign checks, and RNE encoding. |
+    | `accepted_failure_repeat_wait_and_temporary_view` | Accepted asynchronous failures retained on positive OIDs, repeated identical waits, owner retention, temporary-view destruction safety, in-order queue behavior, and drain/reset boundaries. |
+    | `stored_result_composes_with_mul` | Distinct `[R,M]` or independent-plane `[P,R,M]` `ActivatedGate` storage, then existing `mul(ActivatedGate, Up, Product)` in that operand order with the stored rounding boundary intact. |
+
+    The shared cases cover exact output ownership, logical runs and features,
+    independent planes, poisoned input/output padding, every applicable
+    backend/dtype expectation, admission and overflow failures, special
+    classes and rounding, accepted failures and repeated waits, and the
+    stored-result composition boundary. They do not add a generic unary,
+    SwiGLU, or MLP API.
+
+11. **MLP composition boundary.** The caller stores `SiLU(Gate)` in a
+    distinct `[R,M]` result, or `[P,R,M]` for independent leading planes,
+    then calls existing `mul(ActivatedGate, Up, Product)` in that operand
+    order. SiLU MUST NOT fuse with multiplication, alter `mul` or `add`,
+    erase the stored-result rounding boundary, or add a generic unary or
+    fused SwiGLU/MLP operation. Existing residual, session, and model
+    boundaries remain outside this section.
+
+The operation-specific conformance header and future backend drivers are the
+only test surface for this contract. No declaration, implementation, kernel,
+test, registration, model, or session file is changed by this documentation
+leaf; until a port lands, the current runtime hooks remain `Unsupported`.
+
 ### 10. Model loading and weight layout
 
 Model ingestion begins with an explicit model directory and stays
@@ -3986,6 +4239,14 @@ targets are
 `test/backend/test_backend_coexistence.cpp` and target
 `iom_backend_coexistence_tests` provide the combined coexistence gate.
 
+The planned SiLU operation has one shared executable source map,
+`test/backend/backend_conformance_silu.hpp`, whose eight named cases cover
+its ABI, pure zero-workspace query, shape and padding mapping, all 23 leaves
+and the final backend matrix, admission and overflow, stable arithmetic and
+special values, accepted failures and repeat waits, and stored-result `mul`
+composition. Existing backend drivers remain the future consumers of that
+shared header; no second SiLU test project is permitted.
+
 Each backend driver exercises ADD, MUL, SUB, and DIV through its real queue for
 every required leaf, as well as unsupported domains, validation precedence,
 broadcasting, transformed mappings, exact aliases, owner deduplication, repeat
@@ -4013,6 +4274,10 @@ Use these sources when changing or extending the contract:
   purity, precedence, rejection-effect, snapshot, and ownership tests in
   `test/test_iom.cpp` and its valid-shape `Unsupported` probes in
   `test/backend/backend_conformance_other.hpp` and `test/cpu/test_cpu.cpp`;
+- planned SiLU ABI, scalar/raw reference, admission, zero-workspace,
+  capability, numerical, queue/lifetime, and MLP composition contract:
+  [SiLU activation](#silu-activation), `src/shared/scalar_binary_codec.hpp`,
+  and the planned shared `test/backend/backend_conformance_silu.hpp` cases;
 - storage, transfer, copy, and physical oracle:
   `test/backend/backend_conformance_copy_storage.hpp`,
   `test/backend/backend_conformance_oracle.hpp`;
