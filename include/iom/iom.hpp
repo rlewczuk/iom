@@ -169,6 +169,21 @@ namespace iom {
                 const TensorView& lhs, const TensorView& rhs,
                 const TensorView& out);
         /**
+         * Backend-neutral cache-row append:
+         * `destination[..., h, a + r, d] = source[..., h, r, d]`.
+         * The source and destination ranks are three through eight, the
+         * leading tuple, head count, feature width, encodings, and exact
+         * queue device must match, and the explicit row offset is never
+         * inferred from session state.
+         */
+        oid cache_append(
+                const TensorView& source, TensorView& destination,
+                std::size_t a, RawWorkspaceView workspace = {}) noexcept;
+        [[nodiscard]] WorkspaceRequirements
+                cache_append_workspace_requirements(
+                        const TensorView& source,
+                        const TensorView& destination, std::size_t a);
+        /**
          * Embedding row lookup `out[b, r, f] = table[indices[b, 0, r], f]`
          * over a rank-two `E[V, F]` table shared unchanged by every
          * independent leading plane, `indices[..., 1, R]`, and
@@ -380,6 +395,66 @@ namespace iom {
             void* native_handle;
             std::size_t plane_offset;
             std::vector<std::size_t> plane_strides;
+        };
+        /**
+         * Fixed-size, immutable metadata captured for one cache append
+         * operand. The arrays deliberately avoid TensorSpec/TensorShape
+         * copies so a successful workspace query does not allocate.
+         */
+        struct CacheAppendViewSnapshot {
+            std::size_t rank = 0;
+            std::array<std::size_t, 8> dimensions{};
+            std::array<std::size_t, 6> plane_strides{};
+            std::size_t plane_offset = 0;
+            DataType data_type = DataType::BOOL;
+            QuantizationFormat quantization = QuantizationFormat::NONE;
+            const Device* device_identity = nullptr;
+            const Tensor* owner_identity = nullptr;
+            void* native_handle = nullptr;
+
+            [[nodiscard]] std::span<const std::size_t>
+                    shape_dimensions() const noexcept {
+                return {dimensions.data(), rank};
+            }
+            [[nodiscard]] std::span<const std::size_t>
+                    leading_plane_strides() const noexcept {
+                return {plane_strides.data(), rank >= 2 ? rank - 2 : 0};
+            }
+        };
+        /**
+         * Immutable cache append admission request. Source/destination
+         * metadata and `a` are value-copied before backend admission; only
+         * the validated workspace and retained lease are populated while
+         * the common submission helper prepares the accepted work.
+         */
+        struct CacheAppendRequest {
+            CacheAppendViewSnapshot source;
+            CacheAppendViewSnapshot destination;
+            std::size_t a = 0;
+            RawWorkspaceView workspace;
+            WorkspaceRequirements workspace_requirements;
+            detail::WorkspaceLease workspace_lease;
+
+            CacheAppendRequest(
+                    CacheAppendViewSnapshot source_,
+                    CacheAppendViewSnapshot destination_,
+                    std::size_t a_,
+                    RawWorkspaceView workspace_ = {},
+                    WorkspaceRequirements workspace_requirements_ = {},
+                    detail::WorkspaceLease workspace_lease_ = {})
+                : source(std::move(source_)),
+                  destination(std::move(destination_)), a(a_),
+                  workspace(workspace_),
+                  workspace_requirements(workspace_requirements_),
+                  workspace_lease(workspace_lease_) {}
+            CacheAppendRequest(const CacheAppendRequest&) = default;
+            CacheAppendRequest& operator=(const CacheAppendRequest&) = delete;
+            CacheAppendRequest(CacheAppendRequest&& other) noexcept
+                : source(std::move(other.source)),
+                  destination(std::move(other.destination)), a(other.a),
+                  workspace(other.workspace),
+                  workspace_requirements(other.workspace_requirements),
+                  workspace_lease(other.workspace_lease) {}
         };
         /**
          * Immutable admission snapshot of one linear projection operand:
@@ -682,6 +757,7 @@ namespace iom {
         virtual oid copy_impl(
                 const TensorView& source, TensorView& destination);
         virtual oid binary_impl(const BinaryRequest& request);
+        virtual oid cache_append_impl(const CacheAppendRequest& request);
         virtual oid embedding_impl(const EmbeddingRequest& request);
         virtual oid silu_impl(const SiLURequest& request);
         [[nodiscard]] virtual WorkspaceRequirements
@@ -750,6 +826,15 @@ namespace iom {
                               size_t n_kv_heads, size_t head_dim,
                               TensorView& attn_out);
         /**
+         * Backend hook behind `cache_append_workspace_requirements`.
+         * Receives an already fully validated cache append request snapshot
+         * and must stay pure: no allocation beyond the returned value, no
+         * registration, lease, token/queue resource, or backend effect.
+         */
+        [[nodiscard]] virtual WorkspaceRequirements
+                cache_append_workspace_requirements(
+                        const CacheAppendRequest& request);
+        /**
          * Backend hook behind the four *_workspace_requirements queries.
          * Receives an already fully validated request snapshot and must
          * stay pure: no allocation beyond the returned value, no
@@ -783,6 +868,11 @@ namespace iom {
         [[nodiscard]] static BinaryViewSnapshot snapshot_binary_view(
                 const TensorView& view,
                 std::span<const std::size_t> result_dimensions);
+        [[nodiscard]] static CacheAppendRequest validate_cache_append(
+                const Device& device, const TensorView& source,
+                const TensorView& destination, std::size_t a);
+        [[nodiscard]] static CacheAppendViewSnapshot snapshot_cache_append_view(
+                const TensorView& view);
         static void validate_copy(
                 const Device& device, const TensorView& source,
                 const TensorView& destination);
@@ -1292,6 +1382,111 @@ namespace iom {
                 QueueWork queue_work) {
             const detail::Fence fence_copy = fence;
             return submit_binary(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+        /**
+         * Shared prepared-ownership submission for cache row append. The
+         * source and destination owners are retained through completion and
+         * any positive caller workspace is leased before backend work is
+         * invoked. Registration and lease acquisition are all-or-nothing;
+         * every partial resource is removed by rollback.
+         */
+        template <typename QueueWork>
+        oid submit_cache_append(
+                const CacheAppendRequest& request,
+                detail::RegistryState& state, detail::QueueId queue_id,
+                FenceFactory build_fence, QueueWork queue_work) {
+            struct Prepared {
+                CacheAppendRequest request;
+                detail::WorkspaceLease workspace_lease;
+                detail::BinaryEntryRegistration entries;
+                std::function<void(
+                        std::uint64_t, const CacheAppendRequest&,
+                        detail::BinaryEntryRegistration)> work;
+                Prepared(
+                        const CacheAppendRequest& request_,
+                        QueueWork work_)
+                    : request(request_), work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    request, std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, build_fence](
+                            std::uint64_t sequence) {
+                        const detail::Fence fence = build_fence(sequence);
+                        const std::array<
+                                detail::BinaryOwnerRegistration, 2>
+                                owners{{
+                                        {prepared->request.source.owner_identity,
+                                         prepared->request.source.native_handle},
+                                        {prepared->request.destination.owner_identity,
+                                         prepared->request.destination.native_handle},
+                                }};
+                        try {
+                            if (prepared->request.workspace_requirements.bytes
+                                    != 0) {
+                                prepared->workspace_lease =
+                                        detail::acquire_workspace_lease(
+                                                state,
+                                                prepared->request.workspace
+                                                        .owner_identity(),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
+                                                sequence, queue_id, fence);
+                                prepared->request.workspace_lease =
+                                        prepared->workspace_lease;
+                            }
+                            prepared->entries = detail::register_binary_entries(
+                                    state, queue_id, sequence, owners, fence);
+                        } catch (...) {
+                            if (prepared->entries.count != 0) {
+                                state.registry.remove_entries(
+                                        std::span<const detail::EntryId>(
+                                                prepared->entries.entries.data(),
+                                                prepared->entries.count));
+                                prepared->entries = {};
+                            }
+                            if (prepared->workspace_lease.entry_id != 0) {
+                                detail::complete_workspace_lease(
+                                        state, prepared->workspace_lease, true);
+                                prepared->workspace_lease = {};
+                                prepared->request.workspace_lease = {};
+                            }
+                            throw;
+                        }
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.count != 0) {
+                            state.registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            prepared->entries.entries.data(),
+                                            prepared->entries.count));
+                        }
+                        if (prepared->workspace_lease.entry_id != 0) {
+                            detail::complete_workspace_lease(
+                                    state, prepared->workspace_lease, true);
+                        }
+                    });
+        }
+
+        // Constant-fence overload retained so backend queue implementations
+        // that build one fence per operation keep the same admission seam.
+        template <typename QueueWork>
+        oid submit_cache_append(
+                const CacheAppendRequest& request,
+                detail::RegistryState& state, detail::QueueId queue_id,
+                const detail::Fence& fence, QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_cache_append(
                     request, state, queue_id,
                     [fence_copy](std::uint64_t) { return fence_copy; },
                     std::move(queue_work));

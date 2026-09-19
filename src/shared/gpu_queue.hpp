@@ -185,6 +185,9 @@ class GpuQueue final : public DeviceOps {
         std::optional<BinaryRequest> binary_request;
         bool is_embedding = false;
         std::optional<EmbeddingRequest> embedding_request;
+        bool is_cache_append = false;
+        std::optional<CacheAppendRequest> cache_append_request;
+        detail::BinaryEntryRegistration cache_append_entries{};
         std::size_t status_slot = EventRing::kNoAttachedSlot;
         detail::BinaryEntryRegistration binary_entries{};
         bool is_rmsnorm = false;
@@ -217,10 +220,12 @@ class GpuQueue final : public DeviceOps {
     struct GpuOutcome {
         detail::SequenceOutcome common{};
         detail::BinaryEntryRegistration binary_entries{};
+        detail::BinaryEntryRegistration cache_append_entries{};
         detail::BinaryEntryRegistration rmsnorm_entries{};
         detail::WorkspaceLease workspace_lease{};
         std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
+        bool is_cache_append = false;
         bool is_rmsnorm = false;
         bool is_embedding = false;
         bool is_linear = false;
@@ -251,6 +256,10 @@ public:
     oid copy_impl(
             const TensorView& source, TensorView& destination) override;
     oid binary_impl(const BinaryRequest& request) override;
+    [[nodiscard]] WorkspaceRequirements
+            cache_append_workspace_requirements(
+                    const CacheAppendRequest& request) override;
+    oid cache_append_impl(const CacheAppendRequest& request) override;
 
     // RMSNorm consumes the immutable common request and the common
     // owner-registration output; the shared branch adds no admission of its
