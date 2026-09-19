@@ -255,6 +255,38 @@ void write_padded_plane_image(
             host_row_major, tt::tt_metal::Layout::TILE);
     ttnn::copy_to_device(host_tiled, plane);
 }
+// Reads one complete native padded TILE plane into row-major carrier order,
+// independently of the production copy path.
+std::vector<std::byte> read_padded_plane_image(
+        const ttnn::Tensor& plane) {
+    const TtnnPlaneLayout native(plane);
+    const std::size_t carrier_size =
+            iom::ttnn_detail::carrier_bytes(plane.dtype());
+    const std::size_t bytes =
+            native.padded_rows * native.padded_columns * carrier_size;
+    std::vector<std::byte> tiled(bytes);
+    auto* device = plane.device();
+    REQUIRE(device != nullptr);
+    auto& queue = device->mesh_command_queue(0);
+    ttnn::copy_to_host(
+            queue, plane, tiled.data(), std::nullopt, /*blocking=*/false);
+    queue.finish();
+
+    std::vector<std::byte> row_major(bytes);
+    for (std::size_t row = 0; row < native.padded_rows; ++row) {
+        for (std::size_t column = 0; column < native.padded_columns;
+             ++column) {
+            std::memcpy(
+                    row_major.data()
+                            + (row * native.padded_columns + column)
+                                    * carrier_size,
+                    tiled.data()
+                            + native.element_index(row, column) * carrier_size,
+                    carrier_size);
+        }
+    }
+    return row_major;
+}
 
 // Observes one native plane's complete padded TILE readback into standard
 // slot order, mapping every standard padded coordinate — padded rows and
@@ -717,6 +749,174 @@ TEST_CASE("TTNN conformance: full-storage oracle exposes native padding mutation
                 "logical write re-establishes native zero padding", true));
         iom_conformance::require_logical_bytes(
                 view, pattern, "logical write content");
+    }
+}
+
+TEST_CASE("TTNN padded logical copy preserves destination padding") {
+    require_hardware();
+    TtnnDevices devices;
+    const std::span<const iom::DataType> supported =
+            iom::ttnn_supported_data_types();
+    const iom::TensorShape geometries[] = {
+            iom::TensorShape{{1, 1, 32, 48}},
+            iom::TensorShape{{2, 3, 17, 33}}};
+    std::uint64_t salt = 0x3500;
+
+    for (const iom::DataType type : supported) {
+        for (const iom::TensorShape& shape : geometries) {
+            const iom::TensorSpec spec{shape, type};
+            auto source = devices.candidate->create_tensor(spec);
+            auto destination = devices.candidate->create_tensor(spec);
+            iom::TensorView& source_owner = source->view();
+            iom::TensorView& destination_owner = destination->view();
+            auto* source_planes =
+                    static_cast<ttnn::Tensor*>(source_owner.native_handle());
+            auto* destination_planes = static_cast<ttnn::Tensor*>(
+                    destination_owner.native_handle());
+            const std::size_t plane_count = owner_plane_count(spec);
+            const std::span<const std::size_t> dimensions =
+                    spec.shape.dimensions();
+            const std::size_t rows = dimensions[dimensions.size() - 2];
+            const std::size_t columns = dimensions[dimensions.size() - 1];
+            const std::size_t factor =
+                    iom::ttnn_detail::carrier_factor(type);
+            const std::size_t carrier_size =
+                    iom::ttnn_detail::carrier_bytes(source_planes[0].dtype());
+            REQUIRE(columns <= std::numeric_limits<std::size_t>::max() / factor);
+            const std::size_t native_columns = columns * factor;
+
+            std::vector<std::vector<std::byte>> source_images(plane_count);
+            std::vector<std::vector<std::byte>> destination_images(plane_count);
+            std::vector<std::byte> source_storage =
+                    iom_conformance::encode_standard_tiled_storage(spec);
+            std::vector<std::byte> destination_storage =
+                    iom_conformance::encode_standard_tiled_storage(spec);
+            const std::vector<std::byte> source_logical =
+                    iom_conformance::encode_logical(spec, salt);
+            const std::vector<std::byte> destination_logical =
+                    iom_conformance::encode_logical(spec, salt + 1);
+            ++salt;
+            iom_conformance::apply_standard_tiled_view(
+                    source_owner, spec, source_logical, source_storage);
+            iom_conformance::apply_standard_tiled_view(
+                    destination_owner, spec, destination_logical,
+                    destination_storage);
+
+            bool has_physical_padding = false;
+            for (std::size_t plane_index = 0; plane_index < plane_count;
+                 ++plane_index) {
+                const TtnnPlaneLayout source_layout(source_planes[plane_index]);
+                const TtnnPlaneLayout destination_layout(
+                        destination_planes[plane_index]);
+                source_images[plane_index] = padded_plane_image(
+                        source_planes[plane_index], spec, plane_index,
+                        source_storage);
+                destination_images[plane_index] = padded_plane_image(
+                        destination_planes[plane_index], spec, plane_index,
+                        destination_storage);
+                const bool row_padding = rows < source_layout.padded_rows;
+                const bool column_padding =
+                        native_columns < source_layout.padded_columns;
+                has_physical_padding =
+                        has_physical_padding || row_padding || column_padding;
+                if (!row_padding && !column_padding) {
+                    continue;
+                }
+                const std::size_t sentinel_row =
+                        row_padding ? rows : 0;
+                const std::size_t sentinel_column =
+                        column_padding ? native_columns : 0;
+                const bool sentinel_is_padding =
+                        sentinel_row >= rows
+                        || sentinel_column >= native_columns;
+                REQUIRE(sentinel_is_padding);
+                const auto plant = [&](std::vector<std::byte>& image,
+                                       const TtnnPlaneLayout& layout,
+                                       std::byte value) {
+                    std::byte* cell =
+                            image.data()
+                            + (sentinel_row * layout.padded_columns
+                               + sentinel_column)
+                                    * carrier_size;
+                    std::fill(cell, cell + carrier_size, value);
+                };
+                plant(source_images[plane_index], source_layout,
+                      std::byte{0x35});
+                plant(destination_images[plane_index], destination_layout,
+                      std::byte{0xC7});
+                write_padded_plane_image(
+                        source_planes[plane_index],
+                        source_images[plane_index]);
+                write_padded_plane_image(
+                        destination_planes[plane_index],
+                        destination_images[plane_index]);
+            }
+            if (!has_physical_padding) {
+                continue;
+            }
+            source_planes[0].device()->mesh_command_queue(0).finish();
+
+            const std::size_t slice_start = dimensions[0] > 1 ? 1 : 0;
+            iom::TensorView source_view =
+                    source_owner.slice(0, slice_start, 1);
+            iom::TensorView destination_view =
+                    destination_owner.slice(0, slice_start, 1);
+            auto queue = devices.candidate->create_ops();
+            const iom::oid token =
+                    queue->copy(source_view, destination_view);
+            REQUIRE(iom::oid_is_token(token));
+            REQUIRE_NOTHROW(queue->wait(token));
+
+            for (std::size_t plane_index = 0; plane_index < plane_count;
+                 ++plane_index) {
+                std::vector<std::byte> expected =
+                        destination_images[plane_index];
+                for (std::size_t view_plane = 0;
+                     view_plane
+                             < iom::ttnn_detail::snapshot_plane_count(
+                                     source_view.spec());
+                     ++view_plane) {
+                    const std::size_t source_plane_index =
+                            oracle_view_plane_at(source_view, view_plane);
+                    const std::size_t destination_plane_index =
+                            oracle_view_plane_at(
+                                    destination_view, view_plane);
+                    if (destination_plane_index != plane_index) continue;
+                    const TtnnPlaneLayout source_layout(
+                            source_planes[source_plane_index]);
+                    const TtnnPlaneLayout destination_layout(
+                            destination_planes[destination_plane_index]);
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t column = 0; column < columns;
+                             ++column) {
+                            for (std::size_t part = 0; part < factor;
+                                 ++part) {
+                                const std::size_t native_column =
+                                        column * factor + part;
+                                std::memcpy(
+                                        expected.data()
+                                                + (row
+                                                           * destination_layout
+                                                                   .padded_columns
+                                                   + native_column)
+                                                        * carrier_size,
+                                        source_images[source_plane_index].data()
+                                                + (row
+                                                           * source_layout
+                                                                   .padded_columns
+                                                   + native_column)
+                                                        * carrier_size,
+                                        carrier_size);
+                            }
+                        }
+                    }
+                }
+                const std::vector<std::byte> observed =
+                        read_padded_plane_image(
+                                destination_planes[plane_index]);
+                CHECK_EQ(observed, expected);
+            }
+        }
     }
 }
 

@@ -60,9 +60,8 @@ void TtnnQueue::execute_copy(Task& task) {
                 static_cast<ttnn::Tensor*>(
                         task.destination->native_handle);
         ttnn_detail::copy_planes(
-                *task.source, source_planes,
-                *task.destination, destination_planes,
-                any_submitted);
+                *device_, *task.source, source_planes,
+                *task.destination, destination_planes, any_submitted);
     } catch (...) {
         submission_failure = std::current_exception();
     }
