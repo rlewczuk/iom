@@ -15,6 +15,32 @@ target_link_libraries(iom_scalar_add_tests
 )
 
 add_test(NAME iom_scalar_add_tests COMMAND iom_scalar_add_tests)
+ 
+add_executable(iom_backend_conformance_sdpa_reference_tests
+        backend/backend_conformance_sdpa_reference_test.cpp
+)
+
+set_source_files_properties(
+        backend/backend_conformance_sdpa_reference_test.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+)
+
+target_include_directories(iom_backend_conformance_sdpa_reference_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}
+)
+
+target_link_libraries(iom_backend_conformance_sdpa_reference_tests
+    PRIVATE
+        doctest::doctest
+        libiom
+)
+
+add_test(
+        NAME iom_backend_conformance_sdpa_reference_tests
+        COMMAND iom_backend_conformance_sdpa_reference_tests
+)
 
 add_executable(iom_rope_reference_tests
         backend/test_rope_reference.cpp
