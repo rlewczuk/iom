@@ -1022,6 +1022,10 @@ TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
         }
     }
 
+    // TTNN advertises only BF16/F32 for RMSNorm. Its six storable encoded
+    // carriers are explicit queue-level capability limitations. F8_E8M0 is
+    // rejected at tensor creation because TTNN has no storage carrier for it;
+    // that storage-level limitation is covered by the supported-type test.
     const iom::DataType unsupported[] = {
             iom::DataType::BOOL, iom::DataType::I2, iom::DataType::U2,
             iom::DataType::I4, iom::DataType::U4, iom::DataType::I8,
@@ -1029,6 +1033,7 @@ TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
             iom::DataType::I32, iom::DataType::U32, iom::DataType::I64,
             iom::DataType::U64, iom::DataType::F4_E2M1,
             iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
+            iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
             iom::DataType::F16, iom::DataType::F64};
     for (const iom::DataType type : unsupported) {
         const iom::TensorSpec spec{
