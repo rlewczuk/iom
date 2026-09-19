@@ -425,10 +425,11 @@ separate native specialization on CUDA, ROCm, and SYCL, whose availability is a
 runtime device and loaded-image fact — while TTNN implements the mandatory
 `BF16` leaf alone on its direct Metalium route and explicitly rejects the other
 twenty applicable leaves after structural validation. A backend without its own
-linear port keeps reporting `Unsupported`. CUDA and ROCm
-provide source-inspected RMSNorm launch wrappers over the shared core, and
-TTNN now provides its preallocated BF16/F32 queue path; only backends without
-one of those ports keep reporting RMSNorm `Unsupported`.
+linear port keeps reporting `Unsupported`. CUDA and ROCm provide
+source-inspected RMSNorm launch wrappers over the shared core, SYCL provides
+its native row kernel with the `aspect::fp64` guard, and TTNN provides its
+preallocated BF16/F32 queue path. The all-five RMSNorm closure evidence and
+supported/limited matrix are recorded in [RMS normalization](#rms-normalization).
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
@@ -923,9 +924,10 @@ The detailed datatype applicability, special-value behavior, references,
 tolerances, fixture provenance, snapshots/hooks, kernels, and evidenced
 backend limitations remain solely owned by the
 [RMS normalization](#rms-normalization) and planned **SiLU** operation
-sections. Until each operation's backend ports land, the `rmsnorm` and `silu`
-calls continue to return negative `Unsupported` before submission, mutation,
-or token acceptance, and this plan subsection declares no ABI of its own.
+sections. RMSNorm's five backend ports are closed by the focused conformance
+targets named in its section; SiLU remains a planned operation and continues
+to return negative `Unsupported` before submission, mutation, or token
+acceptance. This plan subsection declares no additional ABI.
 
 Delivery is operation-first, not mathematical-forward order: embedding,
 linear, RMSNorm, RoPE, cache append, SiLU, and finally SDPA. For each operation,
@@ -3220,13 +3222,13 @@ integer norm, quantization, or storage-format staging is introduced.
    CPU, CUDA, and ROCm support all nine applicable floating leaves. SYCL
    supports the eight non-`F64` leaves and supports `F64` only when the device
    reports `aspect::fp64`; otherwise `F64` is `Unsupported`. TTNN supports only
-   `BF16` and `F32`: its seven encoded-carrier floats (`F4_E2M1`, `F6_E2M3`,
-   `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, and `F64`) are `Unsupported`
-   because native TILE compute cannot consume those carrier layouts without
-   the forbidden host staging. On every backend, an unknown dtype
-   enumeration value is `InvalidArgument`, while a recognized inapplicable or
-   unsupported leaf and a recognized non-`NONE` quantization format are
-   `Unsupported`.
+   `BF16` and `F32`: its seven encoded-carrier leaves (`F4_E2M1`,
+   `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, and `F8_E8M0`)
+   and `F64` are `Unsupported` because native TILE compute cannot consume
+   those carrier layouts without the forbidden host staging. On every backend,
+   an unknown dtype enumeration value is `InvalidArgument`, while a recognized
+   inapplicable or unsupported leaf and a recognized non-`NONE` quantization
+   format are `Unsupported`.
 5. **Admission order.** Before capability dispatch or any queue effect, a
    submission validates in exactly this order: (1) rank, nonzero extents,
    identical `[...,R,F]` shape, and `scale == [1,F]`; (2) exact queue `Device`
@@ -3353,10 +3355,12 @@ which must use the queue's already-created nonblocking stream. The CUDA
 launcher in `src/cuda/copy.cu` calls the shared
 `launch_standard_tiled_rmsnorm` kernel directly on that stream, while
 `src/cuda/copy.hpp` advertises all nine applicable signed floating leaves.
-This source-inspected capability evidence does not claim hardware execution;
-the future CUDA conformance target owns that gate. ROCm supplies the
-corresponding wrapper in its backend leaf, while any backend without its own
-wrapper remains Unsupported.
+The CUDA, ROCm, SYCL, and TTNN runtime identities and focused gate results
+are recorded in the closure evidence below. The shared CUDA/ROCm core and
+the SYCL row kernel are exercised through their real queues; SYCL `F64`
+remains conditional on `aspect::fp64`, and TTNN's documented-nonconforming
+BF16/F32 fidelity policy remains explicit rather than being reported as
+contract-exact conformance.
 
 **ROCm capability and implementation evidence.** `src/rocm/copy.hpp` exposes
 the ROCm policy's immutable RMSNorm capability for the nine applicable
@@ -3375,8 +3379,44 @@ the caller's output plane directly, so no output relocation, host roundtrip,
 positive workspace, or hidden host arithmetic participates. Logical feature
 width alone reaches the preallocated primitive; physical tile padding and
 untouched planes remain outside the reduction and write mapping. The TTNN
-conformance driver owns the BF16/F32 capability probe and future bounded
-remote runtime gate.
+focused gate below records its device identity, carrier limitations, and
+reduced-fidelity observation.
+ 
+**All-backend closure evidence.** The five focused gates were run from the
+prepared closure worktree on branch
+`run-task/006-tinyllama--05-rms-normalization--11-all-backend-rmsnorm-closure`,
+based at revision `e6d834726bc80d8d8786ace6a965dd5c9c2c380e`. Accelerator
+commands used the configured remote profiles and a fresh sync immediately
+before each execution; the complete command transcripts are retained in the
+task evidence file
+`.cswd/tasks/006-tinyllama/05-rms-normalization/11-all-backend-rmsnorm-closure/remote.log`.
+The accelerator mirrors were `impl11closure-cuda`,
+`impl11closure-rocm`, `impl11closure-sycl`, and `impl11closure-ttnn`.
+Accelerator executable and CTest rows used
+`flock -w 120 /tmp/iom-<backend>-gpu.lock timeout --kill-after=30s 900s`
+around the listed command; SYCL additionally sourced
+`/opt/intel/oneapi/setvars.sh` and ran the full-path `sycl-ls` inventory
+before each remote command.
+
+| Backend and runtime identity | Focused gate evidence |
+| --- | --- |
+| CPU: local `x86_64`, AMD Ryzen AI 9 HX 370 w/ Radeon 890M | `cmake --build build --target iom_backend_conformance_cpu_tests iom_tests iom_cpu_tests -j2`; `ctest --test-dir build --output-on-failure --timeout 300 -R '^(iom_backend_conformance_cpu_tests\|iom_tests\|iom_cpu_tests)$'` — all 3 tests passed. |
+| CUDA profile `bv1`: NVIDIA GeForce RTX 5090, driver `595.71.05`, CUDA `13.2`, `nvcc` `V13.2.78` | `./build/test/iom_cuda_conformance_tests --test-case=*RMSNorm*` — 1 test, 2054 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_cuda_conformance_tests$'` — 1/1 passed. |
+| ROCm profile `bv2`: AMD Radeon AI PRO R9700 `gfx1201` (with `gfx1036` enumerated), HIP `7.15.26333` | `./build/test/iom_rocm_conformance_tests --test-case=*RMSNorm*` — 1 test, 2053 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_rocm_conformance_tests$'` — 1/1 passed. |
+| SYCL profile `bv2`: two Intel Arc Pro B60 Level Zero GPUs, oneAPI compiler `2026.1.0` | `./build/test/iom_sycl_conformance_tests --test-case=*RMSNorm*` after `sycl-ls` — 1 test, 1734 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_conformance_tests$'` — 1/1 passed. The enumerated device has `aspect::fp64`, so the conditional `F64` leaf ran. |
+| TTNN profile `bv1`: Blackhole, firmware `19.13.1`, KMD `2.8.0` | `./build/test/iom_ttnn_conformance_tests --test-case=*planes*` — 1 test, 50 assertions passed; `./build/test/iom_ttnn_conformance_tests --test-case=*RMSNorm*` — 2 tests, 822 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_ttnn_conformance_tests$'` — 1/1 passed. The output retains the documented BF16-native/reduced-fidelity and unavailable native-failure records. |
+ The automated driver links are [`test/cpu/test_cpu_conformance.cpp`](../test/cpu/test_cpu_conformance.cpp),
+ [`test/cuda/test_cuda_conformance.cpp`](../test/cuda/test_cuda_conformance.cpp),
+ [`test/rocm/test_rocm_conformance.cpp`](../test/rocm/test_rocm_conformance.cpp),
+ [`test/sycl/test_sycl_conformance.cpp`](../test/sycl/test_sycl_conformance.cpp),
+ and [`test/ttnn/test_ttnn_conformance.cpp`](../test/ttnn/test_ttnn_conformance.cpp).
+
+The exact target links for these observations are the five drivers named
+above: `iom_backend_conformance_cpu_tests`,
+`iom_cuda_conformance_tests`, `iom_rocm_conformance_tests`,
+`iom_sycl_conformance_tests`, and `iom_ttnn_conformance_tests`. The matrix
+does not treat TTNN's reduced-fidelity observations or its unavailable native
+failure seam as contract-exact numerical or accepted-failure coverage.
 
 
 The common owner is `src/device_ops_rmsnorm.cpp` behind
@@ -3390,9 +3430,14 @@ geometries, padded-physical invariance, and the common query, workspace,
 admission, alias, overflow, capability, ownership, ordering, and retained
 failure cases — and the CPU, CUDA, ROCm, SYCL, and TTNN conformance drivers
 each invoke its one dispatcher with their own device setup, declared
-supported-leaf span, and native storage observation. `test/cpu/test_cpu.cpp`
-retains the CPU-local probe coverage, and
-`test/backend/backend_conformance_other.hpp` keeps the unrelated neural
+supported-leaf span, and native storage observation. The five focused target
+links are `iom_backend_conformance_cpu_tests` (`test/cpu/test_cpu_conformance.cpp`),
+`iom_cuda_conformance_tests` (`test/cuda/test_cuda_conformance.cpp`),
+`iom_rocm_conformance_tests` (`test/rocm/test_rocm_conformance.cpp`),
+`iom_sycl_conformance_tests` (`test/sycl/test_sycl_conformance.cpp`), and
+`iom_ttnn_conformance_tests` (`test/ttnn/test_ttnn_conformance.cpp`).
+`test/cpu/test_cpu.cpp` retains CPU-local RMSNorm probes, while
+`test/backend/backend_conformance_other.hpp` keeps unrelated neural
 capability probes without a second RMSNorm suite. Backend kernels and their
 backend-specific launch code remain owned by their own ports.
 
@@ -4708,8 +4753,9 @@ Use these sources when changing or extending the contract:
 - common RMS normalization layout, admission, capability, request snapshot,
   and pure requirement query: `src/device_ops_rmsnorm.cpp`, with its API,
   purity, precedence, rejection-effect, snapshot, and ownership tests in
-  `test/test_iom.cpp` and its valid-shape `Unsupported` probes in
-  `test/backend/backend_conformance_other.hpp` and `test/cpu/test_cpu.cpp`;
+  `test/test_iom.cpp` and the shared conformance scenarios in
+  `test/backend/backend_conformance_rmsnorm.hpp`; CPU-local result probes
+  remain in `test/cpu/test_cpu.cpp`;
 - planned SiLU ABI, scalar/raw reference, admission, zero-workspace,
   capability, numerical, queue/lifetime, and MLP composition contract:
   [SiLU activation](#silu-activation), `src/shared/scalar_binary_codec.hpp`,

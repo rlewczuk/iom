@@ -347,11 +347,10 @@ rebuilding consumers; no mixed-version ABI is promised.
 
 TinyLlama composition is a parameterized, imperative sequence of caller-owned
 operations; it is not a graph, fused decoder kernel, or currently shipped
-model API. Embedding, linear, RMSNorm, RoPE, cache append, SiLU, and SDPA are
-planned operation boundaries. The current neural methods remain
-`Unsupported` until their operation-specific ports land, so this section
-describes neither an available model runner nor successful kernel, build,
-profiler, or hardware evidence. Existing `add` and `mul` provide the two
+model API. Embedding, linear, RoPE, cache append, SiLU, and SDPA retain their
+own planned or port-specific status. RMSNorm is the closed operation boundary
+for this revision, with its frozen API, independent reference, and all-five
+backend conformance recorded below. Existing `add` and `mul` provide the two
 residual additions and the SwiGLU product without changing their contracts.
 
 ### Runtime dimensions and loading boundary
@@ -715,15 +714,51 @@ component and is not claimed here.
 
 Implementation delivery remains operation-first and deliberately differs from
 the mathematical forward order: embedding, linear, RMSNorm, RoPE, cache
-append, SiLU, and finally SDPA. For each operation, settle the contract,
-independent reference, and all-five feasibility, then close CPU, CUDA, ROCm,
-SYCL, and TTNN before advancing. The CPU scalar/wide tiled-storage baseline is
-not accelerator evidence. Native BF16 matrix evidence for linear and both
+append, SiLU, and finally SDPA. RMSNorm is closed across CPU, CUDA, ROCm, SYCL,
+and TTNN at one revision; its CPU scalar/wide baseline is not accelerator
+evidence, and TTNN's documented reduced-fidelity policy remains distinct from
+contract-exact conformance. Native BF16 matrix evidence for linear and both
 SDPA products must cover prefill and logical `R=1`; host computation, round
 trips, elementwise substitutes, and padded extra tokens do not count.
-Unavailable ports remain unsupported. Future all-five coverage includes
-success, boundary, rejection, accepted failure, exact `R=1/15/16/17`,
-non-tile widths, independent leading planes, and padding isolation.
+Unavailable non-RMSNorm ports remain unsupported. RMSNorm coverage includes
+success, boundary, rejection, accepted failure, exact `R=1/15/16/17`, non-tile
+widths, independent leading planes, logical-padding isolation, and repeatable
+wait behavior.
+### RMSNorm all-backend closure status
+
+RMSNorm is implemented through the frozen `DeviceOps` API and uses the shared
+backend-neutral conformance harness exactly once per driver. Every supported
+leaf is exercised at this revision; the remaining `Unsupported` results are
+the semantic inapplicable leaves plus the explicit SYCL `F64` capability guard
+and TTNN carrier/device limitations.
+
+| Backend | Exercised supported leaves | Explicit limitations | Automated check |
+| --- | --- | --- | --- |
+| CPU | `F4_E2M1,F6_E2M3,F6_E3M2,F8_E4M3FN,F8_E5M2,F16,BF16,F32,F64` | BOOL, 12 integer leaves, and `F8_E8M0` are `Unsupported` | [`iom_backend_conformance_cpu_tests`](../test/cpu/test_cpu_conformance.cpp) |
+| CUDA | all nine applicable floating leaves | BOOL, 12 integer leaves, and `F8_E8M0` are `Unsupported` | [`iom_cuda_conformance_tests`](../test/cuda/test_cuda_conformance.cpp) |
+| ROCm | all nine applicable floating leaves | BOOL, 12 integer leaves, and `F8_E8M0` are `Unsupported` | [`iom_rocm_conformance_tests`](../test/rocm/test_rocm_conformance.cpp) |
+| SYCL | eight non-`F64` leaves; `F64` when `aspect::fp64` is present | `F64` is `Unsupported` when the selected device lacks `aspect::fp64`; semantic inapplicable leaves remain rejected | [`iom_sycl_conformance_tests`](../test/sycl/test_sycl_conformance.cpp) |
+| TTNN | `BF16,F32` | seven encoded-carrier leaves (`F4_E2M1,F6_E2M3,F6_E3M2,F8_E4M3FN,F8_E5M2,F16,F8_E8M0`) plus `F64` remain `Unsupported`; BF16/F32 use the documented reduced-fidelity policy | [`iom_ttnn_conformance_tests`](../test/ttnn/test_ttnn_conformance.cpp) |
+
+The runtime identities observed by the five closure gates, and the exact
+remote command evidence backing this matrix, are recorded in the RMSNorm
+contract section. The matrix does not claim an identity or gate result that
+was not observed.
+ 
+Closure identities and check outcomes at the prepared revision are also
+published here, not only in the normative contract: CPU ran on the local
+`x86_64` AMD Ryzen AI 9 HX 370 w/ Radeon 890M host; CUDA ran on an NVIDIA
+GeForce RTX 5090 (driver `595.71.05`, CUDA `13.2`); ROCm enumerated the AMD
+Radeon AI PRO R9700 `gfx1201` (and `gfx1036`); SYCL enumerated two Intel Arc
+Pro B60 Level Zero GPUs with oneAPI compiler `2026.1.0`; and TTNN ran on
+Blackhole firmware `19.13.1` with KMD `2.8.0`. The five focused targets
+passed, including the shared RMSNorm records and TTNN's explicit
+documented-nonconforming fidelity record. The exact commands and retained
+remote transcript are recorded in the RMSNorm contract's closure-evidence
+table and task evidence file
+`.cswd/tasks/006-tinyllama/05-rms-normalization/11-all-backend-rmsnorm-closure/remote.log`.
+
+
 
 ## Public API guide
 
@@ -757,7 +792,7 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `make_ttnn_device(ordinal, queue_config)` | Creates a TTNN device, whose native per-plane storage is owned by TTNN (no raw arena). |
 | `ttnn_supported_data_types()` | Returns TTNN's immutable accepted unquantized leaf-type table. |
 | `Device` | Reports backend identity and immutable storage capability table; creates `Tensor` owners and `DeviceOps` queues. |
-| `DeviceOps` | Provides `copy` plus exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades; `silu`, `linear`, `rmsnorm`, and GQA `sdpa` remain unsupported. `wait(token)` observes completion. |
+| `DeviceOps` | Provides `copy`, exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades, and the closed `rmsnorm`/`rmsnorm_workspace_requirements` API; `silu`, `linear`, and GQA `sdpa` retain their own support status. `wait(token)` observes completion. |
 | `gpu_algorithm::compute_staging_size(logical_nbytes)` | Returns the logical transfer payload rounded to a 4-byte GPU word, rejecting rounding overflow. |
 
 `DeviceOps::copy` is pure device-to-device work on compatible views. The four
