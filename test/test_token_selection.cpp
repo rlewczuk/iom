@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <condition_variable>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +10,9 @@
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <mutex>
 #include <utility>
+#include <thread>
 #include <vector>
 
 #include "iom/alloc.hpp"
@@ -60,6 +63,76 @@ public:
         return static_cast<std::uint64_t>(token) & kMask;
     }
 };
+class DeferredCopyQueue final : public iom::DeviceOps {
+public:
+    explicit DeferredCopyQueue(const iom::Device& device)
+        : iom::DeviceOps(device) {}
+
+    using iom::DeviceOps::commit_failure;
+    using iom::DeviceOps::complete;
+    using iom::DeviceOps::seek_next_sequence;
+    using iom::DeviceOps::submit;
+
+    struct Record {
+        std::uint64_t sequence;
+        const iom::TensorView* source;
+        iom::TensorView* destination;
+        bool released;
+    };
+
+    [[nodiscard]] iom::oid probe() {
+        return submit([this](std::uint64_t sequence) {
+            records_.push_back({sequence, nullptr, nullptr, false});
+        });
+    }
+
+    void release(iom::oid token) {
+        Record* record = find(sequence(token));
+        if (record == nullptr || record->source == nullptr
+                || record->destination == nullptr) {
+            throw std::logic_error("deferred copy record is unavailable");
+        }
+        std::vector<std::byte> bytes(record->source->spec().logical_nbytes());
+        record->source->copy_to_host(bytes);
+        record->destination->copy_from_host(bytes);
+        record->released = true;
+        complete(record->sequence);
+    }
+
+    void fail(iom::oid token, const char* message) {
+        commit_failure(
+                sequence(token),
+                std::make_exception_ptr(std::runtime_error(message)));
+        complete(sequence(token));
+    }
+
+    [[nodiscard]] static std::uint64_t sequence(iom::oid token) noexcept {
+        constexpr std::uint64_t kMask = (std::uint64_t{1} << 55) - 1;
+        return static_cast<std::uint64_t>(token) & kMask;
+    }
+
+protected:
+    iom::oid copy_impl(
+            const iom::TensorView& source,
+            iom::TensorView& destination) override {
+        return submit([this, &source, &destination](
+                              std::uint64_t sequence) {
+            records_.push_back(
+                    {sequence, &source, &destination, false});
+        });
+    }
+
+private:
+    [[nodiscard]] Record* find(std::uint64_t sequence) noexcept {
+        for (Record& record : records_) {
+            if (record.sequence == sequence) return &record;
+        }
+        return nullptr;
+    }
+
+    std::vector<Record> records_;
+};
+
 
 struct CpuFixture {
     HeapAllocator allocator;
@@ -102,6 +175,14 @@ void poison_padding(iom::Tensor& tensor) {
         }
     }
 }
+[[nodiscard]] std::vector<std::byte> snapshot_storage(
+        const iom::Tensor& tensor) {
+    const iom::TensorView view = tensor.view();
+    const auto* storage = static_cast<const std::byte*>(view.native_handle());
+    const std::size_t bytes = view.spec().tiled_storage_nbytes();
+    return std::vector<std::byte>(storage, storage + bytes);
+}
+
 
 struct PreparedLogits {
     std::unique_ptr<iom::Tensor> source;
@@ -477,4 +558,307 @@ TEST_CASE("greedy token selection validates positive device scratch") {
             std::invalid_argument);
 
     queue.complete(ManualQueue::sequence(producer));
+}
+TEST_CASE(
+        "token selection readiness and lifetime rejects invalid producer OIDs before effects") {
+    CpuFixture fixture;
+    const std::vector<std::uint16_t> values(17, 0x3f80u);
+    const std::vector<std::uint16_t> stale(17, 0xbf80u);
+    auto source = fixture.device->create_tensor(logits_spec(values.size()));
+    auto logits = fixture.device->create_tensor(logits_spec(values.size()));
+    source->view().copy_from_host(encode_bf16(values));
+    std::vector<std::uint16_t> stale_values = stale;
+    stale_values[0] = 0x4000u;
+    logits->view().copy_from_host(encode_bf16(stale_values));
+    poison_padding(*logits);
+
+    iom::TensorView source_view = source->view();
+    iom::TensorView logits_view = logits->view();
+    DeferredCopyQueue queue(*fixture.device);
+    const iom::oid producer = queue.copy(source_view, logits_view);
+    REQUIRE(iom::oid_is_token(producer));
+
+    iom::GreedyTokenSelector selector;
+    constexpr std::byte kTail{0xA5};
+    std::vector<std::byte> host(
+            values.size() * sizeof(std::uint16_t) + 7, kTail);
+    auto workspace = fixture.device->create_workspace(0);
+    const iom::RawWorkspaceView device_scratch = workspace->view();
+    const iom::RawWorkspace* workspace_identity =
+            device_scratch.owner_identity();
+    const iom::Tensor* logits_owner = logits_view.owner_identity();
+    const std::vector<std::size_t> history{31, 32, 33};
+    const std::vector<std::size_t> history_before = history;
+    const std::vector<std::byte> source_before = snapshot_storage(*source);
+    const std::vector<std::byte> logits_before = snapshot_storage(*logits);
+
+    const auto reject = [&](iom::DeviceOps& candidate, iom::oid token) {
+        const std::vector<std::byte> host_before = host;
+        CHECK_THROWS_AS(
+                selector.select(
+                        candidate, logits_view, values.size(), token, history,
+                        iom::TokenSelectorScratch{
+                                std::span<std::byte>(host), device_scratch}),
+                std::invalid_argument);
+        CHECK(host == host_before);
+        CHECK(snapshot_storage(*source) == source_before);
+        CHECK(snapshot_storage(*logits) == logits_before);
+        CHECK(history == history_before);
+        CHECK_EQ(logits_view.owner_identity(), logits_owner);
+        CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
+    };
+
+    // Zero and negative OIDs are rejected before queue readiness is observed.
+    reject(queue, 0);
+    reject(queue, -1);
+
+    // Both future and otherwise unsubmitted positive sequences are invalid.
+    reject(queue, producer + 1);
+    reject(queue, producer + 100);
+
+    DeferredCopyQueue foreign_queue(*fixture.device);
+    const iom::oid foreign = foreign_queue.probe();
+    reject(queue, foreign);
+
+    DeferredCopyQueue skipped_queue(*fixture.device);
+    const iom::oid first = skipped_queue.probe();
+    skipped_queue.complete(DeferredCopyQueue::sequence(first));
+    skipped_queue.seek_next_sequence(4);
+    const iom::oid later = skipped_queue.probe();
+    reject(skipped_queue, later - 1);
+
+    // Invalid admission did not consume or complete the real producer.
+    queue.release(producer);
+    const std::vector<std::byte> expected = encode_bf16(values);
+    CHECK_EQ(
+            selector.select(
+                    queue, logits_view, values.size(), producer, history,
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            0);
+    check_scratch_contents(host, expected, kTail);
+
+    // The same queue remains usable after every rejected OID.
+    const iom::oid second = queue.copy(source_view, logits_view);
+    REQUIRE(iom::oid_is_token(second));
+    queue.release(second);
+    CHECK_EQ(
+            selector.select(
+                    queue, logits_view, values.size(), second, history,
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            0);
+
+    foreign_queue.complete(DeferredCopyQueue::sequence(foreign));
+    skipped_queue.complete(DeferredCopyQueue::sequence(later));
+}
+
+TEST_CASE(
+        "token selection readiness and lifetime waits for deferred producer and releases borrowed inputs") {
+    CpuFixture fixture;
+    iom::GreedyTokenSelector selector;
+    auto workspace = fixture.device->create_workspace(0);
+    const iom::RawWorkspaceView device_scratch = workspace->view();
+    const iom::RawWorkspace* workspace_identity =
+            device_scratch.owner_identity();
+    constexpr std::byte kTail{0xA5};
+    std::vector<std::byte> host(17 * sizeof(std::uint16_t) + 9, kTail);
+
+    {
+        std::vector<std::uint16_t> values(17, 0xbf80u);
+        values[12] = 0x4000u;
+        std::vector<std::uint16_t> stale(17, 0x3f80u);
+        stale[0] = 0x4000u;
+        auto source = fixture.device->create_tensor(logits_spec(values.size()));
+        auto logits = fixture.device->create_tensor(logits_spec(values.size()));
+        source->view().copy_from_host(encode_bf16(values));
+        logits->view().copy_from_host(encode_bf16(stale));
+        poison_padding(*logits);
+        iom::TensorView source_view = source->view();
+        iom::TensorView logits_view = logits->view();
+        DeferredCopyQueue queue(*fixture.device);
+        const iom::oid producer = queue.copy(source_view, logits_view);
+        REQUIRE(iom::oid_is_token(producer));
+
+        const iom::Tensor* logits_owner = logits_view.owner_identity();
+        const void* logits_native = logits_view.native_handle();
+        const std::vector<std::size_t> history{41, 42};
+        const std::vector<std::size_t> history_before = history;
+        const std::vector<std::byte> source_before =
+                snapshot_storage(*source);
+        const std::vector<std::byte> expected = encode_bf16(values);
+        std::size_t selected = std::numeric_limits<std::size_t>::max();
+        std::exception_ptr selection_failure;
+        bool started = false;
+        std::mutex start_mutex;
+        std::condition_variable start_cv;
+
+        std::thread selection_thread([&] {
+            {
+                std::lock_guard<std::mutex> lock(start_mutex);
+                started = true;
+            }
+            start_cv.notify_one();
+            try {
+                selected = selector.select(
+                        queue, logits_view, values.size(), producer, history,
+                        iom::TokenSelectorScratch{
+                                std::span<std::byte>(host), device_scratch});
+            } catch (...) {
+                selection_failure = std::current_exception();
+            }
+        });
+        {
+            std::unique_lock<std::mutex> lock(start_mutex);
+            start_cv.wait(lock, [&] { return started; });
+        }
+
+        // The selector call has started before the producer is released.
+        queue.release(producer);
+        const std::vector<std::byte> destination_after_release =
+                snapshot_storage(*logits);
+        selection_thread.join();
+
+        CHECK_FALSE(selection_failure);
+        CHECK_EQ(selected, 12);
+        check_scratch_contents(host, expected, kTail);
+        CHECK(snapshot_storage(*source) == source_before);
+        CHECK(snapshot_storage(*logits) == destination_after_release);
+        CHECK(history == history_before);
+        CHECK_EQ(logits_view.owner_identity(), logits_owner);
+        CHECK_EQ(logits_view.native_handle(), logits_native);
+        CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
+    }
+
+    // The caller can destroy every prior view/owner/history immediately and
+    // use the same selector and scratch again.
+    const std::vector<std::uint16_t> next_values{
+            0x3f80u, 0x4000u, 0x3f80u};
+    PreparedLogits next = prepare_cpu_logits(
+            *fixture.device, std::span<const std::uint16_t>(next_values));
+    std::fill(host.begin(), host.end(), kTail);
+    CHECK_EQ(
+            selector.select(
+                    *next.queue, next.logits->view(), next_values.size(),
+                    next.producer, {},
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            1);
+    check_scratch_contents(host, encode_bf16(next_values), kTail);
+}
+
+TEST_CASE(
+        "token selection readiness and lifetime retains failures and reuses scratch") {
+    CpuFixture fixture;
+    iom::GreedyTokenSelector selector;
+    auto workspace = fixture.device->create_workspace(0);
+    const iom::RawWorkspaceView device_scratch = workspace->view();
+    const iom::RawWorkspace* workspace_identity =
+            device_scratch.owner_identity();
+    constexpr std::byte kTail{0xA5};
+    std::vector<std::byte> host(17 * sizeof(std::uint16_t) + 5, kTail);
+
+    {
+        const std::vector<std::uint16_t> values(3, 0x3f80u);
+        auto source = fixture.device->create_tensor(logits_spec(values.size()));
+        auto logits = fixture.device->create_tensor(logits_spec(values.size()));
+        source->view().copy_from_host(encode_bf16(values));
+        poison_padding(*logits);
+        iom::TensorView source_view = source->view();
+        iom::TensorView logits_view = logits->view();
+        DeferredCopyQueue queue(*fixture.device);
+        const iom::oid producer = queue.copy(source_view, logits_view);
+        REQUIRE(iom::oid_is_token(producer));
+        queue.fail(producer, "retained deferred producer failure");
+        const std::vector<std::byte> logits_before =
+                snapshot_storage(*logits);
+        const std::vector<std::byte> host_before = host;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            CHECK_THROWS_WITH(
+                    selector.select(
+                            queue, logits_view, values.size(), producer, {},
+                            iom::TokenSelectorScratch{
+                                    std::span<std::byte>(host),
+                                    device_scratch}),
+                    "retained deferred producer failure");
+            CHECK(host == host_before);
+            CHECK(snapshot_storage(*logits) == logits_before);
+            CHECK_THROWS_WITH(
+                    queue.wait(producer),
+                    "retained deferred producer failure");
+        }
+    }
+
+    // A separate valid producer proves that a retained failure does not poison
+    // the caller's reusable scratch.
+    const std::vector<std::uint16_t> successful_values = [] {
+        std::vector<std::uint16_t> values(15, 0x3f80u);
+        values[14] = 0x4000u;
+        return values;
+    }();
+    PreparedLogits successful = prepare_cpu_logits(
+            *fixture.device,
+            std::span<const std::uint16_t>(successful_values));
+    std::fill(host.begin(), host.end(), kTail);
+    CHECK_EQ(
+            selector.select(
+                    *successful.queue, successful.logits->view(),
+                    successful_values.size(), successful.producer, {},
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            14);
+    check_scratch_contents(host, encode_bf16(successful_values), kTail);
+    CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
+
+    // A nonfinite scan writes only the permitted host scratch and leaves it
+    // reusable for the next independent call.
+    std::vector<std::uint16_t> nonfinite_values(5, 0x3f80u);
+    nonfinite_values[2] = 0x7f80u;
+    PreparedLogits nonfinite = prepare_cpu_logits(
+            *fixture.device,
+            std::span<const std::uint16_t>(nonfinite_values));
+    std::fill(host.begin(), host.end(), kTail);
+    CHECK_THROWS_AS(
+            selector.select(
+                    *nonfinite.queue, nonfinite.logits->view(),
+                    nonfinite_values.size(), nonfinite.producer, {},
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            std::runtime_error);
+    CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
+
+    // This completed queue has a synchronous transfer failure, not a retained
+    // producer failure: its OID remains waitable and successful.
+    iom_model_loading::FakeDevice transfer_device;
+    auto transfer_logits = transfer_device.create_tensor(logits_spec(1));
+    ManualQueue transfer_queue(transfer_device);
+    const iom::oid transfer_producer = transfer_queue.probe();
+    transfer_queue.complete(ManualQueue::sequence(transfer_producer));
+    std::fill(host.begin(), host.end(), kTail);
+    const std::vector<std::byte> transfer_host_before = host;
+    CHECK_THROWS_AS(
+            selector.select(
+                    transfer_queue, transfer_logits->view(), 1,
+                    transfer_producer, {},
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            std::logic_error);
+    CHECK(host == transfer_host_before);
+    CHECK_NOTHROW(transfer_queue.wait(transfer_producer));
+    CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
+
+    const std::vector<std::uint16_t> final_values{0x4000u};
+    PreparedLogits final = prepare_cpu_logits(
+            *fixture.device,
+            std::span<const std::uint16_t>(final_values));
+    std::fill(host.begin(), host.end(), kTail);
+    CHECK_EQ(
+            selector.select(
+                    *final.queue, final.logits->view(), final_values.size(),
+                    final.producer, {},
+                    iom::TokenSelectorScratch{
+                            std::span<std::byte>(host), device_scratch}),
+            0);
+    check_scratch_contents(host, encode_bf16(final_values), kTail);
+    CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
 }
