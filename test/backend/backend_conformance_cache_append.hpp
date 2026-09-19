@@ -1321,16 +1321,18 @@ inline void run_cache_append_admission_conformance(
             }
         }
 
-        auto foreign = config.devices.foreign.create_workspace(
-                requirements.bytes);
-        REQUIRE(foreign != nullptr);
-        CHECK_EQ(
-                queue->cache_append(
-                        valid_source->view(), valid_destination->view(), 1,
-                        foreign->view()),
-                iom::to_oid(iom::OidError::InvalidArgument));
-        CHECK(cache_append_logical_equal(
-                read_logical(valid_destination->view()), after_exact));
+        if (config.workspace_overlap_supported) {
+            auto foreign = config.devices.foreign.create_workspace(
+                    requirements.bytes);
+            REQUIRE(foreign != nullptr);
+            CHECK_EQ(
+                    queue->cache_append(
+                            valid_source->view(), valid_destination->view(), 1,
+                            foreign->view()),
+                    iom::to_oid(iom::OidError::InvalidArgument));
+            CHECK(cache_append_logical_equal(
+                    read_logical(valid_destination->view()), after_exact));
+        }
         auto stale_owner = config.devices.candidate.create_workspace(
                 requirements.bytes);
         REQUIRE(stale_owner != nullptr);
