@@ -245,6 +245,18 @@ void embedding_planes(
             detail::leaf_bits(request.out.spec.data_type), "payload width");
     const std::uint32_t id_bits = checked_dimension(
             detail::leaf_bits(request.indices.spec.data_type), "index width");
+    // Native carrier columns per logical element. A 64-bit payload or index
+    // leaf occupies two consecutive native columns (low word first), which is
+    // exactly the expansion `TtnnTensor` applies to its native plane.
+    const std::uint32_t table_factor = checked_dimension(
+            carrier_factor(request.table.spec.data_type),
+            "table carrier factor");
+    const std::uint32_t index_factor = checked_dimension(
+            carrier_factor(request.indices.spec.data_type),
+            "index carrier factor");
+    const std::uint32_t output_factor = checked_dimension(
+            carrier_factor(request.out.spec.data_type),
+            "output carrier factor");
 
     const auto* const table_planes =
             static_cast<const ttnn::Tensor*>(request.table.native_handle);
@@ -260,7 +272,9 @@ void embedding_planes(
 
     const NativePlaneFacts table =
             plane_facts(table_planes[request.table.plane_offset], "table");
-    if (table.padded_rows < vocabulary || table.padded_columns < features) {
+    if (table.padded_rows < vocabulary
+            || table.padded_columns
+                    < static_cast<std::uint64_t>(features) * table_factor) {
         throw std::runtime_error(
                 "TTNN embedding table native geometry is too small");
     }
@@ -293,9 +307,13 @@ void embedding_planes(
                 plane_facts(index_planes[index_plane], "indices");
         const NativePlaneFacts output =
                 plane_facts(output_planes[output_plane], "output");
-        if (indices.padded_rows < 1 || indices.padded_columns < run
+        if (indices.padded_rows < 1
+                || indices.padded_columns
+                        < static_cast<std::uint64_t>(run) * index_factor
                 || output.padded_rows < run
-                || output.padded_columns < features) {
+                || output.padded_columns
+                        < static_cast<std::uint64_t>(features)
+                                  * output_factor) {
             throw std::runtime_error(
                     "TTNN embedding native geometry is too small");
         }
@@ -320,7 +338,9 @@ void embedding_planes(
                 output.padded_columns,
                 status_base,
                 status_page,
-                checked_u32(workspace.offset, "status subrange")};
+                checked_u32(workspace.offset, "status subrange"),
+                table_factor,
+                index_factor};
         program.dispatch(device.mesh_command_queue(0), args);
         any_submitted = true;
     }

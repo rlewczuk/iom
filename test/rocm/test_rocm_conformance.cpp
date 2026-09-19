@@ -405,7 +405,6 @@ constexpr iom_conformance::EmbeddingDeclaration kRocmEmbeddingDeclaration{
         iom_conformance::kEmbeddingIdSpan,
         iom_conformance::kEmbeddingPayloadSpan,
         iom_conformance::kEmbeddingIdSpan,
-        false,
         iom::WorkspaceRequirements{32, 32}};
 
 TEST_CASE("ROCm conformance: embedding lookup reference, admission, and lifetime") {

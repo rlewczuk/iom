@@ -1036,17 +1036,17 @@ TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
     }
 }
 
-// TTNN's staged-native embedding path supports the temporary one-carrier
-// matrix: 19 payload leaves and 10 narrow index leaves. The native path
-// reports the exact `{32, 32}` status-workspace contract, whose status
-// subrange alone is read back. The wide-carrier leaf replaces both spans with
-// the final 22/12 TTNN matrix.
+// TTNN's native embedding path implements the final matrix: the 22 payload
+// leaves its carrier table can store and all 12 integral index leaves, with
+// `I64`/`U64`/`F64` payloads and `I64`/`U64` indices carried as two consecutive
+// native UInt32 columns. The native path reports the exact `{32, 32}`
+// status-workspace contract, whose status subrange alone is read back. Only
+// `F8_E8M0` stays outside embedding support, and the device cannot store it.
 constexpr iom_conformance::EmbeddingDeclaration kTtnnEmbeddingDeclaration{
-        iom_conformance::kEmbeddingStagedTtnnPayloadSpan,
-        iom_conformance::kEmbeddingStagedTtnnIdSpan,
-        iom_conformance::kEmbeddingStagedTtnnPayloadSpan,
-        iom_conformance::kEmbeddingStagedTtnnIdSpan,
-        true,
+        iom_conformance::kEmbeddingTtnnPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
+        iom_conformance::kEmbeddingTtnnPayloadSpan,
+        iom_conformance::kEmbeddingIdSpan,
         iom::WorkspaceRequirements{32, 32}};
 
 TEST_CASE("TTNN conformance: embedding lookup reference, admission, and lifetime") {
@@ -1056,6 +1056,99 @@ TEST_CASE("TTNN conformance: embedding lookup reference, admission, and lifetime
     iom_conformance::run_embedding_conformance(
             devices.conformance(), kTtnnEmbeddingDeclaration, nullptr,
             &oracle);
+}
+
+// The double-carrier path on the real device: a 64-bit payload and a 64-bit
+// index keep their low/high native column order across the 16-column face and
+// 32-column tile boundaries of the doubled column space, an accepted
+// high-word-only ID fails only after native proof, and the same status cell
+// and workspace range stay reusable once that completion is proven.
+TEST_CASE("TTNN embedding double carriers keep words and reuse proven scratch") {
+    require_hardware();
+    TtnnDevices devices;
+    constexpr std::size_t vocabulary = 17;
+    constexpr std::size_t features = 33;
+    constexpr std::size_t run = 17;
+    const iom::TensorSpec table_spec{
+            iom::TensorShape{{vocabulary, features}}, iom::DataType::F64};
+    const iom::TensorSpec index_spec{
+            iom::TensorShape{{1, run}}, iom::DataType::I64};
+    const iom::TensorSpec output_spec{
+            iom::TensorShape{{run, features}}, iom::DataType::F64};
+    auto table = devices.candidate->create_tensor(table_spec);
+    auto indices = devices.candidate->create_tensor(index_spec);
+    auto output = devices.candidate->create_tensor(output_spec);
+    auto second_output = devices.candidate->create_tensor(output_spec);
+    auto workspace = devices.candidate->create_workspace(32);
+    auto queue = devices.candidate->create_ops();
+
+    // Every element sets both carrier words, crosses the `2^53` integer
+    // boundary, and carries a high-word sign bit, so a dropped or swapped word
+    // and a numeric decode are all observable.
+    const auto table_code = [](std::size_t linear) {
+        return (static_cast<std::uint64_t>(linear) << 40)
+                ^ 0x8000000000000001ull
+                ^ (static_cast<std::uint64_t>(linear) * 0x0000000100000003ull);
+    };
+    const std::vector<std::byte> table_bytes =
+            iom_conformance::encode_logical_codes(table_spec, table_code);
+    std::vector<std::uint64_t> ids(run, 0);
+    for (std::size_t row = 0; row < run; ++row) {
+        ids[row] = (row * 5 + 1) % vocabulary;
+    }
+    const std::vector<std::byte> index_bytes =
+            iom_conformance::encode_logical_codes(
+                    index_spec,
+                    [&ids](std::size_t linear) { return ids[linear % run]; });
+    // Every code has a valid small low word and a nonzero high word, so a
+    // narrowing implementation would gather row `2` instead of failing.
+    const std::vector<std::byte> high_word_only_bytes =
+            iom_conformance::encode_logical_codes(
+                    index_spec,
+                    [](std::size_t) { return 0x0000000100000002ull; });
+    iom_conformance::copy_from_host(table->view(), table_bytes);
+    iom_conformance::copy_from_host(indices->view(), index_bytes);
+    const std::vector<std::byte> poison(
+            output_spec.logical_nbytes(), std::byte{0x5A});
+    iom_conformance::copy_from_host(output->view(), poison);
+    iom_conformance::copy_from_host(second_output->view(), poison);
+    const std::vector<std::byte> expected =
+            iom_conformance::select_embedding_rows(
+                    table_bytes, iom::DataType::F64, vocabulary, features, run,
+                    std::span<const std::uint64_t>{ids});
+
+    const iom::oid valid = queue->embedding(
+            table->view(), indices->view(), output->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(valid));
+    REQUIRE_NOTHROW(queue->wait(valid));
+    iom_conformance::require_logical_bytes(
+            output->view(), expected,
+            "wide payload and wide index gather");
+    iom_conformance::require_logical_bytes(
+            table->view(), table_bytes, "wide gather changed the table");
+
+    // An accepted high-word-only ID is a data failure: the low word alone is a
+    // valid ID, so only the high-word check rejects it, and only after native
+    // proof.
+    iom_conformance::copy_from_host(indices->view(), high_word_only_bytes);
+    const iom::oid rejected = queue->embedding(
+            table->view(), indices->view(), second_output->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(rejected));
+    iom_conformance::expect_repeated_invalid_argument(*queue, rejected);
+
+    // Proven completion released the status cell and the range: the same
+    // workspace and owners serve an independent wide gather again.
+    iom_conformance::copy_from_host(indices->view(), index_bytes);
+    const iom::oid reused = queue->embedding(
+            table->view(), indices->view(), second_output->view(),
+            workspace->view());
+    REQUIRE(iom::oid_is_token(reused));
+    REQUIRE_NOTHROW(queue->wait(reused));
+    iom_conformance::require_logical_bytes(
+            second_output->view(), expected,
+            "wide gather after proven status and workspace reuse");
 }
 
 // TTNN's declared linear expectation: the mandatory BF16 leaf alone through the

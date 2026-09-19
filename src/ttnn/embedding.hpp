@@ -33,7 +33,12 @@ struct EmbeddingNativeRequest {
     detail::WorkspaceLease workspace_lease;
 };
 
-constexpr std::size_t kEmbeddingRuntimeArgCount = 21;
+// Runtime words: V, R, F, native table/index/output addresses and pages, the
+// three native carrier widths, the payload and index widths, the signed-index
+// marker, the three padded native column counts, the status owner's base, page
+// size, and subrange, and the table and index native carrier factors (one
+// column per logical element, or two consecutive columns for a 64-bit leaf).
+constexpr std::size_t kEmbeddingRuntimeArgCount = 23;
 
 struct alignas(32) EmbeddingStatusPacket {
     std::array<std::byte, 32> bytes{};
