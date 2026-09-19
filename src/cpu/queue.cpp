@@ -138,6 +138,56 @@ public:
                 });
     }
 
+    oid cache_append_impl(const CacheAppendRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(
+                submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_cache_append(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this](
+                        std::uint64_t sequence,
+                        const CacheAppendRequest& captured,
+                        detail::BinaryEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        cache_append_elements(captured);
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)
+                                            detail::release_or_invalidate_binary_entries(
+                                                    device_->registry_state()
+                                                            .registry,
+                                                    entries,
+                                                    static_cast<bool>(failure),
+                                                    true);
+                                    detail::complete_workspace_lease(
+                                            device_->registry_state(),
+                                            captured.workspace_lease, true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        detail::complete_workspace_lease(
+                                device_->registry_state(),
+                                captured.workspace_lease, true);
+                        throw;
+                    }
+                });
+    }
+
+    [[nodiscard]] WorkspaceRequirements
+            cache_append_workspace_requirements(
+                    const CacheAppendRequest&) override {
+        return {0, 1};
+    }
+
     [[nodiscard]] std::string_view backend_label() const noexcept override {
         return "CPU";
     }
@@ -1121,6 +1171,53 @@ private:
             std::size_t, std::size_t, LinearOutputLayout, std::size_t,
             std::size_t) override {
         return {0, 1};
+    }
+
+    static void cache_append_elements(const CacheAppendRequest& request) {
+        const std::span<const std::size_t> source_dimensions =
+                request.source.shape_dimensions();
+        const std::span<const std::size_t> destination_dimensions =
+                request.destination.shape_dimensions();
+        const std::size_t leading_rank = source_dimensions.size() - 2;
+        const std::size_t rows = source_dimensions[leading_rank];
+        const std::size_t features = source_dimensions[leading_rank + 1];
+        const auto* source_base =
+                static_cast<const unsigned char*>(
+                        request.source.native_handle);
+        auto* destination_base =
+                static_cast<unsigned char*>(
+                        request.destination.native_handle);
+
+        auto visit = [&](auto&& self, std::size_t axis,
+                         std::size_t source_plane,
+                         std::size_t destination_plane) -> void {
+            if (axis == leading_rank) {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    cpu_detail::copy_row_span(
+                            destination_base, destination_dimensions,
+                            destination_plane, request.a + row, source_base,
+                            source_dimensions, source_plane, row,
+                            request.source.data_type, features);
+                }
+                return;
+            }
+            for (std::size_t index = 0;
+                 index < source_dimensions[axis]; ++index) {
+                self(
+                        self, axis + 1,
+                        source_plane
+                                + index
+                                        * request.source
+                                                  .leading_plane_strides()[axis],
+                        destination_plane
+                                + index
+                                        * request.destination
+                                                  .leading_plane_strides()[axis]);
+            }
+        };
+        visit(
+                visit, 0, request.source.plane_offset,
+                request.destination.plane_offset);
     }
 
     static void copy_elements(
