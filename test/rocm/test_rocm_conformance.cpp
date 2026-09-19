@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "backend/backend_conformance_common.hpp"
+#include "backend/backend_conformance_rope.hpp"
 
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_embedding.hpp"
@@ -858,6 +859,18 @@ TEST_CASE("ROCm conformance: RMSNorm reference, admission, and lifetime") {
             "rocm_detail::SubmissionFault::event_record",
             {}};
     iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm conformance: RoPE reference, admission, and lifetime") {
+    iom_conformance::TrafficGate gate;
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    HipStorageOracle oracle;
+    iom_conformance::rope_reference::run_rope_conformance(
+            *candidate,
+            iom_conformance::rope_reference::kRopeRocmExpectedSupported,
+            oracle);
     CHECK_FALSE(gate.armed());
 }
 

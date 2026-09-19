@@ -511,13 +511,12 @@ void gpu_policy::launch_silu(
     throw detail::UnsupportedOperation();
 }
 
-// The shared Rope facility is compiled into this translation unit, but the
-// queue policy remains an explicit Unsupported stub until the independent
-// ROCm wrapper leaf enables its launch.
+// Launch the shared standard-tiled logical-F Rope operation on the queue's
+// existing nonblocking stream. The wrapper adds no host arithmetic, staging,
+// allocation, or synchronization.
 void gpu_policy::launch_rope(
-        hipStream_t, const detail::RopeMetadata& metadata) {
-    static_cast<void>(metadata);
-    throw detail::UnsupportedOperation();
+        hipStream_t stream, const detail::RopeMetadata& metadata) {
+    detail::launch_standard_tiled_rope<gpu_policy>(stream, metadata);
 }
 
 // Launch the completed shared standard-tiled scalar linear projection, or the
