@@ -544,6 +544,36 @@ TEST_CASE("CPU device reports CPU backend with ordinal zero") {
     CHECK(&tensor->view().device() == first.get());
 }
 
+class DeviceLessQueue final : public iom::DeviceOps {
+public:
+    DeviceLessQueue() : iom::DeviceOps() {}
+};
+
+TEST_CASE("DeviceOps exposes exact queue device identity") {
+    RecordingAllocator allocator;
+    auto device_a = iom::make_cpu_device(allocator);
+    auto device_b = iom::make_cpu_device(allocator);
+    REQUIRE(device_a != nullptr);
+    REQUIRE(device_b != nullptr);
+    REQUIRE(device_a.get() != device_b.get());
+
+    auto queue_a = device_a->create_ops();
+    auto queue_b = device_a->create_ops();
+    auto foreign_queue = device_b->create_ops();
+    REQUIRE(queue_a != nullptr);
+    REQUIRE(queue_b != nullptr);
+    REQUIRE(foreign_queue != nullptr);
+
+    CHECK(&queue_a->device() == device_a.get());
+    CHECK(&queue_b->device() == device_a.get());
+    CHECK(&queue_a->device() == &queue_b->device());
+    CHECK(&foreign_queue->device() == device_b.get());
+    CHECK(&queue_a->device() != &foreign_queue->device());
+
+    DeviceLessQueue device_less_queue;
+    CHECK_THROWS_AS((void)device_less_queue.device(), std::logic_error);
+}
+
 TEST_CASE("CPU tensors allocate exactly once per leaf type and free once") {
     for (const iom::DataType type : kAllDataTypes) {
         for (const std::vector<std::size_t> dimensions :

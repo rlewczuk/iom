@@ -255,6 +255,9 @@ namespace iom {
             throw;
         }
     }
+    const Device& DeviceOps::device() const {
+        return queue_device();
+    }
     const Device& DeviceOps::queue_device() const {
         if (device_ == nullptr)
             throw std::logic_error("operation queue has no device");
