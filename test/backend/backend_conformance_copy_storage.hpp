@@ -10,7 +10,7 @@
 // bit-for-bit. All shared types, helpers, and the case-parameter structs
 // come from backend_conformance_common.hpp.
 
-#include "backend/backend_conformance_oracle.hpp"
+#include "backend_conformance_oracle.hpp"
 
 #include <cstddef>
 #include <functional>
