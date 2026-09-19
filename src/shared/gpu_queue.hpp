@@ -26,7 +26,9 @@
 // copy_metadata_layout, write_copy_metadata, RmsnormMetadata,
 // make_rmsnorm_metadata, write_rmsnorm_metadata) by non-dependent names.
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <exception>
 #include <map>
@@ -36,7 +38,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+
 
 #include "../iom_internal.hpp"
 
@@ -47,6 +51,159 @@
 #include "standard_tiled_embedding.hpp"
 
 namespace iom::detail {
+
+// Immutable device-visible SiLU metadata. The leading extents and strides
+// point into the same fixed metadata slot as the descriptor; no caller view or
+// borrowed span survives admission.
+struct SiluMetadata {
+    const unsigned char* x;
+    unsigned char* y;
+    const std::uint64_t* dims;
+    const std::uint64_t* x_strides;
+    const std::uint64_t* y_strides;
+    std::uint64_t rows;
+    std::uint64_t columns;
+    std::uint64_t plane_count;
+    std::uint64_t x_offset;
+    std::uint64_t y_offset;
+    std::uint32_t bits;
+    std::uint32_t type;
+    std::uint32_t leading_rank;
+};
+static_assert(std::is_trivially_copyable_v<SiluMetadata>);
+static_assert(
+        sizeof(SiluMetadata) + 3 * (8 - 2) * sizeof(std::uint64_t)
+        <= kMetadataSlotBytes);
+static_assert(
+        alignof(SiluMetadata) <= 32
+        && kMetadataSlotBytes % alignof(SiluMetadata) == 0);
+
+[[nodiscard]] inline std::size_t silu_metadata_checked_mul(
+        std::size_t left, std::size_t right, const char* message) {
+    if (right != 0
+            && left > std::numeric_limits<std::size_t>::max() / right) {
+        throw std::overflow_error(message);
+    }
+    return left * right;
+}
+
+[[nodiscard]] inline std::size_t silu_metadata_checked_add(
+        std::size_t left, std::size_t right, const char* message) {
+    if (left > std::numeric_limits<std::size_t>::max() - right) {
+        throw std::overflow_error(message);
+    }
+    return left + right;
+}
+
+[[nodiscard]] inline std::uint64_t silu_metadata_u64(
+        std::size_t value, const char* message) {
+    if (value > std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error(message);
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+[[nodiscard]] inline std::size_t silu_metadata_storage_bytes(
+        std::size_t rank) {
+    if (rank < 2 || rank > 8) {
+        throw std::invalid_argument("SILU metadata rank is out of range");
+    }
+    const std::size_t leading_rank = rank - 2;
+    const std::size_t arrays = silu_metadata_checked_mul(
+            silu_metadata_checked_mul(
+                    leading_rank, sizeof(std::uint64_t),
+                    "SILU metadata rank storage overflows"),
+            3, "SILU metadata rank storage overflows");
+    const std::size_t result = silu_metadata_checked_add(
+            sizeof(SiluMetadata), arrays,
+            "SILU metadata storage size overflows");
+    if (result > kMetadataSlotBytes) {
+        throw std::overflow_error("SILU metadata exceeds fixed slot");
+    }
+    return result;
+}
+
+template <typename Request>
+[[nodiscard]] SiluMetadata make_silu_metadata(const Request& request) {
+    const std::span<const std::size_t> dimensions =
+            request.x.shape_dimensions();
+    if (dimensions.size() < 2 || dimensions.size() > 8
+            || request.y.rank != dimensions.size()) {
+        throw std::invalid_argument("SILU metadata rank is out of range");
+    }
+    const std::size_t leading_rank = dimensions.size() - 2;
+    (void)silu_metadata_storage_bytes(dimensions.size());
+
+    SiluMetadata metadata{};
+    metadata.x = static_cast<const unsigned char*>(request.x.native_handle);
+    metadata.y = static_cast<unsigned char*>(request.y.native_handle);
+    metadata.rows = silu_metadata_u64(
+            dimensions[leading_rank], "SILU metadata row extent overflows");
+    metadata.columns = silu_metadata_u64(
+            dimensions[leading_rank + 1],
+            "SILU metadata feature extent overflows");
+    metadata.x_offset = silu_metadata_u64(
+            request.x.plane_offset, "SILU metadata x offset overflows");
+    metadata.y_offset = silu_metadata_u64(
+            request.y.plane_offset, "SILU metadata output offset overflows");
+    metadata.bits = static_cast<std::uint32_t>(
+            leaf_bits(request.x.data_type));
+    metadata.type = static_cast<std::uint32_t>(request.x.data_type);
+    metadata.leading_rank = static_cast<std::uint32_t>(leading_rank);
+
+    std::size_t plane_count = 1;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        plane_count = silu_metadata_checked_mul(
+                plane_count, dimensions[axis],
+                "SILU metadata leading plane count overflows");
+    }
+    metadata.plane_count = silu_metadata_u64(
+            plane_count, "SILU metadata leading plane count overflows");
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        (void)silu_metadata_u64(
+                request.x.plane_strides[axis],
+                "SILU metadata x stride overflows");
+        (void)silu_metadata_u64(
+                request.y.plane_strides[axis],
+                "SILU metadata output stride overflows");
+    }
+    return metadata;
+}
+
+template <typename Request>
+void write_silu_metadata(
+        void* host_storage, const void* device_storage,
+        const Request& request) {
+    SiluMetadata metadata = make_silu_metadata(request);
+    const std::span<const std::size_t> dimensions =
+            request.x.shape_dimensions();
+    const std::size_t leading_rank = dimensions.size() - 2;
+    auto* host_bytes = static_cast<std::byte*>(host_storage);
+    const auto* device_bytes =
+            static_cast<const std::byte*>(device_storage);
+    const std::size_t arrays_offset = sizeof(SiluMetadata);
+    auto* host_dims = reinterpret_cast<std::uint64_t*>(
+            host_bytes + arrays_offset);
+    auto* host_x_strides = host_dims + leading_rank;
+    auto* host_y_strides = host_x_strides + leading_rank;
+    for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+        host_dims[axis] = silu_metadata_u64(
+                dimensions[axis], "SILU metadata leading extent overflows");
+        host_x_strides[axis] = silu_metadata_u64(
+                request.x.plane_strides[axis],
+                "SILU metadata x stride overflows");
+        host_y_strides[axis] = silu_metadata_u64(
+                request.y.plane_strides[axis],
+                "SILU metadata output stride overflows");
+    }
+    const auto* device_values = reinterpret_cast<const std::uint64_t*>(
+            device_bytes + arrays_offset);
+    metadata.dims = device_values;
+    metadata.x_strides = device_values + leading_rank;
+    metadata.y_strides = device_values + leading_rank * 2;
+    *reinterpret_cast<SiluMetadata*>(host_storage) = metadata;
+}
+
 
 template <typename Policy>
 class GpuQueue final : public DeviceOps {
@@ -195,6 +352,9 @@ class GpuQueue final : public DeviceOps {
         detail::BinaryEntryRegistration rmsnorm_entries{};
         bool is_linear = false;
         std::optional<LinearRequest> linear_request;
+        bool is_silu = false;
+        std::optional<SiLURequest> silu_request;
+        detail::BinaryEntryRegistration silu_entries{};
         detail::EntryRegistration entries{};
         typename EventRing::Submission* submission = nullptr;
         std::shared_ptr<CompletionState> completion;
@@ -222,6 +382,7 @@ class GpuQueue final : public DeviceOps {
         detail::BinaryEntryRegistration binary_entries{};
         detail::BinaryEntryRegistration cache_append_entries{};
         detail::BinaryEntryRegistration rmsnorm_entries{};
+        detail::BinaryEntryRegistration silu_entries{};
         detail::WorkspaceLease workspace_lease{};
         std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
@@ -229,6 +390,7 @@ class GpuQueue final : public DeviceOps {
         bool is_rmsnorm = false;
         bool is_embedding = false;
         bool is_linear = false;
+        bool is_silu = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -270,6 +432,15 @@ public:
 
     [[nodiscard]] bool rmsnorm_supported(
             DataType data_type) const override;
+
+    // SiLU consumes the immutable common request and the common
+    // owner-registration output; the shared branch adds no admission of its
+    // own and reuses the fixed metadata, event, worker, completion, and
+    // quarantine resources above. The policy remains explicitly unsupported
+    // until an independent backend wrapper supplies a real device launch.
+    WorkspaceRequirements silu_workspace_requirements_impl(
+            const SiLURequest& request) override;
+    oid silu_impl(const SiLURequest& request) override;
 
     WorkspaceRequirements embedding_workspace_requirements_impl(
             const TensorView& table, const TensorView& indices,

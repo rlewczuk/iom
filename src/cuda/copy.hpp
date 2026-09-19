@@ -28,6 +28,10 @@ struct RmsnormMetadata;
 // Device descriptor of the shared tiled scalar linear projection
 // (src/shared/standard_tiled_linear.inl), declared for the same reason.
 struct LinearMetadata;
+// Device descriptor of the shared SiLU queue dispatch metadata. The
+// operation is intentionally unported here; the descriptor preserves the
+// callback seam without retaining a borrowed TensorView.
+struct SiluMetadata;
 }  // namespace iom::detail
 
 namespace iom::cuda_detail {
@@ -343,6 +347,22 @@ struct gpu_policy {
 
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
+
+    // SiLU remains an explicit Unsupported policy stub until the independent
+    // CUDA wrapper supplies a real device launch. The common queue therefore
+    // rejects it before owner registration, sequence consumption, metadata,
+    // event, or stream effects.
+    [[nodiscard]] static constexpr bool silu_supported() noexcept {
+        return false;
+    }
+
+    static void launch_silu(
+            stream_type stream, const detail::SiluMetadata& metadata);
+
+    [[nodiscard]] static constexpr const char* silu_kernel_operation()
+            noexcept {
+        return "CUDA SiLU kernel launch";
+    }
 
     // Linear projection capability: exactly the twenty non-BF16 applicable
     // leaves on the shared tiled scalar path plus `BF16` on the native

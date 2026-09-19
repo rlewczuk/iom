@@ -27,6 +27,10 @@ struct RmsnormMetadata;
 // (src/shared/standard_tiled_linear.inl). Like the RMSNorm descriptor it is
 // only needed inside the ROCm translation unit.
 struct LinearMetadata;
+// Device descriptor of the shared SiLU queue dispatch metadata. The
+// operation is intentionally unported here; the descriptor preserves the
+// callback seam without retaining a borrowed TensorView.
+struct SiluMetadata;
 }  // namespace iom::detail
 
 namespace iom::rocm_detail {
@@ -312,6 +316,22 @@ struct gpu_policy {
 
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
+
+    // SiLU remains an explicit Unsupported policy stub until the independent
+    // ROCm wrapper supplies a real device launch. The common queue therefore
+    // rejects it before owner registration, sequence consumption, metadata,
+    // event, or stream effects.
+    [[nodiscard]] static constexpr bool silu_supported() noexcept {
+        return false;
+    }
+
+    static void launch_silu(
+            stream_type stream, const detail::SiluMetadata& metadata);
+
+    [[nodiscard]] static constexpr const char* silu_kernel_operation()
+            noexcept {
+        return "HIP SiLU kernel launch";
+    }
 
     // Linear projection seams. The complete backend-parameterized device
     // operation lives in src/shared/standard_tiled_linear.inl; the ROCm
