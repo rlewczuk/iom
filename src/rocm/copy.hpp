@@ -336,10 +336,11 @@ struct gpu_policy {
         return "HIP SiLU kernel launch";
     }
 
-    // RoPE remains an explicit Unsupported policy stub until the independent
-    // ROCm wrapper leaf enables the shared standard-tiled launch.
+    // The shared standard-tiled Rope producer is launched by the ROCm wrapper
+    // on the queue's existing nonblocking stream. Common admission restricts
+    // this immutable capability to the nine applicable floating leaves.
     [[nodiscard]] static constexpr bool rope_supported() noexcept {
-        return false;
+        return true;
     }
 
     static void launch_rope(
