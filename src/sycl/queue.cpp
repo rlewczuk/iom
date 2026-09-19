@@ -305,6 +305,11 @@ void SyclQueue::execute(Task& task) {
         execute_linear(task);
         return;
     }
+    if (task.rope_request.has_value()) {
+        execute_rope(task);
+        return;
+    }
+
 
     if (consume_submission_fault(SubmissionFault::outcome_insertion)) {
         throw std::bad_alloc();
@@ -468,6 +473,12 @@ void SyclQueue::complete_task(
                     fence_succeeded);
             detail::complete_workspace_lease(
                     *state_, outcome.workspace_lease, completion_proven);
+        } else if (outcome.rope_entries.has_value()) {
+            // RoPE uses the fixed zero-workspace requirement, so only its
+            // deduplicated input/output owner registrations are released.
+            (void)detail::release_or_invalidate_binary_entries(
+                    state_->registry, *outcome.rope_entries, failed,
+                    fence_succeeded);
         } else {
             (void)detail::release_or_invalidate_entries(
                     state_->registry, outcome.common, failed,

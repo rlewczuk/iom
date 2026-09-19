@@ -28,6 +28,7 @@
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
+#include "backend/backend_conformance_rope.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -999,6 +1000,75 @@ TEST_CASE("SYCL conformance: RMS normalization capability follows the device FP6
                 iom::to_oid(iom::OidError::Unsupported));
     }
 }
+TEST_CASE("SYCL conformance: native RoPE reference and eight-leaf capability") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    iom_conformance::rope_reference::run_rope_conformance(
+            *devices.candidate,
+            iom_conformance::rope_reference::kRopeSyclExpectedSupported,
+            &oracle);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("SYCL conformance: RoPE rejects unsupported leaves and workspace") {
+    SyclDevices devices;
+    auto queue = devices.candidate->create_ops();
+    const iom::TensorSpec f32_spec{
+            iom::TensorShape{{1, 1, 2}}, iom::DataType::F32};
+    auto f32_x = devices.candidate->create_tensor(f32_spec);
+    auto f32_out = devices.candidate->create_tensor(f32_spec);
+    auto workspace = devices.candidate->create_workspace(32);
+    CHECK_EQ(
+            queue->rope(
+                    f32_x->view(), f32_out->view(), 0, 10000.0,
+                    workspace->view()),
+            iom::to_oid(iom::OidError::InvalidArgument));
+
+    for (const iom::DataType data_type :
+         iom_conformance::rope_reference::kRopeUnsupportedDataTypes) {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{1, 1, 2}}, data_type};
+        auto x = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        CHECK_THROWS_AS(
+                (void)queue->rope_workspace_requirements(
+                        x->view(), out->view(), 0, 10000.0),
+                std::runtime_error);
+        CHECK_EQ(
+                queue->rope(x->view(), out->view(), 0, 10000.0),
+                iom::to_oid(iom::OidError::Unsupported));
+    }
+    const iom::TensorSpec f64_spec{
+            iom::TensorShape{{1, 1, 2}}, iom::DataType::F64};
+    auto f64_x = devices.candidate->create_tensor(f64_spec);
+    auto f64_out = devices.candidate->create_tensor(f64_spec);
+    CHECK_THROWS_AS(
+            (void)queue->rope_workspace_requirements(
+                    f64_x->view(), f64_out->view(), 0, 10000.0),
+            std::runtime_error);
+    CHECK_EQ(
+            queue->rope(f64_x->view(), f64_out->view(), 0, 10000.0),
+            iom::to_oid(iom::OidError::Unsupported));
+}
+
+TEST_CASE("SYCL conformance: accepted RoPE failure repeats through the fence") {
+    SyclDevices devices;
+    const iom::TensorSpec spec{
+            iom::TensorShape{{1, 1, 2}}, iom::DataType::F32};
+    auto x = devices.candidate->create_tensor(spec);
+    auto out = devices.candidate->create_tensor(spec);
+    auto queue = devices.candidate->create_ops();
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::post_launch);
+    const iom::oid token = queue->rope(x->view(), out->view(), 1, 10000.0);
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_THROWS_AS(queue->wait(token), std::runtime_error);
+    CHECK_THROWS_AS(queue->wait(token), std::runtime_error);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 
 TEST_CASE("SYCL conformance: binary requests use native queue and owner registry") {
     SyclDevices devices;

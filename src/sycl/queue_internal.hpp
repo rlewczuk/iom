@@ -47,6 +47,10 @@ class SyclQueue final : public DeviceOps {
         // captured with the request.
         std::optional<LinearRequest> linear_request;
         detail::BinaryEntryRegistration linear_entries;
+        // Immutable split-half RoPE request captured by admission, plus the
+        // common owner registrations retained until proven completion.
+        std::optional<RopeRequest> rope_request;
+        detail::BinaryEntryRegistration rope_entries;
     };
 
     struct SyclSequenceOutcome {
@@ -57,15 +61,14 @@ class SyclQueue final : public DeviceOps {
         std::optional<detail::BinaryEntryRegistration> rmsnorm_entries;
         bool is_embedding = false;
         // Trailing so every existing aggregate initialization of this outcome
-        // keeps its own field order. Linear registers the same deduplicated
-        // owner set as RMS normalization; the scalar leaves report the
-        // `{0, 1}` zero-scratch requirement and therefore carry an empty
-        // lease, while the native `BF16` specialization leases its product
-        // scratch through proven completion in the shared field above.
+        // keeps its own field order. Linear and RoPE register their
+        // deduplicated owner sets; both currently consume no raw workspace.
         std::optional<detail::BinaryEntryRegistration> linear_entries;
+        std::optional<detail::BinaryEntryRegistration> rope_entries;
     };
 
 public:
+
 #ifdef IOM_ENABLE_TESTING
     [[nodiscard]] detail::MetadataSlotPool&
             metadata_pool_for_testing() noexcept {
@@ -97,6 +100,10 @@ public:
     oid embedding_impl(const EmbeddingRequest& request) override;
     oid rmsnorm_impl(const RmsnormRequest& request) override;
     oid linear_impl(const LinearRequest& request) override;
+    oid rope_impl(const RopeRequest& request) override;
+    [[nodiscard]] WorkspaceRequirements
+            rope_workspace_requirements(const RopeRequest& request) override;
+
 
     /**
      * Pure capability decision and exact raw-workspace requirement of the
@@ -148,6 +155,7 @@ private:
     void execute_embedding(Task& task);
     void execute_rmsnorm(Task& task);
     void execute_linear(Task& task);
+    void execute_rope(Task& task);
 
     // Immutable capability predicate of the linear scalar leaf set, shared by
     // the pure requirement query and the admitted execution hook so the query
