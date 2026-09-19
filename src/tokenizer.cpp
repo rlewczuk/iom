@@ -946,7 +946,9 @@ struct Tokenizer::Impl {
     std::vector<TokenPair> merges_by_rank;
     std::vector<std::uint32_t> encode(
             std::string_view text, EncodeOptions options) const;
-
+    std::vector<std::uint32_t> encode_pair(
+            std::string_view first, std::string_view second,
+            EncodeOptions options) const;
 };
 
 std::string utf8_byte_description(std::uint8_t byte) {
@@ -959,14 +961,16 @@ std::string utf8_byte_description(std::uint8_t byte) {
 
 [[noreturn]] void reject_encode_utf8(
         std::size_t offset, std::string_view expected,
-        std::string_view actual) {
+        std::string_view actual, std::string_view context) {
     throw std::invalid_argument(
-            "Tokenizer::encode: invalid UTF-8 at byte " +
+            std::string(context) + ": invalid UTF-8 at byte " +
             std::to_string(offset) + "; expected " + std::string(expected) +
             "; actual " + std::string(actual));
 }
 
-void validate_encode_utf8(std::string_view text) {
+void validate_encode_utf8(
+        std::string_view text,
+        std::string_view context = "Tokenizer::encode") {
     std::size_t offset = 0;
     while (offset < text.size()) {
         const auto lead = static_cast<std::uint8_t>(text[offset]);
@@ -998,14 +1002,14 @@ void validate_encode_utf8(std::string_view text) {
                     "a 4-byte UTF-8 sequence with second byte 0x80..0x8F";
         } else {
             reject_encode_utf8(offset, "a UTF-8 leading byte",
-                                utf8_byte_description(lead));
+                               utf8_byte_description(lead), context);
         }
 
         if (text.size() - offset < length) {
             reject_encode_utf8(
                     text.size(), expected_lead.empty() ? "continuation bytes"
                                                         : expected_lead,
-                    "end-of-input");
+                    "end-of-input", context);
         }
 
         const auto second = [&]() -> std::uint8_t {
@@ -1032,7 +1036,7 @@ void validate_encode_utf8(std::string_view text) {
                         utf8_byte_description(second_min) + ".." +
                         utf8_byte_description(second_max);
                 reject_encode_utf8(offset + 1, expected,
-                                   utf8_byte_description(second));
+                                   utf8_byte_description(second), context);
             }
         }
         for (std::size_t index = 1; index < length; ++index) {
@@ -1040,7 +1044,7 @@ void validate_encode_utf8(std::string_view text) {
                     static_cast<std::uint8_t>(text[offset + index]);
             if (byte < 0x80 || byte > 0xBF) {
                 reject_encode_utf8(offset + index, "a continuation byte",
-                                   utf8_byte_description(byte));
+                                   utf8_byte_description(byte), context);
             }
         }
         offset += length;
@@ -1395,9 +1399,100 @@ std::vector<std::uint32_t> Tokenizer::Impl::encode(
     return result;
 }
 
+std::vector<std::uint32_t> Tokenizer::Impl::encode_pair(
+        std::string_view first, std::string_view second,
+        EncodeOptions options) const {
+    validate_encode_utf8(first, "Tokenizer::encode_pair");
+    validate_encode_utf8(second, "Tokenizer::encode_pair");
+
+    const std::vector<std::uint32_t> first_ids =
+            encode(first, EncodeOptions{false});
+    const std::vector<std::uint32_t> second_ids =
+            encode(second, EncodeOptions{false});
+
+    std::size_t reserve_size =
+            encode_checked_add(first_ids.size(), second_ids.size(),
+                               "pair result");
+    if (options.add_special_tokens) {
+        for (const TemplateItemState& item : pair_template) {
+            if (!item.special) {
+                continue;
+            }
+            const auto special = special_tokens.find(item.id);
+            if (special == special_tokens.end()) {
+                throw std::logic_error(
+                        "Tokenizer::encode_pair: pair template special token "
+                        "is missing");
+            }
+            reserve_size = encode_checked_add(
+                    reserve_size, special->second.ids.size(), "pair result");
+        }
+    }
+
+    std::vector<std::uint32_t> result;
+    encode_checked_reserve(result, reserve_size, "pair result");
+    const auto append_ids = [&result](
+                                    const std::vector<std::uint32_t>& ids) {
+        for (const std::uint32_t id : ids) {
+            encode_checked_push(result, id);
+        }
+    };
+
+    if (!options.add_special_tokens) {
+        append_ids(first_ids);
+        append_ids(second_ids);
+        return result;
+    }
+
+    bool first_seen = false;
+    bool second_seen = false;
+    for (const TemplateItemState& item : pair_template) {
+        if (item.special) {
+            const auto special = special_tokens.find(item.id);
+            if (special == special_tokens.end()) {
+                throw std::logic_error(
+                        "Tokenizer::encode_pair: pair template special token "
+                        "is missing");
+            }
+            append_ids(special->second.ids);
+            continue;
+        }
+        if (item.id == "A") {
+            if (first_seen) {
+                throw std::logic_error(
+                        "Tokenizer::encode_pair: pair template repeats A");
+            }
+            first_seen = true;
+            append_ids(first_ids);
+        } else if (item.id == "B") {
+            if (second_seen) {
+                throw std::logic_error(
+                        "Tokenizer::encode_pair: pair template repeats B");
+            }
+            second_seen = true;
+            append_ids(second_ids);
+        } else {
+            throw std::logic_error(
+                    "Tokenizer::encode_pair: pair template sequence is invalid");
+        }
+    }
+    if (!first_seen || !second_seen) {
+        throw std::logic_error(
+                "Tokenizer::encode_pair: pair template is missing a sequence");
+    }
+    return result;
+}
+
+
 std::vector<std::uint32_t> Tokenizer::encode(
         std::string_view text, EncodeOptions options) const {
     return impl_->encode(text, options);
+}
+
+std::vector<std::uint32_t> Tokenizer::encode_pair(
+        std::string_view first, std::string_view second,
+        EncodeOptions options) const {
+    return impl_->encode_pair(first, second, options);
 }
 
 Tokenizer::Tokenizer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

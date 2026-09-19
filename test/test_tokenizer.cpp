@@ -433,4 +433,94 @@ TEST_CASE("Tokenizer validates every decode ID before publishing output") {
     const std::array<std::uint32_t, 1> valid = {267};
     CHECK(owner->decode(valid, {}) == "hello");
 }
+TEST_CASE("Tokenizer encodes pairs with exact empty and text templates") {
+    TempDir directory("encode-pairs-basic");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    const auto check_pair = [&](std::string_view first, std::string_view second,
+                                std::vector<std::uint32_t> raw,
+                                std::vector<std::uint32_t> processed) {
+        CHECK(owner->encode_pair(first, second, iom::EncodeOptions{false}) ==
+              raw);
+        CHECK(owner->encode_pair(first, second, iom::EncodeOptions{true}) ==
+              processed);
+    };
+
+    check_pair("", "", {}, {1, 1});
+    check_pair("", "hello", {268}, {1, 1, 268});
+    check_pair("hello", "", {268}, {1, 268, 1});
+    check_pair("hello", "world", {268, 276}, {1, 268, 1, 276});
+    check_pair("he", "llo", {259, 264, 259, 266},
+               {1, 259, 264, 1, 259, 266});
+}
+
+TEST_CASE("Tokenizer keeps pair sequence boundaries and added tokens independent") {
+    TempDir directory("encode-pairs-boundaries");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    CHECK(owner->encode_pair("hello", "hello", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{268, 268});
+    CHECK(owner->encode_pair("hello", "hello", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 268, 1, 268});
+    CHECK(owner->encode_pair(" ", " ", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{259, 259, 259, 259});
+    CHECK(owner->encode_pair(" ", " ", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 259, 259, 1, 259, 259});
+    CHECK(owner->encode_pair("héllø", "世界", iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{
+                  259, 260, 277, 265, 278, 259, 279, 280});
+    CHECK(owner->encode_pair("🙂", "?", iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{
+                  1, 259, 243, 162, 156, 133, 1, 259, 284});
+    CHECK(owner->encode_pair("<unk>hello<s></s>", "<s>",
+                             iom::EncodeOptions{false}) ==
+          std::vector<std::uint32_t>{0, 268, 1, 2, 1});
+    CHECK(owner->encode_pair("<unk>hello<s></s>", "<s>",
+                             iom::EncodeOptions{true}) ==
+          std::vector<std::uint32_t>{1, 0, 268, 1, 2, 1, 1});
+}
+
+TEST_CASE("Tokenizer rejects invalid UTF-8 in either pair sequence atomically") {
+    TempDir directory("encode-pairs-invalid-utf8");
+    write_tokenizer(directory.path());
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    std::string invalid(4, '\0');
+    invalid[0] = static_cast<char>(0xF0);
+    invalid[1] = static_cast<char>(0x28);
+    invalid[2] = static_cast<char>(0x8C);
+    invalid[3] = static_cast<char>(0x28);
+
+    const auto check_rejected = [&](std::string_view first,
+                                    std::string_view second) {
+        for (const bool add_special_tokens : {false, true}) {
+            std::vector<std::uint32_t> published{777};
+            bool rejected = false;
+            std::string message;
+            try {
+                const auto actual = owner->encode_pair(
+                        first, second, iom::EncodeOptions{add_special_tokens});
+                published = actual;
+            } catch (const std::invalid_argument& error) {
+                rejected = true;
+                message = error.what();
+            }
+            CHECK(rejected);
+            CHECK(published == std::vector<std::uint32_t>{777});
+            CHECK(message.find("Tokenizer::encode_pair") != std::string::npos);
+            CHECK(message.find("invalid UTF-8") != std::string::npos);
+            CHECK(message.find("byte 1") != std::string::npos);
+            CHECK(message.find("expected") != std::string::npos);
+            CHECK(message.find("actual") != std::string::npos);
+        }
+    };
+
+    check_rejected(invalid, "hello");
+    check_rejected("hello", invalid);
+}
 }  // namespace
