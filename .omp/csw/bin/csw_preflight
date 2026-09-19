@@ -84,9 +84,20 @@ BOSS_AGENTS = (
     AgentContract("boss-advocate-strong", "@slow", LOOKUP_TOOLS),
     AgentContract("csw-plan-facts", "@task", READ_ONLY_TOOLS),
 )
-SPEC_RUN_ALL_AGENTS = (
-    AgentContract("csw-implementer", "@implementer", BUILDER_TOOLS, ("csw-debug",)),
+CSW_RUN_WORKER_AGENTS = (
     AgentContract("csw-debug", "@slow", (*READ_ONLY_TOOLS, "bash")),
+    AgentContract(
+        "csw-yodacoder",
+        "@csw-yoda",
+        BUILDER_TOOLS,
+        (),
+        ("spawns", "advisor", "prewalk"),
+        (("advisor", False), ("prewalk", False)),
+    ),
+)
+SPEC_RUN_ALL_AGENTS = (
+    AgentContract("csw-implementer", "@implementer", BUILDER_TOOLS, ("csw-debug", "csw-yodacoder")),
+    *CSW_RUN_WORKER_AGENTS,
     AgentContract(
         "csw-verifier",
         "@csw-verifier",
@@ -112,7 +123,6 @@ SPEC_RUN_ALL_AGENTS = (
         (("advisor", False), ("prewalk", False)),
     ),
 )
-CSW_RUN_WORKER_AGENTS = (SPEC_RUN_ALL_AGENTS[1],)
 WORKFLOWS = {
     "boss": (BOSS_AGENTS, 1),
     "csw-run": (SPEC_RUN_ALL_AGENTS, 2),

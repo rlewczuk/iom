@@ -48,8 +48,9 @@ class CswPreflightTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Preflight Test"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "preflight@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m", "initial"], check=True)
-        self.write_profile("csw-implementer", "@implementer", BUILDER, "[csw-debug]")
+        self.write_profile("csw-implementer", "@implementer", BUILDER, "[csw-debug, csw-yodacoder]")
         self.write_profile("csw-debug", "@slow", f"[{READ_ONLY}, bash]", "[]", advisor=False)
+        self.write_profile("csw-yodacoder", "@csw-yoda", BUILDER, "[]", advisor=False, prewalk=False)
         self.write_profile("csw-verifier", "@csw-verifier", VERIFIER, "[]", advisor=False, prewalk=False)
         self.write_profile("csw-review", "@csw-review", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
         self.write_profile("csw-review-2", "@csw-review-2", f"[{REVIEW}]", "[]", advisor=False, prewalk=False)
@@ -120,6 +121,7 @@ class CswPreflightTests(unittest.TestCase):
             "modelRoles": {
                 "implementer": "openai/cheap",
                 "slow": "openai/slow",
+                "csw-yoda": "openai/yoda",
                 "smol": "openai/cheap",
                 "task": "openai/task",
                 "advisor": "openai/advisor",
@@ -144,6 +146,7 @@ class CswPreflightTests(unittest.TestCase):
             {"selector": "openai/verifier", "provider": "openai", "id": "verifier", "thinking": ["high"]},
             {"selector": "openai/review", "provider": "openai", "id": "review", "thinking": ["high"]},
             {"selector": "openai/review-2", "provider": "openai", "id": "review-2", "thinking": ["high"]},
+            {"selector": "openai/yoda", "provider": "openai", "id": "yoda", "thinking": ["high"]},
         ]
         if cheap:
             result.append({"selector": "openai/cheap", "provider": "openai", "id": "cheap", "thinking": ["low", "high"]})
@@ -171,9 +174,12 @@ class CswPreflightTests(unittest.TestCase):
         self.assertFalse(payload["git"]["clean"])
         self.assertEqual(payload["agents"]["csw-implementer"]["resolved"], "openai/cheap")
         self.assertTrue(payload["agents"]["csw-debug"]["available"])
+        self.assertTrue(payload["agents"]["csw-yodacoder"]["available"])
+        self.assertEqual(payload["agents"]["csw-yodacoder"]["resolved"], "openai/yoda")
         self.assertEqual(set(payload["agents"]), {
             "csw-implementer",
             "csw-debug",
+            "csw-yodacoder",
             "csw-verifier",
             "csw-review",
             "csw-review-2",
@@ -188,13 +194,34 @@ class CswPreflightTests(unittest.TestCase):
         self.assertTrue(payload["git"]["detached"])
         self.assertIsNone(payload["git"]["branch"])
 
-    def test_csw_run_worker_checks_only_debugger_profile(self):
+    def test_csw_run_worker_checks_only_rescue_profiles(self):
         (self.repo / ".omp" / "agents" / "csw-implementer.md").unlink()
         self.write_omp(self.config(), self.models())
         result = self.run_helper("csw-run-worker")
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(set(payload["agents"]), {"csw-debug"})
+        self.assertEqual(set(payload["agents"]), {"csw-debug", "csw-yodacoder"})
+
+    def test_missing_yoda_alias_blocks_standalone_worker(self):
+        config = self.config()
+        del config["modelRoles"]["value"]["csw-yoda"]
+        self.write_omp(config, self.models())
+        result = self.run_helper("csw-run-worker")
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("missing model role @csw-yoda" in error
+                            for error in payload["agents"]["csw-yodacoder"]["errors"]))
+
+    def test_implementer_without_yoda_spawn_is_a_blocker(self):
+        self.write_profile("csw-implementer", "@implementer", BUILDER, "[csw-debug]")
+        self.write_omp(self.config(), self.models())
+        result = self.run_helper()
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("spawn exactly" in error and "csw-yodacoder" in error
+                            for error in payload["agents"]["csw-implementer"]["errors"]))
 
     def test_boss_contract_validates_every_associated_profile(self):
         self.write_boss_profiles()
@@ -214,6 +241,7 @@ class CswPreflightTests(unittest.TestCase):
                     "implementer": "@worker",
                     "worker": "openai/cheap:low",
                     "slow": "openai/slow",
+                    "csw-yoda": "openai/yoda",
                     "csw-verifier": "openai/verifier",
                     "csw-review": "openai/review",
                     "csw-review-2": "openai/review-2",
@@ -265,6 +293,7 @@ class CswPreflightTests(unittest.TestCase):
                 modelRoles={
                     "implementer": "openai/cheap",
                     "slow": "openai/slow",
+                    "csw-yoda": "openai/yoda",
                     "csw-verifier": "openai/verifier",
                     "csw-review": "@primary",
                     "primary": "openai/review",
@@ -287,6 +316,7 @@ class CswPreflightTests(unittest.TestCase):
                 modelRoles={
                     "implementer": "openai/cheap",
                     "slow": "openai/slow",
+                    "csw-yoda": "openai/yoda",
                     "csw-verifier": "openai/verifier",
                     "csw-review": "@primary",
                     "primary": "@review-selector",
