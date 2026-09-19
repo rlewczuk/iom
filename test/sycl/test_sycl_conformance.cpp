@@ -27,6 +27,7 @@
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_rmsnorm.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -418,7 +419,7 @@ TEST_CASE("SYCL conformance: compute methods reject unsupported capability witho
     // SiLU and SDPA stay `Unsupported`.
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "SYCL", true, true, true);
+            &devices.gate, "SYCL", true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -787,15 +788,59 @@ TEST_CASE(
     CHECK_EQ(iom::sycl_detail::fence_wait_count_for_testing(), first_waits);
 }
 
+TEST_CASE("SYCL conformance: RMSNorm reference, admission, and lifetime") {
+    // The declared span is the device's own immutable `aspect::fp64` fact:
+    // the port queues the eight non-`F64` leaves on every device and `F64`
+    // exactly where the aspect is reported.
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    const sycl::device native_device =
+            devices.candidate_context->get_devices().front();
+    const bool fp64_available = native_device.has(sycl::aspect::fp64);
+    const std::span<const iom::DataType> supported =
+            fp64_available
+                    ? std::span<const iom::DataType>(
+                              iom_conformance::kRmsNormAllLeafSpan)
+                    : std::span<const iom::DataType>(
+                              iom_conformance::kRmsNormNonF64LeafSpan);
+    CHECK_EQ(
+            supported.size(), fp64_available ? std::size_t{9} : std::size_t{8});
+    iom_conformance::RmsNormConformanceConfig config{
+            devices.conformance(), supported, &devices.gate, &oracle};
+    // The SYCL testing seam reaches the real RMSNorm path: `execute_rmsnorm`
+    // (src/sycl/queue_rmsnorm.cpp) consumes `SubmissionFault::post_launch`
+    // after `native_attempted = true` and `launch_rmsnorm`, and its handler
+    // stores that failure on the already-accepted token
+    // (`task.state->set_failure`), which is exactly the retained
+    // accepted-failure identity the shared scenario asserts. Only the
+    // post-acceptance point is armed: `first_submit` and `outcome_insertion`
+    // are earlier points of the same executor and are deliberately left
+    // disarmed so the failure cannot be consumed before acceptance.
+    config.native_failure = iom_conformance::RmsNormNativeFailureSeam{
+            [] {
+                iom::sycl_detail::inject_submission_fault_for_testing(
+                        iom::sycl_detail::SubmissionFault::post_launch);
+            },
+            [] {
+                iom::sycl_detail::inject_submission_fault_for_testing(
+                        iom::sycl_detail::SubmissionFault::none);
+            },
+            "sycl_detail::SubmissionFault::post_launch",
+            {}};
+    iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("SYCL conformance: full shared suite") {
     SyclDevices devices;
     SyclStorageOracle oracle(*devices.candidate_context);
-    // The one shared suite observes the landed binary, RMS normalization, and
-    // linear capabilities through its own probe with explicit expectations.
+    // The shared suite observes the landed binary and linear capabilities
+    // through its own probe with explicit expectations; the RMS normalization
+    // scenarios run through the shared dispatcher above.
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true, true);
+            &devices.gate, &oracle, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 

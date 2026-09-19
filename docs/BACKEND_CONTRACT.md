@@ -3021,12 +3021,14 @@ workspace failures, device rejection, accepted failures, and repeated waits.
 
 This is the operation-owned contract for `DeviceOps::rmsnorm`. The common
 facade, its admission rules, and its pure requirement query are declared and
-frozen here. The CPU port has landed and queues all nine applicable floating
-leaves at the exact `{0, 1}` zero-workspace requirement; CUDA and ROCm provide
-their own source-inspected launch wrappers over the shared core, and TTNN
-provides a preallocated BF16/F32 queue path. The remaining backends report
-the operation `Unsupported` exactly as section 9 states above, and an
-unsupported port never counts as numerical conformance. The exact ABI is:
+frozen here. The CPU port queues all nine applicable floating leaves at the
+exact `{0, 1}` zero-workspace requirement, CUDA and ROCm launch the shared
+tiled core on their existing nonblocking streams, SYCL queues its native row
+kernel for the eight non-`F64` leaves and for `F64` exactly where the device
+reports `aspect::fp64`, and TTNN provides a preallocated BF16/F32 queue path.
+Each port owns its own capability predicate, and an unsupported or limited
+leaf stays `Unsupported` exactly as section 9 states above rather than
+counting as numerical conformance. The exact ABI is:
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
@@ -3073,8 +3075,12 @@ integer norm, quantization, or storage-format staging is introduced.
    row. Infinite `x` makes the reduction infinite: finite features normalize
    to signed zero, and infinite features become quiet NaN before the scale
    multiply. A nonfinite `scale` affects only its own feature after the shared
-   norm. Admission MUST NOT scan for nonfinite data, and no RMS-specific
-   queued data failure is added.
+   norm. A NaN result — including the all-zero-row decision — is stored in its
+   canonical positive form: the sign bit of a NaN result is cleared before the
+   single destination encode, so a leaf without a NaN encoding saturates to
+   its positive maximum and no device's invalid-operation NaN sign can change
+   a stored result. Admission MUST NOT scan for nonfinite data, and no
+   RMS-specific queued data failure is added.
 4. **Capability matrix.** Applicability is exactly the nine ordinary signed
    floating leaves; the remaining fourteen leaves have no integer, boolean,
    or exponent-only normalization contract. The matrix below is the complete
@@ -3176,6 +3182,41 @@ integer norm, quantization, or storage-format staging is introduced.
    rounds every FP32 intermediate and uses `double` for `F64`; production
    code MUST NOT serve as its own oracle.
 
+**TTNN reduced-fidelity limitation and its published expectation policy.**
+TTNN's preallocated `ttnn::prim::LayerNorm`-backed adapter is
+**documented-nonconforming** and keeps advertising `BF16` and `F32`; no other
+backend declares any deviation, and every other backend is measured against
+clauses 1 through 9 unchanged. The measured TTNN deviations are:
+
+- clause 2 (accumulator domain and single encode): the native primitive
+  evaluates a plane at BF16 compute fidelity, so a finite `F32` output carries
+  at most BF16-precision bits — for example `mixed` element 0 stores
+  `0x3E8E8000` where the contract's `F32` result is `0x3E8E849C`;
+- clause 3 (special values): signed zeros, the `eps == 0` all-zero-row quiet
+  NaN, NaN row poisoning, infinity rows, and nonfinite scale features are not
+  produced — a signed negative zero is stored as positive zero and a quiet-NaN
+  decision is stored as zero;
+- clause 9 (`F32` tolerance): the reduced-fidelity outputs exceed
+  `abs_err <= 1e-6 + 2e-5 * abs(reference)`.
+
+The expectation policy the shared conformance harness implements for TTNN is
+therefore exactly, and only:
+
+- a finite `F32` expectation is compared at the declared BF16 compute
+  fidelity: the observed and reference values must lie within two adjacent
+  `BF16` destination encodings of each other;
+- an expectation whose class is not `finite` — signed zeros, quiet NaNs, and
+  infinities — is observed rather than asserted;
+- finite `BF16` expectations, and every admission, workspace, alias, overflow,
+  capability, ownership, ordering, and retained-failure case, keep the frozen
+  policy unchanged for TTNN.
+
+The policy is declared by the TTNN driver as its own
+`RmsNormComparisonMode`, and every element it observes rather than asserts is
+counted in its `RmsNormComparisonRecord` and printed by its conformance case,
+so the deviation is explicit, quantified, and never reported as success. The
+TTNN rows of the capability matrix above are unaffected by this limitation.
+
 **Shared CUDA/ROCm queue and tiled-kernel core.** The two accelerator
 backends share one queue branch and one tiled device operation.
 `src/shared/gpu_queue.hpp` carries the immutable RMSNorm task and completion
@@ -3230,9 +3271,18 @@ remote runtime gate.
 The common owner is `src/device_ops_rmsnorm.cpp` behind
 `include/iom/iom.hpp`. `test/test_iom.cpp` owns signature/cutover, query
 purity, validation precedence, rejection-effect, snapshot-lifetime,
-registration-lifetime, workspace, and repeat-wait coverage;
-`test/backend/backend_conformance_other.hpp` and `test/cpu/test_cpu.cpp` own
-the valid-shape `Unsupported` probes. Backend kernels and their
+registration-lifetime, workspace, and repeat-wait coverage.
+`test/backend/backend_conformance_rmsnorm.hpp` is the single shared owner of
+every observable conformance scenario — the independent oracle's numeric
+matrix for each declared leaf, the rank-two-through-eight and boundary
+geometries, padded-physical invariance, and the common query, workspace,
+admission, alias, overflow, capability, ownership, ordering, and retained
+failure cases — and the CPU, CUDA, ROCm, SYCL, and TTNN conformance drivers
+each invoke its one dispatcher with their own device setup, declared
+supported-leaf span, and native storage observation. `test/cpu/test_cpu.cpp`
+retains the CPU-local probe coverage, and
+`test/backend/backend_conformance_other.hpp` keeps the unrelated neural
+capability probes without a second RMSNorm suite. Backend kernels and their
 backend-specific launch code remain owned by their own ports.
 
 #### SiLU activation

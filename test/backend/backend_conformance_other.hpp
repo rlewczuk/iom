@@ -533,17 +533,18 @@ inline void run_lifetime_conformance(
     }
 }
 
-// Compute capability probes may pass an explicit RMSNorm expectation for a
+// Compute capability probes may pass an explicit linear expectation for a
 // focused backend case. The full backend suite leaves it unspecified so the
 // same scenario accepts either an unsupported operation or a newly landed
-// backend port and derives its token accounting from the observed result.
+// backend port and derives its token accounting from the observed result. The
+// frozen RMS normalization scenarios live in
+// `backend_conformance_rmsnorm.hpp` and are not duplicated here.
 inline void run_compute_capability_conformance(
         iom::Device& candidate,
         const std::span<const iom::DataType>,
         ConformanceObserver* observer = nullptr,
         std::string_view backend_label = {},
         bool binary_supported = false,
-        std::optional<bool> rmsnorm_supported = std::nullopt,
         std::optional<bool> linear_supported = std::nullopt) {
     const iom::TensorSpec spec{iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     auto x = candidate.create_tensor(spec);
@@ -551,11 +552,6 @@ inline void run_compute_capability_conformance(
     auto w = candidate.create_tensor(spec);
     auto attn = candidate.create_tensor(spec);
     auto scratch = candidate.create_tensor(spec);
-    // The rank-two `[1,F]` RMSNorm scale shared across planes and rows: the
-    // probe stays a valid-shape request so it exercises capability rejection
-    // rather than structural validation.
-    auto scale = candidate.create_tensor(
-            iom::TensorSpec{iom::TensorShape{{1, 16}}, iom::DataType::F32});
     if (observer != nullptr) {
         observer->setup_complete();
     }
@@ -635,25 +631,6 @@ inline void run_compute_capability_conformance(
         CHECK_EQ(linear_token, unsupported);
     }
     const bool linear_submitted = iom::oid_is_token(linear_token);
-    // The valid-shape `[2,16,16]`/`[1,16]` RMS normalization request
-    // exercises the operation's own capability. Focused callers can provide
-    // an explicit expectation; the full backend suite observes either the
-    // supported token or the established Unsupported result.
-    const iom::oid rmsnorm_token =
-            queue->rmsnorm(x->view(), scale->view(), y->view(), 1e-6F);
-    if (!rmsnorm_supported.has_value()) {
-        if (iom::oid_is_token(rmsnorm_token)) {
-            CHECK_NOTHROW(queue->wait(rmsnorm_token));
-        } else {
-            CHECK_EQ(rmsnorm_token, unsupported);
-        }
-    } else if (*rmsnorm_supported) {
-        REQUIRE(iom::oid_is_token(rmsnorm_token));
-        CHECK_NOTHROW(queue->wait(rmsnorm_token));
-    } else {
-        CHECK_EQ(rmsnorm_token, unsupported);
-    }
-    const bool rmsnorm_submitted = iom::oid_is_token(rmsnorm_token);
     CHECK_EQ(queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
                          attn->view()),
              unsupported);
@@ -669,8 +646,7 @@ inline void run_compute_capability_conformance(
     const iom::oid probe = queue->copy(x->view(), scratch->view());
     CHECK_EQ(
             token_sequence(probe),
-            (binary_supported ? 4 : 0) + (rmsnorm_submitted ? 1 : 0)
-                    + (linear_submitted ? 1 : 0) + 1);
+            (binary_supported ? 4 : 0) + (linear_submitted ? 1 : 0) + 1);
     queue->wait(probe);
     queue.reset();
 
@@ -680,15 +656,15 @@ inline void run_compute_capability_conformance(
 }
 
 // Full suite: storage, transfers, copies, errors, lifetime, and capabilities
-// in dependency order. An unspecified RMSNorm capability is observed from
-// the queue so newly landed backend ports need no duplicated caller wiring.
+// in dependency order. The frozen RMS normalization scenarios are composed by
+// `run_rmsnorm_conformance` from the same driver files instead of a capability
+// observation.
 inline void run_backend_conformance(
         const ConformanceDevices& devices,
         const std::span<const iom::DataType> supported_types,
         ConformanceObserver* observer = nullptr,
         AcceleratorStorageOracle* oracle = nullptr,
         bool binary_supported = false,
-        std::optional<bool> rmsnorm_supported = std::nullopt,
         std::optional<bool> linear_supported = std::nullopt) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
     run_async_copy_conformance(devices, supported_types, observer, oracle);
@@ -700,6 +676,6 @@ inline void run_backend_conformance(
     run_memory_contract_conformance(devices);
     run_compute_capability_conformance(
             devices.candidate, supported_types, observer, {}, binary_supported,
-            rmsnorm_supported, linear_supported);
+            linear_supported);
 }
 }  // namespace iom_conformance

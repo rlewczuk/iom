@@ -13,6 +13,7 @@
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "iom/alloc.hpp"
@@ -237,7 +238,7 @@ TEST_CASE("CPU conformance: all binary operations through the real queue") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true, std::nullopt, true);
+            &devices.gate, nullptr, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -274,7 +275,7 @@ TEST_CASE("CPU conformance: binary operations are supported") {
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CPU", true, std::nullopt, true);
+            &devices.gate, "CPU", true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -325,12 +326,41 @@ TEST_CASE("CPU conformance: linear projection reference, admission, and lifetime
     CHECK_FALSE(devices.gate.armed());
 }
 
+// CPU's declared RMSNorm expectation: the nine applicable signed floating
+// leaves, the frozen `{0, 1}` workspace requirement, and positive execution
+// through the real queue, with host observation of the logical results and of
+// deliberately poisoned tile padding.
+TEST_CASE("CPU conformance: RMSNorm reference, admission, and lifetime") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    iom_conformance::RmsNormConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kRmsNormAllLeafSpan,
+            &devices.gate,
+            &oracle};
+    // The CPU backend exposes no testing seam at all: `src/cpu` carries no
+    // fault-injection hook, and a CPU RMSNorm request runs to completion on the
+    // shared FIFO host worker, so no existing seam can produce an accepted
+    // CPU RMSNorm failure. The harness records that gap explicitly. The minimal
+    // test-only seam that would close it is a `cpu_detail` fault consumed
+    // inside the enqueued host task (after acceptance, before the row loop)
+    // under an `IOM_ENABLE_TESTING` guard.
+    config.native_failure = iom_conformance::RmsNormNativeFailureSeam{
+            {},
+            {},
+            "cpu_detail",
+            "src/cpu exposes no fault-injection seam; an accepted CPU RMSNorm "
+            "request cannot be made to fail after acceptance"};
+    iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     CpuDevices devices;
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true, std::nullopt, true);
+            &devices.gate, nullptr, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 

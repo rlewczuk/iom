@@ -29,6 +29,7 @@
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "iom/rocm/device.hpp"
@@ -394,7 +395,7 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
             0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     iom_conformance::run_compute_capability_conformance(
             *candidate, candidate->supported_data_types(), &gate, "ROCm",
-            true, true, true);
+            true, true);
     CHECK_FALSE(gate.armed());
 }
 
@@ -825,6 +826,41 @@ TEST_CASE("ROCm embedding status transfer failure retires safely") {
     CHECK_FALSE(gate.armed());
 }
 
+TEST_CASE("ROCm conformance: RMSNorm reference, admission, and lifetime") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
+    iom_conformance::RmsNormConformanceConfig config{
+            devices, iom_conformance::kRmsNormAllLeafSpan, &gate, &oracle};
+    // The ROCm seam is the same shared-GPU-dispatch step as CUDA's: the HIP
+    // RMSNorm launch is followed by `Policy::record_event` on the queue's
+    // existing stream, which is exactly what `SubmissionFault::event_record`
+    // fails, so the armed fault is consumed by the real RMSNorm submission
+    // after acceptance. Consumption is proven behaviorally by the shared
+    // scenario because the counted fault has no consumption accessor.
+    config.native_failure = iom_conformance::RmsNormNativeFailureSeam{
+            [] {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::event_record);
+            },
+            [] {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::none);
+            },
+            "rocm_detail::SubmissionFault::event_record",
+            {}};
+    iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(gate.armed());
+}
+
 TEST_CASE("ROCm conformance: full shared suite") {
     iom_conformance::TrafficGate gate;
 
@@ -840,7 +876,7 @@ TEST_CASE("ROCm conformance: full shared suite") {
     HipStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate, &oracle, true, true, true);
+            &gate, &oracle, true, true);
     CHECK_FALSE(gate.armed());
 }
 
