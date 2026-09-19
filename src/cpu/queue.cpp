@@ -21,6 +21,50 @@
 #include "../shared/scalar_add.hpp"
 
 namespace iom {
+namespace {
+
+template <typename Carrier>
+struct CpuRopeCodecTraits {
+    using carrier_type = Carrier;
+
+    static Carrier positive_infinity() noexcept {
+        return std::numeric_limits<Carrier>::infinity();
+    }
+    static Carrier quiet_nan() noexcept {
+        return std::numeric_limits<Carrier>::quiet_NaN();
+    }
+    static Carrier max_finite() noexcept {
+        return std::numeric_limits<Carrier>::max();
+    }
+    static bool isnan(Carrier value) noexcept {
+        return std::isnan(value);
+    }
+    static bool isinf(Carrier value) noexcept {
+        return std::isinf(value);
+    }
+    static bool signbit(Carrier value) noexcept {
+        return std::signbit(value);
+    }
+    static Carrier fabs(Carrier value) noexcept {
+        return std::fabs(value);
+    }
+    static Carrier floor(Carrier value) noexcept {
+        return std::floor(value);
+    }
+    static Carrier ldexp(Carrier value, int exponent) noexcept {
+        return std::ldexp(value, exponent);
+    }
+    static Carrier frexp(Carrier value, int* exponent) noexcept {
+        return std::frexp(value, exponent);
+    }
+};
+
+template <typename Carrier>
+using CpuRopeCodec =
+        detail::scalar_binary_codec_detail::Codec<CpuRopeCodecTraits<Carrier>>;
+
+}  // namespace
+
 
 class CpuQueue final : public DeviceOps {
     struct HostTask {
@@ -611,6 +655,224 @@ private:
                     }
                 });
     }
+    using RopeFormat = detail::scalar_binary_codec_detail::Format;
+
+    template <typename Carrier>
+    static Carrier rope_decode(
+            const unsigned char* base,
+            std::span<const std::size_t> dimensions,
+            DataType data_type, const RopeFormat& format,
+            std::size_t plane, std::size_t row, std::size_t column) {
+        return CpuRopeCodec<Carrier>::decode(
+                cpu_detail::load_logical_element(
+                        base, dimensions, data_type, plane, row, column),
+                format);
+    }
+
+    template <typename Carrier>
+    static void rope_pair(
+            const RopeRequest& request, const RopeFormat& format,
+            const unsigned char* x_base, unsigned char* out_base,
+            std::span<const std::size_t> x_dimensions,
+            std::span<const std::size_t> out_dimensions,
+            std::size_t x_plane, std::size_t out_plane, std::size_t row,
+            std::size_t first_column, Carrier theta) {
+        const std::size_t width = x_dimensions.back();
+        const std::size_t half = width / 2;
+        const std::size_t second_column = first_column + half;
+        const Carrier first = rope_decode<Carrier>(
+                x_base, x_dimensions, request.x.data_type, format, x_plane,
+                row, first_column);
+        const Carrier second = rope_decode<Carrier>(
+                x_base, x_dimensions, request.x.data_type, format, x_plane,
+                row, second_column);
+        const Carrier exponent = static_cast<Carrier>(
+                (-2.0 * static_cast<double>(first_column))
+                / static_cast<double>(width));
+        const Carrier frequency = std::pow(theta, exponent);
+        const Carrier position = static_cast<Carrier>(request.a + row);
+        const Carrier angle = position * frequency;
+        const Carrier sine = std::sin(angle);
+        const Carrier cosine = std::cos(angle);
+
+        // Keep the two products and the following add/subtract as separate
+        // operations. Volatile intermediates prevent contraction into FMA
+        // while preserving the selected FP32/FP64 carrier domain.
+        const volatile Carrier first_product = first * cosine;
+        const volatile Carrier second_product = second * sine;
+        const volatile Carrier first_output =
+                first_product - second_product;
+        const volatile Carrier second_cosine_product = second * cosine;
+        const volatile Carrier first_sine_product = first * sine;
+        const volatile Carrier second_output =
+                second_cosine_product + first_sine_product;
+
+        cpu_detail::store_logical_element(
+                out_base, out_dimensions, request.out.data_type, out_plane,
+                row, first_column,
+                CpuRopeCodec<Carrier>::encode(first_output, format));
+        cpu_detail::store_logical_element(
+                out_base, out_dimensions, request.out.data_type, out_plane,
+                row, second_column,
+                CpuRopeCodec<Carrier>::encode(second_output, format));
+    }
+
+    template <typename Carrier>
+    static void rope_plane(
+            const RopeRequest& request, const RopeFormat& format,
+            std::size_t x_plane, std::size_t out_plane,
+            Carrier theta) {
+        const std::span<const std::size_t> x_dimensions =
+                request.x.shape_dimensions();
+        const std::span<const std::size_t> out_dimensions =
+                request.out.shape_dimensions();
+        const std::size_t rank = x_dimensions.size();
+        const std::size_t rows = x_dimensions[rank - 2];
+        const std::size_t width = x_dimensions[rank - 1];
+        const std::size_t half = width / 2;
+        const std::size_t row_tiles =
+                rows / TensorSpec::TILE
+                + (rows % TensorSpec::TILE != 0);
+        const std::size_t feature_tiles =
+                width / TensorSpec::TILE
+                + (width % TensorSpec::TILE != 0);
+        const std::size_t pair_tiles =
+                half / TensorSpec::TILE
+                + (half % TensorSpec::TILE != 0);
+        const auto* x_base =
+                static_cast<const unsigned char*>(request.x.native_handle);
+        auto* out_base =
+                static_cast<unsigned char*>(request.out.native_handle);
+
+        for (std::size_t tile_row = 0; tile_row < row_tiles; ++tile_row) {
+            const std::size_t first_row = tile_row * TensorSpec::TILE;
+            for (std::size_t row_in_tile = 0;
+                 row_in_tile < TensorSpec::TILE
+                         && first_row + row_in_tile < rows;
+                 ++row_in_tile) {
+                const std::size_t row = first_row + row_in_tile;
+                const std::size_t position = request.a + row;
+                if (position == 0) {
+                    for (std::size_t tile_column = 0;
+                         tile_column < feature_tiles; ++tile_column) {
+                        const std::size_t first_column =
+                                tile_column * TensorSpec::TILE;
+                        for (std::size_t column_in_tile = 0;
+                             column_in_tile < TensorSpec::TILE
+                                     && first_column + column_in_tile < width;
+                             ++column_in_tile) {
+                            const std::size_t column =
+                                    first_column + column_in_tile;
+                            const std::uint64_t raw =
+                                    cpu_detail::load_logical_element(
+                                            x_base, x_dimensions,
+                                            request.x.data_type, x_plane, row,
+                                            column);
+                            cpu_detail::store_logical_element(
+                                    out_base, out_dimensions,
+                                    request.out.data_type, out_plane, row,
+                                    column, raw);
+                        }
+                    }
+                    continue;
+                }
+
+                for (std::size_t tile_column = 0;
+                     tile_column < pair_tiles; ++tile_column) {
+                    const std::size_t first_column =
+                            tile_column * TensorSpec::TILE;
+                    for (std::size_t column_in_tile = 0;
+                         column_in_tile < TensorSpec::TILE
+                                 && first_column + column_in_tile < half;
+                         ++column_in_tile) {
+                        rope_pair<Carrier>(
+                                request, format, x_base, out_base,
+                                x_dimensions, out_dimensions, x_plane,
+                                out_plane, row,
+                                first_column + column_in_tile, theta);
+                    }
+                }
+            }
+        }
+    }
+
+    template <typename Carrier>
+    static void rope_elements(const RopeRequest& request) {
+        const std::span<const std::size_t> dimensions =
+                request.x.shape_dimensions();
+        const std::size_t leading_rank = dimensions.size() - 3;
+        const std::size_t heads = dimensions[leading_rank];
+        const Carrier theta = static_cast<Carrier>(request.theta);
+        const RopeFormat format =
+                CpuRopeCodec<Carrier>::format(request.x.data_type);
+        const std::span<const std::size_t> x_strides =
+                request.x.leading_plane_strides();
+        const std::span<const std::size_t> out_strides =
+                request.out.leading_plane_strides();
+        auto visit = [&](auto&& self, std::size_t axis,
+                         std::size_t x_plane, std::size_t out_plane) -> void {
+            if (axis == leading_rank) {
+                const std::size_t x_head_stride = x_strides[leading_rank];
+                const std::size_t out_head_stride = out_strides[leading_rank];
+                for (std::size_t head = 0; head < heads; ++head) {
+                    rope_plane<Carrier>(
+                            request, format,
+                            x_plane + head * x_head_stride,
+                            out_plane + head * out_head_stride, theta);
+                }
+                return;
+            }
+            for (std::size_t index = 0; index < dimensions[axis]; ++index) {
+                self(self, axis + 1,
+                     x_plane + index * x_strides[axis],
+                     out_plane + index * out_strides[axis]);
+            }
+        };
+        visit(visit, 0, request.x.plane_offset, request.out.plane_offset);
+    }
+
+    oid rope_impl(const RopeRequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_rope(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this](std::uint64_t sequence, const RopeRequest& captured,
+                       detail::BinaryEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        if (captured.x.data_type
+                                                == DataType::F64) {
+                                            rope_elements<double>(captured);
+                                        } else {
+                                            rope_elements<float>(captured);
+                                        }
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)detail::release_or_invalidate_binary_entries(
+                                            device_->registry_state().registry,
+                                            entries,
+                                            static_cast<bool>(failure), true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        throw;
+                    }
+                });
+    }
+
+    [[nodiscard]] WorkspaceRequirements rope_workspace_requirements(
+            const RopeRequest&) override {
+        return {0, 1};
+    }
+
 
     // ------------------------------------------------------------------
     // Linear projection: an asynchronous, in-order scalar dot product over

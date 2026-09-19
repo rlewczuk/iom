@@ -51,6 +51,33 @@ inline std::size_t logical_element_bits(
            * detail::leaf_bits(spec.data_type);
 }
 
+// Value-captured RoPE snapshots intentionally do not retain a dynamic
+// TensorSpec. This overload applies the same standard 16x16 plane mapping to
+// the fixed-capacity shape metadata after common admission has checked every
+// product and address bound.
+inline std::size_t logical_element_bits(
+        std::span<const std::size_t> dimensions, DataType data_type,
+        std::size_t plane, std::size_t row, std::size_t column) {
+    const std::size_t leading_rank = dimensions.size() - 2;
+    const std::size_t tile_rows =
+            dimensions[leading_rank] / TensorSpec::TILE
+            + (dimensions[leading_rank] % TensorSpec::TILE != 0);
+    const std::size_t tile_columns =
+            dimensions[leading_rank + 1] / TensorSpec::TILE
+            + (dimensions[leading_rank + 1] % TensorSpec::TILE != 0);
+    const std::size_t tiles_per_plane =
+            tile_rows * tile_columns;
+    const std::size_t tile_index =
+            plane * tiles_per_plane
+            + (row / TensorSpec::TILE) * tile_columns
+            + column / TensorSpec::TILE;
+    const std::size_t slot =
+            tile_index * TensorSpec::TILE * TensorSpec::TILE
+            + (row % TensorSpec::TILE) * TensorSpec::TILE
+            + column % TensorSpec::TILE;
+    return slot * detail::leaf_bits(data_type);
+}
+
 // Load/store one logical element through its packed bit offset. The offset
 // arithmetic is checked exactly as `standard_plane_slot` documents, so an
 // unvalidated plane, row, or column reports the established overflow instead
@@ -69,6 +96,28 @@ inline void store_logical_element(
     const std::size_t bits = detail::leaf_bits(spec.data_type);
     store_bits(
             base, logical_element_bits(spec, plane, row, column), bits, value);
+}
+
+inline std::uint64_t load_logical_element(
+        const unsigned char* base, std::span<const std::size_t> dimensions,
+        DataType data_type, std::size_t plane, std::size_t row,
+        std::size_t column) {
+    const std::size_t bits = detail::leaf_bits(data_type);
+    return load_bits(
+            base, logical_element_bits(
+                         dimensions, data_type, plane, row, column),
+            bits);
+}
+
+inline void store_logical_element(
+        unsigned char* base, std::span<const std::size_t> dimensions,
+        DataType data_type, std::size_t plane, std::size_t row,
+        std::size_t column, std::uint64_t value) {
+    const std::size_t bits = detail::leaf_bits(data_type);
+    store_bits(
+            base, logical_element_bits(
+                          dimensions, data_type, plane, row, column),
+            bits, value);
 }
 
 inline void copy_value(
