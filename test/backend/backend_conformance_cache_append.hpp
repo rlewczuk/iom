@@ -720,9 +720,11 @@ inline void run_cache_append_view_case(
             read_logical(candidate_destination_view);
     CHECK(cache_append_logical_equal(after_query, destination_before));
 
-    std::unique_ptr<iom::RawWorkspace> reference_workspace =
-            cache_append_workspace(
-                    config.devices.reference, reference_requirements);
+    // The CPU reference executes cache_append with its internal staging path.
+    // Keep its pure requirement query above, but do not turn that query into
+    // a positive raw-workspace allocation on the reference device.
+    (void)reference_requirements;
+    std::unique_ptr<iom::RawWorkspace> reference_workspace;
     std::unique_ptr<iom::RawWorkspace> candidate_workspace =
             cache_append_workspace(
                     config.devices.candidate, candidate_requirements);
