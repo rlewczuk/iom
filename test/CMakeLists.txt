@@ -50,6 +50,7 @@ option(IOM_TEST_REAL_MODEL_LOADING
 
 add_executable(iom_tests
         test_iom.cpp
+        test_token_selection.cpp
         test_mmap.cpp
         test_safetensors.cpp
         test_tokenizer.cpp
@@ -58,7 +59,6 @@ add_executable(iom_tests
         test_alloc.cpp
         test_gpu_status.cpp
 )
-
 set_source_files_properties(test_iom.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 )

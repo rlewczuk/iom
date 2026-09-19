@@ -82,6 +82,7 @@ set(IOM_SOURCES
         src/workspace.cpp
         src/tensor.cpp
         src/tensor_view.cpp
+        src/token_selection.cpp
         src/cpu/device.cpp
         src/cpu/tensor.cpp
         src/cpu/queue.cpp
