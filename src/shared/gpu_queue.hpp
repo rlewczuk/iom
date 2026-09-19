@@ -20,11 +20,12 @@
 // native resources.
 //
 // This header must be included by a backend translation unit only after the
-// backend-specific expansion of standard_tiled_copy.inl and
-// standard_tiled_rmsnorm.inl, because the queue composes those files'
-// metadata helpers (CopyMetadataLayout, InlineCopyMetadata,
-// copy_metadata_layout, write_copy_metadata, RmsnormMetadata,
-// make_rmsnorm_metadata, write_rmsnorm_metadata) by non-dependent names.
+// backend-specific expansion of the shared `standard_tiled_*.inl` files,
+// because the queue composes their metadata helpers (CopyMetadataLayout,
+// InlineCopyMetadata, copy_metadata_layout, write_copy_metadata,
+// RmsnormMetadata, make_rmsnorm_metadata, write_rmsnorm_metadata,
+// RopeMetadata, make_rope_metadata, write_rope_metadata) by non-dependent
+// names.
 
 #include <cstddef>
 #include <cstdint>
@@ -355,6 +356,9 @@ class GpuQueue final : public DeviceOps {
         bool is_silu = false;
         std::optional<SiLURequest> silu_request;
         detail::BinaryEntryRegistration silu_entries{};
+        bool is_rope = false;
+        std::optional<RopeRequest> rope_request;
+        detail::BinaryEntryRegistration rope_entries{};
         detail::EntryRegistration entries{};
         typename EventRing::Submission* submission = nullptr;
         std::shared_ptr<CompletionState> completion;
@@ -383,6 +387,7 @@ class GpuQueue final : public DeviceOps {
         detail::BinaryEntryRegistration cache_append_entries{};
         detail::BinaryEntryRegistration rmsnorm_entries{};
         detail::BinaryEntryRegistration silu_entries{};
+        detail::BinaryEntryRegistration rope_entries{};
         detail::WorkspaceLease workspace_lease{};
         std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
@@ -391,6 +396,7 @@ class GpuQueue final : public DeviceOps {
         bool is_embedding = false;
         bool is_linear = false;
         bool is_silu = false;
+        bool is_rope = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -446,6 +452,15 @@ public:
             const TensorView& table, const TensorView& indices,
             const TensorView& out) override;
     oid embedding_impl(const EmbeddingRequest& request) override;
+
+    // RoPE consumes the immutable common request and common owner
+    // registrations; the shared branch adds no admission of its own and
+    // reuses the fixed metadata, event, worker, and zero-workspace lease
+    // resources above. The capability remains the backend policy's until its
+    // backend launch wrapper lands.
+    oid rope_impl(const RopeRequest& request) override;
+    [[nodiscard]] WorkspaceRequirements rope_workspace_requirements(
+            const RopeRequest& request) override;
 
     // Linear projection consumes the immutable common request and the common
     // owner-registration output; the shared branch adds no admission of its

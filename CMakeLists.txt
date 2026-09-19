@@ -226,6 +226,7 @@ if(CUDA_ENABLED)
         src/shared/standard_tiled_embedding.inl
         src/shared/standard_tiled_copy_metadata.inl
         src/shared/standard_tiled_linear.inl
+        src/shared/standard_tiled_rope.inl
         src/shared/scalar_binary_codec.hpp
         include/iom/cuda/device.hpp
     )
@@ -303,6 +304,7 @@ if(ROCM_ENABLED)
         src/shared/standard_tiled_linear.inl
         src/shared/standard_tiled_copy.inl
         src/shared/standard_tiled_copy_metadata.inl
+        src/shared/standard_tiled_rope.inl
         include/iom/rocm/device.hpp
     )
 

@@ -32,6 +32,9 @@ struct LinearMetadata;
 // operation is intentionally unported here; the descriptor preserves the
 // callback seam without retaining a borrowed TensorView.
 struct SiluMetadata;
+// Device descriptor of the shared tiled RoPE operation
+// (src/shared/standard_tiled_rope.inl).
+struct RopeMetadata;
 }  // namespace iom::detail
 
 namespace iom::cuda_detail {
@@ -362,6 +365,20 @@ struct gpu_policy {
     [[nodiscard]] static constexpr const char* silu_kernel_operation()
             noexcept {
         return "CUDA SiLU kernel launch";
+    }
+
+    // RoPE remains an explicit Unsupported policy stub until the independent
+    // CUDA wrapper leaf enables the shared standard-tiled launch.
+    [[nodiscard]] static constexpr bool rope_supported() noexcept {
+        return false;
+    }
+
+    static void launch_rope(
+            stream_type stream, const detail::RopeMetadata& metadata);
+
+    [[nodiscard]] static constexpr const char* rope_kernel_operation()
+            noexcept {
+        return "CUDA RoPE kernel launch";
     }
 
     // Linear projection capability: exactly the twenty non-BF16 applicable

@@ -72,6 +72,7 @@ bool consume_submission_fault(
 #include "../shared/standard_tiled_add.inl"
 #include "../shared/standard_tiled_rmsnorm.inl"
 #include "../shared/standard_tiled_linear.inl"
+#include "../shared/standard_tiled_rope.inl"
 
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_BARRIER
@@ -96,6 +97,15 @@ void gpu_policy::launch_rmsnorm(
 // leaf deliberately keeps the policy unported and reports Unsupported.
 void gpu_policy::launch_silu(
         cudaStream_t, const detail::SiluMetadata& metadata) {
+    static_cast<void>(metadata);
+    throw detail::UnsupportedOperation();
+}
+
+// The shared Rope facility is compiled into this translation unit, but the
+// queue policy remains an explicit Unsupported stub until the independent
+// CUDA wrapper leaf enables its launch.
+void gpu_policy::launch_rope(
+        cudaStream_t, const detail::RopeMetadata& metadata) {
     static_cast<void>(metadata);
     throw detail::UnsupportedOperation();
 }
@@ -378,5 +388,8 @@ template void launch_standard_tiled_rmsnorm<iom::cuda_detail::gpu_policy>(
 template void launch_standard_tiled_linear<iom::cuda_detail::gpu_policy>(
         iom::cuda_detail::gpu_policy::stream_type stream,
         const LinearMetadata& metadata);
+template void launch_standard_tiled_rope<iom::cuda_detail::gpu_policy>(
+        iom::cuda_detail::gpu_policy::stream_type stream,
+        const RopeMetadata& metadata);
 
 }  // namespace iom::detail

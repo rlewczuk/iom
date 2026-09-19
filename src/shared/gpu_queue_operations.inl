@@ -281,6 +281,20 @@ WorkspaceRequirements GpuQueue<Policy>::silu_workspace_requirements_impl(
 }
 
 template <typename Policy>
+WorkspaceRequirements GpuQueue<Policy>::rope_workspace_requirements(
+        const RopeRequest&) {
+    // Capability is immutable per queue policy.  The common facade has
+    // already completed structural/device/alias/parameter admission before
+    // reaching this pure hook, and an unported policy must reject before
+    // workspace inspection, registration, sequence consumption, or queue
+    // resource use.
+    if (!Policy::rope_supported()) {
+        throw detail::UnsupportedOperation();
+    }
+    return WorkspaceRequirements{0, 1};
+}
+
+template <typename Policy>
 oid GpuQueue<Policy>::silu_impl(const SiLURequest& request) {
     std::lock_guard<std::mutex> submission_lock(
             submission_order_mutex_);
@@ -346,6 +360,76 @@ oid GpuQueue<Policy>::silu_impl(const SiLURequest& request) {
                 }
             });
 }
+
+template <typename Policy>
+oid GpuQueue<Policy>::rope_impl(const RopeRequest& request) {
+    std::lock_guard<std::mutex> submission_lock(
+            submission_order_mutex_);
+    // Descriptor arithmetic is checked before common acceptance's queue
+    // callback reserves a sequence.  Shape, device, alias, dtype,
+    // quantization, position, theta, and workspace admission remain solely
+    // in the common Rope contract.
+    if (!Policy::rope_supported()) {
+        throw detail::UnsupportedOperation();
+    }
+    (void)detail::make_rope_metadata(request);
+    auto completion = std::make_shared<CompletionState>();
+    const detail::Fence fence = build_fence(completion);
+    return submit_rope(
+            request, *registry_state_, registry_queue_id_, fence,
+            [this, completion](
+                    std::uint64_t sequence,
+                    const RopeRequest& captured,
+                    detail::BinaryEntryRegistration entries) {
+                auto submission = state_->try_acquire();
+                if (submission == nullptr) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                const auto metadata_slot = metadata_pool_->try_acquire();
+                if (!metadata_slot.has_value()) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                MetadataLease metadata_lease{
+                        metadata_pool_.get(), *metadata_slot};
+                completion->bind(submission);
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] =
+                                outcomes_.try_emplace(sequence);
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    std::string("duplicate ")
+                                    + Policy::backend_label()
+                                    + " outstanding-work sequence");
+                        }
+                        it->second.rope_entries = entries;
+                        it->second.workspace_lease =
+                                captured.workspace_lease;
+                        it->second.completion = completion;
+                        it->second.is_rope = true;
+                    }
+                    Task task;
+                    task.sequence = sequence;
+                    task.is_rope = true;
+                    task.rope_request.emplace(captured);
+                    task.rope_entries = entries;
+                    task.submission = submission.get();
+                    task.completion = completion;
+                    task.fence = task.submission;
+                    task.metadata_lease = std::move(metadata_lease);
+                    worker_.submit_copy(std::move(task));
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        outcomes_.erase(sequence);
+                    }
+                    completion->clear();
+                    throw;
+                }
+            });
+}
+
 
 template <typename Policy>
 bool GpuQueue<Policy>::rmsnorm_supported(DataType data_type) const {
@@ -810,6 +894,32 @@ void GpuQueue<Policy>::execute(Task& task) {
                     state_->event_of(*task.submission), stream_);
             event_recorded = true;
             state_->mark_event_recorded(*task.submission);
+        } else if (task.is_rope) {
+            const RopeRequest& request = *task.rope_request;
+            const std::size_t metadata_bytes =
+                    detail::rope_metadata_storage_bytes(request.x.rank);
+            const std::size_t metadata_slot = task.metadata_lease.slot;
+            task.submission->attach_metadata_slot(metadata_slot);
+            task.metadata_lease.handoff();
+            detail::write_rope_metadata(
+                    metadata_pool_->host_data(metadata_slot),
+                    metadata_pool_->device_data(metadata_slot), request);
+            // The immutable descriptor is uploaded on the queue's existing
+            // in-order stream. No caller workspace, hidden allocation, or
+            // host payload round trip is introduced by the shared path.
+            native_work_submitted = true;
+            Policy::copy_from_host(
+                    stream_, metadata_pool_->device_data(metadata_slot),
+                    metadata_pool_->host_data(metadata_slot), metadata_bytes);
+            const detail::RopeMetadata metadata =
+                    *reinterpret_cast<const detail::RopeMetadata*>(
+                            metadata_pool_->host_data(metadata_slot));
+            Policy::launch_rope(stream_, metadata);
+            Policy::check_kernel(Policy::rope_kernel_operation());
+            Policy::record_event(
+                    state_->event_of(*task.submission), stream_);
+            event_recorded = true;
+            state_->mark_event_recorded(*task.submission);
         } else {
             execute_copy();
         }
@@ -908,6 +1018,16 @@ void GpuQueue<Policy>::complete_task(
         (void)detail::release_or_invalidate_binary_entries(
                 registry_state_->registry, outcome.silu_entries,
                 failed, completion_proven);
+    } else if (outcome.is_rope) {
+        // RoPE currently admits the fixed zero-workspace requirement, but
+        // retains the same registered two-owner and lease state so a future
+        // backend launch cannot bypass proven completion or quarantine.
+        (void)detail::release_or_invalidate_binary_entries(
+                registry_state_->registry, outcome.rope_entries,
+                failed, completion_proven);
+        detail::complete_workspace_lease(
+                *registry_state_, outcome.workspace_lease,
+                completion_proven);
     } else if (outcome.is_rmsnorm) {
         // RMSNorm consumes no raw workspace, so its admitted `{0, 1}`
         // requirement reserved no lease; the deduplicated read/read
