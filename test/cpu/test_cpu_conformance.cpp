@@ -10,6 +10,8 @@
 #include <vector>
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_cache_append.hpp"
+
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -341,6 +343,67 @@ TEST_CASE("CPU conformance: linear projection reference, admission, and lifetime
             &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
+// CPU's cache append port is the direct zero-workspace implementation. The
+// shared runner owns the independent byte oracle, all 23 opaque leaves,
+// transformed view offsets/strides, admission boundaries, FIFO pipeline,
+// temporary-view lifetime, repeated waits, and untouched padding checks.
+TEST_CASE("CPU conformance: cache row append reference, admission, and lifetime") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    iom_conformance::CacheAppendConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kStandardCapabilityOracle,
+            &oracle,
+            {},
+            {},
+            &devices.gate,
+            true};
+    // CPU has no post-acceptance failure seam by design; the shared
+    // fault/repeat-wait section is intentionally unavailable here, while
+    // successful repeated waits remain exercised by the common cases.
+    iom_conformance::run_cache_append_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+TEST_CASE("CPU cache append drains accepted work during queue destruction") {
+    CpuDevices devices;
+    const iom::TensorSpec source_spec{
+            iom::TensorShape{{2, 3, 1, 17}}, iom::DataType::BF16};
+    const iom::TensorSpec destination_spec{
+            iom::TensorShape{{2, 3, 17, 17}}, iom::DataType::BF16};
+    auto source = devices.candidate->create_tensor(source_spec);
+    auto destination = devices.candidate->create_tensor(destination_spec);
+    const std::vector<std::byte> source_bytes =
+            iom_conformance::encode_cache_append_logical(source_spec, 0x711);
+    const std::vector<std::byte> destination_before =
+            iom_conformance::encode_logical(destination_spec, 0x712);
+    const std::vector<std::byte> expected =
+            iom_conformance::cache_append_expected_logical(
+                    source_spec, destination_spec, 1, source_bytes,
+                    destination_before);
+    iom_conformance::copy_from_host(source->view(), source_bytes);
+    iom_conformance::copy_from_host(
+            destination->view(), destination_before);
+
+    devices.gate.setup_complete();
+    {
+        auto queue = devices.candidate->create_ops();
+        const iom::TensorView temporary_source = source->view();
+        iom::TensorView temporary_destination = destination->view();
+        const iom::oid token = queue->cache_append(
+                temporary_source, temporary_destination, 1);
+        REQUIRE(iom::oid_is_token(token));
+        // Destruction must drain the FIFO worker before invalidating the
+        // accepted owner registrations. No explicit wait is issued here.
+    }
+    devices.gate.case_complete();
+
+    iom_conformance::require_logical_bytes(
+            destination->view(), expected,
+            "cache append queue destruction drain");
+    CHECK_FALSE(devices.gate.armed());
+}
+
+
 
 // CPU's declared RMSNorm expectation: the nine applicable signed floating
 // leaves, the frozen `{0, 1}` workspace requirement, and positive execution

@@ -135,6 +135,54 @@ inline void copy_value(
     store_bits(destination, destination_bit, nbits,
                load_bits(source, source_bit, nbits));
 }
+// Copy one logical row in tile-sized spans. Each span starts at the checked
+// standard tiled slot for its own view and copies only logical feature bits,
+// leaving every tile-padding bit untouched. The cache append admission path
+// has already checked all dimensions and address arithmetic before this
+// helper runs on the deferred worker.
+inline void copy_row_span(
+        unsigned char* destination,
+        std::span<const std::size_t> destination_dimensions,
+        std::size_t destination_plane, std::size_t destination_row,
+        const unsigned char* source,
+        std::span<const std::size_t> source_dimensions,
+        std::size_t source_plane, std::size_t source_row,
+        DataType data_type, std::size_t columns) {
+    const std::size_t bits = detail::leaf_bits(data_type);
+    for (std::size_t first_column = 0; first_column < columns;
+         first_column += TensorSpec::TILE) {
+        const std::size_t remaining = columns - first_column;
+        const std::size_t elements =
+                remaining < TensorSpec::TILE
+                ? remaining : TensorSpec::TILE;
+        const std::size_t source_bit = logical_element_bits(
+                source_dimensions, data_type, source_plane, source_row,
+                first_column);
+        const std::size_t destination_bit = logical_element_bits(
+                destination_dimensions, data_type, destination_plane,
+                destination_row, first_column);
+        // Every standard tiled row-span begins at a tile-aligned feature, so
+        // both checked row starts are byte aligned before the whole-byte
+        // prefix is copied. The admission path validates this layout domain.
+        assert(source_bit % 8 == 0);
+        assert(destination_bit % 8 == 0);
+        const std::size_t span_bits = elements * bits;
+        const std::size_t whole_bytes_bits = (span_bits / 8) * 8;
+        if (whole_bytes_bits != 0) {
+            copy_value(
+                    destination, destination_bit, source, source_bit,
+                    whole_bytes_bits);
+        }
+        const std::size_t tail_bits = span_bits - whole_bytes_bits;
+        if (tail_bits != 0) {
+            copy_value(
+                    destination, destination_bit + whole_bytes_bits,
+                    source, source_bit + whole_bytes_bits, tail_bits);
+        }
+    }
+}
+
+
 
 template <std::size_t kElementBytes>
 inline void copy_tile_row_byte_aligned(
