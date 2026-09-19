@@ -911,6 +911,47 @@ def validate_prior_task_commits(worktree: Path, state: dict[str, Any]) -> list[s
             raise TaskError(f"refusing to rewrite commit not owned by task: {commit} {subject}")
     return commits
 
+def commit_tree(repo: Path, commit: str) -> str:
+    return git(repo, "rev-parse", f"{commit}^{{tree}}").stdout.strip()
+
+
+def unmerged_paths(repo: Path) -> list[str]:
+    process = git(repo, "diff", "--name-only", "-z", "--diff-filter=U", binary=True)
+    raw = process.stdout
+    assert isinstance(raw, bytes)
+    return sorted({item.decode(errors="surrogateescape") for item in raw.split(b"\0") if item})
+
+
+def complete_rebase(worktree: Path, state: dict[str, Any], onto: str) -> None:
+    state["base"] = onto
+    state.pop("pending_rebase_onto", None)
+    state["final_commit"] = head(worktree)
+    rebind_metadata_snapshot(state, state["final_commit"])
+    pending = state.pop("pending_rebase", None)
+    if isinstance(pending, dict) and pending.get("onto") == onto:
+        event = dict(pending)
+        event["commit"] = state["final_commit"]
+        event["tree"] = commit_tree(worktree, state["final_commit"])
+        history = state.setdefault("rebase_history", [])
+        if isinstance(history, list):
+            history.append(event)
+    save_state(worktree, state)
+
+
+def record_rebase_conflict(worktree: Path, state: dict[str, Any]) -> None:
+    pending = state.get("pending_rebase")
+    if not isinstance(pending, dict):
+        # State written by older workers has no provenance to update.  Keep
+        # pending_rebase_onto for compatibility, but never invent an event.
+        return
+    pending["conflicted"] = True
+    existing = pending.get("conflicts", [])
+    if not isinstance(existing, list):
+        existing = []
+    pending["conflicts"] = sorted({str(path) for path in existing} | set(unmerged_paths(worktree)))
+    save_state(worktree, state)
+
+
 def worktree_report(worktree: Path, state: dict[str, Any]) -> dict[str, Any]:
     base = resolve_commit(worktree, state["base"])
     branch_head = head(worktree)
@@ -950,6 +991,8 @@ def show_task(repo: Path, task: str) -> dict[str, Any]:
         "base": state["base"],
         "head": head(worktree),
         "pending_rebase_onto": state.get("pending_rebase_onto"),
+        "rebase_history": state.get("rebase_history", []),
+        "pending_rebase": state.get("pending_rebase"),
         **worktree_report(worktree, state),
     }
 
@@ -1058,8 +1101,6 @@ def rebind_metadata_snapshot(state: dict[str, Any], commit: str) -> None:
     if not isinstance(snapshot, dict):
         raise TaskError("task commit has no metadata snapshot to rebind after rebase")
     snapshot["commit"] = commit
-
-
 def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
     task = validate_target(task, branch_safe=True)
     wt, state = load_state(repo, task)
@@ -1091,6 +1132,14 @@ def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
         raise TaskError("target base already contains the task commit; refusing to replay it")
 
     state["pending_rebase_onto"] = onto
+    state["pending_rebase"] = {
+        "from_commit": commits[0],
+        "from_base": state["base"],
+        "from_tree": commit_tree(wt, commits[0]),
+        "onto": onto,
+        "conflicted": False,
+        "conflicts": [],
+    }
     save_state(wt, state)
     process = git(
         wt,
@@ -1104,15 +1153,12 @@ def rebase_task(repo: Path, task: str, onto: str) -> dict[str, Any]:
         env={"GIT_EDITOR": "true"},
     )
     if process.returncode != 0:
+        record_rebase_conflict(wt, state)
         detail = (process.stderr or process.stdout).strip()
         raise RebaseConflict(
             f"rebase stopped in {wt}: {detail}; resolve files, then run continue-rebase for {task}"
         )
-    state["base"] = onto
-    state.pop("pending_rebase_onto", None)
-    state["final_commit"] = head(wt)
-    rebind_metadata_snapshot(state, state["final_commit"])
-    save_state(wt, state)
+    complete_rebase(wt, state, onto)
     return check_task(repo, task, None) | {"rebased": True}
 
 
@@ -1123,18 +1169,16 @@ def continue_rebase(repo: Path, task: str) -> dict[str, Any]:
     onto = state.get("pending_rebase_onto")
     if not onto or not rebase_in_progress(wt):
         raise TaskError(f"no script-managed rebase is in progress for {task}")
+    record_rebase_conflict(wt, state)
     git(wt, "add", "-A")
     process = git(wt, "rebase", "--continue", check=False, env={"GIT_EDITOR": "true"})
     if process.returncode != 0:
+        record_rebase_conflict(wt, state)
         detail = (process.stderr or process.stdout).strip()
         raise RebaseConflict(
             f"rebase still stopped in {wt}: {detail}; resolve remaining files, then run continue-rebase again"
         )
-    state["base"] = onto
-    state.pop("pending_rebase_onto", None)
-    state["final_commit"] = head(wt)
-    rebind_metadata_snapshot(state, state["final_commit"])
-    save_state(wt, state)
+    complete_rebase(wt, state, onto)
     return check_task(repo, task, None) | {"rebased": True}
 
 
@@ -1146,9 +1190,9 @@ def abort_rebase(repo: Path, task: str) -> dict[str, Any]:
         raise TaskError(f"no script-managed rebase is in progress for {task}")
     git(wt, "rebase", "--abort")
     state.pop("pending_rebase_onto", None)
+    state.pop("pending_rebase", None)
     save_state(wt, state)
     return {"task_path": task, "aborted": True, "base": state["base"], "head": head(wt)}
-
 
 def commit_changed_paths(repo: Path, commit: str) -> list[str]:
     process = git(

@@ -25,7 +25,20 @@ review TASK --packet FILE
   Waived items require consent/source and cannot bypass critical/high findings.
   If neither review succeeded, only two unavailable/quota outcomes may request
   an availability waiver: {commit,round,consent,source} with actual user evidence.
+  Two successful reports set persistent reviews_done. Approved dual reviews
+  establish a reusable basis; reduced coverage/waivers remain exact-commit only.
   status TASK returns next_review_round and retained ledger/receipts.
+
+assess-rebase TASK --packet FILE
+  After green gates, verify returns review.action: reuse|review_required|
+  assessment_required. Clean recorded rebases reuse approved dual reviews.
+  Conflicted rebases require a verifier-authored packet:
+  {"commit":"verified ID","base":"verified base","worktree":"absolute path",
+   "reviewed_commit":"original reviewed ID","rebase_digest":"returned digest",
+   "complexity":"simple|complex","evidence":"inspected changes and reasoning"}.
+  Simple preserves algorithms/structure and reuses approval; complex means
+  substantial algorithmic/structural changes and requires a new dual review.
+  Both classifications require fresh unit/conformance gates, never old tests.
 
 integrate TASK
   Requires matching verified/review receipts. Only the short head check,
@@ -346,6 +359,83 @@ def successful(receipt: Any) -> bool:
             and all(gate.get("ok") is True for gate in receipt["gates"]))
 
 
+
+def append_review_evidence(path: Path, text: str) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def review_decision(wt: Path, data: dict[str, Any], current: dict[str, Any],
+                    state: dict[str, Any]) -> dict[str, Any]:
+    receipt = data.get("verification_receipt")
+    authorization = data.get("review_receipt", {})
+    if (successful(receipt) and matching(receipt, current) and authorization.get("approved")
+            and authorization.get("commit") == current["commit"]
+            and authorization.get("verification_digest") == digest(receipt)):
+        return {"action": "reuse", "reason": "exact review receipt remains valid"}
+    required = {"action": "review_required", "reason": "no approved review covers this candidate"}
+    basis = data.get("review_basis")
+    if not basis or basis["worktree"] != current["worktree"]:
+        return required
+    if (basis["base"] == current["base"] and basis["tree"] == current["tree"]
+            and (basis["reusable"] or basis["commit"] == current["commit"])):
+        return {"action": "reuse", "reason": "reviewed tree and base unchanged"}
+    if not basis["reusable"]:
+        return required
+    base, tree = basis["base"], basis["tree"]
+    rebases = []
+    for replay in state.get("rebase_history", []):
+        if replay["from_base"] != base or replay["from_tree"] != tree:
+            continue
+        if not worker.is_ancestor(wt, base, replay["onto"]):
+            return required
+        rebases.append(replay)
+        base, tree = replay["onto"], replay["tree"]
+        if (base, tree) == (current["base"], current["tree"]):
+            break
+    if not rebases or (base, tree) != (current["base"], current["tree"]):
+        return required
+    conflicted = any(replay["conflicted"] for replay in rebases)
+    return {
+        "action": "assessment_required" if conflicted else "reuse",
+        "reason": "conflict resolution needs assessment" if conflicted else "conflict-free integration rebase",
+        "reviewed_commit": basis["reviewed_commit"],
+        "rebase_digest": digest(rebases), "rebases": rebases,
+    }
+
+
+def bind_review(data: dict[str, Any], receipt: dict[str, Any]) -> None:
+    basis = data["review_basis"]
+    basis.update({key: receipt[key] for key in ("commit", "base", "tree", "worktree")})
+    data["review_receipt"] = {
+        "commit": receipt["commit"], "verification_digest": digest(receipt), "approved": True,
+        "reviewed_commit": basis["reviewed_commit"], "round": basis["round"],
+        "review_file": basis["review_file"],
+    }
+
+
+def refresh_review(repo: Path, task: str, wt: Path, data: dict[str, Any],
+                   receipt: dict[str, Any]) -> dict[str, Any]:
+    _, state = worker.load_state(repo, task)
+    decision = review_decision(wt, data, receipt, state)
+    if decision["action"] != "reuse":
+        data.pop("review_receipt", None)
+        return decision
+    authorization = data.get("review_receipt", {})
+    if (authorization.get("approved") and authorization.get("commit") == receipt["commit"]
+            and authorization.get("verification_digest") == digest(receipt)):
+        return decision
+    basis = data["review_basis"]
+    evidence = {**decision, "commit": receipt["commit"], "base": receipt["base"],
+                "reviewed_commit": basis["reviewed_commit"], "round": basis["round"],
+                "verification_logs": receipt["log_dir"]}
+    append_review_evidence(Path(basis["review_file"]),
+                           "\n## Review reuse\n\n```json\n" + json.dumps(evidence, indent=2) + "\n```\n")
+    bind_review(data, receipt)
+    return decision
+
 def conflict(repo: Path, task: str, wt: Path, error: str) -> dict[str, Any]:
     _, state = worker.load_state(repo, task)
     paths = worker.git(wt, "diff", "--name-only", "--diff-filter=U", "-z").stdout.split("\0")
@@ -372,7 +462,9 @@ def verify(repo: Path, task: str, wt: Path, plan_arg: str, summary: str) -> dict
         if (current["base"] == canonical and current["status"] == "verified"
                 and matching(receipt, current) and successful(receipt) and receipt["plan"] == plan):
             worker.validate_metadata_snapshot(repo, state, current["commit"], require_verified=True)
-            return result(True, "verified", task=task, receipt=receipt, reused=True)
+            decision = refresh_review(repo, task, wt, data, receipt)
+            save(wt, data)
+            return result(True, "verified", task=task, receipt=receipt, reused=True, review=decision)
         data.pop("verification_receipt", None)
         data.pop("review_receipt", None)
         save(wt, data)
@@ -427,8 +519,9 @@ def verify(repo: Path, task: str, wt: Path, plan_arg: str, summary: str) -> dict
             raise worker.TaskError("verified commit no longer has the tested tree/base")
         receipt["commit"] = final["commit"]
         data["verification_receipt"] = receipt
+        decision = refresh_review(repo, task, wt, data, receipt)
         save(wt, data)
-    return result(True, "verified", task=task, receipt=receipt, reused=False)
+    return result(True, "verified", task=task, receipt=receipt, reused=False, review=decision)
 
 
 def normalize_review(reviewer: Any, commit: str, base: str, wt: Path) -> dict[str, Any]:
@@ -501,6 +594,9 @@ def review(repo: Path, task: str, wt: Path, packet_arg: str) -> dict[str, Any]:
     if type(number) is not int or (number != prior_round + 1 and not waiver_retry):
         raise worker.TaskError("review round must equal status.next_review_round, or add only consent to the pending waiver")
     data.pop("review_receipt", None)
+    data.pop("review_basis", None)
+    data.pop("assessment_digest", None)
+    data.pop("assessment_result", None)
     save(wt, data)
     reviewers = packet.get("reviewers")
     if not isinstance(reviewers, list) or len(reviewers) != 2:
@@ -573,15 +669,58 @@ def review(repo: Path, task: str, wt: Path, packet_arg: str) -> dict[str, Any]:
         text.append("```json\n" + json.dumps(values, indent=2, sort_keys=True) + "\n```\n")
     if waiver is not None:
         text.append("### Developer availability waiver\n\n" + json.dumps(waiver, indent=2) + "\n")
-    with review_file.open("a", encoding="utf-8") as stream:
-        stream.write("\n".join(text) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    append_review_evidence(review_file, "\n".join(text) + "\n")
     output = result(approved, code, task=task, commit=receipt["commit"], round=number,
                     review_file=str(review_file), ledger=ledger, blocking_ids=[item["id"] for item in blocking])
     data.update(review_round=number, review_digest=packet_digest, review_ledger=ledger, review_result=output,
                 review_receipt={"commit": receipt["commit"], "verification_digest": digest(receipt),
                                 "approved": approved, "review_file": str(review_file), "round": number})
+    complete_pair = all(item["status"] == "success" for item in normalized)
+    data["reviews_done"] = data.get("reviews_done", False) or complete_pair
+    if approved:
+        data["review_basis"] = {
+            **{key: receipt[key] for key in ("commit", "base", "tree", "worktree")},
+            "reviewed_commit": receipt["commit"], "round": number, "review_file": str(review_file),
+            "reusable": complete_pair,
+        }
+        bind_review(data, receipt)
+    save(wt, data)
+    return output
+
+
+def assess_rebase(repo: Path, task: str, wt: Path, packet_arg: str) -> dict[str, Any]:
+    packet = read_json(packet_arg)
+    data = load(wt)
+    receipt = data.get("verification_receipt")
+    current = snapshot(repo, task)
+    if not matching(receipt, current) or not successful(receipt):
+        raise worker.TaskError("rebase assessment requires an exact successful verification receipt")
+    if any(packet.get(key) != receipt[key] for key in ("commit", "base", "worktree")):
+        return result(False, "stale_assessment", task=task, expected_commit=receipt["commit"])
+    if data.get("assessment_digest") == digest(packet):
+        return data["assessment_result"]
+    _, state = worker.load_state(repo, task)
+    decision = review_decision(wt, data, current, state)
+    if (decision["action"] != "assessment_required"
+            or packet.get("reviewed_commit") != decision["reviewed_commit"]
+            or packet.get("rebase_digest") != decision["rebase_digest"]):
+        raise worker.TaskError("assessment must match the recorded conflicted rebase of approved work")
+    complexity = packet.get("complexity")
+    if complexity not in ("simple", "complex"):
+        raise worker.TaskError("rebase complexity must be simple or complex")
+    nonempty(packet.get("evidence"), "conflict resolution assessment evidence")
+    evidence = {**packet, "rebases": decision["rebases"], "verification_logs": receipt["log_dir"]}
+    append_review_evidence(Path(data["review_basis"]["review_file"]),
+                           "\n## Rebase assessment\n\n```json\n" + json.dumps(evidence, indent=2) + "\n```\n")
+    if complexity == "simple":
+        bind_review(data, receipt)
+        decision.update(action="reuse", reason="simple conflict resolution assessed by verifier")
+    else:
+        data.pop("review_basis", None)
+        data.pop("review_receipt", None)
+        decision.update(action="review_required", reason="substantial algorithmic or structural conflict resolution")
+    output = result(True, "rebase_assessed", task=task, commit=receipt["commit"], review=decision)
+    data.update(assessment_digest=digest(packet), assessment_result=output)
     save(wt, data)
     return output
 
@@ -648,9 +787,10 @@ def parser() -> argparse.ArgumentParser:
     gate.add_argument("task")
     gate.add_argument("--plan", required=True)
     gate.add_argument("--summary", required=True)
-    review_cmd = sub.add_parser("review")
-    review_cmd.add_argument("task")
-    review_cmd.add_argument("--packet", required=True)
+    for name in ("review", "assess-rebase"):
+        packet_cmd = sub.add_parser(name)
+        packet_cmd.add_argument("task")
+        packet_cmd.add_argument("--packet", required=True)
     for name in ("integrate", "status"):
         sub.add_parser(name).add_argument("task")
     return command
@@ -673,7 +813,12 @@ def main() -> int:
                 output = integrate(repo, task, wt)
             else:
                 with worker.integration_lock(repo):
-                    output = review(repo, task, wt, args.packet) if args.command == "review" else status(repo, task, wt)
+                    if args.command == "review":
+                        output = review(repo, task, wt, args.packet)
+                    elif args.command == "assess-rebase":
+                        output = assess_rebase(repo, task, wt, args.packet)
+                    else:
+                        output = status(repo, task, wt)
     except KeyboardInterrupt:
         output = result(False, "interrupted", error="operation interrupted; active local gate process group stopped")
     except worker.RebaseConflict as exc:
