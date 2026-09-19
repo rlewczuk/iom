@@ -6,3 +6,4 @@ _*.sh
 _local/
 .work/
 /.cswd
+*.pyc
