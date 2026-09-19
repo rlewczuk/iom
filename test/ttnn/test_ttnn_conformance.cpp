@@ -14,6 +14,7 @@
 
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <span>
 #include <utility>
@@ -33,6 +34,7 @@
 #include "iom/cpu/device.hpp"
 #include "iom/ttnn/device.hpp"
 #include "../../src/ttnn/device_internal.hpp"
+#include "../../src/ttnn/copy.hpp"
 #include "../../src/ttnn/registry_state.hpp"
 
 namespace {
@@ -2768,446 +2770,238 @@ TEST_CASE("TTNN deferred binary failures remain repeatable after release") {
     iom::ttnn_test::fail_next_copy_finishes_for_testing(0);
 }
 
-namespace {
-// Deterministic workspace-completion fence for the native workspace cases:
-// `success` reports proved completion and `pending` never does, so a lease
-// carrying a pending fence is exactly an unproved native completion.
-enum class NativeWorkspaceFenceMode { success, pending };
 
-struct NativeWorkspaceFenceCapture {
-    NativeWorkspaceFenceMode mode;
-};
-
-static_assert(
-        sizeof(NativeWorkspaceFenceCapture)
-        <= iom::detail::kFenceStorageBytes);
-static_assert(
-        alignof(NativeWorkspaceFenceCapture)
-        <= iom::detail::kFenceStorageAlign);
-
-iom::detail::FenceResult native_workspace_fence_invoke(
-        const iom::detail::Fence& fence) noexcept {
-    const auto& capture = *std::launder(
-            reinterpret_cast<const NativeWorkspaceFenceCapture*>(
-                    fence.storage));
-    return capture.mode == NativeWorkspaceFenceMode::success
-            ? iom::detail::FenceResult::success()
-            : iom::detail::FenceResult::pending();
-}
-
-iom::detail::Fence make_native_workspace_fence(
-        NativeWorkspaceFenceMode mode) noexcept {
-    iom::detail::Fence fence;
-    ::new (fence.storage) NativeWorkspaceFenceCapture{mode};
-    fence.invoke = &native_workspace_fence_invoke;
-    return fence;
-}
-
-// Owner-absolute native address of one checked workspace view: distinct
-// subranges of one owner must keep distinct lease identity.
-[[nodiscard]] void* native_workspace_address(
-        const iom::ttnn_detail::NativeWorkspace& native) noexcept {
-    return reinterpret_cast<void*>(
-            static_cast<std::uintptr_t>(native.range_address()));
-}
-
-[[nodiscard]] iom::TtnnDevice& native_workspace_device(
-        const std::unique_ptr<iom::Device>& device) {
-    auto* const ttnn_device = dynamic_cast<iom::TtnnDevice*>(device.get());
-    REQUIRE(ttnn_device != nullptr);
-    return *ttnn_device;
-}
-}  // namespace
-
-TEST_CASE("TTNN conformance: positive raw workspace owns one native page") {
+TEST_CASE("TTNN positive workspaces own exact aligned host ranges") {
     require_hardware();
     TtnnDevices devices;
-    iom::TtnnDevice& ttnn_device = native_workspace_device(devices.candidate);
-    iom::ttnn_test::reset_native_workspace_counts_for_testing();
+    auto* const ttnn_device =
+            dynamic_cast<iom::TtnnDevice*>(devices.candidate.get());
+    REQUIRE(ttnn_device != nullptr);
 
-    // The empty owner stays valid, allocation-free and native-free.
-    const std::unique_ptr<iom::RawWorkspace> empty =
-            devices.candidate->create_workspace(0);
-    REQUIRE(empty != nullptr);
-    CHECK(empty->empty());
-    CHECK_EQ(empty->byte_size(), 0);
-    CHECK(&empty->device() == devices.candidate.get());
-    CHECK(empty->backend_kind() == iom::BackendKind::TTNN);
-
-    const iom::RawWorkspaceView empty_view = empty->view();
-    CHECK(empty_view.owner_identity() == empty.get());
-    CHECK(&empty_view.device() == devices.candidate.get());
-    CHECK_EQ(empty_view.byte_size(), 0);
-    CHECK_FALSE(empty_view.empty());
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_allocation_count_for_testing(),
-            std::size_t{0});
-    CHECK_THROWS_AS(
-            (void)iom::ttnn_detail::checked_native_workspace(
-                    ttnn_device, empty_view),
-            std::invalid_argument);
-
-    // A positive non-32-multiple request reports exactly the requested
-    // logical capacity over one native page rounded up to 32 bytes.
-    const std::unique_ptr<iom::RawWorkspace> workspace =
-            devices.candidate->create_workspace(40);
-    REQUIRE(workspace != nullptr);
-    CHECK_FALSE(workspace->empty());
-    CHECK_EQ(workspace->byte_size(), 40);
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_allocation_count_for_testing(),
-            std::size_t{1});
-    const iom::RawWorkspaceView view = workspace->view();
-    const iom::ttnn_detail::NativeWorkspace native =
-            iom::ttnn_detail::checked_native_workspace(ttnn_device, view);
-    REQUIRE(native.owner != nullptr);
-    CHECK_EQ(native.page_size, std::uint64_t{64});
-    CHECK_EQ(native.logical_bytes, 40);
-    CHECK_EQ(native.offset, 0);
-    CHECK_EQ(native.range_address(), native.base);
-    CHECK_EQ(native.base % 32, 0);
-
-    // The native identity is a real owning replicated DRAM allocation: the
-    // backing buffer only exists for the owning creation form, never for a
-    // non-owning explicit-address view or a host substitute.
-    CHECK(native.owner->is_allocated());
-    CHECK(native.owner->get_backing_buffer() != nullptr);
-    CHECK(native.owner->get_reference_buffer() != nullptr);
-    CHECK(
-            native.owner->get_reference_buffer()->alignment() >= 32);
-    CHECK(
-            native.owner->global_layout()
-            == tt::tt_metal::distributed::MeshBufferLayout::REPLICATED);
-    CHECK(
-            native.owner->device_local_config().buffer_type
-            == tt::tt_metal::BufferType::DRAM);
-    CHECK_EQ(
-            native.owner->device_local_config().page_size,
-            std::uint64_t{64});
-    CHECK_EQ(native.owner->size(), std::uint64_t{64});
-    CHECK_EQ(native.owner->num_pages(), std::uint32_t{1});
-
-    // Distinct owners have distinct native bases and page sizes.
-    const std::unique_ptr<iom::RawWorkspace> other =
-            devices.candidate->create_workspace(32);
-    const iom::ttnn_detail::NativeWorkspace other_native =
-            iom::ttnn_detail::checked_native_workspace(
-                    ttnn_device, other->view());
-    CHECK_NE(other_native.base, native.base);
-    CHECK_EQ(other_native.page_size, std::uint64_t{32});
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_allocation_count_for_testing(),
-            std::size_t{2});
-
-    // Real ranges: distinct owner-absolute 32-byte subranges address
-    // distinct native bytes, and merely constructing views or subranges
-    // acquires no lease and submits no work.
-    const std::unique_ptr<iom::RawWorkspace> spans =
-            devices.candidate->create_workspace(64);
-    const iom::RawWorkspaceView spans_view = spans->view();
-    const iom::RawWorkspaceView first = spans_view.subrange(0, 32);
-    const iom::RawWorkspaceView second = spans_view.subrange(32, 32);
-    const iom::ttnn_detail::NativeWorkspace spans_native =
-            iom::ttnn_detail::checked_native_workspace(
-                    ttnn_device, spans_view);
-    const iom::ttnn_detail::NativeWorkspace first_native =
-            iom::ttnn_detail::checked_native_workspace(ttnn_device, first);
-    const iom::ttnn_detail::NativeWorkspace second_native =
-            iom::ttnn_detail::checked_native_workspace(ttnn_device, second);
-    CHECK_EQ(first_native.owner, second_native.owner);
-    CHECK_EQ(first_native.range_address(), spans_native.base);
-    CHECK_EQ(second_native.range_address(), spans_native.base + 32);
-    CHECK_NE(first_native.range_address(), second_native.range_address());
-    CHECK_EQ(first_native.offset, 0);
-    CHECK_EQ(second_native.offset, 32);
-    CHECK_EQ(first_native.logical_bytes, 64);
-    CHECK_EQ(second_native.logical_bytes, 64);
-    CHECK_EQ(
-            ttnn_device.registry_state().workspace_leases.leases.size(),
-            std::size_t{0});
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_release_count_for_testing(),
-            std::size_t{0});
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_allocation_count_for_testing(),
-            std::size_t{3});
-
-    // Native identity is independent of tensor allocations: creating real
-    // tensors neither relocates nor replaces the workspace allocation.
-    const std::unique_ptr<iom::Tensor> tensor =
-            devices.candidate->create_tensor(
-                    iom::TensorSpec{
-                            iom::TensorShape{{16, 16}}, iom::DataType::BF16});
-    REQUIRE(tensor != nullptr);
-    CHECK_EQ(
-            iom::ttnn_detail::checked_native_workspace(ttnn_device, view).base,
-            native.base);
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_allocation_count_for_testing(),
-            std::size_t{3});
-
-    // Checked round-up overflow and native page-size narrowing reject
-    // before any native allocation, and other backends are unchanged.
     CHECK_THROWS_AS(
             (void)devices.candidate->create_workspace(
                     std::numeric_limits<std::size_t>::max()),
             std::overflow_error);
-    CHECK_THROWS_AS(
-            (void)devices.candidate->create_workspace(std::size_t{1} << 32),
-            std::overflow_error);
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_allocation_count_for_testing(),
-            std::size_t{3});
-    CHECK_THROWS_AS(
-            devices.reference->create_workspace(4096),
-            std::invalid_argument);
 
-    // Foreign and dead owners reject by exact identity before any native
-    // effect; a dead owner is never dereferenced.
-    const std::unique_ptr<iom::RawWorkspace> foreign =
-            devices.foreign->create_workspace(0);
-    CHECK_THROWS_AS(
-            (void)iom::ttnn_detail::checked_native_workspace(
-                    ttnn_device, foreign->view()),
-            std::invalid_argument);
-    auto dying = devices.candidate->create_workspace(32);
-    const iom::RawWorkspaceView stale_view = dying->view();
-    const std::size_t released_before =
-            iom::ttnn_test::native_workspace_release_count_for_testing();
-    dying.reset();
+    auto workspace = devices.candidate->create_workspace(96);
+    REQUIRE(workspace != nullptr);
+    CHECK_FALSE(workspace->empty());
+    CHECK_EQ(workspace->byte_size(), std::size_t{96});
+    const iom::RawWorkspaceView full = workspace->view();
+    const iom::ttnn_detail::HostWorkspace full_access =
+            iom::ttnn_detail::checked_host_workspace(*ttnn_device, full);
+    REQUIRE(full_access.data != nullptr);
+    CHECK_EQ(full_access.byte_size, std::size_t{96});
     CHECK_EQ(
-            iom::ttnn_test::native_workspace_release_count_for_testing(),
-            released_before + 1);
+            reinterpret_cast<std::uintptr_t>(full_access.data) % 32,
+            std::uintptr_t{0});
+    CHECK(full_access.keepalive != nullptr);
+
+    const iom::RawWorkspaceView first = full.subrange(0, 32);
+    const iom::RawWorkspaceView second = full.subrange(32, 64);
+    const iom::ttnn_detail::HostWorkspace first_access =
+            iom::ttnn_detail::checked_host_workspace(*ttnn_device, first);
+    const iom::ttnn_detail::HostWorkspace second_access =
+            iom::ttnn_detail::checked_host_workspace(*ttnn_device, second);
+    CHECK_NE(first_access.data, second_access.data);
+    CHECK_EQ(second_access.data, first_access.data + 32);
     CHECK_THROWS_AS(
-            (void)iom::ttnn_detail::checked_native_workspace(
-                    ttnn_device, stale_view),
+            (void)full.subrange(16, 32), std::invalid_argument);
+    CHECK_THROWS_AS(
+            (void)full.subrange(64, 64), std::out_of_range);
+
+    auto empty = devices.candidate->create_workspace(0);
+    REQUIRE(empty != nullptr);
+    CHECK(empty->empty());
+    CHECK_THROWS_AS(
+            (void)iom::ttnn_detail::checked_host_workspace(
+                    *ttnn_device, empty->view()),
+            std::invalid_argument);
+    auto foreign = devices.foreign->create_workspace(0);
+    CHECK_THROWS_AS(
+            (void)iom::ttnn_detail::checked_host_workspace(
+                    *ttnn_device, foreign->view()),
+            std::invalid_argument);
+    const iom::RawWorkspaceView stale = workspace->view();
+    workspace.reset();
+    CHECK_THROWS_AS(
+            (void)iom::ttnn_detail::checked_host_workspace(
+                    *ttnn_device, stale),
             std::invalid_argument);
     CHECK_THROWS_AS(
-            (void)iom::ttnn_detail::checked_native_workspace(
-                    ttnn_device, iom::RawWorkspaceView{}),
+            (void)iom::ttnn_detail::checked_host_workspace(
+                    *ttnn_device, iom::RawWorkspaceView{}),
             std::invalid_argument);
-    CHECK_EQ(
-            iom::ttnn_test::native_workspace_release_count_for_testing(),
-            released_before + 1);
 }
 
-TEST_CASE("TTNN workspace ranges lease exclusively and retire only after proof") {
+TEST_CASE(
+        "TTNN workspace owner destruction retains a live common lease") {
     require_hardware();
     TtnnDevices devices;
-    iom::TtnnDevice& ttnn_device = native_workspace_device(devices.candidate);
-    iom::ttnn_test::reset_native_workspace_counts_for_testing();
-    iom::detail::RegistryState& state = ttnn_device.registry_state();
+    auto* const ttnn_device =
+            dynamic_cast<iom::TtnnDevice*>(devices.candidate.get());
+    REQUIRE(ttnn_device != nullptr);
 
-    // A live lease over one supplied subrange is exclusive: overlapping
-    // live use is resource exhaustion while a disjoint aligned subrange of
-    // the same owner proceeds. The owner cannot retire either live range
-    // early.
+    auto table = devices.candidate->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{1, 8}}, iom::DataType::U32});
+    auto indices = devices.candidate->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{1, 8}}, iom::DataType::U32});
+    auto out = devices.candidate->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{8, 8}}, iom::DataType::U32});
+    REQUIRE(table != nullptr);
+    REQUIRE(indices != nullptr);
+    REQUIRE(out != nullptr);
+    std::vector<std::byte> table_bytes(
+            table->view().spec().logical_nbytes(), std::byte{0});
+    std::vector<std::byte> index_bytes(
+            indices->view().spec().logical_nbytes(), std::byte{0});
+    iom_conformance::copy_from_host(table->view(), table_bytes);
+    iom_conformance::copy_from_host(indices->view(), index_bytes);
+
+    auto queue = devices.candidate->create_ops();
+    auto workspace = devices.candidate->create_workspace(32);
+    REQUIRE(workspace != nullptr);
+    const iom::RawWorkspaceView view = workspace->view();
+    std::byte* host_data = nullptr;
     {
-        auto owner = devices.candidate->create_workspace(96);
-        const iom::RawWorkspaceView view = owner->view();
-        const iom::ttnn_detail::NativeWorkspace native =
-                iom::ttnn_detail::checked_native_workspace(ttnn_device, view);
-        REQUIRE_EQ(state.workspace_leases.leases.size(), std::size_t{0});
-
-        // Two distinct owner-absolute 32-byte subranges of one owner.
-        const iom::RawWorkspaceView first = view.subrange(0, 32);
-        const iom::RawWorkspaceView second = view.subrange(32, 32);
-        const iom::ttnn_detail::NativeWorkspace first_native =
-                iom::ttnn_detail::checked_native_workspace(ttnn_device, first);
-        const iom::ttnn_detail::NativeWorkspace second_native =
-                iom::ttnn_detail::checked_native_workspace(ttnn_device, second);
-        CHECK_EQ(first_native.range_address(), native.base);
-        CHECK_EQ(second_native.range_address(), native.base + 32);
-        CHECK_NE(first_native.range_address(), second_native.range_address());
-
-        const iom::detail::Fence pending =
-                make_native_workspace_fence(NativeWorkspaceFenceMode::pending);
-        const iom::detail::WorkspaceLease live =
-                iom::detail::acquire_workspace_lease(
-                        state, first.owner_identity(),
-                        native_workspace_address(first_native),
-                        first.byte_size(), 1, 1, pending);
-        CHECK(live.entry_id != 0);
-        // The disjoint aligned subrange of the same owner proceeds.
-        const iom::detail::WorkspaceLease disjoint =
-                iom::detail::acquire_workspace_lease(
-                        state, second.owner_identity(),
-                        native_workspace_address(second_native),
-                        second.byte_size(), 2, 1, pending);
-        CHECK(disjoint.entry_id != 0);
-        CHECK_EQ(state.workspace_leases.leases.size(), std::size_t{2});
-
-        // Overlapping live leases are resource exhaustion; a misaligned or
-        // empty range is invalid input. No rejected attempt leaves state
-        // behind.
-        CHECK_THROWS_AS(
-                (void)iom::detail::acquire_workspace_lease(
-                        state, first.owner_identity(),
-                        native_workspace_address(first_native), 32, 3, 1,
-                        pending),
-                std::bad_alloc);
-        CHECK_THROWS_AS(
-                (void)iom::detail::acquire_workspace_lease(
-                        state, second.owner_identity(),
-                        native_workspace_address(first_native), 64, 3, 1,
-                        pending),
-                std::bad_alloc);
-        CHECK_THROWS_AS(
-                (void)iom::detail::acquire_workspace_lease(
-                        state, first.owner_identity(),
-                        static_cast<char*>(
-                                native_workspace_address(first_native))
-                                + 16,
-                        32, 3, 1, pending),
-                std::invalid_argument);
-        CHECK_THROWS_AS(
-                (void)iom::detail::acquire_workspace_lease(
-                        state, first.owner_identity(),
-                        native_workspace_address(first_native), 0, 3, 1,
-                        pending),
-                std::invalid_argument);
-        CHECK_EQ(state.workspace_leases.leases.size(), std::size_t{2});
-
-        // Neither live range may retire early.
-        const std::size_t released_before =
-                iom::ttnn_test::native_workspace_release_count_for_testing();
-        owner.reset();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before);
-
-        // The device's own drain proves native completion and releases the
-        // retained allocation exactly once.
-        ttnn_device.registry_state().quarantine.drain();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before + 1);
-        ttnn_device.registry_state().quarantine.drain();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before + 1);
-
-        // A covering completion proof resolves both leases.
-        iom::detail::complete_workspace_lease(state, live, true);
-        iom::detail::complete_workspace_lease(state, disjoint, true);
-        CHECK_EQ(state.workspace_leases.leases.size(), std::size_t{0});
+        const iom::ttnn_detail::HostWorkspace access =
+                iom::ttnn_detail::checked_host_workspace(
+                        *ttnn_device, view);
+        REQUIRE(access.data != nullptr);
+        host_data = access.data;
+        std::fill_n(host_data, 32, static_cast<std::byte>(0x5A));
     }
 
-    // A covered completion proof lets the owner retire its real allocation
-    // exactly once, without quarantining anything.
-    {
-        auto owner = devices.candidate->create_workspace(64);
-        const iom::RawWorkspaceView view = owner->view();
-        const iom::ttnn_detail::NativeWorkspace native =
-                iom::ttnn_detail::checked_native_workspace(ttnn_device, view);
-        const iom::detail::Fence proved =
-                make_native_workspace_fence(NativeWorkspaceFenceMode::success);
-        const iom::detail::WorkspaceLease lease =
-                iom::detail::acquire_workspace_lease(
-                        state, view.owner_identity(),
-                        native_workspace_address(native), view.byte_size(), 4,
-                        1, proved);
-        iom::detail::complete_workspace_lease(state, lease, true);
-        REQUIRE_EQ(state.workspace_leases.leases.size(), std::size_t{0});
-        const std::size_t released_before =
-                iom::ttnn_test::native_workspace_release_count_for_testing();
-        owner.reset();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before + 1);
-        ttnn_device.registry_state().quarantine.drain();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before + 1);
-    }
+    iom::ttnn_test::reset_host_workspace_release_count_for_testing();
+    const iom::oid token =
+            queue->embedding(table->view(), indices->view(), out->view(), view);
+    REQUIRE(iom::oid_is_token(token));
 
-    // A runtime failure is not a completion proof: the covered range stays
-    // quarantined and the real allocation stays retained until the device
-    // drain proves completion, and a later covering proof resolves it.
-    {
-        auto owner = devices.candidate->create_workspace(64);
-        const iom::RawWorkspaceView view = owner->view();
-        const iom::ttnn_detail::NativeWorkspace native =
-                iom::ttnn_detail::checked_native_workspace(ttnn_device, view);
-        const iom::detail::Fence pending =
-                make_native_workspace_fence(NativeWorkspaceFenceMode::pending);
-        const iom::detail::WorkspaceLease lease =
-                iom::detail::acquire_workspace_lease(
-                        state, view.owner_identity(),
-                        native_workspace_address(native), view.byte_size(), 5,
-                        1, pending);
-        iom::detail::complete_workspace_lease(state, lease, false);
-        REQUIRE_EQ(state.workspace_leases.leases.size(), std::size_t{1});
-        CHECK_THROWS_AS(
-                (void)iom::detail::acquire_workspace_lease(
-                        state, view.owner_identity(),
-                        native_workspace_address(native), 32, 6, 1, pending),
-                std::bad_alloc);
+    // The accepted operation has a common workspace lease.  Destroying the
+    // owner must transfer its host keepalive to quarantine rather than unmap
+    // the bytes while that lease is still live.
+    workspace.reset();
+    CHECK_EQ(
+            iom::ttnn_test::host_workspace_release_count_for_testing(),
+            std::size_t{0});
+    CHECK_EQ(*host_data, static_cast<std::byte>(0x5A));
 
-        const std::size_t released_before =
-                iom::ttnn_test::native_workspace_release_count_for_testing();
-        owner.reset();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before);
-        ttnn_device.registry_state().quarantine.drain();
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before + 1);
-        iom::detail::complete_workspace_lease(state, lease, true);
-        CHECK_EQ(state.workspace_leases.leases.size(), std::size_t{0});
-    }
+    CHECK_NOTHROW(queue->wait(token));
+    CHECK_NOTHROW(ttnn_device->registry_state().quarantine.drain());
+    CHECK_EQ(
+            iom::ttnn_test::host_workspace_release_count_for_testing(),
+            std::size_t{1});
 }
 
-TEST_CASE("TTNN workspace native owner survives an unrecordable quarantine") {
+TEST_CASE("TTNN raw padded BF16 plane round trip uses host workspace") {
     require_hardware();
-    auto device = iom::make_ttnn_device(0);
-    iom::TtnnDevice& ttnn_device = native_workspace_device(device);
-    iom::ttnn_test::reset_native_workspace_counts_for_testing();
+    TtnnDevices devices;
+    auto* const ttnn_device =
+            dynamic_cast<iom::TtnnDevice*>(devices.candidate.get());
+    REQUIRE(ttnn_device != nullptr);
+    auto tensor = devices.candidate->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{17, 17}}, iom::DataType::BF16});
+    REQUIRE(tensor != nullptr);
+    auto* const plane =
+            static_cast<ttnn::Tensor*>(tensor->view().native_handle());
+    REQUIRE(plane != nullptr);
+    const std::size_t bytes = iom::ttnn_detail::padded_plane_bytes(*plane);
+    CHECK_EQ(bytes, std::size_t{2048});
 
-    const std::size_t released_before =
-            iom::ttnn_test::native_workspace_release_count_for_testing();
-
-    // Two rounds: the first observes the fault's own false-to-true
-    // transition, the second re-arms a fault that is already consumed, so
-    // the retention boundary is exercised by this test alone and never
-    // depends on what an earlier test case left behind.
-    for (std::size_t round = 0; round != 2; ++round) {
-        auto owner = device->create_workspace(64);
-        const iom::RawWorkspaceView view = owner->view();
-        const iom::ttnn_detail::NativeWorkspace native =
-                iom::ttnn_detail::checked_native_workspace(
-                        ttnn_device, view);
-        const iom::detail::Fence pending = make_native_workspace_fence(
-                NativeWorkspaceFenceMode::pending);
-        const iom::detail::WorkspaceLease lease =
-                iom::detail::acquire_workspace_lease(
-                        ttnn_device.registry_state(),
-                        view.owner_identity(),
-                        native_workspace_address(native), view.byte_size(),
-                        round + 1, 1, pending);
-        CHECK(lease.entry_id != 0);
-
-        // Arming resets the one-shot fault, so this round's fault is still
-        // pending immediately before the destruction below.
-        iom::ttnn_test::fail_next_quarantine_action_for_testing();
-        CHECK_FALSE(
-                iom::ttnn_test::
-                        quarantine_action_fault_consumed_for_testing());
-
-        // A quarantine record that cannot be created keeps the unproved
-        // native allocation retained instead of releasing it, and never
-        // throws: the retention cell reserved by the owner's constructor
-        // receives the real `MeshBuffer` without allocating again.
-        CHECK_NOTHROW(owner.reset());
-        CHECK(iom::ttnn_test::quarantine_action_fault_consumed_for_testing());
-        CHECK_EQ(
-                iom::ttnn_test::native_workspace_release_count_for_testing(),
-                released_before);
+    auto workspace = devices.candidate->create_workspace(bytes);
+    REQUIRE(workspace != nullptr);
+    auto access = iom::ttnn_detail::checked_host_workspace(
+            *ttnn_device, workspace->view());
+    REQUIRE(access.data != nullptr);
+    std::vector<std::byte> expected(bytes);
+    for (std::size_t index = 0; index < bytes; ++index) {
+        expected[index] = static_cast<std::byte>(
+                static_cast<unsigned char>((index * 37 + 11) & 0xff));
     }
+    std::memcpy(access.data, expected.data(), bytes);
+    {
+        auto lease = iom::ttnn_detail::acquire_workspace_lease(
+                *ttnn_device, workspace->view());
+        iom::ttnn_detail::raw_upload_plane(*ttnn_device, *plane, lease);
+        {
+            std::lock_guard<std::mutex> lock(ttnn_device->api_mutex());
+            ttnn_device->mesh().mesh_command_queue(0).finish();
+        }
+        lease.complete(true);
+    }
+    std::memset(access.data, 0, bytes);
+    {
+        auto lease = iom::ttnn_detail::acquire_workspace_lease(
+                *ttnn_device, workspace->view());
+        iom::ttnn_detail::raw_download_plane(*ttnn_device, *plane, lease);
+        {
+            std::lock_guard<std::mutex> lock(ttnn_device->api_mutex());
+            ttnn_device->mesh().mesh_command_queue(0).finish();
+        }
+        lease.complete(true);
+    }
+    CHECK(std::memcmp(access.data, expected.data(), bytes) == 0);
+}
 
-    // Device teardown still drains without throwing.
-    CHECK_NOTHROW(device.reset());
+TEST_CASE("TTNN raw transfer submission failure retains host lease") {
+    require_hardware();
+    TtnnDevices devices;
+    auto* const ttnn_device =
+            dynamic_cast<iom::TtnnDevice*>(devices.candidate.get());
+    REQUIRE(ttnn_device != nullptr);
+    auto tensor = devices.candidate->create_tensor(
+            iom::TensorSpec{
+                    iom::TensorShape{{17, 17}}, iom::DataType::BF16});
+    REQUIRE(tensor != nullptr);
+    auto* const plane =
+            static_cast<ttnn::Tensor*>(tensor->view().native_handle());
+    REQUIRE(plane != nullptr);
+    const std::size_t bytes = iom::ttnn_detail::padded_plane_bytes(*plane);
+    auto workspace = devices.candidate->create_workspace(bytes);
+    REQUIRE(workspace != nullptr);
+    std::byte* host_data = nullptr;
+    {
+        const iom::ttnn_detail::HostWorkspace access =
+                iom::ttnn_detail::checked_host_workspace(
+                        *ttnn_device, workspace->view());
+        REQUIRE(access.data != nullptr);
+        host_data = access.data;
+        std::fill_n(host_data, bytes, static_cast<std::byte>(0xA5));
+    }
+    iom::ttnn_test::reset_host_workspace_release_count_for_testing();
+
+    iom::ttnn_test::fail_next_host_transfer_submission_for_testing(0);
+    iom::ttnn_test::fail_next_quarantine_action_for_testing();
+    {
+        auto lease = iom::ttnn_detail::acquire_workspace_lease(
+                *ttnn_device, workspace->view());
+        CHECK_THROWS_AS(
+                iom::ttnn_detail::raw_download_plane(
+                        *ttnn_device, *plane, lease),
+                std::runtime_error);
+        CHECK(
+                iom::ttnn_test::
+                        host_transfer_submission_fault_consumed_for_testing());
+    }
+    CHECK(
+            iom::ttnn_test::quarantine_action_fault_consumed_for_testing());
+
+    // The injected submission failure has no completion proof.  The lease
+    // therefore deliberately leaks its payload when quarantine recording is
+    // faulted, keeping the owner bytes addressable instead of releasing them.
+    workspace.reset();
+    CHECK_EQ(
+            iom::ttnn_test::host_workspace_release_count_for_testing(),
+            std::size_t{0});
+    CHECK_EQ(*host_data, static_cast<std::byte>(0xA5));
+    CHECK_NOTHROW(ttnn_device->registry_state().quarantine.drain());
+    CHECK_EQ(
+            iom::ttnn_test::host_workspace_release_count_for_testing(),
+            std::size_t{0});
 }
 
 TEST_CASE("TTNN conformance: workspace requirement queries report exact zero") {

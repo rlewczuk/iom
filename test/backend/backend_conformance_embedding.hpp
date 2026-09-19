@@ -1330,6 +1330,28 @@ protected:
     }
 
     iom::oid embedding_impl(const EmbeddingRequest& request) override {
+        if (request.workspace_requirements.bytes != 0
+                && queue_device().backend_kind()
+                        == iom::BackendKind::TTNN) {
+            const void* const workspace_address =
+                    iom::detail::WorkspaceValidation::address(
+                            request.workspace);
+            const std::array<const void*, 3> operand_addresses{
+                    request.table.native_handle,
+                    request.indices.native_handle,
+                    request.out.native_handle};
+            for (const void* const operand_address : operand_addresses) {
+                // This test double can fabricate a workspace whose address
+                // aliases an opaque TTNN handle.  Keep that malformed probe
+                // rejected while production TTNN admission treats real host
+                // mappings and device storage as separate domains.
+                if (workspace_address == operand_address) {
+                    throw std::invalid_argument(
+                            "workspace range overlaps an operand or output "
+                            "storage range");
+                }
+            }
+        }
         const Failure failure = std::exchange(next_failure_, Failure::none);
         iom::detail::Fence fence;
         fence.invoke = [](const iom::detail::Fence&) noexcept {

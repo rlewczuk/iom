@@ -1,4 +1,5 @@
 #include "copy.hpp"
+#include "device_internal.hpp"
 #include "registry_state.hpp"
 #include "staging.hpp"
 #include "testing_internal.hpp"
@@ -13,9 +14,12 @@
 #include <ttnn/operations/data_movement/copy/copy.hpp>
 #include <ttnn/tensor/tensor_ops.hpp>
 #include <cstring>
-#include "../shared/scalar_add.hpp"
-
-
+#include <limits>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
 namespace iom::ttnn_detail {
 
     std::size_t carrier_bytes(tt::tt_metal::DataType type) {
@@ -23,7 +27,235 @@ namespace iom::ttnn_detail {
             case tt::tt_metal::DataType::UINT8: return 1;
             case tt::tt_metal::DataType::UINT16:
             case tt::tt_metal::DataType::BFLOAT16: return 2;
-            default: return 4;
+            case tt::tt_metal::DataType::FLOAT32:
+            case tt::tt_metal::DataType::INT32:
+            case tt::tt_metal::DataType::UINT32: return 4;
+            default:
+                throw std::invalid_argument(
+                        "TTNN native dtype has no byte carrier");
+        }
+    }
+
+    namespace {
+        template <typename Value>
+        [[nodiscard]] std::size_t checked_plane_dimension(
+                Value value, const char* what) {
+            using Raw = std::remove_cv_t<Value>;
+            if constexpr (std::is_signed_v<Raw>) {
+                if (value <= 0) {
+                    throw std::invalid_argument(
+                            std::string("TTNN plane ") + what
+                            + " is non-positive");
+                }
+            } else if (value == 0) {
+                throw std::invalid_argument(
+                        std::string("TTNN plane ") + what
+                        + " is zero");
+            }
+            using Unsigned = std::make_unsigned_t<Raw>;
+            const std::uintmax_t widened =
+                    static_cast<std::uintmax_t>(
+                            static_cast<Unsigned>(value));
+            if (widened
+                    > static_cast<std::uintmax_t>(
+                              std::numeric_limits<std::size_t>::max())) {
+                throw std::overflow_error(
+                        std::string("TTNN plane ") + what
+                        + " exceeds size_t");
+            }
+            return static_cast<std::size_t>(widened);
+        }
+
+        [[nodiscard]] std::size_t checked_product(
+                std::size_t lhs, std::size_t rhs, const char* what) {
+            if (lhs != 0
+                    && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
+                throw std::overflow_error(
+                        std::string("TTNN ") + what + " overflows");
+            }
+            return lhs * rhs;
+        }
+    }  // namespace
+
+    std::size_t padded_plane_bytes(const ttnn::Tensor& plane) {
+        if (plane.layout() != tt::tt_metal::Layout::TILE) {
+            throw std::invalid_argument(
+                    "TTNN raw plane must use the TILE layout");
+        }
+        const auto padded = plane.padded_shape();
+        const std::size_t rows = checked_plane_dimension(
+                padded[-2], "padded row count");
+        const std::size_t columns = checked_plane_dimension(
+                padded[-1], "padded column count");
+        if (rows % 32 != 0 || columns % 32 != 0) {
+            throw std::invalid_argument(
+                    "TTNN plane is not a complete TILE image");
+        }
+        const std::size_t elements =
+                checked_product(rows, columns, "padded plane element count");
+        return checked_product(
+                elements, carrier_bytes(plane.dtype()),
+                "padded plane byte count");
+    }
+
+    TtnnWorkspaceLease::TtnnWorkspaceLease(
+            TtnnDevice& device, std::byte* data, std::size_t bytes,
+            std::unique_ptr<HostWorkspaceLeasePayload> payload)
+            : device_(&device), data_(data), bytes_(bytes),
+              payload_(std::move(payload)) {}
+
+    TtnnWorkspaceLease::~TtnnWorkspaceLease() noexcept {
+        complete(false);
+    }
+
+    TtnnWorkspaceLease::TtnnWorkspaceLease(
+            TtnnWorkspaceLease&& other) noexcept
+            : device_(std::exchange(other.device_, nullptr)),
+              data_(std::exchange(other.data_, nullptr)),
+              bytes_(std::exchange(other.bytes_, 0)),
+              payload_(std::move(other.payload_)) {}
+
+    TtnnWorkspaceLease& TtnnWorkspaceLease::operator=(
+            TtnnWorkspaceLease&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        complete(false);
+        device_ = std::exchange(other.device_, nullptr);
+        data_ = std::exchange(other.data_, nullptr);
+        bytes_ = std::exchange(other.bytes_, 0);
+        payload_ = std::move(other.payload_);
+        return *this;
+    }
+
+    std::shared_ptr<void> TtnnWorkspaceLease::keepalive() const noexcept {
+        return payload_ == nullptr ? std::shared_ptr<void>{}
+                                    : payload_->keepalive;
+    }
+
+    void TtnnWorkspaceLease::complete(bool covering_proof) noexcept {
+        if (payload_ == nullptr) {
+            device_ = nullptr;
+            data_ = nullptr;
+            bytes_ = 0;
+            return;
+        }
+        if (covering_proof) {
+            payload_.reset();
+        } else if (device_ != nullptr) {
+            device_->retain_host_workspace(std::move(payload_));
+        } else {
+            // No device remains to own a quarantine record.  Retain the
+            // payload permanently rather than releasing unproved bytes.
+            (void)payload_.release();
+        }
+        device_ = nullptr;
+        data_ = nullptr;
+        bytes_ = 0;
+    }
+
+    TtnnWorkspaceLease acquire_workspace_lease(
+            TtnnDevice& device, const RawWorkspaceView& workspace) {
+        const HostWorkspace checked =
+                checked_host_workspace(device, workspace);
+        auto payload = std::make_unique<HostWorkspaceLeasePayload>();
+        payload->keepalive = checked.keepalive;
+        payload->pin.emplace(payload->keepalive);
+        return TtnnWorkspaceLease{
+                device, checked.data, checked.byte_size, std::move(payload)};
+    }
+
+    namespace {
+        void validate_raw_range(
+                const ttnn::Tensor& plane,
+                const TtnnWorkspaceLease& workspace,
+                std::size_t& bytes) {
+            bytes = padded_plane_bytes(plane);
+            if (workspace.empty() || workspace.data() == nullptr) {
+                throw std::invalid_argument(
+                        "TTNN raw transfer workspace is empty");
+            }
+            if (bytes > workspace.byte_size()) {
+                throw std::invalid_argument(
+                        "TTNN raw transfer workspace is smaller than plane");
+            }
+            const std::uintptr_t address =
+                    reinterpret_cast<std::uintptr_t>(workspace.data());
+            if (address == 0 || address % 32 != 0
+                    || bytes
+                            > std::numeric_limits<std::uintptr_t>::max()
+                                    - address) {
+                throw std::invalid_argument(
+                        "TTNN raw transfer workspace range is invalid");
+            }
+        }
+
+        template <typename T>
+        void raw_upload_typed(
+                ttnn::Tensor& plane, TtnnWorkspaceLease& workspace,
+                std::size_t bytes) {
+            if (bytes % sizeof(T) != 0) {
+                throw std::logic_error(
+                        "TTNN raw plane bytes do not match carrier width");
+            }
+            tt::tt_metal::HostBuffer host_buffer(
+                    ttsl::Span<T>(
+                            reinterpret_cast<T*>(workspace.data()),
+                            bytes / sizeof(T)),
+                    tt::tt_metal::MemoryPin(workspace.keepalive()));
+            ttnn::Tensor host_tiled(
+                    std::move(host_buffer), plane.logical_shape(),
+                    plane.padded_shape(), plane.dtype(),
+                    tt::tt_metal::Layout::TILE);
+#ifdef IOM_ENABLE_TESTING
+            ::iom::ttnn_detail::fail_host_transfer_submission_at(0);
+#endif
+            ttnn::copy_to_device(host_tiled, plane);
+        }
+    }  // namespace
+
+    void raw_download_plane(
+            TtnnDevice& device, const ttnn::Tensor& plane,
+            TtnnWorkspaceLease& workspace) {
+        std::size_t bytes = 0;
+        validate_raw_range(plane, workspace, bytes);
+        (void)bytes;
+#ifdef IOM_ENABLE_TESTING
+        ::iom::ttnn_detail::fail_host_transfer_submission_at(0);
+#endif
+        ttnn::copy_to_host(
+                device.mesh().mesh_command_queue(0), plane, workspace.data(),
+                std::nullopt, /*blocking=*/false);
+    }
+
+    void raw_upload_plane(
+            TtnnDevice& device, ttnn::Tensor& plane,
+            TtnnWorkspaceLease& workspace) {
+        (void)device;
+        std::size_t bytes = 0;
+        validate_raw_range(plane, workspace, bytes);
+        switch (plane.dtype()) {
+            case tt::tt_metal::DataType::BFLOAT16:
+                raw_upload_typed<bfloat16>(plane, workspace, bytes);
+                break;
+            case tt::tt_metal::DataType::FLOAT32:
+                raw_upload_typed<float>(plane, workspace, bytes);
+                break;
+            case tt::tt_metal::DataType::UINT32:
+                raw_upload_typed<std::uint32_t>(plane, workspace, bytes);
+                break;
+            case tt::tt_metal::DataType::INT32:
+                raw_upload_typed<std::int32_t>(plane, workspace, bytes);
+                break;
+            case tt::tt_metal::DataType::UINT16:
+                raw_upload_typed<std::uint16_t>(plane, workspace, bytes);
+                break;
+            case tt::tt_metal::DataType::UINT8:
+                raw_upload_typed<std::uint8_t>(plane, workspace, bytes);
+                break;
+            default:
+                throw std::invalid_argument(
+                        "TTNN raw upload has no typed carrier");
         }
     }
 

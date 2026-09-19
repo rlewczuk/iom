@@ -1,12 +1,71 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
+#include <span>
 #include <vector>
 #include <ttnn/tensor/tensor.hpp>
 #include "iom/iom.hpp"
 #include "../shared/scalar_add.hpp"
 
 namespace tt::tt_metal::distributed { class MeshDevice; }
+
+namespace iom {
+class TtnnDevice;
+namespace ttnn_detail {
+struct HostWorkspaceLeasePayload;
+
+/**
+ * Move-only access to one checked caller-owned TTNN workspace range.  A
+ * payload keeps the host allocation and its TT-Metal pin alive until the
+ * caller supplies a covering completion proof.  Destruction without proof
+ * quarantines the payload through the owning `TtnnDevice`.
+ */
+class TtnnWorkspaceLease final {
+public:
+    ~TtnnWorkspaceLease() noexcept;
+    TtnnWorkspaceLease(const TtnnWorkspaceLease&) = delete;
+    TtnnWorkspaceLease& operator=(const TtnnWorkspaceLease&) = delete;
+    TtnnWorkspaceLease(TtnnWorkspaceLease&&) noexcept;
+    TtnnWorkspaceLease& operator=(TtnnWorkspaceLease&&) noexcept;
+
+    [[nodiscard]] std::byte* data() const noexcept { return data_; }
+    [[nodiscard]] std::size_t byte_size() const noexcept { return bytes_; }
+    [[nodiscard]] bool empty() const noexcept {
+        return data_ == nullptr || bytes_ == 0;
+    }
+    [[nodiscard]] std::shared_ptr<void> keepalive() const noexcept;
+
+    // A true disposition is a covering native completion proof.  A false
+    // disposition keeps the payload quarantined and blocks reuse.
+    void complete(bool covering_proof) noexcept;
+
+private:
+    friend TtnnWorkspaceLease acquire_workspace_lease(
+            TtnnDevice&, const RawWorkspaceView&);
+    TtnnWorkspaceLease(
+            TtnnDevice&, std::byte*, std::size_t,
+            std::unique_ptr<HostWorkspaceLeasePayload>);
+
+    TtnnDevice* device_ = nullptr;
+    std::byte* data_ = nullptr;
+    std::size_t bytes_ = 0;
+    std::unique_ptr<HostWorkspaceLeasePayload> payload_;
+};
+
+[[nodiscard]] TtnnWorkspaceLease acquire_workspace_lease(
+        TtnnDevice& device, const RawWorkspaceView& workspace);
+
+[[nodiscard]] std::size_t padded_plane_bytes(const ttnn::Tensor& plane);
+
+void raw_download_plane(
+        TtnnDevice& device, const ttnn::Tensor& plane,
+        TtnnWorkspaceLease& workspace);
+void raw_upload_plane(
+        TtnnDevice& device, ttnn::Tensor& plane,
+        TtnnWorkspaceLease& workspace);
+}  // namespace ttnn_detail
+}  // namespace iom
 
 namespace iom::ttnn_detail {
 class TtnnHostStaging;

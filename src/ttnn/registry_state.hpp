@@ -4,14 +4,29 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
+#include <tt-metalium/memory_pin.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
 #include <ttnn/tensor/tensor.hpp>
 
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "testing_internal.hpp"
+
+namespace iom::ttnn_detail {
+
+/**
+ * Host bytes retained by a private raw-workspace submission.  The pin and
+ * keepalive stay together so a failed or otherwise unproved submission can be
+ * quarantined without returning caller storage to the allocator.
+ */
+struct HostWorkspaceLeasePayload {
+    std::shared_ptr<void> keepalive;
+    std::optional<tt::tt_metal::MemoryPin> pin;
+};
+}  // namespace iom::ttnn_detail
 
 namespace iom::ttnn_test {
     // Deterministically pause worker-side binary execution after publication.
@@ -76,17 +91,13 @@ namespace iom::ttnn_test {
     // creations and growths, including replacements after a discarded
     // slot).
     std::size_t host_transfer_staging_allocation_count_for_testing() noexcept;
+    // Counts host workspace mappings released by their owning deleter.  The
+    // focused raw-workspace tests use this to prove a retained owner releases
+    // exactly once after its quarantine is drained.
+    void reset_host_workspace_release_count_for_testing() noexcept;
+    void record_host_workspace_release_for_testing() noexcept;
+    std::size_t host_workspace_release_count_for_testing() noexcept;
 
-    // Native raw-workspace accounting: one native allocation per positive
-    // create_workspace and one native release per retired owning buffer,
-    // whether released directly or by a completed quarantine action. These
-    // symbols always exist so the owning header needs no build-mode split;
-    // outside a testing build they count nothing.
-    void reset_native_workspace_counts_for_testing() noexcept;
-    void record_native_workspace_allocation_for_testing() noexcept;
-    void record_native_workspace_release_for_testing() noexcept;
-    std::size_t native_workspace_allocation_count_for_testing() noexcept;
-    std::size_t native_workspace_release_count_for_testing() noexcept;
 }
 namespace iom::ttnn_detail {
 
@@ -142,7 +153,6 @@ private:
             return;
         }
         workspace_.reset();
-        iom::ttnn_test::record_native_workspace_release_for_testing();
     }
 
     std::vector<ttnn::Tensor> planes_;
@@ -152,4 +162,57 @@ private:
     bool completed_ = false;
 };
 
+/**
+ * Retains a caller-owned host workspace lease until the owning mesh queue has
+ * been proven complete.  If the quarantine cannot be recorded, destruction
+ * deliberately leaks the payload rather than releasing pinned bytes early.
+ */
+class TtnnHostCleanupAction final : public detail::CleanupAction {
+public:
+    TtnnHostCleanupAction(
+            std::unique_ptr<HostWorkspaceLeasePayload> payload,
+            std::function<void()> finish)
+            : payload_(std::move(payload)), finish_(std::move(finish)) {}
+
+    ~TtnnHostCleanupAction() override {
+        if (!completed_) {
+            (void)payload_.release();
+        }
+    }
+
+    void run() noexcept override {
+        if (completed_) {
+            return;
+        }
+        try {
+            if (finish_) {
+                finish_();
+            }
+            payload_.reset();
+            completed_ = true;
+        } catch (...) {
+            if (failure_ == nullptr) {
+                failure_ = std::current_exception();
+            }
+        }
+    }
+
+    [[nodiscard]] bool completed() const noexcept override {
+        return completed_;
+    }
+
+    [[nodiscard]] bool failed() const noexcept override {
+        return static_cast<bool>(failure_);
+    }
+
+    [[nodiscard]] std::exception_ptr failure() const noexcept override {
+        return failure_;
+    }
+
+private:
+    std::unique_ptr<HostWorkspaceLeasePayload> payload_;
+    std::function<void()> finish_;
+    std::exception_ptr failure_;
+    bool completed_ = false;
+};
 }  // namespace iom::ttnn_detail
