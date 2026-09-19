@@ -22,6 +22,7 @@
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "iom/cpu/device.hpp"
@@ -322,7 +323,7 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     CudaDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CUDA", true, true, true);
+            &devices.gate, "CUDA", true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -904,6 +905,39 @@ TEST_CASE("CUDA embedding status transfer failure retires safely") {
 
 }
 
+TEST_CASE("CUDA conformance: RMSNorm reference, admission, and lifetime") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    iom_conformance::RmsNormConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kRmsNormAllLeafSpan,
+            &devices.gate,
+            &oracle};
+    // The CUDA testing seam reaches the real RMSNorm path: the shared GPU
+    // queue dispatch records the submission's completion event on the kernel's
+    // own stream (`Policy::record_event` in src/shared/gpu_queue_operations.inl)
+    // after the shared tiled RMSNorm launch, and that record step is exactly
+    // what `SubmissionFault::event_record` fails, so the fault is consumed by
+    // the real RMSNorm submission and the accepted token fails. The seam is a
+    // counted fault with no consumption accessor, so the shared scenario
+    // proves consumption behaviorally (disarmed control succeeds; armed
+    // accepted token fails and keeps failing; cleared queue recovers).
+    config.native_failure = iom_conformance::RmsNormNativeFailureSeam{
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::event_record);
+            },
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::none);
+            },
+            "cuda_detail::SubmissionFault::event_record",
+            {}};
+    iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 TEST_CASE("CUDA conformance: full shared suite") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
@@ -911,7 +945,7 @@ TEST_CASE("CUDA conformance: full shared suite") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true, true);
+            &devices.gate, &oracle, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 

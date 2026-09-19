@@ -28,6 +28,7 @@
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/ttnn/device.hpp"
@@ -164,11 +165,12 @@ struct TtnnPlaneLayout {
 };
 
 // Builds one native plane's padded row-major host image from the encoded
-// standard model: logical elements at their row-major padded positions and
-// zero padding, optionally planting nonzero sentinels at padded coordinates.
-// Uses only the standard slot arithmetic, independent of the production TTNN
-// copy helper, so the seed path and the padding-mutation probe share one
-// geometry.
+// canonical image: every canonical cell — logical and padded alike — is
+// copied from its own canonical slot, and native cells beyond the canonical
+// padded extents stay zero. Optionally plants nonzero sentinels at further
+// padded coordinates. Uses only the standard slot arithmetic, independent of
+// the production TTNN copy helper, so the seed path, the padding-mutation
+// probe, and the shared padded-physical conformance case share one geometry.
 std::vector<std::byte> padded_plane_image(
         const ttnn::Tensor& plane, const iom::TensorSpec& owner,
         std::size_t plane_index, std::span<const std::byte> encoded,
@@ -190,10 +192,16 @@ std::vector<std::byte> padded_plane_image(
                        ? 2
                        : 4);
     const std::size_t factor = bits > 32 ? 2 : 1;
+    const std::size_t canonical_rows =
+            iom_conformance::canonical_padded_extent(rows);
+    const std::size_t canonical_columns =
+            iom_conformance::canonical_padded_extent(columns);
+    REQUIRE_LE(canonical_rows, padded_rows);
+    REQUIRE_LE(canonical_columns * factor, padded_columns);
     std::vector<std::byte> padded(
             padded_rows * padded_columns * carrier_bytes, std::byte{0});
-    for (std::size_t row = 0; row < rows; ++row) {
-        for (std::size_t column = 0; column < columns; ++column) {
+    for (std::size_t row = 0; row < canonical_rows; ++row) {
+        for (std::size_t column = 0; column < canonical_columns; ++column) {
             const std::size_t slot = iom_conformance::canonical_plane_slot(
                     owner, plane_index, row, column);
             std::uint64_t value = 0;
@@ -893,12 +901,12 @@ TEST_CASE("TTNN conformance: deferred queue lifetime and stability") {
             *devices.candidate, iom::ttnn_supported_data_types());
 }
 
-TEST_CASE("TTNN conformance: compute capabilities and RMSNorm queue") {
+TEST_CASE("TTNN conformance: compute capabilities") {
     require_hardware();
     TtnnDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, iom::ttnn_supported_data_types(), nullptr,
-            "TTNN", true, true, false);
+            "TTNN", true, false);
 }
 TEST_CASE("TTNN RMSNorm BF16 and F32 planes preserve output identity") {
     require_hardware();
@@ -1246,6 +1254,56 @@ TEST_CASE("TTNN embedding owners survive accepted dispatch before wait") {
     }
 }
 
+// TTNN's native RMSNorm path is documented-nonconforming and is measured under
+// its own published expectation policy: docs/BACKEND_CONTRACT.md's **RMS
+// normalization** section records that the preallocated `ttnn::prim::LayerNorm`
+// -backed adapter evaluates a row at BF16 compute fidelity and cannot produce
+// the contract's special value classes. The declared deviations are named here
+// — reduced accumulator fidelity and absent special values — and every element
+// they observe is counted and printed; the frozen comparison policy still
+// applies to the finite BF16 leaves, to every admission, workspace, alias,
+// overflow, ownership, ordering, and retained-failure case, and to all four
+// other backends, none of which declares any deviation.
+TEST_CASE("TTNN conformance: RMSNorm documented BF16-fidelity policy") {
+    require_hardware();
+    TtnnDevices devices;
+    TtnnStorageOracle oracle;
+    iom_conformance::RmsNormComparisonRecord record;
+    iom_conformance::RmsNormConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kRmsNormWideLeafSpan,
+            nullptr,
+            &oracle,
+            iom_conformance::RmsNormComparisonMode{false, false},
+            &record};
+    // TTNN exposes no testing seam that reaches its RMSNorm path: every
+    // `iom::ttnn_test` fault is copy-, binary-, or host-transfer-specific
+    // (`fail_next_copy_finishes_for_testing`,
+    // `fail_next_binary_outcome_insertion_for_testing`,
+    // `fail_next_host_transfer_submission_for_testing`, ...) while
+    // `TtnnQueue::execute_rmsnorm` carries no fault point, so no existing seam
+    // can produce an accepted RMSNorm failure. The harness records the gap
+    // explicitly. The minimal test-only seam that would close it is a
+    // rmsnorm-scoped finish/outcome fault consumed in the rmsnorm outcome or
+    // completion path under the existing `IOM_ENABLE_TESTING` guard.
+    config.native_failure = iom_conformance::RmsNormNativeFailureSeam{
+            {},
+            {},
+            "iom::ttnn_test",
+            "no existing TTNN testing seam reaches execute_rmsnorm; the seams "
+            "are copy/binary/host-transfer specific"};
+    iom_conformance::run_rmsnorm_conformance(config);
+    std::printf(
+            "ttnn-rmsnorm-fidelity-record policy=documented-bf16-native "
+            "fp32_finite=reduced_fidelity special_values=absent "
+            "observed_precision_elements=%zu "
+            "observed_special_value_elements=%zu\n",
+            record.observed_precision_elements,
+            record.observed_special_value_elements);
+    CHECK_GT(record.observed_precision_elements, std::size_t{0});
+    CHECK_GT(record.observed_special_value_elements, std::size_t{0});
+}
+
 TEST_CASE("TTNN conformance: full shared suite") {
     require_hardware();
     TtnnDevices devices;
@@ -1254,7 +1312,7 @@ TEST_CASE("TTNN conformance: full shared suite") {
     TtnnStorageOracle oracle;
     iom_conformance::run_backend_conformance(
             devices.conformance(), supported.subspan(0, 1), nullptr, &oracle,
-            true, std::nullopt, false);
+            true, false);
 }
 
 TEST_CASE("TTNN conformance: binary MUL SUB and floating DIV values through real queue") {

@@ -555,7 +555,20 @@ IOM_GPU_DEVICE void rmsnorm_tiled_row(
                                     scale_bit + index * bits, bits),
                             format);
                     const Carrier normalized = feature * inverse;
-                    const Carrier scaled = normalized * scale;
+                    Carrier scaled = normalized * scale;
+                    // Contract clause 3 and 9: a NaN result is stored in its
+                    // canonical positive form by clearing its sign before the
+                    // single destination encode. NaN payloads and NaN signs
+                    // are outside the contract, and only the positive
+                    // canonical form also satisfies the published comparison
+                    // for the narrow finite-only leaves, where a NaN
+                    // saturates to a finite encoding instead of a NaN one.
+                    // The CPU port applies the identical rule, so every
+                    // backend encodes the same result independently of the
+                    // device's invalid-operation NaN sign.
+                    if (RmsnormCodecOf<Carrier>::traits::isnan(scaled)) {
+                        scaled = RmsnormCodecOf<Carrier>::traits::fabs(scaled);
+                    }
                     const std::uint64_t encoded =
                             Codec::encode(scaled, format);
                     const std::uint64_t overlap_first =

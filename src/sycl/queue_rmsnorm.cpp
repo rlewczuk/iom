@@ -299,7 +299,18 @@ void rmsnorm_row(
                 rmsnorm_load_bits(scale, scale_offset, metadata.bits),
                 format);
         const Accumulator normalized = feature * inverse;
-        const Accumulator scaled = normalized * factor;
+        Accumulator scaled = normalized * factor;
+        // Contract clause 3 and 9: a NaN result is stored in its canonical
+        // positive form by clearing its sign before the single destination
+        // encode. NaN payloads and NaN signs are outside the contract, and
+        // only the positive canonical form also satisfies the published
+        // comparison for the narrow finite-only leaves, where a NaN saturates
+        // to a finite encoding instead of a NaN one. The CPU port applies the
+        // identical rule, so every backend encodes the same result
+        // independently of the device's invalid-operation NaN sign.
+        if (RmsnormTraits<Accumulator>::isnan(scaled)) {
+            scaled = RmsnormTraits<Accumulator>::fabs(scaled);
+        }
         const std::uint64_t out_offset =
                 rmsnorm_plane_slot(
                         out_plane, row, column, metadata.rows,
