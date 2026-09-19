@@ -303,6 +303,13 @@ struct gpu_policy {
         return "HIP kernel launch";
     }
 
+    // Cache-row append is a direct raw-word update over the queue's existing
+    // nonblocking stream.  The request is an immutable common snapshot; the
+    // ROCm wrapper derives a compact device descriptor and launches no staging
+    // or workspace allocation.
+    template <typename Request>
+    static void launch_cache_append(
+            stream_type stream, const Request& request);
     // RMSNorm seams. The complete backend-parameterized device operation
     // lives in src/shared/standard_tiled_rmsnorm.inl; the ROCm RMSNorm
     // wrapper leaf launches it on the queue's existing nonblocking stream.
