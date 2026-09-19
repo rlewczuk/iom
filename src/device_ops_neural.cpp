@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <cmath>
 
 namespace iom {
 
@@ -95,6 +96,213 @@ namespace iom {
             }
         }
 
+        constexpr const char* kRopeContext = "ROPE";
+        constexpr std::size_t kRopeMaxPosition =
+                (std::size_t{1} << 24) - 1;
+        constexpr WorkspaceRequirements kRopeWorkspaceRequirements{0, 1};
+
+        bool rope_leaf(DataType value) noexcept {
+            switch (value) {
+                case DataType::F4_E2M1:
+                case DataType::F6_E2M3:
+                case DataType::F6_E3M2:
+                case DataType::F8_E4M3FN:
+                case DataType::F8_E5M2:
+                case DataType::F16:
+                case DataType::BF16:
+                case DataType::F32:
+                case DataType::F64:
+                    return true;
+                case DataType::BOOL:
+                case DataType::I2:
+                case DataType::U2:
+                case DataType::I4:
+                case DataType::U4:
+                case DataType::I8:
+                case DataType::U8:
+                case DataType::I16:
+                case DataType::U16:
+                case DataType::I32:
+                case DataType::U32:
+                case DataType::I64:
+                case DataType::U64:
+                case DataType::F8_E8M0:
+                    return false;
+            }
+            return false;
+        }
+
+
+        void reject_rope_output_overlap(
+                BackendKind backend,
+                const TensorView& out,
+                const detail::CheckedViewFacts& out_facts,
+                const TensorView& input,
+                const detail::CheckedViewFacts& input_facts) {
+            if (out.owner_identity() == input.owner_identity()) {
+                throw std::invalid_argument(
+                        "ROPE output aliases an input owner");
+            }
+            const void* const out_handle = out.native_handle();
+            const void* const input_handle = input.native_handle();
+            if (out_handle == input_handle) {
+                throw std::invalid_argument(
+                        "ROPE output shares an input storage handle");
+            }
+            if (backend == BackendKind::TTNN) {
+                return;
+            }
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out_handle);
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input_handle);
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_facts.storage_bytes > limit - out_begin
+                    || input_facts.storage_bytes > limit - input_begin) {
+                throw std::overflow_error("ROPE storage range overflows");
+            }
+            if (out_begin < input_begin + input_facts.storage_bytes
+                    && input_begin < out_begin + out_facts.storage_bytes) {
+                throw std::invalid_argument(
+                        "ROPE output storage range overlaps an input");
+            }
+        }
+        struct RopeValidationFacts {
+            detail::CheckedViewFacts x;
+            detail::CheckedViewFacts out;
+        };
+
+        /*
+         * Complete common RoPE admission. This path intentionally only
+         * inspects host metadata: no snapshots, registrations, leases,
+         * sequence reservation, queue submission, or data access occur here.
+         * Submission and the pure requirement query call this same validator
+         * before their respective capability hooks.
+         */
+        RopeValidationFacts validate_rope(
+                const Device& device, const TensorView& x,
+                const TensorView& out, std::size_t a, double theta) {
+            validate_checked_spec(x.spec(), kRopeContext);
+            validate_checked_spec(out.spec(), kRopeContext);
+            const std::span<const std::size_t> x_dimensions =
+                    x.spec().shape.dimensions();
+            const std::span<const std::size_t> out_dimensions =
+                    out.spec().shape.dimensions();
+            const std::size_t rank = x_dimensions.size();
+            if (rank < 3 || rank > detail::kMaxTensorRank
+                    || out_dimensions.size() != rank) {
+                throw std::invalid_argument(
+                        "ROPE requires rank three through eight");
+            }
+            for (std::size_t axis = 0; axis < rank; ++axis) {
+                if (x_dimensions[axis] != out_dimensions[axis]) {
+                    throw std::invalid_argument(
+                            "ROPE input and output shapes must match");
+                }
+            }
+
+            const std::size_t heads = x_dimensions[rank - 3];
+            const std::size_t rows = x_dimensions[rank - 2];
+            const std::size_t width = x_dimensions[rank - 1];
+            if (heads == 0 || rows == 0 || width == 0) {
+                throw std::invalid_argument(
+                        "ROPE head, row, and width extents must be nonzero");
+            }
+            if ((width & 1U) != 0) {
+                throw std::invalid_argument(
+                        "ROPE final width must be positive and even");
+            }
+
+            // Exact queue/device, owner, native-handle, transformed-leading
+            // bounds, and checked view arithmetic precede aliases and leaf
+            // capability. The facts are also retained in each snapshot.
+            const detail::CheckedViewFacts x_facts =
+                    validate_checked_view(device, x, kRopeContext);
+            const detail::CheckedViewFacts out_facts =
+                    validate_checked_view(device, out, kRopeContext);
+
+            // Repeat all operation-owned shape, tile, and logical-address
+            // products explicitly so no backend adapter receives an
+            // unchecked intermediate.
+            std::size_t leading_planes = 1;
+            for (std::size_t axis = 0; axis + 3 < rank; ++axis) {
+                leading_planes = detail::checked_mul(
+                        leading_planes, x_dimensions[axis],
+                        "ROPE leading plane count overflows");
+            }
+            const std::size_t plane_count = detail::checked_mul(
+                    leading_planes, heads, "ROPE plane count overflows");
+            const std::size_t row_width = detail::checked_mul(
+                    rows, width, "ROPE row element count overflows");
+            const std::size_t logical_elements = detail::checked_mul(
+                    plane_count, row_width,
+                    "ROPE logical element count overflows");
+            const std::size_t half_width = width / 2;
+            (void)detail::checked_mul(
+                    plane_count, detail::checked_mul(
+                            rows, half_width,
+                            "ROPE pair count overflows"),
+                    "ROPE pair count overflows");
+            const std::size_t padded_rows = detail::padded_extent(
+                    rows, "ROPE padded row extent overflows");
+            const std::size_t padded_width = detail::padded_extent(
+                    width, "ROPE padded width extent overflows");
+            const std::size_t padded_plane = detail::checked_mul(
+                    padded_rows, padded_width,
+                    "ROPE padded tile size overflows");
+            (void)detail::checked_mul(
+                    plane_count, padded_plane,
+                    "ROPE padded storage element count overflows");
+            (void)detail::checked_mul(
+                    logical_elements, detail::leaf_bits(x.spec().data_type),
+                    "ROPE logical bit count overflows");
+
+            // Position arithmetic and its binary32 representability bound are
+            // part of checked shape/address admission, before alias and theta
+            // policy checks.
+            const std::size_t last_position = detail::checked_add(
+                    a, rows - 1, "ROPE position range overflows");
+            if (last_position > kRopeMaxPosition) {
+                throw std::invalid_argument(
+                        "ROPE position exceeds the binary32 bound");
+            }
+            const float narrowed_position =
+                    static_cast<float>(last_position);
+            if (!std::isfinite(narrowed_position)) {
+                throw std::overflow_error(
+                        "ROPE position narrowing overflows");
+            }
+
+            reject_rope_output_overlap(
+                    device.backend_kind(), out, out_facts, x, x_facts);
+
+            if (!std::isfinite(theta)
+                    || theta < 1.0
+                    || theta
+                            > static_cast<double>(
+                                    std::numeric_limits<float>::max())) {
+                throw std::invalid_argument(
+                        "ROPE theta must be finite in [1,float_max]");
+            }
+            const float narrowed_theta = static_cast<float>(theta);
+            if (!std::isfinite(narrowed_theta) || narrowed_theta < 1.0F) {
+                throw std::overflow_error(
+                        "ROPE theta narrowing overflows");
+            }
+
+            if (x.spec().data_type != out.spec().data_type
+                    || x.spec().quantization != out.spec().quantization) {
+                throw std::invalid_argument(
+                        "ROPE input and output specifications must match");
+            }
+            if (x.spec().quantization != QuantizationFormat::NONE
+                    || !rope_leaf(x.spec().data_type)) {
+                throw UnsupportedOperation();
+            }
+            return {x_facts, out_facts};
+        }
+
     }  // namespace
 
     DeviceOps::LinearViewSnapshot DeviceOps::snapshot_linear_view(
@@ -104,6 +312,33 @@ namespace iom {
                 const_cast<void*>(view.native_handle()), view.plane_offset(),
                 {view.plane_strides().begin(), view.plane_strides().end()}};
     }
+    DeviceOps::RopeViewSnapshot DeviceOps::snapshot_rope_view(
+            const TensorView& view,
+            const detail::CheckedViewFacts& facts) {
+        RopeViewSnapshot snapshot;
+        snapshot.rank = view.spec().shape.rank();
+        const std::span<const std::size_t> dimensions =
+                view.spec().shape.dimensions();
+        for (std::size_t axis = 0; axis < dimensions.size(); ++axis) {
+            snapshot.dimensions[axis] = dimensions[axis];
+        }
+        const std::span<const std::size_t> strides = view.plane_strides();
+        for (std::size_t axis = 0; axis < strides.size(); ++axis) {
+            snapshot.plane_strides[axis] = strides[axis];
+        }
+        snapshot.plane_offset = view.plane_offset();
+        snapshot.data_type = view.spec().data_type;
+        snapshot.quantization = view.spec().quantization;
+        snapshot.device_identity = &view.device();
+        snapshot.owner_identity = view.owner_identity();
+        snapshot.native_handle = const_cast<void*>(view.native_handle());
+        snapshot.max_plane = facts.max_plane;
+        snapshot.addressed_bytes = facts.addressed_bytes;
+        snapshot.storage_bytes = facts.storage_bytes;
+        snapshot.logical_bytes = facts.logical_bytes;
+        return snapshot;
+    }
+
 
     void DeviceOps::validate_linear(
             const Device& device, const TensorView& x, const TensorView& w,
@@ -266,6 +501,15 @@ namespace iom {
             std::size_t) {
         throw UnsupportedOperation();
     }
+    oid DeviceOps::rope_impl(const RopeRequest&) {
+        throw UnsupportedOperation();
+    }
+
+    WorkspaceRequirements DeviceOps::rope_workspace_requirements(
+            const RopeRequest&) {
+        throw UnsupportedOperation();
+    }
+
 
     oid DeviceOps::sdpa_impl(
             const TensorView&, const TensorView&, const TensorView&,
@@ -315,6 +559,62 @@ namespace iom {
             return invoke_failure(std::current_exception());
         }
     }
+    oid DeviceOps::rope(
+            const TensorView& x, TensorView& out, std::size_t a,
+            double theta, RawWorkspaceView workspace) noexcept {
+        try {
+            const Device& device = queue_device();
+            const RopeValidationFacts validation =
+                    validate_rope(device, x, out, a, theta);
+
+            // Capability is intentionally queried before the supplied
+            // workspace. The default unsupported hook therefore returns
+            // Unsupported without inspecting an otherwise foreign or
+            // malformed workspace.
+            const RopeRequest capability_request{
+                    snapshot_rope_view(x, validation.x),
+                    snapshot_rope_view(out, validation.out), a, theta};
+            const WorkspaceRequirements requirements =
+                    rope_workspace_requirements(capability_request);
+            if (requirements != kRopeWorkspaceRequirements) {
+                throw std::invalid_argument(
+                        "ROPE workspace requirement must be exactly {0,1}");
+            }
+            if (!workspace.empty()) {
+                throw std::invalid_argument(
+                        "ROPE consumes no raw workspace, so the supplied "
+                        "workspace view must be empty");
+            }
+            const std::array<TensorView, 2> operands{x, out};
+            const RawWorkspaceView validated_workspace =
+                    detail::WorkspaceValidation::validated(
+                            device, workspace, requirements.bytes,
+                            requirements.alignment, operands);
+            return invoke(rope_impl(RopeRequest{
+                    capability_request.x, capability_request.out, a, theta,
+                    validated_workspace, requirements, {}}));
+        } catch (...) {
+            return invoke_failure(std::current_exception());
+        }
+    }
+
+    WorkspaceRequirements DeviceOps::rope_workspace_requirements(
+            const TensorView& x, const TensorView& out, std::size_t a,
+            double theta) {
+        const RopeValidationFacts validation =
+                validate_rope(queue_device(), x, out, a, theta);
+        const RopeRequest request{
+                snapshot_rope_view(x, validation.x),
+                snapshot_rope_view(out, validation.out), a, theta};
+        const WorkspaceRequirements requirements =
+                rope_workspace_requirements(request);
+        if (requirements != kRopeWorkspaceRequirements) {
+            throw std::invalid_argument(
+                    "ROPE workspace requirement must be exactly {0,1}");
+        }
+        return requirements;
+    }
+
 
     WorkspaceRequirements DeviceOps::linear_workspace_requirements(
             const TensorView& x, const TensorView& w, const TensorView& out,

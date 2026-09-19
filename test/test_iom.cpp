@@ -1394,6 +1394,103 @@ public:
         return submit([](std::uint64_t) {});
     }
 };
+/*
+ * A tiny ported queue used only to exercise the common immutable RoPE
+ * request and prepared two-owner adapter. It performs no numerical work.
+ */
+class RopeQueue final : public iom::DeviceOps {
+public:
+    struct Record {
+        std::uint64_t sequence;
+        iom::DeviceOps::RopeViewSnapshot x;
+        iom::DeviceOps::RopeViewSnapshot out;
+        std::size_t a;
+        double theta;
+        iom::WorkspaceRequirements workspace_requirements;
+        iom::detail::BinaryEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
+        bool retained_failure;
+    };
+
+    explicit RopeQueue(const iom::Device& device)
+            : iom::DeviceOps(device) {}
+
+    using iom::DeviceOps::complete;
+    using iom::DeviceOps::rope_workspace_requirements;
+
+    [[nodiscard]] std::string_view backend_label() const noexcept override {
+        return "rope-test";
+    }
+
+    [[nodiscard]] const std::vector<Record>& records() const noexcept {
+        return records_;
+    }
+
+    void inject_failure() noexcept {
+        next_failure_ = true;
+    }
+
+    void finish(std::uint64_t sequence) {
+        for (const Record& record : records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_binary_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            iom::detail::complete_workspace_lease(
+                    registry_state_, record.workspace_lease, true);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake ROPE sequence");
+    }
+
+    [[nodiscard]] std::size_t registered_at(const void* address) const {
+        return registry_state_.registry
+                .snapshot_for(const_cast<void*>(address))
+                .size();
+    }
+
+protected:
+    [[nodiscard]] iom::WorkspaceRequirements rope_workspace_requirements(
+            const RopeRequest&) override {
+        return {0, 1};
+    }
+
+    iom::oid rope_impl(const RopeRequest& request) override {
+        const bool retained_failure = std::exchange(next_failure_, false);
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_rope(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, retained_failure](
+                        std::uint64_t sequence, const RopeRequest& snapshot,
+                        iom::detail::BinaryEntryRegistration entries) {
+                    records_.push_back(Record{
+                            sequence, snapshot.x, snapshot.out, snapshot.a,
+                            snapshot.theta,
+                            snapshot.workspace_requirements, entries,
+                            snapshot.workspace_lease, retained_failure});
+                    if (retained_failure) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake ROPE retained failure")));
+                    }
+                });
+    }
+
+private:
+    iom::detail::RegistryState registry_state_;
+    iom::detail::QueueId registry_queue_id_ =
+            iom::detail::allocate_queue_id(registry_state_);
+    std::vector<Record> records_;
+    bool next_failure_ = false;
+};
+
 
 class InlineQueue final : public iom::DeviceOps {
 public:
@@ -1531,7 +1628,7 @@ private:
     void* address_;
 };
 
-class FakeDevice final : public iom::Device {
+class FakeDevice : public iom::Device {
 public:
     using iom::Device::Device;
 
@@ -1566,6 +1663,15 @@ public:
     // The deterministic deferred queue stands in for the concrete backends.
     [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
         return std::make_unique<FakeQueue>(*this);
+    }
+};
+
+class OpaqueTtnnDevice final : public FakeDevice {
+public:
+    using FakeDevice::FakeDevice;
+
+    [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
+        return iom::BackendKind::TTNN;
     }
 };
 TEST_CASE("DeviceOps parks unavailable admission without recursive retry") {
@@ -2520,6 +2626,17 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         iom::WorkspaceRequirements (DeviceOps::*)(const TensorView&,
                                 const TensorView&, const TensorView&, float)>);
     static_assert(std::is_same_v<
+        decltype(&DeviceOps::rope),
+        iom::oid (DeviceOps::*)(const TensorView&, TensorView&,
+                                std::size_t, double,
+                                iom::RawWorkspaceView) noexcept>);
+    using RopeQuery = iom::WorkspaceRequirements (DeviceOps::*)(
+            const TensorView&, const TensorView&, std::size_t, double);
+    static_assert(std::is_same_v<
+        decltype(static_cast<RopeQuery>(
+                &DeviceOps::rope_workspace_requirements)),
+        RopeQuery>);
+    static_assert(std::is_same_v<
         decltype(&DeviceOps::sdpa),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
                                 const TensorView&, size_t, size_t, size_t,
@@ -2562,6 +2679,15 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         decltype(&DeviceOps::rmsnorm_workspace_requirements), DeviceOps*,
         const TensorView&, const TensorView&, const TensorView&, float,
         iom::RawWorkspaceView>);
+    // RoPE has no Tensor overload, alternate argument order, or workspace
+    // parameter on its requirement query.
+    static_assert(!std::is_invocable_v<
+        decltype(&DeviceOps::rope), DeviceOps*, const iom::Tensor&,
+        iom::Tensor&, std::size_t, double>);
+    static_assert(!std::is_invocable_v<
+        RopeQuery, DeviceOps*, const TensorView&, const TensorView&,
+        std::size_t, double, iom::RawWorkspaceView>);
+
 
     // The linear cutover keeps exactly the layout-aware argument list. The
     // old three-view call form, any Tensor operand overload, and a
@@ -3484,6 +3610,214 @@ iom::RawWorkspaceView dead_workspace_view(iom::Device& device) {
 }
 
 }  // namespace
+
+TEST_CASE("RoPE admission precedes capability and leaves unported hooks unsupported") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid overflow = iom::to_oid(iom::OidError::Overflow);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    FakeDevice device;
+    FakeDevice foreign;
+    UnportedQueue queue(device);
+
+    OwnedFakeTensor x(device, {2, 3, 4, 16});
+    OwnedFakeTensor out(device, {2, 3, 4, 16});
+    FakeWorkspace small(device, reinterpret_cast<void*>(0x4712), 16);
+    FakeWorkspace foreign_workspace(
+            foreign, reinterpret_cast<void*>(0x4712), 64);
+
+    CHECK_EQ(queue.rope(x.view(), out.view(), 0, 1.0), unsupported);
+    CHECK_EQ(
+            queue.rope(x.view(), out.view(), 0, 1.0, small.view()),
+            unsupported);
+    CHECK_EQ(
+            queue.rope(
+                    x.view(), out.view(), 0, 1.0,
+                    foreign_workspace.view()),
+            unsupported);
+    CHECK_THROWS_AS(
+            (void)queue.rope_workspace_requirements(
+                    x.view(), out.view(), 0, 1.0),
+            std::runtime_error);
+
+    OwnedFakeTensor rank_two(device, {4, 16});
+    OwnedFakeTensor rank_two_out(device, {4, 16});
+    CHECK_EQ(
+            queue.rope(rank_two.view(), rank_two_out.view(), 0, 1.0),
+            invalid);
+
+    OwnedFakeTensor odd(device, {2, 3, 4, 15});
+    OwnedFakeTensor odd_out(device, {2, 3, 4, 15});
+    CHECK_EQ(queue.rope(odd.view(), odd_out.view(), 0, 1.0), invalid);
+    CHECK_EQ(queue.rope(x.view(), out.view(), 0, 0.5), invalid);
+    CHECK_EQ(
+            queue.rope(
+                    x.view(), out.view(), 0,
+                    std::numeric_limits<double>::quiet_NaN()),
+            invalid);
+    CHECK_EQ(
+            queue.rope(
+                    x.view(), out.view(), 0,
+                    static_cast<double>(
+                            std::numeric_limits<float>::max())
+                            * 2.0),
+            invalid);
+
+    OwnedFakeTensor two_rows(device, {2, 3, 2, 16});
+    OwnedFakeTensor two_rows_out(device, {2, 3, 2, 16});
+    CHECK_THROWS_AS(
+            (void)queue.rope_workspace_requirements(
+                    two_rows.view(), two_rows.view(),
+                    std::numeric_limits<std::size_t>::max(), 1.0),
+            std::overflow_error);
+    CHECK_THROWS_AS(
+            (void)queue.rope_workspace_requirements(
+                    two_rows.view(), two_rows_out.view(),
+                    std::numeric_limits<std::size_t>::max(), 0.5),
+            std::overflow_error);
+    CHECK_EQ(
+            queue.rope(
+                    two_rows.view(), two_rows.view(),
+                    std::numeric_limits<std::size_t>::max(), 1.0),
+            overflow);
+    CHECK_EQ(
+            queue.rope(
+                    two_rows.view(), two_rows_out.view(),
+                    std::numeric_limits<std::size_t>::max(), 1.0),
+            overflow);
+    CHECK_EQ(
+            queue.rope(
+                    x.view(), out.view(), std::size_t{1} << 24, 1.0),
+            invalid);
+    CHECK_EQ(queue.rope(x.view(), x.view(), 0, 1.0), invalid);
+    OwnedFakeTensor foreign_out(foreign, {2, 3, 4, 16});
+    CHECK_EQ(queue.rope(x.view(), foreign_out.view(), 0, 1.0), invalid);
+
+    OwnedFakeTensor boolean_x(device, {2, 3, 4, 16}, iom::DataType::BOOL);
+
+    OwnedFakeTensor boolean_out(device, {2, 3, 4, 16}, iom::DataType::BOOL);
+    CHECK_EQ(
+            queue.rope(boolean_x.view(), boolean_out.view(), 0, 1.0),
+            unsupported);
+
+    // Every rejection is pre-admission: the first accepted queue operation
+    // still receives sequence one.
+    CHECK_EQ(token_sequence(queue.probe()), 1);
+}
+TEST_CASE("RoPE treats TTNN native handles as opaque storage") {
+    OpaqueTtnnDevice device;
+    RopeQueue queue(device);
+    FakeTensor x(
+            make_spec({2, 3, 4, 16}, iom::DataType::F32), device);
+    FakeTensor out(
+            make_spec({2, 3, 4, 16}, iom::DataType::F32), device);
+    // These deliberately overlapping numeric host intervals model two
+    // distinct TTNN wrapper-array handles; their device payloads are opaque.
+    x.use_storage_handle(reinterpret_cast<void*>(0x1000));
+    out.use_storage_handle(reinterpret_cast<void*>(0x2000));
+
+    CHECK(
+            queue.rope_workspace_requirements(
+                    x.view(), out.view(), 0, 1.0)
+            == iom::WorkspaceRequirements{0, 1});
+    const iom::oid token = queue.rope(x.view(), out.view(), 0, 1.0);
+    REQUIRE(iom::oid_is_token(token));
+    queue.finish(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+}
+
+TEST_CASE("RoPE query is pure and accepted requests retain fixed snapshots") {
+    FakeDevice device;
+    RopeQueue queue(device);
+    OwnedFakeTensor x(device, {2, 3, 4, 16});
+    OwnedFakeTensor out(device, {2, 3, 4, 16});
+    const iom::WorkspaceRequirements zero{0, 1};
+
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements queried =
+            queue.rope_workspace_requirements(
+                    x.view(), out.view(), 15, 1.25);
+    const std::size_t query_allocations = iom_test::disarm();
+    CHECK_EQ(query_allocations, std::size_t{0});
+    CHECK(queried == zero);
+    CHECK(queue.records().empty());
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+
+    const std::vector<std::size_t> x_strides(
+            x.view().plane_strides().begin(),
+            x.view().plane_strides().end());
+    const iom::oid token = queue.rope(x.view(), out.view(), 15, 1.25);
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.records().size(), std::size_t{1});
+    const RopeQueue::Record& record = queue.records().back();
+    CHECK_EQ(record.sequence, token_sequence(token));
+    CHECK_EQ(record.x.rank, std::size_t{4});
+    CHECK_EQ(
+            std::vector<std::size_t>(
+                    record.x.shape_dimensions().begin(),
+                    record.x.shape_dimensions().end()),
+            std::vector<std::size_t>({2, 3, 4, 16}));
+    CHECK_EQ(
+            std::vector<std::size_t>(
+                    record.x.leading_plane_strides().begin(),
+                    record.x.leading_plane_strides().end()),
+            x_strides);
+    CHECK_EQ(record.x.plane_offset, x.view().plane_offset());
+    CHECK(record.x.device_identity == &device);
+    CHECK(record.x.owner_identity == x.view().owner_identity());
+    CHECK(record.x.native_handle == x.view().native_handle());
+    CHECK_EQ(record.a, std::size_t{15});
+    CHECK(record.theta == 1.25);
+    CHECK(record.workspace_requirements == zero);
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 1);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 1);
+
+    iom_test::arm_counting();
+    CHECK(queue.rope_workspace_requirements(
+                  x.view(), out.view(), 16, 1.25)
+          == zero);
+    CHECK_EQ(iom_test::disarm(), std::size_t{0});
+    CHECK_EQ(queue.records().size(), std::size_t{1});
+
+    // Caller-owned view metadata can change after admission without changing
+    // the fixed callback snapshot or owner registration.
+    const_cast<std::size_t*>(x.view().plane_strides().data())[0] = 99;
+    CHECK_EQ(record.x.plane_strides[0], x_strides[0]);
+    const_cast<std::size_t*>(x.view().plane_strides().data())[0] =
+            x_strides[0];
+
+    queue.finish(token_sequence(token));
+    CHECK_EQ(queue.registered_at(x.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(out.view().native_handle()), 0);
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_NOTHROW(queue.wait(token));
+
+    FakeWorkspace workspace(device, reinterpret_cast<void*>(0x4800), 64);
+    const iom::oid rejected =
+            queue.rope(x.view(), out.view(), 0, 1.0, workspace.view());
+    CHECK_EQ(rejected, iom::to_oid(iom::OidError::InvalidArgument));
+    const iom::oid after_rejection = queue.rope(x.view(), out.view(), 0, 1.0);
+    REQUIRE(iom::oid_is_token(after_rejection));
+    CHECK_EQ(token_sequence(after_rejection), 2);
+    queue.finish(token_sequence(after_rejection));
+    CHECK_NOTHROW(queue.wait(after_rejection));
+}
+
+TEST_CASE("RoPE accepted failures remain repeatable after completion") {
+    FakeDevice device;
+    RopeQueue queue(device);
+    OwnedFakeTensor x(device, {1, 2, 1, 16});
+    OwnedFakeTensor out(device, {1, 2, 1, 16});
+    queue.inject_failure();
+    const iom::oid token = queue.rope(x.view(), out.view(), 17, 1.0);
+    REQUIRE(iom::oid_is_token(token));
+    queue.finish(token_sequence(token));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        CHECK_THROWS_WITH_AS(
+                queue.wait(token), "fake ROPE retained failure",
+                std::runtime_error);
+    }
+}
 
 TEST_CASE("Embedding admission precedes capability and leaves unported hooks unsupported") {
     const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
