@@ -11,8 +11,8 @@
 // for the shared types and on backend_conformance_copy_storage.hpp for
 // the storage-and-copy scenarios referenced by the suite dispatcher.
 
-#include "backend/backend_conformance_copy_storage.hpp"
-#include "backend/backend_conformance_memory.hpp"
+#include "backend_conformance_copy_storage.hpp"
+#include "backend_conformance_memory.hpp"
 
 #include <algorithm>
 #include <chrono>

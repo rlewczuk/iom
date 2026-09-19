@@ -5,7 +5,7 @@
 // encoder that shares no arithmetic with production mapping; backend drivers
 // provide the native access.
 
-#include "backend/backend_conformance_common.hpp"
+#include "backend_conformance_common.hpp"
 
 #include <functional>
 #include <cstdint>
@@ -363,6 +363,98 @@ inline std::size_t swap_first_adjacent_slots(std::size_t logical) {
         return 0;
     }
     return logical;
+}
+
+inline std::vector<std::byte> encode_cache_append_storage(
+        const iom::TensorSpec& spec, std::uint64_t salt,
+        std::byte padding = std::byte{0xD7}) {
+    spec.validate();
+    const std::size_t bits = bits_of(spec.data_type);
+    const std::size_t logical_count = spec.shape.element_count();
+    std::vector<std::byte> storage(
+            spec.tiled_storage_nbytes(), padding);
+    const std::span<const std::size_t> dimensions =
+            spec.shape.dimensions();
+    std::vector<std::size_t> coordinates(dimensions.size());
+    for (std::size_t linear = 0; linear < logical_count; ++linear) {
+        std::size_t rest = linear;
+        for (std::size_t axis = dimensions.size(); axis-- > 0;) {
+            coordinates[axis] = rest % dimensions[axis];
+            rest /= dimensions[axis];
+        }
+        const std::size_t slot = canonical_layout_slot(
+                spec, std::span<const std::size_t>{coordinates});
+        write_storage_bits(
+                storage.data(), slot * bits, bits,
+                cache_append_element_pattern(
+                        spec.data_type, linear, salt));
+    }
+    return storage;
+}
+
+// Apply the cache-row mapping to an independent physical owner model. The
+// source and destination views may have arbitrary leading-only transforms; the
+// final two coordinates remain the row/feature axes. Only addressed logical
+// elements are written, so destination padding and every untouched row retain
+// their seeded sentinels.
+inline void apply_cache_append_storage(
+        const iom::TensorView& source_view,
+        const iom::TensorSpec& source_owner,
+        const iom::TensorView& destination_view,
+        const iom::TensorSpec& destination_owner,
+        std::size_t a,
+        std::span<const std::byte> source_storage,
+        std::span<std::byte> destination_storage) {
+    const std::span<const std::size_t> source_dimensions =
+            source_view.spec().shape.dimensions();
+    const std::span<const std::size_t> destination_dimensions =
+            destination_view.spec().shape.dimensions();
+    if (source_dimensions.size() != destination_dimensions.size()
+            || source_view.spec().data_type
+                    != destination_view.spec().data_type
+            || source_storage.size() != source_owner.tiled_storage_nbytes()
+            || destination_storage.size()
+                    != destination_owner.tiled_storage_nbytes()) {
+        throw std::invalid_argument(
+                "cache append storage model has mismatched operands");
+    }
+    const std::size_t rank = source_dimensions.size();
+    if (rank < 3) {
+        throw std::invalid_argument(
+                "cache append storage model has an invalid rank");
+    }
+    const std::size_t destination_rows = destination_dimensions[rank - 2];
+    if (source_dimensions[rank - 3]
+                    != destination_dimensions[rank - 3]
+            || source_dimensions.back() != destination_dimensions.back()
+            || a > destination_rows
+            || source_dimensions[rank - 2] > destination_rows - a) {
+        throw std::invalid_argument(
+                "cache append storage model has an invalid row range");
+    }
+    const std::size_t bits = bits_of(source_view.spec().data_type);
+    const std::size_t source_rows = source_dimensions[rank - 2];
+    const std::size_t features = source_dimensions.back();
+    const std::size_t count = source_view.spec().shape.element_count();
+    for (std::size_t linear = 0; linear < count; ++linear) {
+        std::size_t rest = linear;
+        const std::size_t column = rest % features;
+        rest /= features;
+        const std::size_t row = rest % source_rows;
+        rest /= source_rows;
+        const std::size_t destination_linear =
+                (rest * destination_rows + a + row)
+                        * features + column;
+        const std::size_t source_slot = standard_layout_view_slot(
+                source_view, source_owner, linear);
+        const std::size_t destination_slot = standard_layout_view_slot(
+                destination_view, destination_owner, destination_linear);
+        const std::uint64_t value = read_storage_bits(
+                source_storage.data(), source_slot * bits, bits);
+        write_storage_bits(
+                destination_storage.data(), destination_slot * bits, bits,
+                value);
+    }
 }
 
 }  // namespace iom_conformance

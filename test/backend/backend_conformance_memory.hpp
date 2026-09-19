@@ -3,7 +3,7 @@
 // Backend-neutral memory, admission, rank, and workspace contract. No backend
 // kind or runtime header is used here.
 
-#include "backend/backend_conformance_common.hpp"
+#include "backend_conformance_common.hpp"
 
 #include <algorithm>
 #include <array>

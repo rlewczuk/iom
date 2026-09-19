@@ -140,6 +140,55 @@ inline std::uint64_t element_pattern(
     }
     return raw & ((std::uint64_t{1} << bits) - 1);
 }
+// Cache-append payloads deliberately include raw negative-zero and NaN
+// encodings for floating leaves.  These values are selected by bits, never
+// by arithmetic, so a backend that numerically canonicalizes an opaque
+// payload cannot hide behind a hash-only fixture.
+inline std::uint64_t cache_append_element_pattern(
+        iom::DataType type, std::size_t linear, std::uint64_t salt) {
+    const std::uint64_t hashed = element_pattern(type, linear, salt);
+    if (linear == 0) {
+        switch (type) {
+            case iom::DataType::F4_E2M1:
+                return 0x8;
+            case iom::DataType::F6_E2M3:
+            case iom::DataType::F6_E3M2:
+                return 0x20;
+            case iom::DataType::F8_E4M3FN:
+            case iom::DataType::F8_E5M2:
+                return 0x80;
+            case iom::DataType::F16:
+            case iom::DataType::BF16:
+                return 0x8000;
+            case iom::DataType::F32:
+                return 0x80000000ull;
+            case iom::DataType::F64:
+                return 0x8000000000000000ull;
+            default:
+                break;
+        }
+    } else if (linear == 1) {
+        switch (type) {
+            case iom::DataType::F8_E4M3FN:
+                return 0x7F;
+            case iom::DataType::F8_E5M2:
+                return 0x7D;
+            case iom::DataType::F8_E8M0:
+                return 0xFF;
+            case iom::DataType::F16:
+                return 0x7E01;
+            case iom::DataType::BF16:
+                return 0x7FC1;
+            case iom::DataType::F32:
+                return 0x7FC00001ull;
+            case iom::DataType::F64:
+                return 0x7FF8000000000001ull;
+            default:
+                break;
+        }
+    }
+    return hashed;
+}
 
 // Contiguous row-major host encoding of one specification's logical bytes.
 inline std::vector<std::byte> encode_logical(

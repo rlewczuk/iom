@@ -31,7 +31,7 @@
 #include "iom/cpu/device.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
 #include "iom/tensor.hpp"
-
+#include "backend/backend_conformance_cache_append.hpp"
 namespace iom_test {
 
 std::atomic<bool> allocation_fault_armed{false};
@@ -4082,6 +4082,328 @@ TEST_CASE("Cache append snapshots operands and retains workspace through complet
             failing.registered_at(destination.view().native_handle()),
             std::size_t{1});
 }
+TEST_CASE("Cache append logical oracle preserves raw rows and tail bits") {
+    using namespace iom_conformance;
+
+    REQUIRE_EQ(kStandardCapabilityOracle.size(), std::size_t{23});
+    std::array<bool, 4> seen_r{};
+    constexpr std::array<std::size_t, 4> allowed_rows{1, 15, 16, 17};
+    constexpr std::array<std::size_t, 4> allowed_offsets{
+            1, 15, 16, 17};
+    const auto check_special_payload =
+            [](iom::DataType type, std::size_t index, std::uint64_t raw) {
+                if (index == 0) {
+                    const std::size_t bits = bits_of(type);
+                    switch (type) {
+                        case iom::DataType::F4_E2M1:
+                        case iom::DataType::F6_E2M3:
+                        case iom::DataType::F6_E3M2:
+                        case iom::DataType::F8_E4M3FN:
+                        case iom::DataType::F8_E5M2:
+                        case iom::DataType::F16:
+                        case iom::DataType::BF16:
+                        case iom::DataType::F32:
+                        case iom::DataType::F64:
+                            CHECK_EQ(raw, std::uint64_t{1} << (bits - 1));
+                            break;
+                        default:
+                            break;
+                    }
+                    return;
+                }
+                if (index != 1) {
+                    return;
+                }
+                switch (type) {
+                    case iom::DataType::F8_E4M3FN:
+                        CHECK_EQ(raw & 0x78, std::uint64_t{0x78});
+                        CHECK((raw & 0x07) != 0);
+                        break;
+                    case iom::DataType::F8_E5M2:
+                        CHECK_EQ(raw & 0x7C, std::uint64_t{0x7C});
+                        CHECK((raw & 0x03) != 0);
+                        break;
+                    case iom::DataType::F8_E8M0:
+                        CHECK_EQ(raw, std::uint64_t{0xFF});
+                        break;
+                    case iom::DataType::F16:
+                        CHECK_EQ(raw & 0x7C00, std::uint64_t{0x7C00});
+                        CHECK((raw & 0x03FF) != 0);
+                        break;
+                    case iom::DataType::BF16:
+                        CHECK_EQ(raw & 0x7F80, std::uint64_t{0x7F80});
+                        CHECK((raw & 0x007F) != 0);
+                        break;
+                    case iom::DataType::F32:
+                        CHECK_EQ(
+                                raw & 0x7F800000ull,
+                                std::uint64_t{0x7F800000ull});
+                        CHECK((raw & 0x007FFFFFull) != 0);
+                        break;
+                    case iom::DataType::F64:
+                        CHECK_EQ(
+                                raw & 0x7FF0000000000000ull,
+                                std::uint64_t{0x7FF0000000000000ull});
+                        CHECK((raw & 0x000FFFFFFFFFFFFFull) != 0);
+                        break;
+                    default:
+                        break;
+                }
+            };
+    std::array<bool, 4> seen_a{};
+    for (const CacheAppendScenario& scenario : cache_append_scenarios()) {
+        REQUIRE(scenario.valid());
+        CHECK(scenario.rank() >= 3);
+        CHECK(scenario.rank() <= 8);
+        CHECK(scenario.offset + scenario.source_rows
+              <= scenario.destination_rows);
+        const auto row_slot = std::find(
+                allowed_rows.begin(), allowed_rows.end(),
+                scenario.source_rows);
+        REQUIRE(row_slot != allowed_rows.end());
+        seen_r[static_cast<std::size_t>(
+                row_slot - allowed_rows.begin())] = true;
+        const auto offset_slot = std::find(
+                allowed_offsets.begin(), allowed_offsets.end(),
+                scenario.offset);
+        REQUIRE(offset_slot != allowed_offsets.end());
+        seen_a[static_cast<std::size_t>(
+                offset_slot - allowed_offsets.begin())] = true;
+
+        const iom::TensorSpec view_owner_spec =
+                scenario.source_spec(iom::DataType::U8);
+        const auto view_cases = cache_append_view_cases(view_owner_spec);
+        const auto has_view_case = [&view_cases](std::string_view needle) {
+            return std::find_if(
+                           view_cases.begin(), view_cases.end(),
+                           [needle](const CacheAppendViewCase& view_case) {
+                               return view_case.label.find(needle)
+                                       != std::string::npos;
+                           })
+                    != view_cases.end();
+        };
+        const auto scenario_dimensions =
+                view_owner_spec.shape.dimensions();
+        if (scenario_dimensions.size() >= 3
+                && scenario_dimensions[0] >= 4) {
+            CHECK(has_view_case("stepped slice"));
+        }
+        if (scenario_dimensions.size() >= 4) {
+            CHECK(has_view_case("non-identity leading permutation"));
+        }
+        if (scenario_dimensions.size() >= 5
+                && scenario_dimensions[0] >= 2
+                && scenario_dimensions[1] >= 3) {
+            CHECK(has_view_case("nested select"));
+        }
+
+        for (const iom::DataType type : kStandardCapabilityOracle) {
+            const CacheAppendLogicalModel model =
+                    make_cache_append_logical_model(
+                            scenario, type,
+                            static_cast<std::uint64_t>(type) + 0x1000);
+            const std::size_t bits = bits_of(type);
+            for (std::size_t index = 0; index < 2; ++index) {
+                check_special_payload(
+                        type, index,
+                        read_storage_bits(
+                                model.source.data(), index * bits, bits));
+            }
+            const std::size_t destination_count =
+                    model.destination_spec.shape.element_count();
+            const std::span<const std::size_t> destination_dimensions =
+                    model.destination_spec.shape.dimensions();
+            const std::size_t rank = destination_dimensions.size();
+            for (std::size_t linear = 0; linear < destination_count;
+                 ++linear) {
+                std::size_t rest = linear;
+                rest /= destination_dimensions.back();
+                const std::size_t row =
+                        rest % destination_dimensions[rank - 2];
+                const std::uint64_t before = read_storage_bits(
+                        model.destination_before.data(),
+                        linear * bits, bits);
+                const std::uint64_t after = read_storage_bits(
+                        model.destination_after.data(), linear * bits, bits);
+                if (row < scenario.offset
+                        || row >= scenario.offset + scenario.source_rows) {
+                    CHECK_EQ(after, before);
+                }
+            }
+
+            if (scenario.offset != 0) {
+                const std::vector<std::byte> wrong_row =
+                        cache_append_expected_logical(
+                                model.source_spec, model.destination_spec,
+                                scenario.offset - 1, model.source,
+                                model.destination_before);
+                CHECK_FALSE(cache_append_logical_equal(
+                        wrong_row, model.destination_after));
+            }
+
+            const std::size_t used_bits = destination_count * bits;
+            const std::size_t total_bits =
+                    model.destination_after.size() * 8;
+            for (std::size_t bit = used_bits; bit < total_bits; ++bit) {
+                CHECK_EQ(
+                        read_storage_bits(
+                                model.destination_before.data(), bit, 1),
+                        read_storage_bits(
+                                model.destination_after.data(), bit, 1));
+            }
+        }
+    }
+    CHECK(std::all_of(seen_r.begin(), seen_r.end(), [](bool value) {
+        return value;
+    }));
+    CHECK(std::all_of(seen_a.begin(), seen_a.end(), [](bool value) {
+        return value;
+    }));
+}
+
+TEST_CASE("Cache append physical oracle distinguishes rows planes and padding") {
+    using namespace iom_conformance;
+
+    const CacheAppendScenario& scenario = cache_append_scenarios()[2];
+    const iom::DataType type = iom::DataType::U8;
+    const iom::TensorSpec source_spec = scenario.source_spec(type);
+    const iom::TensorSpec destination_spec = scenario.destination_spec(type);
+    FakeDevice device;
+    const std::vector<std::size_t> source_dimensions(
+            source_spec.shape.dimensions().begin(),
+            source_spec.shape.dimensions().end());
+    const std::vector<std::size_t> destination_dimensions(
+            destination_spec.shape.dimensions().begin(),
+            destination_spec.shape.dimensions().end());
+
+    for (const CacheAppendViewCase& view_case :
+         cache_append_view_cases(source_spec)) {
+        OwnedFakeTensor source(device, source_dimensions, type);
+        OwnedFakeTensor destination(device, destination_dimensions, type);
+        const iom::TensorView source_view = view_case.build(source.view());
+        const iom::TensorView destination_view =
+                view_case.build(destination.view());
+        if (!cache_append_view_is_usable(source_view, destination_view)) {
+            continue;
+        }
+
+        const std::vector<std::byte> source_storage =
+                encode_cache_append_storage(source_spec, 0x1234,
+                                            kCacheAppendSourceSentinel);
+        std::vector<std::byte> expected_destination =
+                encode_cache_append_storage(
+                        destination_spec, 0x5678,
+                        kCacheAppendDestinationSentinel);
+        const std::vector<std::byte> destination_before =
+                expected_destination;
+        apply_cache_append_storage(
+                source_view, source_spec, destination_view, destination_spec,
+                scenario.offset, source_storage, expected_destination);
+        const std::size_t bits = bits_of(type);
+        const std::size_t source_count =
+                source_view.spec().shape.element_count();
+        const std::span<const std::size_t> destination_view_dimensions =
+                destination_view.spec().shape.dimensions();
+        const std::size_t destination_rank =
+                destination_view_dimensions.size();
+        const std::size_t destination_plane_elements =
+                destination_view_dimensions[destination_rank - 2]
+                * destination_view_dimensions.back();
+        std::size_t destination_plane_count = 1;
+        for (std::size_t axis = 0; axis + 2 < destination_rank; ++axis) {
+            destination_plane_count *= destination_view_dimensions[axis];
+        }
+        std::vector<bool> touched(expected_destination.size(), false);
+        for (std::size_t source_linear = 0;
+             source_linear < source_count; ++source_linear) {
+            std::size_t rest = source_linear;
+            const std::size_t column =
+                    rest % source_view.spec().shape.dimensions().back();
+            rest /= source_view.spec().shape.dimensions().back();
+            const std::size_t row =
+                    rest % source_view.spec().shape.dimensions()[
+                            source_view.spec().shape.rank() - 2];
+            rest /= source_view.spec().shape.dimensions()[
+                    source_view.spec().shape.rank() - 2];
+            const std::size_t destination_linear =
+                    (rest * destination_view.spec().shape.dimensions()[
+                            destination_view.spec().shape.rank() - 2]
+                     + scenario.offset + row)
+                            * destination_view.spec().shape.dimensions().back()
+                    + column;
+            const std::size_t source_slot = standard_layout_view_slot(
+                    source_view, source_spec, source_linear);
+            const std::size_t destination_slot = standard_layout_view_slot(
+                    destination_view, destination_spec, destination_linear);
+            const std::uint64_t value = read_storage_bits(
+                    source_storage.data(), source_slot * bits, bits);
+            CHECK_EQ(
+                    read_storage_bits(
+                            expected_destination.data(),
+                            destination_slot * bits, bits),
+                    value);
+            touched[destination_slot] = true;
+        }
+        CHECK_FALSE(cache_append_logical_equal(
+                expected_destination, destination_before));
+        for (std::size_t slot = 0; slot < touched.size(); ++slot) {
+            if (!touched[slot]) {
+                CHECK_EQ(expected_destination[slot], destination_before[slot]);
+            }
+        }
+
+        const std::vector<std::byte> wrong_row =
+                [&] {
+                    std::vector<std::byte> perturbed = destination_before;
+                    apply_cache_append_storage(
+                            source_view, source_spec, destination_view,
+                            destination_spec, scenario.offset - 1,
+                            source_storage, perturbed);
+                    return perturbed;
+                }();
+        CHECK_FALSE(cache_append_logical_equal(
+                wrong_row, expected_destination));
+
+        std::vector<std::byte> wrong_plane = destination_before;
+        for (std::size_t source_linear = 0;
+             source_linear < source_count; ++source_linear) {
+            std::size_t rest = source_linear;
+            const std::size_t column =
+                    rest % source_view.spec().shape.dimensions().back();
+            rest /= source_view.spec().shape.dimensions().back();
+            const std::size_t row =
+                    rest % source_view.spec().shape.dimensions()[
+                            source_view.spec().shape.rank() - 2];
+            rest /= source_view.spec().shape.dimensions()[
+                    source_view.spec().shape.rank() - 2];
+            const std::size_t destination_linear =
+                    (rest * destination_view.spec().shape.dimensions()[
+                            destination_view.spec().shape.rank() - 2]
+                     + scenario.offset + row)
+                            * destination_view.spec().shape.dimensions().back()
+                    + column;
+            const std::size_t source_slot = standard_layout_view_slot(
+                    source_view, source_spec, source_linear);
+            const std::size_t plane = destination_linear
+                    / destination_plane_elements;
+            const std::size_t within =
+                    destination_linear % destination_plane_elements;
+            const std::size_t wrong_linear =
+                    ((plane + 1) % destination_plane_count)
+                            * destination_plane_elements
+                    + within;
+            const std::size_t wrong_slot = standard_layout_view_slot(
+                    destination_view, destination_spec, wrong_linear);
+            write_storage_bits(
+                    wrong_plane.data(), wrong_slot * bits, bits,
+                    read_storage_bits(
+                            source_storage.data(), source_slot * bits, bits));
+        }
+        CHECK_FALSE(cache_append_logical_equal(
+                wrong_plane, expected_destination));
+    }
+}
+
 
 
 namespace {
