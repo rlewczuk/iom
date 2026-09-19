@@ -132,6 +132,44 @@ namespace iom {
             return false;
         }
 
+        constexpr WorkspaceRequirements kSiluWorkspaceRequirements{0, 1};
+        constexpr const char* kSiluContext = "SILU";
+
+        // SiLU accepts only the nine ordinary floating leaves. Every
+        // recognized boolean, integer, and exponent-only scale leaf is
+        // semantically inapplicable and therefore reports Unsupported after
+        // all malformed host facts have been rejected.
+        bool silu_leaf(DataType value) noexcept {
+            switch (value) {
+                case DataType::F4_E2M1:
+                case DataType::F6_E2M3:
+                case DataType::F6_E3M2:
+                case DataType::F8_E4M3FN:
+                case DataType::F8_E5M2:
+                case DataType::F16:
+                case DataType::BF16:
+                case DataType::F32:
+                case DataType::F64:
+                    return true;
+                case DataType::BOOL:
+                case DataType::I2:
+                case DataType::U2:
+                case DataType::I4:
+                case DataType::U4:
+                case DataType::I8:
+                case DataType::U8:
+                case DataType::I16:
+                case DataType::U16:
+                case DataType::I32:
+                case DataType::U32:
+                case DataType::I64:
+                case DataType::U64:
+                case DataType::F8_E8M0:
+                    return false;
+            }
+            return false;
+        }
+
 
         void reject_rope_output_overlap(
                 BackendKind backend,
@@ -302,6 +340,84 @@ namespace iom {
             }
             return {x_facts, out_facts};
         }
+        void reject_silu_overlap(
+                const TensorView& out, std::size_t out_storage_bytes,
+                const TensorView& input, std::size_t input_storage_bytes) {
+            if (out.owner_identity() == input.owner_identity()) {
+                throw std::invalid_argument(
+                        "SILU output aliases an input owner");
+            }
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out.native_handle());
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input.native_handle());
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_storage_bytes > limit - out_begin
+                    || input_storage_bytes > limit - input_begin) {
+                throw std::overflow_error("SILU storage range overflows");
+            }
+            const std::uintptr_t out_end = out_begin + out_storage_bytes;
+            const std::uintptr_t input_end =
+                    input_begin + input_storage_bytes;
+            if (out_begin < input_end && input_begin < out_end) {
+                throw std::invalid_argument(
+                        "SILU output storage range overlaps an input");
+            }
+        }
+
+        // Common SiLU admission is allocation-free and deliberately builds no
+        // snapshot. Both the pure query and submission call this exact path
+        // before backend capability, sequence, registration, or workspace
+        // handling.
+        void validate_silu(
+                const Device& device, const TensorView& x,
+                const TensorView& y) {
+            validate_checked_spec(x.spec(), kSiluContext);
+            validate_checked_spec(y.spec(), kSiluContext);
+            if (x.spec().shape != y.spec().shape) {
+                throw std::invalid_argument(
+                        "SILU input and output shapes must match");
+            }
+            if (x.spec().data_type != y.spec().data_type
+                    || x.spec().quantization != y.spec().quantization) {
+                throw std::invalid_argument(
+                        "SILU input and output specifications must match");
+            }
+
+            // Validate each complete owner specification before the shared
+            // checked-view helper indexes its final two dimensions. This
+            // keeps malformed owner metadata in the invalid-input path rather
+            // than allowing an underflow while checking view bounds.
+            if (x.owner_identity() != nullptr) {
+                validate_checked_spec(
+                        x.owner_identity()->view().spec(), kSiluContext);
+            }
+            if (y.owner_identity() != nullptr
+                    && y.owner_identity() != x.owner_identity()) {
+                validate_checked_spec(
+                        y.owner_identity()->view().spec(), kSiluContext);
+            }
+            const detail::CheckedViewFacts x_facts =
+                    validate_checked_view(device, x, kSiluContext);
+            const detail::CheckedViewFacts y_facts =
+                    validate_checked_view(device, y, kSiluContext);
+            reject_silu_overlap(
+                    y, y_facts.storage_bytes, x, x_facts.storage_bytes);
+
+            if (x.spec().quantization != QuantizationFormat::NONE
+                    || !silu_leaf(x.spec().data_type)) {
+                throw UnsupportedOperation();
+            }
+        }
+
+        void validate_silu_requirements(
+                const WorkspaceRequirements& requirements) {
+            if (requirements != kSiluWorkspaceRequirements) {
+                throw std::invalid_argument(
+                        "SILU workspace requirement must be {0, 1}");
+            }
+        }
 
     }  // namespace
 
@@ -336,6 +452,31 @@ namespace iom {
         snapshot.addressed_bytes = facts.addressed_bytes;
         snapshot.storage_bytes = facts.storage_bytes;
         snapshot.logical_bytes = facts.logical_bytes;
+        return snapshot;
+    }
+
+
+    DeviceOps::SiLUViewSnapshot DeviceOps::snapshot_silu_view(
+            const TensorView& view) {
+        SiLUViewSnapshot snapshot;
+        const std::span<const std::size_t> dimensions =
+                view.spec().shape.dimensions();
+        snapshot.rank = dimensions.size();
+        for (std::size_t index = 0; index < snapshot.rank; ++index) {
+            snapshot.dimensions[index] = dimensions[index];
+        }
+        const std::span<const std::size_t> strides =
+                view.plane_strides();
+        for (std::size_t index = 0; index < strides.size(); ++index) {
+            snapshot.plane_strides[index] = strides[index];
+        }
+        snapshot.plane_offset = view.plane_offset();
+        snapshot.data_type = view.spec().data_type;
+        snapshot.quantization = view.spec().quantization;
+        snapshot.device_identity = &view.device();
+        snapshot.owner_identity = view.owner_identity();
+        snapshot.native_handle = const_cast<void*>(view.native_handle());
+
         return snapshot;
     }
 
@@ -487,7 +628,12 @@ namespace iom {
         }
     }
 
-    oid DeviceOps::silu_impl(const TensorView&, TensorView&) {
+    oid DeviceOps::silu_impl(const SiLURequest&) {
+        throw UnsupportedOperation();
+    }
+
+    WorkspaceRequirements
+    DeviceOps::silu_workspace_requirements_impl(const SiLURequest&) {
         throw UnsupportedOperation();
     }
 
@@ -518,15 +664,36 @@ namespace iom {
     }
 
     oid DeviceOps::silu(
-            const TensorView& x, TensorView& y) noexcept {
+            const TensorView& x, TensorView& y,
+            RawWorkspaceView workspace) noexcept {
+        (void)workspace;
         try {
-            validate_views(queue_device(), {&x, &y});
-            return invoke(silu_impl(x, y));
+            const Device& device = queue_device();
+            validate_silu(device, x, y);
+            SiLURequest request{
+                    snapshot_silu_view(x), snapshot_silu_view(y),
+                    kSiluWorkspaceRequirements};
+            const WorkspaceRequirements requirements =
+                    silu_workspace_requirements_impl(request);
+            validate_silu_requirements(requirements);
+            request.workspace_requirements = requirements;
+            return invoke(silu_impl(request));
         } catch (...) {
             return invoke_failure(std::current_exception());
         }
     }
 
+    WorkspaceRequirements DeviceOps::silu_workspace_requirements(
+            const TensorView& x, const TensorView& y) {
+        validate_silu(queue_device(), x, y);
+        const SiLURequest request{
+                snapshot_silu_view(x), snapshot_silu_view(y),
+                kSiluWorkspaceRequirements};
+        const WorkspaceRequirements requirements =
+                silu_workspace_requirements_impl(request);
+        validate_silu_requirements(requirements);
+        return requirements;
+    }
     oid DeviceOps::linear(
             const TensorView& x, const TensorView& w, TensorView& out,
             std::size_t s, std::size_t R, LinearOutputLayout layout,
