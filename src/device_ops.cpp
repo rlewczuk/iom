@@ -33,18 +33,6 @@ namespace iom {
                 throw std::invalid_argument(std::move(message));
             }
 
-            // Scalar rounding of one final matrix extent to the standard
-            // 16x16 tile grid: the allocation-free equivalent of one
-            // TensorSpec::standard_padded_shape dimension.
-            [[nodiscard]] std::size_t padded_extent(
-                    std::size_t extent, const char* what) {
-                const std::size_t remainder = extent % TensorSpec::TILE;
-                if (remainder == 0) {
-                    return extent;
-                }
-                return checked_add(
-                        extent, TensorSpec::TILE - remainder, what);
-            }
 
             // Checked product of the leading plane-selecting extents.
             [[nodiscard]] std::size_t checked_plane_count(

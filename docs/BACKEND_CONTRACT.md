@@ -893,69 +893,157 @@ rejections, and repeatable accepted failures. Only after SDPA closes may the
 session assemble and verify the complete layer from these boundaries.
 #### TinyLlama forward layout — Positions and cache boundaries
 
-The following RoPE and cache-append interfaces are planned ABIs, not currently
-declared or supported facades:
+The common layer now declares the RoPE facade and freezes its
+backend-neutral admission contract. It does not add a kernel or claim positive
+support: until a backend leaf replaces the protected hooks, a valid request
+returns `Unsupported` and the pure query throws the same category.
 
 ```cpp
 oid rope(
-        const TensorView& x, TensorView& out, size_t a, double theta,
+        const TensorView& x, TensorView& out, std::size_t a, double theta,
         RawWorkspaceView workspace = {}) noexcept;
 WorkspaceRequirements rope_workspace_requirements(
-        const TensorView& x, const TensorView& out, size_t a, double theta);
-
-oid cache_append(
-        const TensorView& source, TensorView& destination, size_t a,
-        RawWorkspaceView workspace = {}) noexcept;
-WorkspaceRequirements cache_append_workspace_requirements(
-        const TensorView& source, const TensorView& destination, size_t a);
+        const TensorView& x, const TensorView& out, std::size_t a,
+        double theta);
 ```
 
-Their operation siblings MUST add these declarations and implementations before
-reporting support. Each requirements query mirrors all semantic arguments,
-accepts no workspace argument, and MUST be pure: it performs no allocation,
-registration, submission, sequence reservation, or state mutation.
+The two facades have exactly the same semantic arguments in the stated order.
+`a` is an explicit absolute position and `theta` is an explicit runtime
+scalar; neither is inferred from a session, cursor, cache, or model state.
+`x` and `out` MUST have identical logical shape `[...,H,R,D]`, rank three
+through eight, identical nonzero leading dimensions, `H > 0`, `R > 0`, and
+positive even `D`. Every logical output element is written from its
+corresponding input under the two views' independent valid offset and
+leading-stride mappings. Tile padding and uninitialized physical slots are not
+logical values. Q and K are separate calls, so unequal Q/K head counts are
+valid and there is no cross-request Q/K alias category.
 
-For RoPE, `x` and `out` MUST have identical logical shape `[...,H,R,D]` and
-rank three through eight. `H` and `R` are nonzero, `D` is positive and even,
-and the views have identical leading tuples, dtype, device, quantization, and
-mapping-compatible final axes. Every logical output element MUST be written
-from its corresponding input element, honoring the independent leading offset
-and strides of both views and the logical mapping of partial final tiles. If
-`b` denotes the complete leading-coordinate tuple, then for every `j < D/2`
+For every leading coordinate tuple `b`, head `h`, run index `r`, and
+`0 <= j < D/2`, the frozen split-half equation is:
 
 ```text
-angle(a,r,j)       = (a+r) * theta^(-2*j/D)
-y[b,h,r,j]         = x[b,h,r,j] * cos(angle(a,r,j))
-                     - x[b,h,r,j+D/2] * sin(angle(a,r,j))
-y[b,h,r,j+D/2]     = x[b,h,r,j] * sin(angle(a,r,j))
-                     + x[b,h,r,j+D/2] * cos(angle(a,r,j))
+angle = (a + r) * theta^(-2*j/D)
+y[b,h,r,j]       = x[b,h,r,j]       * cos(angle)
+                   - x[b,h,r,j+D/2] * sin(angle)
+y[b,h,r,j+D/2]   = x[b,h,r,j+D/2] * cos(angle)
+                   + x[b,h,r,j]       * sin(angle)
 ```
 
-These are exactly first-half/second-half pairs, never adjacent pairs. The
-operation MUST use the explicit absolute position `a+r`; it has no hidden
-cursor, state broadcast, subtraction artifact, scaling parameter, or alternate
-angle convention. `theta` MUST be finite and greater than zero. Admission MUST
-compute `a+(R-1)` with checked arithmetic and enforce the representable
-position/conversion bound fixed by the RoPE numerical contract before any
-kernel effect. The session's bounded per-layer capacity `C` supplies the model
-positions and model-position bound; RoPE does not own `C`. The ABI's `double`
-scalar does not require FP64 device trigonometry. The RoPE operation's
-numerical sibling MUST define applicable dtypes, reference and fixture
-provenance, special-value behavior, tolerances, BF16 operation-boundary
-rounding, and backend feasibility.
+The implementation MUST pair the first and second halves, never adjacent
+elements, and MUST use the explicit `a+r`. It adds no scaling, position
+broadcast, reset, cursor, cache update, transpose, head packing, or alternate
+angle convention. Admission accepts only finite `theta` in
+`[1, std::numeric_limits<float>::max()]`. Checked arithmetic MUST compute
+`a + R - 1` and require the result to be no greater than `2^24 - 1` before
+any queue, owner, output, or backend effect. `a` is `std::size_t`, so a
+position-range overflow is `std::overflow_error`; a representable position
+above the bound is `std::invalid_argument`.
 
-Q and K MUST be submitted to RoPE independently, so `Hq != Hkv` is valid.
-Independent Q and K calls are each admitted under their own operation alias
-contract; an exact alias relationship between operands read by those separate
-calls MUST NOT be rejected merely because it is a Q/K alias category.
-Repeated one-row calls use continuous absolute positions: calls with `R=1`
-and `a=1`, `a=15`, `a=16`, or `a=17` rotate positions 1, 15, 16, and 17
-respectively, with no reset or discontinuity at the 16-row tile boundary. A
-multi-row call starting at any such `a` uses the consecutive positions
-`a` through `a+R-1`.
-Consecutive calls MUST pass the next `a` as the preceding `a+R`; for example,
-successive one-row calls at 15, 16, and 17 cross the tile boundary without
-reusing or skipping a position.
+At position zero, the encoding is an exact bitwise identity for every
+admitted leaf, including signed-zero representations and all nonfinite
+payloads. At nonzero positions, the eight non-F64 leaves use binary32
+exponent, frequency, angle, sine, cosine, and pair intermediates. Each pair
+uses separate noncontracted multiply operations followed by the add/subtract;
+accidental FMA/contraction and fast-math are forbidden. Exactly one existing
+named-format round-to-nearest-even/saturation encode stores each destination
+value. `F64` uses binary64 exponent, frequency, angle, trigonometry, and
+intermediates throughout and is never narrowed.
+
+The nine semantically applicable ordinary signed floating leaves are exactly
+`F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`,
+`F32`, and `F64`. The fourteen recognized but semantically inapplicable leaves
+are exactly `BOOL`, `I2`, `U2`, `I4`, `U4`, `I8`, `U8`, `I16`, `U16`, `I32`,
+`U32`, `I64`, `U64`, and `F8_E8M0`. RoPE has no boolean/integer trigonometric
+result, and exponent-only `F8_E8M0` cannot represent a general signed
+rotation. Unknown enum values are `InvalidArgument`; only
+`QuantizationFormat::NONE` is admitted. Recognized non-`NONE` formats and the
+fourteen inapplicable leaves return `Unsupported` only after every earlier
+shape, device, alias, parameter, range, overflow, and metadata check.
+
+Admission MUST NOT scan tensor values. IEEE nonfinite classes follow the
+written expression, including infinity-times-zero becoming NaN; nonzero
+position NaN payload equality is not promised, and NaN comparisons are by
+class. Finite acceptance uses an independent high-precision reference and
+fixed destination tolerances: each of the eight non-F64 leaves permits at
+most one destination ULP plus
+`2^-9 * (abs(x_first) + abs(x_second))`; `F64` permits at most one
+destination ULP plus `2^-44 * pair_norm`, where `pair_norm` is the
+corresponding pair magnitude. Analytic and golden coefficients are pinned to
+`mpmath 1.3.0` at 100 decimal digits in generated/static fixtures only;
+production code has no runtime Python dependency.
+
+Both facades perform the same host-side checks before capability dispatch,
+snapshot allocation with externally visible effects, sequence reservation,
+owner registration, workspace lease, queue submission, native metadata
+transfer, or data access, in this order:
+
+1. Validate both full specs, rank three through eight, all nonzero extents,
+   positive even `D`, and identical `[...,H,R,D]` shape.
+2. Validate exact queue-device identity, non-null/live owner registrations and
+   native handles, value-consistent owner metadata, and checked plane,
+   leading-stride, and view bounds.
+3. Validate identical leading tuple/final axes and every checked shape, tile,
+   element, byte, stride, address, and `a + R - 1` arithmetic, including
+   the position conversion bound.
+4. Reject any input/output owner identity overlap and any conservatively
+   overlapping complete owner storage or transformed view range. Input and
+   output owners MUST be distinct; in-place encoding is not promised.
+5. Validate finite `theta`, its `[1,float_max]` bound, and all checked
+   exponent/frequency/angle and narrowing intermediates.
+6. Validate matching dtype and quantization, then classify the recognized
+   dtype and quantization capability.
+
+`rope_workspace_requirements` is pure and deterministic. After the same
+admission validation it returns exactly `{0,1}` for an admitted supported
+capability and performs no allocation, retained request construction, owner
+registration, lease acquisition, token/sequence reservation, queue
+submission, native metadata upload, data read/write, or queue/session
+mutation. Its result is independent of queue occupancy, allocator state,
+registration state, and prior submissions. Malformed and overflow input
+propagates as `std::invalid_argument` or `std::overflow_error`; unsupported
+capability propagates as `UnsupportedOperation`, never as an OID.
+
+Submission repeats admission, obtains fixed-capacity value-copied
+`RopeViewSnapshot`s and an immutable `RopeRequest`, and accepts only an empty
+`RawWorkspaceView`. A supplied nonempty workspace is `InvalidArgument` and is
+never silently ignored on an admitted supported path. Because the common
+requirement is zero, no positive workspace, angle cache, caller scratch,
+hidden tensor allocation, host round trip, or cursor exists. The request
+retains exact owner/native identities and queue metadata through the existing
+prepared registration and rollback mechanics until proven in-order
+completion. Any setup failure rolls back every earlier registration and lease.
+Admission failures map through `invoke_failure` to established negative OIDs,
+consume no sequence/token, submit no work, and leave output bytes, owner
+registry, workspace state, and queue/session state unchanged.
+
+A default `UnsupportedOperation` hook is a pre-acceptance failure after common
+admission: `rope` returns negative `OidError::Unsupported` with no accepted
+token, registration, output mutation, or retained request. A positive OID is
+never replaced by a later negative result. An accepted runtime/device failure
+may leave output indeterminate or partial, is retained and rethrown
+identically on every repeat wait, and prohibits output/session reuse until the
+failure is drained under existing queue rules; no rollback of already-written
+device data is promised.
+
+The eventual backend matrix is explicit but is not a support claim in this
+common leaf:
+
+| Backend | Applicable leaves | Explicitly rejected leaves |
+| --- | --- | --- |
+| CPU | all nine ordinary signed floating leaves | the fourteen inapplicable leaves |
+| CUDA | all nine ordinary signed floating leaves | the fourteen inapplicable leaves |
+| ROCm | all nine ordinary signed floating leaves | the fourteen inapplicable leaves |
+| SYCL | the eight non-F64 applicable leaves | `F64` and the fourteen inapplicable leaves |
+| TTNN | `BF16` and `F32` | the other seven applicable leaves and the fourteen inapplicable leaves |
+
+Backend branches consume only their own frozen producer outputs and add no
+common backend-kind switch or capability registry. Every later port preserves
+this ABI, validation order, zero-workspace result, aliases, absolute
+positions, arithmetic, nonfinite behavior, and OID/lifetime contract.
+Calls with `R=1` and `a=1,15,16,17`, and multi-row calls spanning those
+positions, use consecutive absolute positions with no tile-boundary reset,
+skipped position, or reused cursor. The common leaf owns no cache/session
+initialized length.
 
 For cache append, `source` MUST have shape `[...,H,R,D]` and `destination`
 shape `[...,H,C,D]`, each of rank three through eight and with every extent
@@ -1179,9 +1267,10 @@ the all-five SDPA gate closes may the session component claim complete
 decoder-layer assembly and verification.
 #### TinyLlama forward layout — Workspace and execution
 
-This subsection specifies a planned facade boundary. It does not declare or
-implement a neural operation. The seven target `DeviceOps` facades return
-`oid`, are `noexcept`, and have exactly these signatures:
+This subsection records the shared facade boundary. The common layer now
+declares embedding, linear, RMSNorm, and RoPE; cache append, SiLU, and SDPA
+remain planned until their own leaves land. The target `DeviceOps` facades
+return `oid`, are `noexcept`, and have exactly these signatures:
 
 ```cpp
 oid embedding(const TensorView& table, const TensorView& indices,

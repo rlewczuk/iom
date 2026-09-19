@@ -28,6 +28,7 @@
 namespace iom {
 
     namespace detail {
+        struct CheckedViewFacts;
         // A backend dispatch may defer an accepted FIFO head when a fixed
         // completion or metadata resource is quarantined. This is not a
         // terminal operation failure and must leave the node parked.
@@ -316,6 +317,30 @@ namespace iom {
         [[nodiscard]] WorkspaceRequirements rmsnorm_workspace_requirements(
                 const TensorView& x, const TensorView& scale,
                 const TensorView& out, float eps);
+        /**
+         * Common `noexcept` facade for split-half rotary position encoding.
+         * `x` and `out` have identical logical `[...,H,R,D]` shapes with
+         * rank three through eight, independent leading-plane mappings,
+         * nonzero `H` and `R`, and positive even `D`. `a` is the explicit
+         * absolute position of the first row and `theta` is the explicit
+         * runtime base. The common layer owns admission, immutable metadata
+         * snapshots, OID error mapping, and completion lifetime; an
+         * unported backend remains `Unsupported`.
+         */
+        oid rope(const TensorView& x, TensorView& out, std::size_t a,
+                 double theta,
+                 RawWorkspaceView workspace = {}) noexcept;
+        /**
+         * Pure deterministic workspace query for `rope`. It accepts no
+         * workspace and performs the same allocation-free admission and
+         * capability validation as submission. A supported implementation
+         * reports exactly `{0, 1}`; an unported backend throws
+         * `detail::UnsupportedOperation`.
+         */
+        [[nodiscard]] WorkspaceRequirements rope_workspace_requirements(
+                const TensorView& x, const TensorView& out, std::size_t a,
+                double theta);
+
         oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
                  size_t n_heads, size_t n_kv_heads, size_t head_dim,
                  TensorView& attn_out) noexcept;
@@ -525,6 +550,72 @@ namespace iom {
                   out(std::move(other.out)), epsilon(other.epsilon),
                   workspace_requirements(other.workspace_requirements) {}
         };
+        /**
+         * Fixed-capacity immutable admission snapshot for one RoPE view.
+         * Every scalar and array is copied from the caller's view; no
+         * `TensorView`, dynamic shape, or borrowed metadata survives the
+         * facade call. The checked facts are retained so backend adapters can
+         * address the admitted view without repeating unchecked arithmetic.
+         */
+        struct RopeViewSnapshot {
+            std::size_t rank = 0;
+            std::array<std::size_t, 8> dimensions{};
+            std::array<std::size_t, 6> plane_strides{};
+            std::size_t plane_offset = 0;
+            DataType data_type = DataType::BOOL;
+            QuantizationFormat quantization = QuantizationFormat::NONE;
+            const Device* device_identity = nullptr;
+            const Tensor* owner_identity = nullptr;
+            void* native_handle = nullptr;
+            std::size_t max_plane = 0;
+            std::size_t addressed_bytes = 0;
+            std::size_t storage_bytes = 0;
+            std::size_t logical_bytes = 0;
+
+            [[nodiscard]] std::span<const std::size_t>
+                    shape_dimensions() const noexcept {
+                return {dimensions.data(), rank};
+            }
+            [[nodiscard]] std::span<const std::size_t>
+                    leading_plane_strides() const noexcept {
+                return {plane_strides.data(), rank >= 2 ? rank - 2 : 0};
+            }
+        };
+
+        /**
+         * Immutable host-side RoPE request retained by accepted work. It
+         * carries fixed-capacity value snapshots, explicit absolute position
+         * and theta, the validated zero-workspace view and exact requirement,
+         * plus the lease populated by the prepared submission helper.
+         */
+        struct RopeRequest {
+            RopeViewSnapshot x;
+            RopeViewSnapshot out;
+            std::size_t a;
+            double theta;
+            RawWorkspaceView workspace;
+            WorkspaceRequirements workspace_requirements;
+            detail::WorkspaceLease workspace_lease;
+            RopeRequest(
+                    RopeViewSnapshot x_, RopeViewSnapshot out_,
+                    std::size_t a_, double theta_,
+                    RawWorkspaceView workspace_ = {},
+                    WorkspaceRequirements workspace_requirements_ = {},
+                    detail::WorkspaceLease workspace_lease_ = {})
+                : x(std::move(x_)), out(std::move(out_)), a(a_),
+                  theta(theta_), workspace(workspace_),
+                  workspace_requirements(workspace_requirements_),
+                  workspace_lease(workspace_lease_) {}
+            RopeRequest(const RopeRequest&) = default;
+            RopeRequest& operator=(const RopeRequest&) = delete;
+            RopeRequest(RopeRequest&& other) noexcept
+                : x(std::move(other.x)), out(std::move(other.out)),
+                  a(other.a), theta(other.theta),
+                  workspace(other.workspace),
+                  workspace_requirements(other.workspace_requirements),
+                  workspace_lease(other.workspace_lease) {}
+        };
+
 
         DeviceOps();
         explicit DeviceOps(const Device& device);
@@ -576,6 +667,21 @@ namespace iom {
          */
         [[nodiscard]] virtual bool rmsnorm_supported(
                 DataType data_type) const;
+        /**
+         * Immutable RoPE execution hook. The default common implementation
+         * reports `Unsupported`; a backend replaces it only after common
+         * admission has completed and receives no borrowed caller view.
+         */
+        virtual oid rope_impl(const RopeRequest& request);
+        /**
+         * Pure capability and workspace hook for the RoPE requirement query.
+         * A supported backend must report exactly `{0, 1}` without queue,
+         * allocation, registration, lease, or native effects. The default
+         * common implementation throws `UnsupportedOperation`.
+         */
+        [[nodiscard]] virtual WorkspaceRequirements
+                rope_workspace_requirements(const RopeRequest& request);
+
         virtual oid sdpa_impl(const TensorView& q, const TensorView& k,
                               const TensorView& v, size_t n_heads,
                               size_t n_kv_heads, size_t head_dim,
@@ -619,6 +725,10 @@ namespace iom {
                 const TensorView& destination);
         [[nodiscard]] static LinearViewSnapshot snapshot_linear_view(
                 const TensorView& view);
+        [[nodiscard]] static RopeViewSnapshot snapshot_rope_view(
+                const TensorView& view,
+                const detail::CheckedViewFacts& facts);
+
         /**
          * Complete common linear projection admission validation in the
          * frozen contract order: recognized encodings, rank and nonzero
@@ -915,6 +1025,109 @@ namespace iom {
                     [fence_copy](std::uint64_t) { return fence_copy; },
                     std::move(queue_work));
         }
+        /**
+         * Prepared ownership adapter for one RoPE request. The two admitted
+         * owners and any future positive workspace lease are registered as
+         * one all-or-nothing prepare step and released on rollback or proven
+         * completion. The output owner is distinct by common admission, so
+         * no alias category is introduced here.
+         */
+        template <typename QueueWork>
+        oid submit_rope(
+                const RopeRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, FenceFactory build_fence,
+                QueueWork queue_work) {
+            struct Prepared {
+                RopeRequest request;
+                detail::WorkspaceLease workspace_lease;
+                detail::BinaryEntryRegistration entries;
+                std::function<void(
+                        std::uint64_t, const RopeRequest&,
+                        detail::BinaryEntryRegistration)> work;
+                Prepared(const RopeRequest& request_, QueueWork work_)
+                    : request(request_), work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    request, std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, build_fence](
+                            std::uint64_t sequence) {
+                        const detail::Fence fence = build_fence(sequence);
+                        const std::array<detail::BinaryOwnerRegistration, 2>
+                                owners{{
+                                        {prepared->request.x.owner_identity,
+                                         prepared->request.x.native_handle},
+                                        {prepared->request.out.owner_identity,
+                                         prepared->request.out.native_handle},
+                                }};
+                        try {
+                            if (prepared->request.workspace_requirements.bytes
+                                    != 0) {
+                                prepared->workspace_lease =
+                                        detail::acquire_workspace_lease(
+                                                state,
+                                                prepared->request.workspace
+                                                        .owner_identity(),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
+                                                sequence, queue_id, fence);
+                                prepared->request.workspace_lease =
+                                        prepared->workspace_lease;
+                            }
+                            prepared->entries = detail::register_binary_entries(
+                                    state, queue_id, sequence, owners, fence);
+                        } catch (...) {
+                            if (prepared->entries.count != 0) {
+                                state.registry.remove_entries(
+                                        std::span<const detail::EntryId>(
+                                                prepared->entries.entries.data(),
+                                                prepared->entries.count));
+                                prepared->entries = {};
+                            }
+                            if (prepared->workspace_lease.entry_id != 0) {
+                                detail::complete_workspace_lease(
+                                        state, prepared->workspace_lease, true);
+                                prepared->workspace_lease = {};
+                                prepared->request.workspace_lease = {};
+                            }
+                            throw;
+                        }
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.count != 0) {
+                            state.registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            prepared->entries.entries.data(),
+                                            prepared->entries.count));
+                        }
+                        if (prepared->workspace_lease.entry_id != 0) {
+                            detail::complete_workspace_lease(
+                                    state, prepared->workspace_lease, true);
+                        }
+                    });
+        }
+
+        // Constant-fence overload retained so backend queues can use one
+        // fence object when their native submission path already provides it.
+        template <typename QueueWork>
+        oid submit_rope(
+                const RopeRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_rope(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+
 
         template <typename QueueWork>
         oid submit_binary(

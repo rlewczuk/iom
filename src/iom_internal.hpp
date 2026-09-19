@@ -29,6 +29,15 @@ inline std::size_t checked_mul(
     return lhs * rhs;
 }
 
+inline std::size_t padded_extent(
+        std::size_t extent, const char* what) {
+    const std::size_t remainder = extent % TensorSpec::TILE;
+    if (remainder == 0) {
+        return extent;
+    }
+    return checked_add(extent, TensorSpec::TILE - remainder, what);
+}
+
 inline std::size_t bits_to_bytes(std::size_t bits, const char* what) {
     return checked_add(bits, 7, what) / 8;
 }
