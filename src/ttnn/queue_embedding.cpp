@@ -5,7 +5,6 @@
 
 #include <array>
 #include <cstring>
-#include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -75,6 +74,7 @@ namespace {
     }
     return false;
 }
+
 
 }  // namespace
 

@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <utility>
 #include <stdexcept>
 
 #include <tt-metalium/mesh_buffer.hpp>
@@ -58,6 +59,12 @@ public:
     [[nodiscard]] tt::tt_metal::distributed::MeshDevice& mesh() noexcept;
     [[nodiscard]] std::mutex& api_mutex() noexcept;
     [[nodiscard]] ttnn_detail::TtnnHostStaging& host_staging() noexcept;
+    // Retains a private host-workspace lease when completion is not proved.
+    // The payload is consumed by the device quarantine or deliberately
+    // leaked if recording a safe cleanup action is impossible.
+    void retain_host_workspace(
+            std::unique_ptr<ttnn_detail::HostWorkspaceLeasePayload> payload)
+            noexcept;
     [[nodiscard]] detail::RegistryState& registry_state() noexcept;
 
 private:
@@ -103,6 +110,20 @@ struct NativeWorkspace {
         return base + offset;
     }
 };
+
+/**
+ * Checked access to the caller-owned host bytes behind one live TTNN
+ * workspace view.  The keepalive aliases the one allocation owned by the
+ * `RawWorkspace`; it never creates a second backing range.
+ */
+struct HostWorkspace {
+    std::byte* data = nullptr;
+    std::size_t byte_size = 0;
+    std::shared_ptr<void> keepalive;
+};
+
+[[nodiscard]] HostWorkspace checked_host_workspace(
+        TtnnDevice& device, const RawWorkspaceView& workspace);
 
 /**
  * Checked access to the native owner behind one live positive workspace view

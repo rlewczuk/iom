@@ -479,8 +479,10 @@ oid GpuQueue<Policy>::linear_impl(const LinearRequest& request) {
     // The admitted requirement decides the workspace rule: a zero
     // requirement admits only the empty `RawWorkspaceView{}`, while a
     // positive one requires the caller's validated range, which the common
-    // facade already checked for liveness, exact-device identity, size,
-    // alignment, and disjointness from every operand and the output.
+    // facade checked for liveness, exact-device identity, size, and
+    // alignment. Addressable-storage backends additionally receive common
+    // byte-range disjointness; TTNN's host/device storage separation is
+    // documented and enforced at its backend boundary.
     if (request.workspace_requirements.bytes == 0) {
         if (!request.workspace.empty()) {
             throw std::invalid_argument(
