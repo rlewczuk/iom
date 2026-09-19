@@ -28,4 +28,13 @@ namespace iom {
                 std::span<const std::size_t>, TokenSelectorScratch) = 0;
     };
 
+    class GreedyTokenSelector final : public TokenSelector {
+    public:
+        [[nodiscard]] TokenSelectorScratchRequirements scratch_requirements(
+                const TensorView&, std::size_t) const override;
+        [[nodiscard]] std::size_t select(
+                DeviceOps&, const TensorView&, std::size_t, oid,
+                std::span<const std::size_t>, TokenSelectorScratch) override;
+    };
+
 }  // namespace iom
