@@ -24,6 +24,7 @@
 
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
+#include "backend/backend_conformance_cache_append.hpp"
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -132,6 +133,13 @@ struct SyclDevices {
 
     [[nodiscard]] iom_conformance::ConformanceDevices conformance() const {
         return {*reference, *candidate, *foreign};
+    }
+    // Cache append's independent storage oracle supplies expected bytes; use
+    // a second queue on the exact candidate device for the shared reference
+    // role because the CPU backend has no cache-append leaf in this target.
+    [[nodiscard]] iom_conformance::ConformanceDevices
+            cache_append_conformance() const {
+        return {*candidate, *candidate, *foreign};
     }
 };
 
@@ -423,6 +431,27 @@ TEST_CASE("SYCL conformance: compute methods reject unsupported capability witho
             &devices.gate, "SYCL", true, true);
     CHECK_FALSE(devices.gate.armed());
 }
+TEST_CASE(
+        "SYCL conformance: cache append reference, admission, and lifetime") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    iom_conformance::CacheAppendConformanceConfig config{
+            devices.cache_append_conformance(),
+            devices.candidate->supported_data_types(),
+            &oracle,
+            iom_conformance::CacheAppendFaultSeam{
+                    [](iom::DeviceOps& queue) {
+                        (void)queue;
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::post_launch);
+                    }},
+            {},
+            &devices.gate,
+            true};
+    iom_conformance::run_cache_append_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
 
 // SYCL's declared embedding expectation: the complete 23-payload/12-index
 // matrix the SYCL port must reach and the exact `{32, 32}` status-workspace
