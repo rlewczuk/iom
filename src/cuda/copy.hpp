@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include <exception>
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <span>
@@ -108,6 +109,24 @@ inline void check_cuda_kernel(const char* operation, cudaError_t status) {
                 + cudaGetErrorString(status));
     }
 }
+struct CacheAppendLaunchView {
+    std::size_t rank = 0;
+    std::array<std::size_t, 8> dimensions{};
+    std::array<std::size_t, 6> plane_strides{};
+    std::size_t plane_offset = 0;
+    DataType data_type = DataType::BOOL;
+    void* native_handle = nullptr;
+};
+
+struct CacheAppendLaunchRequest {
+    CacheAppendLaunchView source;
+    CacheAppendLaunchView destination;
+    std::size_t a = 0;
+};
+
+void launch_cache_append_native(
+        cudaStream_t stream, const CacheAppendLaunchRequest& request);
+
 
 struct gpu_policy {
     using context_type = CUcontext;
@@ -350,6 +369,37 @@ struct gpu_policy {
 
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
+    // Cache append uses one direct packed-word CUDA launch. The queue keeps
+    // the immutable request and owner/workspace lifetimes; this policy adds
+    // only its already-created nonblocking stream launch.
+    template <typename Request>
+    static void launch_cache_append(
+            stream_type stream, const Request& request) {
+        CacheAppendLaunchRequest native;
+        native.source.rank = request.source.rank;
+        native.source.dimensions = request.source.dimensions;
+        native.source.plane_strides = request.source.plane_strides;
+        native.source.plane_offset = request.source.plane_offset;
+        native.source.data_type = request.source.data_type;
+        native.source.native_handle = request.source.native_handle;
+        native.destination.rank = request.destination.rank;
+        native.destination.dimensions = request.destination.dimensions;
+        native.destination.plane_strides = request.destination.plane_strides;
+        native.destination.plane_offset =
+                request.destination.plane_offset;
+        native.destination.data_type = request.destination.data_type;
+        native.destination.native_handle =
+                request.destination.native_handle;
+        native.a = request.a;
+        launch_cache_append_native(stream, native);
+    }
+
+
+    [[nodiscard]] static constexpr const char* cache_append_kernel_operation()
+            noexcept {
+        return "CUDA cache append kernel launch";
+    }
+
 
     // SiLU remains an explicit Unsupported policy stub until the independent
     // CUDA wrapper supplies a real device launch. The common queue therefore

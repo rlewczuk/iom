@@ -73,6 +73,244 @@ bool consume_submission_fault(
 #include "../shared/standard_tiled_rmsnorm.inl"
 #include "../shared/standard_tiled_linear.inl"
 #include "../shared/standard_tiled_rope.inl"
+namespace iom::detail {
+namespace {
+
+constexpr unsigned int kCacheAppendThreads = 256;
+constexpr unsigned int kCacheAppendMaxBlocks = 65535;
+
+struct CacheAppendMetadata {
+    std::uint64_t source_plane_offset = 0;
+    std::uint64_t destination_plane_offset = 0;
+    std::uint64_t source_rows = 0;
+    std::uint64_t destination_rows = 0;
+    std::uint64_t destination_append_end = 0;
+    std::uint64_t columns = 0;
+    std::uint64_t append_offset = 0;
+    std::uint64_t plane_count = 0;
+    std::uint64_t destination_words_per_plane = 0;
+    std::uint64_t total_words = 0;
+    std::uint64_t destination_padded_rows = 0;
+    std::uint64_t destination_padded_columns = 0;
+    std::uint32_t bits = 0;
+    std::uint32_t plane_rank = 0;
+    std::uint64_t plane_dimensions[6]{};
+    std::uint64_t source_plane_strides[6]{};
+    std::uint64_t destination_plane_strides[6]{};
+};
+
+static_assert(
+        std::is_trivially_copyable_v<CacheAppendMetadata>,
+        "cache append metadata must be passed to the device by value");
+
+IOM_GPU_DEVICE void cache_append_copy_word(
+        const unsigned char* source, unsigned char* destination,
+        const CacheAppendMetadata& metadata, std::uint64_t source_plane,
+        std::uint64_t destination_plane, std::uint64_t word_in_plane) {
+    const std::uint64_t plane_bits =
+            metadata.destination_padded_rows
+            * metadata.destination_padded_columns * metadata.bits;
+    const std::uint64_t word_first_bit = word_in_plane * 32;
+    const std::uint64_t word_end_bit =
+            word_first_bit + 32 < plane_bits
+            ? word_first_bit + 32
+            : plane_bits;
+    const std::uint64_t first_slot = word_first_bit / metadata.bits;
+    const std::uint64_t last_slot =
+            (word_end_bit + metadata.bits - 1) / metadata.bits;
+    const std::uint64_t destination_base_word =
+            plane_slot(
+                    destination_plane, 0, 0, metadata.destination_rows,
+                    metadata.columns)
+            * metadata.bits / 32;
+    auto* destination_words =
+            reinterpret_cast<std::uint32_t*>(destination)
+            + destination_base_word + word_in_plane;
+    std::uint32_t destination_word = *destination_words;
+    for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
+        const PhysicalCoordinate coordinate = physical_coordinate(
+                slot, metadata.destination_rows, metadata.columns);
+        if (coordinate.row >= metadata.destination_rows
+                || coordinate.column >= metadata.columns
+                || coordinate.row < metadata.append_offset
+                || coordinate.row >= metadata.destination_append_end) {
+            continue;
+        }
+        const std::uint64_t source_bit =
+                plane_slot(
+                        source_plane, coordinate.row - metadata.append_offset,
+                        coordinate.column, metadata.source_rows,
+                        metadata.columns)
+                * metadata.bits;
+        const std::uint64_t destination_bit =
+                plane_slot(
+                        destination_plane, coordinate.row, coordinate.column,
+                        metadata.destination_rows, metadata.columns)
+                * metadata.bits;
+        merge_overlapping_field(
+                destination_word, source, source_bit, destination_bit,
+                word_first_bit + destination_base_word * 32,
+                word_end_bit + destination_base_word * 32, metadata.bits);
+    }
+    store_word(destination_words, destination_word);
+}
+
+IOM_GPU_GLOBAL void cache_append_kernel(
+        const unsigned char* source, unsigned char* destination,
+        CacheAppendMetadata metadata) {
+    const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
+    for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX;
+         word < metadata.total_words; word += stride) {
+        const std::uint64_t logical_plane =
+                word / metadata.destination_words_per_plane;
+        const std::uint64_t word_in_plane =
+                word % metadata.destination_words_per_plane;
+        std::uint64_t rest = logical_plane;
+        std::uint64_t source_plane = metadata.source_plane_offset;
+        std::uint64_t destination_plane =
+                metadata.destination_plane_offset;
+        for (std::uint32_t axis = metadata.plane_rank; axis-- > 0;) {
+            const std::uint64_t coordinate =
+                    rest % metadata.plane_dimensions[axis];
+            rest /= metadata.plane_dimensions[axis];
+            source_plane +=
+                    coordinate * metadata.source_plane_strides[axis];
+            destination_plane +=
+                    coordinate * metadata.destination_plane_strides[axis];
+        }
+        cache_append_copy_word(
+                source, destination, metadata, source_plane,
+                destination_plane, word_in_plane);
+    }
+}
+
+[[nodiscard]] std::size_t cache_append_checked_add(
+        std::size_t left, std::size_t right, const char* message) {
+    if (right > std::numeric_limits<std::size_t>::max() - left) {
+        throw std::overflow_error(message);
+    }
+    return left + right;
+}
+
+[[nodiscard]] std::size_t cache_append_checked_mul(
+        std::size_t left, std::size_t right, const char* message) {
+    if (left != 0
+            && right > std::numeric_limits<std::size_t>::max() / left) {
+        throw std::overflow_error(message);
+    }
+    return left * right;
+}
+
+[[nodiscard]] std::size_t cache_append_padded_extent(
+        std::size_t extent, const char* message) {
+    const std::size_t tiles =
+            extent / TensorSpec::TILE
+            + static_cast<std::size_t>(extent % TensorSpec::TILE != 0);
+    return cache_append_checked_mul(tiles, TensorSpec::TILE, message);
+}
+
+[[nodiscard]] std::uint64_t cache_append_u64(std::size_t value) {
+    static_assert(
+            sizeof(std::size_t) <= sizeof(std::uint64_t),
+            "cache append metadata requires a 64-bit size representation");
+    return static_cast<std::uint64_t>(value);
+}
+
+template <typename Request>
+[[nodiscard]] CacheAppendMetadata make_cache_append_metadata(
+        const Request& request) {
+    const auto& source = request.source;
+    const auto& destination = request.destination;
+    if (source.rank < 3 || source.rank > 8 || destination.rank != source.rank) {
+        throw std::invalid_argument("invalid cache append metadata rank");
+    }
+    const std::size_t plane_rank = source.rank - 2;
+    const std::size_t source_rows = source.dimensions[plane_rank];
+    const std::size_t destination_rows = destination.dimensions[plane_rank];
+    const std::size_t columns = source.dimensions[plane_rank + 1];
+    if (destination.dimensions[plane_rank + 1] != columns) {
+        throw std::invalid_argument("cache append metadata shape mismatch");
+    }
+
+    std::size_t plane_count = 1;
+    for (std::size_t axis = 0; axis < plane_rank; ++axis) {
+        if (source.dimensions[axis] != destination.dimensions[axis]) {
+            throw std::invalid_argument(
+                    "cache append metadata leading shape mismatch");
+        }
+        plane_count = cache_append_checked_mul(
+                plane_count, source.dimensions[axis],
+                "cache append plane count overflows");
+    }
+    const std::size_t padded_rows = cache_append_padded_extent(
+            destination_rows, "cache append padded row extent overflows");
+    const std::size_t padded_columns = cache_append_padded_extent(
+            columns, "cache append padded column extent overflows");
+    const std::size_t padded_elements = cache_append_checked_mul(
+            padded_rows, padded_columns,
+            "cache append padded plane extent overflows");
+    const std::size_t plane_bits = cache_append_checked_mul(
+            padded_elements, leaf_bits(source.data_type),
+            "cache append padded plane bits overflow");
+    const std::size_t words_per_plane = plane_bits / 32;
+    const std::size_t total_words = cache_append_checked_mul(
+            plane_count, words_per_plane,
+            "cache append word count overflows");
+
+    CacheAppendMetadata metadata;
+    metadata.source_plane_offset = cache_append_u64(source.plane_offset);
+    metadata.destination_plane_offset =
+            cache_append_u64(destination.plane_offset);
+    metadata.source_rows = cache_append_u64(source_rows);
+    metadata.destination_rows = cache_append_u64(destination_rows);
+    metadata.destination_append_end = cache_append_u64(
+            cache_append_checked_add(
+                    request.a, source_rows,
+                    "cache append destination row end overflows"));
+    metadata.columns = cache_append_u64(columns);
+    metadata.append_offset = cache_append_u64(request.a);
+    metadata.plane_count = cache_append_u64(plane_count);
+    metadata.destination_words_per_plane =
+            cache_append_u64(words_per_plane);
+    metadata.total_words = cache_append_u64(total_words);
+    metadata.destination_padded_rows = cache_append_u64(padded_rows);
+    metadata.destination_padded_columns = cache_append_u64(padded_columns);
+    metadata.bits = static_cast<std::uint32_t>(leaf_bits(source.data_type));
+    metadata.plane_rank = static_cast<std::uint32_t>(plane_rank);
+    for (std::size_t axis = 0; axis < plane_rank; ++axis) {
+        metadata.plane_dimensions[axis] =
+                cache_append_u64(source.dimensions[axis]);
+        metadata.source_plane_strides[axis] =
+                cache_append_u64(source.plane_strides[axis]);
+        metadata.destination_plane_strides[axis] =
+                cache_append_u64(destination.plane_strides[axis]);
+    }
+    return metadata;
+}
+
+template <typename Policy, typename Request>
+void launch_cache_append_kernel(
+        typename Policy::stream_type stream, const Request& request) {
+    const CacheAppendMetadata metadata =
+            make_cache_append_metadata(request);
+    const std::uint64_t block_count =
+            metadata.total_words / kCacheAppendThreads
+            + static_cast<std::uint64_t>(
+                      metadata.total_words % kCacheAppendThreads != 0);
+    const unsigned int blocks = static_cast<unsigned int>(
+            block_count > kCacheAppendMaxBlocks
+                    ? kCacheAppendMaxBlocks
+                    : block_count);
+    IOM_LAUNCH_KERNEL(
+            cache_append_kernel, blocks, kCacheAppendThreads, stream,
+            static_cast<const unsigned char*>(request.source.native_handle),
+            static_cast<unsigned char*>(request.destination.native_handle),
+            metadata);
+}
+
+}  // namespace
+}  // namespace iom::detail
+
 
 #undef IOM_GPU_GLOBAL_INDEX
 #undef IOM_GPU_BARRIER
@@ -91,6 +329,20 @@ void gpu_policy::launch_rmsnorm(
         cudaStream_t stream, const detail::RmsnormMetadata& metadata) {
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
+void launch_cache_append_native(
+        cudaStream_t stream, const CacheAppendLaunchRequest& request) {
+    if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
+        check_cuda_kernel(
+                gpu_policy::cache_append_kernel_operation(),
+                cudaErrorInvalidValue);
+    }
+    detail::launch_cache_append_kernel<gpu_policy>(stream, request);
+    check_cuda_kernel(
+            gpu_policy::cache_append_kernel_operation(),
+            cudaGetLastError());
+
+}
+
 
 // The SiLU queue descriptor is present so a future CUDA wrapper can bind the
 // common producer without changing admission or completion ownership. This
