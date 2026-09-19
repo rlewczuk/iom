@@ -1,8 +1,11 @@
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -331,5 +334,103 @@ TEST_CASE("Tokenizer rejects invalid UTF-8 before publishing an encode result") 
         CHECK(message.find("expected") != std::string::npos);
         CHECK(message.find("actual") != std::string::npos);
     }
+}
+
+// Decode tests
+TEST_CASE("Tokenizer decodes sentence pieces, byte fallback, and decoder boundaries") {
+    TempDir directory("decode-sequence");
+    write_tokenizer(directory.path());
+
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    const std::array<std::uint32_t, 0> empty{};
+    CHECK(owner->decode(empty, {}) == "");
+
+    const std::array<std::uint32_t, 3> sentence = {268, 276, 282};
+    CHECK(owner->decode(sentence, {}) == "hello world 世界");
+
+    const std::array<std::uint32_t, 5> fused = {260, 261, 262, 262, 263};
+    CHECK(owner->decode(fused, {}) == "hello");
+
+    const std::array<std::uint32_t, 4> spaces = {259, 259, 267, 259};
+    CHECK(owner->decode(spaces, {}) == " hello ");
+
+    const std::array<std::uint32_t, 1> unicode = {281};
+    CHECK(owner->decode(unicode, {}) == "héllø");
+
+    const std::array<std::uint32_t, 4> bytes = {243, 43, 143, 43};
+    std::string expected_bytes;
+    expected_bytes.push_back(static_cast<char>(0xF0));
+    expected_bytes.push_back('(');
+    expected_bytes.push_back(static_cast<char>(0x8C));
+    expected_bytes.push_back('(');
+    CHECK(owner->decode(bytes, {}) == expected_bytes);
+}
+
+TEST_CASE("Tokenizer decodes only declared special IDs and ignores decoys") {
+    TempDir directory("decode-specials");
+    json document = make_tokenizer_document();
+    document["model"]["vocab"].erase("<filler-285>");
+    document["model"]["vocab"]["<|user|>"] = 285;
+    document["model"]["vocab"].erase("<filler-286>");
+    document["model"]["vocab"]["literal<0x00>"] = 286;
+    write_tokenizer(directory.path(), document);
+    write_file(directory.path(), "tokenizer.model", "not a model");
+    write_file(directory.path(), "tokenizer_config.json", "{not json");
+    write_file(directory.path(), "generation_config.json", "[]");
+
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    const std::array<std::uint32_t, 6> ids = {0, 1, 2, 285, 286, 3};
+    std::string retained = "<unk><s></s><|user|>literal<0x00>";
+    retained.push_back('\0');
+    CHECK(owner->decode(ids, {}) == retained);
+
+    std::string skipped = "<|user|>literal<0x00>";
+    skipped.push_back('\0');
+    CHECK(owner->decode(ids, iom::DecodeOptions{true}) == skipped);
+}
+
+TEST_CASE("Tokenizer validates every decode ID before publishing output") {
+    TempDir directory("decode-invalid");
+    write_tokenizer(directory.path());
+
+    const auto owner = iom::load_tokenizer(directory.path());
+    REQUIRE(owner);
+
+    std::string published = "sentinel";
+    const auto expect_invalid = [&](std::span<const std::uint32_t> ids,
+                                    std::size_t index, std::uint32_t id,
+                                    iom::DecodeOptions options) {
+        bool rejected = false;
+        std::string message;
+        try {
+            published = owner->decode(ids, options);
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            message = error.what();
+        }
+        CHECK(rejected);
+        CHECK(published == "sentinel");
+        CHECK(message.find("index " + std::to_string(index)) !=
+              std::string::npos);
+        CHECK(message.find(std::to_string(id)) != std::string::npos);
+        CHECK(message.find("0..31999") != std::string::npos);
+    };
+
+    const std::array<std::uint32_t, 2> first = {32'000, 267};
+    expect_invalid(first, 0, 32'000, iom::DecodeOptions{true});
+
+    const std::array<std::uint32_t, 3> middle = {
+            267, std::numeric_limits<std::uint32_t>::max(), 267};
+    expect_invalid(middle, 1, std::numeric_limits<std::uint32_t>::max(), {});
+
+    const std::array<std::uint32_t, 2> last = {267, 32'000};
+    expect_invalid(last, 1, 32'000, iom::DecodeOptions{true});
+
+    const std::array<std::uint32_t, 1> valid = {267};
+    CHECK(owner->decode(valid, {}) == "hello");
 }
 }  // namespace

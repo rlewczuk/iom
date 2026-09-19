@@ -819,6 +819,95 @@ ParsedState parse_tokenizer(const std::filesystem::path& path) {
     return state;
 }
 
+bool is_byte_fallback_piece(std::string_view piece,
+                            unsigned char& value) noexcept {
+    if (piece.size() != 6 || piece[0] != '<' || piece[1] != '0' ||
+        piece[2] != 'x' || piece[5] != '>') {
+        return false;
+    }
+
+    const auto hex_digit = [](char digit) noexcept -> unsigned char {
+        if (digit >= '0' && digit <= '9') {
+            return static_cast<unsigned char>(digit - '0');
+        }
+        if (digit >= 'A' && digit <= 'F') {
+            return static_cast<unsigned char>(digit - 'A' + 10);
+        }
+        return 0xFF;
+    };
+    const unsigned char high = hex_digit(piece[3]);
+    const unsigned char low = hex_digit(piece[4]);
+    if (high == 0xFF || low == 0xFF) {
+        return false;
+    }
+    value = static_cast<unsigned char>((high << 4) | low);
+    return true;
+}
+
+std::size_t checked_decode_size_add(std::size_t current,
+                                    std::size_t addition) {
+    if (addition > std::numeric_limits<std::size_t>::max() - current) {
+        throw std::overflow_error("tokenizer decode output size overflows");
+    }
+    return current + addition;
+}
+
+std::size_t decoded_piece_size(std::string_view piece,
+                               const DecoderState& decoder) {
+    unsigned char byte = 0;
+    if (is_byte_fallback_piece(piece, byte)) {
+        return 1;
+    }
+
+    const std::string_view pattern = decoder.replace_pattern;
+    if (pattern.empty()) {
+        return piece.size();
+    }
+
+    std::size_t total = 0;
+    std::size_t cursor = 0;
+    while (true) {
+        const std::size_t match = piece.find(pattern, cursor);
+        if (match == std::string_view::npos) {
+            return checked_decode_size_add(total, piece.size() - cursor);
+        }
+        total = checked_decode_size_add(total, match - cursor);
+        total = checked_decode_size_add(total, decoder.replace_content.size());
+        cursor = match + pattern.size();
+    }
+}
+
+void append_decoded_piece(std::string& output, std::string_view piece,
+                          const DecoderState& decoder) {
+    unsigned char byte = 0;
+    if (is_byte_fallback_piece(piece, byte)) {
+        output.push_back(static_cast<char>(byte));
+        return;
+    }
+
+    const std::string_view pattern = decoder.replace_pattern;
+    if (pattern.empty()) {
+        output.append(piece.data(), piece.size());
+        return;
+    }
+
+    std::size_t cursor = 0;
+    while (true) {
+        const std::size_t match = piece.find(pattern, cursor);
+        if (match == std::string_view::npos) {
+            output.append(piece.data() + cursor, piece.size() - cursor);
+            return;
+        }
+        output.append(piece.data() + cursor, match - cursor);
+        output.append(decoder.replace_content);
+        cursor = match + pattern.size();
+    }
+}
+
+bool is_skipped_special_id(std::uint32_t id) noexcept {
+    return id == kUnkId || id == kBosId || id == kEosId;
+}
+
 }  // namespace
 
 struct Tokenizer::Impl {
@@ -1330,6 +1419,56 @@ std::uint32_t Tokenizer::unk_id() const noexcept {
 std::uint32_t Tokenizer::tokenizer_pad_id() const noexcept {
     return kEosId;
 }
+std::string Tokenizer::decode(std::span<const std::uint32_t> ids,
+                              DecodeOptions options) const {
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        const std::uint32_t id = ids[index];
+        if (id >= impl_->vocabulary_by_id.size()) {
+            const std::size_t maximum = impl_->vocabulary_by_id.empty()
+                    ? 0
+                    : impl_->vocabulary_by_id.size() - 1;
+            throw std::invalid_argument(
+                    "tokenizer decode ID at index " + std::to_string(index) +
+                    " is " + std::to_string(id) + "; valid range is 0.." +
+                    std::to_string(maximum));
+        }
+    }
+
+    std::size_t output_size = 0;
+    for (const std::uint32_t id : ids) {
+        if (options.skip_special_tokens && is_skipped_special_id(id)) {
+            continue;
+        }
+        output_size = checked_decode_size_add(
+                output_size,
+                decoded_piece_size(impl_->vocabulary_by_id[id],
+                                   impl_->decoder));
+    }
+
+    std::string result;
+    if (output_size > result.max_size()) {
+        throw std::overflow_error(
+                "tokenizer decode output size exceeds string limit");
+    }
+    result.reserve(output_size);
+
+    for (const std::uint32_t id : ids) {
+        if (options.skip_special_tokens && is_skipped_special_id(id)) {
+            continue;
+        }
+        append_decoded_piece(result, impl_->vocabulary_by_id[id],
+                             impl_->decoder);
+    }
+
+    if (impl_->decoder.strip_start == 1 &&
+        impl_->decoder.strip_stop == 0 &&
+        impl_->decoder.strip_content == " " && !result.empty() &&
+        result.front() == ' ') {
+        result.erase(0, 1);
+    }
+    return result;
+}
+
 
 std::unique_ptr<Tokenizer> load_tokenizer(
         const std::filesystem::path& model_directory) {
