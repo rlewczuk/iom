@@ -33,6 +33,7 @@
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_sdpa.hpp"
 #include "iom/rocm/device.hpp"
 #include "rocm/copy.hpp"
 #include "iom/gpu_algorithm.hpp"
@@ -630,6 +631,21 @@ TEST_CASE("ROCm conformance: compute methods reject capability without submittin
     iom_conformance::run_compute_capability_conformance(
             *candidate, candidate->supported_data_types(), &gate, "ROCm",
             true, true);
+    CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm conformance: shared SDPA admission and unsupported matrix") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::SdpaConformanceConfig config{
+            {*reference, *candidate, *foreign}, {}, false, &gate};
+    iom_conformance::run_sdpa_conformance(config);
     CHECK_FALSE(gate.armed());
 }
 
