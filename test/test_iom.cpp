@@ -1859,14 +1859,6 @@ public:
     }
 };
 
-class OpaqueTtnnDevice final : public FakeDevice {
-public:
-    using FakeDevice::FakeDevice;
-
-    [[nodiscard]] iom::BackendKind backend_kind() const noexcept override {
-        return iom::BackendKind::TTNN;
-    }
-};
 TEST_CASE("DeviceOps parks unavailable admission without recursive retry") {
     FakeDevice device{iom::QueueConfig{2}};
     FakeQueue queue{device};
@@ -4529,27 +4521,6 @@ TEST_CASE("RoPE admission precedes capability and leaves unported hooks unsuppor
     // Every rejection is pre-admission: the first accepted queue operation
     // still receives sequence one.
     CHECK_EQ(token_sequence(queue.probe()), 1);
-}
-TEST_CASE("RoPE treats TTNN native handles as opaque storage") {
-    OpaqueTtnnDevice device;
-    RopeQueue queue(device);
-    FakeTensor x(
-            make_spec({2, 3, 4, 16}, iom::DataType::F32), device);
-    FakeTensor out(
-            make_spec({2, 3, 4, 16}, iom::DataType::F32), device);
-    // These deliberately overlapping numeric host intervals model two
-    // distinct TTNN wrapper-array handles; their device payloads are opaque.
-    x.use_storage_handle(reinterpret_cast<void*>(0x1000));
-    out.use_storage_handle(reinterpret_cast<void*>(0x2000));
-
-    CHECK(
-            queue.rope_workspace_requirements(
-                    x.view(), out.view(), 0, 1.0)
-            == iom::WorkspaceRequirements{0, 1});
-    const iom::oid token = queue.rope(x.view(), out.view(), 0, 1.0);
-    REQUIRE(iom::oid_is_token(token));
-    queue.finish(token_sequence(token));
-    CHECK_NOTHROW(queue.wait(token));
 }
 
 TEST_CASE("RoPE query is pure and accepted requests retain fixed snapshots") {

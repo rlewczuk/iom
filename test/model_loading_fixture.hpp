@@ -455,7 +455,7 @@ inline constexpr std::array<iom::DataType, 2> kSupportedWithoutBf16 = {
         iom::DataType::F16, iom::DataType::F32};
 
 // The host-transfer workspace requirement policy of one bounded destination.
-// A zero multiplier is the CPU/TTNN `{0, 1}` policy; a positive one has the
+// A zero multiplier is the CPU `{0, 1}` policy; a positive one has the
 // accelerator shape `{checked logical bytes * multiplier, alignment}`, so the
 // preflight's maxima stay observable as actual owner query outputs.
 struct WorkspacePolicy {

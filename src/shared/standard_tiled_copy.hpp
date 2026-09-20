@@ -13,9 +13,8 @@ namespace iom::detail {
     // leaf encodings the common standard-layout transfer implementation can
     // represent. Backend supported_data_types() overrides return spans into
     // this one array, so the advertised leaf set and its order cannot drift
-    // between standard backends. The per-backend conformance expected
-    // arrays and TTNN's native nine-leaf mapping stay independent so an
-    // accidental narrowing or reordering remains detectable.
+    // between standard backends so an accidental narrowing or reordering
+    // remains detectable.
     inline constexpr std::array<DataType, 23> kStandardSupportedDataTypes = {
             DataType::BOOL,
             DataType::I2, DataType::U2,

@@ -33,8 +33,8 @@ namespace iom_conformance {
 // Independent scenario matrix and stable backend-port contract.
 // ---------------------------------------------------------------------------
 
-// The operation applies to the complete standard payload matrix.  TTNN's
-// driver may omit only F8_E8M0; the runner checks that profile explicitly.
+// The operation applies to the complete standard payload matrix; the runner
+// checks every retained backend profile explicitly.
 
 struct CacheAppendScenario {
     std::string label;
@@ -274,10 +274,6 @@ struct CacheAppendConformanceConfig {
     CacheAppendFaultSeam fault_seam;
     CacheAppendObservation observation;
     ConformanceObserver* observer = nullptr;
-    // TTNN's caller-owned host workspace address domain is intentionally
-    // separate from opaque device tensor handles.  Its port sets this false;
-    // standard CPU/GPU/SYCL ports leave it true to exercise range overlap.
-    bool workspace_overlap_supported = true;
 };
 
 // A backend port arms this window after all fixture owners and resources for a
@@ -1286,53 +1282,49 @@ inline void run_cache_append_admission_conformance(
         queue->wait(token);
         const std::vector<std::byte> after_exact =
                 read_logical(valid_destination->view());
-        if (config.workspace_overlap_supported
-                && requirements.alignment != 0 && requirements.bytes != 0) {
-            const std::uintptr_t operand_base =
-                    reinterpret_cast<std::uintptr_t>(
-                            valid_source->view().native_handle());
-            const std::size_t operand_bytes =
-                    valid_source_spec.tiled_storage_nbytes();
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            const std::uintptr_t remainder =
-                    operand_base % requirements.alignment;
-            const std::uintptr_t aligned_base =
-                    remainder == 0
-                    ? operand_base
-                    : operand_base
-                            + (requirements.alignment - remainder);
-            if (aligned_base >= operand_base
-                    && operand_bytes <= limit - operand_base
-                    && aligned_base < operand_base + operand_bytes
-                    && requirements.bytes <= limit - aligned_base) {
-                CacheAppendConformanceWorkspace overlapping_workspace(
-                        config.devices.candidate,
-                        reinterpret_cast<void*>(aligned_base),
-                        requirements.bytes);
-                CHECK_EQ(
-                        queue->cache_append(
-                                valid_source->view(),
-                                valid_destination->view(), 1,
-                                overlapping_workspace.view()),
-                        iom::to_oid(iom::OidError::InvalidArgument));
-                CHECK(cache_append_logical_equal(
-                        read_logical(valid_destination->view()), after_exact));
-            }
-        }
-
-        if (config.workspace_overlap_supported) {
-            auto foreign = config.devices.foreign.create_workspace(
+        const std::uintptr_t operand_base =
+                reinterpret_cast<std::uintptr_t>(
+                        valid_source->view().native_handle());
+        const std::size_t operand_bytes =
+                valid_source_spec.tiled_storage_nbytes();
+        const std::uintptr_t limit =
+                std::numeric_limits<std::uintptr_t>::max();
+        const std::uintptr_t remainder =
+                operand_base % requirements.alignment;
+        const std::uintptr_t aligned_base =
+                remainder == 0
+                ? operand_base
+                : operand_base
+                        + (requirements.alignment - remainder);
+        if (aligned_base >= operand_base
+                && operand_bytes <= limit - operand_base
+                && aligned_base < operand_base + operand_bytes
+                && requirements.bytes <= limit - aligned_base) {
+            CacheAppendConformanceWorkspace overlapping_workspace(
+                    config.devices.candidate,
+                    reinterpret_cast<void*>(aligned_base),
                     requirements.bytes);
-            REQUIRE(foreign != nullptr);
             CHECK_EQ(
                     queue->cache_append(
-                            valid_source->view(), valid_destination->view(), 1,
-                            foreign->view()),
+                            valid_source->view(),
+                            valid_destination->view(), 1,
+                            overlapping_workspace.view()),
                     iom::to_oid(iom::OidError::InvalidArgument));
             CHECK(cache_append_logical_equal(
                     read_logical(valid_destination->view()), after_exact));
         }
+
+        auto foreign = config.devices.foreign.create_workspace(
+                requirements.bytes);
+        REQUIRE(foreign != nullptr);
+        CHECK_EQ(
+                queue->cache_append(
+                        valid_source->view(), valid_destination->view(), 1,
+                        foreign->view()),
+                iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK(cache_append_logical_equal(
+                read_logical(valid_destination->view()), after_exact));
+
         auto stale_owner = config.devices.candidate.create_workspace(
                 requirements.bytes);
         REQUIRE(stale_owner != nullptr);

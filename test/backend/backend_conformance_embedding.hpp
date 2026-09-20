@@ -78,25 +78,6 @@ inline constexpr std::array<iom::DataType, 12> kEmbeddingIdSpan = {
         iom::DataType::I64, iom::DataType::U64,
 };
 
-// The final TTNN native expectation: every payload leaf its native carrier
-// table can store, which is all 23 contract leaves except `F8_E8M0`, and the
-// complete 12-leaf integral index matrix. Double-carrier leaves occupy two
-// consecutive native UInt32 columns per logical element, so the span is a
-// declaration of supported behavior, never of a storage probe.
-inline constexpr std::array<iom::DataType, 22> kEmbeddingTtnnPayloadSpan = {
-        iom::DataType::BOOL,
-        iom::DataType::I2, iom::DataType::U2,
-        iom::DataType::I4, iom::DataType::U4,
-        iom::DataType::I8, iom::DataType::U8,
-        iom::DataType::I16, iom::DataType::U16,
-        iom::DataType::I32, iom::DataType::U32,
-        iom::DataType::I64, iom::DataType::U64,
-        iom::DataType::F4_E2M1,
-        iom::DataType::F6_E2M3, iom::DataType::F6_E3M2,
-        iom::DataType::F8_E4M3FN, iom::DataType::F8_E5M2,
-        iom::DataType::F16, iom::DataType::BF16,
-        iom::DataType::F32, iom::DataType::F64,
-};
 
 // `BOOL` and the ten floating leaves are recognized but inapplicable as index
 // semantics: the operation capability stage reports them as `Unsupported`.
@@ -116,8 +97,6 @@ inline constexpr std::span<const iom::DataType> kNoEmbeddingSpan{};
 // One driver's explicit embedding declaration.
 struct EmbeddingDeclaration {
     // The complete payload and index matrix this port is expected to reach.
-    // The TTNN driver passes `kEmbeddingTtnnPayloadSpan` and the full
-    // `kEmbeddingIdSpan` here.
     std::span<const iom::DataType> target_payloads;
     std::span<const iom::DataType> target_ids;
     // The leaves this revision's backend port implements and the suite
@@ -126,7 +105,7 @@ struct EmbeddingDeclaration {
     std::span<const iom::DataType> implemented_payloads;
     std::span<const iom::DataType> implemented_ids;
     // The exact workspace requirement the port reports for an applicable
-    // request: `{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and TTNN.
+    // request: `{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, and SYCL.
     // A positive range is an exact live device owner whose first status word
     // is `0` valid / `1` invalid ID and whose remaining 28 bytes are reserved
     // control padding that the caller neither initializes nor polls.
@@ -1330,28 +1309,6 @@ protected:
     }
 
     iom::oid embedding_impl(const EmbeddingRequest& request) override {
-        if (request.workspace_requirements.bytes != 0
-                && queue_device().backend_kind()
-                        == iom::BackendKind::TTNN) {
-            const void* const workspace_address =
-                    iom::detail::WorkspaceValidation::address(
-                            request.workspace);
-            const std::array<const void*, 3> operand_addresses{
-                    request.table.native_handle,
-                    request.indices.native_handle,
-                    request.out.native_handle};
-            for (const void* const operand_address : operand_addresses) {
-                // This test double can fabricate a workspace whose address
-                // aliases an opaque TTNN handle.  Keep that malformed probe
-                // rejected while production TTNN admission treats real host
-                // mappings and device storage as separate domains.
-                if (workspace_address == operand_address) {
-                    throw std::invalid_argument(
-                            "workspace range overlaps an operand or output "
-                            "storage range");
-                }
-            }
-        }
         const Failure failure = std::exchange(next_failure_, Failure::none);
         iom::detail::Fence fence;
         fence.invoke = [](const iom::detail::Fence&) noexcept {

@@ -69,7 +69,6 @@ option(CUDA_ENABLED "Build with CUDA support" OFF)
 set(CUDA_PATH "/usr/local/cuda" CACHE PATH "Path to the CUDA Toolkit")
 option(ROCM_ENABLED "Build with ROCm support" OFF)
 set(ROCM_PATH "/opt/rocm" CACHE PATH "Path to the ROCm SDK")
-option(TTNN_ENABLED "Build with TTNN support" OFF)
 
 set(IOM_SOURCES
         src/device_ops.cpp
@@ -131,77 +130,6 @@ target_link_libraries(libiom
         nlohmann_json::nlohmann_json
 )
 
-if(TTNN_ENABLED)
-    find_package(tt-nn CONFIG REQUIRED)
-    if(NOT TARGET TT::Metalium OR NOT TARGET TTNN::TTNN)
-        message(FATAL_ERROR
-                "TTNN SDK is missing required TT::Metalium or TTNN::TTNN targets")
-    endif()
-    if(NOT DEFINED ENV{TT_METAL_HOME}
-            OR NOT IS_DIRECTORY "$ENV{TT_METAL_HOME}/ttnn/cpp")
-        message(FATAL_ERROR
-                "TTNN_ENABLED requires TT_METAL_HOME/ttnn/cpp for "
-                "the preallocated RMSNorm adapter")
-    endif()
-
-    add_library(iom_ttnn STATIC
-        src/ttnn/device.cpp
-        src/ttnn/queue.cpp
-        src/ttnn/queue_embedding.cpp
-        src/ttnn/queue_copy.cpp
-        src/ttnn/device_types.cpp
-        src/ttnn/rmsnorm_device_operation.cpp
-        src/ttnn/device_internal.hpp
-        src/ttnn/queue_internal.hpp
-        src/ttnn/copy.cpp
-        src/ttnn/embedding.cpp
-        src/ttnn/embedding.hpp
-        src/ttnn/kernels/embedding.cpp
-        src/ttnn/linear.cpp
-        src/ttnn/linear.hpp
-        src/ttnn/kernels/linear_reader.cpp
-        src/ttnn/kernels/linear_compute.cpp
-        src/ttnn/kernels/linear_writer.cpp
-        src/ttnn/testing.cpp
-        src/ttnn/binary.cpp
-        src/ttnn/rmsnorm_device_operation.hpp
-        src/ttnn/copy.hpp
-        src/ttnn/registry_state.hpp
-        src/ttnn/testing_internal.hpp
-        src/ttnn/staging.hpp
-        include/iom/ttnn/device.hpp
-    )
-
-    set_source_files_properties(
-        src/ttnn/kernels/embedding.cpp
-        src/ttnn/kernels/linear_reader.cpp
-        src/ttnn/kernels/linear_compute.cpp
-        src/ttnn/kernels/linear_writer.cpp
-        PROPERTIES HEADER_FILE_ONLY TRUE
-    )
-    target_compile_definitions(iom_ttnn
-        PRIVATE
-            IOM_TTNN_EMBEDDING_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/embedding.cpp"
-            IOM_TTNN_LINEAR_READER_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/linear_reader.cpp"
-            IOM_TTNN_LINEAR_COMPUTE_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/linear_compute.cpp"
-            IOM_TTNN_LINEAR_WRITER_KERNEL_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/ttnn/kernels/linear_writer.cpp"
-    )
-
-    target_include_directories(iom_ttnn
-        PUBLIC
-            ${PROJECT_SOURCE_DIR}/include
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/src/ttnn
-            "$ENV{TT_METAL_HOME}/ttnn/cpp"
-    )
-    target_link_libraries(iom_ttnn
-        PRIVATE
-            libiom
-            TT::Metalium
-            TTNN::TTNN
-    )
-
-endif()
 if(CUDA_ENABLED)
     set(CUDAToolkit_ROOT "${CUDA_PATH}")
     find_package(CUDAToolkit REQUIRED MODULE)
@@ -400,9 +328,6 @@ if(BUILD_TESTING)
     endif()
     if(ROCM_ENABLED)
         target_compile_definitions(iom_rocm PUBLIC IOM_ENABLE_TESTING)
-    endif()
-    if(TTNN_ENABLED)
-        target_compile_definitions(iom_ttnn PRIVATE IOM_ENABLE_TESTING)
     endif()
 endif()
 

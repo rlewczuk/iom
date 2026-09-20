@@ -52,11 +52,6 @@ extern "C" int hipFree(void* pointer);
 constexpr int kHipSuccess = 0;
 #endif
 
-#ifdef IOM_COEXIST_TTNN
-#include <tt-metalium/host_api.hpp>
-
-#include "iom/ttnn/device.hpp"
-#endif
 
 #ifdef IOM_COEXIST_SYCL
 #include <sycl/sycl.hpp>
@@ -141,13 +136,6 @@ constexpr std::size_t kCoexistenceArenaBytes = 16u * 1024 * 1024;
 }
 #endif
 
-#ifdef IOM_COEXIST_TTNN
-[[nodiscard]] std::size_t ttnn_runtime_device_count() {
-    const std::size_t count = tt::tt_metal::GetNumAvailableDevices();
-    REQUIRE(count > 0);
-    return count;
-}
-#endif
 
 // Everything one backend contributes to the shared process: its device,
 // at least two queues, and one source/destination tensor pair per queue.
@@ -241,24 +229,6 @@ BackendParticipant make_sycl_participant() {
 }
 #endif
 
-#ifdef IOM_COEXIST_TTNN
-BackendParticipant make_ttnn_participant() {
-    BackendParticipant participant;
-    participant.name = "ttnn";
-    participant.kind = iom::BackendKind::TTNN;
-    participant.owned_device = iom::make_ttnn_device(0);
-    participant.device = participant.owned_device.get();
-    participant.source = participant.device->create_tensor(coexistence_spec());
-    participant.queues.push_back(participant.device->create_ops());
-    participant.queues.push_back(participant.device->create_ops());
-    for (std::size_t i = 0; i < participant.queues.size(); ++i) {
-        participant.destinations.push_back(
-                participant.device->create_tensor(coexistence_spec()));
-    }
-    participant.submitted.resize(participant.queues.size());
-    return participant;
-}
-#endif
 
 }  // namespace
 
@@ -285,10 +255,6 @@ TEST_CASE("Backend coexistence: enabled backends interleave in one process") {
 #ifdef IOM_COEXIST_SYCL
     BackendParticipant sycl_participant = make_sycl_participant();
     participants.push_back(&sycl_participant);
-#endif
-#ifdef IOM_COEXIST_TTNN
-    BackendParticipant ttnn_participant = make_ttnn_participant();
-    participants.push_back(&ttnn_participant);
 #endif
 
     std::size_t queue_count = 0;
@@ -441,17 +407,6 @@ TEST_CASE("Backend coexistence: queues reject views from another device") {
         check_rejection("sycl", *device, *foreign);
     }
 #endif
-#ifdef IOM_COEXIST_TTNN
-    {
-        // tt-metal permits only one live context per physical device per
-        // process, so an independently created CPU device fills the
-        // foreign slot; queue validation rejects views by Device identity.
-        auto device = iom::make_ttnn_device(0);
-        auto foreign = iom::make_cpu_device(foreign_allocator);
-        CHECK(device->backend_kind() == iom::BackendKind::TTNN);
-        check_rejection("ttnn", *device, *foreign);
-    }
-#endif
 }
 
 // Where hardware provides more than one physical device, a second device
@@ -489,14 +444,6 @@ TEST_CASE("Backend coexistence: second devices report their own ordinal") {
                 1, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         REQUIRE(second != nullptr);
         CHECK(second->backend_kind() == iom::BackendKind::SYCL);
-        CHECK(second->backend_device() == 1);
-    }
-#endif
-#ifdef IOM_COEXIST_TTNN
-    if (ttnn_runtime_device_count() > 1) {
-        auto second = iom::make_ttnn_device(1);
-        REQUIRE(second != nullptr);
-        CHECK(second->backend_kind() == iom::BackendKind::TTNN);
         CHECK(second->backend_device() == 1);
     }
 #endif
@@ -563,11 +510,10 @@ TEST_CASE("Backend coexistence: queue ids release, reuse, and stay unique") {
 // surviving queue's outstanding entry stays live, so its destination
 // storage is released (freed) at tensor destruction -- never quarantined by
 // another queue's teardown -- and every allocated tensor storage is freed
-// exactly once. TTNN owns native storage and the standard-GPU backends
-// suballocate device arenas, so their call sites pass a scalar placeholder
-// (`int`, never dereferenced); for non-class placeholders the
-// allocator-count code is discarded at compile time and the scenario runs
-// without the free-count assertions.
+// exactly once. Standard-GPU backends suballocate device arenas, so their
+// call sites pass a scalar placeholder (`int`, never dereferenced); for
+// non-class placeholders the allocator-count code is discarded at compile
+// time and the scenario runs without the free-count assertions.
 template <typename CountingAllocator>
 void run_concurrent_queue_scenario(
         const char* name, iom::Device& device,
@@ -756,12 +702,6 @@ TEST_CASE(
         auto device = iom::make_sycl_device(
                 0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
         run_concurrent_queue_scenario<int>("sycl", *device, nullptr);
-    }
-#endif
-#ifdef IOM_COEXIST_TTNN
-    {
-        auto device = iom::make_ttnn_device(0);
-        run_concurrent_queue_scenario<int>("ttnn", *device, nullptr);
     }
 #endif
 }
@@ -1056,10 +996,6 @@ TEST_CASE("Backend coexistence: ADD interleaves across enabled backends") {
 #ifdef IOM_COEXIST_SYCL
     BackendParticipant sycl_participant = make_sycl_participant();
     participants.push_back(&sycl_participant);
-#endif
-#ifdef IOM_COEXIST_TTNN
-    BackendParticipant ttnn_participant = make_ttnn_participant();
-    participants.push_back(&ttnn_participant);
 #endif
     run_interleaved_operations(participants, iom::DataType::I32, 7, 5);
     run_interleaved_operations(participants, iom::DataType::U8, 7, 3);

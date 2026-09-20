@@ -174,10 +174,6 @@ inline constexpr std::array<iom::DataType, 8> kRopeSyclExpectedSupported = {
         iom::DataType::BF16,
         iom::DataType::F32,
 };
-inline constexpr std::array<iom::DataType, 2> kRopeTtnnExpectedSupported = {
-        iom::DataType::BF16,
-        iom::DataType::F32,
-};
 
 static_assert(kRopeApplicableDataTypes.size() + kRopeUnsupportedDataTypes.size()
                       == 23,

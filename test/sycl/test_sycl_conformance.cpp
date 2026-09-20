@@ -446,8 +446,7 @@ TEST_CASE(
                                 iom::sycl_detail::SubmissionFault::post_launch);
                     }},
             {},
-            &devices.gate,
-            true};
+            &devices.gate};
     iom_conformance::run_cache_append_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }

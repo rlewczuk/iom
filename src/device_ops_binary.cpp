@@ -238,7 +238,7 @@ namespace iom {
 
     WorkspaceRequirements
     DeviceOps::binary_workspace_requirements(const BinaryRequest&) {
-        // CPU, TTNN, CUDA, and ROCm need no raw workspace for the binary
+        // CPU, CUDA, and ROCm need no raw workspace for the binary
         // operations. SYCL overrides this hook with its checked
         // whole-plane staging sum.
         return {0, 1};

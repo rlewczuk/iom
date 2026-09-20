@@ -945,7 +945,7 @@ void ModelSource::upload_weights(
     // view is supplied as its own borrowed singleton operand span, so the
     // shared rule rejects scratch that overlaps the storage of any destination
     // without copying or allocating a view. A zero-byte `{0, 1}` requirement
-    // consumes no workspace and keeps the CPU/TTNN unused-workspace behavior.
+    // consumes no workspace and keeps the CPU unused-workspace behavior.
     if (requirements.bytes != 0) {
         for (Tensor* const destination : destinations) {
             const TensorView& owner_view = destination->view();

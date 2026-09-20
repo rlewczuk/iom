@@ -347,50 +347,6 @@ if(IOM_TEST_REAL_MODEL_LOADING)
     )
 endif()
 
-if(TTNN_ENABLED)
-    add_iom_backend_tests(ttnn
-        SMOKE_MAIN_SOURCE ttnn/test_ttnn_smoke.cpp
-        CONFORMANCE_MAIN_SOURCE ttnn/test_ttnn_conformance.cpp
-        SMOKE_SOURCES ttnn/test_ttnn_smoke.cpp
-        CONFORMANCE_SOURCES ttnn/test_ttnn_conformance.cpp
-        CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-        BACKEND_LIBRARY iom_ttnn
-        RUNTIME_LIBRARIES TT::Metalium TTNN::TTNN
-    )
-
-    # Regression for the HIGH R2-001 capacity-parked fence seam (task
-    # 006-tinyllama / shared-fenced-runtime). The single-credit admission
-    # queue forces the second submission to park deterministically; the
-    # parked source is destroyed while the head is still executing, the
-    # parked fence must return pending instead of success, and the
-    # worker must dispatch the parked task against the quarantined
-    # storage without UAF.
-    add_executable(iom_ttnn_parking_fence_tests
-        ttnn/test_ttnn_parking_fence.cpp
-    )
-    set_source_files_properties(ttnn/test_ttnn_parking_fence.cpp PROPERTIES
-        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-    )
-    target_include_directories(iom_ttnn_parking_fence_tests
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    target_link_libraries(iom_ttnn_parking_fence_tests
-        PRIVATE
-            doctest::doctest
-            iom_ttnn
-            libiom
-            TT::Metalium
-            TTNN::TTNN
-    )
-    add_test(
-        NAME iom_ttnn_parking_fence_tests
-        COMMAND iom_ttnn_parking_fence_tests
-    )
-    set_tests_properties(
-        iom_ttnn_parking_fence_tests PROPERTIES TIMEOUT 300
-    )
-endif()
 
 # Combined coexistence executable (change 0001-tensor-view / 15): one
 # translation unit includes every enabled public factory header and links
@@ -399,7 +355,7 @@ endif()
 # same target serves every option combination. With no accelerator
 # enabled there is nothing to compose beyond the CPU conformance target
 # above, so the target exists only when at least one backend is enabled.
-if(CUDA_ENABLED OR ROCM_ENABLED OR TTNN_ENABLED OR SYCL_ENABLED)
+if(CUDA_ENABLED OR ROCM_ENABLED OR SYCL_ENABLED)
     add_executable(iom_backend_coexistence_tests
             backend/test_backend_coexistence.cpp
     )
@@ -456,19 +412,6 @@ if(CUDA_ENABLED OR ROCM_ENABLED OR TTNN_ENABLED OR SYCL_ENABLED)
         )
     endif()
 
-    if(TTNN_ENABLED)
-        target_compile_definitions(iom_backend_coexistence_tests
-            PRIVATE
-                IOM_COEXIST_TTNN=1
-        )
-
-        target_link_libraries(iom_backend_coexistence_tests
-            PRIVATE
-                iom_ttnn
-                TT::Metalium
-                TTNN::TTNN
-        )
-    endif()
 
     if(SYCL_ENABLED)
         target_compile_definitions(iom_backend_coexistence_tests

@@ -1029,7 +1029,7 @@ TEST_CASE("Model loading upload preflight keeps a zero-workspace binding at {0, 
             source->upload_workspace_requirements(
                     device, as_destinations(pointers));
 
-    // The CPU/TTNN zero-workspace policy is reported exactly, never as a
+    // The CPU zero-workspace policy is reported exactly, never as a
     // positive allocation request.
     const iom::WorkspaceRequirements no_scratch{0, 1};
     CHECK(requirements == no_scratch);
