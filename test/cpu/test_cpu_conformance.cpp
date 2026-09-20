@@ -15,6 +15,7 @@
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
+#include "backend/backend_conformance_token_selection.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
 #include "backend/backend_conformance_rope_contract.hpp"
@@ -287,6 +288,23 @@ TEST_CASE("CPU conformance: deferred queue lifetime and stability") {
     iom_conformance::run_lifetime_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU conformance: greedy token selection shared matrix and lifetime") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle native_storage;
+    const iom_conformance::TokenSelectionNativeFailureSeam native_failure{
+            {}, {}, "CPU logical transfer failure",
+            "CPU has no accepted post-readiness transfer-failure seam"};
+    const iom_conformance::TokenSelectionConformanceConfig config{
+            devices.conformance(),
+            devices.candidate->supported_data_types(),
+            &devices.gate,
+            &native_storage,
+            iom::WorkspaceRequirements{0, 1},
+            native_failure};
+    iom_conformance::run_token_selection_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 
