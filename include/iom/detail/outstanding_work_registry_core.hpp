@@ -306,9 +306,35 @@ struct BinaryOwnerRegistration {
     void* address = nullptr;
 };
 
+struct SdpaEntryRegistration {
+    std::array<EntryId, 4> entries{};
+    std::size_t count = 0;
+};
+
+struct SdpaOwnerRegistration {
+    const void* identity = nullptr;
+    void* address = nullptr;
+};
+
+
 [[nodiscard]] inline bool release_or_invalidate_binary_entries(
         OutstandingWorkRegistry& registry, const BinaryEntryRegistration& outcome,
         bool failure, bool fence_succeeded) noexcept {
+    const std::span<const EntryId> ids(outcome.entries.data(), outcome.count);
+    if (failure || !fence_succeeded) {
+        registry.invalidate_entries(ids);
+        return false;
+    }
+    for (const EntryId id : ids) {
+        (void)registry.try_release_entry(id);
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool release_or_invalidate_sdpa_entries(
+        OutstandingWorkRegistry& registry,
+        const SdpaEntryRegistration& outcome, bool failure,
+        bool fence_succeeded) noexcept {
     const std::span<const EntryId> ids(outcome.entries.data(), outcome.count);
     if (failure || !fence_succeeded) {
         registry.invalidate_entries(ids);

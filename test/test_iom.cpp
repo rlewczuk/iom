@@ -884,6 +884,10 @@ public:
         dispatch_throw,
         post_acceptance,
     };
+    enum class SdpaFailure {
+        none,
+        post_acceptance,
+    };
 
     struct Submission {
         std::uint64_t sequence;
@@ -939,6 +943,39 @@ public:
         float epsilon;
         iom::WorkspaceRequirements workspace_requirements;
         iom::detail::BinaryEntryRegistration entries;
+        bool retained_failure;
+    };
+    struct SdpaViewRecord {
+        std::size_t rank;
+        std::array<std::size_t, 8> dimensions;
+        std::array<std::size_t, 6> plane_strides;
+        std::size_t plane_offset;
+        iom::DataType data_type;
+        iom::QuantizationFormat quantization;
+        const iom::Device* device;
+        const iom::Tensor* owner;
+        void* handle;
+        std::size_t max_plane;
+        std::size_t addressed_bytes;
+        std::size_t storage_bytes;
+        std::size_t logical_bytes;
+    };
+
+    struct SdpaRecord {
+        std::uint64_t sequence;
+        std::array<SdpaViewRecord, 4> views;
+        std::size_t a;
+        std::size_t L;
+        std::size_t query_heads;
+        std::size_t kv_heads;
+        std::size_t rows;
+        std::size_t cache;
+        std::size_t head_dim;
+        std::size_t grouping;
+        std::size_t output_width;
+        iom::WorkspaceRequirements workspace_requirements;
+        iom::detail::SdpaEntryRegistration entries;
+        iom::detail::WorkspaceLease workspace_lease;
         bool retained_failure;
     };
 
@@ -1052,6 +1089,36 @@ public:
             return;
         }
         throw std::invalid_argument("unknown fake RMSNORM sequence");
+    }
+    void inject_sdpa_failure(SdpaFailure failure) noexcept {
+        next_sdpa_failure_ = failure;
+    }
+
+    void set_sdpa_requirements(
+            iom::WorkspaceRequirements requirements) noexcept {
+        sdpa_requirements_ = requirements;
+    }
+
+    [[nodiscard]] const std::vector<SdpaRecord>& sdpa_records() const
+            noexcept {
+        return sdpa_records_;
+    }
+
+    void finish_sdpa(std::uint64_t sequence) {
+        for (const SdpaRecord& record : sdpa_records_) {
+            if (record.sequence != sequence) {
+                continue;
+            }
+            (void)iom::detail::release_or_invalidate_sdpa_entries(
+                    registry_state_.registry, record.entries,
+                    record.retained_failure, !record.retained_failure);
+            iom::detail::complete_workspace_lease(
+                    registry_state_, record.workspace_lease,
+                    !record.retained_failure);
+            complete(sequence);
+            return;
+        }
+        throw std::invalid_argument("unknown fake SDPA sequence");
     }
 
     void set_embedding_requirements(
@@ -1437,12 +1504,59 @@ protected:
                 });
     }
 
-    iom::oid sdpa_impl(const iom::TensorView&, const iom::TensorView&,
-                       const iom::TensorView&, size_t, size_t, size_t,
-                       iom::TensorView&) override {
-        return submit([&](std::uint64_t sequence) {
-            submissions.push_back({sequence, "sdpa"});
-        });
+    iom::WorkspaceRequirements sdpa_workspace_requirements_impl(
+            const SdpaRequest&) override {
+        return sdpa_requirements_;
+    }
+
+    iom::oid sdpa_impl(const SdpaRequest& request) override {
+        const SdpaFailure failure =
+                std::exchange(next_sdpa_failure_, SdpaFailure::none);
+        iom::detail::Fence fence;
+        fence.invoke = [](const iom::detail::Fence&) noexcept {
+            return iom::detail::FenceResult::pending();
+        };
+        return submit_sdpa(
+                request, registry_state_, registry_queue_id_, fence,
+                [this, failure](
+                        std::uint64_t sequence,
+                        const SdpaRequest& snapshot,
+                        iom::detail::SdpaEntryRegistration entries) {
+                    const auto record_view = [](const SdpaViewSnapshot& view) {
+                        return SdpaViewRecord{
+                                view.rank,
+                                view.dimensions,
+                                view.plane_strides,
+                                view.plane_offset,
+                                view.data_type,
+                                view.quantization,
+                                view.device_identity,
+                                view.owner_identity,
+                                view.native_handle,
+                                view.max_plane,
+                                view.addressed_bytes,
+                                view.storage_bytes,
+                                view.logical_bytes};
+                    };
+                    sdpa_records_.push_back(SdpaRecord{
+                            sequence,
+                            {record_view(snapshot.q), record_view(snapshot.k),
+                             record_view(snapshot.v),
+                             record_view(snapshot.out)},
+                            snapshot.a, snapshot.L, snapshot.Hq, snapshot.Hkv,
+                            snapshot.R, snapshot.C, snapshot.D,
+                            snapshot.grouping, snapshot.output_width,
+                            snapshot.workspace_requirements, entries,
+                            snapshot.workspace_lease,
+                            failure == SdpaFailure::post_acceptance});
+                    submissions.push_back({sequence, "sdpa"});
+                    if (failure == SdpaFailure::post_acceptance) {
+                        commit_failure(
+                                sequence,
+                                std::make_exception_ptr(std::runtime_error(
+                                        "fake SDPA retained failure")));
+                    }
+                });
     }
 
 private:
@@ -1461,6 +1575,9 @@ private:
     std::vector<LinearRecord> linear_records_;
     iom::WorkspaceRequirements linear_requirements_{0, 1};
     LinearFailure next_linear_failure_ = LinearFailure::none;
+    std::vector<SdpaRecord> sdpa_records_;
+    iom::WorkspaceRequirements sdpa_requirements_{0, 1};
+    SdpaFailure next_sdpa_failure_ = SdpaFailure::none;
     bool admission_unavailable_ = false;
 
 };
@@ -2839,8 +2956,14 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
     static_assert(std::is_same_v<
         decltype(&DeviceOps::sdpa),
         iom::oid (DeviceOps::*)(const TensorView&, const TensorView&,
-                                const TensorView&, size_t, size_t, size_t,
-                                TensorView&) noexcept>);
+                                const TensorView&, TensorView&,
+                                std::size_t, std::size_t,
+                                iom::RawWorkspaceView) noexcept>);
+    using SdpaQuery = iom::WorkspaceRequirements (DeviceOps::*)(
+            const TensorView&, const TensorView&, const TensorView&,
+            const TensorView&, std::size_t, std::size_t);
+    static_assert(std::is_same_v<
+        decltype(&DeviceOps::sdpa_workspace_requirements), SdpaQuery>);
 
     // SiLU's exact ABI carries a workspace view for compatibility with
     // admitted callers, while its zero-capacity contract deliberately
@@ -2868,8 +2991,9 @@ TEST_CASE("DeviceOps view signatures are exact and view-only") {
         decltype(&DeviceOps::embedding), DeviceOps*, const iom::Tensor&,
         const iom::Tensor&, iom::Tensor&>);
     static_assert(!std::is_invocable_v<
-        decltype(&DeviceOps::sdpa), DeviceOps*, const iom::Tensor&, const iom::Tensor&,
-        const iom::Tensor&, size_t, size_t, size_t, iom::Tensor&>);
+        decltype(&DeviceOps::sdpa), DeviceOps*, const iom::Tensor&,
+        const iom::Tensor&, const iom::Tensor&, iom::Tensor&,
+        std::size_t, std::size_t, const iom::RawWorkspaceView&>);
 
     // The redundant `dim` argument and every old RMSNorm call form are gone:
     // no overload, alias, compatibility shim, or re-export survives the
@@ -2949,6 +3073,12 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     OwnedFakeTensor linear_x(device, {2, 3, 16, 16});
     OwnedFakeTensor linear_w(device, {16, 16});
     OwnedFakeTensor linear_out(device, {2, 3, 16, 16});
+    OwnedFakeTensor sdpa_q(
+            device, {2, 3, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor sdpa_kv(
+            device, {2, 1, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor sdpa_out(
+            device, {2, 16, 48}, iom::DataType::BF16);
 
     CHECK(iom::oid_is_token(queue.copy(a.view(), b.view())));
     CHECK(iom::oid_is_token(queue.add(frozen.view(), a.view(), b.view())));
@@ -2961,7 +3091,9 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
             iom::LinearOutputLayout::ordinary, 1, 16)));
     CHECK(iom::oid_is_token(
             queue.rmsnorm(a.view(), scale.view(), b.view(), 1e-6F)));
-    CHECK(iom::oid_is_token(queue.sdpa(a.view(), b.view(), b.view(), 2, 1, 16, b.view())));
+    CHECK(iom::oid_is_token(queue.sdpa(
+            sdpa_q.view(), sdpa_kv.view(), sdpa_kv.view(), sdpa_out.view(),
+            0, 16)));
 
     // Derived views are equally acceptable operands.
     const iom::TensorView selected = a.view().select(1, 2);
@@ -2971,6 +3103,211 @@ TEST_CASE("DeviceOps view signatures accept stable owner views from callers") {
     REQUIRE(queue.submissions.size() == 8);
     CHECK_EQ(queue.submissions.back().sequence, 8);
 }
+TEST_CASE("SDPA requirement queries are pure and deterministic") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    OwnedFakeTensor q(device, {2, 3, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor kv(device, {2, 1, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor out(device, {2, 16, 48}, iom::DataType::BF16);
+
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements initial =
+            queue.sdpa_workspace_requirements(
+                    q.view(), kv.view(), kv.view(), out.view(), 0, 16);
+    const std::size_t initial_allocations = iom_test::disarm();
+    CHECK(initial == (iom::WorkspaceRequirements{0, 1}));
+    CHECK_EQ(initial_allocations, 0);
+    CHECK(queue.submissions.empty());
+
+    const iom::oid token =
+            queue.sdpa(q.view(), kv.view(), kv.view(), out.view(), 0, 16);
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.sdpa_records().size(), std::size_t{1});
+    const std::size_t submissions = queue.submissions.size();
+
+    iom_test::arm_counting();
+    const iom::WorkspaceRequirements occupied =
+            queue.sdpa_workspace_requirements(
+                    q.view(), kv.view(), kv.view(), out.view(), 0, 16);
+    const std::size_t occupied_allocations = iom_test::disarm();
+    CHECK(occupied == (iom::WorkspaceRequirements{0, 1}));
+    CHECK_EQ(occupied_allocations, 0);
+    CHECK_EQ(queue.sdpa_records().size(), std::size_t{1});
+    CHECK_EQ(queue.submissions.size(), submissions);
+    CHECK_EQ(queue.registered_at(q.view().native_handle()), 1);
+
+    queue.finish_sdpa(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_EQ(queue.registered_at(q.view().native_handle()), 0);
+}
+
+TEST_CASE("SDPA validates structure and aliases before capability or effects") {
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+
+    {
+        FakeDevice device;
+        FakeQueue queue(device);
+        OwnedFakeTensor malformed_q(device, {16, 16});
+        OwnedFakeTensor kv(device, {2, 1, 16, 16}, iom::DataType::BF16);
+        OwnedFakeTensor out(device, {2, 16, 16}, iom::DataType::BF16);
+        CHECK_EQ(
+                queue.sdpa(
+                        malformed_q.view(), kv.view(), kv.view(), out.view(),
+                        0, 16),
+                invalid);
+        CHECK(queue.submissions.empty());
+        const iom::oid probe = queue.probe();
+        CHECK_EQ(token_sequence(probe), 1);
+        queue.complete(token_sequence(probe));
+        CHECK_NOTHROW(queue.wait(probe));
+    }
+
+    {
+        FakeDevice device;
+        FakeQueue queue(device);
+        OwnedFakeTensor q(device, {2, 2, 16, 16});
+        OwnedFakeTensor kv(device, {2, 1, 16, 16});
+        OwnedFakeTensor out(device, {2, 16, 32});
+        CHECK_EQ(
+                queue.sdpa(q.view(), kv.view(), kv.view(), out.view(), 0, 16),
+                unsupported);
+        CHECK(queue.submissions.empty());
+        const iom::oid probe = queue.probe();
+        CHECK_EQ(token_sequence(probe), 1);
+        queue.complete(token_sequence(probe));
+        CHECK_NOTHROW(queue.wait(probe));
+    }
+
+    {
+        FakeDevice device;
+        FakeQueue queue(device);
+        OwnedFakeTensor q(device, {2, 1, 16, 16}, iom::DataType::BF16);
+        OwnedFakeTensor kv(device, {2, 1, 16, 16}, iom::DataType::BF16);
+        iom::TensorView out_alias =
+                q.view().reshape_leading(span_of({2}));
+        CHECK_EQ(
+                queue.sdpa(
+                        q.view(), kv.view(), kv.view(), out_alias, 0, 16),
+                invalid);
+        CHECK(queue.submissions.empty());
+        const iom::oid probe = queue.probe();
+        CHECK_EQ(token_sequence(probe), 1);
+        queue.complete(token_sequence(probe));
+        CHECK_NOTHROW(queue.wait(probe));
+    }
+}
+
+TEST_CASE("SDPA snapshots views and deduplicates retained read owners") {
+    FakeDevice device;
+    FakeQueue queue(device);
+    OwnedFakeTensor q(device, {2, 3, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor kv(device, {2, 1, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor out(device, {2, 16, 48}, iom::DataType::BF16);
+    void* const q_handle = q.view().native_handle();
+    void* const kv_handle = kv.view().native_handle();
+    void* const out_handle = out.view().native_handle();
+
+    const iom::oid token = [&] {
+        const iom::TensorView q_view = q.view();
+        const iom::TensorView k_view = kv.view();
+        const iom::TensorView v_view = kv.view();
+        iom::TensorView out_view = out.view();
+        return queue.sdpa(q_view, k_view, v_view, out_view, 0, 16);
+    }();
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.sdpa_records().size(), std::size_t{1});
+    const FakeQueue::SdpaRecord& record = queue.sdpa_records().back();
+    CHECK_EQ(record.a, 0);
+    CHECK_EQ(record.L, 16);
+    CHECK_EQ(record.query_heads, 3);
+    CHECK_EQ(record.kv_heads, 1);
+    CHECK_EQ(record.grouping, 3);
+    CHECK(record.views[0].owner == q.view().owner_identity());
+    CHECK(record.views[1].owner == kv.view().owner_identity());
+    CHECK(record.views[2].owner == kv.view().owner_identity());
+    CHECK(record.views[1].owner == record.views[2].owner);
+    CHECK_EQ(record.views[1].handle, record.views[2].handle);
+    CHECK_EQ(record.entries.count, 3);
+    CHECK_EQ(queue.registered_at(q_handle), 1);
+    CHECK_EQ(queue.registered_at(kv_handle), 1);
+    CHECK_EQ(queue.registered_at(out_handle), 1);
+
+    queue.finish_sdpa(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_EQ(queue.registered_at(q_handle), 0);
+    CHECK_EQ(queue.registered_at(kv_handle), 0);
+    CHECK_EQ(queue.registered_at(out_handle), 0);
+}
+
+TEST_CASE("SDPA retains workspace and repeats deferred failures") {
+    FakeDevice device;
+    OwnedFakeTensor q(device, {2, 1, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor kv(device, {2, 1, 16, 16}, iom::DataType::BF16);
+    OwnedFakeTensor out(device, {2, 16, 16}, iom::DataType::BF16);
+    FakeWorkspace workspace(device, reinterpret_cast<void*>(0x4800), 64);
+    FakeQueue queue(device);
+    queue.set_sdpa_requirements({32, 32});
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    FakeWorkspace overlapping_workspace(
+            device, q.storage_base(), q.storage_bytes());
+    CHECK_EQ(
+            queue.sdpa(
+                    q.view(), kv.view(), kv.view(), out.view(), 0, 16,
+                    overlapping_workspace.view().subrange(0, 32)),
+            invalid);
+    CHECK(queue.sdpa_records().empty());
+    CHECK_EQ(queue.registered_at(q.view().native_handle()), 0);
+    CHECK_EQ(queue.registered_at(reinterpret_cast<void*>(0x4800)), 0);
+
+
+    const iom::oid token = queue.sdpa(
+            q.view(), kv.view(), kv.view(), out.view(), 0, 16,
+            workspace.view().subrange(0, 32));
+    REQUIRE(iom::oid_is_token(token));
+    REQUIRE_EQ(queue.sdpa_records().size(), std::size_t{1});
+    CHECK(queue.sdpa_records().back().workspace_requirements
+          == iom::WorkspaceRequirements{32, 32});
+    CHECK(queue.sdpa_records().back().workspace_lease.entry_id != 0);
+    CHECK_EQ(queue.registered_at(reinterpret_cast<void*>(0x4800)), 1);
+    CHECK_EQ(queue.registered_at(q.view().native_handle()), 1);
+
+    queue.finish_sdpa(token_sequence(token));
+    CHECK_NOTHROW(queue.wait(token));
+    CHECK_EQ(queue.registered_at(reinterpret_cast<void*>(0x4800)), 0);
+    CHECK_EQ(queue.registered_at(q.view().native_handle()), 0);
+
+    FakeWorkspace failed_workspace(
+            device, reinterpret_cast<void*>(0x4a00), 64);
+    FakeQueue failing(device);
+    failing.set_sdpa_requirements({32, 32});
+    failing.inject_sdpa_failure(FakeQueue::SdpaFailure::post_acceptance);
+    const iom::oid failed = failing.sdpa(
+            q.view(), kv.view(), kv.view(), out.view(), 0, 16,
+            failed_workspace.view().subrange(0, 32));
+    REQUIRE(iom::oid_is_token(failed));
+    CHECK(failing.sdpa_records().back().workspace_lease.entry_id != 0);
+    CHECK_EQ(
+            failing.sdpa_records().back().workspace_lease.address,
+            reinterpret_cast<void*>(0x4a00));
+    CHECK_EQ(
+            failing.registered_at(reinterpret_cast<void*>(0x4a00)),
+            std::size_t{1});
+    failing.finish_sdpa(token_sequence(failed));
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        CHECK_THROWS_WITH_AS(
+                failing.wait(failed), "fake SDPA retained failure",
+                std::runtime_error);
+    }
+    CHECK_EQ(
+            failing.registered_at(q.view().native_handle()), std::size_t{1});
+    CHECK_EQ(
+            failing.registered_at(reinterpret_cast<void*>(0x4a00)),
+            std::size_t{1});
+}
+
 TEST_CASE("SiLU admission uses a pure query and fixed immutable snapshots") {
     FakeDevice device;
     FakeQueue queue(device);

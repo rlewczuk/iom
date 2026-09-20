@@ -366,8 +366,11 @@ namespace iom {
                 double theta);
 
         oid sdpa(const TensorView& q, const TensorView& k, const TensorView& v,
-                 size_t n_heads, size_t n_kv_heads, size_t head_dim,
-                 TensorView& attn_out) noexcept;
+                 TensorView& out, std::size_t a, std::size_t L,
+                 RawWorkspaceView workspace = {}) noexcept;
+        [[nodiscard]] WorkspaceRequirements sdpa_workspace_requirements(
+                const TensorView& q, const TensorView& k, const TensorView& v,
+                const TensorView& out, std::size_t a, std::size_t L);
 
     protected:
         /*
@@ -700,6 +703,92 @@ namespace iom {
                   workspace_lease(other.workspace_lease) {}
         };
 
+        /**
+         * Fixed-capacity immutable metadata for one SDPA operand. The
+         * dimensions, plane map, selected offset, checked bounds, and stable
+         * owner identities are copied before a request reaches a backend
+         * hook. Keeping the shape in bounded arrays makes the requirement
+         * query allocation-free while retaining the same facts for deferred
+         * submission.
+         */
+        struct SdpaViewSnapshot {
+            std::size_t rank = 0;
+            std::array<std::size_t, 8> dimensions{};
+            std::array<std::size_t, 6> plane_strides{};
+            std::size_t plane_offset = 0;
+            DataType data_type = DataType::BOOL;
+            QuantizationFormat quantization = QuantizationFormat::NONE;
+            const Device* device_identity = nullptr;
+            const Tensor* owner_identity = nullptr;
+            void* native_handle = nullptr;
+            std::size_t max_plane = 0;
+            std::size_t addressed_bytes = 0;
+            std::size_t storage_bytes = 0;
+            std::size_t logical_bytes = 0;
+
+            [[nodiscard]] std::span<const std::size_t>
+                    shape_dimensions() const noexcept {
+                return {dimensions.data(), rank};
+            }
+            [[nodiscard]] std::span<const std::size_t>
+                    leading_plane_strides() const noexcept {
+                return {plane_strides.data(), rank >= 2 ? rank - 2 : 0};
+            }
+        };
+
+        /**
+         * Immutable, value-owned SDPA admission request. All operation
+         * scalars and four fixed-capacity view snapshots survive caller view
+         * mutation/destruction; workspace and its lease are populated only
+         * after the backend requirement hook succeeds.
+         */
+        struct SdpaRequest {
+            SdpaViewSnapshot q;
+            SdpaViewSnapshot k;
+            SdpaViewSnapshot v;
+            SdpaViewSnapshot out;
+            std::size_t a = 0;
+            std::size_t L = 0;
+            std::size_t Hq = 0;
+            std::size_t Hkv = 0;
+            std::size_t R = 0;
+            std::size_t C = 0;
+            std::size_t D = 0;
+            std::size_t grouping = 0;
+            std::size_t output_width = 0;
+            RawWorkspaceView workspace;
+            WorkspaceRequirements workspace_requirements;
+            detail::WorkspaceLease workspace_lease;
+
+            SdpaRequest(
+                    SdpaViewSnapshot q_, SdpaViewSnapshot k_,
+                    SdpaViewSnapshot v_, SdpaViewSnapshot out_,
+                    std::size_t a_, std::size_t L_, std::size_t Hq_,
+                    std::size_t Hkv_, std::size_t R_, std::size_t C_,
+                    std::size_t D_, std::size_t grouping_,
+                    std::size_t output_width_,
+                    RawWorkspaceView workspace_ = {},
+                    WorkspaceRequirements workspace_requirements_ = {},
+                    detail::WorkspaceLease workspace_lease_ = {})
+                : q(std::move(q_)), k(std::move(k_)), v(std::move(v_)),
+                  out(std::move(out_)), a(a_), L(L_), Hq(Hq_), Hkv(Hkv_),
+                  R(R_), C(C_), D(D_), grouping(grouping_),
+                  output_width(output_width_), workspace(workspace_),
+                  workspace_requirements(workspace_requirements_),
+                  workspace_lease(workspace_lease_) {}
+            SdpaRequest(const SdpaRequest&) = default;
+            SdpaRequest& operator=(const SdpaRequest&) = delete;
+            SdpaRequest(SdpaRequest&& other) noexcept
+                : q(std::move(other.q)), k(std::move(other.k)),
+                  v(std::move(other.v)), out(std::move(other.out)),
+                  a(other.a), L(other.L), Hq(other.Hq), Hkv(other.Hkv),
+                  R(other.R), C(other.C), D(other.D),
+                  grouping(other.grouping), output_width(other.output_width),
+                  workspace(other.workspace),
+                  workspace_requirements(other.workspace_requirements),
+                  workspace_lease(other.workspace_lease) {}
+        };
+
 
         /**
          * Fixed-size immutable SiLU view metadata captured before admission.
@@ -821,10 +910,16 @@ namespace iom {
         [[nodiscard]] virtual WorkspaceRequirements
                 rope_workspace_requirements(const RopeRequest& request);
 
-        virtual oid sdpa_impl(const TensorView& q, const TensorView& k,
-                              const TensorView& v, size_t n_heads,
-                              size_t n_kv_heads, size_t head_dim,
-                              TensorView& attn_out);
+        virtual oid sdpa_impl(const SdpaRequest& request);
+        /**
+         * Pure SDPA capability/workspace hook. The request contains only
+         * validated fixed-capacity metadata and checked derived dimensions;
+         * no owner registration, lease, token, queue, or native effect may
+         * occur here. Unported backends report UnsupportedOperation.
+         */
+        [[nodiscard]] virtual WorkspaceRequirements
+                sdpa_workspace_requirements_impl(
+                        const SdpaRequest& request);
         /**
          * Backend hook behind `cache_append_workspace_requirements`.
          * Receives an already fully validated cache append request snapshot
@@ -884,6 +979,13 @@ namespace iom {
 
         [[nodiscard]] static SiLUViewSnapshot snapshot_silu_view(
                 const TensorView& view);
+        [[nodiscard]] static SdpaViewSnapshot snapshot_sdpa_view(
+                const TensorView& view,
+                const detail::CheckedViewFacts& facts);
+        [[nodiscard]] static SdpaRequest validate_sdpa(
+                const Device& device, const TensorView& q,
+                const TensorView& k, const TensorView& v,
+                const TensorView& out, std::size_t a, std::size_t L);
         /**
          * Complete common linear projection admission validation in the
          * frozen contract order: recognized encodings, rank and nonzero
@@ -1102,6 +1204,110 @@ namespace iom {
                     [fence_copy](std::uint64_t) { return fence_copy; },
                     std::move(queue_work));
         }
+        /**
+         * Narrow prepared-ownership adapter for SDPA. It intentionally keeps
+         * its own fixed four-owner registration shape: Q/K/V read aliases
+         * deduplicate by identity, while the output is independently
+         * validated as disjoint by common admission.
+         */
+        template <typename QueueWork>
+        oid submit_sdpa(
+                const SdpaRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, FenceFactory build_fence,
+                QueueWork queue_work) {
+            struct Prepared {
+                SdpaRequest request;
+                detail::WorkspaceLease workspace_lease;
+                detail::SdpaEntryRegistration entries;
+                std::function<void(
+                        std::uint64_t, const SdpaRequest&,
+                        detail::SdpaEntryRegistration)> work;
+                Prepared(const SdpaRequest& request_, QueueWork work_)
+                    : request(request_), work(std::move(work_)) {}
+            };
+            auto prepared = std::make_shared<Prepared>(
+                    request, std::move(queue_work));
+            return submit_prepared(
+                    [prepared, &state, queue_id, build_fence](
+                            std::uint64_t sequence) {
+                        const detail::Fence fence = build_fence(sequence);
+                        const std::array<detail::SdpaOwnerRegistration, 4>
+                                owners{{
+                                        {prepared->request.q.owner_identity,
+                                         prepared->request.q.native_handle},
+                                        {prepared->request.k.owner_identity,
+                                         prepared->request.k.native_handle},
+                                        {prepared->request.v.owner_identity,
+                                         prepared->request.v.native_handle},
+                                        {prepared->request.out.owner_identity,
+                                         prepared->request.out.native_handle},
+                                }};
+                        try {
+                            if (prepared->request.workspace_requirements.bytes
+                                    != 0) {
+                                prepared->workspace_lease =
+                                        detail::acquire_workspace_lease(
+                                                state,
+                                                prepared->request.workspace
+                                                        .owner_identity(),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
+                                                sequence, queue_id, fence);
+                                prepared->request.workspace_lease =
+                                        prepared->workspace_lease;
+                            }
+                            prepared->entries = detail::register_sdpa_entries(
+                                    state, queue_id, sequence, owners, fence);
+                        } catch (...) {
+                            if (prepared->entries.count != 0) {
+                                state.registry.remove_entries(
+                                        std::span<const detail::EntryId>(
+                                                prepared->entries.entries.data(),
+                                                prepared->entries.count));
+                                prepared->entries = {};
+                            }
+                            if (prepared->workspace_lease.entry_id != 0) {
+                                detail::complete_workspace_lease(
+                                        state, prepared->workspace_lease, true);
+                                prepared->workspace_lease = {};
+                                prepared->request.workspace_lease = {};
+                            }
+                            throw;
+                        }
+                    },
+                    [prepared](std::uint64_t sequence) {
+                        prepared->work(
+                                sequence, prepared->request,
+                                prepared->entries);
+                    },
+                    [prepared, &state] {
+                        if (prepared->entries.count != 0) {
+                            state.registry.remove_entries(
+                                    std::span<const detail::EntryId>(
+                                            prepared->entries.entries.data(),
+                                            prepared->entries.count));
+                        }
+                        if (prepared->workspace_lease.entry_id != 0) {
+                            detail::complete_workspace_lease(
+                                    state, prepared->workspace_lease, true);
+                        }
+                    });
+        }
+
+        template <typename QueueWork>
+        oid submit_sdpa(
+                const SdpaRequest& request, detail::RegistryState& state,
+                detail::QueueId queue_id, const detail::Fence& fence,
+                QueueWork queue_work) {
+            const detail::Fence fence_copy = fence;
+            return submit_sdpa(
+                    request, state, queue_id,
+                    [fence_copy](std::uint64_t) { return fence_copy; },
+                    std::move(queue_work));
+        }
+
 
         // Admission path used by a ported SiLU hook. The fixed-size request
         // is captured first, then both distinct owners are registered

@@ -177,6 +177,48 @@ inline EntryRegistration register_copy_entries(
     }
     return result;
 }
+[[nodiscard]] inline SdpaEntryRegistration register_sdpa_entries(
+        RegistryState& state, QueueId queue_id, std::uint64_t sequence,
+        std::span<const SdpaOwnerRegistration> owners,
+        const Fence& fence) {
+    std::lock_guard<std::mutex> lock(state.allocation_mutex);
+    SdpaEntryRegistration result;
+    try {
+        for (std::size_t index = 0; index < owners.size(); ++index) {
+            const SdpaOwnerRegistration owner = owners[index];
+            if (owner.identity == nullptr || owner.address == nullptr) {
+                throw std::invalid_argument(
+                        "SDPA owner identity or address is null");
+            }
+            bool duplicate = false;
+            for (std::size_t prior = 0; prior < index; ++prior) {
+                if (owners[prior].identity == owner.identity) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            if (result.count == result.entries.size()) {
+                throw std::invalid_argument("too many SDPA owners");
+            }
+            const EntryId id = allocate_registry_id(state.next_entry_id);
+            state.registry.register_entry(
+                    id, owner.address, sequence, queue_id, Fence(fence));
+            result.entries[result.count++] = id;
+        }
+    } catch (...) {
+        if (result.count != 0) {
+            state.registry.remove_entries(
+                    std::span<const EntryId>(
+                            result.entries.data(), result.count));
+        }
+        throw;
+    }
+    return result;
+}
+
 
 // Atomically acquires an exclusive lease on the 32-byte-aligned range
 // [address, address + bytes) of one raw-workspace owner, registering the
