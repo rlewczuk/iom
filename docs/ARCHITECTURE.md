@@ -343,10 +343,11 @@ rebuilding consumers; no mixed-version ABI is promised.
 
 TinyLlama composition is a parameterized, imperative sequence of caller-owned
 operations; it is not a graph, fused decoder kernel, or currently shipped
-model API. Embedding, linear, RoPE, cache append, SiLU, and SDPA retain their
-own planned or port-specific status. RMSNorm is the closed operation boundary
-for this revision, with its frozen API, independent reference, and four-backend
-conformance recorded below. Existing `add` and `mul` provide the two residual
+model API. Embedding, linear, RoPE, cache append, and SiLU retain their own
+planned or port-specific status. RMSNorm and causal GQA SDPA are the closed
+operation boundaries for this revision: each has a frozen API, an independent
+reference, and four-backend conformance recorded in the backend contract and
+published below. Existing `add` and `mul` provide the two residual
 additions and the SwiGLU product without changing their contracts.
 
 ### Runtime dimensions and loading boundary
@@ -683,22 +684,23 @@ different quantities and must be labeled as such.
 
 This seam adds no event allocation, timing API, async selector task, or
 per-operation correctness wait solely for disabled tracing. Required
-producer-success waits remain mandatory regardless of attribution. Complete
-mathematical layer assembly remains gated until SDPA closes its four-backend
-gate; incremental session integration belongs to its separate component and is
-not claimed here.
+producer-success waits remain mandatory regardless of attribution. SDPA closed
+its four-backend gate in the revision recorded below, removing the last
+operation prerequisite for complete mathematical layer assembly; incremental
+session integration still belongs to its separate component and is not claimed
+here.
 
 Implementation delivery remains operation-first and deliberately differs from
 the mathematical forward order: embedding, linear, RMSNorm, RoPE, cache
-append, SiLU, and finally SDPA. RMSNorm is closed across CPU, CUDA, ROCm, and
-SYCL at one revision; its CPU scalar/wide baseline is not accelerator evidence.
-Native BF16 matrix evidence for linear and both SDPA products must cover
-prefill and logical `R=1`; host computation, round trips, elementwise
-substitutes, and padded extra tokens do not count.
-Unavailable non-RMSNorm ports remain unsupported. RMSNorm coverage includes
-success, boundary, rejection, accepted failure, exact `R=1/15/16/17`, non-tile
-widths, independent leading planes, logical-padding isolation, and repeatable
-wait behavior.
+append, SiLU, and finally SDPA. RMSNorm and SDPA are each closed across CPU,
+CUDA, ROCm, and SYCL at one revision; their CPU scalar/wide baselines are not
+accelerator evidence. Native BF16 matrix evidence for linear and both SDPA
+products covers prefill and logical `R=1`; host computation, round trips,
+elementwise substitutes, and padded extra tokens do not count.
+A port without its own implementation and evidence remains unsupported. RMSNorm
+coverage includes success, boundary, rejection, accepted failure, exact
+`R=1/15/16/17`, non-tile widths, independent leading planes, logical-padding
+isolation, and repeatable wait behavior.
 ### RMSNorm retained-backend closure status
 
 RMSNorm is implemented through the frozen `DeviceOps` API and uses the shared
@@ -727,6 +729,41 @@ Arc Pro B60 Level Zero GPUs with oneAPI compiler `2026.1.0`. The four focused
 targets passed. The exact commands and retained remote transcript are
 recorded in the RMSNorm contract's closure-evidence table and task evidence
 file.
+
+### SDPA retained-backend closure status
+
+Causal grouped-query SDPA is implemented through the frozen `DeviceOps` API and
+uses the shared backend-neutral conformance harness exactly once per driver: one
+matrix over one independent host oracle, with no per-backend copy of the
+arithmetic, special policy, expected values, or capability table. Its one
+current leaf is `BF16` with `QuantizationFormat::NONE`; the eight other floating
+leaves, BOOL, the integer leaves, `F8_E8M0`, and every quantized domain stay
+explicit `Unsupported` on all four retained backends, with no conversion,
+hidden fallback, or host round trip.
+
+| Backend | Current supported leaf | Explicit limitations | Automated check |
+| --- | --- | --- | --- |
+| CPU | `BF16` | the eight non-BF16 floating leaves, BOOL, the 12 integer leaves, and `F8_E8M0` are `Unsupported`; the CPU port is the scalar host baseline and is not accelerator evidence | [`iom_backend_conformance_cpu_tests`](../test/cpu/test_cpu_conformance.cpp) |
+| CUDA | `BF16` | the same eight floating and every inapplicable leaf are `Unsupported`; a device or queue without the proved BF16 WMMA facility reports `Unsupported` instead of falling back | [`iom_cuda_conformance_tests`](../test/cuda/test_cuda_conformance.cpp) |
+| ROCm | `BF16` | the same limitations, plus `Unsupported` on any device without the checked GFX12 wave32 BF16 WMMA route — the installed `gfx1036` is such a device | [`iom_rocm_conformance_tests`](../test/rocm/test_rocm_conformance.cpp) |
+| SYCL | `BF16` | the same limitations, plus `Unsupported` unless the selected device reports the queried subgroup-16 BF16/BF16/FP32 `ext_intel_matrix` facility | [`iom_sycl_conformance_tests`](../test/sycl/test_sycl_conformance.cpp) |
+
+The runtime identities observed by the four closure gates, the exact commands,
+the native QK/PV records for prefill and logical `R=1`, and the stated profiler
+limitations are recorded in the SDPA contract's retained-backend gate evidence.
+CPU ran on the local `x86_64` AMD Ryzen AI 9 HX 370 w/ Radeon 890M host; CUDA
+ran on an NVIDIA GeForce RTX 5090 (driver `595.71.05`, CUDA `13.2`, executed
+image architecture `1200`); ROCm enumerated the AMD Radeon AI PRO R9700
+`gfx1201` beside `gfx1036` and ran its GFX12 wave32 BF16 WMMA stages; and SYCL
+enumerated two Intel Arc Pro B60 Level Zero GPUs with oneAPI compiler
+`2026.1.0` and traced its subgroup-16 joint-matrix QK and PV kernel launches.
+The four focused targets passed. The matrix claims no identity, kernel, or gate
+result that was not observed.
+
+With this gate closed, every operation boundary of the mathematical forward
+sequence is published, so the later session and decoder-layer components may
+own their own assembly and verification. This status adds no session, model,
+kernel, fixture, or scheduler work.
 
 
 
@@ -760,7 +797,7 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `make_rocm_device(ordinal, memory_config, queue_config)` | Creates a ROCm device for one backend-local ordinal; reserves one data and one checked metadata arena during setup. |
 | `make_sycl_device(ordinal, memory_config, queue_config)` | Creates a SYCL accelerator device for one eligible backend-local ordinal; reserves one data and one checked metadata arena during setup. |
 | `Device` | Reports backend identity and immutable storage capability table; creates `Tensor` owners and `DeviceOps` queues. |
-| `DeviceOps` | Provides `copy`, exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades, and the closed `rmsnorm`/`rmsnorm_workspace_requirements` API; `silu`, `linear`, and GQA `sdpa` retain their own support status. `wait(token)` observes completion. |
+| `DeviceOps` | Provides `copy`, exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades, the closed `rmsnorm`/`rmsnorm_workspace_requirements` API, and the implemented `silu`, `linear`, and GQA `sdpa` facades, whose per-backend BF16 support and limitations are recorded in their operation-owned contract sections. `wait(token)` observes completion. |
 | `gpu_algorithm::compute_staging_size(logical_nbytes)` | Returns the logical transfer payload rounded to a 4-byte GPU word, rejecting rounding overflow. |
 
 `DeviceOps::copy` is pure device-to-device work on compatible views. The four
