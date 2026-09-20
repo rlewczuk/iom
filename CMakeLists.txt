@@ -227,6 +227,8 @@ if(ROCM_ENABLED)
         src/rocm/sdpa_softmax.hip
         src/rocm/sdpa_softmax.hpp
         src/rocm/copy.hpp
+        src/rocm/sdpa_matrix.hip
+        src/rocm/sdpa_matrix.hpp
         src/rocm/driver.cpp
         src/rocm/driver.hpp
         src/rocm/device_internal.hpp
