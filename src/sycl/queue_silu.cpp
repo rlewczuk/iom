@@ -1,21 +1,22 @@
-// Native SYCL BF16/F32 SiLU activation.
+// Native SYCL SiLU activation for the eight non-F64 floating leaves.
 //
 // Admission and the immutable owner snapshots belong to `DeviceOps`; this file
 // keeps the accepted request value-copied, uploads only a fixed control
 // descriptor, and performs every decode, stable FP32 evaluation, and single
 // target-format round-to-nearest-even store in one native in-order device
-// `parallel_for`. There is no host task, no host arithmetic on operand data,
-// no staging buffer, no data roundtrip, no hidden allocation, no fast-math or
-// flush-to-zero, and no synchronous wait: the returned completion event is
-// retained by the queue's fence until an explicit caller wait or drain.
+// `parallel_for`. Each work item exclusively owns one physical output word
+// (or one aligned three-word packet for the six-bit leaves):
+// it reads those words, replaces only the logical fields intersecting them,
+// and stores each owned word once. There is no host task, no host arithmetic
+// on operand data, no staging buffer, no data roundtrip, no hidden allocation,
+// no fast-math or flush-to-zero, and no synchronous wait: the returned
+// completion event is retained by the queue's fence until an explicit caller
+// wait or drain.
 //
-// The ported leaf set is exactly `BF16` and `F32`. `F64` stays `Unsupported`
-// regardless of `aspect::fp64`, the six packed leaves are owned by
-// `10-sycl-silu-packed-formats`, and every semantically inapplicable leaf
-// (`BOOL`, the twelve integer leaves, and `F8_E8M0`) stays `Unsupported`. The
-// descriptor, the FP32 traits, and the shared evaluator/codec helpers are the
-// extension seam a packed-format leaf reuses with its own row- or word-owned
-// work decomposition; nothing here needs to be redesigned for it.
+// The ported leaf set is exactly `F4_E2M1`, `F6_E2M3`, `F6_E3M2`,
+// `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, and `F32`. `F64` stays
+// `Unsupported` because this path has no device-independent FP64 guarantee,
+// regardless of `aspect::fp64`.
 #include "queue_internal.hpp"
 
 #include <sycl/sycl.hpp>
@@ -44,6 +45,7 @@ inline constexpr std::uint64_t kSiluTile = TensorSpec::TILE;
 inline constexpr std::uint64_t kSiluTileSlots =
         static_cast<std::uint64_t>(TensorSpec::TILE)
         * static_cast<std::uint64_t>(TensorSpec::TILE);
+inline constexpr std::uint64_t kSiluMaxPacketWords = 3;
 
 // Immutable device-visible SiLU descriptor copied into one fixed metadata slot
 // before submission. It owns every leading extent and stride the two views
@@ -51,8 +53,8 @@ inline constexpr std::uint64_t kSiluTileSlots =
 // kernel and a temporary view may be destroyed immediately after the call.
 struct SiluMetadata {
     std::uint64_t plane_count = 0;
-    std::uint64_t plane_elements = 0;
-    std::uint64_t element_count = 0;
+    std::uint64_t plane_packets = 0;
+    std::uint64_t packet_words = 0;
     std::uint64_t rows = 0;
     std::uint64_t columns = 0;
     std::uint64_t leading_rank = 0;
@@ -68,6 +70,14 @@ struct SiluMetadata {
 static_assert(std::is_trivially_copyable_v<SiluMetadata>);
 static_assert(sizeof(SiluMetadata) <= detail::kMetadataSlotBytes);
 
+[[nodiscard]] std::size_t silu_checked_add(
+        std::size_t lhs, std::size_t rhs, const char* message) {
+    if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
+        throw std::overflow_error(message);
+    }
+    return lhs + rhs;
+}
+
 [[nodiscard]] std::size_t silu_checked_mul(
         std::size_t lhs, std::size_t rhs, const char* message) {
     if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
@@ -76,12 +86,26 @@ static_assert(sizeof(SiluMetadata) <= detail::kMetadataSlotBytes);
     return lhs * rhs;
 }
 
-// Whole-byte carrier width of the leaves this port queues. Every other leaf,
-// including the packed formats of `10-sycl-silu-packed-formats`, is refused
-// here as well as by `silu_device_supported`, so the launcher can never derive
-// a width for a leaf it does not implement.
+[[nodiscard]] std::size_t silu_padded_dimension(
+        std::size_t value, const char* message) {
+    return silu_checked_mul(
+            silu_checked_add(
+                    value, static_cast<std::size_t>(kSiluTile - 1), message)
+                    / static_cast<std::size_t>(kSiluTile),
+            static_cast<std::size_t>(kSiluTile), message);
+}
+
+// Every supported leaf is packed into a named bit field in the standard
+// tiled stream. The launcher derives no width for F64 or any inapplicable
+// leaf, because `silu_device_supported` rejects those leaves first.
 [[nodiscard]] std::uint32_t silu_leaf_bits(DataType data_type) {
     switch (data_type) {
+        case DataType::F4_E2M1: return 4;
+        case DataType::F6_E2M3: return 6;
+        case DataType::F6_E3M2: return 6;
+        case DataType::F8_E4M3FN: return 8;
+        case DataType::F8_E5M2: return 8;
+        case DataType::F16: return 16;
         case DataType::BF16: return 16;
         case DataType::F32: return 32;
         default: break;
@@ -106,29 +130,74 @@ static_assert(sizeof(SiluMetadata) <= detail::kMetadataSlotBytes);
             + (row % kSiluTile) * kSiluTile + column % kSiluTile;
 }
 
-// BF16 and F32 carriers are whole bytes, so one logically addressed element
-// owns its complete physical slot: the load and the single store below never
-// read or rewrite a neighbouring carrier or a padding byte.
-[[nodiscard]] inline std::uint64_t silu_load_element(
-        const unsigned char* base, std::uint64_t slot,
-        std::uint32_t bits) noexcept {
-    const std::uint64_t byte = slot * (bits / 8);
-    std::uint64_t raw = 0;
-    for (std::uint32_t index = 0; index < bits / 8; ++index) {
-        raw |= static_cast<std::uint64_t>(base[byte + index])
-                << (8 * index);
-    }
-    return raw;
+struct SiluPhysicalCoordinate {
+    std::uint64_t row;
+    std::uint64_t column;
+};
+
+[[nodiscard]] inline SiluPhysicalCoordinate silu_physical_coordinate(
+        std::uint64_t slot, std::uint64_t rows,
+        std::uint64_t columns) noexcept {
+    const std::uint64_t tile_columns =
+            (columns + kSiluTile - 1) / kSiluTile;
+    const std::uint64_t tile_index = slot / kSiluTileSlots;
+    const std::uint64_t in_tile = slot % kSiluTileSlots;
+    return {
+            (tile_index / tile_columns) * kSiluTile
+                    + in_tile / kSiluTile,
+            (tile_index % tile_columns) * kSiluTile
+                    + in_tile % kSiluTile};
 }
 
-inline void silu_store_element(
-        unsigned char* base, std::uint64_t slot, std::uint32_t bits,
-        std::uint64_t value) noexcept {
-    const std::uint64_t byte = slot * (bits / 8);
-    for (std::uint32_t index = 0; index < bits / 8; ++index) {
-        base[byte + index] = static_cast<unsigned char>(
+[[nodiscard]] inline std::uint32_t silu_field_mask(
+        unsigned int bits) noexcept {
+    return bits == 32
+            ? 0xffffffffu
+            : (std::uint32_t{1} << bits) - 1;
+}
+
+[[nodiscard]] inline std::uint32_t silu_load_word(
+        const unsigned char* base, std::uint64_t word) noexcept {
+    std::uint32_t value = 0;
+    for (unsigned int index = 0; index < 4; ++index) {
+        value |= static_cast<std::uint32_t>(base[word * 4 + index])
+                << (8 * index);
+    }
+    return value;
+}
+
+inline void silu_store_word(
+        unsigned char* base, std::uint64_t word,
+        std::uint32_t value) noexcept {
+    for (unsigned int index = 0; index < 4; ++index) {
+        base[word * 4 + index] = static_cast<unsigned char>(
                 value >> (8 * index));
     }
+}
+
+[[nodiscard]] inline std::uint64_t silu_load_bits(
+        const unsigned char* base, std::uint64_t bit,
+        unsigned int bits) noexcept {
+    const std::uint64_t word = bit / 32;
+    const unsigned int offset = static_cast<unsigned int>(bit % 32);
+    std::uint64_t joined = silu_load_word(base, word);
+    if (offset + bits > 32) {
+        joined |= static_cast<std::uint64_t>(
+                          silu_load_word(base, word + 1))
+                << 32;
+    }
+    const std::uint64_t mask = bits == 64
+            ? ~std::uint64_t{}
+            : (std::uint64_t{1} << bits) - 1;
+    return (joined >> offset) & mask;
+}
+
+inline void silu_merge_field(
+        std::uint32_t& destination_word, std::uint32_t value,
+        unsigned int bit_offset, unsigned int bits) noexcept {
+    const std::uint32_t mask = silu_field_mask(bits) << bit_offset;
+    destination_word = (destination_word & ~mask)
+            | ((value << bit_offset) & mask);
 }
 
 // FP32 evaluation traits of the shared SiLU evaluator and the shared named
@@ -175,14 +244,16 @@ struct SiluFloatTraits {
 
 using SiluCodec = detail::scalar_binary_codec_detail::Codec<SiluFloatTraits>;
 
-// One logical element: resolve both leading-plane addresses from the copied
-// descriptor, decode once, evaluate the stable SiLU once with representable
-// special values handled before finite arithmetic, and store exactly one
-// target-format round-to-nearest-even encoding.
-inline void silu_element(
+// One work item owns one physical output word, or one aligned packet of
+// physical output words for six-bit leaves. It resolves both transformed
+// leading-plane addresses, reads the existing destination words, evaluates
+// each logical field intersecting the packet exactly once, merges only those
+// field bits, and stores every owned word exactly once. Padding slots and
+// padding bits are never decoded or changed.
+inline void silu_packet(
         const unsigned char* x, unsigned char* y,
         const SiluMetadata& metadata, std::uint64_t plane,
-        std::uint64_t row, std::uint64_t column) noexcept {
+        std::uint64_t packet_in_plane) noexcept {
     std::uint64_t x_plane = metadata.x_plane_offset;
     std::uint64_t y_plane = metadata.y_plane_offset;
     std::uint64_t rest = plane;
@@ -193,22 +264,107 @@ inline void silu_element(
         x_plane += coordinate * metadata.x_strides[axis];
         y_plane += coordinate * metadata.y_strides[axis];
     }
+
     const auto format = SiluCodec::format(
             static_cast<DataType>(metadata.data_type));
-    const std::uint64_t raw = silu_load_element(
-            x,
-            silu_plane_slot(
-                    x_plane, row, column, metadata.rows, metadata.columns),
-            metadata.bits);
-    const float value = SiluCodec::decode(raw, format);
-    const std::uint64_t encoded = SiluCodec::encode(
-            detail::scalar_silu_detail::evaluate<SiluFloatTraits>(value),
-            format);
-    silu_store_element(
-            y,
-            silu_plane_slot(
-                    y_plane, row, column, metadata.rows, metadata.columns),
-            metadata.bits, encoded);
+    const std::uint64_t destination_base_slot = silu_plane_slot(
+            y_plane, 0, 0, metadata.rows, metadata.columns);
+    const std::uint64_t packet_first_word_in_plane =
+            packet_in_plane * metadata.packet_words;
+    const std::uint64_t packet_first_word =
+            destination_base_slot * metadata.bits / 32
+            + packet_first_word_in_plane;
+    const std::uint64_t packet_first_bit = packet_first_word * 32;
+    const std::uint64_t packet_last_bit = packet_first_bit
+            + metadata.packet_words * 32;
+    std::uint32_t merged[kSiluMaxPacketWords]{};
+    for (std::uint64_t local_word = 0;
+         local_word < metadata.packet_words; ++local_word) {
+        merged[local_word] = silu_load_word(
+                y, packet_first_word + local_word);
+    }
+
+    const std::uint64_t packet_local_first_bit =
+            packet_first_word_in_plane * 32;
+    const std::uint64_t packet_local_last_bit =
+            packet_local_first_bit + metadata.packet_words * 32;
+    const std::uint64_t first_slot =
+            packet_local_first_bit / metadata.bits;
+    const std::uint64_t last_slot =
+            (packet_local_last_bit - 1) / metadata.bits;
+    for (std::uint64_t slot = first_slot; slot <= last_slot; ++slot) {
+        const std::uint64_t slot_bit = slot * metadata.bits;
+        if (slot_bit + metadata.bits <= packet_local_first_bit
+                || slot_bit >= packet_local_last_bit) {
+            continue;
+        }
+        const SiluPhysicalCoordinate coordinate =
+                silu_physical_coordinate(
+                        slot, metadata.rows, metadata.columns);
+        if (coordinate.row >= metadata.rows
+                || coordinate.column >= metadata.columns) {
+            continue;
+        }
+        const std::uint64_t input_bit = silu_plane_slot(
+                x_plane, coordinate.row, coordinate.column,
+                metadata.rows, metadata.columns) * metadata.bits;
+        const std::uint64_t raw = silu_load_bits(
+                x, input_bit, metadata.bits);
+        const float value = SiluCodec::decode(raw, format);
+        const std::uint64_t encoded = SiluCodec::encode(
+                detail::scalar_silu_detail::evaluate<SiluFloatTraits>(value),
+                format);
+        const std::uint64_t output_bit = silu_plane_slot(
+                y_plane, coordinate.row, coordinate.column,
+                metadata.rows, metadata.columns) * metadata.bits;
+        const std::uint64_t field_end = output_bit + metadata.bits;
+        const std::uint64_t overlap_first =
+                output_bit > packet_first_bit
+                ? output_bit
+                : packet_first_bit;
+        const std::uint64_t overlap_end =
+                field_end < packet_last_bit
+                ? field_end
+                : packet_last_bit;
+        if (overlap_first >= overlap_end) continue;
+        const std::uint64_t first_word = overlap_first / 32;
+        const std::uint64_t last_word = (overlap_end - 1) / 32;
+        for (std::uint64_t output_word = first_word;
+             output_word <= last_word; ++output_word) {
+            if (output_word < packet_first_word
+                    || output_word >= packet_first_word
+                            + metadata.packet_words) {
+                continue;
+            }
+            const std::uint64_t word_first_bit = output_word * 32;
+            const std::uint64_t word_overlap_first =
+                    overlap_first > word_first_bit
+                    ? overlap_first
+                    : word_first_bit;
+            const std::uint64_t word_overlap_end =
+                    overlap_end < word_first_bit + 32
+                    ? overlap_end
+                    : word_first_bit + 32;
+            if (word_overlap_first >= word_overlap_end) continue;
+            const unsigned int destination_offset =
+                    static_cast<unsigned int>(
+                            word_overlap_first - word_first_bit);
+            const unsigned int source_offset = static_cast<unsigned int>(
+                    word_overlap_first - output_bit);
+            const unsigned int count = static_cast<unsigned int>(
+                    word_overlap_end - word_overlap_first);
+            const std::uint32_t segment = static_cast<std::uint32_t>(
+                    encoded >> source_offset) & silu_field_mask(count);
+            silu_merge_field(
+                    merged[output_word - packet_first_word], segment,
+                    destination_offset, count);
+        }
+    }
+    for (std::uint64_t local_word = 0;
+         local_word < metadata.packet_words; ++local_word) {
+        silu_store_word(
+                y, packet_first_word + local_word, merged[local_word]);
+    }
 }
 
 template <typename Request>
@@ -227,15 +383,14 @@ template <typename Request>
                     const std::uint64_t index =
                             static_cast<std::uint64_t>(item[0]);
                     const std::uint64_t plane =
-                            index / metadata->plane_elements;
-                    const std::uint64_t within_plane =
-                            index - plane * metadata->plane_elements;
-                    const std::uint64_t row =
-                            within_plane / metadata->columns;
-                    const std::uint64_t column =
-                            within_plane - row * metadata->columns;
-                    silu_element(
-                            x, y, *metadata, plane, row, column);
+                            index / metadata->plane_packets;
+                    if (plane >= metadata->plane_count) {
+                        return;
+                    }
+                    const std::uint64_t packet_in_plane =
+                            index - plane * metadata->plane_packets;
+                    silu_packet(
+                            x, y, *metadata, plane, packet_in_plane);
                 });
     });
 }
@@ -286,23 +441,52 @@ template <typename Request>
                 plane_count, dimensions[axis],
                 "SYCL SiLU plane count overflows");
     }
-    const std::size_t plane_elements = silu_checked_mul(
-            dimensions[leading_rank], dimensions[leading_rank + 1],
-            "SYCL SiLU plane element count overflows");
+    const std::size_t padded_rows = silu_padded_dimension(
+            dimensions[leading_rank], "SYCL SiLU padded row count overflows");
+    const std::size_t padded_columns = silu_padded_dimension(
+            dimensions[leading_rank + 1],
+            "SYCL SiLU padded column count overflows");
+    const std::size_t padded_elements = silu_checked_mul(
+            padded_rows, padded_columns,
+            "SYCL SiLU padded plane element count overflows");
+    const std::size_t plane_bits = silu_checked_mul(
+            padded_elements, metadata.bits,
+            "SYCL SiLU padded plane bit count overflows");
+    const std::size_t plane_words = silu_checked_add(
+            plane_bits, 31, "SYCL SiLU plane word count overflows") / 32;
+    const std::size_t packet_words = metadata.bits == 6 ? 3 : 1;
+    if (plane_words % packet_words != 0) {
+        throw std::overflow_error(
+                "SYCL SiLU plane words are not packet aligned");
+    }
+    const std::size_t plane_packets = plane_words / packet_words;
+    (void)silu_checked_mul(
+            plane_count, plane_packets,
+            "SYCL SiLU physical packet count overflows");
     metadata.plane_count = static_cast<std::uint64_t>(plane_count);
-    metadata.plane_elements = static_cast<std::uint64_t>(plane_elements);
-    metadata.element_count = static_cast<std::uint64_t>(
-            silu_checked_mul(
-                    plane_count, plane_elements,
-                    "SYCL SiLU logical element count overflows"));
+    metadata.plane_packets = static_cast<std::uint64_t>(plane_packets);
+    metadata.packet_words = static_cast<std::uint64_t>(packet_words);
     return metadata;
 }
 
 }  // namespace
 
 bool silu_device_supported(DataType data_type) noexcept {
-    return data_type == DataType::BF16 || data_type == DataType::F32;
+    switch (data_type) {
+        case DataType::F4_E2M1:
+        case DataType::F6_E2M3:
+        case DataType::F6_E3M2:
+        case DataType::F8_E4M3FN:
+        case DataType::F8_E5M2:
+        case DataType::F16:
+        case DataType::BF16:
+        case DataType::F32:
+            return true;
+        default:
+            return false;
+    }
 }
+
 
 void SyclQueue::validate_silu_representation(const SiLURequest& request) {
     (void)build_silu_metadata(request);
@@ -361,9 +545,13 @@ void SyclQueue::execute_silu(Task& task) {
                 const_cast<SiluMetadata*>(metadata_device),
                 metadata_pool_->host_data(*metadata_slot),
                 sizeof(metadata));
+        const std::size_t work_items = silu_checked_mul(
+                static_cast<std::size_t>(metadata.plane_count),
+                static_cast<std::size_t>(metadata.plane_packets),
+                "SYCL SiLU physical packet count overflows");
         const sycl::event silu_event = launch_silu_kernel(
                 queue_, metadata_event, *task.silu_request, metadata_device,
-                static_cast<std::size_t>(metadata.element_count));
+                work_items);
         if (launch_calls.kernel_launched != nullptr) {
             launch_calls.kernel_launched();
         }

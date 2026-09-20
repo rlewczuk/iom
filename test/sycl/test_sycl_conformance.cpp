@@ -892,17 +892,12 @@ TEST_CASE("SYCL conformance: RMSNorm reference, admission, and lifetime") {
     iom_conformance::run_rmsnorm_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
-// SYCL's declared SiLU expectation for this leaf: the device port queues
-// exactly BF16 and F32. The six packed leaves arrive with
-// `10-sycl-silu-packed-formats` (the shared header's `kSiluSyclExpectedSupported`
-// is the eventual full SYCL matrix, whose remaining entry is the conditional
-// F64 aspect path) and F64 is deliberately not claimed here, so the shared
-// suite observes those seven and every semantically inapplicable leaf as
-// capability rejections.
-inline constexpr std::array<iom::DataType, 2> kSyclSiluImplementedLeaves{
-        iom::DataType::BF16,
-        iom::DataType::F32,
-};
+// SYCL queues the eight non-F64 floating leaves through the native device
+// path. F64 remains an explicit capability rejection even on devices that
+// expose `aspect::fp64`, because this operation has no device-independent
+// FP64 guarantee.
+inline constexpr auto kSyclSiluImplementedLeaves =
+        iom_conformance::kSiluSyclExpectedSupported;
 
 TEST_CASE("SYCL conformance: SiLU reference, admission, and lifetime") {
     SyclDevices devices;
@@ -963,18 +958,14 @@ TEST_CASE(
         CHECK(iom_conformance::read_logical(output->view()) == before);
     }
 
-    // The six packed leaves and every semantically inapplicable leaf are
-    // capability rejections on one queue, none of them mutates the output, and
-    // none of them consumes a submission sequence.
+    // Every semantically inapplicable leaf is a capability rejection on one
+    // queue, none of them mutates the output, and none consumes a submission
+    // sequence. The six packed additions are exercised by the shared positive
+    // suite above rather than duplicated in this driver-local rejection probe.
     {
         std::vector<iom::DataType> rejected(
                 iom_conformance::kSiluInapplicableDataTypes.begin(),
                 iom_conformance::kSiluInapplicableDataTypes.end());
-        rejected.insert(
-                rejected.end(),
-                {iom::DataType::F4_E2M1, iom::DataType::F6_E2M3,
-                 iom::DataType::F6_E3M2, iom::DataType::F8_E4M3FN,
-                 iom::DataType::F8_E5M2, iom::DataType::F16});
         auto queue = devices.candidate->create_ops();
         for (const iom::DataType leaf : rejected) {
             CAPTURE(static_cast<int>(leaf));
