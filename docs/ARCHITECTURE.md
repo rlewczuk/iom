@@ -26,11 +26,11 @@ flowchart LR
     upload --> view[TensorView operands]
     view --> queue[DeviceOps queue]
     queue --> cpu[CPU queue]
-    queue --> accel[CUDA / ROCm / SYCL / TTNN backend]
+    queue --> accel[CUDA / ROCm / SYCL backends]
 ```
 
 The public API is split between backend-neutral headers in `include/iom` and
-small backend factory headers in `include/iom/{cpu,cuda,rocm,sycl,ttnn}`.
+small backend factory headers in `include/iom/{cpu,cuda,rocm,sycl}`.
 `libiom` contains the neutral tensor, allocation, mapped-file, SafeTensors,
 model-configuration/model-source, and CPU implementation. Each optional
 accelerator builds as a separate static library and links to `libiom`:
@@ -41,7 +41,6 @@ accelerator builds as a separate static library and links to `libiom`:
 | CUDA | `CUDA_ENABLED`, `iom_cuda` | One owned CUDA driver context per device; caller supplies unmanaged native device storage for that context. |
 | ROCm | `ROCM_ENABLED`, `iom_rocm` | One owned HIP context per device; caller supplies native storage for that ordinal. |
 | SYCL | `SYCL_ENABLED`, `iom_sycl` | One owned SYCL context for an eligible accelerator ordinal; caller supplies the allocator. |
-| TTNN | `TTNN_ENABLED`, `iom_ttnn` | One owned TTNN device; TTNN owns native tensor storage, so no `iom::Allocator` is passed to its factory. |
 
 Common code deliberately knows no runtime-specific type, active-backend global,
 or backend-kind switch. A `Device` is a backend-neutral interface, and every
@@ -67,8 +66,8 @@ can coexist without a process-wide selection step.
    the creating backend.
 3. **Device and storage boundary.** `Device` validates the requested spec
    against backend capabilities and creates a materialized `Tensor`. CPU,
-   CUDA, ROCm, and SYCL use the common standard layout; TTNN may use a native
-   per-plane representation while maintaining the same public tensor contract.
+   CUDA, ROCm, and SYCL use the common standard layout while preserving the
+   same public tensor contract.
 4. **Execution boundary.** `DeviceOps` is an in-order asynchronous queue over
    caller-created views. `copy` and the four binary operations are the shipped
    compute operations:
@@ -149,18 +148,18 @@ After successful standard-GPU setup, tensor/workspace creation and destruction,
 view transforms, transfers, submissions, waits, retirement, queue recreation,
 parking, and failure recovery issue zero additional IOM-native device
 allocation/free calls and do not resize resource arrays. This guarantee is
-about calls made by IOM at the backend allocation boundary. Vendor/SDK
-allocations (including SYCL event internals and TTNN runtime behavior) are a
-separate, potentially unavailable evidence category and are never relabeled
-as IOM calls. Host allocations for snapshots, fixed mirrors, staging, and
-caller-owned workspaces are likewise distinct from native backing allocation.
+about calls made by IOM at the backend allocation boundary.
+Vendor/SDK allocations (including SYCL event internals and other runtime
+behavior) are a separate, potentially unavailable evidence category and are
+never relabeled as IOM calls. Host allocations for snapshots, fixed mirrors,
+staging, and caller-owned workspaces are likewise distinct from native backing
+allocation.
 
 CPU intentionally retains borrowed caller allocator ownership and host/reference
-storage; it has no device metadata arena or fabricated native slots. TTNN
-retains native per-plane tensor ownership and host-only scratch, and does not
-claim the standard-GPU two-backing guarantee. Its vendor-internal allocation
-behavior is reported as unproven whenever the runtime does not expose a
-comparable observation boundary.
+storage; it has no device metadata arena or fabricated native slots. The
+retained accelerator backends report vendor-internal allocation behavior as
+unproven whenever the runtime does not expose a comparable observation
+boundary.
 
 The conformance layer under `test/backend` owns backend-neutral requirement,
 rank, queue, workspace, lifetime, and FIFO observations. Backend drivers own
@@ -186,7 +185,7 @@ A `TensorSpec` contains:
 - a leaf `DataType`, covering boolean, signed/unsigned 2- through 64-bit
   integers, several low-precision floating encodings, and F16/BF16/F32/F64;
 - a `QuantizationFormat`, defaulting to `NONE` and enumerating generic,
-  OCP, NVIDIA, GGML, and Tenstorrent formats.
+  OCP, NVIDIA, GGML, and `TT_BFP*` formats.
 
 `TensorShape` requires rank two or greater and nonzero dimensions.
 `TensorShape::element_count`, `TensorSpec::logical_nbytes`,
@@ -207,9 +206,8 @@ and `F64`. DIV accepts exactly the nine floating leaves
 `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`, `F32`,
 and `F64`. Matching `BOOL`, `F8_E8M0`, non-`NONE` quantization, or integer DIV
 is `Unsupported` after all earlier validation. Required leaves are not limited
-by SDK native dtype support: staging or emulation is internal. TTNN storage
-additionally covers `BOOL` and need not store `F8_E8M0`; its native per-plane
-32x32 layout remains behind the public contract.
+by SDK native dtype support: staging or emulation is internal, and the public
+tensor contract remains unchanged for every retained backend.
 
 ### Standard 16x16 tiled layout
 
@@ -235,9 +233,7 @@ least-significant-bit first at the exact `DataType` width; multi-byte fields
 are little-endian. The transfer implementation scatters that row-major logical
 bit stream into tiles on upload and gathers it on download, leaving tile padding
 outside the logical byte payload. Boolean host bytes are constrained to `0` or
-`1`. TTNN is the storage exception: it maps each logical plane to a native
-`32 x 32` tile internally, while exposing the same public logical shape and
-view rules.
+`1`.
 
 Metadata stays on the host. A tensor's native storage handle is owned by the
 backend and may be host memory or device memory; callers must not infer the
@@ -349,9 +345,9 @@ TinyLlama composition is a parameterized, imperative sequence of caller-owned
 operations; it is not a graph, fused decoder kernel, or currently shipped
 model API. Embedding, linear, RoPE, cache append, SiLU, and SDPA retain their
 own planned or port-specific status. RMSNorm is the closed operation boundary
-for this revision, with its frozen API, independent reference, and all-five
-backend conformance recorded below. Existing `add` and `mul` provide the two
-residual additions and the SwiGLU product without changing their contracts.
+for this revision, with its frozen API, independent reference, and four-backend
+conformance recorded below. Existing `add` and `mul` provide the two residual
+additions and the SwiGLU product without changing their contracts.
 
 ### Runtime dimensions and loading boundary
 
@@ -570,20 +566,8 @@ all_standard_cache_bytes =
     2 * Nlayers * per_cache_standard_bytes.
 ```
 
-The `256` factor is the number of BF16 elements in one tile. TTNN does not use
-that byte formula: its assessment uses one native 32x32 allocation per leading
-plane, checks every native extent and `uint32_t` conversion, and obtains the
-carrier or runtime-owned allocation size from backend evidence. An illustrative
-BF16 assessment is
-
-```text
-per_cache_native32_bytes =
-    Hkv * ceil(C / 32) * ceil(D / 32) * 1024 * carrier_bytes.
-```
-
-It is not permission to invent a carrier byte count or other native allocation
-constant when the backend cannot report it. Existing device arena and queue
-metadata overhead is accounted separately from tensor bytes.
+The `256` factor is the number of BF16 elements in one tile. Existing device
+arena and queue metadata overhead is accounted separately from tensor bytes.
 
 #### Request setup and immutable run banks
 
@@ -605,12 +589,7 @@ logical run shape after all leases and readers complete.
 For `Nlayers=2,F=8,M=12,Hq=4,Hkv=2,D=2,V=19,C=17`, checked logical K+V
 cache storage is `2*2*2*17*2*2 = 544` bytes. Standard storage is
 `2*ceil(17/16)*ceil(2/16)*256*2 = 2048` bytes per cache and
-`2*2*2048 = 8192` bytes for both caches in both layers. A native32 assessment
-instead evaluates
-`Hkv*ceil(C/32)*ceil(D/32)*1024*carrier_bytes`: with an evidenced two-byte
-BF16 carrier this is `4096` bytes per cache and `16384` bytes total. If the
-backend reports another carrier or runtime-owned size, that evidenced result
-replaces the illustration; every native extent and conversion remains checked.
+`2*2*2048 = 8192` bytes for both caches in both layers.
 
 The same case intentionally uses non-tile-aligned `F=8`. An exact `[R,F]`
 BF16 bank has logical byte counts `R*8*2`, so `R=1,15,16,17` requires
@@ -623,9 +602,7 @@ logical storage or a view-retargeting scheme.
 
 All tensor operands and outputs are allocated before asking an operation or
 host-transfer requirement query about those actual views. For each actual
-prefill and decode call, including the CUDA, ROCm, SYCL, and TTNN
-matrix-staging paths described in the backend contract, reusable operation and
-transfer scratch is:
+prefill and decode call, reusable operation and transfer scratch is:
 
 ```text
 scratch_bytes =
@@ -637,11 +614,10 @@ scratch_alignment =
 The maximum uses checked align-up, subrange addition, byte, and address
 arithmetic. Mutually exclusive live ranges are not summed. Independent
 submissions either use disjoint aligned subranges or the existing lease
-serialization. Synchronous selector scratch is provisioned separately from the
-selector's actual requirement and is never allocated during selection. If a
-backend requirement is capability-blocked, setup records the missing evidence
-instead of guessing bytes; CPU and TTNN positive workspace remains rejected
-until the first owning operation closes its minimal factory gap.
+serialization. Synchronous selector scratch is provisioned separately from
+the selector's actual requirement and is never allocated during selection.
+If a backend requirement is capability-blocked, setup records the missing
+evidence instead of guessing bytes.
 
 #### Storage live ranges
 
@@ -708,29 +684,27 @@ different quantities and must be labeled as such.
 This seam adds no event allocation, timing API, async selector task, or
 per-operation correctness wait solely for disabled tracing. Required
 producer-success waits remain mandatory regardless of attribution. Complete
-mathematical layer assembly remains gated until SDPA closes its all-five
-backend gate; incremental session integration belongs to its separate
-component and is not claimed here.
+mathematical layer assembly remains gated until SDPA closes its four-backend
+gate; incremental session integration belongs to its separate component and is
+not claimed here.
 
 Implementation delivery remains operation-first and deliberately differs from
 the mathematical forward order: embedding, linear, RMSNorm, RoPE, cache
-append, SiLU, and finally SDPA. RMSNorm is closed across CPU, CUDA, ROCm, SYCL,
-and TTNN at one revision; its CPU scalar/wide baseline is not accelerator
-evidence, and TTNN's documented reduced-fidelity policy remains distinct from
-contract-exact conformance. Native BF16 matrix evidence for linear and both
-SDPA products must cover prefill and logical `R=1`; host computation, round
-trips, elementwise substitutes, and padded extra tokens do not count.
+append, SiLU, and finally SDPA. RMSNorm is closed across CPU, CUDA, ROCm, and
+SYCL at one revision; its CPU scalar/wide baseline is not accelerator evidence.
+Native BF16 matrix evidence for linear and both SDPA products must cover
+prefill and logical `R=1`; host computation, round trips, elementwise
+substitutes, and padded extra tokens do not count.
 Unavailable non-RMSNorm ports remain unsupported. RMSNorm coverage includes
 success, boundary, rejection, accepted failure, exact `R=1/15/16/17`, non-tile
 widths, independent leading planes, logical-padding isolation, and repeatable
 wait behavior.
-### RMSNorm all-backend closure status
+### RMSNorm retained-backend closure status
 
 RMSNorm is implemented through the frozen `DeviceOps` API and uses the shared
 backend-neutral conformance harness exactly once per driver. Every supported
 leaf is exercised at this revision; the remaining `Unsupported` results are
-the semantic inapplicable leaves plus the explicit SYCL `F64` capability guard
-and TTNN carrier/device limitations.
+the semantic inapplicable leaves plus the explicit SYCL `F64` capability guard.
 
 | Backend | Exercised supported leaves | Explicit limitations | Automated check |
 | --- | --- | --- | --- |
@@ -738,25 +712,21 @@ and TTNN carrier/device limitations.
 | CUDA | all nine applicable floating leaves | BOOL, 12 integer leaves, and `F8_E8M0` are `Unsupported` | [`iom_cuda_conformance_tests`](../test/cuda/test_cuda_conformance.cpp) |
 | ROCm | all nine applicable floating leaves | BOOL, 12 integer leaves, and `F8_E8M0` are `Unsupported` | [`iom_rocm_conformance_tests`](../test/rocm/test_rocm_conformance.cpp) |
 | SYCL | eight non-`F64` leaves; `F64` when `aspect::fp64` is present | `F64` is `Unsupported` when the selected device lacks `aspect::fp64`; semantic inapplicable leaves remain rejected | [`iom_sycl_conformance_tests`](../test/sycl/test_sycl_conformance.cpp) |
-| TTNN | `BF16,F32` | seven encoded-carrier leaves (`F4_E2M1,F6_E2M3,F6_E3M2,F8_E4M3FN,F8_E5M2,F16,F8_E8M0`) plus `F64` remain `Unsupported`; BF16/F32 use the documented reduced-fidelity policy | [`iom_ttnn_conformance_tests`](../test/ttnn/test_ttnn_conformance.cpp) |
 
-The runtime identities observed by the five closure gates, and the exact
+The runtime identities observed by the four closure gates, and the exact
 remote command evidence backing this matrix, are recorded in the RMSNorm
 contract section. The matrix does not claim an identity or gate result that
 was not observed.
- 
+
 Closure identities and check outcomes at the prepared revision are also
 published here, not only in the normative contract: CPU ran on the local
 `x86_64` AMD Ryzen AI 9 HX 370 w/ Radeon 890M host; CUDA ran on an NVIDIA
 GeForce RTX 5090 (driver `595.71.05`, CUDA `13.2`); ROCm enumerated the AMD
-Radeon AI PRO R9700 `gfx1201` (and `gfx1036`); SYCL enumerated two Intel Arc
-Pro B60 Level Zero GPUs with oneAPI compiler `2026.1.0`; and TTNN ran on
-Blackhole firmware `19.13.1` with KMD `2.8.0`. The five focused targets
-passed, including the shared RMSNorm records and TTNN's explicit
-documented-nonconforming fidelity record. The exact commands and retained
-remote transcript are recorded in the RMSNorm contract's closure-evidence
-table and task evidence file
-`.cswd/tasks/006-tinyllama/05-rms-normalization/11-all-backend-rmsnorm-closure/remote.log`.
+Radeon AI PRO R9700 `gfx1201` (and `gfx1036`); and SYCL enumerated two Intel
+Arc Pro B60 Level Zero GPUs with oneAPI compiler `2026.1.0`. The four focused
+targets passed. The exact commands and retained remote transcript are
+recorded in the RMSNorm contract's closure-evidence table and task evidence
+file.
 
 
 
@@ -789,8 +759,6 @@ points; backend implementation classes and `iom::detail` helpers are not API.
 | `make_cuda_device(ordinal, memory_config, queue_config)` | Creates a CUDA device for one backend-local ordinal; reserves one data and one checked metadata arena during setup. |
 | `make_rocm_device(ordinal, memory_config, queue_config)` | Creates a ROCm device for one backend-local ordinal; reserves one data and one checked metadata arena during setup. |
 | `make_sycl_device(ordinal, memory_config, queue_config)` | Creates a SYCL accelerator device for one eligible backend-local ordinal; reserves one data and one checked metadata arena during setup. |
-| `make_ttnn_device(ordinal, queue_config)` | Creates a TTNN device, whose native per-plane storage is owned by TTNN (no raw arena). |
-| `ttnn_supported_data_types()` | Returns TTNN's immutable accepted unquantized leaf-type table. |
 | `Device` | Reports backend identity and immutable storage capability table; creates `Tensor` owners and `DeviceOps` queues. |
 | `DeviceOps` | Provides `copy`, exact three-view `noexcept` `add`, `mul`, `sub`, and `div` facades, and the closed `rmsnorm`/`rmsnorm_workspace_requirements` API; `silu`, `linear`, and GQA `sdpa` retain their own support status. `wait(token)` observes completion. |
 | `gpu_algorithm::compute_staging_size(logical_nbytes)` | Returns the logical transfer payload rounded to a 4-byte GPU word, rejecting rounding overflow. |
@@ -933,33 +901,11 @@ is quarantined with unresolved work rather than being silently replaced.
 
 The staging payload is the logical byte count padded to a 4-byte kernel word;
 overflow in that rounding is an error. Transfers preserve tiled addressing,
-tail-word initialization, and untouched padding. CPU and TTNN keep their
-direct/native host-transfer boundaries and report zero workspace
-requirements, so their empty default view remains valid.
-
-### TTNN queue and retained host staging
-
-TTNN does not use the CUDA/ROCm event ring, metadata pool, or transfer-stream
-pool. A TTNN tensor is a vector of native tiled tensors, one per logical
-plane. Its operation queue registers ownership before native submission and
-uses a fence that locks the device API mutex and finishes the TTNN mesh queue.
-The worker coalesces contiguous completed submissions so it can finish one
-batch and report outcomes in sequence order. Failed fences invalidate
-outstanding-work entries; owner destruction releases storage only when the
-registry says it is safe, otherwise it quarantines the native planes until a
-finish proves that cleanup is safe.
-
-TTNN host transfers are synchronous but use `TtnnHostStaging` retained by the
-device. It keeps upload slots by supported native dtype and plane plus a
-download byte buffer. After warm-up, same-or-smaller transfers reuse host
-staging; larger transfers grow retained buffers once. The API mutex serializes
-access. When completion cannot be proved, the affected upload/download slot is
-retired rather than reused; retired storage is reclaimed only after a covering
-successful finish, or at device teardown.
-
-SYCL and TTNN preserve the public `Device`, `Tensor`, view, and operation queue
-contracts but do not share CUDA/ROCm's `GpuQueue`, event ring, or
-transfer-stream pool implementation.
+tail-word initialization, and untouched padding. CPU keeps its direct
+host-transfer boundary and reports zero workspace requirements, so its empty
+default view remains valid.
+SYCL preserves the public `Device`, `Tensor`, view, and operation queue
+contracts while retaining its own queue and transfer implementation.
 
 ## Invariants checklist
 

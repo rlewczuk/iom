@@ -5,8 +5,8 @@ IOM is an inference-only C++20 engine for sparse, oversized language models. Com
 ## Components
 
 - Core — `include/iom`, `src` excluding backend subdirectories — backend-neutral tensor, queue, allocation, model-loading, and model APIs.
-- Backends — `include/iom/{cpu,cuda,rocm,ttnn}`, `src/{cpu,cuda,rocm,ttnn}` — runtime factories, storage, queues, and copy kernels.
-- Tests — `test`, `test/{backend,cpu,cuda,rocm,ttnn}` — unit tests, shared conformance tests, and backend drivers.
+- Backends — `include/iom/{cpu,cuda,rocm,sycl}`, `src/{cpu,cuda,rocm,sycl}` — runtime factories, storage, queues, and copy kernels.
+- Tests — `test`, `test/{backend,cpu,cuda,rocm,sycl}` — unit tests, shared conformance tests, and backend drivers.
 - Design — `docs/design`, `docs/changes` — architecture and change specifications.
 - Workflows — `.agents/skills` — task-specific procedures, including remote accelerator development.
 
@@ -15,7 +15,7 @@ IOM is an inference-only C++20 engine for sparse, oversized language models. Com
 - Common code stays backend-neutral: no runtime headers or types, backend-kind switches, or global active-backend registry. Devices expose factories and implement behavior through `Device`, `Tensor`, and `DeviceOps`.
 - A creating `Device` and supplied allocator outlive their tensors and queues. Owners are non-copyable and non-movable; views are copyable, non-owning, and never retargeted.
 - Tensor metadata remains on the host. The final two dimensions use fixed `16x16` tiles; leading dimensions are row-major and viewable.
-- CPU, CUDA, and ROCm share the standard tiled encoding and caller allocator. TTNN may use native per-plane storage behind the same public contracts and must reject unsupported formats.
+- CPU, CUDA, ROCm, and SYCL share the standard tiled encoding and caller allocator.
 - Operations allocate neither operands nor outputs. Callers provide tensors and host buffers; views, transforms, and transfers do not relocate owner storage.
 - Queues are asynchronous and in order. Waits are repeatable; completed failures remain observable and are rethrown.
 - Weight flow remains mapped file → SafeTensors → caller-created tensors → queued operations.
@@ -32,12 +32,8 @@ IOM is an inference-only C++20 engine for sparse, oversized language models. Com
 
 - Build with CMake and test with CTest. There is no separate lint or formatter target; preserve existing style.
 - CPU work may run locally. For accelerator build, test, or execution, follow the `csw-remote` skill; do not duplicate its procedure here.
-- After each non-trivial change, run the backend conformance suite for all backends
+- After each non-trivial change, run the backend conformance suite for CPU, CUDA, ROCm, and SYCL.
 - Treat applicable change specifications as acceptance criteria.
-
-## TTNN Remote Verification
-
-TTNN device sometimes hangs. Remember to set timeouts on TTNN test runs. To reset device, run `/home/rlew/bin/ttnn_reset` script on TTNN host.
 
 ## SYCL Remote Verification
 
