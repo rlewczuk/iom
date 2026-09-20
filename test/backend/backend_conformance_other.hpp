@@ -13,6 +13,7 @@
 
 #include "backend_conformance_copy_storage.hpp"
 #include "backend_conformance_memory.hpp"
+#include "backend_conformance_rope_contract.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -668,13 +669,16 @@ inline void run_compute_capability_conformance(
 // in dependency order. The frozen RMS normalization scenarios are composed by
 // `run_rmsnorm_conformance` from the same driver files instead of a capability
 // observation.
+// Full suite: storage, transfers, copies, errors, lifetime, capabilities, and
+// operation-specific contract suites in dependency order.
 inline void run_backend_conformance(
         const ConformanceDevices& devices,
         const std::span<const iom::DataType> supported_types,
         ConformanceObserver* observer = nullptr,
         AcceleratorStorageOracle* oracle = nullptr,
         bool binary_supported = false,
-        std::optional<bool> linear_supported = std::nullopt) {
+        std::optional<bool> linear_supported = std::nullopt,
+        const RopeContractConformanceConfig* rope_contract = nullptr) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
     run_async_copy_conformance(devices, supported_types, observer, oracle);
     run_copy_error_conformance(devices, supported_types, observer);
@@ -686,5 +690,8 @@ inline void run_backend_conformance(
     run_compute_capability_conformance(
             devices.candidate, supported_types, observer, {}, binary_supported,
             linear_supported);
+    if (rope_contract != nullptr) {
+        run_rope_contract_conformance(*rope_contract);
+    }
 }
 }  // namespace iom_conformance

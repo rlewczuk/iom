@@ -17,6 +17,7 @@
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
+#include "backend/backend_conformance_rope_contract.hpp"
 
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -534,10 +535,20 @@ TEST_CASE("CPU RoPE retains owners and preserves FIFO ordering for temporary vie
 
 TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     CpuDevices devices;
+    const iom_conformance::RopeContractConformanceConfig rope_contract{
+            devices.conformance(),
+            iom_conformance::rope_reference::kRopeCpuExpectedSupported,
+            &devices.gate,
+            iom_conformance::RopeNativeFailureSeam{
+                    {},
+                    {},
+                    "cpu RoPE accepted-failure seam",
+                    "the CPU port exposes no native fault-injection seam "
+                    "for a post-acceptance RoPE worker failure"}};
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true, true);
+            &devices.gate, nullptr, true, true, &rope_contract);
     CHECK_FALSE(devices.gate.armed());
 }
 
