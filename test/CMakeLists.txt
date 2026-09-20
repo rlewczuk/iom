@@ -295,7 +295,29 @@ if(CUDA_ENABLED)
         BACKEND_LIBRARY iom_cuda
         RUNTIME_LIBRARIES CUDA::cuda_driver
     )
+    add_executable(iom_cuda_sdpa_nonmatrix_tests
+        cuda/test_cuda_sdpa_nonmatrix.cpp
+    )
+    target_include_directories(iom_cuda_sdpa_nonmatrix_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/src
+    )
+    target_link_libraries(iom_cuda_sdpa_nonmatrix_tests
+        PRIVATE
+            doctest::doctest
+            iom_cuda
+            libiom
+            CUDA::cuda_driver
+            CUDA::cudart
+    )
+    add_test(
+        NAME iom_cuda_sdpa_nonmatrix_tests
+        COMMAND iom_cuda_sdpa_nonmatrix_tests
+    )
 endif()
+
 
 if(SYCL_ENABLED)
     add_iom_backend_tests(sycl

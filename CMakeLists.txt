@@ -140,6 +140,9 @@ if(CUDA_ENABLED)
         src/cuda/device_internal.hpp
         src/cuda/copy.cu
         src/cuda/copy.hpp
+        src/cuda/sdpa_nonmatrix.cu
+        src/cuda/sdpa_nonmatrix.hpp
+        src/cuda/sdpa_nonmatrix_request.hpp
         src/cuda/linear.cu
         src/cuda/driver.cpp
         src/cuda/driver.hpp
