@@ -48,6 +48,10 @@ enum class SubmissionFault {
     stream_synchronize,
     registration,
     outcome_insertion,
+    // SiLU's own accepted-failure seam: consumed by `launch_silu` before the
+    // native launch, so an armed failure never starts the device operation
+    // and never counts as a native launch.
+    silu_launch,
 };
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
@@ -67,6 +71,11 @@ extern std::atomic<std::size_t> stream_destroy_count_for_testing;
 // the executed native kernel instead of trusting the source text.
 extern std::atomic<std::size_t> linear_native_bf16_launch_count_for_testing;
 extern std::atomic<std::size_t> linear_scalar_launch_count_for_testing;
+// Counter over the dispatched SiLU path. An accepted submission must reach
+// the HIP kernel exactly once, and an armed `silu_launch` failure must not
+// reach it at all, so the conformance evidence connects an accepted OID to
+// the executed device kernel instead of trusting the source text.
+extern std::atomic<std::size_t> silu_launch_count_for_testing;
 #endif  // IOM_ENABLE_TESTING
 
 [[nodiscard]] inline std::runtime_error hip_error(
@@ -327,12 +336,14 @@ struct gpu_policy {
     static void launch_rmsnorm(
             stream_type stream, const detail::RmsnormMetadata& metadata);
 
-    // SiLU remains an explicit Unsupported policy stub until the independent
-    // ROCm wrapper supplies a real device launch. The common queue therefore
-    // rejects it before owner registration, sequence consumption, metadata,
-    // event, or stream effects.
+    // SiLU is ported: the HIP kernel in copy.hip evaluates every admitted
+    // logical element through the shared stable evaluator and named-format
+    // codec on the queue's existing nonblocking stream. The predicate is a
+    // compile-time leaf statement only, exactly as the RMSNorm and RoPE
+    // predicates are; the common facade has already restricted it to the nine
+    // applicable floating leaves before the queue is reached.
     [[nodiscard]] static constexpr bool silu_supported() noexcept {
-        return false;
+        return true;
     }
 
     static void launch_silu(

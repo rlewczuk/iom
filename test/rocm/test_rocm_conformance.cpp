@@ -1112,6 +1112,12 @@ TEST_CASE("ROCm conformance: RMSNorm reference, admission, and lifetime") {
     iom_conformance::run_rmsnorm_conformance(config);
     CHECK_FALSE(gate.armed());
 }
+// ROCm declares the complete nine-leaf SiLU matrix and implements it with the
+// HIP kernel bound through `gpu_policy::launch_silu` on the queue's existing
+// nonblocking stream. The armed seam is the port's own
+// `SubmissionFault::silu_launch`, consumed inside the real launch wrapper
+// before the device kernel starts, so an armed submission is accepted with a
+// retained failure that the wrapper's own cases below repeat on every wait.
 TEST_CASE("ROCm conformance: SiLU reference, admission, and lifetime") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
@@ -1126,17 +1132,338 @@ TEST_CASE("ROCm conformance: SiLU reference, admission, and lifetime") {
     HipStorageOracle oracle;
     iom_conformance::SiluConformanceConfig config{
             devices,
-            iom_conformance::kNoSiluSpan,
+            iom_conformance::kSiluRocmExpectedSupported,
             &gate,
             &oracle,
             iom_conformance::SiluNativeFailureSeam{
-                    {},
-                    {},
-                    "rocm_detail::silu",
-                    "the ROCm SiLU port is not present in this leaf; "
-                    "no accepted worker failure seam exists"}};
+                    [] {
+                        iom::rocm_detail::inject_submission_fault_for_testing(
+                                iom::rocm_detail::SubmissionFault::silu_launch);
+                    },
+                    [] {
+                        iom::rocm_detail::inject_submission_fault_for_testing(
+                                iom::rocm_detail::SubmissionFault::none);
+                    },
+                    "rocm_detail::SubmissionFault::silu_launch",
+                    {}}};
     iom_conformance::run_silu_conformance(config);
     CHECK_FALSE(gate.armed());
+}
+
+// The shared accepted-failure scenario observes only that an armed seam yields
+// a distinct accepted sequence, so the port proves the observable contract
+// itself: the accepted failure repeats identically on every wait, an armed
+// submission never reaches the device kernel, and a cleared seam recovers into
+// the independently computed result.
+TEST_CASE("ROCm SiLU accepted native failure repeats and recovers") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::ordinary,
+                    iom::DataType::F32, {2}, 2, 17, "rocm-native-failure/F32");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    auto input = device->create_tensor(spec);
+    auto output = device->create_tensor(spec);
+    const std::vector<std::byte> input_bytes = iom_conformance::silu_pack_bits(
+            iom::DataType::F32, fixture.input_bits);
+    iom_conformance::copy_from_host(input->view(), input_bytes);
+    iom_conformance::copy_from_host(
+            output->view(),
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel));
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    auto queue = device->create_ops();
+
+    const std::size_t launches_before =
+            iom::rocm_detail::silu_launch_count_for_testing.load();
+    const iom::oid healthy = queue->silu(input->view(), output->view());
+    REQUIRE(iom::oid_is_token(healthy));
+    CHECK_NOTHROW(queue->wait(healthy));
+    CHECK_NOTHROW(queue->wait(healthy));
+    CHECK_EQ(
+            iom::rocm_detail::silu_launch_count_for_testing.load(),
+            launches_before + 1);
+
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::silu_launch);
+    const iom::oid failed = queue->silu(input->view(), output->view());
+    REQUIRE(iom::oid_is_token(failed));
+    CHECK_EQ(
+            iom_conformance::token_sequence(failed),
+            iom_conformance::token_sequence(healthy) + 1);
+    iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+    // The armed fault is consumed before the native launch, so the failed
+    // submission is accepted without reaching the device kernel.
+    CHECK_EQ(
+            iom::rocm_detail::silu_launch_count_for_testing.load(),
+            launches_before + 1);
+    iom::rocm_detail::inject_submission_fault_for_testing(
+            iom::rocm_detail::SubmissionFault::none);
+
+    const iom::oid recovered = queue->silu(input->view(), output->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_EQ(
+            iom_conformance::token_sequence(recovered),
+            iom_conformance::token_sequence(failed) + 1);
+    CHECK_NOTHROW(queue->wait(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+    CHECK_EQ(
+            iom::rocm_detail::silu_launch_count_for_testing.load(),
+            launches_before + 2);
+    const std::string mismatch = iom_conformance::silu_compare(
+            iom::DataType::F32, iom_conformance::read_logical(output->view()),
+            expected, "ROCm SiLU recovered activation");
+    CHECK_MESSAGE(mismatch.empty(), mismatch);
+    iom_conformance::require_logical_bytes(
+            input->view(), input_bytes, "ROCm SiLU recovery kept the input");
+}
+
+// An accepted event-record failure also fails the drain: the counted
+// `SubmissionFault::event_record` injection arms two event-record failures and
+// one stream-drain failure, so the worker's rollback cannot record the event
+// and cannot drain the stream, and the completion retires as unknown. The
+// operands of that completion must stay unavailable to the arena until device
+// teardown, while a fresh queue and fresh operands still complete a correct
+// activation after coverage is proven.
+TEST_CASE("ROCm SiLU failed drain quarantines operands and reuse stays correct") {
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::boundary_sizes,
+                    iom::DataType::BF16, {2}, 17, 17, "rocm-drain/BF16");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    const std::vector<std::byte> input_bytes = iom_conformance::silu_pack_bits(
+            iom::DataType::BF16, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto input = device->create_tensor(spec);
+    auto output = device->create_tensor(spec);
+    iom_conformance::copy_from_host(input->view(), input_bytes);
+    const void* input_address = input->view().native_handle();
+    const void* output_address = output->view().native_handle();
+    {
+        auto queue = device->create_ops();
+        iom::rocm_detail::inject_submission_fault_for_testing(
+                iom::rocm_detail::SubmissionFault::event_record);
+        const iom::oid failed = queue->silu(input->view(), output->view());
+        REQUIRE(iom::oid_is_token(failed));
+        iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+        iom::rocm_detail::inject_submission_fault_for_testing(
+                iom::rocm_detail::SubmissionFault::none);
+    }
+    input.reset();
+    output.reset();
+    auto fresh_input = device->create_tensor(spec);
+    auto fresh_output = device->create_tensor(spec);
+    CHECK_NE(fresh_input->view().native_handle(), input_address);
+    CHECK_NE(fresh_input->view().native_handle(), output_address);
+    CHECK_NE(fresh_output->view().native_handle(), input_address);
+    CHECK_NE(fresh_output->view().native_handle(), output_address);
+    iom_conformance::copy_from_host(fresh_input->view(), input_bytes);
+    iom_conformance::copy_from_host(
+            fresh_output->view(),
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel));
+    auto recovery_queue = device->create_ops();
+    const iom::oid recovered =
+            recovery_queue->silu(fresh_input->view(), fresh_output->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_NOTHROW(recovery_queue->wait(recovered));
+    CHECK_NOTHROW(recovery_queue->wait(recovered));
+    const std::string mismatch = iom_conformance::silu_compare(
+            iom::DataType::BF16,
+            iom_conformance::read_logical(fresh_output->view()), expected,
+            "ROCm SiLU post-quarantine reuse");
+    CHECK_MESSAGE(mismatch.empty(), mismatch);
+}
+
+// Temporary operand descriptors die with the inner expression and the input
+// owner dies before the wait: the queued request must already hold every value
+// it needs, and the retained output must be the independent reference result.
+TEST_CASE("ROCm SiLU retains snapshot and owners across temporary views") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec owner_spec = iom_conformance::silu_make_spec(
+            {3, 4, 2, 17}, iom::DataType::F16);
+    // The transformed view is the shared suite's leading slice/step/permute of
+    // a rank-4 owner, which yields two leading planes of two runs and
+    // seventeen features.
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::ordinary,
+                    iom::DataType::F16, {2, 2}, 2, 17, "rocm-temporary/F16");
+    const iom::TensorSpec logical_spec =
+            iom_conformance::silu_case_spec(fixture);
+    const std::vector<std::byte> input_logical =
+            iom_conformance::silu_pack_bits(
+                    iom::DataType::F16, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    // The output starts as poison, so a kernel that skipped a logical element
+    // or re-encoded less than once cannot pass the comparison below.
+    const std::vector<std::byte> output_poison(
+            logical_spec.logical_nbytes(), iom_conformance::kReadbackSentinel);
+    auto input_owner = device->create_tensor(owner_spec);
+    auto output_owner = device->create_tensor(owner_spec);
+    HipStorageOracle oracle;
+    {
+        iom::TensorView input_view =
+                iom_conformance::silu_transformed_view(*input_owner);
+        iom::TensorView output_view =
+                iom_conformance::silu_transformed_view(*output_owner);
+        REQUIRE(input_view.spec() == logical_spec);
+        REQUIRE(output_view.spec() == logical_spec);
+        oracle.set_owner_spec(owner_spec);
+        oracle.seed(
+                input_view,
+                iom_conformance::silu_storage_image(
+                        owner_spec, input_view, input_logical,
+                        std::byte{0x5A}));
+        oracle.set_owner_spec(owner_spec);
+        oracle.seed(
+                output_view,
+                iom_conformance::silu_storage_image(
+                        owner_spec, output_view, output_poison,
+                        std::byte{0xA5}));
+        auto queue = device->create_ops();
+        const auto submit_from_temporary_views =
+                [&queue](iom::Tensor& input, iom::Tensor& output) {
+                    // Both descriptors here, including the two permuted slice
+                    // results, are locals of this call: they die before the
+                    // returned token is waited.
+                    const iom::TensorView input_temporary =
+                            iom_conformance::silu_transformed_view(input);
+                    iom::TensorView output_temporary =
+                            iom_conformance::silu_transformed_view(output);
+                    return queue->silu(input_temporary, output_temporary);
+                };
+        const iom::oid token =
+                submit_from_temporary_views(*input_owner, *output_owner);
+        REQUIRE(iom::oid_is_token(token));
+        input_owner.reset();
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_NOTHROW(queue->wait(token));
+        const std::vector<std::byte> activated_logical =
+                iom_conformance::read_logical(output_view);
+        const std::string mismatch = iom_conformance::silu_compare(
+                iom::DataType::F16, activated_logical, expected,
+                "ROCm SiLU temporary-view activation");
+        CHECK_MESSAGE(mismatch.empty(), mismatch);
+        // Padding isolation: the physical image rebuilt from the observed
+        // logical readback must leave every poisoned padding byte untouched.
+        std::vector<std::byte> expected_storage(
+                owner_spec.tiled_storage_nbytes(), std::byte{0xA5});
+        iom_conformance::apply_standard_tiled_view(
+                output_view, owner_spec, activated_logical, expected_storage);
+        oracle.set_owner_spec(owner_spec);
+        CHECK(oracle.observe(output_view) == expected_storage);
+    }
+    output_owner.reset();
+}
+
+// One accepted submission per declared leaf reaches the HIP kernel exactly
+// once, a rejected request reaches it never, and both directed tails stay
+// nonzero negative subnormals classified in the destination's own domain.
+TEST_CASE("ROCm SiLU native launch evidence and negative subnormal tails") {
+    auto device = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto queue = device->create_ops();
+    for (const iom::DataType type :
+         iom_conformance::kSiluRocmExpectedSupported) {
+        CAPTURE(static_cast<int>(type));
+        const iom::TensorSpec spec =
+                iom_conformance::silu_make_spec({2, 17, 17}, type);
+        auto input = device->create_tensor(spec);
+        auto output = device->create_tensor(spec);
+        const std::size_t launches_before =
+                iom::rocm_detail::silu_launch_count_for_testing.load();
+        const iom::oid token = queue->silu(input->view(), output->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_EQ(
+                iom::rocm_detail::silu_launch_count_for_testing.load(),
+                launches_before + 1);
+    }
+    {
+        // A rejected request must not reach the kernel or the sequence.
+        const iom::TensorSpec spec =
+                iom_conformance::silu_make_spec({2, 17, 17}, iom::DataType::F32);
+        const iom::TensorSpec mismatched =
+                iom_conformance::silu_make_spec({2, 17, 18}, iom::DataType::F32);
+        auto input = device->create_tensor(spec);
+        auto output = device->create_tensor(mismatched);
+        const std::size_t launches_before =
+                iom::rocm_detail::silu_launch_count_for_testing.load();
+        CHECK_EQ(
+                queue->silu(input->view(), output->view()),
+                iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(
+                iom::rocm_detail::silu_launch_count_for_testing.load(),
+                launches_before);
+        const iom::oid accepted = queue->silu(input->view(), input->view());
+        CHECK_EQ(accepted, iom::to_oid(iom::OidError::InvalidArgument));
+        CHECK_EQ(
+                iom::rocm_detail::silu_launch_count_for_testing.load(),
+                launches_before);
+    }
+    for (const iom::DataType type :
+         {iom::DataType::F32, iom::DataType::F64}) {
+        CAPTURE(static_cast<int>(type));
+        const iom_conformance::SiluReferenceCase tail_case =
+                iom_conformance::silu_make_tail_case(type);
+        const iom::TensorSpec spec = iom_conformance::silu_case_spec(tail_case);
+        auto input = device->create_tensor(spec);
+        auto output = device->create_tensor(spec);
+        iom_conformance::copy_from_host(
+                input->view(),
+                iom_conformance::silu_pack_bits(type, tail_case.input_bits));
+        iom_conformance::copy_from_host(
+                output->view(),
+                std::vector<std::byte>(
+                        spec.logical_nbytes(),
+                        iom_conformance::kReadbackSentinel));
+        const iom::oid token = queue->silu(input->view(), output->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        const std::vector<std::byte> observed =
+                iom_conformance::read_logical(output->view());
+        const std::vector<iom_conformance::SiluReferenceValue> expected =
+                iom_conformance::silu_evaluate(tail_case);
+        const std::uint64_t tail_input = iom_conformance::silu_oracle::value_bits(
+                type, type == iom::DataType::F64 ? -746.0 : -104.0);
+        std::size_t tail_elements = 0;
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            if (tail_case.input_bits[index] != tail_input) continue;
+            ++tail_elements;
+            const std::uint64_t bits =
+                    iom_conformance::silu_read_bits(observed, type, index);
+            CHECK_EQ(bits, expected[index].bits);
+            // The destination's own domain is what classifies the tail: a
+            // binary32 subnormal is a normal binary64 value, so the check
+            // decodes in the leaf's domain, not after a promotion.
+            const bool negative_subnormal = type == iom::DataType::F64
+                    ? (std::fpclassify(
+                               iom_conformance::silu_oracle::decode_f64(bits))
+                               == FP_SUBNORMAL
+                       && std::signbit(
+                               iom_conformance::silu_oracle::decode_f64(bits)))
+                    : (std::fpclassify(
+                               iom_conformance::silu_oracle::decode_f32(
+                                       type, bits))
+                               == FP_SUBNORMAL
+                       && std::signbit(
+                               iom_conformance::silu_oracle::decode_f32(
+                                       type, bits)));
+            CHECK_MESSAGE(
+                    negative_subnormal,
+                    "ROCm SiLU tail must stay a nonzero negative subnormal");
+        }
+        CHECK(tail_elements > 0);
+    }
 }
 
 TEST_CASE("ROCm conformance: RoPE reference, admission, and lifetime") {

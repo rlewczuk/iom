@@ -37,6 +37,7 @@ std::atomic<std::size_t> stream_create_count_for_testing{0};
 std::atomic<std::size_t> stream_destroy_count_for_testing{0};
 std::atomic<std::size_t> linear_native_bf16_launch_count_for_testing{0};
 std::atomic<std::size_t> linear_scalar_launch_count_for_testing{0};
+std::atomic<std::size_t> silu_launch_count_for_testing{0};
 #endif  // IOM_ENABLE_TESTING
 
 bool consume_submission_fault(
@@ -76,6 +77,24 @@ bool consume_submission_fault(
 #include "../shared/standard_tiled_rmsnorm.inl"
 #include "../shared/standard_tiled_linear.inl"
 #include "../shared/standard_tiled_rope.inl"
+
+// The shared stable SiLU evaluator is instantiated by this translation unit for
+// both execution spaces: its device instantiation is what the SiLU kernel
+// calls, and its host entry point must stay valid beside it, so the shared
+// qualifier macro is fixed here rather than derived from `IOM_GPU_DEVICE`.
+// FMA contraction is off while the evaluator's body is parsed because the
+// frozen comparison evaluates the identical expression without contraction: a
+// contracted `1 + t*t` moves the stored bits of several `F32` inputs and of
+// the narrow leaves, which would break the frozen 1/4/8-ULP ceilings and the
+// exact `-104` / `-746` tail checks. The shared Rope traits apply the same
+// policy through explicit round-to-nearest primitives. The contraction state
+// is restored immediately to this target's own default (`fast`, measured for
+// both passes of the checked toolchain), so every other kernel in this file
+// keeps the exact arithmetic it was verified with.
+#define IOM_SCALAR_SILU_QUALIFIER __host__ __device__ inline
+#pragma clang fp contract(off)
+#include "../shared/scalar_silu.hpp"
+#pragma clang fp contract(fast)
 
 namespace iom::detail {
 
@@ -790,14 +809,10 @@ void gpu_policy::launch_rmsnorm(
     detail::launch_standard_tiled_rmsnorm<gpu_policy>(stream, metadata);
 }
 
-// The SiLU queue descriptor is present so a future ROCm wrapper can bind the
-// common producer without changing admission or completion ownership. This
-// leaf deliberately keeps the policy unported and reports Unsupported.
-void gpu_policy::launch_silu(
-        hipStream_t, const detail::SiluMetadata& metadata) {
-    static_cast<void>(metadata);
-    throw detail::UnsupportedOperation();
-}
+// The SiLU activation kernel, its policy-parameterized launch wrapper, and
+// this policy binding live in the SiLU section at the end of this file: the
+// shared stable evaluator must be parsed inside a non-contracting region, and
+// that region is kept terminal so no earlier kernel is affected by it.
 
 // Launch the shared standard-tiled logical-F Rope operation on the queue's
 // existing nonblocking stream. The wrapper adds no host arithmetic, staging,
@@ -1044,3 +1059,372 @@ template void launch_standard_tiled_rope<iom::rocm_detail::gpu_policy>(
         const RopeMetadata& metadata);
 
 }  // namespace iom::detail
+// ---------------------------------------------------------------------------
+// SiLU activation over the standard 16x16 tiled encoding.
+//
+// The device operation is the one frozen scalar contract `x / (1 + exp(-x))`
+// from `src/shared/scalar_silu.hpp` applied to every logical element of every
+// leading plane, run, and feature of the admitted pair, through the shared
+// named-format decode and exactly one round-to-nearest-even output encoding.
+// `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`,
+// and `F32` evaluate in the binary32 domain and `F64` keeps its own binary64
+// domain, exactly as the normative SiLU contract fixes the intermediates. The
+// exponential is evaluated in the binary64 domain and rounded once to the
+// carrier: the contract's independent comparison uses a correctly rounded
+// exponential, and the device library's `expf` is one ULP away from it at
+// some arguments (measured on the configured ROCm device), which would exceed
+// the one-ULP ceiling of the narrow leaves for those inputs. The `F64`
+// carrier's exponential is the device binary64 exponential itself, which
+// reproduces the reference over the whole contract range, including the
+// `-746` subnormal tail.
+//
+// The kernel reads the input storage and writes the output storage directly on
+// the queue's existing nonblocking stream: no host round trip, staging,
+// allocation, second stream, fallback, or synchronization. 32-bit words are
+// the unit of exclusive ownership, so one thread loads one destination word,
+// replaces only the logical fields that intersect it, and stores it once:
+// `F4` and `F6` pack several elements into one word, so word ownership is what
+// gives every output field exactly one writer. Padding rows, padding columns,
+// and padding bits are never decoded and never modified, and a word that holds
+// no logical field is not written at all.
+//
+// This section is placed after every other kernel in the translation unit and
+// re-establishes the device qualifiers for its own region exactly as the
+// earlier sections do. The shared evaluator it calls was parsed above with
+// FMA contraction off (see the qualifier block near the top of the file).
+// ---------------------------------------------------------------------------
+
+#define IOM_GPU_DEVICE __device__
+#define IOM_GPU_GLOBAL __global__
+#define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
+#define IOM_GPU_GLOBAL_STRIDE \
+    (static_cast<std::uint64_t>(blockDim.x) * gridDim.x)
+#define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
+    hipLaunchKernelGGL( \
+            kernel, dim3(blocks), dim3(threads), 0, stream, __VA_ARGS__)
+
+namespace iom::detail {
+
+// Both carriers drive the one shared named-format codec and the one shared
+// stable SiLU evaluator in their own IEEE domain. The bit-pattern
+// constructors stay in the double domain the established shared device codec
+// already uses, and the finite maximum is the exact carrier maximum.
+struct SiluFp32Traits {
+    using carrier_type = float;
+
+    IOM_GPU_DEVICE static carrier_type positive_infinity() noexcept {
+        return static_cast<carrier_type>(__longlong_as_double(
+                static_cast<long long>(0x7ff0000000000000ull)));
+    }
+    IOM_GPU_DEVICE static carrier_type quiet_nan() noexcept {
+        return static_cast<carrier_type>(__longlong_as_double(
+                static_cast<long long>(0x7ff8000000000000ull)));
+    }
+    IOM_GPU_DEVICE static carrier_type max_finite() noexcept {
+        return 3.4028234663852886e+38F;
+    }
+    IOM_GPU_DEVICE static carrier_type exp(carrier_type value) noexcept {
+        return static_cast<carrier_type>(::exp(static_cast<double>(value)));
+    }
+    IOM_GPU_DEVICE static bool isnan(carrier_type value) noexcept {
+        return ::isnan(value);
+    }
+    IOM_GPU_DEVICE static bool isinf(carrier_type value) noexcept {
+        return ::isinf(value);
+    }
+    IOM_GPU_DEVICE static bool signbit(carrier_type value) noexcept {
+        return ::signbit(value);
+    }
+    IOM_GPU_DEVICE static carrier_type fabs(carrier_type value) noexcept {
+        return ::fabs(value);
+    }
+    IOM_GPU_DEVICE static carrier_type floor(carrier_type value) noexcept {
+        return ::floor(value);
+    }
+    IOM_GPU_DEVICE static carrier_type ldexp(
+            carrier_type value, int exponent) noexcept {
+        return ::ldexp(value, exponent);
+    }
+    IOM_GPU_DEVICE static carrier_type frexp(
+            carrier_type value, int* exponent) noexcept {
+        return ::frexp(value, exponent);
+    }
+};
+
+struct SiluFp64Traits {
+    using carrier_type = double;
+
+    IOM_GPU_DEVICE static carrier_type positive_infinity() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7ff0000000000000ull));
+    }
+    IOM_GPU_DEVICE static carrier_type quiet_nan() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7ff8000000000000ull));
+    }
+    IOM_GPU_DEVICE static carrier_type max_finite() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7fefffffffffffffull));
+    }
+    IOM_GPU_DEVICE static carrier_type exp(carrier_type value) noexcept {
+        return ::exp(value);
+    }
+    IOM_GPU_DEVICE static bool isnan(carrier_type value) noexcept {
+        return ::isnan(value);
+    }
+    IOM_GPU_DEVICE static bool isinf(carrier_type value) noexcept {
+        return ::isinf(value);
+    }
+    IOM_GPU_DEVICE static bool signbit(carrier_type value) noexcept {
+        return ::signbit(value);
+    }
+    IOM_GPU_DEVICE static carrier_type fabs(carrier_type value) noexcept {
+        return ::fabs(value);
+    }
+    IOM_GPU_DEVICE static carrier_type floor(carrier_type value) noexcept {
+        return ::floor(value);
+    }
+    IOM_GPU_DEVICE static carrier_type ldexp(
+            carrier_type value, int exponent) noexcept {
+        return ::ldexp(value, exponent);
+    }
+    IOM_GPU_DEVICE static carrier_type frexp(
+            carrier_type value, int* exponent) noexcept {
+        return ::frexp(value, exponent);
+    }
+};
+
+namespace {
+
+constexpr std::uint64_t kSiluTile = TensorSpec::TILE;
+constexpr unsigned int kSiluThreads = 256;
+constexpr unsigned int kSiluMaxBlocks = 65535;
+
+[[nodiscard]] std::size_t silu_checked_mul(
+        std::size_t left, std::size_t right, const char* message) {
+    if (right != 0
+            && left > std::numeric_limits<std::size_t>::max() / right) {
+        throw std::overflow_error(message);
+    }
+    return left * right;
+}
+
+[[nodiscard]] std::size_t silu_checked_add(
+        std::size_t left, std::size_t right, const char* message) {
+    if (left > std::numeric_limits<std::size_t>::max() - right) {
+        throw std::overflow_error(message);
+    }
+    return left + right;
+}
+
+[[nodiscard]] std::size_t silu_padded_extent(
+        std::size_t extent, const char* message) {
+    const std::size_t rounded =
+            silu_checked_add(extent, kSiluTile - 1, message);
+    return rounded / kSiluTile * kSiluTile;
+}
+
+// Packed-field primitives, byte addressed so a view whose plane mapping does
+// not start on a word boundary is still addressed correctly. Element slot `s`
+// of a plane occupies bits `[s * bits, (s + 1) * bits)` of that plane's packed
+// stream, and every plane's first slot starts on a 32-bit boundary for every
+// applicable leaf width.
+IOM_GPU_DEVICE std::uint32_t silu_load_word(
+        const unsigned char* base, std::uint64_t word) noexcept {
+    std::uint32_t value;
+    for (unsigned i = 0; i < 4; ++i) {
+        reinterpret_cast<unsigned char*>(&value)[i] = base[word * 4 + i];
+    }
+    return value;
+}
+
+IOM_GPU_DEVICE void silu_store_word(
+        unsigned char* base, std::uint64_t word,
+        std::uint32_t value) noexcept {
+    for (unsigned i = 0; i < 4; ++i) {
+        base[word * 4 + i] =
+                reinterpret_cast<const unsigned char*>(&value)[i];
+    }
+}
+
+IOM_GPU_DEVICE std::uint32_t silu_field_mask(unsigned bits) noexcept {
+    return bits == 32 ? 0xffffffffu : ((std::uint32_t{1} << bits) - 1);
+}
+
+IOM_GPU_DEVICE std::uint64_t silu_load_bits(
+        const unsigned char* base, std::uint64_t bit,
+        unsigned bits) noexcept {
+    const std::uint64_t word = bit / 32;
+    std::uint64_t joined = silu_load_word(base, word);
+    if (bit % 32 + bits > 32) {
+        joined |= static_cast<std::uint64_t>(
+                          silu_load_word(base, word + 1))
+                << 32;
+    }
+    return (joined >> (bit % 32))
+            & (bits == 64
+               ? ~std::uint64_t{}
+               : ((std::uint64_t{1} << bits) - 1));
+}
+
+// One thread owns one 32-bit word of one leading plane. `plane_slot` scales a
+// plane index by the plane's padded slot count, so a plane's first word is
+// `plane_slot(plane, 0, 0, rows, columns) * bits / 32` for every applicable
+// leaf width, and the logical `(row, column)` of an in-plane slot is the same
+// coordinate in the input and the output.
+template <typename Traits>
+IOM_GPU_DEVICE void silu_tiled_words(const SiluMetadata& m) noexcept {
+    const std::uint64_t bits = m.bits;
+    const std::uint64_t padded_rows =
+            (m.rows + kSiluTile - 1) / kSiluTile * kSiluTile;
+    const std::uint64_t padded_columns =
+            (m.columns + kSiluTile - 1) / kSiluTile * kSiluTile;
+    const std::uint64_t plane_bits = padded_rows * padded_columns * bits;
+    const std::uint64_t words_per_plane = (plane_bits + 31) / 32;
+    const std::uint64_t total_words = m.plane_count * words_per_plane;
+    const auto* x_bytes = m.x;
+    auto* y_bytes = m.y;
+    const std::uint64_t stride = IOM_GPU_GLOBAL_STRIDE;
+
+    for (std::uint64_t word = IOM_GPU_GLOBAL_INDEX; word < total_words;
+         word += stride) {
+        const std::uint64_t plane = word / words_per_plane;
+        const std::uint64_t word_in_plane = word % words_per_plane;
+        std::uint64_t x_plane = m.x_offset;
+        std::uint64_t y_plane = m.y_offset;
+        std::uint64_t rest = plane;
+        for (std::uint32_t axis = m.leading_rank; axis-- > 0;) {
+            const std::uint64_t coordinate = rest % m.dims[axis];
+            rest /= m.dims[axis];
+            x_plane += coordinate * m.x_strides[axis];
+            y_plane += coordinate * m.y_strides[axis];
+        }
+        const std::uint64_t x_plane_bit =
+                plane_slot(x_plane, 0, 0, m.rows, m.columns) * bits;
+        const std::uint64_t y_plane_bit =
+                plane_slot(y_plane, 0, 0, m.rows, m.columns) * bits;
+        const std::uint64_t word_first_bit = word_in_plane * 32;
+        const std::uint64_t word_end_bit = word_first_bit + 32;
+        const std::uint64_t first_slot = word_first_bit / bits;
+        const std::uint64_t last_slot = (word_end_bit + bits - 1) / bits;
+        std::uint32_t merged =
+                silu_load_word(y_bytes, y_plane_bit / 32 + word_in_plane);
+        bool owns_logical_field = false;
+        for (std::uint64_t slot = first_slot; slot < last_slot; ++slot) {
+            const PhysicalCoordinate coordinate =
+                    physical_coordinate(slot, m.rows, m.columns);
+            if (coordinate.row >= m.rows
+                    || coordinate.column >= m.columns) {
+                continue;
+            }
+            const std::uint64_t field_bit = slot * bits;
+            const std::uint64_t encoded =
+                    scalar_silu_detail::scalar_silu<Traits>(
+                            static_cast<DataType>(m.type),
+                            silu_load_bits(
+                                    x_bytes, x_plane_bit + field_bit,
+                                    static_cast<unsigned>(bits)));
+            const std::uint64_t field_end = field_bit + bits;
+            const std::uint64_t overlap_first = field_bit > word_first_bit
+                    ? field_bit : word_first_bit;
+            const std::uint64_t overlap_end =
+                    field_end < word_end_bit ? field_end : word_end_bit;
+            if (overlap_first >= overlap_end) {
+                continue;
+            }
+            const unsigned count =
+                    static_cast<unsigned>(overlap_end - overlap_first);
+            const unsigned position =
+                    static_cast<unsigned>(overlap_first - word_first_bit);
+            const unsigned shift =
+                    static_cast<unsigned>(overlap_first - field_bit);
+            const std::uint32_t segment =
+                    static_cast<std::uint32_t>(encoded >> shift)
+                    & silu_field_mask(count);
+            merged = (merged & ~(silu_field_mask(count) << position))
+                    | (segment << position);
+            owns_logical_field = true;
+        }
+        if (owns_logical_field) {
+            silu_store_word(
+                    y_bytes, y_plane_bit / 32 + word_in_plane, merged);
+        }
+    }
+}
+
+// The shared kernel is a plain function so this translation unit compiles the
+// complete device operation for both carriers before the wrapper calls it.
+IOM_GPU_GLOBAL void silu_kernel(SiluMetadata m) {
+    if (m.type == static_cast<std::uint32_t>(DataType::F64)) {
+        silu_tiled_words<SiluFp64Traits>(m);
+    } else {
+        silu_tiled_words<SiluFp32Traits>(m);
+    }
+}
+
+}  // namespace
+
+// Policy-parameterized launch of the SiLU device operation. The backend
+// wrapper supplies the already-created nonblocking stream. Every product,
+// padded extent, bit count, and word count is checked from the immutable
+// descriptor before the HIP launch, exactly as the other ROCm launchers do;
+// the launch introduces no allocation, staging, second stream, or
+// synchronization.
+template <typename Policy>
+void launch_silu_kernel(
+        typename Policy::stream_type stream,
+        const SiluMetadata& metadata) {
+    const std::size_t padded_rows = silu_padded_extent(
+            static_cast<std::size_t>(metadata.rows),
+            "SiLU launch padded row count overflows");
+    const std::size_t padded_columns = silu_padded_extent(
+            static_cast<std::size_t>(metadata.columns),
+            "SiLU launch padded column count overflows");
+    const std::size_t plane_bits = silu_checked_mul(
+            silu_checked_mul(
+                    padded_rows, padded_columns,
+                    "SiLU launch plane slot count overflows"),
+            static_cast<std::size_t>(metadata.bits),
+            "SiLU launch plane bit count overflows");
+    const std::size_t words_per_plane = silu_checked_add(
+            plane_bits, 31, "SiLU launch word count overflows") / 32;
+    const std::size_t total_words = silu_checked_mul(
+            static_cast<std::size_t>(metadata.plane_count),
+            words_per_plane, "SiLU launch total word count overflows");
+    const std::size_t launch_words = silu_checked_add(
+            total_words, kSiluThreads - 1,
+            "SiLU launch block count overflows");
+    const unsigned int blocks = static_cast<unsigned int>(
+            std::min<std::size_t>(
+                    launch_words / kSiluThreads, kSiluMaxBlocks));
+    IOM_LAUNCH_KERNEL(
+            silu_kernel, blocks, kSiluThreads, stream, metadata);
+}
+
+}  // namespace iom::detail
+
+namespace iom::rocm_detail {
+
+// Launch the completed shared SiLU activation on the queue's existing
+// nonblocking stream. The wrapper performs no host arithmetic beyond the
+// checked launch geometry and no staging, allocation, or synchronization.
+void gpu_policy::launch_silu(
+        hipStream_t stream, const detail::SiluMetadata& metadata) {
+    // This accepted-failure seam is consumed before the native launch so an
+    // armed failure never starts a partially activated plane.
+    if (consume_submission_fault(SubmissionFault::silu_launch)) {
+        check_hip(silu_kernel_operation(), hipErrorInvalidValue);
+    }
+    detail::launch_silu_kernel<gpu_policy>(stream, metadata);
+#ifdef IOM_ENABLE_TESTING
+    silu_launch_count_for_testing.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+}  // namespace iom::rocm_detail
+
+#undef IOM_LAUNCH_KERNEL
+#undef IOM_GPU_GLOBAL_STRIDE
+#undef IOM_GPU_GLOBAL_INDEX
+#undef IOM_GPU_GLOBAL
+#undef IOM_GPU_DEVICE
