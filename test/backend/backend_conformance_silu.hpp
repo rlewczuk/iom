@@ -446,11 +446,30 @@ struct SiluReferenceValue {
 
 inline SiluReferenceValue evaluate_value(
         iom::DataType type, std::uint64_t input_bits) noexcept {
-    const std::uint64_t bits = type == iom::DataType::F64
+    std::uint64_t bits = type == iom::DataType::F64
             ? encode_f64(stable_silu(decode_f64(input_bits)))
             : encode_f32(
                       type,
                       stable_silu(decode_f32(type, input_bits)));
+    const SiluReferenceClass value_class = class_of_bits(type, bits);
+    if (value_class == SiluReferenceClass::positive_zero
+            || value_class == SiluReferenceClass::negative_zero) {
+        // A zero-class expectation is compared exactly, so it must not be an
+        // artifact of the reference's own carrier. `silu(2^-24)` is
+        // `2^-25 * (1 + 2^-25)`, which sits just above the F16 rounding tie at
+        // `2^-25`; a binary32 carrier cannot represent that correction and
+        // resolves the minimum F16 input to `+0`, while the widest carrier the
+        // suite has rounds it to the minimum subnormal. Every `+0`/`-0` input,
+        // and every leaf whose tie the widest carrier also cannot resolve,
+        // keeps its carrier-independent zero, so only a carrier-dependent zero
+        // is replaced here and the fixture is then compared by sign and the
+        // declared ULP ceiling instead of by an exact zero class.
+        const FloatFormat format = float_format(type);
+        bits = encode_carrier<long double>(
+                stable_silu(
+                        decode_carrier<long double>(input_bits, format)),
+                format);
+    }
     return {bits, class_of_bits(type, bits)};
 }
 
@@ -648,9 +667,19 @@ inline bool silu_matches(
         if (expected.value_class == SiluReferenceClass::quiet_nan) {
             return actual_class == SiluReferenceClass::quiet_nan;
         }
-        return actual_class == expected.value_class;
+        // A zero expectation can be a target-format rounding tie rather than a
+        // class of its own (see `evaluate_value`: `silu(2^-24)` sits just above
+        // the F16 tie at `2^-25`), so a zero is compared by the same sign plus
+        // declared ULP ceiling as any other value. Infinity expectations stay
+        // exact, and a zero expectation still rejects a different sign.
+        if (expected.value_class != SiluReferenceClass::positive_zero
+                && expected.value_class != SiluReferenceClass::negative_zero) {
+            return actual_class == expected.value_class;
+        }
     }
-    if (actual_class != SiluReferenceClass::finite) {
+    if (actual_class != SiluReferenceClass::finite
+            && actual_class != SiluReferenceClass::positive_zero
+            && actual_class != SiluReferenceClass::negative_zero) {
         return false;
     }
     const double actual = silu_oracle::decode_as_double(type, actual_bits);
@@ -1159,9 +1188,22 @@ inline void silu_check_tail_exact(
             continue;
         }
         const std::uint64_t observed = silu_read_bits(actual, type, index);
-        const double value = silu_oracle::decode_as_double(type, observed);
-        const bool negative_subnormal =
-                value < 0.0 && std::fpclassify(value) == FP_SUBNORMAL;
+        // The requirement belongs to the destination leaf's own domain, so the
+        // stored element is classified as the leaf value the port wrote, the
+        // way `silu_reference_self_check` classifies its own F32 tail. A
+        // binary32 subnormal is FP_NORMAL once promoted to binary64, so the
+        // wider promotion would report every conforming F32 tail as erased,
+        // while a genuinely erased tail still classifies as FP_ZERO here.
+        bool negative_subnormal = false;
+        if (type == iom::DataType::F64) {
+            const double value = silu_oracle::decode_f64(observed);
+            negative_subnormal =
+                    value < 0.0 && std::fpclassify(value) == FP_SUBNORMAL;
+        } else {
+            const float value = silu_oracle::decode_f32(type, observed);
+            negative_subnormal =
+                    value < 0.0F && std::fpclassify(value) == FP_SUBNORMAL;
+        }
         CHECK_MESSAGE(
                 negative_subnormal,
                 label << ": required negative subnormal tail was erased");
@@ -1201,13 +1243,6 @@ inline void run_silu_reference_fixture(
             reference_case.data_type, reference_case.input_bits);
     const std::vector<SiluReferenceValue> expected =
             silu_evaluate(reference_case);
-    std::vector<std::uint64_t> expected_bits;
-    expected_bits.reserve(expected.size());
-    for (const SiluReferenceValue& value : expected) {
-        expected_bits.push_back(value.bits);
-    }
-    const std::vector<std::byte> expected_logical = silu_pack_bits(
-            reference_case.data_type, expected_bits);
     const std::vector<std::byte> output_logical(
             logical_spec.logical_nbytes(), kReadbackSentinel);
     std::vector<std::byte> input_physical;
@@ -1249,9 +1284,19 @@ inline void run_silu_reference_fixture(
 
     if (config.native_storage != nullptr) {
         CHECK(silu_observe_storage(config, *input, input_view) == input_physical);
+        // The physical image is rebuilt from the port's own logical readback
+        // through the independent canonical slot map, so this comparison keeps
+        // enforcing the tiled-layout invariants: every logical element must sit
+        // in the slot the standard 16x16 map assigns it, and no physical slot
+        // or packed sub-byte padding bit outside that set may change from the
+        // caller's poison. Value accuracy deliberately stays with the
+        // ULP-bounded comparison above instead of re-pinning host-libm bits: a
+        // conforming device port's `exp` and division are permitted the
+        // contract's 1-to-8-ULP ceilings, which the exact expected bits cannot
+        // represent.
         std::vector<std::byte> expected_output_storage = output_physical;
         apply_standard_tiled_view(
-                output_view, output->view().spec(), expected_logical,
+                output_view, output->view().spec(), actual,
                 expected_output_storage);
         CHECK(
                 silu_observe_storage(config, *output, output_view)
