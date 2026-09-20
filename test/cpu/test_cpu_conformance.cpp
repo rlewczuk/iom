@@ -19,6 +19,7 @@
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
 #include "backend/backend_conformance_rope_contract.hpp"
+#include "backend/backend_conformance_sdpa.hpp"
 
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -313,6 +314,14 @@ TEST_CASE("CPU conformance: binary operations are supported") {
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "CPU", true, true);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU conformance: shared SDPA admission and unsupported matrix") {
+    CpuDevices devices;
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(), {}, false, &devices.gate};
+    iom_conformance::run_sdpa_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 

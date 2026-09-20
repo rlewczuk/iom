@@ -273,6 +273,7 @@ if(ROCM_ENABLED)
         CONFORMANCE_MAIN_SOURCE rocm/test_rocm_conformance.cpp
         SMOKE_SOURCES rocm/test_rocm_smoke.cpp
         CONFORMANCE_SOURCES rocm/test_rocm_conformance.cpp
+        backend/backend_conformance_sdpa.hpp
         COMPILE_DEFINITIONS __HIP_PLATFORM_AMD__
         SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/rocm
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
@@ -288,6 +289,7 @@ if(CUDA_ENABLED)
         CONFORMANCE_MAIN_SOURCE cuda/test_cuda_conformance.cpp
         SMOKE_SOURCES cuda/test_cuda_smoke.cpp
         CONFORMANCE_SOURCES cuda/test_cuda_conformance.cpp
+        backend/backend_conformance_sdpa.hpp
         SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/cuda
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
         BACKEND_LIBRARY iom_cuda
@@ -301,6 +303,7 @@ if(SYCL_ENABLED)
         CONFORMANCE_MAIN_SOURCE sycl/test_sycl_conformance.cpp
         SMOKE_SOURCES sycl/test_sycl_smoke.cpp
         CONFORMANCE_SOURCES sycl/test_sycl_conformance.cpp
+        backend/backend_conformance_sdpa.hpp
         SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/sycl ${IOM_SYCL_INCLUDE_DIR}
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/src/sycl ${IOM_SYCL_INCLUDE_DIR}
         COMPILE_DEFINITIONS IOM_ENABLE_TESTING
@@ -318,8 +321,8 @@ endif()
 
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
+        backend/backend_conformance_sdpa.hpp
 )
-
 set_source_files_properties(cpu/test_cpu_conformance.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 )

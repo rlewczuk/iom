@@ -35,6 +35,7 @@
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_sdpa.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
 #include "copy.hpp"
@@ -452,6 +453,14 @@ TEST_CASE("SYCL conformance: compute methods reject unsupported capability witho
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "SYCL", true, true);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("SYCL conformance: shared SDPA admission and unsupported matrix") {
+    SyclDevices devices;
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(), {}, false, &devices.gate};
+    iom_conformance::run_sdpa_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 TEST_CASE(

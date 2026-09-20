@@ -28,6 +28,7 @@
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
+#include "backend/backend_conformance_sdpa.hpp"
 #include "backend/backend_conformance_token_selection.hpp"
 
 #include "iom/cpu/device.hpp"
@@ -355,6 +356,15 @@ TEST_CASE("CUDA conformance: compute methods reject capability without submittin
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "CUDA", true, true);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA conformance: shared SDPA admission and unsupported matrix") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(), {}, false, &devices.gate};
+    iom_conformance::run_sdpa_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 
