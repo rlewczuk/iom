@@ -892,22 +892,276 @@ TEST_CASE("SYCL conformance: RMSNorm reference, admission, and lifetime") {
     iom_conformance::run_rmsnorm_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
+// SYCL's declared SiLU expectation for this leaf: the device port queues
+// exactly BF16 and F32. The six packed leaves arrive with
+// `10-sycl-silu-packed-formats` (the shared header's `kSiluSyclExpectedSupported`
+// is the eventual full SYCL matrix, whose remaining entry is the conditional
+// F64 aspect path) and F64 is deliberately not claimed here, so the shared
+// suite observes those seven and every semantically inapplicable leaf as
+// capability rejections.
+inline constexpr std::array<iom::DataType, 2> kSyclSiluImplementedLeaves{
+        iom::DataType::BF16,
+        iom::DataType::F32,
+};
+
 TEST_CASE("SYCL conformance: SiLU reference, admission, and lifetime") {
     SyclDevices devices;
     SyclStorageOracle oracle(*devices.candidate_context);
     iom_conformance::SiluConformanceConfig config{
             devices.conformance(),
-            iom_conformance::kNoSiluSpan,
+            kSyclSiluImplementedLeaves,
             &devices.gate,
             &oracle,
             iom_conformance::SiluNativeFailureSeam{
-                    {},
-                    {},
-                    "sycl_detail::silu",
-                    "the SYCL SiLU port is not present in this leaf; "
-                    "no accepted worker failure seam exists"}};
+                    [] {
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::post_launch);
+                    },
+                    [] {
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::none);
+                    },
+                    "sycl_detail::SubmissionFault::post_launch",
+                    {}}};
     iom_conformance::run_silu_conformance(config);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// Driver-local SiLU coverage the frozen shared suite does not own: the exact
+// rejected-leaf categories against the device's own fp64 fact, pure
+// zero-workspace handling, positive device admission through temporary views
+// and a destroyed producer owner, retained event/lease/owner proof, and an
+// accepted post-launch fault whose repeated waits are identical and which
+// still leaves the queue usable.
+TEST_CASE(
+        "SYCL conformance: SiLU device admission, lifetime, and accepted "
+        "faults") {
+    SyclDevices devices;
+    const sycl::device native_device =
+            devices.candidate_context->get_devices().front();
+    const bool fp64_available = native_device.has(sycl::aspect::fp64);
+    const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
+    const iom::oid invalid = iom::to_oid(iom::OidError::InvalidArgument);
+    const iom::TensorSpec spec =
+            iom_conformance::silu_make_spec({2, 17, 17}, iom::DataType::F32);
+
+    // F64 stays a capability rejection even where the device reports fp64.
+    {
+        CAPTURE(fp64_available);
+        const iom::TensorSpec f64_spec = iom_conformance::silu_make_spec(
+                {2, 17, 17}, iom::DataType::F64);
+        auto input = devices.candidate->create_tensor(f64_spec);
+        auto output = devices.candidate->create_tensor(f64_spec);
+        const std::vector<std::byte> before =
+                iom_conformance::read_logical(output->view());
+        auto queue = devices.candidate->create_ops();
+        CHECK_EQ(queue->silu(input->view(), output->view()), unsupported);
+        CHECK_THROWS_AS(
+                (void)queue->silu_workspace_requirements(
+                        input->view(), output->view()),
+                std::runtime_error);
+        CHECK(iom_conformance::read_logical(output->view()) == before);
+    }
+
+    // The six packed leaves and every semantically inapplicable leaf are
+    // capability rejections on one queue, none of them mutates the output, and
+    // none of them consumes a submission sequence.
+    {
+        std::vector<iom::DataType> rejected(
+                iom_conformance::kSiluInapplicableDataTypes.begin(),
+                iom_conformance::kSiluInapplicableDataTypes.end());
+        rejected.insert(
+                rejected.end(),
+                {iom::DataType::F4_E2M1, iom::DataType::F6_E2M3,
+                 iom::DataType::F6_E3M2, iom::DataType::F8_E4M3FN,
+                 iom::DataType::F8_E5M2, iom::DataType::F16});
+        auto queue = devices.candidate->create_ops();
+        for (const iom::DataType leaf : rejected) {
+            CAPTURE(static_cast<int>(leaf));
+            const iom::TensorSpec leaf_spec =
+                    iom_conformance::silu_make_spec({2, 17, 17}, leaf);
+            auto input = devices.candidate->create_tensor(leaf_spec);
+            auto output = devices.candidate->create_tensor(leaf_spec);
+            const std::vector<std::byte> before =
+                    iom_conformance::read_logical(output->view());
+            CHECK_EQ(
+                    queue->silu(input->view(), output->view()), unsupported);
+            CHECK_THROWS_AS(
+                    (void)queue->silu_workspace_requirements(
+                            input->view(), output->view()),
+                    std::runtime_error);
+            CHECK(iom_conformance::read_logical(output->view()) == before);
+        }
+
+        // An unknown DataType enum is invalid input, not a capability result.
+        auto unknown_input = devices.candidate->create_tensor(spec);
+        auto unknown_output = devices.candidate->create_tensor(spec);
+        iom::TensorSpec unknown = unknown_input->view().spec();
+        unknown.data_type = static_cast<iom::DataType>(255);
+        iom_conformance::SiluOwnerSpecRestore restore_input(
+                *unknown_input, unknown);
+        iom_conformance::SiluOwnerSpecRestore restore_output(
+                *unknown_output, unknown);
+        CHECK_EQ(
+                queue->silu(unknown_input->view(), unknown_output->view()),
+                invalid);
+        CHECK_THROWS_AS(
+                (void)queue->silu_workspace_requirements(
+                        unknown_input->view(), unknown_output->view()),
+                std::invalid_argument);
+
+        // A recognized non-`NONE` quantization is a capability rejection.
+        auto quantized_input = devices.candidate->create_tensor(spec);
+        auto quantized_output = devices.candidate->create_tensor(spec);
+        iom::TensorSpec grouped = quantized_input->view().spec();
+        grouped.quantization = iom::QuantizationFormat::OCP_MXFP4;
+        iom_conformance::SiluOwnerSpecRestore restore_quantized_input(
+                *quantized_input, grouped);
+        iom_conformance::SiluOwnerSpecRestore restore_quantized_output(
+                *quantized_output, grouped);
+        CHECK_EQ(
+                queue->silu(
+                        quantized_input->view(), quantized_output->view()),
+                unsupported);
+
+        // Every rejected probe stayed side-effect free: the first queued
+        // submission on this queue is sequence one, and an empty workspace
+        // plus the ignoring nonempty workspace both reach the device.
+        auto accepted_input = devices.candidate->create_tensor(spec);
+        auto accepted_output = devices.candidate->create_tensor(spec);
+        std::array<std::byte, 64> scratch{};
+        iom_conformance::SiluTestWorkspace nonempty_workspace(
+                *devices.candidate, scratch.data(), scratch.size());
+        CHECK(queue->silu_workspace_requirements(
+                      accepted_input->view(), accepted_output->view())
+              == iom::WorkspaceRequirements{0, 1});
+        const iom::oid first = queue->silu(
+                accepted_input->view(), accepted_output->view(),
+                nonempty_workspace.view());
+        REQUIRE(iom::oid_is_token(first));
+        CHECK_EQ(iom_conformance::token_sequence(first), std::uint64_t{1});
+        CHECK_NOTHROW(queue->wait(first));
+        CHECK_NOTHROW(queue->wait(first));
+    }
+
+    // Positive BF16/F32 device admission: the immutable snapshot and both
+    // owner identities outlive temporary views and a destroyed producer, the
+    // completion event is waited exactly once across repeated waits, and the
+    // released fixed slots prove proven completion under the retained lease.
+    for (const iom::DataType type : {iom::DataType::BF16, iom::DataType::F32}) {
+        CAPTURE(static_cast<int>(type));
+        const iom_conformance::SiluReferenceCase fixture =
+                iom_conformance::silu_make_pattern_case(
+                        iom_conformance::SiluReferenceCaseKind::ordinary, type,
+                        {2}, 2, 17,
+                        "driver/ordinary/"
+                                + iom_conformance::silu_oracle::leaf_name(
+                                        type));
+        const iom::TensorSpec case_spec =
+                iom_conformance::silu_case_spec(fixture);
+        auto input = devices.candidate->create_tensor(case_spec);
+        auto output = devices.candidate->create_tensor(case_spec);
+        iom_conformance::copy_from_host(
+                input->view(),
+                iom_conformance::silu_pack_bits(type, fixture.input_bits));
+        iom_conformance::copy_from_host(
+                output->view(),
+                std::vector<std::byte>(
+                        case_spec.logical_nbytes(),
+                        iom_conformance::kReadbackSentinel));
+        const std::vector<iom_conformance::SiluReferenceValue> expected =
+                iom_conformance::silu_evaluate(fixture);
+        auto queue = devices.candidate->create_ops();
+        iom::sycl_detail::reset_fence_wait_count_for_testing();
+
+        iom::oid token = 0;
+        {
+            iom_conformance::SiluCaseWindow window(&devices.gate);
+            iom::TensorView temporary = output->view();
+            token = queue->silu(input->view(), temporary);
+        }
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(iom_conformance::token_sequence(token), std::uint64_t{1});
+        // Owner retention: the accepted work holds its own metadata, owner
+        // identity, and native handles, so the producer owner may be destroyed
+        // while the access is still retained and unproven.
+        input.reset();
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_EQ(
+                iom::sycl_detail::fence_wait_count_for_testing(),
+                std::size_t{1});
+        const std::string mismatch = iom_conformance::silu_compare(
+                type, iom_conformance::read_logical(output->view()), expected,
+                "driver device SiLU");
+        CHECK_MESSAGE(mismatch.empty(), mismatch);
+        iom::sycl_detail::QueueResourceSnapshot after;
+        iom::sycl_detail::queue_resource_snapshot_for_testing(*queue, after);
+        CHECK_EQ(after.slots_in_use, 0u);
+        CHECK_EQ(after.slots_protected, 0u);
+    }
+
+    // Accepted post-launch device fault: the submission keeps its positive
+    // OID, the output is unusable, and every repeated wait observes the
+    // identical failure without re-waiting the native event. A later valid
+    // submission on the same queue still succeeds and matches the reference.
+    {
+        const iom::DataType type = iom::DataType::F32;
+        const iom_conformance::SiluReferenceCase fixture =
+                iom_conformance::silu_make_pattern_case(
+                        iom_conformance::SiluReferenceCaseKind::ordinary, type,
+                        {2}, 2, 17, "driver/native-failure/F32");
+        const iom::TensorSpec case_spec =
+                iom_conformance::silu_case_spec(fixture);
+        auto input = devices.candidate->create_tensor(case_spec);
+        auto output = devices.candidate->create_tensor(case_spec);
+        iom_conformance::copy_from_host(
+                input->view(),
+                iom_conformance::silu_pack_bits(type, fixture.input_bits));
+        iom_conformance::copy_from_host(
+                output->view(),
+                std::vector<std::byte>(
+                        case_spec.logical_nbytes(),
+                        iom_conformance::kReadbackSentinel));
+        const std::vector<iom_conformance::SiluReferenceValue> expected =
+                iom_conformance::silu_evaluate(fixture);
+        auto queue = devices.candidate->create_ops();
+
+        const iom::oid healthy = queue->silu(
+                input->view(), output->view());
+        REQUIRE(iom::oid_is_token(healthy));
+        CHECK_NOTHROW(queue->wait(healthy));
+
+        iom::sycl_detail::inject_submission_fault_for_testing(
+                iom::sycl_detail::SubmissionFault::post_launch);
+        const iom::oid failed = queue->silu(
+                input->view(), output->view());
+        iom::sycl_detail::inject_submission_fault_for_testing(
+                iom::sycl_detail::SubmissionFault::none);
+        REQUIRE(iom::oid_is_token(failed));
+        CHECK_EQ(
+                iom_conformance::token_sequence(failed),
+                iom_conformance::token_sequence(healthy) + 1);
+        const std::size_t native_waits =
+                iom::sycl_detail::fence_wait_count_for_testing();
+        iom_conformance::expect_repeated_runtime_failure(*queue, failed);
+        CHECK_EQ(
+                iom::sycl_detail::fence_wait_count_for_testing(),
+                native_waits + 1);
+
+        const iom::oid recovered = queue->silu(
+                input->view(), output->view());
+        REQUIRE(iom::oid_is_token(recovered));
+        CHECK_EQ(
+                iom_conformance::token_sequence(recovered),
+                iom_conformance::token_sequence(failed) + 1);
+        CHECK_NOTHROW(queue->wait(recovered));
+        CHECK_NOTHROW(queue->wait(recovered));
+        const std::string mismatch = iom_conformance::silu_compare(
+                type, iom_conformance::read_logical(output->view()), expected,
+                "driver recovered SiLU");
+        CHECK_MESSAGE(mismatch.empty(), mismatch);
+    }
 }
 
 TEST_CASE("SYCL conformance: full shared suite") {
