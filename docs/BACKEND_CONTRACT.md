@@ -2059,7 +2059,7 @@ queries:
 
 | Backend | Matrix staging that request setup must include when selected |
 | --- | --- |
-| CUDA | Direct linear may query zero global scratch because its assessed route uses fixed kernel-local tiles. SDPA's assessed caller range contains checked, 32-byte-aligned FP32 score and BF16 probability segments. |
+| CUDA | Direct linear may query zero global scratch because its assessed route uses fixed kernel-local tiles. The SDPA caller range is the exact two-segment layout of `src/cuda/sdpa.hpp`: `alignment 32`, `bytes = A32(P*Hq*pad16(R)*pad16(L)*4) + A32(P*Hq*pad16(R)*pad16(L)*2)`, with the BF16 probability segment beginning at the checked offset `A32(P*Hq*pad16(R)*pad16(L)*4)`. |
 | ROCm | The conservative assessed linear range contains checked aligned `x_pack` and `y_pack`. Its SDPA range contains `q_pack`, sequentially reused per-`Hkv` K/V pack, FP32 scores, BF16 probabilities, BF16 PV, and merged staging. |
 | SYCL | The assessed linear range contains checked FP32 product staging. Its conservative SDPA range contains FP32 scores, BF16 probabilities, FP32 PV, and BF16 head staging, with reuse only after the producing stage completes. |
 Standard CUDA/ROCm/SYCL tensor data and raw workspace subranges retain the
@@ -2138,12 +2138,15 @@ CUDA neural implementation or a support claim; each interface-owning port
 carries its own evidence. On the inventoried device the native CUDA Toolkit
 route is **supported for implementation feasibility** for ordinary and
 head-planar linear, QK, and PV at every required row count. Production status
-is **closed for linear and the CUDA SDPA matrix QK/PV stages** — the
-operation-owning ports supply the runtime numerical, conformance, and
-execution-connected evidence recorded in `[Linear native evidence](#linear-native-evidence)`
-and `[SDPA matrix native evidence](#sdpa-matrix-native-evidence)` — and remains **blocked for RoPE and end-to-end SDPA**
-until their own ports supply the same evidence. The
-implemented SiLU port is closed separately by its operation-owned gate receipt.
+is **closed for linear, the CUDA SDPA matrix QK/PV stages, and the end-to-end
+CUDA SDPA port** — the operation-owning ports supply the runtime numerical,
+conformance, and execution-connected evidence recorded in `[Linear native evidence](#linear-native-evidence)`,
+`[SDPA matrix native evidence](#sdpa-matrix-native-evidence)`, and
+`[SDPA integration native evidence](#sdpa-integration-native-evidence)` — and
+remains **blocked for RoPE, for the ROCm and SYCL end-to-end SDPA ports, and
+therefore for the four-backend SDPA gate** until those ports supply the same
+evidence. The implemented SiLU port is closed separately by its operation-owned
+gate receipt.
 A device below compute capability 8.0 is **unsupported** for this BF16 WMMA
 route; it does not earn a fallback pass.
 
@@ -2261,6 +2264,82 @@ RoPE, or end-to-end SDPA integration.
 - **Conclusion.** The private CUDA QK/PV matrix stages are closed on this
   device for the exercised decode and prefill rows; full CUDA SDPA remains
   gated on its nonmatrix and integration ports.
+
+##### SDPA integration native evidence
+
+Recorded on 2026-09-20 through the configured `cuda` `csw-remote` profile from
+the exact
+`run-task/006-tinyllama--08-causal-grouped-attention--07-cuda-integration`
+worktree, mirror `csw-run-006-08-07-cuda-integration`, host `bv1`. This record
+closes the end-to-end CUDA SDPA port — the exact `sdpa` facade and pure query,
+the CUDA policy seam of `src/cuda/copy.hpp`, the stage chain of
+`src/cuda/sdpa.hpp`/`src/cuda/sdpa.cpp`, and the shared SDPA branch of
+`src/shared/gpu_queue.hpp`, `src/shared/gpu_queue_operations.inl`, and
+`src/shared/gpu_queue_lifecycle.inl`. It makes no ROCm, SYCL, CPU, RoPE,
+session, or four-backend claim.
+
+- **Backend, device, and toolchain.** CUDA; NVIDIA GeForce RTX 5090, compute
+  capability 12.0, driver 595.71.05; CUDA Toolkit 13.2 (`nvcc` `V13.2.78`),
+  with runtime and driver API 13020 as reported by `cudaRuntimeGetVersion` and
+  `cudaDriverGetVersion` inside the conformance binary, and the executed image
+  reporting its own architecture through `linear_bf16_wmma_image_arch()` =
+  `1200`. The port is selected only on the queue policy of a device that
+  proved the BF16 WMMA facility; a queue whose construction observed the
+  injected facility absence reports the operation `Unsupported` for both the
+  pure query and the submission and leaves the output byte-exact.
+- **Public path, workspace, and exercised submissions.** `DeviceOps::sdpa`
+  and `DeviceOps::sdpa_workspace_requirements` through the real queue/OID
+  path: one full causal prefill (`Hq=2,Hkv=1,R=4,D=3,C=4,a=0,L=4`) and one
+  logical `R=1` decode (its last row, `a=3`) were each accepted with a
+  caller-owned `alignment 32` workspace and waited twice; every output element
+  was compared against the shared independent reference, and each decoded row
+  matched the corresponding prefill row bit for bit. The queried layout is
+  exactly `A32(P*Hq*pad16(R)*pad16(L)*4)` for the FP32 score segment plus
+  `A32(P*Hq*pad16(R)*pad16(L)*2)` for the BF16 probability segment that begins
+  at the checked score offset, at the fixed 32-byte alignment; the same value
+  is returned by the pure query and validated by the accepted stage chain.
+- **Native stages and resource use.** The single in-order queue stream runs
+  `sdpa_qk_kernel` then the device-local `scale_mask_kernel`,
+  `softmax_kernel`, `sdpa_pv_kernel`, and `canonicalize_output_kernel`; an
+  accepted prefill/decode pair creates no additional stream and no additional
+  completion resource (asserted around that pair with the CUDA resource
+  counters), so the port adds no hidden stream, event, or allocation.
+- **Conformance gate.** `ctest --test-dir build --output-on-failure --timeout
+  300 -R '^iom_cuda_conformance_tests$'` passed on that mirror (`1/1`,
+  `79.49s`), and the direct binary reports `46/46` cases and
+  `6,214,411/6,214,411` assertions with no skipped case. That selection covers
+  the shared SDPA matrix (grouped KV heads, causal/initialized-prefix and
+  capacity-tail isolation, physical-padding perturbation, `R=1,15,16,17`,
+  non-tile `D`, multiple leading planes, transformed head strides, cached
+  incremental rows, the negative admission matrix, workspace/alias/overflow
+  rejection, and accepted-failure lifetime), the semantic probes — an included
+  `+0 * infinity` probability poisons its output component with a quiet NaN,
+  and `2^-127` survives the final BF16 RNE store — and the CUDA BF16 native
+  evidence cases. `iom_cuda_smoke_tests` additionally passed with `23/23` cases
+  and `462/462` assertions on the same mirror.
+- **Accepted failure and workspace lifetime.** An injected native stage launch
+  fault after acceptance keeps one positive OID, leaves the output unusable,
+  rethrows the same error on every repeated wait, and the next submission
+  recovers. A second accepted submission of the same live workspace range is
+  bounded-resource exhaustion until the caller observes the first token, whose
+  observation releases the range again; the shared workspace case was repeated
+  twelve times on that mirror without a single failure, and the earlier
+  proof-based release of the same branch failed ten of twelve runs, which is
+  why a successful accepted submission now retains its lease until its token is
+  observed and queue teardown releases whatever no caller observed.
+- **Profiler.** Nsight Compute is installed but counter collection is denied
+  to this account (`ERR_NVGPUCTRPERM`; no passwordless root), so no
+  counter-based instruction observation was obtained. Nsight Systems captured
+  `/tmp/cuda-sdpa-integration.nsys-rep`; its `cuda_gpu_kern_sum` reports
+  `sdpa_qk_kernel` with 2 instances and `sdpa_pv_kernel` with 2 instances —
+  one per product at decode and one at prefill — beside the two scale, softmax,
+  and canonicalization instances. This proves both native matrix stages ran for
+  decode and prefill through the public request and that the chain contains no
+  duplicate or corrective pass; it claims no unavailable performance counters.
+- **Conclusion.** The CUDA BF16 SDPA port is closed on this device for the
+  exercised decode and prefill rows and for the shared conformance matrix. The
+  four-backend SDPA gate remains open until the ROCm and SYCL ports supply the
+  same evidence.
 
 ##### Evidence boundary and installed capability
 

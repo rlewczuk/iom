@@ -359,6 +359,9 @@ class GpuQueue final : public DeviceOps {
         bool is_rope = false;
         std::optional<RopeRequest> rope_request;
         detail::BinaryEntryRegistration rope_entries{};
+        bool is_sdpa = false;
+        std::optional<SdpaRequest> sdpa_request;
+        detail::SdpaEntryRegistration sdpa_entries{};
         detail::EntryRegistration entries{};
         typename EventRing::Submission* submission = nullptr;
         std::shared_ptr<CompletionState> completion;
@@ -388,6 +391,7 @@ class GpuQueue final : public DeviceOps {
         detail::BinaryEntryRegistration rmsnorm_entries{};
         detail::BinaryEntryRegistration silu_entries{};
         detail::BinaryEntryRegistration rope_entries{};
+        detail::SdpaEntryRegistration sdpa_entries{};
         detail::WorkspaceLease workspace_lease{};
         std::shared_ptr<CompletionState> completion;
         bool is_binary = false;
@@ -397,6 +401,7 @@ class GpuQueue final : public DeviceOps {
         bool is_linear = false;
         bool is_silu = false;
         bool is_rope = false;
+        bool is_sdpa = false;
     };
 
     [[nodiscard]] static detail::FenceResult fence_invoke(
@@ -473,11 +478,27 @@ public:
             std::size_t s, std::size_t R, LinearOutputLayout layout,
             std::size_t H, std::size_t D) override;
     oid linear_impl(const LinearRequest& request) override;
+    // SDPA uses the same accepted-task, retained-owner, workspace-lease, and
+    // event/quarantine protocol as the other GPU operations. The backend
+    // policy supplies the pure capability and one-stream native stage chain.
+    [[nodiscard]] WorkspaceRequirements
+            sdpa_workspace_requirements_impl(
+                    const SdpaRequest& request) override;
+    oid sdpa_impl(const SdpaRequest& request) override;
 private:
     void execute(Task& task);
 
     void complete_task(
             std::uint64_t sequence, std::exception_ptr failure);
+
+    // The caller's observation of one accepted token. The base `wait`
+    // invokes it once the token's completion state is recorded, so it is the
+    // point where a retained SDPA workspace lease becomes reusable again.
+    void fence_through_sequence(std::uint64_t sequence) noexcept override;
+
+    // Releases every retained SDPA lease that no caller ever observed; the
+    // drain proof of queue teardown is the covering proof for those ranges.
+    void release_retained_leases(bool covering_proof) noexcept;
 
 #ifdef IOM_ENABLE_TESTING
 public:
@@ -502,6 +523,9 @@ private:
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
     std::map<std::uint64_t, GpuOutcome> outcomes_;
+    // Successful accepted submissions whose caller workspace lease stays live
+    // until the caller observes the token; guarded by `outcome_mutex_`.
+    std::map<std::uint64_t, detail::WorkspaceLease> retained_leases_;
     detail::StagedWorker<Task> worker_;
 };
 }  // namespace iom::detail

@@ -353,11 +353,20 @@ __device__ __forceinline__ std::uint64_t matrix_plane_base(
 
 __device__ __forceinline__ std::uint16_t matrix_bf16_encode(float value) {
     // The matrix result is rounded once at the destination.  Canonicalize
-    // both signs of numerical zero before applying the exact BF16 RNE carry.
+    // both signs of numerical zero, and keep the all-ones exponent out of
+    // the RNE carry: without it a NaN whose payload reaches the carry would
+    // wrap into the sign bit and be stored as a zero, and an infinity would
+    // not survive.  NaN payload and sign stay unspecified by the contract;
+    // this is the same quiet positive NaN the probability boundary stores.
     if (value == 0.0f) {
         return 0;
     }
     const std::uint32_t bits = __float_as_uint(value);
+    if ((bits & 0x7f800000u) == 0x7f800000u) {
+        return (bits & 0x007fffffu) == 0
+                ? static_cast<std::uint16_t>(bits >> 16)
+                : static_cast<std::uint16_t>(0x7fc0u);
+    }
     const std::uint32_t lsb = (bits >> 16) & 1u;
     const std::uint32_t rounded = bits + 0x7fffu + lsb;
     return static_cast<std::uint16_t>(rounded >> 16);
