@@ -28,6 +28,7 @@
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
+#include "backend/backend_conformance_token_selection.hpp"
 
 #include "iom/cpu/device.hpp"
 #include "iom/cuda/device.hpp"
@@ -319,6 +320,32 @@ TEST_CASE("CUDA conformance: deferred queue lifetime and stability") {
     iom_conformance::run_lifetime_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA conformance: greedy token selection shared matrix and lifetime") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle native_storage;
+    const iom_conformance::TokenSelectionNativeFailureSeam native_failure{
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::third_plane_launch);
+            },
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::none);
+            },
+            "CUDA logical transfer failure",
+            {}};
+    const iom_conformance::TokenSelectionConformanceConfig config{
+            devices.conformance(),
+            devices.candidate->supported_data_types(),
+            &devices.gate,
+            &native_storage,
+            {},
+            native_failure};
+    iom_conformance::run_token_selection_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 
