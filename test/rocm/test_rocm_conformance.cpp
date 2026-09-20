@@ -34,6 +34,7 @@
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
+#include "backend/backend_conformance_token_selection.hpp"
 #include "iom/rocm/device.hpp"
 #include "rocm/copy.hpp"
 #include "iom/gpu_algorithm.hpp"
@@ -1120,6 +1121,48 @@ TEST_CASE("ROCm conformance: RoPE reference, admission, and lifetime") {
             *candidate,
             iom_conformance::rope_reference::kRopeRocmExpectedSupported,
             oracle);
+    CHECK_FALSE(gate.armed());
+}
+
+TEST_CASE("ROCm conformance: greedy token selection shared matrix and lifetime") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
+    // The selector's only device work after `wait(producer)` is
+    // `TensorView::copy_to_host` for the logical BF16 bytes: the shared staged
+    // transfer gathers device-to-staging through the HIP plane kernel and
+    // `Policy::after_copy_plane_launch(2)` consumes this counted fault after
+    // that launch, so the armed failure is the real logical-byte transfer
+    // failure and not an unrelated later submission.
+    const iom_conformance::TokenSelectionNativeFailureSeam native_failure{
+            [] {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::third_plane_launch);
+            },
+            [] {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::none);
+            },
+            "rocm_detail::SubmissionFault::third_plane_launch",
+            {}};
+    const iom_conformance::TokenSelectionConformanceConfig config{
+            devices,
+            candidate->supported_data_types(),
+            &gate,
+            &oracle,
+            iom::WorkspaceRequirements{
+                    iom::gpu_algorithm::compute_staging_size(17 * sizeof(std::uint16_t)),
+                    32},
+            native_failure};
+    iom_conformance::run_token_selection_conformance(config);
     CHECK_FALSE(gate.armed());
 }
 
