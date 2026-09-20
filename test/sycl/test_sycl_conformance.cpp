@@ -30,6 +30,7 @@
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
+#include "backend/backend_conformance_rope_contract.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -863,13 +864,25 @@ TEST_CASE("SYCL conformance: RMSNorm reference, admission, and lifetime") {
 TEST_CASE("SYCL conformance: full shared suite") {
     SyclDevices devices;
     SyclStorageOracle oracle(*devices.candidate_context);
-    // The shared suite observes the landed binary and linear capabilities
-    // through its own probe with explicit expectations; the RMS normalization
-    // scenarios run through the shared dispatcher above.
+    const iom_conformance::RopeContractConformanceConfig rope_contract{
+            devices.conformance(),
+            iom_conformance::rope_reference::kRopeSyclExpectedSupported,
+            &devices.gate,
+            iom_conformance::RopeNativeFailureSeam{
+                    [] {
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::post_launch);
+                    },
+                    [] {
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::none);
+                    },
+                    "sycl_detail::SubmissionFault::post_launch",
+                    {}}};
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true);
+            &devices.gate, &oracle, true, true, &rope_contract);
     CHECK_FALSE(devices.gate.armed());
 }
 

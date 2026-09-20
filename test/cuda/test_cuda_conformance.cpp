@@ -24,6 +24,7 @@
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
+#include "backend/backend_conformance_rope_contract.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
@@ -1088,10 +1089,25 @@ TEST_CASE("CUDA conformance: full shared suite") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     CudaStorageOracle oracle;
+    const iom_conformance::RopeContractConformanceConfig rope_contract{
+            devices.conformance(),
+            iom_conformance::rope_reference::kRopeCudaExpectedSupported,
+            &devices.gate,
+            iom_conformance::RopeNativeFailureSeam{
+                    [] {
+                        iom::cuda_detail::inject_submission_fault_for_testing(
+                                iom::cuda_detail::SubmissionFault::event_record);
+                    },
+                    [] {
+                        iom::cuda_detail::inject_submission_fault_for_testing(
+                                iom::cuda_detail::SubmissionFault::none);
+                    },
+                    "cuda_detail::SubmissionFault::event_record",
+                    {}}};
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true);
+            &devices.gate, &oracle, true, true, &rope_contract);
     CHECK_FALSE(devices.gate.armed());
 }
 

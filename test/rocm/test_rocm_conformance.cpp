@@ -25,7 +25,7 @@
 
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_rope.hpp"
-
+#include "backend/backend_conformance_rope_contract.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
@@ -1120,9 +1120,24 @@ TEST_CASE("ROCm conformance: full shared suite") {
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     HipStorageOracle oracle;
+    const iom_conformance::RopeContractConformanceConfig rope_contract{
+            devices,
+            iom_conformance::rope_reference::kRopeRocmExpectedSupported,
+            &gate,
+            iom_conformance::RopeNativeFailureSeam{
+                    [] {
+                        iom::rocm_detail::inject_submission_fault_for_testing(
+                                iom::rocm_detail::SubmissionFault::event_record);
+                    },
+                    [] {
+                        iom::rocm_detail::inject_submission_fault_for_testing(
+                                iom::rocm_detail::SubmissionFault::none);
+                    },
+                    "rocm_detail::SubmissionFault::event_record",
+                    {}}};
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate, &oracle, true, true);
+            &gate, &oracle, true, true, &rope_contract);
     CHECK_FALSE(gate.armed());
 }
 
