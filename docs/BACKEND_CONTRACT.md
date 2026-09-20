@@ -3380,6 +3380,57 @@ only test surface for this contract. No declaration, implementation, kernel,
 test, registration, model, or session file is changed by this documentation
 leaf; until a port lands, the current runtime hooks remain `Unsupported`.
 
+##### CUDA SiLU implementation boundary and evidence
+
+CUDA's SiLU leaf is implemented in `src/cuda/copy.cu` behind the common
+`DeviceOps::silu` admission path, the shared queue seam of
+`src/shared/gpu_queue.hpp`, and the CUDA `gpu_policy` hooks declared in
+`src/cuda/copy.hpp`. This subsection records the CUDA boundary only: it makes
+no claim about the other backends and no native-matrix claim of any kind.
+
+- **Capability.** CUDA queues exactly the nine applicable signed floating
+  leaves (`F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`,
+  `BF16`, `F32`, and `F64`) and no other. `BOOL`, the twelve integer leaves,
+  `F8_E8M0`, and every non-`NONE` quantization format stay `Unsupported` from
+  common admission before the CUDA capability predicate is consulted, and the
+  pure `silu_workspace_requirements` query keeps returning exactly `{0, 1}`
+  while a supplied nonempty workspace stays ignored.
+- **Device operation.** Each accepted submission uploads its immutable
+  descriptor into the queue's fixed metadata slot and then launches exactly one
+  kernel on the queue's own nonblocking stream: no staging, hidden allocation,
+  host round trip, second queue, or device-side detour through another
+  operation. One thread owns whole 32-bit words of one 16-slot tile-row chunk,
+  so every owned word is read, merged once, and stored once, each logical
+  element is evaluated exactly once, and neither physical tile padding nor any
+  packed padding bit outside the logical element set is written. Independent
+  leading planes, logical runs, and features keep their own transformed plane
+  offsets and strides.
+- **Numerics.** `src/shared/scalar_binary_codec.hpp` remains the sole
+  named-format codec and `src/shared/scalar_silu.hpp` the sole stable scalar
+  evaluator; the CUDA translation unit instantiates both with an FP64 carrier
+  for all nine leaves and performs exactly one RNE destination encode per
+  element, with no FTZ or fast-math behavior on this path, so the required
+  `F32` `-104` and `F64` `-746` negative subnormal tails survive.
+- **Queue, ownership, and errors.** Owner registration, metadata leasing, the
+  completion event, retained failures, drain, and quarantine remain properties
+  of the shared queue. An accepted launch or event-record failure keeps its
+  positive OID, consumes no further sequence, and reports the identical error
+  on every wait; operands and temporary views may be destroyed immediately
+  after submission and the accepted work still completes from retained
+  storage; an unknown completion whose covering drain fails quarantines the
+  queue lease until a covering proof reclaims its partition.
+- **Observed evidence.** A CUDA-only configuration (`-DCUDA_ENABLED=ON`, no
+  other optional backend) builds `iom_cuda_conformance_tests` without
+  diagnostics, and the anchored `ctest --test-dir build --output-on-failure
+  --timeout 300 -R '^iom_cuda_conformance_tests$'` passes on the reference
+  device (NVIDIA GeForce RTX 5090, compute capability 12.0, driver 595.71.05,
+  `nvcc` 13.2): 43 test cases with 6193239 assertions, every one passing. That
+  run covers the per-leaf device results for all nine leaves, the ULP, class,
+  and sign checks, the zero-workspace query, the logical-only write and
+  tile-padding invariants across full, transformed, and selected leading
+  views, `runs` 1/15/16/17, non-tile feature sizes, and the CUDA
+  fault/lifetime cases named in the queue clause above.
+
 ### 10. Model loading and weight layout
 
 Model ingestion begins with an explicit model directory and stays

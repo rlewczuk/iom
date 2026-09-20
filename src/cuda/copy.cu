@@ -19,6 +19,35 @@
 #include <utility>
 #include "driver.hpp"
 
+// ---------------------------------------------------------------------------
+// The one shared named-format codec and the one shared stable SiLU evaluator,
+// instantiated for this translation unit. `src/shared/scalar_binary_codec.hpp`
+// stays the sole owner of the named-format rules and
+// `src/shared/scalar_silu.hpp` the sole owner of the SiLU arithmetic, so this
+// CUDA leaf consumes both instead of restating either.
+//
+// Their default qualifier is this file's device qualifier, which is unusable
+// here: the evaluator header also defines the host-only convenience wrapper,
+// and a host function may not call a `__device__` specialization. The headers
+// therefore take the caller-supplied qualifier below, which leaves every
+// instantiation valid in both passes of this unit, and the include stays ahead
+// of the shared tiled device code that uses the same codec class. That
+// qualifier also makes the device pass analyze the wrapper's dead host-traits
+// instantiation, which NVCC reports as a deferred diagnostic for a
+// host-only standard-math call no device code can reach; the suppression is
+// scoped to this include and to that one diagnostic.
+#if defined(__CUDACC__)
+#pragma nv_diag_suppress 20014
+#endif
+#define IOM_SCALAR_CODEC_QUALIFIER __host__ __device__ inline
+#define IOM_SCALAR_SILU_QUALIFIER __host__ __device__ inline
+#include "../shared/scalar_silu.hpp"
+#undef IOM_SCALAR_SILU_QUALIFIER
+#undef IOM_SCALAR_CODEC_QUALIFIER
+#if defined(__CUDACC__)
+#pragma nv_diag_default 20014
+#endif
+
 namespace iom::cuda_detail {
 namespace {
 
@@ -320,6 +349,228 @@ void launch_cache_append_kernel(
 
 #include "../shared/gpu_queue.hpp"
 
+// ---------------------------------------------------------------------------
+// CUDA SiLU device operation.
+//
+// The shared queue (src/shared/gpu_queue.hpp) owns SiLU admission, owner
+// registration, the immutable metadata slot, the upload of that descriptor,
+// the completion event, and the retained-failure/quarantine protocol. This
+// translation unit contributes only the device launch behind
+// `gpu_policy::launch_silu`: one kernel over the logical elements of every
+// independent plane, each element evaluated once through the shared packed
+// codec and the shared stable evaluator in an FP64 carrier, and stored with
+// exactly one RNE encode in the destination format.
+//
+// Layout ownership: element slot `s` of one plane occupies bits
+// `[s * bits, (s + 1) * bits)` of that plane's packed stream. One chunk of a
+// 16-slot tile row is exactly `bits / 2` whole 32-bit words for every
+// applicable leaf width, so one thread owns its words exclusively: it reads an
+// owned word, replaces only the fields of the logical elements it owns, and
+// stores that word once. Physical tile padding and every cell outside the
+// logical `[..., rows, columns]` extent are never written, and no input cell
+// other than a logical element is ever read.
+// ---------------------------------------------------------------------------
+
+#define IOM_GPU_DEVICE __device__
+#define IOM_GPU_GLOBAL __global__
+#define IOM_GPU_GLOBAL_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
+#define IOM_LAUNCH_KERNEL(kernel, blocks, threads, stream, ...) \
+    kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(__VA_ARGS__)
+
+namespace iom::detail {
+namespace {
+
+constexpr unsigned int kSiluThreads = 256;
+constexpr unsigned int kSiluMaxBlocks = 65535;
+
+// The FP64 carrier the SiLU contract requires for all nine applicable leaves.
+// The shared evaluator and the shared codec drive it through `::exp` and the
+// device math library's IEEE predicates, so no intermediate is narrowed to the
+// destination format before the single destination encode, and no FTZ or
+// fast-math behavior is requested anywhere on this path.
+struct SiluFp64Traits {
+    using carrier_type = double;
+
+    IOM_GPU_DEVICE static carrier_type positive_infinity() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7ff0000000000000ull));
+    }
+    IOM_GPU_DEVICE static carrier_type quiet_nan() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7ff8000000000000ull));
+    }
+    IOM_GPU_DEVICE static carrier_type max_finite() noexcept {
+        return __longlong_as_double(
+                static_cast<long long>(0x7fefffffffffffffull));
+    }
+    IOM_GPU_DEVICE static carrier_type exp(carrier_type value) noexcept {
+        return ::exp(value);
+    }
+    IOM_GPU_DEVICE static bool isnan(carrier_type value) noexcept {
+        return ::isnan(value);
+    }
+    IOM_GPU_DEVICE static bool isinf(carrier_type value) noexcept {
+        return ::isinf(value);
+    }
+    IOM_GPU_DEVICE static bool signbit(carrier_type value) noexcept {
+        return ::signbit(value);
+    }
+    IOM_GPU_DEVICE static carrier_type fabs(carrier_type value) noexcept {
+        return ::fabs(value);
+    }
+    IOM_GPU_DEVICE static carrier_type floor(carrier_type value) noexcept {
+        return ::floor(value);
+    }
+    IOM_GPU_DEVICE static carrier_type ldexp(
+            carrier_type value, int exponent) noexcept {
+        return ::ldexp(value, exponent);
+    }
+    IOM_GPU_DEVICE static carrier_type frexp(
+            carrier_type value, int* exponent) noexcept {
+        return ::frexp(value, exponent);
+    }
+};
+
+// One packed field of a plane. The tensor's base address and every plane start
+// are 32-bit aligned, and the access only ever spans the field's own words, so
+// neither word read can leave the owner's storage.
+IOM_GPU_DEVICE std::uint64_t silu_load_field(
+        const unsigned char* base, std::uint64_t bit,
+        unsigned int bits) noexcept {
+    const auto* words = reinterpret_cast<const std::uint32_t*>(base);
+    const std::uint64_t word = bit / 32;
+    std::uint64_t joined = words[word];
+    if (bit % 32 + bits > 32) {
+        joined |= static_cast<std::uint64_t>(words[word + 1]) << 32;
+    }
+    return (joined >> (bit % 32))
+            & (bits == 64
+               ? ~std::uint64_t{}
+               : ((std::uint64_t{1} << bits) - 1));
+}
+
+// One task is one (plane, row, 16-feature chunk) tuple: the granularity whose
+// owned word range is exclusive. Tasks and leading coordinates are derived
+// exactly like the established shared tiled row kernels, so a transformed or
+// selected leading-plane view keeps its own plane offset and strides.
+IOM_GPU_GLOBAL void silu_kernel(SiluMetadata metadata) {
+    const DataType type = static_cast<DataType>(metadata.type);
+    const unsigned int bits = metadata.bits;
+    const std::uint64_t rows = metadata.rows;
+    const std::uint64_t columns = metadata.columns;
+    const std::uint64_t chunks_per_row =
+            (columns + TensorSpec::TILE - 1) / TensorSpec::TILE;
+    const std::uint64_t tasks =
+            metadata.plane_count * rows * chunks_per_row;
+    const unsigned char* x_bytes = metadata.x;
+    unsigned char* y_bytes = metadata.y;
+
+    for (std::uint64_t task = IOM_GPU_GLOBAL_INDEX; task < tasks;
+         task += IOM_GPU_GLOBAL_STRIDE) {
+        const std::uint64_t chunk = task % chunks_per_row;
+        const std::uint64_t row_index = task / chunks_per_row;
+        const std::uint64_t row = row_index % rows;
+        std::uint64_t x_plane = metadata.x_offset;
+        std::uint64_t y_plane = metadata.y_offset;
+        std::uint64_t rest = row_index / rows;
+        for (std::uint32_t axis = metadata.leading_rank; axis-- > 0;) {
+            const std::uint64_t coordinate = rest % metadata.dims[axis];
+            rest /= metadata.dims[axis];
+            x_plane += coordinate * metadata.x_strides[axis];
+            y_plane += coordinate * metadata.y_strides[axis];
+        }
+
+        const std::uint64_t first_feature = chunk * TensorSpec::TILE;
+        const std::uint64_t length =
+                columns - first_feature < TensorSpec::TILE
+                ? columns - first_feature
+                : TensorSpec::TILE;
+        const std::uint64_t x_bit = plane_slot(
+                x_plane, row, first_feature, rows, columns) * bits;
+        const std::uint64_t y_bit = plane_slot(
+                y_plane, row, first_feature, rows, columns) * bits;
+        const std::uint64_t last_word =
+                (y_bit + length * bits - 1) / 32;
+
+        auto* y_words = reinterpret_cast<std::uint32_t*>(y_bytes);
+        for (std::uint64_t word = y_bit / 32; word <= last_word; ++word) {
+            const std::uint64_t word_first_bit = word * 32;
+            const std::uint64_t word_end_bit = word_first_bit + 32;
+            // Only fields overlapping this owned word are visited, and every
+            // visited field overlaps it: a field that straddles the word start
+            // still owns this word's segment, while a field that already ended
+            // before the word contributes nothing and is never merged.
+            const std::uint64_t first_index =
+                    word_first_bit > y_bit
+                    ? (word_first_bit - y_bit) / bits
+                    : 0;
+            std::uint64_t last_index =
+                    (word_end_bit - y_bit + bits - 1) / bits;
+            if (last_index > length) {
+                last_index = length;
+            }
+            std::uint32_t merged = y_words[word];
+            for (std::uint64_t index = first_index; index < last_index;
+                 ++index) {
+                const std::uint64_t field_bit = y_bit + index * bits;
+                const std::uint64_t encoded =
+                        scalar_silu_detail::scalar_silu<SiluFp64Traits>(
+                                type,
+                                silu_load_field(
+                                        x_bytes, x_bit + index * bits,
+                                        bits));
+                const std::uint64_t overlap_first =
+                        field_bit > word_first_bit
+                        ? field_bit
+                        : word_first_bit;
+                const std::uint64_t overlap_end =
+                        field_bit + bits < word_end_bit
+                        ? field_bit + bits
+                        : word_end_bit;
+                const unsigned int count = static_cast<unsigned int>(
+                        overlap_end - overlap_first);
+                const unsigned int position = static_cast<unsigned int>(
+                        overlap_first - word_first_bit);
+                const unsigned int shift = static_cast<unsigned int>(
+                        overlap_first - field_bit);
+                const std::uint32_t segment =
+                        static_cast<std::uint32_t>(encoded >> shift)
+                        & field_mask(count);
+                merged = (merged
+                          & ~(field_mask(count) << position))
+                        | (segment << position);
+            }
+            store_word(y_words + word, merged);
+        }
+    }
+}
+
+// One thread per task with a grid-stride loop; the task count is at most the
+// already validated logical element count, and the block count is capped so a
+// larger tensor simply keeps striding.
+void launch_silu_kernel(
+        cudaStream_t stream, const SiluMetadata& metadata) {
+    const std::uint64_t chunks_per_row =
+            (metadata.columns + TensorSpec::TILE - 1) / TensorSpec::TILE;
+    const std::uint64_t tasks =
+            metadata.plane_count * metadata.rows * chunks_per_row;
+    const std::uint64_t block_count =
+            tasks / kSiluThreads
+            + static_cast<std::uint64_t>(tasks % kSiluThreads != 0);
+    const unsigned int blocks = static_cast<unsigned int>(
+            block_count > kSiluMaxBlocks ? kSiluMaxBlocks : block_count);
+    IOM_LAUNCH_KERNEL(
+            silu_kernel, blocks, kSiluThreads, stream, metadata);
+}
+
+}  // namespace
+}  // namespace iom::detail
+
+#undef IOM_LAUNCH_KERNEL
+#undef IOM_GPU_GLOBAL_INDEX
+#undef IOM_GPU_GLOBAL
+#undef IOM_GPU_DEVICE
+
 namespace iom::cuda_detail {
 
 // CUDA's RMSNorm leaf delegates to the shared logical-row kernel. The queue
@@ -344,13 +595,19 @@ void launch_cache_append_native(
 }
 
 
-// The SiLU queue descriptor is present so a future CUDA wrapper can bind the
-// common producer without changing admission or completion ownership. This
-// leaf deliberately keeps the policy unported and reports Unsupported.
+// CUDA's SiLU leaf launches the device kernel above on the queue's
+// already-created nonblocking stream, using the immutable descriptor the queue
+// uploaded into its metadata slot. No stream, allocation, staging, host round
+// trip, or synchronization is added, and the shared queue's own post-launch
+// check reports the launch status. The launch fault point precedes the launch,
+// so an injected fault observes the same pre-launch error the copy family
+// already reports.
 void gpu_policy::launch_silu(
-        cudaStream_t, const detail::SiluMetadata& metadata) {
-    static_cast<void>(metadata);
-    throw detail::UnsupportedOperation();
+        cudaStream_t stream, const detail::SiluMetadata& metadata) {
+    if (consume_submission_fault(SubmissionFault::third_plane_launch)) {
+        check_cuda_kernel(silu_kernel_operation(), cudaErrorInvalidValue);
+    }
+    detail::launch_silu_kernel(stream, metadata);
 }
 
 // CUDA's RoPE leaf delegates to the shared packed-word-owned kernel.  The
