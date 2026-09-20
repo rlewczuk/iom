@@ -18,6 +18,7 @@
 #include "backend/backend_conformance_token_selection.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
+#include "backend/backend_conformance_silu.hpp"
 #include "backend/backend_conformance_rope_contract.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 
@@ -458,6 +459,27 @@ TEST_CASE("CPU conformance: RMSNorm reference, admission, and lifetime") {
             "src/cpu exposes no fault-injection seam; an accepted CPU RMSNorm "
             "request cannot be made to fail after acceptance"};
     iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+// The SiLU leaf is intentionally rejection-only in this leaf: the CPU
+// implementation port changes the explicit driver span in its follow-on
+// task. The shared suite already owns the complete oracle and admission
+// matrix, so this test proves every unported leaf remains side-effect free.
+TEST_CASE("CPU conformance: SiLU reference, admission, and lifetime") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    iom_conformance::SiluConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kNoSiluSpan,
+            &devices.gate,
+            &oracle,
+            iom_conformance::SiluNativeFailureSeam{
+                    {},
+                    {},
+                    "cpu_detail::silu",
+                    "the CPU SiLU port is not present in this leaf; "
+                    "no accepted worker failure seam exists"}};
+    iom_conformance::run_silu_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 // The CPU port covers the complete nine-leaf RoPE span. The runner owns the
