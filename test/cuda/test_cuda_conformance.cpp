@@ -199,6 +199,40 @@ public:
     }
 };
 
+// Seed one owner's whole physical storage from a logical image plus an
+// explicit padding byte through the driver's own device oracle, and return the
+// seeded image so a later observation can be compared byte for byte.
+[[nodiscard]] std::vector<std::byte> cuda_seed_silu_image(
+        CudaStorageOracle& oracle, iom::Tensor& owner, iom::TensorView& view,
+        std::span<const std::byte> logical, std::byte padding) {
+    const std::vector<std::byte> storage = iom_conformance::silu_storage_image(
+            owner.view().spec(), view, logical, padding);
+    oracle.set_owner_spec(owner.view().spec());
+    oracle.seed(view, storage);
+    return storage;
+}
+
+[[nodiscard]] std::vector<std::byte> cuda_observe_silu_image(
+        CudaStorageOracle& oracle, const iom::Tensor& owner,
+        const iom::TensorView& view) {
+    oracle.set_owner_spec(owner.view().spec());
+    return oracle.observe(view);
+}
+
+// True exactly when one observed whole-owner image is the seeded image with
+// only the view's logical bits replaced. The logical values themselves are
+// compared against the independent reference separately, through the
+// contract's ULP ceiling, so this check isolates what only this leaf can
+// decide: every padding cell and every unrelated plane cell stayed byte-exact.
+[[nodiscard]] bool cuda_silu_image_keeps_padding(
+        const std::vector<std::byte>& observed,
+        const iom::TensorSpec& owner_spec, const iom::TensorView& view,
+        std::vector<std::byte> seeded, std::span<const std::byte> logical) {
+    iom_conformance::apply_standard_tiled_view(
+            view, owner_spec, logical, seeded);
+    return observed == seeded;
+}
+
 
 }  // namespace
 TEST_CASE("Device::supported_data_types returns the per-backend 23-entry span") {
@@ -1117,16 +1151,417 @@ TEST_CASE("CUDA conformance: SiLU reference, admission, and lifetime") {
     CudaStorageOracle oracle;
     iom_conformance::SiluConformanceConfig config{
             devices.conformance(),
-            iom_conformance::kNoSiluSpan,
+            iom_conformance::kSiluCudaExpectedSupported,
             &devices.gate,
             &oracle,
             iom_conformance::SiluNativeFailureSeam{
-                    {},
-                    {},
-                    "cuda_detail::silu",
-                    "the CUDA SiLU port is not present in this leaf; "
-                    "no accepted worker failure seam exists"}};
+                    // The CUDA testing seam reaches the real SiLU path: the
+                    // shared GPU queue records the submission's completion
+                    // event on the kernel's own stream (`Policy::record_event`
+                    // in src/shared/gpu_queue_operations.inl) after the SiLU
+                    // device launch, and that record step is exactly what
+                    // `SubmissionFault::event_record` fails, so the fault is
+                    // consumed by the real submission and the accepted token
+                    // fails. The shared scenario proves consumption
+                    // behaviorally (disarmed control succeeds, armed accepted
+                    // token fails, cleared queue recovers).
+                    [] {
+                        iom::cuda_detail::inject_submission_fault_for_testing(
+                                iom::cuda_detail::SubmissionFault::event_record);
+                    },
+                    [] {
+                        iom::cuda_detail::inject_submission_fault_for_testing(
+                                iom::cuda_detail::SubmissionFault::none);
+                    },
+                    "cuda_detail::SubmissionFault::event_record",
+                    {}}};
+    // CUDA declares exactly the nine applicable signed floating leaves, so the
+    // shared suite compares the independent reference against real device
+    // results for all nine and keeps only the semantically inapplicable leaves
+    // as capability rejections.
     iom_conformance::run_silu_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// Pre-acceptance failures must not consume a sequence, mutate the output, or
+// register an owner, and the same queue must stay healthy and in order
+// afterwards. The submission-time completion-resource acquisition fault is the
+// realizable resource fault of this device path: a completed submission
+// recycles its immutable completion resources, so only the acquisition step
+// itself can fail.
+TEST_CASE("CUDA SiLU resource faults stay transactional") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    constexpr iom::DataType type = iom::DataType::BF16;
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::ordinary, type,
+                    {2}, 2, 17, "resource-fault/BF16");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    auto input = devices.candidate->create_tensor(spec);
+    auto output = devices.candidate->create_tensor(spec);
+    iom::TensorView input_view = input->view();
+    iom::TensorView output_view = output->view();
+    const std::vector<std::byte> input_logical =
+            iom_conformance::silu_pack_bits(type, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    const std::vector<std::byte> input_image = cuda_seed_silu_image(
+            oracle, *input, input_view, input_logical, std::byte{0x5A});
+    const std::vector<std::byte> output_image = cuda_seed_silu_image(
+            oracle, *output, output_view,
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel),
+            std::byte{0xA5});
+    auto queue = devices.candidate->create_ops();
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        const iom::oid accepted = queue->silu(input_view, output_view);
+        REQUIRE(iom::oid_is_token(accepted));
+        CHECK_EQ(iom_conformance::token_sequence(accepted), 1);
+        CHECK_NOTHROW(queue->wait(accepted));
+    }
+    const std::string baseline_mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(output_view), expected,
+            "resource-fault baseline");
+    CHECK_MESSAGE(baseline_mismatch.empty(), baseline_mismatch);
+    const std::vector<std::byte> baseline_logical =
+            iom_conformance::read_logical(output_view);
+
+    // Submission-time completion-resource acquisition: the real submission
+    // reports the established device error, consumes no sequence, and leaves
+    // every operand untouched. Two consecutive injected faults show the queue
+    // stays transactional across repeats.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::event_create);
+        CHECK_EQ(
+                queue->silu(input_view, output_view),
+                iom::to_oid(iom::OidError::DeviceError));
+        CHECK(
+                queue->silu_workspace_requirements(input_view, output_view)
+                == iom::WorkspaceRequirements{0, 1});
+    }
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    // No rejected submission ran, registered an owner, or consumed a sequence:
+    // the input is byte-identical to its seeded image, the output still holds
+    // exactly the accepted baseline result with its padding intact, and the
+    // next accepted submission continues the sequence at two.
+    CHECK(cuda_observe_silu_image(oracle, *input, input_view) == input_image);
+    CHECK(
+            cuda_silu_image_keeps_padding(
+                    cuda_observe_silu_image(oracle, *output, output_view),
+                    output_view.spec(), output_view, output_image,
+                    baseline_logical));
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        const iom::oid accepted = queue->silu(input_view, output_view);
+        REQUIRE(iom::oid_is_token(accepted));
+        CHECK_EQ(iom_conformance::token_sequence(accepted), 2);
+        CHECK_NOTHROW(queue->wait(accepted));
+        CHECK_NOTHROW(queue->wait(accepted));
+    }
+    const std::string recovered_mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(output_view), expected,
+            "resource-fault recovery");
+    CHECK_MESSAGE(recovered_mismatch.empty(), recovered_mismatch);
+    CHECK(
+            cuda_silu_image_keeps_padding(
+                    cuda_observe_silu_image(oracle, *output, output_view),
+                    output_view.spec(), output_view, output_image,
+                    iom_conformance::read_logical(output_view)));
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// An accepted CUDA SiLU failure keeps its positive OID, repeats the identical
+// error on every wait, and leaves the queue able to complete the same work
+// after the fault is reset. The launch fault is raised before the kernel is
+// launched, so that failure's output provably stayed byte-identical to the
+// seeded image, padding included.
+TEST_CASE("CUDA SiLU keeps accepted failures observable and recovers") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    constexpr iom::DataType type = iom::DataType::F32;
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::ordinary, type,
+                    {2}, 2, 17, "accepted-failure/F32");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    auto input = devices.candidate->create_tensor(spec);
+    auto output = devices.candidate->create_tensor(spec);
+    iom::TensorView input_view = input->view();
+    iom::TensorView output_view = output->view();
+    const std::vector<std::byte> input_logical =
+            iom_conformance::silu_pack_bits(type, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    const std::vector<std::byte> input_image = cuda_seed_silu_image(
+            oracle, *input, input_view, input_logical, std::byte{0x5A});
+    const std::vector<std::byte> output_image = cuda_seed_silu_image(
+            oracle, *output, output_view,
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel),
+            std::byte{0xA5});
+    auto queue = devices.candidate->create_ops();
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::third_plane_launch);
+    const iom::oid launch_failed = queue->silu(input_view, output_view);
+    REQUIRE(iom::oid_is_token(launch_failed));
+    CHECK_EQ(iom_conformance::token_sequence(launch_failed), 1);
+    iom_conformance::expect_repeated_runtime_failure(*queue, launch_failed);
+    // The pure query stays pure and exact while the failure is undrained.
+    CHECK(
+            queue->silu_workspace_requirements(input_view, output_view)
+            == iom::WorkspaceRequirements{0, 1});
+    CHECK(cuda_observe_silu_image(oracle, *output, output_view) == output_image);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::event_record);
+    const iom::oid record_failed = queue->silu(input_view, output_view);
+    REQUIRE(iom::oid_is_token(record_failed));
+    CHECK_EQ(iom_conformance::token_sequence(record_failed), 2);
+    iom_conformance::expect_repeated_runtime_failure(*queue, record_failed);
+    iom::cuda_detail::inject_submission_fault_for_testing(
+            iom::cuda_detail::SubmissionFault::none);
+
+    // Recovery: the same owners complete correctly once the injector is reset,
+    // and both failed tokens keep their established error.
+    iom::oid recovered = 0;
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        recovered = queue->silu(input_view, output_view);
+        REQUIRE(iom::oid_is_token(recovered));
+        CHECK_EQ(iom_conformance::token_sequence(recovered), 3);
+        CHECK_NOTHROW(queue->wait(recovered));
+        CHECK_NOTHROW(queue->wait(recovered));
+        iom_conformance::expect_repeated_runtime_failure(*queue, launch_failed);
+        iom_conformance::expect_repeated_runtime_failure(*queue, record_failed);
+    }
+    const std::string mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(output_view), expected,
+            "recovered CUDA SiLU");
+    CHECK_MESSAGE(mismatch.empty(), mismatch);
+    CHECK(
+            cuda_silu_image_keeps_padding(
+                    cuda_observe_silu_image(oracle, *output, output_view),
+                    output_view.spec(), output_view, output_image,
+                    iom_conformance::read_logical(output_view)));
+    CHECK(cuda_observe_silu_image(oracle, *input, input_view) == input_image);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// The owners and every temporary view of an accepted SiLU may be destroyed
+// immediately after submission: the queue retains the accepted operands until
+// proven completion, so a fresh allocation that would reuse a released range
+// cannot disturb the result.
+TEST_CASE("CUDA SiLU retains destroyed operands and temporary views") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    constexpr iom::DataType type = iom::DataType::F32;
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::ordinary, type,
+                    {2, 2}, 17, 17, "owner-retention/F32");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    auto input = devices.candidate->create_tensor(spec);
+    auto output = devices.candidate->create_tensor(spec);
+    iom::TensorView input_view = input->view();
+    iom::TensorView output_view = output->view();
+    const std::vector<std::byte> input_logical =
+            iom_conformance::silu_pack_bits(type, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    // Seed the input's whole storage; its image is deliberately not compared
+    // after the owner is destroyed, because no observable of a released range
+    // may be read.
+    (void)cuda_seed_silu_image(
+            oracle, *input, input_view, input_logical, std::byte{0x5A});
+    const std::vector<std::byte> output_image = cuda_seed_silu_image(
+            oracle, *output, output_view,
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel),
+            std::byte{0xA5});
+    auto queue = devices.candidate->create_ops();
+
+    iom::oid token = 0;
+    {
+        // Temporary borrowed views: both die at the end of this scope, before
+        // any wait.
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        iom::TensorView temporary_input = input->view();
+        iom::TensorView temporary_output = output->view();
+        token = queue->silu(temporary_input, temporary_output);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_EQ(iom_conformance::token_sequence(token), 1);
+    }
+    input.reset();
+    auto replacement = devices.candidate->create_tensor(spec);
+    iom::TensorView replacement_view = replacement->view();
+    // The allocator may legally hand this range back only after the accepted
+    // submission proved completion; poisoning the replacement can therefore
+    // never disturb a correct result, while an early release would corrupt it.
+    const std::vector<std::byte> replacement_image = cuda_seed_silu_image(
+            oracle, *replacement, replacement_view,
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), std::byte{0x3C}),
+            std::byte{0xC3});
+
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_NOTHROW(queue->wait(token));
+    }
+    const std::string mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(output_view), expected,
+            "retained-owner CUDA SiLU");
+    CHECK_MESSAGE(mismatch.empty(), mismatch);
+    CHECK(
+            cuda_silu_image_keeps_padding(
+                    cuda_observe_silu_image(oracle, *output, output_view),
+                    output_view.spec(), output_view, output_image,
+                    iom_conformance::read_logical(output_view)));
+    const std::vector<std::byte> replacement_image_after =
+            cuda_observe_silu_image(oracle, *replacement, replacement_view);
+    CHECK(replacement_image_after == replacement_image);
+    CHECK_FALSE(devices.gate.armed());
+
+    // The released range is reusable once the completion is proven: a fresh
+    // owner of the same shape still computes the reference result.
+    auto later = devices.candidate->create_tensor(spec);
+    iom::TensorView later_view = later->view();
+    (void)cuda_seed_silu_image(
+            oracle, *later, later_view, input_logical, std::byte{0x5A});
+    auto later_output = devices.candidate->create_tensor(spec);
+    iom::TensorView later_output_view = later_output->view();
+    (void)cuda_seed_silu_image(
+            oracle, *later_output, later_output_view,
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel),
+            std::byte{0xA5});
+    const iom::oid reused = queue->silu(later_view, later_output_view);
+    REQUIRE(iom::oid_is_token(reused));
+    CHECK_NOTHROW(queue->wait(reused));
+    const std::string reused_mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(later_output_view), expected,
+            "reused-range CUDA SiLU");
+    CHECK_MESSAGE(reused_mismatch.empty(), reused_mismatch);
+}
+
+// A double fault retires the submission with unknown completion: the token
+// keeps failing, the failing covering drain quarantines the queue lease, and a
+// fresh queue on the same device still completes the same logical work. A
+// later covering proof reclaims exactly the quarantined partition.
+TEST_CASE("CUDA SiLU unknown completion quarantines and recovers") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    constexpr iom::DataType type = iom::DataType::F32;
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::ordinary, type,
+                    {2}, 2, 17, "unknown-completion/F32");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    auto input = devices.candidate->create_tensor(spec);
+    auto output = devices.candidate->create_tensor(spec);
+    iom::TensorView input_view = input->view();
+    iom::TensorView output_view = output->view();
+    const std::vector<std::byte> input_logical =
+            iom_conformance::silu_pack_bits(type, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    (void)cuda_seed_silu_image(
+            oracle, *input, input_view, input_logical, std::byte{0x5A});
+    const std::vector<std::byte> output_image = cuda_seed_silu_image(
+            oracle, *output, output_view,
+            std::vector<std::byte>(
+                    spec.logical_nbytes(), iom_conformance::kReadbackSentinel),
+            std::byte{0xA5});
+
+    iom::cuda_detail::QueueResourceSnapshot quarantined_snapshot;
+    {
+        auto queue = devices.candidate->create_ops();
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::event_record);
+        const iom::oid unresolved = queue->silu(input_view, output_view);
+        REQUIRE(iom::oid_is_token(unresolved));
+        CHECK_EQ(iom_conformance::token_sequence(unresolved), 1);
+        iom_conformance::expect_repeated_runtime_failure(*queue, unresolved);
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::none);
+        iom::cuda_detail::queue_resource_snapshot_for_testing(
+                *queue, quarantined_snapshot);
+        // The covering drain at teardown fails as well, so the whole lease is
+        // quarantined instead of released.
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::stream_synchronize);
+        queue.reset();
+        iom::cuda_detail::inject_submission_fault_for_testing(
+                iom::cuda_detail::SubmissionFault::none);
+    }
+
+    // Three further queues fit; the quarantined lease keeps its own partition,
+    // so none of them can receive it and the fourth queue credit stays
+    // reserved while that lease is unreclaimed.
+    std::vector<std::unique_ptr<iom::DeviceOps>> live;
+    for (std::size_t index = 0; index < 3; ++index) {
+        live.push_back(devices.candidate->create_ops());
+        iom::cuda_detail::QueueResourceSnapshot snapshot;
+        iom::cuda_detail::queue_resource_snapshot_for_testing(
+                *live.back(), snapshot);
+        CHECK_NE(snapshot.device_base, quarantined_snapshot.device_base);
+    }
+    CHECK_THROWS_AS((void)devices.candidate->create_ops(), std::bad_alloc);
+
+    // Recovery: a queue created after the unknown completion still completes
+    // the same logical work against the reference, so the device itself was
+    // never poisoned.
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        const iom::oid recovered =
+                live.front()->silu(input_view, output_view);
+        REQUIRE(iom::oid_is_token(recovered));
+        CHECK_NOTHROW(live.front()->wait(recovered));
+        CHECK_NOTHROW(live.front()->wait(recovered));
+    }
+    const std::string mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(output_view), expected,
+            "unknown-completion recovery");
+    CHECK_MESSAGE(mismatch.empty(), mismatch);
+    CHECK(
+            cuda_silu_image_keeps_padding(
+                    cuda_observe_silu_image(oracle, *output, output_view),
+                    output_view.spec(), output_view, output_image,
+                    iom_conformance::read_logical(output_view)));
+
+    // One live lease is released by a safe drain, and the recreated queue
+    // receives that released partition, never the quarantined one.
+    iom::cuda_detail::QueueResourceSnapshot drained_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *live.back(), drained_snapshot);
+    live.pop_back();
+    auto recreated = devices.candidate->create_ops();
+    iom::cuda_detail::QueueResourceSnapshot recreated_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *recreated, recreated_snapshot);
+    CHECK_EQ(recreated_snapshot.device_base, drained_snapshot.device_base);
+
+    // A covering proof reclaims the quarantined lease's partition, which is
+    // then handed out again.
+    iom::cuda_detail::reclaim_retained_queue_leases_for_testing(
+            *devices.candidate);
+    auto reclaimed = devices.candidate->create_ops();
+    iom::cuda_detail::QueueResourceSnapshot reclaimed_snapshot;
+    iom::cuda_detail::queue_resource_snapshot_for_testing(
+            *reclaimed, reclaimed_snapshot);
+    CHECK_EQ(reclaimed_snapshot.device_base, quarantined_snapshot.device_base);
     CHECK_FALSE(devices.gate.armed());
 }
 

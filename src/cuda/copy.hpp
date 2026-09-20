@@ -29,9 +29,8 @@ struct RmsnormMetadata;
 // Device descriptor of the shared tiled scalar linear projection
 // (src/shared/standard_tiled_linear.inl), declared for the same reason.
 struct LinearMetadata;
-// Device descriptor of the shared SiLU queue dispatch metadata. The
-// operation is intentionally unported here; the descriptor preserves the
-// callback seam without retaining a borrowed TensorView.
+// Device descriptor of the shared SiLU queue dispatch metadata. The CUDA
+// translation unit is the only place where its definition is needed.
 struct SiluMetadata;
 // Device descriptor of the shared tiled RoPE operation
 // (src/shared/standard_tiled_rope.inl).
@@ -401,12 +400,14 @@ struct gpu_policy {
     }
 
 
-    // SiLU remains an explicit Unsupported policy stub until the independent
-    // CUDA wrapper supplies a real device launch. The common queue therefore
-    // rejects it before owner registration, sequence consumption, metadata,
-    // event, or stream effects.
+    // SiLU uses the shared packed-format device kernel of this translation
+    // unit on the queue's already-created nonblocking stream. Capability is
+    // exactly the nine applicable signed floating leaves; common admission
+    // keeps `BOOL`, the twelve integer leaves, `F8_E8M0`, and every
+    // non-`NONE` quantization format `Unsupported` before this predicate is
+    // consulted.
     [[nodiscard]] static constexpr bool silu_supported() noexcept {
-        return false;
+        return true;
     }
 
     static void launch_silu(
