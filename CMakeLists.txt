@@ -285,8 +285,14 @@ if(SYCL_ENABLED)
         src/sycl/queue_rope.cpp
         src/sycl/queue_linear.cpp
         src/sycl/queue_silu.cpp
+        src/sycl/queue_sdpa.cpp
         src/sycl/queue.cpp
         src/sycl/add.cpp
+        src/sycl/sdpa_matrix.cpp
+        src/sycl/sdpa_matrix.hpp
+        src/sycl/sdpa_nonmatrix.cpp
+        src/sycl/sdpa_nonmatrix.hpp
+        src/sycl/sdpa_stage.hpp
         src/sycl/runtime.hpp
         src/sycl/copy.hpp
         src/sycl/device_internal.hpp

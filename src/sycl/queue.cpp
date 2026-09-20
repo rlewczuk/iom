@@ -475,6 +475,7 @@ SyclQueue::SyclQueue(
           fp64_supported_(native_device.has(sycl::aspect::fp64)),
           bf16_linear_supported_(
                   bf16_linear_device_capable(native_device)),
+          sdpa_supported_(sdpa_matrix_device_capable(native_device)),
           queue_(make_queue_with_fault_check(context, native_device)),
           worker_(
                   detail::StagedWorker<Task>::Callbacks{
@@ -730,6 +731,10 @@ void SyclQueue::execute(Task& task) {
     }
     if (task.silu_request.has_value()) {
         execute_silu(task);
+        return;
+    }
+    if (task.sdpa_plan.has_value()) {
+        execute_sdpa(task);
         return;
     }
 
@@ -1010,6 +1015,15 @@ void SyclQueue::complete_task(
             (void)detail::release_or_invalidate_binary_entries(
                     state_->registry, *outcome.silu_entries, failed,
                     fence_succeeded);
+        } else if (outcome.sdpa_entries.has_value()) {
+            // SDPA registers four distinct tensor owners plus the caller
+            // workspace lease, so an unknown completion retains or quarantines
+            // the lease instead of releasing it early.
+            (void)detail::release_or_invalidate_sdpa_entries(
+                    state_->registry, *outcome.sdpa_entries, failed,
+                    fence_succeeded);
+            detail::complete_workspace_lease(
+                    *state_, outcome.workspace_lease, completion_proven);
         } else {
             (void)detail::release_or_invalidate_entries(
                     state_->registry, outcome.common, failed,

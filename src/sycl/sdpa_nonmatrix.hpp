@@ -12,6 +12,10 @@ namespace iom::sycl_detail {
 // of any optional SYCL BF16 arithmetic extension.
 using SdpaBf16 = std::uint16_t;
 
+// Bounded leading-plane tuple of the merged destination, mirroring the common
+// rank-eight tensor limit minus the two tiled matrix axes plus the head axis.
+inline constexpr std::size_t kSdpaNonmatrixMaxLeadingRank = 6;
+
 // Exact BF16 matrix-operand DAZ rule.  The helper is usable by the native PV
 // kernel without allocating or materializing a second V range.
 [[nodiscard]] inline SdpaBf16 sdpa_bf16_daz(SdpaBf16 bits) noexcept {
@@ -27,7 +31,15 @@ using SdpaBf16 = std::uint16_t;
 // ranges use logical [plane, head, row, key] coordinates (their row/key
 // pitches may include the fixed Rp/Lp padding); PV and head staging use
 // [plane, head, row, feature] coordinates; V uses [plane, kv-head, key,
-// feature]; merged output uses [plane, row, head, feature].
+// feature].
+//
+// The merged destination is the caller's standard 16x16 tiled output plane for
+// logical (row, head * head_dim + feature) coordinates, exactly as the CPU and
+// CUDA ports write it.  A tiled plane is not expressible with affine row/head/
+// feature strides, so `merged_plane_offset` and `merged_leading_strides`
+// address only the independently transformed leading planes (element slots from
+// `merged_bf16`); the row/column slot inside a plane is derived from `rows`,
+// `query_heads`, and `head_dim` with the standard tiled formula.
 struct SdpaNonmatrixRequest final {
     float* scores = nullptr;
     SdpaBf16* p_bf16 = nullptr;
@@ -85,10 +97,13 @@ struct SdpaNonmatrixRequest final {
     std::size_t head_row_stride = 0;
     std::size_t head_feature_stride = 0;
 
-    std::size_t merged_plane_stride = 0;
-    std::size_t merged_row_stride = 0;
-    std::size_t merged_head_stride = 0;
-    std::size_t merged_feature_stride = 0;
+    // Independent transformed leading-plane map of the merged destination.
+    // `merged_plane_offset` is an element-slot offset from `merged_bf16`; each
+    // leading stride is the element-slot distance between neighbouring planes
+    // along that axis.  Zero rank is the single-plane case.
+    std::size_t merged_leading_rank = 0;
+    std::size_t merged_leading_dimensions[kSdpaNonmatrixMaxLeadingRank]{};
+    std::size_t merged_leading_strides[kSdpaNonmatrixMaxLeadingRank]{};
 };
 
 // Host-side representation and range checks shared by every stage entry.  It
@@ -113,8 +128,9 @@ void validate_sdpa_nonmatrix_request(
 
 
 // Convert FP32 PV into BF16 head staging once, then merge the logical head
-// coordinates into [plane,row,head,feature] output with canonical +0 stores.
-// No padded row/feature or excluded output cell is read or written.
+// coordinates into the caller's standard 16x16 tiled [.., rows, Hq*D] output
+// at `out[b, row, head*head_dim + feature]` with canonical +0 stores.  No
+// padded row/feature or excluded output cell is read or written.
 [[nodiscard]] sycl::event launch_sdpa_merge_output(
         sycl::queue& queue, const SdpaNonmatrixRequest& request);
 [[nodiscard]] sycl::event launch_sdpa_merge_output(

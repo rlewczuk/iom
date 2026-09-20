@@ -20,6 +20,14 @@ enum class SubmissionFault {
     outcome_insertion,
     first_submit,
     post_launch,
+    // Consumed by the SDPA task only after all four joined device stages have
+    // been successfully enqueued on the in-order queue. Every stage is then
+    // submitted, so native completion stays proven while the injected failure
+    // is retained for every later wait and the caller workspace lease is
+    // released after that proof. A real enqueue exception keeps the
+    // conservative unknown-completion path that quarantines owners and the
+    // workspace.
+    sdpa_post_acceptance_failure,
     queue_stream_create,
 };
 

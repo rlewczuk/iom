@@ -13,6 +13,7 @@
 #include "device_internal.hpp"
 #include "queue_support.hpp"
 #include "scalar_add.hpp"
+#include "sdpa_stage.hpp"
 
 namespace iom::sycl_detail {
 
@@ -70,6 +71,13 @@ class SyclQueue final : public DeviceOps {
         // consumes no `RawWorkspace`, so no workspace lease is carried.
         std::optional<SiLURequest> silu_request;
         detail::BinaryEntryRegistration silu_entries;
+        // Immutable lowered SDPA stage plan built before sequence consumption,
+        // plus the four-owner registration and the caller workspace lease that
+        // must survive through proven completion. Both are carried by value:
+        // the plan holds only device addresses and checked geometry.
+        std::optional<SdpaStagePlan> sdpa_plan;
+        detail::SdpaEntryRegistration sdpa_entries;
+        detail::WorkspaceLease sdpa_lease;
     };
 
     struct SyclSequenceOutcome {
@@ -90,6 +98,10 @@ class SyclQueue final : public DeviceOps {
         // entries. Trailing so every existing aggregate initialization keeps
         // its own field order.
         std::optional<detail::BinaryEntryRegistration> silu_entries;
+        // SDPA registers four distinct tensor owners plus the caller workspace
+        // lease through terminal completion. Trailing so every existing
+        // aggregate initialization keeps its own field order.
+        std::optional<detail::SdpaEntryRegistration> sdpa_entries;
     };
 
 public:
@@ -184,6 +196,27 @@ public:
     // and the retained completion event is returned with a positive OID.
     oid silu_impl(const SiLURequest& request) override;
 
+    /**
+     * Pure capability decision and conservative alignment-32 workspace
+     * requirement of the implemented SDPA leaf set: the common facade has
+     * already accepted only the current BF16 leaf, so the remaining capability
+     * is the immutable device fact this queue was constructed with — the
+     * queried subgroup-16 BF16/BF16/FP32 `joint_matrix` facility the native QK
+     * and PV stages queue. The reported requirement is the checked layout of
+     * four distinct 32-byte-aligned scratch segments (FP32 scores, BF16
+     * probabilities, FP32 PV, BF16 head staging). No allocation,
+     * registration, lease, sequence, submission, or operand access occurs.
+     */
+    [[nodiscard]] WorkspaceRequirements sdpa_workspace_requirements_impl(
+            const SdpaRequest& request) override;
+
+    // Registered in-order submission of one admitted SDPA request: the complete
+    // lowered stage plan is built and validated before the submission sequence,
+    // the four tensor owners and the caller workspace lease are registered
+    // transactionally, and the retained final-stage event is returned with a
+    // positive OID.
+    oid sdpa_impl(const SdpaRequest& request) override;
+
     // Pure `{32, 32}` workspace requirement the SYCL gather reports: the
     // caller-supplied range owns one uint32 status word plus reserved
     // padding. Common validation precedes this hook so capability-stage
@@ -204,6 +237,7 @@ private:
     void execute_linear(Task& task);
     void execute_rope(Task& task);
     void execute_silu(Task& task);
+    void execute_sdpa(Task& task);
     // Immutable descriptor-representation admission of the SYCL SiLU
     // specialization, defined beside its kernels in `queue_silu.cpp`: it
     // builds the rank-bounded leading-plane descriptor with checked plane,
@@ -261,6 +295,12 @@ private:
     // bounded sample, and gates both the pure requirement query and the
     // submission before any queue effect.
     const bool bf16_linear_supported_ = false;
+    // Immutable capability of the same exact device for the native SDPA
+    // stages. It is the same queried subgroup-16 BF16/BF16/FP32 family the
+    // native `BF16` linear specialization proves, computed once at construction
+    // and never re-read per submission, and it gates both the pure requirement
+    // query and the submission before any queue effect.
+    const bool sdpa_supported_ = false;
     sycl::queue queue_;
     std::mutex submission_order_mutex_;
     std::mutex outcome_mutex_;
