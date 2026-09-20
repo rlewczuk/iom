@@ -39,20 +39,13 @@ logical tensor metadata, view transformations, queue-token encoding, and
 wait/failure bookkeeping. Do not duplicate common validation or create a
 backend-specific version of `TensorView`.
 
-### Choose the storage model first
+### Standard tiled storage
 
-There are two valid implementation paths.
-
-| Path | Use when | Required result |
-| --- | --- | --- |
-| **Standard tiled** | The backend can store the common 16x16 encoding directly. | Allocate `TensorSpec::tiled_storage_nbytes()`, report the immutable 23-type standard capability table in its exact order, and preserve every standard physical tile and padding byte. CPU, CUDA, ROCm, and SYCL follow this path. |
-| **Native storage** | The runtime requires a different physical tile, plane, or allocation model. | Keep the public logical shape, view, transfer, copy, ownership, and queue contract unchanged; advertise only supported types; translate host logical bytes and view plane mappings correctly; supply a native test oracle that observes the canonical standard padded allocation. TTNN follows this path. |
-
-A native path is not permission to change public tensor semantics. In
-particular, final tensor dimensions are still the public 16x16-tiled matrix
-contract even when a vendor resource uses a larger physical tile. Internal
-native-only padding MUST be initialized/treated so it cannot contaminate
-logical results or a later valid transfer.
+The retained CPU, CUDA, ROCm, and SYCL backends use the common 16x16
+encoding directly. Each backend MUST allocate
+`TensorSpec::tiled_storage_nbytes()`, report the immutable 23-type standard
+capability table in its exact order, and preserve every standard physical tile
+and padding byte.
 
 ### Recommended implementation order
 
@@ -66,8 +59,7 @@ logical results or a later valid transfer.
    reject invalid ordinals before creating a usable device, and make that
    context/device identity stable for the `Device` lifetime. Borrowed
    allocator and `Device` lifetimes must outlast all tensors and queues they
-   create. TTNN-style backends that own native storage may omit the allocator
-   only when their factory documents that ownership model.
+   create.
 3. **Implement capabilities and tensor creation.** Return an immutable,
    nonempty span from `supported_data_types()`. Validate `TensorSpec` and
    reject any unadvertised type before native allocation. Allocate one stable
@@ -103,7 +95,7 @@ logical results or a later valid transfer.
 ### Minimal conformance-driver shape
 
 The shared harness is backend-neutral. A backend driver SHOULD mirror the CPU,
-CUDA, ROCm, SYCL, or TTNN driver structure:
+CUDA, ROCm, or SYCL driver structure:
 
 ```cpp
 struct BackendDevices {
@@ -171,6 +163,12 @@ Before considering a backend complete, confirm all of the following:
    means rank at least two, nonzero dimensions, checked size arithmetic, a
    declared leaf type, and `QuantizationFormat::NONE`; every other declared
    quantization format is invalid.
+
+The public `QuantizationFormat::TT_BFP2`, `TT_BFP2A`, `TT_BFP4`,
+`TT_BFP4A`, `TT_BFP8`, and `TT_BFP8A` enumerators remain stable public names.
+The retained backends reject each recognized format as `Unsupported` after
+structural validation; this contract does not rename, remove, renumber, or
+reinterpret those values.
 7. `create_ops` MUST return an independent queue associated with that exact
    device. A queue created by one device MUST reject foreign views.
 8. A backend factory MUST leave no partially usable device/context behind when
@@ -338,10 +336,10 @@ transfer query before submission. A missing, undersized, misaligned, stale,
 foreign, overlapping, or already-leased range is invalid or resource
 exhausted as specified by the public facade; the caller retains ownership
 through proven completion. CPU retains borrowed host/reference storage
-without a device metadata arena or fabricated native slots. TTNN retains
-native per-plane tensor ownership and host-only scratch; it MUST NOT claim the
-standard-GPU two-backing guarantee, and vendor-internal runtime allocation is
-unproven where it cannot be observed.
+without a device metadata arena or fabricated native slots. Retained
+accelerator backends report vendor-internal runtime allocation separately from
+IOM evidence whenever the runtime does not expose a comparable observation
+boundary.
 
 The four-live-queue cap and quota are local to the exact `Device`; there is no
 global ordinal cap, active-backend registry, or queue selector. Two-/eight-GPU
@@ -422,13 +420,10 @@ submission, mutation, or token acceptance. The `linear` hooks are owned by
 all twenty-one applicable leaves — the twenty non-BF16 leaves on the shared
 scalar projection path plus `BF16` on the scalar recurrence on CPU and on a
 separate native specialization on CUDA, ROCm, and SYCL, whose availability is a
-runtime device and loaded-image fact — while TTNN implements the mandatory
-`BF16` leaf alone on its direct Metalium route and explicitly rejects the other
-twenty applicable leaves after structural validation. A backend without its own
-linear port keeps reporting `Unsupported`. CUDA and ROCm provide
-source-inspected RMSNorm launch wrappers over the shared core, SYCL provides
-its native row kernel with the `aspect::fp64` guard, and TTNN provides its
-preallocated BF16/F32 queue path. The all-five RMSNorm closure evidence and
+runtime device and loaded-image fact. A backend without its own linear port
+keeps reporting `Unsupported`. CUDA and ROCm provide source-inspected RMSNorm
+launch wrappers over the shared core, and SYCL provides its native row kernel
+with the `aspect::fp64` guard. The four-backend RMSNorm closure evidence and
 supported/limited matrix are recorded in [RMS normalization](#rms-normalization).
 
 #### TinyLlama forward layout — Embedding and projection boundaries
@@ -437,8 +432,9 @@ This subsection freezes the backend-neutral boundaries and records the
 implemented embedding ports. The embedding methods below are declared and
 admitted by the current neural facade: common structural, device, view, shape,
 alias, checked-arithmetic validation, and the pure requirement query are
-implemented, while CPU, CUDA, and ROCm provide their operation hooks. SYCL and
-TTNN remain explicitly capability-gated according to their own port state.
+implemented, while CPU, CUDA, ROCm, and SYCL provide their operation hooks.
+Each retained backend remains explicitly capability-gated according to its own
+port state.
 The normative `linear` surface is exactly the frozen `LinearOutputLayout` form
 below, owned by [Linear projections](#linear-projections): there is no second
 `linear` declaration, and the earlier three-view `linear(x, w, y)` facade is
@@ -587,11 +583,11 @@ the workspace lease through proven completion; it never retains borrowed
 Every result is stored in the caller-provided output leaf. Embedding preserves
 payload bits; each distinct projection result is rounded and stored at the
 operation boundary according to [Linear projections](#linear-projections).
-BF16 is mandatory for CPU, CUDA, ROCm, SYCL, and TTNN when those ports are
+BF16 is mandatory for CPU, CUDA, ROCm, and SYCL when those ports are
 implemented. The operation-owned sections classify datatype leaves, special
 values, numerical references, tolerances, fixture provenance, and backend
-feasibility. Delivery order is contract/reference/all-five feasibility, then
-CPU, CUDA, ROCm, SYCL, and TTNN, closing the five-backend gate before the next
+feasibility. Delivery order is contract/reference/four-backend feasibility,
+then CPU, CUDA, ROCm, and SYCL, closing the four-backend gate before the next
 operation. This planned boundary makes no kernel, profiler, or native-backend
 conformance claim.
 
@@ -659,17 +655,15 @@ Semantic applicability is independent of native storage or arithmetic
 capability. For cache append, all 23 leaves are opaque storage payloads; a
 backend capability row may reject a recognized leaf only after the common
 structural and arithmetic admission checks. The 23 stored leaves on the
-standard CPU, CUDA, ROCm, and SYCL paths, and TTNN's 22 stored leaves
-excluding `F8_E8M0` plus its encoded-carrier limits, are capability evidence
-rather than permission to narrow this common classification.
-Each operation contract MUST enumerate a backend implementation or a justified
-limitation for every applicable dtype. BF16 weights, activations, and caches
-are mandatory for TinyLlama on all five backends: CPU, CUDA, ROCm, SYCL, and
-TTNN. Integer linear accumulation, overflow behavior, and any conversion
-before a kernel belong to the [Linear projections](#linear-projections)
-contract; this table does not infer integer normalization or silently mean
-“all floats.” Only `QuantizationFormat::NONE` is applicable; every other
-quantization format is rejected. For cache append, only
+standard CPU, CUDA, ROCm, and SYCL paths are capability evidence rather than
+permission to narrow this common classification. Each operation contract MUST
+enumerate a backend implementation or a justified limitation for every
+applicable dtype. BF16 weights, activations, and caches are mandatory for
+TinyLlama on CPU, CUDA, ROCm, and SYCL. Integer linear accumulation, overflow
+behavior, and any conversion before a kernel belong to the [Linear
+projections](#linear-projections) contract; this table does not infer integer
+normalization or silently mean “all floats.” Only `QuantizationFormat::NONE` is
+applicable; every other quantization format is rejected. For cache append, only
 `QuantizationFormat::NONE` is applicable to opaque payload storage.
 ##### SiLU-specific semantic, scalar, and numerical policy
 
@@ -799,7 +793,7 @@ Future shared coverage MUST exercise logical `R=1,15,16,17`, non-tile feature
 sizes, rank and planes, independent logical/tiled encodings, padding and tail
 perturbations, causal future-token exclusion, cached/full equivalence, exact
 capacity, and accepted/rejected failures. Exact token goldens are appropriate
-only when the independent reference states its margin. All-five gates and
+only when the independent reference states its margin. Four-backend gates and
 existing supported-operation coverage remain required. Unsupported neural
 probes migrate only when a backend is actually ported and do not constitute
 numerical conformance.
@@ -924,22 +918,22 @@ The detailed datatype applicability, special-value behavior, references,
 tolerances, fixture provenance, snapshots/hooks, kernels, and evidenced
 backend limitations remain solely owned by the
 [RMS normalization](#rms-normalization) and planned **SiLU** operation
-sections. RMSNorm's five backend ports are closed by the focused conformance
-targets named in its section; SiLU remains a planned operation and continues
-to return negative `Unsupported` before submission, mutation, or token
-acceptance. This plan subsection declares no additional ABI.
+sections. RMSNorm's four retained-backend ports are closed by the focused
+conformance targets named in its section; SiLU remains a planned operation and
+continues to return negative `Unsupported` before submission, mutation, or
+token acceptance. This plan subsection declares no additional ABI.
 
 Delivery is operation-first, not mathematical-forward order: embedding,
 linear, RMSNorm, RoPE, cache append, SiLU, and finally SDPA. For each operation,
-finish its contract, independent reference, and all-five feasibility record,
-then close CPU, CUDA, ROCm, SYCL, and TTNN in that order before starting the
-next operation. The CPU baseline is scalar/wide arithmetic over existing tiled
-storage, not native-accelerator evidence. CUDA/ROCm/SYCL/TTNN native BF16
-matrix feasibility for linear and SDPA prefill and logical `R=1` MUST be
-evidenced before those implementations; host computation, round trips,
-elementwise substitutes, and padded extra logical tokens do not count.
-Unavailable ports remain reported as unsupported and do not count as
-numerical conformance. Future all-five conformance covers success, runs
+finish its contract, independent reference, and four-backend feasibility record,
+then close CPU, CUDA, ROCm, and SYCL in that order before starting the next
+operation. The CPU baseline is scalar/wide arithmetic over existing tiled
+storage, not native-accelerator evidence. CUDA/ROCm/SYCL native BF16 matrix
+feasibility for linear and SDPA prefill and logical `R=1` MUST be evidenced
+before those implementations; host computation, round trips, elementwise
+substitutes, and padded extra logical tokens do not count.
+Unavailable ports remain reported as unsupported and do not count as numerical
+conformance. Future four-backend conformance covers success, runs
 `1/15/16/17`, non-tile features, independent planes, padding isolation,
 rejections, and repeatable accepted failures. Only after SDPA closes may the
 session assemble and verify the complete layer from these boundaries.
@@ -1089,7 +1083,6 @@ common leaf:
 | CUDA | all nine ordinary signed floating leaves | the fourteen inapplicable leaves |
 | ROCm | all nine ordinary signed floating leaves | the fourteen inapplicable leaves |
 | SYCL | the eight non-F64 applicable leaves | `F64` and the fourteen inapplicable leaves |
-| TTNN | `BF16` and `F32` | the other seven applicable leaves and the fourteen inapplicable leaves |
 
 Backend branches consume only their own frozen producer outputs and add no
 common backend-kind switch or capability registry. Every later port preserves
@@ -1173,10 +1166,9 @@ through transformed views, intersecting backing ranges, or identical native
 handles. Read/read overlap elsewhere is harmless when all shape rules hold.
 No operand, output, or temporary tensor may be allocated, relocated, silently
 converted, or moved through hidden or unaccounted host staging. Standard tiled
-paths write directly; the explicit caller-owned TTNN padded-plane workspace
-described below is the accounted transfer path.
+paths write directly and require no hidden or unaccounted staging.
 
-##### Cache append five-backend feasibility
+##### Cache append feasibility
 
 The following concise table records implementation feasibility, not current
 runtime support. A port MUST advertise only the leaves it has implemented and
@@ -1185,7 +1177,6 @@ MUST return `Unsupported` for a recognized but unported capability.
 | Backend path | Storage leaves | Query workspace and required route |
 | --- | --- | --- |
 | CPU / CUDA / ROCm / SYCL (standard tiled) | support all 23 storage leaves | zero workspace (`{0, 1}`); direct existing tiled writes through the 16x16 mapping |
-| TTNN (native) | store 22 leaves, excluding `F8_E8M0` | positive, explicit caller-owned host workspace containing one complete padded source-plane image plus one complete padded destination-plane image reused serially; deferred native padded-byte download/patch/upload using the existing 32x32 tile/four-face mapping |
 
 The SYCL standard-tiled path uses the exact-device in-order queue and one
 native `parallel_for` over destination words after the fixed immutable
@@ -1204,22 +1195,12 @@ compiler and device properties are checked facts; hardware/runtime behavior is
 claimed only from the configured `csw-remote` ROCm build and conformance
 evidence, not inferred from this capability statement.
 
-BF16 is mandatory on all five backends, and `QuantizationFormat::NONE` is the
-only applicable quantization format. No route may zero storage, convert or
-re-encode payloads, allocate hidden workspace, or use native partial-row or
-partial-matrix evidence in place of the complete logical mapping. TTNN
-workspace synchronization MUST be proven before its lease is released.
-
-For cache append, the explicit positive caller-owned TTNN padded-plane
-workspace above is the accounted staging route. The pre-existing TTNN
-capability note that describes partial native32 updates as requiring
-preservation “without host staging” is superseded for this operation by that
-route; it remains a blocked pre-port observation and MUST NOT be read as
-forbidding the queried workspace. Hidden or unaccounted staging remains
-forbidden.
-TTNN also keeps an internal `padded_logical_copy` helper that is purely
-byte-preserving and does not change `cache_append` semantics or add a public
-copy overload or generic staging facility.
+BF16 is mandatory on CPU, CUDA, ROCm, and SYCL, and `QuantizationFormat::NONE`
+is the only applicable quantization format. No route may zero storage, convert
+or re-encode payloads, allocate hidden workspace, or use native partial-row or
+partial-matrix evidence in place of the complete logical mapping. Workspace
+synchronization MUST be proven before its lease is released. Hidden or
+unaccounted staging remains forbidden.
 
 ##### CUDA cache-row append implementation boundary
 CUDA's cache-row append leaf is implemented in `src/cuda/copy.cu` through the
@@ -1258,8 +1239,7 @@ exact device, the query's exact required size and alignment, overlap,
 freshness, and lease availability. The pure query itself does not inspect the
 supplied workspace or mutate queue state. No operand, output, or temporary
 tensor may be allocated, relocated, or silently converted, and cache append
-introduces no hidden or unaccounted host round trip; the explicit caller-owned
-TTNN padded-plane workspace above is the sole accounted host transfer.
+introduces no hidden or unaccounted host round trip.
 
 ##### Cache append admission, errors, and snapshots
 
@@ -1290,14 +1270,14 @@ proven completion, but never retains borrowed `TensorView` objects beyond
 submission.
 
 ##### Cache append delivery and coverage
-Future delivery order is contract, independent reference, and all-five
-feasibility, followed by CPU, CUDA, ROCm, SYCL, and TTNN closure for RoPE;
-only then does cache append follow the same sequence. Each operation's
-five-backend gate MUST close before the next operation begins. CPU feasibility
-is scalar or wide arithmetic over existing tiled storage; the table above
-makes no current support, native accelerator, or profiler claim. The
-operation-specific cache-row append implementation leaves own detailed
-capability, numerical, snapshot/hook, and native evidence.
+Future delivery order is contract, independent reference, and four-backend
+feasibility, followed by CPU, CUDA, ROCm, and SYCL closure for RoPE; only then
+does cache append follow the same sequence. Each operation's four-backend gate
+MUST close before the next operation begins. CPU feasibility is scalar or wide
+arithmetic over existing tiled storage; the table above makes no current
+support, native accelerator, or profiler claim. The operation-specific
+cache-row append implementation owns detailed capability, numerical,
+snapshot/hook, and native evidence.
 
 Its shared regression coverage MUST extend the existing byte-level
 copy/storage suite and independent physical oracle for applicable payload
@@ -1347,9 +1327,8 @@ out[b,r,h*D+d]
 ```
 
 for `0<=r<R`, `0<=h<Hq`, and `0<=d<D`. Logical elements use the shared
-16x16 tiled mapping and independent leading-plane mappings; a backend-native
-physical representation, including TTNN native32 preservation, must preserve
-these logical coordinates and tail rules.
+16x16 tiled mapping and independent leading-plane mappings; every backend
+physical representation must preserve these logical coordinates and tail rules.
 
 The scalar range contract is `0<L<=C`, `a<C`, and `R<=C-a`; implementations
 must perform the last check by subtraction rather than by first forming
@@ -1435,11 +1414,11 @@ observable on every repeated wait, while a pre-submit failure changes no
 output and consumes no token. Submission snapshots metadata and never retains
 a borrowed `TensorView` beyond the call.
 
-Delivery order is contract and independent reference, all-five native
-feasibility, then CPU, CUDA, ROCm, SYCL, and TTNN closure; SDPA is final among
-the seven missing TinyLlama operations. The shared CPU scalar/wide baseline
-over existing tiled storage is correctness coverage, not an accelerator
-claim. Native evidence must cover both QK and PV for prefill and logical
+Delivery order is contract and independent reference, four-backend native
+feasibility, then CPU, CUDA, ROCm, and SYCL closure; SDPA is final among the
+seven missing TinyLlama operations. The shared CPU scalar/wide baseline over
+existing tiled storage is correctness coverage, not an accelerator claim.
+Native evidence must cover both QK and PV for prefill and logical
 `run=1`, not merely one GEMM, and excludes host computation or round trips,
 elementwise substitutes, and padded extra logical tokens. Unsupported
 hardware must be reported, and this design subsection makes no native kernel
@@ -1451,7 +1430,7 @@ cached decode, generic shorter initialized prefixes, every applicable
 dtype/backend combination, wrong rank/empty-key/shape/GQA ratio, alias,
 device, workspace, range and overflow rejection, and accepted-failure
 repeated waits. An unsupported port is not numerical conformance. Only after
-the all-five SDPA gate closes may the session component claim complete
+the four-backend SDPA gate closes may the session component claim complete
 decoder-layer assembly and verification.
 #### TinyLlama forward layout — Workspace and execution
 
@@ -1574,15 +1553,10 @@ The caller owns every output and all scratch. Nonzero scratch MUST be a live
 bytes, the queried alignment, and no overlap with any operand or output.
 Workspace subrange offsets are checked and 32-byte aligned, and owner
 subranges are at least 32-byte aligned. An empty workspace is valid exactly
-when the query reports zero bytes. CPU still rejects creation of a positive
-`RawWorkspace`; TTNN creation of a positive `RawWorkspace` now owns one
-replicated DRAM native page whose page size is the checked request rounded up
-to 32 bytes while `byte_size()` stays exactly the caller-requested logical
-bytes, and its native allocation is released only after proven completion.
-The first operation that actually requires positive scratch on a backend owns
-the minimal factory support and conformance tests. A capability-blocked
-backend MUST name the missing evidence instead of inventing a byte
-requirement.
+when the query reports zero bytes. A backend that requires positive scratch owns
+the minimal factory support and conformance tests for that requirement.
+A capability-blocked backend MUST name the missing evidence instead of
+inventing a byte requirement.
 
 The reusable session scratch capacity is the maximum of the actual
 prefill/decode operation and host-transfer requirements, not the sum of
@@ -1831,7 +1805,7 @@ requirements.
 This subsection is the normative bounded-storage plan for the planned
 single-sequence session. It does not add a model, session, loader, selector,
 facade, kernel, or current support claim. The existing neural hooks remain
-`Unsupported`; the operation-owning sections and all-five gates above remain
+`Unsupported`; the operation-owning sections and four-backend gates above remain
 authoritative.
 
 ##### Parameters and two-stage setup
@@ -1907,30 +1881,12 @@ elements in a 16x16 tile. A checked ceiling division must not first perform an
 unchecked `extent+tile-1`. Standard storage is the result of the existing
 `TensorSpec::tiled_storage_nbytes()` contract, not its logical byte count.
 
-TTNN does not use the standard formula. Its assessment requires one native
-32x32 allocation per leading plane, checked native extents and `uint32_t`
-conversions, and an evidenced carrier/runtime allocation size:
-
-```text
-per_cache_native32_bytes =
-    Hkv * ceil(C / 32) * ceil(D / 32) * 1024 * carrier_bytes.
-```
-
-That expression is an assessment form, not a fabricated TTNN allocation
-promise. If the backend reports another carrier representation or owns an
-opaque allocation size, the reported value is used. Unknown exact native
-allocation remains a capability-evidence gap.
-
 For the independent checked case
 `Nlayers=2,F=8,M=12,Hq=4,Hkv=2,D=2,V=19,C=17`, `F=Hq*D`.
-Logical K+V storage is `2*2*2*17*2*2 = 544` bytes. A standard cache is
-`2*ceil(17/16)*ceil(2/16)*256*2 = 2048` bytes, so both caches in both
-layers require `2*2*2048 = 8192` bytes. A native32 assessment is
-`2*ceil(17/32)*ceil(2/32)*1024*carrier_bytes`; with a confirmed two-byte
-BF16 carrier this illustration is `4096` bytes per cache and `16384` bytes
-total. Another measured carrier or runtime-owned size replaces that
-illustration; native extents, plane counts, byte products, and conversions
-remain checked.
+Logical K+V storage is `2*2*2*17*2*2 = 544` bytes. Standard storage is
+`2*ceil(17/16)*ceil(2/16)*256*2 = 2048` bytes per cache, so both caches in
+both layers require `2*2*2048 = 8192` bytes. Native storage is not part of
+this standard sizing contract.
 
 `F=8` and `M=12` deliberately exercise non-tile final axes. Exact BF16
 activation accounting is:
@@ -2036,14 +1992,10 @@ queries:
 | CUDA | Direct linear may query zero global scratch because its assessed route uses fixed kernel-local tiles. SDPA's assessed caller range contains checked, 32-byte-aligned FP32 score and BF16 probability segments. |
 | ROCm | The conservative assessed linear range contains checked aligned `x_pack` and `y_pack`. Its SDPA range contains `q_pack`, sequentially reused per-`Hkv` K/V pack, FP32 scores, BF16 probabilities, BF16 PV, and merged staging. |
 | SYCL | The assessed linear range contains checked FP32 product staging. Its conservative SDPA range contains FP32 scores, BF16 probabilities, FP32 PV, and BF16 head staging, with reuse only after the producing stage completes. |
-| TTNN | Native32 score and probability storage is a minimum SDPA need; optional packs/PV storage depend on the selected Metalium path. The assessed buffer route may require 4096-byte alignment. The TTNN factory/range path now exists (one owning replicated DRAM native page per positive request); the exact positive SDPA requirement itself remains unassessed, and neither hidden TTNN tensors nor guessed bytes are allowed. |
-
 Standard CUDA/ROCm/SYCL tensor data and raw workspace subranges retain the
-existing 32-byte arena guarantees. TTNN uses its assessed native32 allocation
-and checked `uint32` limits, never the standard tensor byte formula. CPU
-continues to reject positive `create_workspace` requests; TTNN now owns real
-positive scratch, so an operation that needs it names its own queried
-requirement instead of inheriting a missing backend-private factory gap.
+existing 32-byte arena guarantees. CPU continues to reject positive
+`create_workspace` requests; a backend that needs positive scratch names its
+own queried requirement instead of inheriting a missing factory gap.
 Unknown capability-dependent requirements are recorded as missing evidence,
 not filled with a speculative constant.
 
@@ -2106,270 +2058,9 @@ disabled. The correctness waits above remain mandatory with or without
 attribution.
 
 Complete mathematical layer assembly remains gated until SDPA closes its
-all-five backend gate. Incremental model/session/selector integration is owned
+four-backend gate. Incremental model/session/selector integration is owned
 by its later siblings, not by this documentation plan.
 
-#### TinyLlama forward layout — TTNN matrix feasibility
-
-This is a bounded feasibility record for the planned BF16 TinyLlama
-operations, not a declaration of current support. TTNN still returns
-`Unsupported` for the neural facades before accepting an OID, and no result
-below is production conformance or profiler evidence. In particular, the
-host-computed implementation in `src/ttnn/binary.cpp` and the existing smoke,
-native-storage, copy, and unsupported-capability tests are not matrix
-evidence.
-
-##### Evidence and installed target
-
-The assessment used the configured `ttnn` host and the isolated remote
-workspace `forward-layout-ttnn-feasibility`. Installed facts, source facts,
-documented capability, and runtime evidence are deliberately separated:
-
-- **Installed package and source.** `TT_METAL_HOME` was
-  `/home/rlew/tt/src/tt-metal`. A clean `main` checkout reported commit
-  `06994d4afdaa61e89753d73a59d7fd241187f37b`, description
-  `v0.76.0-dev20260801-268-g06994d4afda`, and the generated TT-NN and Metalium
-  CMake package-version files both report `0.76.0`. The source's own configured
-  version is `0.76.0-dev20260801+268.06994d4afd`. IOM already requires
-  `find_package(tt-nn CONFIG REQUIRED)` and privately links
-  `TT::Metalium` and `TTNN::TTNN`; it has no TTNN version bound.
-- **Installed device and storage.** A standalone inventory program, compiled
-  against those two imported targets and then removed, observed one initialized
-  Blackhole device: device 0, one hardware command queue, eight DRAM channels,
-  1,572,864 bytes L1 per core, 4,278,190,080 bytes per DRAM channel, a
-  1,350 MHz clock, physical grid `17x12`, logical grid `12x10`,
-  compute/storage grid `11x10`, and DRAM grid `8x1`. The runtime logged firmware
-  bundle `19.13.1`, KMD `2.8.0`, and IOMMU disabled. This proves installed
-  runtime availability and device identity, not a matrix result.
-- **IOM source-declared storage.** `src/ttnn/device.cpp` creates one TILE-layout
-  `ttnn::Tensor` per logical leading plane. BF16 is native
-  `DataType::BFLOAT16`; rows and columns are physically rounded to 32 and each
-  plane is capped at 1 GiB. `src/ttnn/copy.cpp` identifies the physical order
-  as row-major 32x32 tiles, each tile containing four row-major 16x16 faces.
-  `src/ttnn/device_types.cpp` checks each native extent against `uint32_t`.
-  These facts establish native32 storage only.
-- **Installed high-level API.** At the installed commit,
-  [`matmul.hpp`](https://github.com/tenstorrent/tt-metal/blob/06994d4afdaa61e89753d73a59d7fd241187f37b/ttnn/cpp/ttnn/operations/matmul/matmul.hpp)
-  declares BF16-capable `ttnn::matmul`/`linear`, transpose flags, compute
-  configuration, and an `optional_output_tensor`.
-  [`matmul_device_operation.cpp`](https://github.com/tenstorrent/tt-metal/blob/06994d4afdaa61e89753d73a59d7fd241187f37b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp)
-  requires allocated, same-device, tiled floating inputs; a 32-wide inner tile;
-  matching logical and padded K; and positive M/K/N. Its optional-output path
-  requires exact computed logical shape, selected dtype, and memory
-  configuration, and reuses that tensor; the absent-output path calls
-  `create_device_tensor`.
-- **High-level rejection and allocation cases.**
-  [`matmul.cpp`](https://github.com/tenstorrent/tt-metal/blob/06994d4afdaa61e89753d73a59d7fd241187f37b/ttnn/cpp/ttnn/operations/matmul/matmul.cpp)
-  rejects optional-output volume mismatch. `matmul_batched_weights` rejects
-  both transpose flags, activation, output-tile selection, and every optional
-  output, so it cannot satisfy caller-owned projection or QK/PV output.
-  Depending on its chosen program, ordinary `matmul` may call allocating
-  transpose wrappers; its bias and unary post-processing can also become
-  separate operations. TinyLlama uses no linear bias or fused activation, but
-  the HF `[out,in]` weight still requires either a program that consumes
-  transposed B without an allocating wrapper or a checked caller-owned pack.
-  Therefore an optional output is only a candidate, never proof of the IOM
-  ownership contract.
-- **Documented lower-level capability.** The
-  [Metalium single-core matmul](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/matmul_single_core.html)
-  uses explicit source and destination DRAM buffers, a selected mesh command
-  queue, 32x32 BF16 tiles, reader/compute/writer kernels,
-  `matmul_init`/`matmul_tiles`, and `pack_tile`. This demonstrates a route
-  whose writer can target a pre-existing buffer. The
-  [Tensix compute/dataflow documentation](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html)
-  documents the FPU/SFPU, circular-buffer synchronization, and the distinction
-  between storage format and compute registers. It also explicitly warns that
-  `fp32_dest_acc_en=true` only makes each destination element 32 bits and does
-  not prove FP32 computation; the matrix engine's stated maximum is TF32.
-- **Runtime matrix evidence.** Parent verification configured and built the
-  existing IOM TTNN smoke target, then observed its single device test pass in
-  1.50 seconds on the installed Blackhole. That establishes availability only:
-  no project neural test, logical `R=1/15/16/17` matmul sample, QK/PV sample,
-  production conformance run, or profiler run was executed for this record. An
-  attempted build of the installed upstream single-core example produced no
-  binary because that SDK build tree was configured with programming examples
-  disabled and its regeneration stopped at a missing `AMDDeviceLibs` package.
-
-The repeatable inventory commands are
-`git -C "$TT_METAL_HOME" rev-parse HEAD`,
-`git -C "$TT_METAL_HOME" describe --tags --always --dirty`, and inspection of
-`build_RelWithDebInfo/lib/cmake/{tt-nn,tt-metalium}/*-config-version.cmake`.
-Every TTNN execution uses a 300-second timeout. Parent verification synchronized
-this exact worktree and ran:
-
-```text
-cmake -S . -B build/ttnn -DBUILD_TESTING=ON -DTTNN_ENABLED=ON -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF -DSYCL_ENABLED=OFF
-cmake --build build/ttnn --target iom_ttnn_smoke_tests -j2
-ctest --test-dir build/ttnn --output-on-failure -R "^iom_ttnn_smoke_tests$" --timeout 300
-```
-
-Smoke can establish device availability only. It cannot change a matrix cell
-below from blocked to supported.
-
-##### Contract fit and matrix decision
-
-Let `B` be the checked product of all independent leading dimensions and let
-`P32(n)=checked_mul(checked_ceil_div(n,32),32)`. Every public dimension is
-nonzero and remains `size_t` through common validation. Before constructing a
-TTNN shape or a `uint32_t` runtime argument, the backend checks the conversion
-against `UINT32_MAX`; all plane, tile, element, byte, stride, and address
-products and additions are checked first. Ranks remain 2 through 8,
-`QuantizationFormat::NONE` is required, transformed leading offsets and
-strides select independent native planes, and neither 16x16 logical nor 32x32
-physical padding creates a logical row, feature, head, key, or token.
-
-The preferred route is one bounded backend-private Metalium program family,
-not a public matrix layer. Its dataflow readers consume existing IOM native32
-owners, mask the logical tails, select linear row window `s..s+R`, read HF
-weights `[O,I]` in transposed orientation, and map GQA head `h` directly to
-`g(h)=floor(h/(Hq/Hkv))`. Its writer targets the supplied IOM output or a
-caller-workspace subrange. Any padding placed in workspace is explicitly
-initialized to neutral values. It does not materialize repeated KV heads,
-transpose or copy persistent weights, read K/V capacity tail `L..C`, expose a
-TTNN type publicly, or use a host/staging/elementwise substitute.
-
-For the table, **blocked/native route present** means that installed TTNN and
-Metalium expose the necessary matrix mechanism on the observed Blackhole, but
-the current IOM port correctly remains `Unsupported` until the operation
-implements that route, proves its precision, ownership, queue, and lifetime
-behavior, and passes its native gates. The two linear rows are **implemented**
-at this revision: the mandatory `BF16` leaf runs on the direct Metalium route
-recorded in [Linear projections](#linear-projections) and the twenty other
-applicable leaves are explicit capability rejections, so those rows no longer
-carry that blocker; the QK and PV rows still do.
-
-| Product | Logical `R=1` | `R=15` | `R=16` | `R=17` | Required native mapping and present blocker |
-| --- | --- | --- | --- | --- | --- |
-| ordinary linear | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | Per `b`, multiply selected `x[b,s:s+R,I]` by transposed shared `w[O,I]` and write exactly `out[b,R,O]`. Non-tile I/O and every leading plane are valid with the tail-masked readers of the landed route; no high-level transpose and no hidden temporary. |
-| head-planar linear | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | implemented (`BF16`) | The same product writes `out[b,h,R,d]` from weight row `h*D+d`, after checked `O=H*D`; the landed writer scatters logical head columns without padded-column shuffling. |
-| SDPA QK | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | For each `b,h`, BF16 `q[b,h,R,D]` multiplies the logical transpose of `k[b,g(h),0:L,D]` into FP32 scores `[R,L]`, followed by FP32 scale and causal/prefix mask. Non-tile D/L and GQA require custom address generation; TTNN's high-level output and FP32-accumulation contract are unproved. |
-| SDPA PV | blocked/native route present | blocked/native route present | blocked/native route present | blocked/native route present | Explicit RNE-rounded BF16 `P[b,h,R,L]` multiplies `v[b,g(h),0:L,D]` with FP32 accumulation and writes or merges exactly `out[b,R,h*D+d]`. It may not fuse away the probability store, read masked V, or create repeated KV heads; the current positive-workspace and numerical paths are absent. |
-
-These four row cases are shape-generic tile counts, not special kernels:
-`P32(R)` is 32 for `R=1/15/16/17`, while logical readers and writers admit
-exactly 1, 15, 16, or 17 rows. Physical padding is masked independently of the
-SDPA condition `0<=t<L && t<=a+r`. The SDPA route also requires
-`Hq%Hkv=0`, `0<L<=C`, `a<C`, and `R<=C-a`; K/V public owners remain
-`[B...,Hkv,C,D]`, even when internal readers address only prefix `L`.
-
-For BF16 linear, QK, and PV, configure a candidate kernel with
-`math_approx_mode=false`, high fidelity, and 32-bit destination accumulation,
-but do not infer conformance from those knobs. BF16 products must be accumulated
-with the contract's FP32 behavior and stored with RNE. QK scale, maximum,
-subtraction, exponentiation, and denominator remain FP32; masked probability is
-exactly zero; the probability is then explicitly RNE-rounded to BF16 before PV;
-PV accumulates in FP32 and the merged result is RNE-rounded to BF16. Installed
-headers and the inventory run do not prove those mathematical properties.
-Numerical comparison against the independent references, including cancellation
-and long-K cases that distinguish partial BF16/TF32 accumulation, is therefore a
-hard support gate. This BF16 assessment makes no additional F64 claim.
-
-##### Checked dataflow, output, and scratch
-
-The following table freezes the admissible data flow. `logical bytes` account
-for caller data; `native capacity` accounts for 32x32 storage. Each
-multiplication and the final sum of aligned subranges is checked. BF16 tiles
-are 2,048 bytes and FP32 tiles are 4,096 bytes, so a Metalium buffer-backed
-workspace route uses 4,096-byte alignment (which also satisfies the common
-32-byte minimum). The operation query is pure: it computes these bounds from
-validated values without allocating, registering, submitting, consulting
-queue occupancy or allocator capacity, or depending on a native handle state.
-
-| Purpose | Existing owner and logical traffic | Caller-owned temporary, if required | Native invocation and destination | Lifetime and checked capacity |
-| --- | --- | --- | --- | --- |
-| linear A/window | `x[B...,T,I]`; `checked(B*R*I*2)` bytes read | none for an offset/tail-aware reader; otherwise BF16 packed A of `checked(B*P32(R)*P32(I)*2)` | reader supplies `[R,I]` tiles to Metalium matmul | x and any packed A remain registered through native completion |
-| linear B/orientation | shared persistent `w[O,I]`; logical weight bytes are not scratch | none for a transpose-aware reader; otherwise one BF16 packed `[I,O]` region of `checked(P32(I)*P32(O)*2)`, not one per plane | `matmul_init`/`matmul_tiles`; never an allocating `ttnn::transpose` | w and any pack remain live through every submitted plane; no duplicate persistent checkpoint copy |
-| ordinary/head-planar result | ordinary output traffic `checked(B*R*O*2)`; head-planar is the equal checked value `B*H*R*D*2` | none when the writer maps result columns directly; otherwise BF16 product region `checked(B*P32(R)*P32(O)*2)` | writer stores into caller output `[B...,R,O]` or scatters `o=h*D+d` to `[B...,H,R,D]` | output and any product region remain leased until completion; result padding is not logical |
-| QK operands | q traffic `checked(B*Hq*R*D*2)`; K initialized-prefix traffic `checked(B*Hkv*L*D*2)` from capacity owners `[B...,Hkv,C,D]` | no repeated K heads; optional tail-neutral BF16 pack is at most `checked(B*(Hq*P32(R)*P32(D)+Hkv*P32(L)*P32(D))*2)` | per-head native QK, with K read in transposed orientation and `g(h)` address mapping | Q/K and any pack live through QK; bytes for `L..C` are neither scratch nor logical input |
-| QK scale/mask/scores | logical FP32 score requirement `checked(B*Hq*R*L*4)` | FP32 native32 scores `checked(B*Hq*P32(R)*P32(L)*4)` | matrix writer targets the score subrange; device-local scale, causal/prefix mask, max and sum operate there | score range remains exclusive through probability production |
-| probability preparation | logical BF16 probability requirement `checked(B*Hq*R*L*2)` | distinct BF16 native32 P region `checked(B*Hq*P32(R)*P32(L)*2)` so the RNE boundary is observable | device-local FP32 softmax writes RNE BF16 P; masked cells and physical padding are initialized zero | scores and P may not overlap while score values are live; P remains through PV |
-| PV and merge | V prefix traffic `checked(B*Hkv*L*D*2)`; PV logical result `checked(B*Hq*R*D*2)`; merged caller output `checked(B*R*Hq*D*2)` | no PV temporary when the writer maps `(h,d)` directly; otherwise BF16 native32 PV region `checked(B*Hq*P32(R)*P32(D)*2)` | native BF16 P/V matmul writes caller output at `h*D+d`, or writes the checked PV region followed by device-local merge | V, P, output, and any PV region remain live until the final native completion |
-
-The query reports zero linear workspace only when direct readers and writers
-eliminate every DRAM pack/product temporary. Otherwise it returns the aligned
-sum of only the live packed regions for the chosen path. SDPA requires at least
-nonoverlapping native32 score and P regions, plus a PV region only if direct
-merge is unavailable; optional Q/K packs are added only when direct native32
-readers cannot express the installed layout. Scratch never includes persistent
-weights, Q/K/V owners, output, or duplicate caches. The scheduler may reuse
-nonoverlapping-lifetime subranges only after their native completion is proven.
-
-TTNN `create_workspace(bytes)` now owns real positive scratch, so the score/P
-route is blocked by its own kernels and alignment needs rather than by the
-absence of a native factory or by permission for a hidden tensor allocation.
-The embedding-lookup leaf under
-`.cswd/tasks/006-tinyllama/03-embedding-lookup` owns that minimal TTNN-private
-`RawWorkspace` factory: one owning replicated DRAM `MeshBuffer` on the existing
-mesh, exposed as exactly the requested logical bytes over one contiguous native
-page whose page size is the checked request rounded up to 32 bytes, with
-checked owner-absolute range access and release only after proven completion.
-Creation, rebind, subrange addressability, exact-device checks, and
-destruction/reset follow those semantics. Workspace and output are disjoint
-from all operands and each other; new output/read and scratch/operand overlap
-are rejected, while valid read/read overlap, including exact Q/K/V aliases, is
-accepted.
-
-One facade submission must enqueue the bounded program on the exact
-`TtnnDevice` mesh command queue used by that `DeviceOps`, in call order and
-without an internal host wait. It snapshots specs, native handles, plane
-mappings, scalar values, and workspace ranges; registers each distinct owner;
-and retains the workspace lease until the existing native fence proves
-completion. A pre-admission failure consumes no sequence and mutates nothing.
-After a positive OID, device failure is retained and rethrown by every repeated
-wait. Workspace reset/destruction must wait for proven use or quarantine the
-range; device destruction must drain or retain unresolved work. The high-level
-matmul signature does not select an IOM queue or establish these lifetime
-facts, which is another reason its optional output is not yet adopted.
-
-##### Fit of all seven operations
-
-| Planned facade | Installed facility and contract disposition |
-| --- | --- |
-| embedding | `ttnn::embedding` declares an optional output, but installed evidence does not verify every integral index carrier, bit-preserving BF16 payload, independent IOM planes, transformed mappings, no hidden temporary, or IOM queue/lifetime behavior. A bounded device-local gather can use the same owner/writer rules; current support is blocked, not replaced by a host index scan. |
-| linear | Implemented for the mandatory `BF16` leaf by the direct per-plane Metalium route: tail-masked readers, the native matrix facility with FP32 accumulation, and one RNE BF16 writer per output tile row, with checked `O=H*D` head-planar scatter, no high-level transpose, no hidden temporary, and the pure `{0, 1}` requirement query. The twenty other applicable leaves are explicit capability rejections; the executed evidence is recorded in [Linear projections](#linear-projections). |
-| rmsnorm | Installed `sum`/`mean`/`max` reductions return tensors and do not expose caller output, while unary `rsqrt` has an optional output. Composing them would allocate intermediates and does not prove logical-tail exclusion or wide reduction. A backend-private fused row reduction is required; current support is blocked. |
-| rope | Installed unary `sin` and `cos` accept optional outputs, but composing transpose/arithmetic wrappers can allocate and does not prove FP32 angle/trig behavior or split-half pairing. A device-local kernel must write caller output, mask tails, and use `a+r`; current support is blocked. |
-| cache append | Installed slice/data-movement APIs expose optional outputs, and Metalium readers/writers can address tiles, but partial native32 updates must preserve every cell outside `[a,a+R)`, including other logical rows and physical padding, without host staging. Exact destination-window, queue, and alias behavior is unproved; current support is blocked. |
-| silu | Installed `ttnn::silu` declares an optional output and is a plausible direct route only after exact shape/dtype/memory configuration, no-hidden-temporary, stable wide evaluation, RNE, queue, and lifetime behavior are verified. Until then a backend-private unary kernel is required and support remains blocked. |
-| sdpa | Installed `scaled_dot_product_attention` returns a new tensor and has no optional output; its public mask/layout and fused numerical boundaries do not establish IOM's GQA, capacity-owner, explicit BF16-P, caller-scratch, or merged-output contract. Use the bounded QK/softmax/PV flow above; current support is blocked. |
-
-Allocating wrappers are never repaired by copying their result into the caller
-output: that still violates the no-hidden-allocation rule. Likewise, current
-host transfer/staging and elementwise binary paths prove none of gather,
-reduction, trig, partial-tile mutation, unary numerics, linear, QK, or PV.
-
-##### Dependency decision and remaining gates
-
-**Decision: add no matrix library.** The already-required
-`TTNN::TTNN`/`TT::Metalium` pair provides high-level matmul and the lower-level
-Blackhole matrix/dataflow primitives. A BLAS package or umbrella dispatcher
-would add discovery, link, redistribution, handle, and workspace lifecycle
-without solving native32 addressing, BF16/FP32 fidelity, IOM queue retention,
-or caller-owned output/scratch. Prefer the single bounded TTNN-private
-Metalium program family above when the high-level optional-output path cannot
-be proven exact. Do not add a plugin layer, a second handle system, or separate
-matrix facilities for linear, QK, and PV. Absence of BLAS linkage is not a
-capability gap, and unavailable hardware remains `Unsupported`.
-
-The eventual TTNN linear and SDPA leaves must first recheck the exact installed
-commit/API and fail TTNN-enabled configuration explicitly if their required
-TTNN/Metalium features are absent; TTNN-disabled and CPU-only builds acquire no
-new dependency. If later evidence shows even lower-level Metalium cannot meet
-the contract, that operation leaf must document the precise failure before
-proposing a minimal alternative with an exact package, minimum version,
-imported target, private linkage, redistribution terms, runtime footprint,
-context/handle initialization, caller-workspace binding, queue integration,
-and reset/destruction synchronization. No such need is evidenced here.
-
-Parent verification observed the configured TTNN smoke gate pass as recorded
-above. Production ports later owe
-`cmake --build build --target iom_ttnn_conformance_tests` and
-`ctest --test-dir build --output-on-failure -R '^iom_ttnn_conformance_tests$' --timeout 300`,
-plus native runtime/profiler evidence for ordinary and head-planar linear and
-both QK and PV at logical `R=1/15/16/17`, non-tile I/O/D/L, independent
-leading planes, GQA, tails, aliases, checked failures, in-order OIDs, and
-repeated waits. None of those production gates or profiler runs was run by
-this assessment.
 #### TinyLlama forward layout — CUDA matrix feasibility
 
 This is a bounded capability record for the planned interfaces above, not a
@@ -2746,7 +2437,7 @@ separate:
 | Installed target definitions | Installed generated `clang/Basic/BuiltinsAMDGPU.inc` exposes the BF16-to-FP32 GFX11 WMMA `_w32`/`_w64`, GFX12 `_w32_gfx12`/`_w64_gfx12`, and BF16 MFMA names. Its guards are respectively `wmma-256b-insts` plus the selected wave size, `wmma-128b-insts` plus the selected wave size, and `mai-insts`. | A name in a compiler table is not proof that it is invocable on every target. |
 | Installed runtime/device | `rocminfo` reported HSA runtime `1.21`, runtime extension `1.30`, a Radeon AI PRO R9700 `gfx1201` agent with wavefront size 32, and a separate `gfx1036` agent. `hipGetDeviceProperties` enumerated ordinal 0 as the R9700 (`gfx1201`, `warpSize=32`, 32 reported multiprocessors, 1024 maximum threads per block, 34,208,743,424 bytes global memory) and ordinal 1 as `gfx1036`; `hipRuntimeGetVersion` and `hipDriverGetVersion` both returned `70152801`. AMD's [GPU specification table](https://rocm.docs.amd.com/en/latest/reference/gpu-specs.html) independently identifies the R9700 as RDNA4/gfx1201 with wave32 or wave64. | The inventory does not make the older `gfx1036` matrix-capable and does not benchmark the R9700. |
 | Bounded capability samples | `hipcc --offload-arch=gfx1201 -O2` compiled a 32-lane kernel calling `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12`; execution on ordinal 0 completed and preserved an FP32 accumulator for a zero BF16 product (`gfx12_w32_bf16_wmma_zero_product=pass`). The same installed compiler compiled, but did not run, a `--offload-arch=gfx1100` kernel calling the GFX11 `_w32` builtin with its replicated input vector shape. Both temporary `_local` sources and the remote workspace were removed. | The zero-product sample proves target compilation, dispatch, all-wave participation, and FP32 result transport only. It is not a layout, tail, numerical, throughput, or production conformance test; the GFX11 result is compile-only. |
-| Deliberately unrun production gates | No `iom_rocm_conformance_tests` build or CTest run, production native linear/QK/PV kernel, numerical matrix, profiler, tuning run, or all-five gate was executed. | No current ROCm neural support or performance conclusion follows. |
+| Deliberately unrun production gates | No `iom_rocm_conformance_tests` build or CTest run, production native linear/QK/PV kernel, numerical matrix, profiler, tuning run, or four-backend gate was executed. | No current ROCm neural support or performance conclusion follows. |
 
 The exact inventory command was:
 
@@ -3174,12 +2865,11 @@ This is the operation-owned contract for `DeviceOps::rmsnorm`. The common
 facade, its admission rules, and its pure requirement query are declared and
 frozen here. The CPU port queues all nine applicable floating leaves at the
 exact `{0, 1}` zero-workspace requirement, CUDA and ROCm launch the shared
-tiled core on their existing nonblocking streams, SYCL queues its native row
-kernel for the eight non-`F64` leaves and for `F64` exactly where the device
-reports `aspect::fp64`, and TTNN provides a preallocated BF16/F32 queue path.
-Each port owns its own capability predicate, and an unsupported or limited
-leaf stays `Unsupported` exactly as section 9 states above rather than
-counting as numerical conformance. The exact ABI is:
+tiled core on their existing nonblocking streams, and SYCL queues its native
+row kernel for the eight non-`F64` leaves and for `F64` exactly where the
+device reports `aspect::fp64`. Each port owns its own capability predicate, and
+an unsupported or limited leaf stays `Unsupported` exactly as section 9 states
+above rather than counting as numerical conformance. The exact ABI is:
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
@@ -3237,36 +2927,32 @@ integer norm, quantization, or storage-format staging is introduced.
    or exponent-only normalization contract. The matrix below is the complete
    leaf-by-backend capability record.
 
-   | Leaf | Contract | CPU | CUDA | ROCm | SYCL | TTNN |
-   | --- | --- | --- | --- | --- | --- | --- |
-   | `BOOL` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `I2`, `U2` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `I4`, `U4` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `I8`, `U8` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `I16`, `U16` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `I32`, `U32` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `I64`, `U64` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `F4_E2M1` | applicable | supported | supported | supported | supported | `Unsupported` |
-   | `F6_E2M3` | applicable | supported | supported | supported | supported | `Unsupported` |
-   | `F6_E3M2` | applicable | supported | supported | supported | supported | `Unsupported` |
-   | `F8_E4M3FN` | applicable | supported | supported | supported | supported | `Unsupported` |
-   | `F8_E5M2` | applicable | supported | supported | supported | supported | `Unsupported` |
-   | `F8_E8M0` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-   | `F16` | applicable | supported | supported | supported | supported | `Unsupported` |
-   | `BF16` | applicable | supported | supported | supported | supported | supported |
-   | `F32` | applicable | supported | supported | supported | supported | supported |
-   | `F64` | applicable | supported | supported | supported | `aspect::fp64` only | `Unsupported` |
+   | Leaf | Contract | CPU | CUDA | ROCm | SYCL |
+   | --- | --- | --- | --- | --- | --- |
+   | `BOOL` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I2`, `U2` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I4`, `U4` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I8`, `U8` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I16`, `U16` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I32`, `U32` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `I64`, `U64` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `F4_E2M1` | applicable | supported | supported | supported | supported |
+   | `F6_E2M3` | applicable | supported | supported | supported | supported |
+   | `F6_E3M2` | applicable | supported | supported | supported | supported |
+   | `F8_E4M3FN` | applicable | supported | supported | supported | supported |
+   | `F8_E5M2` | applicable | supported | supported | supported | supported |
+   | `F8_E8M0` | unsupported | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+   | `F16` | applicable | supported | supported | supported | supported |
+   | `BF16` | applicable | supported | supported | supported | supported |
+   | `F32` | applicable | supported | supported | supported | supported |
+   | `F64` | applicable | supported | supported | supported | `aspect::fp64` only |
 
-   CPU, CUDA, and ROCm support all nine applicable floating leaves. SYCL
-   supports the eight non-`F64` leaves and supports `F64` only when the device
-   reports `aspect::fp64`; otherwise `F64` is `Unsupported`. TTNN supports only
-   `BF16` and `F32`: its seven encoded-carrier leaves (`F4_E2M1`,
-   `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, and `F8_E8M0`)
-   and `F64` are `Unsupported` because native TILE compute cannot consume
-   those carrier layouts without the forbidden host staging. On every backend,
-   an unknown dtype enumeration value is `InvalidArgument`, while a recognized
-   inapplicable or unsupported leaf and a recognized non-`NONE` quantization
-   format are `Unsupported`.
+CPU, CUDA, and ROCm support all nine applicable floating leaves. SYCL supports
+the eight non-`F64` leaves and supports `F64` only when the device reports
+`aspect::fp64`; otherwise `F64` is `Unsupported`. On every backend, an unknown
+dtype enumeration value is `InvalidArgument`, while a recognized inapplicable
+or unsupported leaf and a recognized non-`NONE` quantization format are
+`Unsupported`.
 5. **Admission order.** Before capability dispatch or any queue effect, a
    submission validates in exactly this order: (1) rank, nonzero extents,
    identical `[...,R,F]` shape, and `scale == [1,F]`; (2) exact queue `Device`
@@ -3333,41 +3019,6 @@ integer norm, quantization, or storage-format staging is introduced.
    rounds every FP32 intermediate and uses `double` for `F64`; production
    code MUST NOT serve as its own oracle.
 
-**TTNN reduced-fidelity limitation and its published expectation policy.**
-TTNN's preallocated `ttnn::prim::LayerNorm`-backed adapter is
-**documented-nonconforming** and keeps advertising `BF16` and `F32`; no other
-backend declares any deviation, and every other backend is measured against
-clauses 1 through 9 unchanged. The measured TTNN deviations are:
-
-- clause 2 (accumulator domain and single encode): the native primitive
-  evaluates a plane at BF16 compute fidelity, so a finite `F32` output carries
-  at most BF16-precision bits — for example `mixed` element 0 stores
-  `0x3E8E8000` where the contract's `F32` result is `0x3E8E849C`;
-- clause 3 (special values): signed zeros, the `eps == 0` all-zero-row quiet
-  NaN, NaN row poisoning, infinity rows, and nonfinite scale features are not
-  produced — a signed negative zero is stored as positive zero and a quiet-NaN
-  decision is stored as zero;
-- clause 9 (`F32` tolerance): the reduced-fidelity outputs exceed
-  `abs_err <= 1e-6 + 2e-5 * abs(reference)`.
-
-The expectation policy the shared conformance harness implements for TTNN is
-therefore exactly, and only:
-
-- a finite `F32` expectation is compared at the declared BF16 compute
-  fidelity: the observed and reference values must lie within two adjacent
-  `BF16` destination encodings of each other;
-- an expectation whose class is not `finite` — signed zeros, quiet NaNs, and
-  infinities — is observed rather than asserted;
-- finite `BF16` expectations, and every admission, workspace, alias, overflow,
-  capability, ownership, ordering, and retained-failure case, keep the frozen
-  policy unchanged for TTNN.
-
-The policy is declared by the TTNN driver as its own
-`RmsNormComparisonMode`, and every element it observes rather than asserts is
-counted in its `RmsNormComparisonRecord` and printed by its conformance case,
-so the deviation is explicit, quantified, and never reported as success. The
-TTNN rows of the capability matrix above are unaffected by this limitation.
-
 **Shared CUDA/ROCm queue and tiled-kernel core.** The two accelerator
 backends share one queue branch and one tiled device operation.
 `src/shared/gpu_queue.hpp` carries the immutable RMSNorm task and completion
@@ -3393,12 +3044,10 @@ which must use the queue's already-created nonblocking stream. The CUDA
 launcher in `src/cuda/copy.cu` calls the shared
 `launch_standard_tiled_rmsnorm` kernel directly on that stream, while
 `src/cuda/copy.hpp` advertises all nine applicable signed floating leaves.
-The CUDA, ROCm, SYCL, and TTNN runtime identities and focused gate results
-are recorded in the closure evidence below. The shared CUDA/ROCm core and
-the SYCL row kernel are exercised through their real queues; SYCL `F64`
-remains conditional on `aspect::fp64`, and TTNN's documented-nonconforming
-BF16/F32 fidelity policy remains explicit rather than being reported as
-contract-exact conformance.
+The CUDA, ROCm, and SYCL runtime identities and focused gate results are
+recorded in the retained-backend closure evidence below. The shared CUDA/ROCm
+core and the SYCL row kernel are exercised through their real queues; SYCL
+`F64` remains conditional on `aspect::fp64`.
 
 **ROCm capability and implementation evidence.** `src/rocm/copy.hpp` exposes
 the ROCm policy's immutable RMSNorm capability for the nine applicable
@@ -3407,20 +3056,8 @@ floating leaves. `src/rocm/copy.hip` invokes the shared
 nonblocking stream, preserving the device-local logical-`F` reduction,
 FP32/FP64 accumulator domains, one destination encode, and zero-workspace
 queue protocol.
-**TTNN capability and implementation evidence.** `src/ttnn/device_types.cpp`
-classifies the complete RMSNorm matrix and `TtnnQueue` advertises only BF16
-and F32. `src/ttnn/queue.cpp` snapshots and registers all three native
-per-plane owners, submits one preallocated adapter launch for every mapped
-leading plane under the TTNN API mutex and mesh queue, and retains or
-quarantines those owners until native completion is proven. The adapter binds
-the caller's output plane directly, so no output relocation, host roundtrip,
-positive workspace, or hidden host arithmetic participates. Logical feature
-width alone reaches the preallocated primitive; physical tile padding and
-untouched planes remain outside the reduction and write mapping. The TTNN
-focused gate below records its device identity, carrier limitations, and
-reduced-fidelity observation.
  
-**All-backend closure evidence.** The five focused gates were run from the
+**Retained-backend closure evidence.** The four focused gates were run from the
 prepared closure worktree on branch
 `run-task/006-tinyllama--05-rms-normalization--11-all-backend-rmsnorm-closure`,
 based at revision `e6d834726bc80d8d8786ace6a965dd5c9c2c380e`. Accelerator
@@ -3428,9 +3065,8 @@ commands used the configured remote profiles and a fresh sync immediately
 before each execution; the complete command transcripts are retained in the
 task evidence file
 `.cswd/tasks/006-tinyllama/05-rms-normalization/11-all-backend-rmsnorm-closure/remote.log`.
-The accelerator mirrors were `impl11closure-cuda`,
-`impl11closure-rocm`, `impl11closure-sycl`, and `impl11closure-ttnn`.
-Accelerator executable and CTest rows used
+The accelerator mirrors were `impl11closure-cuda`, `impl11closure-rocm`, and
+`impl11closure-sycl`. Accelerator executable and CTest rows used
 `flock -w 120 /tmp/iom-<backend>-gpu.lock timeout --kill-after=30s 900s`
 around the listed command; SYCL additionally sourced
 `/opt/intel/oneapi/setvars.sh` and ran the full-path `sycl-ls` inventory
@@ -3442,19 +3078,16 @@ before each remote command.
 | CUDA profile `bv1`: NVIDIA GeForce RTX 5090, driver `595.71.05`, CUDA `13.2`, `nvcc` `V13.2.78` | `./build/test/iom_cuda_conformance_tests --test-case=*RMSNorm*` — 1 test, 2054 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_cuda_conformance_tests$'` — 1/1 passed. |
 | ROCm profile `bv2`: AMD Radeon AI PRO R9700 `gfx1201` (with `gfx1036` enumerated), HIP `7.15.26333` | `./build/test/iom_rocm_conformance_tests --test-case=*RMSNorm*` — 1 test, 2053 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_rocm_conformance_tests$'` — 1/1 passed. |
 | SYCL profile `bv2`: two Intel Arc Pro B60 Level Zero GPUs, oneAPI compiler `2026.1.0` | `./build/test/iom_sycl_conformance_tests --test-case=*RMSNorm*` after `sycl-ls` — 1 test, 1734 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_conformance_tests$'` — 1/1 passed. The enumerated device has `aspect::fp64`, so the conditional `F64` leaf ran. |
-| TTNN profile `bv1`: Blackhole, firmware `19.13.1`, KMD `2.8.0` | `./build/test/iom_ttnn_conformance_tests --test-case=*planes*` — 1 test, 50 assertions passed; `./build/test/iom_ttnn_conformance_tests --test-case=*RMSNorm*` — 2 tests, 822 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_ttnn_conformance_tests$'` — 1/1 passed. The output retains the documented BF16-native/reduced-fidelity and unavailable native-failure records. |
- The automated driver links are [`test/cpu/test_cpu_conformance.cpp`](../test/cpu/test_cpu_conformance.cpp),
- [`test/cuda/test_cuda_conformance.cpp`](../test/cuda/test_cuda_conformance.cpp),
- [`test/rocm/test_rocm_conformance.cpp`](../test/rocm/test_rocm_conformance.cpp),
- [`test/sycl/test_sycl_conformance.cpp`](../test/sycl/test_sycl_conformance.cpp),
- and [`test/ttnn/test_ttnn_conformance.cpp`](../test/ttnn/test_ttnn_conformance.cpp).
 
-The exact target links for these observations are the five drivers named
-above: `iom_backend_conformance_cpu_tests`,
-`iom_cuda_conformance_tests`, `iom_rocm_conformance_tests`,
-`iom_sycl_conformance_tests`, and `iom_ttnn_conformance_tests`. The matrix
-does not treat TTNN's reduced-fidelity observations or its unavailable native
-failure seam as contract-exact numerical or accepted-failure coverage.
+The automated driver links are [`test/cpu/test_cpu_conformance.cpp`](../test/cpu/test_cpu_conformance.cpp),
+[`test/cuda/test_cuda_conformance.cpp`](../test/cuda/test_cuda_conformance.cpp),
+[`test/rocm/test_rocm_conformance.cpp`](../test/rocm/test_rocm_conformance.cpp),
+and [`test/sycl/test_sycl_conformance.cpp`](../test/sycl/test_sycl_conformance.cpp).
+
+The exact target links are `iom_backend_conformance_cpu_tests`,
+`iom_cuda_conformance_tests`, `iom_rocm_conformance_tests`, and
+`iom_sycl_conformance_tests`. The matrix does not count unsupported probes as
+contract-exact numerical or accepted-failure coverage.
 
 
 The common owner is `src/device_ops_rmsnorm.cpp` behind
@@ -3466,14 +3099,13 @@ every observable conformance scenario — the independent oracle's numeric
 matrix for each declared leaf, the rank-two-through-eight and boundary
 geometries, padded-physical invariance, and the common query, workspace,
 admission, alias, overflow, capability, ownership, ordering, and retained
-failure cases — and the CPU, CUDA, ROCm, SYCL, and TTNN conformance drivers
-each invoke its one dispatcher with their own device setup, declared
-supported-leaf span, and native storage observation. The five focused target
-links are `iom_backend_conformance_cpu_tests` (`test/cpu/test_cpu_conformance.cpp`),
+failure cases — and the CPU, CUDA, ROCm, and SYCL conformance drivers each
+invoke its one dispatcher with their own device setup and declared supported
+leaf span. The four focused target links are
+`iom_backend_conformance_cpu_tests` (`test/cpu/test_cpu_conformance.cpp`),
 `iom_cuda_conformance_tests` (`test/cuda/test_cuda_conformance.cpp`),
-`iom_rocm_conformance_tests` (`test/rocm/test_rocm_conformance.cpp`),
-`iom_sycl_conformance_tests` (`test/sycl/test_sycl_conformance.cpp`), and
-`iom_ttnn_conformance_tests` (`test/ttnn/test_ttnn_conformance.cpp`).
+`iom_rocm_conformance_tests` (`test/rocm/test_rocm_conformance.cpp`), and
+`iom_sycl_conformance_tests` (`test/sycl/test_sycl_conformance.cpp`).
 `test/cpu/test_cpu.cpp` retains CPU-local RMSNorm probes, while
 `test/backend/backend_conformance_other.hpp` keeps unrelated neural
 capability probes without a second RMSNorm suite. Backend kernels and their
@@ -3532,45 +3164,42 @@ capability.
    the following 23-leaf table. Applicability is semantic and is not a claim
    that every backend stores or computes every applicable leaf.
 
-   | Leaf | Semantic SiLU class | CPU | CUDA | ROCm | SYCL | TTNN |
-   | --- | --- | --- | --- | --- | --- | --- |
-   | `BOOL` | Unsupported/inapplicable: not a signed real-valued transcendental operand or result | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `I2` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `U2` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `I4` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `U4` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `I8` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `U8` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `I16` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `U16` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `I32` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `U32` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `I64` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `U64` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `F4_E2M1` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
-   | `F6_E2M3` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
-   | `F6_E3M2` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
-   | `F8_E4M3FN` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
-   | `F8_E5M2` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
-   | `F8_E8M0` | Unsupported/inapplicable: unsigned exponent-only encoding is not a signed real value | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
-   | `F16` | Applicable signed real format | Supported | Supported | Supported | Supported | `Unsupported` — no contract-compatible TTNN representation/math path |
-   | `BF16` | Applicable signed real format | Supported | Supported | Supported | Supported | Supported |
-   | `F32` | Applicable signed real format | Supported | Supported | Supported | Supported | Supported |
-   | `F64` | Applicable signed real format; never silently narrowed | Supported | Supported | Supported | Supported only with `aspect::fp64`; otherwise `Unsupported` — device fp64 unavailable | `Unsupported` — no contract-compatible TTNN representation/math path |
+   | Leaf | Semantic SiLU class | CPU | CUDA | ROCm | SYCL |
+   | --- | --- | --- | --- | --- |
+   | `BOOL` | Unsupported/inapplicable: not a signed real-valued transcendental operand or result | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I2` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U2` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I4` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U4` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I8` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U8` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I16` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U16` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I32` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U32` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `I64` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `U64` | Unsupported/inapplicable: no implicit integer-to-real SiLU | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `F4_E2M1` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F6_E2M3` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F6_E3M2` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F8_E4M3FN` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F8_E5M2` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F8_E8M0` | Unsupported/inapplicable: unsigned exponent-only encoding is not a signed real value | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability | `Unsupported` — semantic inapplicability |
+   | `F16` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `BF16` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F32` | Applicable signed real format | Supported | Supported | Supported | Supported |
+   | `F64` | Applicable signed real format; never silently narrowed | Supported | Supported | Supported | Supported only with `aspect::fp64`; otherwise `Unsupported` — device fp64 unavailable |
 
-   CPU, CUDA, and ROCm therefore support all nine applicable leaves. SYCL
-   supports the eight applicable leaves other than `F64` unconditionally and
-   supports `F64` only when the device provides `aspect::fp64`; unavailable
-   device FP64 is an explicit `Unsupported` capability. TTNN supports only
-   `BF16` and `F32`; every other applicable leaf is `Unsupported` for the
-   named lack of a contract-compatible representation or math path. `BOOL`,
-   all 12 integer leaves, and `F8_E8M0` remain `Unsupported` on every backend
-   because they are semantically inapplicable. An unknown `DataType` enum is
-   `InvalidArgument`, not a capability result. A recognized but unsupported
-   applicable leaf returns `Unsupported` with the named capability reason only
-   after structural admission checks. Only `QuantizationFormat::NONE` is in
-   scope; an unknown quantization enum is `InvalidArgument`, and a recognized
-   non-`NONE` format is `Unsupported`.
+CPU, CUDA, and ROCm therefore support all nine applicable leaves. SYCL supports
+the eight applicable leaves other than `F64` unconditionally and supports `F64`
+only when the device provides `aspect::fp64`; unavailable device FP64 is an
+explicit `Unsupported` capability. `BOOL`, all 12 integer leaves, and
+`F8_E8M0` remain `Unsupported` on every backend because they are semantically
+inapplicable. An unknown `DataType` enum is `InvalidArgument`, not a capability
+result. A recognized but unsupported applicable leaf returns `Unsupported` with
+the named capability reason only after structural admission checks. Only
+`QuantizationFormat::NONE` is in scope; an unknown quantization enum is
+`InvalidArgument`, and a recognized non-`NONE` format is `Unsupported`.
 
 4. **Zero workspace and pure requirements.** Every backend's
    `silu_workspace_requirements(x, y)` returns exactly `{0, 1}`. Since the
@@ -3659,7 +3288,7 @@ capability.
     | --- | --- |
     | `api_and_query_purity_zero_workspace` | Exact ABI and pure query; deterministic `{0, 1}` requirements; nonempty workspace ignored without validation, leasing, retention, or state effects. |
     | `shape_rank_planes_runs_and_padding` | Rank 2..8, complete `[...,R,F]` mapping, independent leading planes, logical runs `R=1,15,16,17`, non-tile feature sizes, TILE padding poisoning, and output-padding isolation. |
-    | `dtype_classification_and_backend_matrix` | All 23 leaves, semantic inapplicability versus capability, `NONE` quantization, CPU/CUDA/ROCm nine-leaf support, SYCL eight-plus-conditional-F64 support, and TTNN `BF16`/`F32` only. |
+    | `dtype_classification_and_backend_matrix` | All 23 leaves, semantic inapplicability versus capability, `NONE` quantization, CPU/CUDA/ROCm nine-leaf support, and SYCL eight-plus-conditional-F64 support. |
     | `admission_alias_device_owner_and_overflow` | Shape/layout/dtype/device/owner/native-view admission, exact aliases and partial overlaps, transformed-view disjointness, checked element/tile/byte/stride/plane/address overflow, and negative OID categories. |
     | `stable_finite_reference_and_tails` | Independent scalar/raw reference, stable finite branches, FP32/FP64 intermediates, one output encode, no FTZ, `F32 -104` and `F64 -746` tails, and 1/4/8-ULP ceilings. |
     | `special_values_signed_zero_and_rounding` | Infinity and NaN classes, signed zeros, negative-zero underflow, finite-only format limits, saturation/subnormals, exact class/sign checks, and RNE encoding. |
@@ -3876,7 +3505,7 @@ are all computed with checked arithmetic; `logical_nbytes()` and
 repeated-layer aggregate is derived from the nine representative role sizes and
 `N`, so an impossible configuration fails without allocating a huge payload or
 generating a huge name list. Standard tiled totals are never presented as
-TTNN-native sizes; native allocation, stride, and address checks remain
+backend-private sizes; native allocation, stride, and address checks remain
 `Device`-factory responsibilities.
 
 **Ownership and validation order.** The order is fixed: validate the
@@ -3985,11 +3614,11 @@ owner and device identity.
 `copy_from_host_workspace_requirements()` results, so one serial scratch range
 satisfies every weight. It is never a sum of mutually exclusive scratch
 requirements, a guessed native storage size, or an aggregate logical byte
-count. A binding whose requirements are all zero returns exactly `{0, 1}`, so
-the CPU and TTNN zero-workspace policy never requests a positive allocation.
-The per-owner requirement hook is pure and deterministic, so the same complete
-destination list reports the same maxima regardless of arena capacity, queue
-occupancy, leases, or completion state.
+count. A binding whose requirements are all zero returns exactly `{0, 1}` and
+never requests a positive allocation. The per-owner requirement hook is pure
+and deterministic, so the same complete destination list reports the same
+maxima regardless of arena capacity, queue occupancy, leases, or completion
+state.
 
 **Destination failures.** These categories are normative:
 
@@ -4043,9 +3672,9 @@ every destination's full owner view with the shared
 [section 4](#4-view-and-transfer-contract), even when the caller supplied the
 empty view, so a missing, insufficient, misaligned, foreign, dead, or
 destination-overlapping scratch range fails before the first copied role. A
-zero-byte requirement of `{0, 1}` consumes no workspace at all, which preserves
-the CPU and TTNN unused-workspace behavior: those devices realize their weights
-with the default empty view.
+zero-byte requirement of `{0, 1}` consumes no workspace at all, preserving
+the CPU zero-workspace behavior. Retained accelerator backends provision
+caller-owned scratch only when their queried requirement is positive.
 
 **Ownership.** The caller creates and owns every destination and any scratch it
 provisions from the preflight result. This call allocates no tensor, no
@@ -4085,8 +3714,8 @@ backend-neutral loading scenario,
 `iom_conformance::run_model_loading_conformance(const ConformanceDevices&)`. It
 is the only model-loading conformance surface: it contains no backend-kind
 switch, no accelerator header, no failure-injection seam, and no second
-inventory generator, so every backend driver calls it unchanged with its own
-devices, in the fixed CPU, CUDA, ROCm, SYCL, then TTNN integration order.
+inventory generator, so every retained backend driver calls it unchanged with
+its own devices, in the CPU, CUDA, ROCm, and SYCL integration order.
 `test/cpu/test_cpu_conformance.cpp` registers it as
 `iom_backend_conformance_cpu_tests` case `CPU model loading*`, which is the CPU
 invocation:
@@ -4228,7 +3857,7 @@ the full `iom_rocm_conformance_tests` suite.
 
 `test/sycl/test_sycl_conformance.cpp` registers the same shared scenario as
 `iom_sycl_conformance_tests` case `SYCL model loading*`, which is the fourth
-invocation of the CPU-first case above, after the ROCm case and before TTNN:
+invocation of the CPU-first case above, after the ROCm case:
 
 ```text
 cmake --build build --target iom_sycl_conformance_tests
@@ -4265,90 +3894,13 @@ SYCL setup and limitations:
   staging, and `src/sycl/device_tensor.cpp` and `src/sycl/copy.cpp` change only
   if a loading failure demonstrates a transfer defect.
 
-#### TTNN loading conformance and observable inventory
-
-The shared contract of this
-[section 10](#10-model-loading-and-weight-layout) is unchanged; this subsection
-records only TTNN setup, native-storage consequences, and the exact invocation.
-`test/ttnn/test_ttnn_conformance.cpp` registers the same backend-neutral
-scenario as `iom_ttnn_conformance_tests` cases `TTNN model loading*`, after the
-SYCL predecessor, through the existing `TtnnDevices` fixture and the target's
-custom runtime registration. The two registered cases are `TTNN model loading:
-complete checkpoint inventories realize exact BF16 weights` and `TTNN model
-loading: failed weight uploads publish nothing and retain staging`, so the
-wildcard selection covers both.
-
-**Native per-plane storage.** TTNN destinations are created from
-`tensor_spec(index)` on the selected TTNN device exactly as on every other
-backend, but realization lands in TTNN-native per-plane storage: one TTNN-owned
-plane per leading logical index, each padded to 32x32 tiles with its own native
-padding. The logical readback is compared bit-for-bit with the fixture's
-independent BF16 bytes, so native padding or a wrong slot map can never
-compensate a wrong result, and no numeric tolerance, matrix-performance claim,
-or fixed native byte formula is used. Native storage stays TTNN-owned and is
-not an `iom::Allocator` arena; unsupported quantization and unsupported leaf
-types are still rejected before native allocation by the existing
-supported-type table.
-
-**Unused workspace.** Every TTNN per-owner host-transfer requirement is
-`{0, 1}`, so a complete binding of these checkpoints reports exactly `{0, 1}`
-and realizes with the default empty `RawWorkspaceView`: the scenario never
-provisions the real owning TTNN-native positive scratch an operation
-requirement can create on this device, and a standard 16x16 tiled byte count is
-never mistaken for a native32 requirement.
-
-**One live context.** `TtnnDevices` owns exactly one TTNN context
-(`make_ttnn_device(0)`); a second TTNN device of the same ordinal cannot coexist
-in one process, so its `reference` and `foreign` slots are independently created
-CPU devices with their own allocator. The foreign-destination rejection
-therefore proves exact `Device` identity across two backend kinds rather than an
-equal backend kind and ordinal, and the CPU reference device remains the
-independent comparison device for every role.
-
-**Host-transfer failures and retained staging.** Realization is synchronous, so
-there is no queued token to wait for: every role's `copy_from_host` runs through
-the device's retained host-transfer staging (one byte slot per native upload
-dtype per plane plus one download buffer). The second case exercises the
-existing staging-allocation and single-plane submission seams on a weight
-upload. A failed retained allocation raises `std::bad_alloc` before any
-destination byte is written and retains nothing. A submission fault armed for a
-later upload throws that backend's `std::runtime_error` before the failed role's
-native submission, so the complete ordered binding stops immediately: every
-destination still holds the sentinel bytes of the earlier successful upload of
-that binding, no later role of the aborted call is uploaded, and the aborted
-call publishes nothing. The bounded recovery drain then completes the work the
-failed transfer had already submitted, after which the acquired staging returns
-to the facility; only the next normal `void` return is the publication
-permission, and it reuses the same retained slot rather than the failed attempt
-having freed or replaced storage that could still be read. Retired staging is
-freed only with the device. This adds no loader hook, no backend-kind switch, no
-second loader or harness, and no whole-checkpoint host copy or native format
-rewrite; the shared scenario keeps containing no failure-injection seam.
-
-**Invocation.** The TTNN gate is remote-only through `skill://csw-remote`
-(profile alias `ttnn`), which syncs this workspace to a unique mirror and
-preserves the existing `TTNN_ENABLED` configuration and SDK arguments. TTNN
-device execution can hang, so every invocation is bounded, and
-`/home/rlew/bin/ttnn_reset` resets the host device:
-
-```text
-cmake --build build --target iom_ttnn_conformance_tests
-timeout 300s ./build/test/iom_ttnn_conformance_tests --test-case="TTNN model loading*"
-ctest --test-dir build --output-on-failure -R '^iom_ttnn_conformance_tests$' --timeout 300
-```
-
-The first two commands are the focused model-loading gate and must report a
-nonempty selection; the third is the complete TTNN conformance regression that
-must keep passing. Session, tokenizer, and neural-operation coverage is not
-owned here.
-
 #### Opt-in real-checkpoint loading verification
 
-The synthetic five-driver integration above stays required and unchanged. In
+The synthetic four-driver integration above stays required and unchanged. In
 addition, one explicit, default-off check loads a caller-supplied official
-checkpoint on the selected device of each existing backend conformance
+checkpoint on the selected device of each retained backend conformance
 executable. `test/CMakeLists.txt` owns the option and defines
-`IOM_TEST_REAL_MODEL_LOADING=1` for those five executables only:
+`IOM_TEST_REAL_MODEL_LOADING=1` for those four executables only:
 
 ```cmake
 option(IOM_TEST_REAL_MODEL_LOADING
@@ -4371,7 +3923,6 @@ created:
 | CUDA | `iom_cuda_conformance_tests` | `CUDA real model loading` |
 | ROCm | `iom_rocm_conformance_tests` | `ROCm real model loading` |
 | SYCL | `iom_sycl_conformance_tests` | `SYCL real model loading` |
-| TTNN | `iom_ttnn_conformance_tests` | `TTNN real model loading` |
 
 **Shared case.** The one case is
 `iom_conformance::run_real_model_loading(iom::Device&)` and the standard-GPU
@@ -4425,12 +3976,11 @@ unchanged; an unavailable enabled device fails its factory; and a synchronous
 upload failure keeps that backend's established category.
 
 **Ownership and storage.** Only the driver's selected device is used: CPU
-creates its destinations through the driver's own allocator, TTNN through its
-native per-plane storage with the `{0, 1}` requirement that consumes no
-workspace, and the standard GPUs through the caller-selected arena. No
-reference or foreign device receives a second copy of the full inventory, no
-equally large reference payload is built, and the source, the destinations, and
-any scratch stay alive through every call.
+creates its destinations through the driver's own allocator, and the retained
+accelerators use the caller-selected arena or queried workspace. No reference
+or foreign device receives a second copy of the full inventory, no equally
+large reference payload is built, and the source, the destinations, and any
+scratch stay alive through every call.
 
 **Evidence record.** Each case prints one evidence block to the run's standard
 output: the exact invocation (the process argv), the backend kind, the backend
@@ -4456,13 +4006,11 @@ for the ordinary suite, which needs none of these variables.
 | CUDA | `iom_cuda_conformance_tests` | `./build/test/iom_cuda_conformance_tests --test-case="*real model loading*"` |
 | ROCm | `iom_rocm_conformance_tests` | `./build/test/iom_rocm_conformance_tests --test-case="*real model loading*"` |
 | SYCL | `iom_sycl_conformance_tests` | `./build/test/iom_sycl_conformance_tests --test-case="*real model loading*"` |
-| TTNN | `iom_ttnn_conformance_tests` | `timeout 300s ./build/test/iom_ttnn_conformance_tests --test-case="*real model loading*"` |
 
 All accelerator commands execute only in their synchronized remote mirrors
-through `skill://csw-remote`, with the SYCL toolchain initialization and TTNN
-timeout rules of the sections above unchanged. Missing artifacts, missing
-hardware, or an unrun required gate prevents closure; none of them is a skip
-reason.
+through `skill://csw-remote`, with the SYCL toolchain initialization rules above
+unchanged. Missing artifacts, missing hardware, or an unrun required gate
+prevents closure; none of them is a skip reason.
 
 ### 11. Tokenizer and prompt boundary
 
@@ -4732,8 +4280,8 @@ live in `test/backend/backend_conformance_model_loading.hpp` with its
 `test/model_loading_fixture.hpp` checkpoint fixture, registered for CPU as the
 `CPU model loading*`. Backend-local targets are
 `iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
-`iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
-`iom_ttnn_conformance_tests`. The accelerator targets are registered by
+`iom_rocm_conformance_tests`, and `iom_sycl_conformance_tests`. The accelerator
+targets are registered by
 `add_iom_backend_tests`; the CPU conformance executable is created directly
 in `test/CMakeLists.txt` and is not created through that helper.
 `test/backend/test_backend_coexistence.cpp` and target
@@ -4760,8 +4308,8 @@ claim that the current backend drivers already contain or have run them.
 Each backend driver exercises ADD, MUL, SUB, and DIV through its real queue for
 every required leaf, as well as unsupported domains, validation precedence,
 broadcasting, transformed mappings, exact aliases, owner deduplication, repeat
-waits, and retained failures. CPU may complete inline; accelerator queues and
-TTNN staging/emulation preserve the same contract without SDK dtype narrowing.
+waits, and retained failures. CPU may complete inline; accelerator queues
+preserve the same contract without SDK dtype narrowing.
 
 CMake registration uses `add_iom_backend_tests` for the accelerator smoke and
 conformance targets; `iom_backend_conformance_cpu_tests` is created and
@@ -4817,10 +4365,8 @@ Use these sources when changing or extending the contract:
   `src/shared/standard_tiled_copy.inl` (`plane_slot`,
   `physical_coordinate`, and `copy_tiled_to_tiled_word`) and
   `src/shared/standard_tiled_copy_metadata.inl`;
-- TTNN padded-byte carrier mapping and workspace seams:
-  `src/ttnn/copy.cpp` (`padded_cell_index`, `submit_download_plane`,
-  `assemble_download_plane`, and `region_to_host`) and
-  `src/ttnn/device.cpp`;
+- retained accelerator workspace and storage rules:
+  this contract's standard tiled mapping and caller-owned workspace boundaries;
 - storage, transfer, copy, and physical oracle:
   `test/backend/backend_conformance_copy_storage.hpp`,
   `test/backend/backend_conformance_oracle.hpp`;
@@ -4834,7 +4380,6 @@ Use these sources when changing or extending the contract:
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and
-  `test/ttnn/test_ttnn_conformance.cpp`;
 - coexistence integration: `test/backend/test_backend_coexistence.cpp` and
   `test/CMakeLists.txt`.
 
@@ -4912,14 +4457,12 @@ bits, and uninitialized output bytes are outside the logical element set, and
 valid logical output MUST NOT depend on padding or uninitialized storage.
 
 Payload elements are copied as raw codes. Subbyte payloads are addressed at
-their logical bit width, so a standard-storage implementation reads and writes
-packed fields while a native-carrier implementation such as TTNN uses one whole
-carrier cell per logical element and masks only its logical width — and, for a
-64-bit element, two consecutive carrier cells holding the low and the high
-`uint32` word. A 64-bit payload occupies paired low/high `uint32` words, never
-floating arithmetic and never a shift by 64. Only `QuantizationFormat::NONE` is
-in scope: every other recognized quantization format is `Unsupported`, and this
-operation adds no quantization or storage format.
+their logical bit width, so standard storage reads and writes packed fields
+while preserving each logical cell's untouched carrier bits. A 64-bit element
+uses paired low/high `uint32` words, never floating arithmetic and never a
+shift by 64. Only `QuantizationFormat::NONE` is in scope: every other
+recognized quantization format is `Unsupported`, and this operation adds no
+quantization or storage format.
 
 #### Payload and index classification
 
@@ -4960,35 +4503,11 @@ which leaves that backend implements.
 | CUDA | all 23 | all 12 | `NONE` only |
 | ROCm | all 23 | all 12 | `NONE` only |
 | SYCL | all 23 | all 12 | `NONE` only |
-| TTNN (native) | 22: all except `F8_E8M0` | all 12 | `NONE` only |
 The CPU implementation covers all 23 payload and 12 integral index leaves for
 `QuantizationFormat::NONE`. It reports `{0,1}`, rejects positive
 `RawWorkspace` creation, executes gathers on the existing asynchronous FIFO
 worker with raw bit helpers, and defers queued negative or out-of-vocabulary
 IDs as repeatable `std::invalid_argument` failures after acceptance.
-
-The TTNN native row is final. Its 22 payload leaves and all 12 integral index
-leaves use the same carrier layout: one native `UInt32` column per logical
-element for every leaf of at most 32 bits, and two consecutive native columns —
-low word at column `2*f`, high word at `2*f+1` — for the `I64`, `U64`, and
-`F64` payloads and the `I64` and `U64` indices. A wide row index is valid only
-when its high word is zero and its low word is below `V`, which is the same
-condition as "nonnegative and `< V`" for a signed leaf whose sign bit lives in
-the high word. `F8_E8M0` remains an unsupported payload leaf, and the backend's
-carrier table does not store it.
-
-The TTNN native row is measured on the configured TTNN device by
-`iom_ttnn_conformance_tests` in `test/ttnn/test_ttnn_conformance.cpp`. With the
-final declaration above, `ctest --test-dir build/ttnn --output-on-failure
---timeout 300 -R '^iom_ttnn_conformance_tests$'` passed 1/1 in 55.66 s on the
-TTNN host (`bv1`, mirror `l11-wide-final-a1`), and a direct run of the same
-binary reported `test cases: 48 | 48 passed`, `assertions: 1863947 | 1863947
-passed`, and `Status: SUCCESS!` with a warm JIT cache. Those runs instantiate
-the 22 declared payload leaves with `U32` indices, all 12 index leaves with
-`BF16` payload, the targeted mixed 64-bit pairs, every directed 64-bit
-raw-code fixture, the high-word-only out-of-vocabulary fixtures, and the
-focused double-carrier case whose gathering, deferred failure, and proven
-status/workspace reuse all cross the doubled column space.
 
 No backend may advertise a capability it has not implemented. An `Unsupported`
 result, a storage-only observation, or a rejection-only probe is never
@@ -5065,7 +4584,7 @@ The rejection results are normative:
 #### Workspace and control-status protocol
 
 Successful requirements are exactly `{0,1}` for CPU and `{32,32}` for a
-supported accelerator (CUDA, ROCm, SYCL, and TTNN). CPU allocates no operation
+supported accelerator (CUDA, ROCm, and SYCL). CPU allocates no operation
 workspace and no device scratch, continues to reject creation of a positive
 `RawWorkspace`, and keeps the established zero-requirement semantics: a
 supplied but unused range is neither validated nor leased.
@@ -5106,7 +4625,7 @@ cell per fixed queue metadata slot and releases it through `cudaFreeHost` only
 when that queue-resource lease is proven safe. The worker interprets the cell
 only after event proof and caches a queued `std::invalid_argument`; native
 launch, transfer, and event failures retain precedence. These are inspected
-source/API facts, and the closing five-backend gate executed them on the
+source/API facts, and the retained-backend gate executed them on the
 configured CUDA device: `ctest --test-dir build --output-on-failure --timeout
 300 -R '^iom_cuda_conformance_tests$'` passed `1/1`, the direct binary reported
 `31/31` cases with `5,956,331/5,956,331` assertions, and its embedding cases
@@ -5123,8 +4642,8 @@ bounded 256-thread HIP gather, exactly one four-byte `hipMemcpyAsync` status
 transfer, and the completion event on the queue stream. `src/rocm/device.cpp`
 reserves one page-locked `hipHostMalloc` status cell per fixed queue metadata
 slot and releases it through `hipHostFree` only after the queue-resource lease
-has proven completion. These are inspected source/API facts, and the closing
-five-backend gate executed them on the configured ROCm device: `ctest
+has proven completion. These are inspected source/API facts, and the
+retained-backend gate executed them on the configured ROCm device: `ctest
 --test-dir build --output-on-failure --timeout 300 -R
 '^iom_rocm_conformance_tests$'` passed `1/1`, the direct binary reported `32/32`
 cases with `5,947,095/5,947,095` assertions, and its embedding cases alone
@@ -5132,16 +4651,6 @@ reported `2/2` cases with `117,046/117,046` assertions on `gfx1201`
 (`AMD Radeon AI PRO R9700`, HIP `7.15.26333-0000000`, AMD clang `23.0.0git`),
 including the deferred invalid-ID and repeated-wait cases that require the
 four-byte `hipMemcpyAsync` status transfer.
-
-TTNN transfers the entire 32-byte control packet. Its positive workspace is one
-real owning replicated DRAM `MeshBuffer` on the existing unit mesh, whose native
-page size is the checked request rounded up to a multiple of 32 while
-`byte_size()` remains exactly the caller-requested logical bytes. Each accepted
-call resets exactly `BufferRegion{owner_offset, 32}` once, gathers its planes in
-order, and then reads exactly that 32-byte region non-blockingly before host
-completion; only its first `uint32` is interpreted. A four-byte transfer for
-that region, a read of an oversized workspace owner, and any admission-side wait
-are contract violations.
 
 Proven native completion releases the status cell, packet, and workspace lease
 exactly once and permits safe reuse of independent scratch. Unknown completion,
@@ -5204,46 +4713,6 @@ existing asynchronous FIFO worker and moves raw bits with the existing
 `load_bits`/`store_bits`/`copy_value` helpers; it never uses a numeric codec. No
 implementation stages table, index, or output data on the host.
 
-The TTNN recipe is a raw device-native gather over the existing native carriers
-(`uint8`, `uint16`, `BF16`, `float32`, and `uint32` containers) and fixed
-DRAM-interleaved geometry. One reusable raw `MeshWorkload`/`Program` with one
-data-movement core and a fixed raw L1/circular-buffer capacity sized for the
-largest native tile (4096 bytes) serves every call; there is no compute kernel,
-type conversion, numeric decode, high-level gather, or shape-keyed program
-cache, and `TensorAccessorArgs::create_dram_interleaved()` fixes the topology
-without caller tensors. Native data is a 32x32 `TILE` of four row-major 16x16
-faces. For a logical carrier cell `(r,c)` with native carrier width
-`carrier_bytes`, the native tile and intra-tile byte offset are
-
-```text
-tile = (r / 32) * native_tile_columns + c / 32
-byte = (((r % 32) / 16 * 2 + (c % 32) / 16) * 256
-        + (r % 16) * 16 + (c % 16)) * carrier_bytes
-```
-
-and the second, wide carrier of a 64-bit element is the following logical
-column, which stays inside the same 16x16 face whenever the pair starts there.
-Each dispatch supplies runtime words for `V`, `R`, `F`, the native table, index,
-and output addresses, the carrier widths, the payload and index widths, the
-signed index marker, the native carrier factor of the table and index planes
-(one column per logical element, two for a 64-bit leaf), the padded column
-count, and the status owner's base, page size, and subrange; native data pages
-stay 1024, 2048, or 4096 bytes and the status owner uses its own full page size.
-Each logical feature copies its raw carrier cells from the table row's physical
-tile position to the output position, while physical padding stays non-logical.
-Index values are checked inside the data-movement core before any NoC page
-arithmetic: a 64-bit index reads both carrier words, treats a nonzero high word
-as out of range, and never narrows a rejected value to an addressable row. The
-core accumulates a monotone invalid-ID flag that it publishes with the required
-NoC barrier, so ordered plane launches preserve earlier flags without a
-cross-core atomic protocol. Leading planes are iterated on the host from the
-immutable submission snapshots, without reading values or allocating a plane
-list, and native submission reuses the existing unit-mesh device mutex.
-
-The public `ttnn::embedding` operator is not suitable for this contract: it is
-`ROW_MAJOR`/`BF16`-only, performs layout conversion, and leaves out-of-range IDs
-unchecked.
-
 #### Independent reference and conformance obligations
 
 The independent reference MUST separately encode the table as row-major raw
@@ -5284,53 +4753,41 @@ fixture chooses a representable ID code.
 The cases live in the shared header
 `test/backend/backend_conformance_embedding.hpp` and run through the existing
 `iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
-`iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
-`iom_ttnn_conformance_tests` drivers. No second test project, generic test
-framework, model fixture, checkpoint, or network dependency is permitted. Each
-driver supplies its own explicit expected payload and index spans, and common
-code never switches on backend kind. An unported backend keeps an empty
-embedding span and asserts `Unsupported` only; that rejection probe is not
-gather conformance. The existing copy/add/mul/sub/div suites and the `silu`
-and `sdpa` `Unsupported` probes remain unchanged until their own operation
-leaves migrate them; the `linear` probes were migrated by the five linear
-leaves, and RMSNorm now has backend-owned CUDA and ROCm
-launch wrappers, while its shared conformance helper remains task-owned.
+`iom_rocm_conformance_tests`, and `iom_sycl_conformance_tests` drivers. No
+second test project, generic test framework, model fixture, checkpoint, or
+network dependency is permitted. Each driver supplies its own explicit expected
+payload and index spans, and common code never switches on backend kind. An
+unported backend keeps an empty embedding span and asserts `Unsupported` only;
+that rejection probe is not gather conformance.
 
-Each driver declares through `iom_conformance::EmbeddingDeclaration` the
-payload and index matrix its port must reach, the leaves this revision
+Each retained driver declares through `iom_conformance::EmbeddingDeclaration`
+the payload and index matrix its port must reach, the leaves this revision
 implements (both spans empty for an unported port), and its exact workspace
-requirement (`{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and TTNN). The
-matrix drives the shared fixtures, so a case exists exactly for a leaf the port
-must reach; `iom_conformance::kEmbeddingPayloadSpan`,
-`iom_conformance::kEmbeddingIdSpan`, and
-`iom_conformance::kEmbeddingTtnnPayloadSpan` are the standard 23/12 matrix and
-the final TTNN 22/12 native row, and `iom_conformance::kNoEmbeddingSpan` is the
-empty implemented span of an unported port. Entry points are
-`iom_conformance::run_embedding_conformance` (self-check, declared request
-cases, and common admission/ownership/queue/failure cases),
+requirement. The matrix drives the shared fixtures, so a case exists exactly
+for a leaf the port must reach; `iom_conformance::kEmbeddingPayloadSpan`,
+`iom_conformance::kEmbeddingIdSpan`, and `iom_conformance::kNoEmbeddingSpan`
+are the standard matrix and empty-port span. Entry points are
+`iom_conformance::run_embedding_conformance`,
 `iom_conformance::run_embedding_oracle_self_check`,
 `iom_conformance::run_embedding_reference_conformance`, and
 `iom_conformance::run_embedding_common_conformance`, and the driver cases are
 the `embedding lookup reference, admission, and lifetime` cases of
 `test/cpu/test_cpu_conformance.cpp`, `test/cuda/test_cuda_conformance.cpp`,
-`test/rocm/test_rocm_conformance.cpp`, `test/sycl/test_sycl_conformance.cpp`,
-and `test/ttnn/test_ttnn_conformance.cpp`.
+`test/rocm/test_rocm_conformance.cpp`, and
+`test/sycl/test_sycl_conformance.cpp`.
 
 Every rule in this section MUST be observable through the shared conformance
 suite or through a focused native lifetime and control-transfer scenario; tests
-assert behavior rather than field forwarding, source text, or incidental message
+assert behavior rather than field forwarding, source text, or incidental
 wording.
+#### Same-revision retained-backend gate evidence
 
-#### Same-revision five-backend gate evidence
-
-The closing Embedding gate ran every backend's existing conformance target and
-its direct binary at one revision — `5f839f10`, prepared worktree
-`.work/006-tinyllama/03-embedding-lookup/12-embedding-five-backend-gate` — and
-recorded the device, runtime, and toolchain identity of each run. The CPU pair
-ran locally; every accelerator pair used exact-worktree `csw-remote` sync/exec
-with a fresh sync immediately before each execution, a unique per-profile
-mirror, remote-side `timeout --kill-after=30s`, and a bounded hardware lock,
-and the TTNN invocation kept its 300-second CTest bound. No `.cswd` metadata
+The closing Embedding gate ran every retained backend's existing conformance
+target and its direct binary at one revision and recorded the device, runtime,
+and toolchain identity of each run. The CPU pair ran locally; every
+accelerator pair used exact-worktree `csw-remote` sync/exec with a fresh sync
+immediately before each execution, a unique per-profile mirror, remote-side
+`timeout --kill-after=30s`, and a bounded hardware lock. No `.cswd` metadata
 was copied to any host. Every row below is a real run: nothing in it is
 compile-only, storage-only, rejection-only, or skipped.
 
@@ -5340,87 +4797,29 @@ compile-only, storage-only, rejection-only, or skipped.
 | CUDA | both commands on remote host `bv1` (mirror `csw03emb12-a1-cuda`) | `NVIDIA GeForce RTX 5090`, compute capability `12.0`, driver `595.71.05`, `nvcc` release `13.2` build `V13.2.78` | `1/1` CTest pass in `16.33 s`; `31/31` cases, `5,956,331/5,956,331` assertions; embedding cases `2/2` cases, `117,047/117,047` assertions |
 | ROCm | both commands on remote host `bv2` (mirror `csw03emb12-a1-rocm`) | `gfx1201` (`AMD Radeon AI PRO R9700`), HIP `7.15.26333-0000000`, AMD clang `23.0.0git` | `1/1` CTest pass in `20.78 s`; `32/32` cases, `5,947,095/5,947,095` assertions; embedding cases `2/2` cases, `117,046/117,046` assertions |
 | SYCL | both commands on remote host `bv2` through the outside-checkout profile override with an empty `REMOTE_SETUP`, `set +u; source /opt/intel/oneapi/setvars.sh; set -u` and a `sycl-ls` GPU enumeration in every remote call (mirror `csw03emb12-a1-sycl`) | Level Zero V2 `Intel(R) Arc(TM) Pro B60 Graphics`, oneAPI DPC++/C++ `2026.1.0`, `ocloc` `26.22.38646.7` | `1/1` CTest pass in `6.83 s`; `29/29` cases, `5,907,297/5,907,297` assertions; embedding cases `4/4` cases, `117,124/117,124` assertions |
-| TTNN | `ctest --test-dir build/ttnn --output-on-failure --timeout 300 -R '^iom_ttnn_conformance_tests$'` and the direct binary on remote host `bv1` (mirror `csw03emb12-a1-ttnn`) | Blackhole device 0, UMD firmware bundle `19.13.1`, TT-Metalium `v0.76.0-dev20260801-268-g06994d4afda` (`06994d4afda`) | `1/1` CTest pass in `33.63 s`; `48/48` cases, `1,863,947/1,863,947` assertions; embedding cases `3/3` cases, `116,723/116,723` assertions |
 
 Each sync and exec pair, with its exact argv and observed exit status, is
-retained in
-`.cswd/tasks/006-tinyllama/03-embedding-lookup/12-embedding-five-backend-gate/remote.log`;
-the remote-side logs named there hold the full run output.
+retained in the gate task's `remote.log` beside its specification in the
+shared task store; the remote-side logs named there hold the full run output.
 
-**Matrix closure.** The four standard drivers declare and reach the complete
+**Matrix closure.** The four retained drivers declare and reach the complete
 23-payload and 12-index matrix through `kEmbeddingPayloadSpan` and
-`kEmbeddingIdSpan`, and the TTNN driver declares and reaches its 22-payload,
-12-index native row through `kEmbeddingTtnnPayloadSpan`. This gate adds no case,
-no span, and no second test project: the runs above are the existing shared
-cases plus each driver's own native cases. `BF16` and `R=1`, `15`, `16`, and
-`17` execute on every backend inside those declared cases, because the derived
-fixtures pair every declared payload leaf with `U32` indices, pair the declared
-`BF16` payload with every index leaf, and vary `R`, the feature extent, the
-vocabulary, and the leading planes with `BF16` as the default payload. TTNN's
-only payload outside its row is `F8_E8M0`: the canonical TTNN storage span omits
-it, the storage case asserts that `create_tensor` throws for it while all
-twenty-two other leaves succeed, and the embedding declaration therefore holds
-no `F8_E8M0` case. No other leaf, shape, or backend was excluded, and no
-`Unsupported`-only, storage-only, or compile-only observation is counted
-anywhere in the table.
+`kEmbeddingIdSpan`. `BF16` and `R=1`, `15`, `16`, and `17` execute inside those
+declared cases, with independent planes, padding isolation, and checked
+failure behavior. Unsupported-only, storage-only, and compile-only
+observations are not counted.
 
-**Lifetime, workspace, and queue obligations observed by the same runs.** The
-shared `run_embedding_conformance` cases behind every row above cover the
-independent raw-bit oracle and its deliberate wrong-row, transposed,
-padded-table, numeric-re-encoding, and plane-blind negative variants; the
-declared request matrix with repeated IDs, first and last vocabulary rows,
-non-tile features, vocabulary boundaries, independent leading offsets, steps,
-and permutations through rank eight, a selected rank-two table plane, and
-poisoned native and output padding; accepted out-of-vocabulary and negative IDs
-including the `U64_MAX`, `I64_MIN`, and high-word-only classes, together with
-the directed 64-bit payload codes that cross `2^53` and carry both carrier
-words; repeated waits caching the same `std::invalid_argument`; the pure
-requirement query with no record, submission, registration, lease, or sequence
-consumption; positive-workspace validation, disjoint-range coexistence,
-overlapping live lease, stale and foreign range, and proven-completion reuse;
-output/input alias and overlap rejection with input/input read aliasing allowed;
-the producer copy to embedding to output consumer FIFO order; and
-unknown-completion quarantine with release only after native proof. The declared
-workspace rows are `{0, 1}` on CPU and `{32, 32}` on CUDA, ROCm, SYCL, and TTNN,
-whose first `uint32` is the bounds status (`0` valid, `1` invalid ID) and whose
-remaining 28 bytes are reserved control padding the caller neither initializes
-nor polls.
+**Lifetime and queue obligations.** The shared cases cover the independent
+raw-bit oracle, transformed leading planes through rank eight, padded-table
+invariance, accepted out-of-vocabulary and negative IDs, repeated waits,
+pure requirement queries, workspace validation and reuse, output/input alias
+rejection, producer-to-consumer FIFO order, and unknown-completion quarantine.
+The retained-backend control/status and workspace implementations own their
+backend-specific transfer details while preserving the common contract.
 
-**Status-transfer and execution-style evidence.** The standard accelerators
-transfer exactly four status bytes: the shared
-`src/shared/gpu_queue_operations.inl` path that CUDA and ROCm instantiate resets
-the device status word, launches the bounded gather, copies back
-`sizeof(std::uint32_t)` through `cudaMemcpyAsync`/`hipMemcpyAsync`, and records
-the completion event in FIFO order on the in-order queue. On SYCL the run
-executes the native gather declared in `src/sycl/embedding.cpp`: the status
-reset and the four-byte status copy are queue submissions that explicitly
-depend on the preceding event in `src/sycl/queue_embedding.cpp`, the built
-conformance binary carries the `launch_embedding_words` kernel symbol
-(31 occurrences) and no `host_task` occurrence, and the only `host_task` in the
-whole source tree is the unrelated SYCL binary-operation host realization in
-`src/sycl/queue_binary.cpp`. The deferred device-side invalid-ID failures the
-run asserts are reachable only when the native kernel writes the status word
-and the event-ordered copy delivers it, because no host scan of queued indices
-exists on this path. TTNN transfers the complete 32-byte control packet, and
-its run observed the raw Metal route rather than a high-level operator: with the
-Metalium build logger enabled (`TT_METAL_LOGGER_LEVEL=debug
-TT_METAL_LOGGER_TYPES=BuildKernels`) the focused TTNN embedding cases report
-`JIT build cache hit:
-.../kernels/embedding/16918367578600865223/ncrisc/ncrisck.o`, so the
-data-movement (`ncrisc`) kernel built from `src/ttnn/kernels/embedding.cpp` is
-what the device executes; `EmbeddingProgram` creates the program, circular
-buffer, and reader kernel through `CreateProgram`/`CreateKernel` and dispatches
-them with `EnqueueMeshWorkload`, and the status owner is read back as exactly
-`BufferRegion{owner_offset, 32}` through `enqueue_read_shards`. The public
-`ttnn::embedding` operator appears nowhere in the tree, so no high-level,
-host-emulated, or BF16-only substitution took place.
-
-**No defect.** Every recorded run passed with zero failures, so this gate
-corrected no normative statement, weakened no comparison, and changed no case,
-span, declaration, or implementation file: the section, the shared header, and
-the five drivers already match the exercised behavior, and the previously
-completed ports were revalidated by these same runs rather than by an unrun
-obligation.
+**No defect.** The retained-backend gate changes no normative statement or
+implementation file; it records only the existing shared cases and each
+driver's declared matrix.
 
 #### Implementation references and delivery prerequisites
 
@@ -5442,13 +4841,9 @@ Implementers need these existing sources and seams:
   `src/shared/event_ring.hpp`;
 - CPU asynchronous worker and raw bit movement: `src/cpu/queue.cpp` and
   `src/cpu/transfer_helpers.hpp`;
-- TTNN native carriers, storage, queue, and workspace:
-  `src/ttnn/device_types.cpp`, `src/ttnn/device.cpp`,
-  `src/ttnn/device_internal.hpp`, `src/ttnn/registry_state.hpp`,
-  `src/ttnn/queue_internal.hpp`, and `src/ttnn/copy.cpp`;
-- TT-Metal raw path: `mesh_buffer.hpp`, `buffer.hpp`,
-  `tensor_accessor_args.hpp`, `tensor_accessor.h`, and `dataflow_api.h` under
-  the installed `tt-metalium` API and hardware headers;
+- accelerator capability classification, queues, and storage:
+  `src/cuda/copy.hpp`, `src/cuda/copy.cu`, `src/rocm/copy.hpp`,
+  `src/rocm/copy.hip`, `src/sycl/queue_internal.hpp`, and `src/sycl/queue.cpp`;
 - accelerator status APIs: the CUDA Runtime memory interface (`cudaHostAlloc`,
   `cudaFreeHost`, and `cudaMemcpyAsync`), `hip/hip_runtime_api.h` page-locked
   allocation and asynchronous copy, and the SYCL USM, queue, and `atomic_ref`
@@ -5456,13 +4851,12 @@ Implementers need these existing sources and seams:
 - independent storage oracle and conformance drivers:
   `test/backend/backend_conformance_oracle.hpp`,
   `test/backend/backend_conformance_common.hpp`,
-  `test/backend/backend_conformance_memory.hpp`, the five
+  `test/backend/backend_conformance_memory.hpp`, the four retained
   `test/<backend>/test_<backend>_conformance.cpp` drivers, and
   `test/CMakeLists.txt`.
 
-The shared raw-word embedding sources, the TTNN carrier/queue/workspace
-sources, and the five conformance drivers named above are the delivered
-implementation and test surface of this section.
+The shared raw-word embedding sources and the four retained conformance
+drivers are the delivered implementation and test surface of this section.
 
 The genuine prerequisites and the final closure are producer/consumer
 relationships, not a fixed serial backend order:
@@ -5471,20 +4865,19 @@ relationships, not a fixed serial backend order:
    and requirement-query declarations with `Unsupported` defaults;
 2. the independent raw-bit reference and the shared embedding conformance
    header, before any backend claims numerical conformance;
-3. the per-backend port, which for TTNN required the caller-owned
-   positive workspace and its 32-byte status owner before the native
-   one-carrier port, and then the double-carrier completion; and
-4. the shared five-backend gate, which closes Embedding lookup before linear
-   implementation begins and revalidates already completed ports if a later
-   backend exposes a contract defect.
+3. the per-backend port, which owns its caller-provided workspace and status
+   transfer requirements; and
+4. the shared retained-backend gate, which closes Embedding lookup before
+   linear implementation begins and revalidates already completed ports if a
+   later backend exposes a contract defect.
 
-CPU, CUDA, ROCm, SYCL, and TTNN appear in that order only as the task-list and
-scheduling order. This contract imposes no serial CPU-to-TTNN execution
-requirement: accelerator ports may proceed independently once the shared ABI,
-admission, and reference prerequisites exist, and an unported backend names its
-missing evidence instead of inventing capability. This section records the
-frozen target and the obligations of implementers; it claims no build, test,
-accelerator, hardware, or runtime validation on any backend.
+CPU, CUDA, ROCm, and SYCL appear in the task-list and scheduling order only.
+This contract imposes no serial backend execution requirement: accelerator ports
+may proceed independently once the shared ABI, admission, and reference
+prerequisites exist, and an unported backend names its missing evidence instead
+of inventing capability. This section records the frozen target and obligations
+of implementers; it claims no build, test, accelerator, hardware, or runtime
+validation on any backend.
 
 ### Linear projections
 
@@ -5717,136 +5110,41 @@ subsection.
 Applicability is exactly the 21 leaves above, and the matrix below is the
 complete leaf-by-backend capability record.
 
-| Leaf | Contract | CPU | CUDA | ROCm | SYCL | TTNN |
-| --- | --- | --- | --- | --- | --- | --- |
-| `BOOL` | inapplicable | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-| `I2`, `U2` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `I4`, `U4` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `I8`, `U8` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `I16`, `U16` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `I32`, `U32` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `I64`, `U64` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F4_E2M1` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F6_E2M3` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F6_E3M2` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F8_E4M3FN` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F8_E5M2` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F8_E8M0` | inapplicable | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
-| `F16` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `BF16` | applicable | supported | supported | supported | supported | supported |
-| `F32` | applicable | supported | supported | supported | supported | `Unsupported` |
-| `F64` | applicable | supported | supported | supported | `aspect::fp64` only | `Unsupported` |
+| Leaf | Contract | CPU | CUDA | ROCm | SYCL |
+| --- | --- | --- | --- | --- | --- |
+| `BOOL` | inapplicable | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+| `I2`, `U2` | applicable | supported | supported | supported | supported |
+| `I4`, `U4` | applicable | supported | supported | supported | supported |
+| `I8`, `U8` | applicable | supported | supported | supported | supported |
+| `I16`, `U16` | applicable | supported | supported | supported | supported |
+| `I32`, `U32` | applicable | supported | supported | supported | supported |
+| `I64`, `U64` | applicable | supported | supported | supported | supported |
+| `F4_E2M1` | applicable | supported | supported | supported | supported |
+| `F6_E2M3` | applicable | supported | supported | supported | supported |
+| `F6_E3M2` | applicable | supported | supported | supported | supported |
+| `F8_E4M3FN` | applicable | supported | supported | supported | supported |
+| `F8_E5M2` | applicable | supported | supported | supported | supported |
+| `F8_E8M0` | inapplicable | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` |
+| `F16` | applicable | supported | supported | supported | supported |
+| `BF16` | applicable | supported | supported | supported | supported |
+| `F32` | applicable | supported | supported | supported | supported |
+| `F64` | applicable | supported | supported | supported | `aspect::fp64` only |
 
-CPU, CUDA, ROCm, and SYCL implement all 21 semantic leaves. On CUDA, ROCm, and
-SYCL the scalar path covers the 20 non-BF16 leaves and a separate native BF16
-specialization covers `BF16`; on CPU, `BF16` uses the scalar recurrence above.
-SYCL reports `F64` `Unsupported` at runtime unless the device reports
-`aspect::fp64`; that gate is a genuine device fact. TTNN implements mandatory
-`BF16` only and explicitly rejects the other 20 applicable leaves, because its
-native TILE compute cannot consume the encoded carriers of those leaves without
-the forbidden host staging. `BF16` weights, activations, and caches remain
-mandatory on all five backends.
-
-**TTNN direct Metalium `BF16` route.** `src/ttnn/linear.hpp`,
-`src/ttnn/linear.cpp`, and the `linear_reader`, `linear_compute`, and
-`linear_writer` kernels in `src/ttnn/kernels/` implement the mandatory `BF16`
-leaf as a direct per-plane Metalium program family on the existing unit mesh:
-the reader gathers the selected `x[...,s:s+R,I]` rows and the Hugging Face
-`w[O,I]` rows out of the caller's own native DRAM planes into the `in0`/`in1`
-operand tiles, the matrix engine accumulates every inner tile in the FP32
-destination register through the native matmul facility, and one output pack
-performs the single BF16 round-to-nearest-ties-to-even store into the caller's
-own output plane. The route allocates no tensor, stages nothing through host
-memory, transposes no tensor, and consumes no workspace, so
-`linear_workspace_requirements` stays `{0, 1}` for `BF16`, the queue keeps the
-same FIFO, owner-registration, fence, and completion machinery, and every other
-applicable leaf remains an explicit capability rejection.
-
-**Observed TTNN nonfinite limitation.** That facility's native matrix multiply
-does not reproduce this contract's nonfinite classes when an operand is itself
-nonfinite or when the product's exponent leaves the accumulator's range.
-Executed through this route with BF16 operands and `{0, 1}` workspace,
-`inf*inf`, `huge_finite*inf`, `inf*huge_finite`, and `1.7e38*1.7e38` all
-return `+0` where the contract's FP32 recurrence returns `+inf`, and a `NaN`
-operand returns `+inf` where the recurrence returns `NaN`; finite products,
-finite overflow (`max_finite*max_finite -> +inf`), `inf*finite(1) -> +inf`, and
-signed zero agree with the recurrence. The behavior is independent of
-`fp32_dest_acc_en`, so it is an unpack/multiply property of the facility rather
-than a port or destination-accumulate defect. The shared `BF16` fixture
-deliberately places `x = 3.38953e38` and `w = +inf` in the same inner row, so
-`canonical I=3 O=10 H=2 D=5 T=19 s=2 R=1 ordinary` exercises both declared
-limitations on this backend: the elements those declarations cover are
-observed and counted rather than asserted, and every other element of that case
-is still compared under the unchanged tolerances. Before the declarations
-existed, a strict run of the same case failed exactly one of its assertions
-with 1,505,991 of the TTNN conformance target's 1,505,992 assertions passing;
-that pre-declaration measurement is the history that motivated the two `false`
-flags, not the current state of the suite. A port whose facility cannot express these classes
-records the measured limitation in its `LinearDeclaration`
-(`nonfinite_classes_asserted = false`) instead of failing conformance: the
-shared comparison then still checks every finite expectation under the
-unchanged tolerances, still requires the observed element from accepted queued
-work, and observes a nonfinite expected class rather than asserting it, and it
-counts every element it observes that way in a `LinearComparisonRecord`. The
-TTNN declaration sets that flag from the measured table below, and it also
-sets `subnormal_operands_preserved = false` from the separate subnormal table
-further below; CPU, CUDA, ROCm, and SYCL keep both defaults (`true`) and their
-unchanged class and finite assertions, so these two exceptions are TTNN-only
-and no other backend may carry them.
-Until a developer decision changes the fixture, the obligation, or the
-facility, the TTNN `BF16` linear leaf is implemented and exercised with both
-measured limitations recorded, and it is not reported as supported numerical
-conformance for the affected classes and elements. The residual
-subnormal-operand deviation recorded below is the finite deviation the
-`subnormal_operands_preserved = false` declaration observes rather than
-asserts, so the port remains short of full numerical conformance for that
-element until a developer decision addresses that second facility limitation.
-At the five-backend gate revision the TTNN conformance target passes `47/47`
-cases with `1,859,192/1,859,192` assertions, of which the linear projection
-case contributes `1,449,065`; that case also requires both declarations to stay
-live (`skips.nonfinite_elements > 0` and `skips.subnormal_elements > 0`), so
-the two flags cannot rot into dead declarations.
-
-**Facility class expressibility (measured).** Probing one `32x32x32` matrix
-operation per case through this same route, with `MathFidelity::HiFi4` under
-both `fp32_dest_acc_en` settings, the facility agrees with the contract's FP32
-FMA rule for `inf*finite(1) -> ±inf`, `inf + inf -> +inf`,
-`max_finite*max_finite -> +inf`, and subnormal underflow, and disagrees where
-the rule requires an infinity from a nonfinite or extreme operand
-(`inf*inf`, `max_finite*inf`, `inf*max_finite`, and `1.7e38*1.7e38` all return
-`+0` instead of `+inf`), where it requires `NaN` (`inf*0`, `0*inf`,
-`inf + (-inf)`, and `max*max + (-max*max)` return `+0` instead of `NaN` or
-`-inf`), and for every `NaN` operand, which returns `+inf` instead of `NaN`.
-No tested operand encoding produces a `NaN` output at all, so no selection over
-the facility's own outputs can synthesize that class; an implementation that
-wanted these classes would have to detect nonfinite operands and inject the
-class outside the matrix facility, which is an elementwise substitute in the
-sense of
-[Native matrix evidence obligations](#native-matrix-evidence-obligations) and
-is therefore not accepted as native TTNN evidence.
-
-**Facility subnormal handling (measured).** The same facility flushes
-subnormal operands to zero before the multiply: `1.0` times the largest BF16
-subnormal (`0x007f` = `1.16631e-38`, whose FP32 product `1.16631e-38` is
-normal) returns `+0`, and `max_finite` times that subnormal returns `+0` where
-the rule gives `3.95325`; `min_normal` (`0x0080` = `1.17549e-38`) and larger
-operands multiply correctly, and a subnormal-times-subnormal product
-underflows to zero under both rules. A request whose inner sum contains such a
-product is therefore a finite-value deviation, not a nonfinite class, and the
-`nonfinite_classes_asserted` declaration does not cover it. Measured through
-the same production route with `MathFidelity::HiFi4` and `fp32_dest_acc_en`
-true.
+CPU, CUDA, ROCm, and SYCL implement all 21 semantic leaves. On CUDA, ROCm,
+and SYCL the scalar path covers the 20 non-BF16 leaves and a separate native
+BF16 specialization covers `BF16`; on CPU, `BF16` uses the scalar recurrence
+above. SYCL reports `F64` `Unsupported` at runtime unless the device reports
+`aspect::fp64`; that gate is a genuine device fact. `BF16` weights, activations,
+and caches remain mandatory on all four retained backends.
 
 Missing implementation is never unsupported hardware. An unported backend or
 leaf reports `Unsupported` as missing capability and names its missing
 evidence; no backend may advertise a capability it has not implemented, and a
 rejection-only probe, a storage-only observation, or a host or elementwise
 substitute is never linear conformance. The per-backend native feasibility
-records remain the
-[CUDA](#tinyllama-forward-layout--cuda-matrix-feasibility),
-[ROCm](#tinyllama-forward-layout--rocm-matrix-feasibility),
-[SYCL](#tinyllama-forward-layout--sycl-matrix-feasibility), and
-[TTNN](#tinyllama-forward-layout--ttnn-matrix-feasibility) matrix records.
+records remain the [CUDA](#tinyllama-forward-layout--cuda-matrix-feasibility),
+[ROCm](#tinyllama-forward-layout--rocm-matrix-feasibility), and
+[SYCL](#tinyllama-forward-layout--sycl-matrix-feasibility) matrix records.
 
 #### Workspace requirements and packed-writer ownership
 
@@ -5860,28 +5158,23 @@ round-up of `n` to a multiple of 32, which is the alignment those paths report.
 | CPU, every applicable leaf | `{0, 1}` |
 | CUDA, every applicable leaf | `{0, 1}` |
 | ROCm, the 20 scalar leaves | `{0, 1}` |
-| SYCL, the 20 scalar leaves | `{0, 1}` |
 | ROCm `BF16` | alignment 32, bytes `A32(P*pad16(R)*pad16(I)*2) + A32(P*pad16(R)*pad16(O)*2)` |
+| SYCL, the 20 scalar leaves | `{0, 1}` |
 | SYCL `BF16` | alignment 32, bytes `A32(P*pad16(R)*pad16(O)*4)` |
-| TTNN `BF16` | `{0, 1}` |
 
 A `{0, 1}` requirement means only the empty `RawWorkspaceView{}` is
-admissible, and a supplied owner is `InvalidArgument` before dispatch. For
-TTNN `BF16` that is the frozen direct-reader and direct-writer route: the
-operation advertises no packed operand or product region, and a route that
-needed one would require changing this contract instead of silently reporting
-a different query result. Where the requirement is positive, the range MUST be
-a live exact-device owner range, 32-byte aligned, at least the reported bytes,
-disjoint from every operand and from the output, and leased through proven
-completion; owner-absolute subranges
-are checked and 32-byte aligned, disjoint aligned ranges may be used
-concurrently, and overlapping live leases reject with `ResourceExhausted`. The
-positive range is caller-owned staging only: it carries no control packet, so
-no status word is reset, transferred, or interpreted, and no operand, weight,
-or result is staged on the host or inside a library's hidden internal
-workspace. Proven completion releases the lease and permits safe reuse of
-independent scratch; unknown completion retains or quarantines the range
-instead of reusing it.
+admissible, and a supplied owner is `InvalidArgument` before dispatch. Where
+the requirement is positive, the range MUST be a live exact-device owner
+range, 32-byte aligned, at least the reported bytes, disjoint from every
+operand and from the output, and leased through proven completion. Owner-
+absolute subranges are checked and 32-byte aligned, disjoint aligned ranges
+may be used concurrently, and overlapping live leases reject with
+`ResourceExhausted`. The positive range is caller-owned staging only: it
+carries no control packet, so no status word is reset, transferred, or
+interpreted, and no operand, weight, or result is staged on the host or inside
+a library's hidden internal workspace. Proven completion releases the lease
+and permits safe reuse of independent scratch; unknown completion retains or
+quarantines the range instead of reusing it.
 
 **Packed sub-byte ownership.** The `I2`, `U2`, `I4`, `U4`, `F4_E2M1`,
 `F6_E2M3`, and `F6_E3M2` leaves are stored packed at their logical width. Every
@@ -5945,15 +5238,13 @@ failure with repeated waits, and scratch reuse after proven drain.
 The cases live in the shared header
 `test/backend/backend_conformance_linear.hpp` and run through the existing
 `iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
-`iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
-`iom_ttnn_conformance_tests` drivers. No second test project, generic test
-framework, model fixture, checkpoint, or network dependency is permitted, and
-common code never switches on backend kind. An unported backend keeps an empty
-linear span and asserts `Unsupported` for every applicable leaf; that rejection
-probe is not projection conformance. Each of the five ports migrated its own
-`linear` `Unsupported` probe when it landed, so no driver keeps a blanket
-linear rejection probe today, while the unrelated copy/add/mul/sub/div suites
-remain unchanged.
+`iom_rocm_conformance_tests`, and `iom_sycl_conformance_tests` drivers. No
+second test project, generic test framework, model fixture, checkpoint, or
+network dependency is permitted, and common code never switches on backend kind.
+An unported backend keeps an empty linear span and asserts `Unsupported` for
+every applicable leaf; that rejection probe is not projection conformance.
+Each retained port owns its own `linear` capability probe, while the unrelated
+copy/add/mul/sub/div suites remain unchanged.
 
 The fixture provenance and case links of that header are:
 
@@ -6091,40 +5382,18 @@ reported as unimplemented rather than supported. Supported or unsupported
 conclusions are recorded separately for `R=1`, `15`, `16`, and `17`, and each
 of those conclusions must come from real execution. CPU scalar, host,
 elementwise, and emulated substitutes are never native evidence for CUDA, ROCm,
-SYCL, or TTNN. Accelerator verification follows the `csw-remote` procedure, and
-TTNN verification uses a 300-second timeout.
+or SYCL. Accelerator verification follows the `csw-remote` procedure with
+finite deadlines.
 
-**Observed TTNN `BF16` evidence.** Remote executions used profile `ttnn`
-(mirror `cswrun-20260918-04lp-11-ttnn-v1`) with `csw-remote-sync` immediately
-before every `csw-remote-exec`, remote-side `timeout --kill-after=30s`, and a
-bounded `flock -w` hardware lock, against the installed Blackhole (device 0,
-UMD firmware bundle `19.13.1`, TT-Metalium
-`v0.76.0-dev20260801-268-g06994d4afda`, `TT_METAL_HOME` from the profile's
-`ttnn_env.sh`). The gate command is
-`ctest --test-dir build/ttnn --output-on-failure --timeout 300 -R "^iom_ttnn_conformance_tests$"`.
-Layout: ordinary and head-planar planes, rank two through eight, `I=3`,
-`O=10`, `H=2`, `D=5`, `T=19`, `s=2`, native padded tile grid `32 x 32` rows
-and columns per plane with the `I=65` fixture spanning three inner tile
-columns, workspace `{0, 1}`. Kernel symbols: `linear_reader`,
-`linear_compute` (the matrix facility on one Tensix core, one `MeshWorkload`
-per output plane), and `linear_writer`. Real accepted submissions: `R=1`,
-`R=15`, `R=16`, and `R=17` each returned a positive OID (queue 1, sequence 1:
-`36028797018963969`) and completed with zero mismatches against an independent
-host FP64 reference under the contract's BF16 bound; the shared canonical
-`R=1` case reaches the device with exactly the elements the two declared
-facility limitations cover observed and counted rather than asserted, which
-the TTNN driver pins with `skips.nonfinite_elements > 0` and
-`skips.subnormal_elements > 0`.
+#### Same-revision retained-backend gate evidence
 
-#### Same-revision five-backend gate evidence
-
-The closing Linear-projections gate ran every backend's conformance target and
-its direct binary at one revision, from one prepared task worktree, and
-recorded the device, runtime, and toolchain identity of each run. The CPU pair
-ran locally; every accelerator pair used exact-worktree `csw-remote`
+The closing Linear-projections gate ran every retained backend's conformance
+target and its direct binary at one revision, from one prepared task worktree,
+and recorded the device, runtime, and toolchain identity of each run. The CPU
+pair ran locally; every accelerator pair used exact-worktree `csw-remote`
 sync/exec with a fresh sync immediately before each execution, remote-side
-`timeout --kill-after=30s`, and a bounded hardware lock, and the TTNN pair kept
-its 300-second bound. The observed results are:
+`timeout --kill-after=30s`, and a bounded hardware lock. The observed results
+are:
 
 | Backend | Commands | Device / runtime identity | Observed result |
 | --- | --- | --- | --- |
@@ -6132,13 +5401,11 @@ its 300-second bound. The observed results are:
 | CUDA | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_cuda_conformance_tests$'` and the direct binary on remote `bv1` | `NVIDIA GeForce RTX 5090`, compute capability `12.0`, driver `595.71.05`, `nvcc` release `13.2` build `V13.2.78` | `31/31` cases, `5,954,449/5,954,449` assertions, `1/1` CTest pass |
 | ROCm | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_rocm_conformance_tests$'` and the direct binary on remote `bv2` | `gfx1201` (`AMD Radeon AI PRO R9700`), HIP `7.15.26333-0000000`, AMD clang `23.0.0git` | `32/32` cases, `5,945,213/5,945,213` assertions at the recorded run (one other identical run reported `5,945,212`; no case failed in any run), `1/1` CTest pass |
 | SYCL | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_(conformance\|smoke)_tests$'` and the direct binary on remote `bh2` | Level Zero V2 `Intel(R) Arc(TM) Pro B60 Graphics`, oneAPI DPC++/C++ `2026.1.0`, `ocloc` `26.22.38646.7` | `29/29` cases, `5,905,415/5,905,415` assertions, `2/2` CTest pass including the smoke target |
-| TTNN | `ctest --test-dir build/ttnn --output-on-failure --timeout 300 -R '^iom_ttnn_conformance_tests$'` and the direct binary on remote `bv1` | Blackhole device 0, UMD firmware bundle `19.13.1`, TT-Metalium `v0.76.0-dev20260801-268-g06994d4afda` | `47/47` cases, `1,859,192/1,859,192` assertions, `1/1` CTest pass |
 
 CPU, CUDA, ROCm, and SYCL therefore demonstrate all twenty-one applicable
-leaves at this revision, and TTNN demonstrates the mandatory `BF16` leaf with
-the twenty other applicable leaves explicitly rejected after structural
-validation. No planned, rejection-only, storage-only, compile-only, or
-unsupported probe is counted as a pass anywhere in that table.
+leaves at this revision. No planned, rejection-only, storage-only,
+compile-only, or unsupported probe is counted as a pass anywhere in that
+table.
 
 **Crossing-factorization obligation.** The two additive head-planar crossing
 cases (`H=2 D=9 O=18` and `H=4 D=5 O=20`, `T=19`, `s=2`, `R=17`, every
@@ -6156,29 +5423,11 @@ observably executed rather than skipped:
 | CUDA | `39,045` / `43,521` | `1/1` case, `5,670,287/5,670,287` assertions |
 | ROCm | `39,045` / `43,521` | `1/1` case, `5,670,297/5,670,297` assertions |
 | SYCL | `39,045` / `43,521` | `1/1` case, `5,670,248/5,670,248` assertions |
-| TTNN (`BF16`, its declared span) | `2,484` / `2,784` | `1/1` case, `1,449,065/1,449,065` assertions |
 
 No backend reported a crossing-case mismatch, so no case, tolerance, or
-declaration was weakened or re-scoped at this gate, and the TTNN row stays
-inside TTNN's documented mandatory-`BF16` exception. The `R=1`, `15`, `16`,
+declaration was weakened or re-scoped at this gate. The `R=1`, `15`, `16`,
 and `17` native-facility records above remain the per-backend execution
 records for those logical runs.
-
-**TTNN per-leaf scope (observed at this revision).** A temporary `_local`
-probe driven through `csw-remote` on the TTNN host submitted the canonical
-ordinary `I=3, O=10, T=19, s=2, R=17, H=1, D=10` request for all twenty-one
-applicable leaves through the real queue and OID path. `BF16` returned the pure
-`{0, 1}` requirement, accepted the positive OID `36028797018963969`, completed
-its wait, and wrote the output; each of the other twenty leaves returned
-`Unsupported` from both the pure query and the submission (negative OID), and
-no leaf returned any other category — `accepted=1 rejected=20 other=0`. With
-`R=0`, the implemented `BF16` leaf and a rejected non-`BF16` leaf both return
-`InvalidArgument` rather than the capability rejection, so structural
-validation precedes the dtype/backend capability decision exactly as this
-contract requires. The device stores `22` leaves (`F8_E8M0` excluded), so the
-twenty rejections are capability statements about an implemented port, not
-storage-only observations; the probe was removed after the run.
-
 #### Implementation references and delivery prerequisites
 
 Implementers need these existing sources and seams:
@@ -6197,27 +5446,23 @@ Implementers need these existing sources and seams:
   `src/shared/gpu_queue.hpp`, and `src/shared/gpu_queue_operations.inl`;
 - CPU asynchronous worker and raw codecs: `src/cpu/queue.cpp` and
   `src/cpu/transfer_helpers.hpp`;
-- backend capability classification, queues, and native storage:
+- backend capability classification and queues:
   `src/cuda/copy.hpp`, `src/cuda/copy.cu`, `src/rocm/copy.hpp`,
-  `src/rocm/copy.hip`, `src/sycl/queue_internal.hpp`, `src/sycl/queue.cpp`,
-  `src/sycl/queue_binary.cpp`, `src/ttnn/device_types.cpp`,
-  `src/ttnn/queue.cpp`, and `src/ttnn/queue_internal.hpp`; and
+  `src/rocm/copy.hip`, `src/sycl/queue_internal.hpp`, and `src/sycl/queue.cpp`;
 - independent reference and conformance harness:
   `test/backend/backend_conformance_oracle.hpp`,
   `test/backend/backend_conformance_common.hpp`,
-  `test/backend/backend_conformance_other.hpp`, and the five
+  `test/backend/backend_conformance_other.hpp`, and the four retained
   `test/<backend>/test_<backend>_conformance.cpp` drivers.
 
 `test/backend/backend_conformance_linear.hpp` is the shared conformance header
 described above. The per-backend linear kernels, launch wrappers, and
 capability predicates are owned by their own ports, which replace only their
 own hooks and migrate their own `Unsupported` probe as each declared leaf is
-actually implemented. The executed records this section carries — the ROCm and
-SYCL native `BF16` observations, the TTNN `BF16` evidence, and the
-same-revision five-backend gate table — are observations at their named
-revisions; the CUDA and TTNN native records referenced above live in their own
-matrix-feasibility subsections, and nothing here extends a recorded result to
-an unexercised shape, device, leaf, or revision.
+actually implemented. The executed ROCm and SYCL native `BF16` records and
+the retained-backend gate are observations at their named revisions; nothing
+here extends a recorded result to an unexercised shape, device, leaf, or
+revision.
 
 ### Scaled dot-product attention
 
@@ -6371,7 +5616,7 @@ converted to BF16 to obtain an apparent success.
 
 #### Current capability matrix
 
-The current operation matrix is BF16-only on the five named backends:
+The current operation matrix is BF16-only on the four retained backends:
 
 | Backend | `F4_E2M1` | `F6_E2M3` | `F6_E3M2` | `F8_E4M3FN` | `F8_E5M2` | `F16` | `BF16` | `F32` | `F64` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -6379,7 +5624,6 @@ The current operation matrix is BF16-only on the five named backends:
 | CUDA | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Supported` | `Unsupported` | `Unsupported` |
 | ROCm | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Supported` | `Unsupported` | `Unsupported` |
 | SYCL | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Supported` | `Unsupported` | `Unsupported` |
-| TTNN | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Unsupported` | `Supported` | `Unsupported` | `Unsupported` |
 
 `Supported` in this matrix means that the operation/type pair is the current
 target capability and may be advertised only after the backend has supplied
@@ -6551,15 +5795,14 @@ ctest --test-dir build --output-on-failure -R '^iom_backend_conformance_sdpa_ref
 ```
 
 The backend conformance drivers remain the vehicles for later operation
-verification:
-`iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
-`iom_rocm_conformance_tests`, `iom_sycl_conformance_tests`, and
-`iom_ttnn_conformance_tests`.  This reference leaf claims no backend result,
-kernel, queue, workspace-size, or native matrix evidence.  Accelerator
-execution remains remote-only under the configured `csw-remote` profiles,
-with SYCL setup and TTNN timeout/reset rules inherited from the repository
-guidance.  A future SDPA port must run the shared oracle on every touched
-backend and retain explicit `Unsupported` results for the other eight leaves.
+verification: `iom_backend_conformance_cpu_tests`,
+`iom_cuda_conformance_tests`, `iom_rocm_conformance_tests`, and
+`iom_sycl_conformance_tests`. This reference leaf claims no backend result,
+kernel, queue, workspace-size, or native matrix evidence. Accelerator
+execution remains remote-only under the configured `csw-remote` profiles, with
+SYCL setup rules inherited from the repository guidance. A future SDPA port
+must run the shared oracle on every touched backend and retain explicit
+`Unsupported` results for the other eight leaves.
 
 #### Implementation references and delivery boundary
 
