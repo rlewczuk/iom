@@ -18,8 +18,8 @@
 #include "../shared/metadata_slot_pool.hpp"
 #include "../shared/queue_resources.hpp"
 #include "iom/detail/outstanding_work_registry.hpp"
-
 #include "iom/iom.hpp"
+#include "sdpa.hpp"
 
 namespace iom::detail {
 // Device descriptor of the shared 16x16 tiled RMSNorm operation
@@ -434,6 +434,28 @@ struct gpu_policy {
         return "CUDA RoPE kernel launch";
     }
 
+    // CUDA SDPA is enabled only on the queue variant whose construction
+    // proved the exact device's BF16 WMMA facility and loadable image. The
+    // shared queue keeps the capability decision pure and never re-queries
+    // the device from a workspace query or submission admission path.
+    [[nodiscard]] static constexpr bool sdpa_supported() noexcept {
+        return true;
+    }
+
+    // This backend's own assessed scratch geometry: the checked two-segment
+    // score/probability layout of `sdpa_scratch`. The shared queue consults
+    // it only after the capability gate and computes no layout of its own.
+    template <typename Request>
+    [[nodiscard]] static WorkspaceRequirements sdpa_workspace_requirements(
+            const Request& request) {
+        return sdpa_scratch_requirements(request);
+    }
+
+    template <typename Request>
+    static void launch_sdpa(stream_type stream, const Request& request) {
+        launch_sdpa_stages(stream, request);
+    }
+
     // Linear projection capability: exactly the twenty non-BF16 applicable
     // leaves on the shared tiled scalar path plus `BF16` on the native
     // specialization of src/cuda/linear.cu. The inapplicable `BOOL`/`F8_E8M0`
@@ -474,6 +496,9 @@ struct gpu_policy {
 // creation, and no submission re-reads it.
 struct gpu_policy_scalar_linear final : gpu_policy {
     [[nodiscard]] static bool linear_supported(DataType data_type) noexcept;
+    [[nodiscard]] static constexpr bool sdpa_supported() noexcept {
+        return false;
+    }
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
 

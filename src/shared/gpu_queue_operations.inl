@@ -635,6 +635,86 @@ oid GpuQueue<Policy>::linear_impl(const LinearRequest& request) {
 }
 
 template <typename Policy>
+WorkspaceRequirements GpuQueue<Policy>::sdpa_workspace_requirements_impl(
+        const SdpaRequest& request) {
+    if constexpr (requires { Policy::sdpa_supported(); }) {
+        if (!Policy::sdpa_supported()) {
+            throw detail::UnsupportedOperation();
+        }
+        // The exact scratch geometry is the backend policy's own fact: the
+        // shared queue never computes or hardcodes a backend segment layout,
+        // so a backend whose assessed range differs (for example a
+        // conservative multi-segment pack/score/probability range) supplies
+        // it through this one pure hook. It is consulted only after the
+        // capability gate and before any workspace validation.
+        return Policy::sdpa_workspace_requirements(request);
+    } else {
+        throw detail::UnsupportedOperation();
+    }
+}
+
+template <typename Policy>
+oid GpuQueue<Policy>::sdpa_impl(const SdpaRequest& request) {
+    if constexpr (requires { Policy::sdpa_supported(); }) {
+        if (!Policy::sdpa_supported()) {
+            throw detail::UnsupportedOperation();
+        }
+    } else {
+        throw detail::UnsupportedOperation();
+    }
+    std::lock_guard<std::mutex> submission_lock(
+            submission_order_mutex_);
+    auto completion = std::make_shared<CompletionState>();
+    const detail::Fence fence = build_fence(completion);
+    return submit_sdpa(
+            request, *registry_state_, registry_queue_id_, fence,
+            [this, completion](
+                    std::uint64_t sequence,
+                    const SdpaRequest& captured,
+                    detail::SdpaEntryRegistration entries) {
+                auto submission = state_->try_acquire();
+                if (submission == nullptr) {
+                    throw detail::AdmissionResourceUnavailable{};
+                }
+                completion->bind(submission);
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        const auto [it, inserted] =
+                                outcomes_.try_emplace(sequence);
+                        if (!inserted) {
+                            throw std::logic_error(
+                                    std::string("duplicate ")
+                                    + Policy::backend_label()
+                                    + " outstanding-work sequence");
+                        }
+                        it->second.sdpa_entries = entries;
+                        it->second.workspace_lease =
+                                captured.workspace_lease;
+                        it->second.completion = completion;
+                        it->second.is_sdpa = true;
+                    }
+                    Task task;
+                    task.sequence = sequence;
+                    task.is_sdpa = true;
+                    task.sdpa_request.emplace(captured);
+                    task.sdpa_entries = entries;
+                    task.submission = submission.get();
+                    task.completion = completion;
+                    task.fence = task.submission;
+                    worker_.submit_copy(std::move(task));
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(outcome_mutex_);
+                        outcomes_.erase(sequence);
+                    }
+                    completion->clear();
+                    throw;
+                }
+            });
+}
+
+template <typename Policy>
 void GpuQueue<Policy>::execute(Task& task) {
     task.fence = task.submission;
     std::exception_ptr retained_failure;
@@ -918,6 +998,32 @@ void GpuQueue<Policy>::execute(Task& task) {
                     state_->event_of(*task.submission), stream_);
             event_recorded = true;
             state_->mark_event_recorded(*task.submission);
+        } else if (task.is_sdpa) {
+            const SdpaRequest& request = *task.sdpa_request;
+            if constexpr (requires(
+                                  typename Policy::stream_type stream,
+                                  const SdpaRequest& candidate) {
+                              Policy::launch_sdpa(stream, candidate);
+                          }) {
+                if constexpr (requires { Policy::sdpa_supported(); }) {
+                    if (!Policy::sdpa_supported()) {
+                        throw detail::UnsupportedOperation();
+                    }
+                } else {
+                    throw detail::UnsupportedOperation();
+                }
+                // The private launcher owns only stage construction and
+                // native calls. Completion remains the common queue's event
+                // on this same in-order stream.
+                native_work_submitted = true;
+                Policy::launch_sdpa(stream_, request);
+                Policy::record_event(
+                        state_->event_of(*task.submission), stream_);
+                event_recorded = true;
+                state_->mark_event_recorded(*task.submission);
+            } else {
+                throw detail::UnsupportedOperation();
+            }
         } else {
             execute_copy();
         }
@@ -1000,6 +1106,43 @@ void GpuQueue<Policy>::complete_task(
         detail::complete_workspace_lease(
                 *registry_state_, outcome.workspace_lease,
                 completion_proven);
+    } else if (outcome.is_sdpa) {
+        (void)detail::release_or_invalidate_sdpa_entries(
+                registry_state_->registry, outcome.sdpa_entries,
+                failed, completion_proven);
+        if (failed || !completion_proven
+                || outcome.workspace_lease.entry_id == 0) {
+            // A failed or unproven submission frees its range exactly as the
+            // covering stream proof allows: a failed output has no consumer,
+            // and an unproven range stays quarantined by the shared lease
+            // protocol. A submission that leased no range has nothing to hold.
+            detail::complete_workspace_lease(
+                    *registry_state_, outcome.workspace_lease,
+                    completion_proven);
+        } else {
+            // Successful accepted work keeps its caller workspace live until
+            // the caller observes the token: the range may be reused only
+            // after that observation, so a second submission of the same live
+            // range is bounded-resource exhaustion instead of a silent
+            // overlap. `wait` releases it through `fence_through_sequence`,
+            // and queue teardown releases whatever no caller observed.
+            bool retained = false;
+            try {
+                std::lock_guard<std::mutex> lock(outcome_mutex_);
+                retained = retained_leases_
+                                   .emplace(sequence, outcome.workspace_lease)
+                                   .second;
+            } catch (...) {
+                retained = false;
+            }
+            if (!retained) {
+                // Retaining failed: fall back to the proof-based release
+                // rather than dropping the lease record entirely.
+                detail::complete_workspace_lease(
+                        *registry_state_, outcome.workspace_lease,
+                        completion_proven);
+            }
+        }
     } else if (outcome.is_binary || outcome.is_embedding
             || outcome.is_linear) {
         (void)detail::release_or_invalidate_binary_entries(
@@ -1040,6 +1183,44 @@ void GpuQueue<Policy>::complete_task(
                 completion_proven);
     }
     complete(sequence, std::move(failure));
+}
+
+template <typename Policy>
+void GpuQueue<Policy>::fence_through_sequence(
+        std::uint64_t sequence) noexcept {
+    detail::WorkspaceLease lease{};
+    {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
+        const auto found = retained_leases_.find(sequence);
+        if (found == retained_leases_.end()) {
+            return;
+        }
+        lease = found->second;
+        retained_leases_.erase(found);
+    }
+    // The caller has now observed this token's terminal state, so its
+    // retained workspace range returns to the shared lease registry and may
+    // be leased again. Repeated waits find no record and change nothing.
+    detail::complete_workspace_lease(*registry_state_, lease, true);
+}
+
+template <typename Policy>
+void GpuQueue<Policy>::release_retained_leases(
+        bool covering_proof) noexcept {
+    std::map<std::uint64_t, detail::WorkspaceLease> retained;
+    try {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
+        retained.swap(retained_leases_);
+    } catch (...) {
+        // The device keeps a retained range out of its allocator while the
+        // lease record survives, so an unavailable queue lock can only leave
+        // the ranges reserved, never reuse them unsafely.
+        return;
+    }
+    for (const auto& entry : retained) {
+        detail::complete_workspace_lease(
+                *registry_state_, entry.second, covering_proof);
+    }
 }
 
 }  // namespace iom::detail

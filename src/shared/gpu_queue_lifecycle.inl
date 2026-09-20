@@ -115,6 +115,11 @@ GpuQueue<Policy>::~GpuQueue() {
         drained = false;
     }
     state_->on_queue_drain(drained);
+    // A caller that submitted SDPA and never observed its token leaves that
+    // token's workspace lease retained; this queue's own drain is the
+    // covering proof for every such range. An unresolved drain quarantines
+    // them with the rest of the queue's unproven state.
+    release_retained_leases(drained);
     if (drained || !state_->has_unproven_completion()) {
         // Every lease is proved: release the native stream and return
         // the partition, queue-count reservation, and completion

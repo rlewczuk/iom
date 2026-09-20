@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <span>
 #include <unordered_set>
 #include <vector>
 
@@ -388,18 +389,119 @@ TEST_CASE("CUDA conformance: greedy token selection shared matrix and lifetime")
 TEST_CASE("CUDA conformance: compute methods reject capability without submitting") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
+    // This device's own BF16 WMMA queue policy carries SDPA support, so the
+    // shared capability probe observes an accepted SDPA token here; the
+    // injected-absence case below observes the `Unsupported` direction.
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CUDA", true, true);
+            &devices.gate, "CUDA", true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CUDA conformance: shared SDPA admission and unsupported matrix") {
+TEST_CASE("CUDA conformance: shared SDPA admission and native BF16 matrix") {
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
+    CudaStorageOracle native_storage;
+    const bool support_enabled =
+            cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal)
+            && iom::cuda_detail::linear_bf16_wmma_image_arch() >= 800;
+    const std::span<const iom::DataType> supported =
+            support_enabled
+            ? std::span<const iom::DataType>(
+                      iom_conformance::kSdpaCurrentSupportedDataTypes.data(),
+                      iom_conformance::kSdpaCurrentSupportedDataTypes.size())
+            : std::span<const iom::DataType>{};
+    const iom_conformance::SdpaNativeFailureSeam native_failure{
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::third_plane_launch);
+            },
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::none);
+            },
+            "CUDA SDPA QK stage launch",
+            {}};
     const iom_conformance::SdpaConformanceConfig config{
-            devices.conformance(), {}, false, &devices.gate};
+            devices.conformance(), supported, support_enabled, &devices.gate,
+            &native_storage, {}, native_failure};
     iom_conformance::run_sdpa_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// The execution-connected native evidence runs of the end-to-end CUDA SDPA
+// port: one full causal prefill and one logical `R=1` decode through the real
+// public queue/OID path, each compared element by element against the shared
+// independent reference and each emitting its own record naming the two
+// private native matrix stages. The profiler observes exactly these runs, so an
+// observed native instruction is attributed to these executions:
+//
+//   ncu --set full --target-processes all --kernel-name regex:'.*(qk|pv).*' \
+//       <build>/test/iom_cuda_conformance_tests \
+//       --test-case='CUDA TinyLlama SDPA native QK/PV decode and prefill'
+//   nsys profile --force-overwrite=true -o /tmp/cuda-sdpa-integration \
+//       <build>/test/iom_cuda_conformance_tests \
+//       --test-case='CUDA TinyLlama SDPA native QK/PV decode and prefill'
+//   nsys stats --report cuda_gpu_kern_sum /tmp/cuda-sdpa-integration.nsys-rep
+TEST_CASE("CUDA TinyLlama SDPA native QK/PV decode and prefill") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle native_storage;
+    const bool support_enabled =
+            cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal)
+            && iom::cuda_detail::linear_bf16_wmma_image_arch() >= 800;
+    int device_index = 0;
+    REQUIRE(cudaGetDevice(&device_index) == cudaSuccess);
+    cudaDeviceProp properties{};
+    REQUIRE(cudaGetDeviceProperties(&properties, device_index) == cudaSuccess);
+    int runtime_version = 0;
+    int driver_version = 0;
+    REQUIRE(cudaRuntimeGetVersion(&runtime_version) == cudaSuccess);
+    REQUIRE(cudaDriverGetVersion(&driver_version) == cudaSuccess);
+    std::printf(
+            "cuda-sdpa-integration-environment backend=CUDA device=%s "
+            "compute_capability=%d.%d runtime=%d driver=%d image_arch=%u "
+            "bf16_wmma=%s\n",
+            properties.name, properties.major, properties.minor,
+            runtime_version, driver_version,
+            iom::cuda_detail::linear_bf16_wmma_image_arch(),
+            support_enabled ? "supported" : "unsupported");
+    if (!support_enabled) {
+        MESSAGE("CUDA BF16 WMMA SDPA facility is unavailable on ordinal 0");
+        return;
+    }
+    const std::span<const iom::DataType> supported(
+            iom_conformance::kSdpaCurrentSupportedDataTypes.data(),
+            iom_conformance::kSdpaCurrentSupportedDataTypes.size());
+    const iom_conformance::SdpaNativeFailureSeam native_failure{
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::none);
+            },
+            [] {
+                iom::cuda_detail::inject_submission_fault_for_testing(
+                        iom::cuda_detail::SubmissionFault::none);
+            },
+            "CUDA SDPA QK stage launch",
+            {}};
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(), supported, true, &devices.gate,
+            &native_storage, {}, native_failure};
+    const iom_conformance::SdpaReferenceCase prefill =
+            iom_conformance::sdpa_oracle::make_cached_incremental_case(
+                    iom::DataType::BF16);
+    const iom_conformance::SdpaReferenceCase decode =
+            iom_conformance::sdpa_incremental_slice(
+                    prefill, prefill.rows - 1);
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, prefill, "TinyLlama SDPA prefill");
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, decode, "TinyLlama SDPA decode");
+    std::printf(
+            "cuda-sdpa-integration-record backend=CUDA cases=decode,prefill "
+            "kernel=sdpa_qk_kernel,sdpa_pv_kernel facility=bf16-wmma "
+            "image_arch=%u\n",
+            iom::cuda_detail::linear_bf16_wmma_image_arch());
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -888,6 +990,37 @@ TEST_CASE("CUDA BF16 linear is Unsupported on a device without the WMMA facility
             "the scalar path of a facility-less queue still projects");
     CHECK_FALSE(devices.gate.armed());
 
+    // The exact same absence decides this queue's SDPA capability: the pure
+    // query and the submission both report `Unsupported` after structural
+    // validation, the output keeps every byte, and no token is consumed.
+    const iom::TensorSpec sdpa_q_spec{
+            iom::TensorShape{{1, 2, 4, 3}}, iom::DataType::BF16};
+    const iom::TensorSpec sdpa_kv_spec{
+            iom::TensorShape{{1, 2, 8, 3}}, iom::DataType::BF16};
+    const iom::TensorSpec sdpa_out_spec{
+            iom::TensorShape{{1, 4, 6}}, iom::DataType::BF16};
+    auto sdpa_q = devices.candidate->create_tensor(sdpa_q_spec);
+    auto sdpa_kv = devices.candidate->create_tensor(sdpa_kv_spec);
+    auto sdpa_out = devices.candidate->create_tensor(sdpa_out_spec);
+    const std::vector<std::byte> sdpa_out_poison =
+            iom_conformance::sdpa_detail::pack_output_sentinel(
+                    sdpa_out_spec, std::byte{0x5C});
+    iom_conformance::copy_from_host(sdpa_out->view(), sdpa_out_poison);
+    CHECK_THROWS_AS(
+            (void)queue->sdpa_workspace_requirements(
+                    sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                    sdpa_out->view(), 0, 4),
+            std::runtime_error);
+    CHECK_EQ(
+            queue->sdpa(
+                    sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                    sdpa_out->view(), 0, 4),
+            iom::to_oid(iom::OidError::Unsupported));
+    iom_conformance::require_logical_bytes(
+            sdpa_out->view(), sdpa_out_poison,
+            "an unsupported SDPA submission changed the output");
+    CHECK_FALSE(devices.gate.armed());
+
     // A fresh queue resolves the device's own truth again: the injected
     // absence was consumed by exactly one creation.
     if (cuda_bf16_wmma_device_fact(kCudaConformanceOrdinal)) {
@@ -897,6 +1030,95 @@ TEST_CASE("CUDA BF16 linear is Unsupported on a device without the WMMA facility
         REQUIRE(iom::oid_is_token(recovered));
         CHECK_NOTHROW(recovered_queue->wait(recovered));
     }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// One queue owns one in-order stream and one fixed completion ring. A full
+// causal prefill and a logical `R=1` decode submitted through the same queue
+// therefore create neither a second stream nor another completion resource,
+// and both runs are compared against the shared independent reference. This is
+// the CUDA-only observation the shared suite cannot make: the stage chain runs
+// on the queue's own stream with no hidden stream, event, or allocation.
+TEST_CASE("CUDA SDPA submissions reuse the queue's own stream and completion ring") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle native_storage;
+    const iom::DataType type = iom::DataType::BF16;
+    iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(),
+            std::span<const iom::DataType>{},
+            false,
+            &devices.gate,
+            &native_storage,
+            {},
+            {}};
+    const iom_conformance::SdpaReferenceCase prefill =
+            iom_conformance::sdpa_oracle::make_cached_incremental_case(type);
+    const iom_conformance::SdpaReferenceCase decode =
+            iom_conformance::sdpa_incremental_slice(prefill, prefill.rows - 1);
+
+    auto queue = devices.candidate->create_ops();
+    const std::size_t events_before =
+            iom::cuda_detail::event_create_count_for_testing.load();
+    const std::size_t streams_before =
+            iom::cuda_detail::stream_create_count_for_testing.load();
+
+    for (const iom_conformance::SdpaReferenceCase& item : {prefill, decode}) {
+        CAPTURE(iom_conformance::sdpa_reference_case_label(item));
+        iom_conformance::sdpa_detail::OwnedOperands operands =
+                iom_conformance::sdpa_detail::make_operands(
+                        *devices.candidate, item, type);
+        const iom::TensorSpec q_owner = operands.q->view().spec();
+        const iom::TensorSpec k_owner = operands.k->view().spec();
+        const iom::TensorSpec v_owner = operands.v->view().spec();
+        const iom::TensorSpec out_owner = operands.out->view().spec();
+        iom_conformance::sdpa_detail::seed_logical(
+                config, operands.q->view(), q_owner,
+                iom_conformance::sdpa_detail::logical_case_bytes(
+                        type, item.q_bits));
+        iom_conformance::sdpa_detail::seed_logical(
+                config, operands.k->view(), k_owner,
+                iom_conformance::sdpa_detail::logical_case_bytes(
+                        type, item.k_bits));
+        iom_conformance::sdpa_detail::seed_logical(
+                config, operands.v->view(), v_owner,
+                iom_conformance::sdpa_detail::logical_case_bytes(
+                        type, item.v_bits));
+        iom_conformance::copy_from_host(
+                operands.out->view(),
+                iom_conformance::sdpa_detail::case_output_bytes(
+                        out_owner, std::byte{0x6B}));
+
+        const iom::WorkspaceRequirements requirements =
+                queue->sdpa_workspace_requirements(
+                        operands.q->view(), operands.k->view(),
+                        operands.v->view(), operands.out->view(),
+                        item.position, item.length);
+        CHECK_EQ(requirements.alignment, std::size_t{32});
+        auto workspace =
+                devices.candidate->create_workspace(requirements.bytes);
+        REQUIRE(workspace != nullptr);
+        const iom::oid token = queue->sdpa(
+                operands.q->view(), operands.k->view(), operands.v->view(),
+                operands.out->view(), item.position, item.length,
+                workspace->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        CHECK_NOTHROW(queue->wait(token));
+        const std::vector<std::byte> observed =
+                iom_conformance::sdpa_detail::observe_logical(
+                        config, operands.out->view(), out_owner);
+        iom_conformance::sdpa_detail::check_reference_output(
+                type, observed, iom_conformance::evaluate(item),
+                iom_conformance::sdpa_reference_case_label(item));
+    }
+
+    CHECK_EQ(
+            iom::cuda_detail::event_create_count_for_testing.load(),
+            events_before);
+    CHECK_EQ(
+            iom::cuda_detail::stream_create_count_for_testing.load(),
+            streams_before);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -1595,10 +1817,13 @@ TEST_CASE("CUDA conformance: full shared suite") {
                     },
                     "cuda_detail::SubmissionFault::event_record",
                     {}}};
+    // The full shared suite observes this device's own capability verdicts:
+    // binary and linear are supported here, and so is the BF16 SDPA port, so
+    // the suite's SDPA probe must be given the exact queried workspace.
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true, &rope_contract);
+            &devices.gate, &oracle, true, true, &rope_contract, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -2173,5 +2398,3 @@ TEST_CASE("CUDA conformance: workspace requirement queries are pure and exact") 
                     foreign_tensor->view(), rhs->view(), out->view()),
             std::invalid_argument);
 }
-
-

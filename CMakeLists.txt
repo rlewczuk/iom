@@ -141,6 +141,8 @@ if(CUDA_ENABLED)
         src/cuda/device_internal.hpp
         src/cuda/copy.cu
         src/cuda/copy.hpp
+        src/cuda/sdpa.cpp
+        src/cuda/sdpa.hpp
         src/cuda/sdpa_nonmatrix.cu
         src/cuda/sdpa_nonmatrix.hpp
         src/cuda/sdpa_nonmatrix_request.hpp
