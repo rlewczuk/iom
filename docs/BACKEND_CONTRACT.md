@@ -414,10 +414,12 @@ must record that fact rather than adding an example.
 
 ### 9. Other compute capabilities
 
-`silu` is implemented on CPU, CUDA, ROCm, and SYCL; CPU `sdpa` now
-supports the BF16 leaf through its scalar FIFO port, while non-BF16 CPU
-leaves and accelerator SDPA ports remain explicitly unsupported until their
-operation-owned implementations land. The `linear` hooks are owned by
+`silu` is implemented on CPU, CUDA, ROCm, and SYCL; GQA `sdpa` is implemented
+on the same four retained backends for its one current BF16 leaf, closed by
+the retained-backend gate evidence in
+[Scaled dot-product attention](#scaled-dot-product-attention), while the
+eight non-BF16 SDPA leaves stay explicitly `Unsupported` everywhere. The
+`linear` hooks are owned by
 CPU, CUDA, ROCm, and SYCL implement all twenty-one applicable leaves — the
 twenty non-BF16 leaves on the shared scalar projection path plus `BF16` on the
 scalar recurrence on CPU and on a separate native specialization on CUDA, ROCm,
@@ -1288,12 +1290,13 @@ overflow, no-side-effect admission failures, accepted failures and repeat
 waits, and the exact `1/15/16/17` offsets and row-length cases.
 #### TinyLlama forward layout — Causal grouped-query attention
 
-This subsection freezes the planned TinyLlama caller boundary for the
-operation-owned [Scaled dot-product attention](#scaled-dot-product-attention)
-section. It does not add declarations or implementation. The CPU port now
-accepts BF16 through this facade; the other CPU leaves and accelerator ports
-remain `Unsupported` before submission, output mutation, or token acceptance
-until their operation-owned implementations land.
+This subsection freezes the TinyLlama caller boundary for the operation-owned
+[Scaled dot-product attention](#scaled-dot-product-attention) section. It does
+not add declarations or implementation. CPU, CUDA, ROCm, and SYCL all accept
+the current BF16 leaf through this facade at this revision; the other eight
+floating leaves and every other backend/leaf pair remain `Unsupported` before
+submission, output mutation, or token acceptance. The four-backend closure
+record is in [Scaled dot-product attention](#scaled-dot-product-attention).
 
 The clean-cutover target has exactly the following submission and pure
 workspace-query signatures:
@@ -1432,16 +1435,20 @@ features, independent leading planes, padding/tail isolation, causal prefill,
 cached decode, generic shorter initialized prefixes, every applicable
 dtype/backend combination, wrong rank/empty-key/shape/GQA ratio, alias,
 device, workspace, range and overflow rejection, and accepted-failure
-repeated waits. An unsupported port is not numerical conformance. Only after
-the four-backend SDPA gate closes may the session component claim complete
-decoder-layer assembly and verification.
+repeated waits. An unsupported port is not numerical conformance. That shared
+suite now runs on all four retained backends and closes the four-backend SDPA
+gate in [Scaled dot-product attention](#scaled-dot-product-attention); SDPA
+closure was the last missing operation prerequisite, so the session component
+may claim complete decoder-layer assembly and verification against these
+published boundaries without this design subsection adding session work.
 #### TinyLlama forward layout — Workspace and execution
 
 This subsection records the shared facade boundary. The common layer now
 declares embedding, linear, RMSNorm, RoPE, and SiLU; cache append remains
-planned, while the CPU BF16 SDPA leaf has landed and accelerator SDPA ports
-remain planned until their own leaves land. The target `DeviceOps` facades
-return `oid`, are `noexcept`, and have exactly these signatures:
+planned, and all four retained backends implement the BF16 GQA SDPA leaf,
+closed in [Scaled dot-product attention](#scaled-dot-product-attention). The
+target `DeviceOps` facades return `oid`, are `noexcept`, and have exactly
+these signatures:
 
 ```cpp
 oid embedding(const TensorView& table, const TensorView& indices,
@@ -2127,9 +2134,11 @@ task, and does not force a per-operation wait merely because tracing is
 disabled. The correctness waits above remain mandatory with or without
 attribution.
 
-Complete mathematical layer assembly remains gated until SDPA closes its
-four-backend gate. Incremental model/session/selector integration is owned
-by its later siblings, not by this documentation plan.
+Complete mathematical layer assembly was gated on the four-backend SDPA gate,
+which the revision recorded in
+[Scaled dot-product attention](#scaled-dot-product-attention) closes.
+Incremental model/session/selector integration is owned by its later siblings,
+not by this documentation plan.
 
 #### TinyLlama forward layout — CUDA matrix feasibility
 
@@ -2143,10 +2152,11 @@ CUDA SDPA port** — the operation-owning ports supply the runtime numerical,
 conformance, and execution-connected evidence recorded in `[Linear native evidence](#linear-native-evidence)`,
 `[SDPA matrix native evidence](#sdpa-matrix-native-evidence)`, and
 `[SDPA integration native evidence](#sdpa-integration-native-evidence)` — and
-remains **blocked for RoPE, for the ROCm and SYCL end-to-end SDPA ports, and
-therefore for the four-backend SDPA gate** until those ports supply the same
-evidence. The implemented SiLU port is closed separately by its operation-owned
-gate receipt.
+the ROCm and SYCL end-to-end SDPA ports have since supplied the same evidence,
+so the four-backend SDPA gate is closed by the
+`[Same-revision retained-backend SDPA gate evidence](#same-revision-retained-backend-sdpa-gate-evidence)`
+record; RoPE retains its own status. The implemented SiLU port is closed
+separately by its operation-owned gate receipt.
 A device below compute capability 8.0 is **unsupported** for this BF16 WMMA
 route; it does not earn a fallback pass.
 
@@ -2262,8 +2272,9 @@ RoPE, or end-to-end SDPA integration.
   ran for the decode and prefill fixture submissions without claiming
   unavailable performance counters.
 - **Conclusion.** The private CUDA QK/PV matrix stages are closed on this
-  device for the exercised decode and prefill rows; full CUDA SDPA remains
-  gated on its nonmatrix and integration ports.
+  device for the exercised decode and prefill rows; at that record full CUDA
+  SDPA was still gated on its nonmatrix and integration ports, which the
+  following record closes.
 
 ##### SDPA integration native evidence
 
@@ -2338,8 +2349,8 @@ session, or four-backend claim.
   duplicate or corrective pass; it claims no unavailable performance counters.
 - **Conclusion.** The CUDA BF16 SDPA port is closed on this device for the
   exercised decode and prefill rows and for the shared conformance matrix. The
-  four-backend SDPA gate remains open until the ROCm and SYCL ports supply the
-  same evidence.
+  ROCm and SYCL ports have since supplied the same evidence, so the
+  four-backend SDPA gate is closed by the same-revision gate record below.
 
 ##### Evidence boundary and installed capability
 
@@ -2533,11 +2544,11 @@ OID after a failure.
 | --- | --- |
 | gather | Contract-compatible device kernel for integral index payloads and bit-preserving BF16 table values; a device-discovered bad index must become an accepted retained failure. WMMA is irrelevant. A host index scan or round trip is forbidden. Current implementation remains blocked. |
 | matmul | Supported feasibility on the sampled CC 12.0 device by direct BF16/FP32 WMMA with tile-local standard-layout staging. Global owner layout, arbitrary `s`, transformed leading strides, and physical tails are incompatible with direct unguarded `load_matrix_sync`; the bounded staging above is required. |
-| reduction | Contract-compatible device-local FP32 reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. The CUDA RMSNorm wrapper is source-inspected, the linear accumulation helpers are implemented through the landed port (see [Linear projections](#linear-projections)), and the CUDA SDPA nonmatrix scale/mask, stable softmax, BF16 probability preparation, and merged-output canonicalization are implemented by `src/cuda/sdpa_nonmatrix.cu` and independently passed the remote `iom_cuda_sdpa_nonmatrix_tests` device smoke; QK/PV and complete attention remain gated by their own ports. |
+| reduction | Contract-compatible device-local FP32 reduction for linear accumulation helpers, RMSNorm, and stable softmax. Reductions exclude masked/padded cells and retain the specified wide intermediates; WMMA does not replace max, sum, or normalization. The CUDA RMSNorm wrapper is source-inspected, the linear accumulation helpers are implemented through the landed port (see [Linear projections](#linear-projections)), and the CUDA SDPA nonmatrix scale/mask, stable softmax, BF16 probability preparation, and merged-output canonicalization are implemented by `src/cuda/sdpa_nonmatrix.cu` and independently passed the remote `iom_cuda_sdpa_nonmatrix_tests` device smoke; QK, PV, and the complete attention operation are closed by their own CUDA records above. |
 | trig | Contract-compatible CUDA device FP32/wide-domain sine and cosine with finite positive `theta`; it neither uses nor is evidenced by WMMA. A host math substitute is forbidden. Current RoPE kernel remains blocked. |
 | partial-tile copy | Existing CUDA standard-tiled copy machinery establishes device-local tile addressing, but not neural matrix support. A native port must use guarded logical loads/stores and neutral shared cells so owner padding, cache capacity tail, and rows outside `R` are unobservable. |
 | unary | Contract-compatible CUDA device FP32/wide-domain SiLU and BF16 RNE output. It is elementwise by design and is not an invalid matrix substitute. Current kernel remains blocked. |
-| attention | Supported matrix feasibility for both QK and PV, including GQA and every required `R`, only as the complete device-local flow above. FP32 masking/softmax and explicit P-to-BF16 preparation are mandatory. Elementwise QK/PV, repeated KV heads, host work, hidden allocation, or treating physical rows as tokens is incompatible. Current SDPA port and evidence remain blocked. |
+| attention | Supported matrix feasibility for both QK and PV, including GQA and every required `R`, only as the complete device-local flow above. FP32 masking/softmax and explicit P-to-BF16 preparation are mandatory. Elementwise QK/PV, repeated KV heads, host work, hidden allocation, or treating physical rows as tokens is incompatible. The CUDA SDPA port and its prefill/decode evidence are closed by its operation-owned records above. |
 
 This matrix result says nothing about the other applicable dtype leaves; their
 kernel selection, numerics, and tolerances remain with the operation-owned
@@ -2871,9 +2882,13 @@ This is the bounded feasibility record for the seven-operation ABI. Embedding
 lookup has its device-native raw-word `parallel_for` port, linear projections
 are implemented as the twenty non-BF16 leaves on the operation-local in-order
 path plus the native BF16 `joint_matrix` route with explicit RNE packing,
-recorded in [Linear projections](#linear-projections), and SiLU is implemented
-by the native packet path recorded in its operation-owned section. RMSNorm,
-RoPE, cache append, and SDPA remain unimplemented. A future port MUST preserve
+recorded in [Linear projections](#linear-projections), SiLU is implemented by
+the native packet path recorded in its operation-owned section, and SDPA is
+implemented by the native subgroup-16 `joint_matrix` QK/PV route with
+device-local masking, stable softmax, RNE BF16 P preparation, and head merge,
+closed in [Scaled dot-product attention](#scaled-dot-product-attention). The
+status of every other operation remains as stated in its own operation-owned
+section. A future port MUST preserve
 the signatures, pure requirement queries, validation precedence, owner rules,
 and producer-wait schedule above; SYCL types remain backend-private.
 
@@ -2886,7 +2901,7 @@ The evidence layers are deliberately separate:
 | Installed runtime and device | Required `sycl-ls` enumeration reported two Level Zero V2 devices, each `Intel(R) Arc(TM) Pro B60 Graphics 20.1.0`, driver `1.15.38646+7`, PCI device `8086:e211`, architecture `intel_gpu_bmg_g21`, and subgroup sizes `16,32`. PCI inventory reported the in-kernel `xe` driver on Linux `7.0.0-31-generic`. The selected device reports `aspect::ext_intel_matrix=true` and maximum work-group size 1024. | An eligible Level Zero XMX device and subgroup 16 are installed. The eventual queue MUST bind one exact enumerated device, not an OpenCL or other-device fallback. |
 | Documented native capability | The installed `matrix_combinations` query returned 53 combinations per B60. For `A=BF16,B=BF16,C=FP32,D=FP32`, it returned continuous `M<=8,N=16,K=16`, exact `16x16x16`, and exact `1x64x16`, `32x64x16`, `1x64x32`, and `32x64x32`. It also returned BF16-output variants, but this contract does not rely on their conversion rounding. | `M=1`, `M=16`, and a `16+1` decomposition are legal with BF16 inputs and FP32 accumulation; N/K tails require physical padding or tile decomposition. |
 | Bounded sample | A removed standalone sample allocated device USM, required subgroup 16, invoked `joint_matrix_load`, `joint_matrix_mad`, and `joint_matrix_store`, and checked all-one BF16 products. Separate Level Zero executions printed `BF16xBF16->FP32 1x16x16 PASS` and `16x16x16 PASS`. | Representative native XMX execution exists for the row shapes used below. It does not implement IOM linear, QK, or PV and is not conformance or profiler evidence. |
-| Production evidence (2026-09-14 snapshot) | Not run at that date: IOM linear, QK, PV, masking, softmax, RNE packing, head merge, all shape cases, conformance, tuning, and profiling. | At that date the SYCL port was blocked/unimplemented, and inventory or the sample cannot close a native-operation gate. The linear portion is since superseded by the implemented port and its executed record in [Linear projections](#linear-projections); QK, PV, masking, softmax, RNE packing, head merge, and the remaining operations are still unrun. |
+| Production evidence (2026-09-14 snapshot) | Not run at that date: IOM linear, QK, PV, masking, softmax, RNE packing, head merge, all shape cases, conformance, tuning, and profiling. | At that date the SYCL port was blocked/unimplemented, and inventory or the sample cannot close a native-operation gate. The linear portion is since superseded by the implemented port and its executed record in [Linear projections](#linear-projections), and the QK, PV, masking, softmax, RNE packing, and head merge portions by the implemented SDPA port and its executed record in [Scaled dot-product attention](#scaled-dot-product-attention); the remaining operations remain unrun. |
 
 These conclusions use the
 [experimental matrix extension at revision `cf12c378`](https://github.com/intel/llvm/blob/cf12c3783cc6a7adaf76e54c6a4f11f81ec8599b/sycl/doc/extensions/experimental/sycl_ext_matrix/sycl_ext_oneapi_matrix.asciidoc),
@@ -2908,10 +2923,13 @@ was enumerated but was not sampled as a matrix execution shape.
 **Product/row decision.** Let `p16(x)` mean checked round-up to 16. Every
 entry below is *native-shape feasible on the enumerated B60*: the device query
 supports the decomposition and the two primitive M shapes executed. The two
-linear rows are now implemented by the landed SYCL linear port and evidenced
-in [Linear projections](#linear-projections); the QK and PV rows remain
-unlanded production ports, and each such product must keep returning
-`Unsupported` until its real SYCL implementation and native tests land.
+linear rows are implemented by the SYCL linear port and evidenced in
+[Linear projections](#linear-projections); the QK and PV rows are implemented
+by the SYCL SDPA port and evidenced in
+[Scaled dot-product attention](#scaled-dot-product-attention). A device or
+queue whose queried facilities do not cover the submitted shape keeps
+returning `Unsupported`, never host attention, host staging, or an elementwise
+substitute.
 
 | Product | logical `R=1` | logical `R=15` | logical `R=16` | logical `R=17` |
 | --- | --- | --- | --- | --- |
@@ -5987,7 +6005,11 @@ evidence returns `Unsupported` after structural validation, never a silent
 conversion or fallback.  The reference header records the same split through
 `sdpa_data_type_classification(DataType)`: `current_supported` is BF16,
 `unsupported` is the other eight floating leaves, and `inapplicable` is every
-BOOL/integer/`F8_E8M0` leaf.
+BOOL/integer/`F8_E8M0` leaf.  Every `Supported` cell above is backed by the
+executed retained-backend record in
+[Same-revision retained-backend SDPA gate evidence](#same-revision-retained-backend-sdpa-gate-evidence);
+the eight floating and all inapplicable leaves stay explicit rejection classes
+on all four backends.
 
 #### BF16 arithmetic, DAZ, underflow, and rounding
 
@@ -6147,15 +6169,92 @@ cmake --build build --target iom_backend_conformance_sdpa_reference_tests
 ctest --test-dir build --output-on-failure -R '^iom_backend_conformance_sdpa_reference_tests$'
 ```
 
-The backend conformance drivers remain the vehicles for later operation
-verification: `iom_backend_conformance_cpu_tests`,
-`iom_cuda_conformance_tests`, `iom_rocm_conformance_tests`, and
-`iom_sycl_conformance_tests`. This reference leaf claims no backend result,
-kernel, queue, workspace-size, or native matrix evidence. Accelerator
-execution remains remote-only under the configured `csw-remote` profiles, with
-SYCL setup rules inherited from the repository guidance. A future SDPA port
-must run the shared oracle on every touched backend and retain explicit
-`Unsupported` results for the other eight leaves.
+The backend conformance drivers are the vehicles for operation verification:
+`iom_backend_conformance_cpu_tests`, `iom_cuda_conformance_tests`,
+`iom_rocm_conformance_tests`, and `iom_sycl_conformance_tests`. This reference
+leaf claims no backend result, kernel, queue, workspace-size, or native matrix
+evidence. Accelerator execution remains remote-only under the configured
+`csw-remote` profiles, with SYCL setup rules inherited from the repository
+guidance. Every SDPA port runs the shared oracle on its own backend and retains
+explicit `Unsupported` results for the other eight leaves.
+
+#### Same-revision retained-backend SDPA gate evidence
+
+The closing four-backend SDPA gate ran the one shared conformance harness
+through every retained backend's conformance target and its direct binary at
+one revision, the prepared integration base
+`668cd13d74dcdd8df87e1b56606d7191dfd980f7`, from one prepared task worktree,
+and recorded the device, runtime, toolchain, and profiler identity of each run.
+The CPU pair ran locally; every accelerator pair used exact-worktree
+`csw-remote` sync/exec with a fresh sync immediately before each execution,
+remote-side `timeout --kill-after=30s`, a bounded hardware lock, and
+`ctest --timeout 300`. Every row below was then re-run unchanged on the
+delivered tree after the documentation edits of this gate, which change no
+source file; the recorded timings are those delivered-tree re-runs. The
+observed results are:
+
+| Backend | Commands | Device / runtime identity | Observed result |
+| --- | --- | --- | --- |
+| CPU | `ctest --test-dir build --output-on-failure --timeout 300 -R '^(iom_backend_conformance_cpu_tests\|iom_backend_conformance_sdpa_reference_tests)$'`, the direct `./build/test/iom_backend_conformance_cpu_tests`, its `--test-case='*SDPA*'` selection, and the backend-free reference binary | Local `x86_64` host, AMD Ryzen AI 9 HX 370 w/ Radeon 890M, GCC `15.2.0`, CMake `4.0.2` | `2/2` CTest pass (`13.47 s`); direct binary `34/34` cases and `6,174,802/6,174,802` assertions; SDPA case `1/1` with `2,761/2,761` assertions; reference target `2/2` cases |
+| CUDA | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_cuda_conformance_tests$'`, the direct binary, and `--test-case='*TinyLlama*SDPA*decode*'` on remote `bv1` | `NVIDIA GeForce RTX 5090`, compute capability `12.0`, driver `595.71.05`, CUDA Toolkit `13.2` (`nvcc` `V13.2.78`), runtime and driver API `13020`, executed image architecture `1200`, `bf16_wmma=supported` | `1/1` CTest pass (`20.64 s`); `46/46` cases and `6,214,549/6,214,549` assertions; native record `cases=decode,prefill kernel=sdpa_qk_kernel,sdpa_pv_kernel facility=bf16-wmma` |
+| ROCm | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_rocm_conformance_tests$'`, the direct binary, and `--test-case='*TinyLlama*SDPA*'` on remote `bv2` | `gfx1201` (AMD Radeon AI PRO R9700; the installed `gfx1036` remains the unproved ordinal), HIP `7.15.26333-0000000`, AMD clang `23.0.0git` | `1/1` CTest pass (`26.39 s`); `48/48` cases and `6,186,178/6,186,178` assertions; native record `facility=gfx1201-wave32-bf16-wmma` with the complete eight-kernel chain |
+| SYCL | `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_conformance_tests$'`, the direct binary, and `--test-case='*SDPA*native*'` on remote `bv2` through the nounset-safe no-setup profile override with `sycl-ls` Level Zero enumeration first | Level Zero V2 `Intel(R) Arc(TM) Pro B60 Graphics` (two enumerated), architecture `intel_gpu_bmg_g21`, driver `1.15.38646+7`, subgroup sizes `16,32`, `ext_intel_matrix` present; Intel oneAPI DPC++/C++ `2026.1.0` | `1/1` CTest pass (`22.75 s`); `40/40` cases and `6,116,692/6,116,692` assertions; native-stage record for `shape=decode rows=1 head_dim=3` and `shape=prefill rows=16 head_dim=7` |
+
+The four drivers consume the single shared
+`test/backend/backend_conformance_sdpa.hpp` matrix over the independent
+`test/backend/backend_conformance_sdpa_reference.hpp` oracle; no backend runs
+a private copy of the arithmetic, special policy, expected values, or
+capability table, no case was skipped on an enabled device, and no
+`Unsupported` leaf is counted as conformance. The automated checks are
+`test/cpu/test_cpu_conformance.cpp`, `test/cuda/test_cuda_conformance.cpp`,
+`test/rocm/test_rocm_conformance.cpp`, and `test/sycl/test_sycl_conformance.cpp`.
+
+Native QK/PV evidence at prefill and logical `R=1` decode, in addition to the
+passing values above:
+
+| Backend | Native facility | Prefill and decode records | Trace or profiler result |
+| --- | --- | --- | --- |
+| CUDA | Direct BF16/FP32 `wmma` QK and PV stages | `cuda-sdpa-integration-record backend=CUDA cases=decode,prefill kernel=sdpa_qk_kernel,sdpa_pv_kernel facility=bf16-wmma image_arch=1200` — `1/1` case, `72` assertions | `nsys profile --force-overwrite=true -o /tmp/csw-17-cuda-sdpa ./build/test/iom_cuda_conformance_tests --test-case=*TinyLlama*SDPA*decode*`, then `nsys stats --report cuda_gpu_kern_sum`: `sdpa_pv_kernel` with `2` instances and `sdpa_qk_kernel` with `2` instances beside two scale, softmax, and canonicalization instances each (Nsight Systems `2026.4.1.191`). One instance per product at decode and one at prefill, with no duplicate or corrective pass. |
+| ROCm | GFX12 wave32 BF16 WMMA QK and PV stages | `rocm-sdpa-integration-record backend=ROCm facility=gfx1201-wave32-bf16-wmma kernels=sdpa_q_pack_kernel,sdpa_k_pack_kernel,sdpa_qk_wmma_kernel,sdpa_softmax_kernel,sdpa_v_pack_kernel,sdpa_pv_wmma_kernel,sdpa_merge_kernel,sdpa_output_store_kernel prefill_rows=17 prefill_position=0 prefill_head_dim=3 decode_rows=1 decode_position=16 decode_head_dim=3` — `1/1` case, `152` assertions | `rocprofv3 --kernel-trace --hip-trace --sys-trace -f csv -d /tmp/csw-17-rocm-prof -- ./build/test/iom_rocm_conformance_tests --test-case=*TinyLlama*SDPA*` exited `0`; the `*_kernel_trace.csv` of that capture contains `4` `sdpa_qk_wmma_kernel` and `4` `sdpa_pv_wmma_kernel` dispatches (`rocprofv3` `1.3.5`). |
+| SYCL | Subgroup-16 `ext_intel_matrix` joint-matrix QK and PV stages | `sdpa-native-stage shape=decode rows=1 position=3 length=4 capacity=4 head_dim=3` and `sdpa-native-stage shape=prefill rows=16 position=2 length=17 capacity=19 head_dim=7` — `1/1` case, `254` assertions | `sycl-trace --print-format=verbose --ur.call ./build/test/iom_sycl_conformance_tests --test-case=*SDPA*native*` exited `0`; the Unified Runtime trace creates `...SdpaQkJointMatrixTailKernelTagE` (handle `0x38b21f0`) and `...SdpaPvJointMatrixTailKernelTagE` (handle `0x38b2490`), and each handle appears in exactly two `urEnqueueKernelLaunchWithArgsExp` calls, one per recorded shape. |
+
+CPU's scalar port is the host baseline and supplies no accelerator claim. The
+recorded values are the logical fixtures the shared harness submits; the
+native records connect them to the executed device-local stages rather than to
+host computation, a storage round trip, a padded extra logical token, or an
+elementwise substitute. Three stated limitations accompany this record:
+
+1. CUDA hardware-counter collection is denied to this account
+   (`ERR_NVGPUCTRPERM`, no passwordless root), so the CUDA observation is a
+   kernel summary and claims no unavailable counter.
+2. `rocprof` does not exist on the ROCm 7.x host; `rocprofv3`, its supported
+   successor with the same kernel-identification surface, produced the kernel
+   trace. PC sampling and SPM counters are unsupported on `gfx1201`, so no
+   hardware instruction counter is claimed there either.
+3. No SYCL ISA-level confirmation was obtained: `clang-offload-extract` on the
+   built conformance binary yields the `sycl-spir64` images (the one carrying
+   both SDPA tail-kernel symbols compiles with
+   `ocloc compile -spirv_input -device bmg`), but `ocloc disasm -dump`
+   (`ocloc` `26.22.38646.7`) emits only `sections.txt` with no instruction
+   listing, so no `dpas` count is reported. The SYCL record rests on the traced
+   dispatch, the created kernel identities, the device's queried
+   `ext_intel_matrix`/subgroup-16 facts, and the numerical result.
+
+The supported/unsupported matrix published in
+[Current capability matrix](#current-capability-matrix) is the state these runs
+observed: `BF16` is `Supported` on CPU, CUDA, ROCm, and SYCL with
+`QuantizationFormat::NONE` only, while `F4_E2M1`, `F6_E2M3`, `F6_E3M2`,
+`F8_E4M3FN`, `F8_E5M2`, `F16`, `F32`, and `F64` remain explicit
+`Unsupported` rejection classes on every backend, as do BOOL, every integer
+leaf, `F8_E8M0`, and every non-`NONE` quantization. No failed or unavailable
+native path in this record is relabelled as supported, and no case, fixture,
+or tolerance was weakened to reach it.
+
+Publishing this gate closes the last missing operation prerequisite of the
+mathematical forward sequence: the session and decoder-layer components may
+now assemble and verify the complete layer against these operation boundaries.
+This publication is evidence and documentation only — it adds no session,
+model, kernel, fixture, workspace abstraction, or scheduler code.
 
 #### Implementation references and delivery boundary
 
