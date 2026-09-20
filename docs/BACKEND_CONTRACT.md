@@ -2135,10 +2135,11 @@ CUDA neural implementation or a support claim; each interface-owning port
 carries its own evidence. On the inventoried device the native CUDA Toolkit
 route is **supported for implementation feasibility** for ordinary and
 head-planar linear, QK, and PV at every required row count. Production status
-is **closed for linear** — the operation-owning port supplies the runtime
-numerical, conformance, and execution-connected evidence recorded in
-`[Linear native evidence](#linear-native-evidence)` — and remains **blocked for
-QK, PV, RoPE, and SDPA** until their own ports supply the same evidence. The
+is **closed for linear and the CUDA SDPA matrix QK/PV stages** — the
+operation-owning ports supply the runtime numerical, conformance, and
+execution-connected evidence recorded in `[Linear native evidence](#linear-native-evidence)`
+and `[SDPA matrix native evidence](#sdpa-matrix-native-evidence)` — and remains **blocked for RoPE and end-to-end SDPA**
+until their own ports supply the same evidence. The
 implemented SiLU port is closed separately by its operation-owned gate receipt.
 A device below compute capability 8.0 is **unsupported** for this BF16 WMMA
 route; it does not earn a fallback pass.
@@ -2219,6 +2220,44 @@ RoPE, SiLU, or SDPA claim.
   `15`, `16`, and `17` in ordinary and head-planar mode, each established by an
   executed submission whose output was compared against the independent
   reference; a device without the facility reports `Unsupported`.
+
+##### SDPA matrix native evidence
+
+Recorded on 2026-09-20 through the configured `cuda` `csw-remote` profile
+from the exact
+`run-task/006-tinyllama--08-causal-grouped-attention--05-cuda-matrix-products`
+worktree, mirror `05-cuda-matrix-a1`, host `bv1`. This record covers the
+backend-private CUDA matrix stages (`src/cuda/sdpa_matrix.cu`) only; it makes
+no claim for CUDA scale, causal masking, softmax, probability preparation,
+RoPE, or end-to-end SDPA integration.
+
+- **Backend, device, and toolchain.** CUDA; NVIDIA GeForce RTX 5090,
+  compute capability 12.0, driver 595.71.05; CUDA Toolkit 13.2
+  (`nvcc` `V13.2.78`), with the direct BF16/FP32 WMMA route selected at
+  runtime for CC >= 8.0.
+- **Kernel and exercised submissions.** The private native symbols
+  `sdpa_qk_kernel` and `sdpa_pv_kernel` were both emitted by the focused
+  conformance record for logical `R=1,15,16,17`, `L=19,15,16,19`,
+  respectively, with `P=2`, `Hq=4`, `Hkv=2`, `C=24`, and non-tile `D=7`.
+  The fixtures use transformed leading-plane offsets and strides, grouped
+  KV heads, logical/padded tails, BF16 DAZ probes, and direct merged-output
+  checks. The focused selection passed with `19196/19196` assertions, and the
+  shared `*SDPA*` selection passed with `19533/19533` assertions.
+- **Conformance gate.** The configured target
+  `ctest --test-dir build --output-on-failure --timeout 300 -R
+  ^iom_cuda_conformance_tests$` passed on the same mirror (`1/1` test,
+  `78.72s`).
+- **Profiler.** Nsight Compute exercised the focused matrix selection and
+  reported `ERR_NVGPUCTRPERM`; counter collection is denied to this account,
+  so no counter-based instruction observation was obtained. Nsight Systems
+  successfully captured `/tmp/sdpa-matrix-a1.nsys-rep`; its
+  `cuda_gpu_kern_sum` reports `sdpa_pv_kernel` with 4 instances and
+  `sdpa_qk_kernel` with 4 instances. This proves both native matrix stages
+  ran for the decode and prefill fixture submissions without claiming
+  unavailable performance counters.
+- **Conclusion.** The private CUDA QK/PV matrix stages are closed on this
+  device for the exercised decode and prefill rows; full CUDA SDPA remains
+  gated on its nonmatrix and integration ports.
 
 ##### Evidence boundary and installed capability
 
