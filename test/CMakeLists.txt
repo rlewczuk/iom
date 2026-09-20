@@ -281,7 +281,32 @@ if(ROCM_ENABLED)
         RUNTIME_LIBRARIES hip::host
         CONFORMANCE_DOCTEST_CONFIG DOCTEST_CONFIG_IMPLEMENT
     )
+    add_executable(iom_rocm_sdpa_nonmatrix_tests
+        rocm/test_rocm_sdpa_nonmatrix.cpp
+        backend/backend_conformance_sdpa_reference.hpp
+    )
+    set_source_files_properties(rocm/test_rocm_sdpa_nonmatrix.cpp PROPERTIES
+        COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+    )
+    target_include_directories(iom_rocm_sdpa_nonmatrix_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/src/rocm
+    )
+    target_link_libraries(iom_rocm_sdpa_nonmatrix_tests
+        PRIVATE
+            doctest::doctest
+            iom_rocm
+            libiom
+            hip::host
+    )
+    add_test(
+        NAME iom_rocm_sdpa_nonmatrix_tests
+        COMMAND iom_rocm_sdpa_nonmatrix_tests
+    )
 endif()
+
 
 if(CUDA_ENABLED)
     add_iom_backend_tests(cuda
