@@ -223,6 +223,8 @@ if(ROCM_ENABLED)
         src/rocm/device.cpp
         src/rocm/device_tensor.cpp
         src/rocm/copy.hip
+        src/rocm/sdpa_softmax.hip
+        src/rocm/sdpa_softmax.hpp
         src/rocm/copy.hpp
         src/rocm/driver.cpp
         src/rocm/driver.hpp
