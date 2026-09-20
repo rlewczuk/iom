@@ -52,10 +52,24 @@ enum class SubmissionFault {
     // native launch, so an armed failure never starts the device operation
     // and never counts as a native launch.
     silu_launch,
+    // The joined SDPA lowering's accepted-failure seam: consumed after the
+    // native QK stage was enqueued, so an armed failure reaches the queue as
+    // a post-acceptance stage failure with a positive OID, repeatable wait
+    // errors, and clean resource release.
+    sdpa_launch,
 };
 
 void inject_submission_fault_for_testing(SubmissionFault fault) noexcept;
 [[nodiscard]] bool consume_submission_fault(SubmissionFault fault) noexcept;
+
+// Accepted-failure checkpoint inside the joined SDPA lowering. When the
+// SDPA launch fault is armed, one submission fails after its native QK stage
+// was enqueued: the queue has already accepted the request and registered
+// owners and its workspace lease, so the conformance suite observes a
+// positive OID, the same error on every wait, clean release on proven
+// completion, and a healthy successor. An unarmed checkpoint is a no-op, so
+// production behaviour is unchanged.
+void sdpa_stage_checkpoint();
 
 #ifdef IOM_ENABLE_TESTING
 // Counters over the policy's native queue-resource lifecycle. Queue setup
@@ -429,11 +443,61 @@ struct gpu_policy {
     static void launch_linear(
             stream_type stream, const detail::LinearMetadata& metadata);
 
+    // Causal grouped-query SDPA: the joined ROCm lowering of the completed
+    // native QK/PV (src/rocm/sdpa_matrix.hpp) and nonmatrix
+    // (src/rocm/sdpa_softmax.hpp) stages. The capability is a property of
+    // this policy type and is chosen once, at queue creation, from the exact
+    // checked device fact: only a device whose GFX12 wave32 BF16 WMMA route
+    // and completed native stages are proven selects this variant, and no
+    // workspace query or submission re-reads the device.
+    [[nodiscard]] static constexpr bool sdpa_supported() noexcept {
+        return true;
+    }
+
+    // Exact `{bytes, alignment}` of one admitted SDPA request: alignment 32
+    // over the checked six-segment conservative sum of the packed q_pack, the
+    // sequentially reused K/V pack, FP32 scores, BF16 probabilities, BF16
+    // planar PV, and the merged staging region. The request type is a
+    // template parameter because the shared queue's immutable request is a
+    // protected backend hook type; the lowering never widens it.
+    template <typename Request>
+    [[nodiscard]] static WorkspaceRequirements sdpa_workspace_requirements(
+            const Request& request);
+
+    // Enqueue every joined SDPA stage on this queue's existing in-order
+    // stream: pack Q/K, native QK into FP32 scores, device-local scale/mask/
+    // stable-special softmax into the BF16 probability boundary, reused-pack
+    // native PV, planar merge, and the logical copy into the caller's
+    // standard-tiled output. No stream, allocation, staging, host round trip,
+    // or synchronization is created here; the shared queue records the
+    // completion event after this returns.
+    template <typename Request>
+    static void launch_sdpa(stream_type stream, const Request& request);
+
+    [[nodiscard]] static constexpr const char* sdpa_kernel_operation() noexcept {
+        return "HIP SDPA stage launch";
+    }
+
     [[nodiscard]] static constexpr const char* backend_label() noexcept {
 
         return "ROCm";
     }
 
+};
+
+// The queue policy of a ROCm device without the checked native SDPA route:
+// the installed `gfx1036`, any wave64 or otherwise unproved target, and any
+// device whose GFX12 wave32 BF16 WMMA execution evidence is absent. The
+// shared queue template is instantiated once per capability variant, so such
+// a device reports the established `Unsupported` for the operation before a
+// layout query, registration, credit, lease, metadata upload, or launch —
+// never a scalar, emulated, or host substitute — while every other operation
+// keeps its established path unchanged. The fact is resolved once, at queue
+// creation, and no submission re-reads it.
+struct gpu_policy_unsupported_sdpa final : gpu_policy {
+    [[nodiscard]] static constexpr bool sdpa_supported() noexcept {
+        return false;
+    }
 };
 using EventRingState = iom::detail::EventRingState<gpu_policy>;
 
@@ -451,7 +515,8 @@ void region_to_host(
 
 [[nodiscard]] std::unique_ptr<DeviceOps> make_queue(
         const Device& device, detail::QueueResourceProvider& resource_provider,
-        int device_ordinal, detail::RegistryState& registry_state);
+        int device_ordinal, detail::RegistryState& registry_state,
+        bool sdpa_capable);
 
 #ifdef IOM_ENABLE_TESTING
 // Observed fixed resource geometry of one live queue: the reserved

@@ -228,6 +228,7 @@ if(ROCM_ENABLED)
         src/rocm/copy.hip
         src/rocm/sdpa_softmax.hip
         src/rocm/sdpa_softmax.hpp
+        src/rocm/sdpa_lowering.hpp
         src/rocm/copy.hpp
         src/rocm/sdpa_matrix.hip
         src/rocm/sdpa_matrix.hpp

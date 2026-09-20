@@ -2,11 +2,14 @@
 #include "copy.hpp"
 
 #include "iom/device.hpp"
+#include "sdpa_lowering.hpp"
+#include "sdpa_matrix.hpp"
 #include "../iom_internal.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -904,6 +907,20 @@ WorkspaceRequirements gpu_policy::linear_native_bf16_requirements(
             32};
 }
 
+// Exact native SDPA capability of one HIP ordinal: only the checked GFX12
+// `gfx1201` wave32 image with the completed native QK/PV and nonmatrix stages
+// is admitted. `gfx1036`, wave64 devices, an unavailable ordinal, and every
+// other unproved target report false, so their queue keeps the established
+// `Unsupported` behaviour instead of an emulated or partially native route.
+bool sdpa_native_capability(int device_ordinal) noexcept {
+    return sdpa_matrix_capability(device_ordinal)
+            == SdpaMatrixCapability::gfx1201_wave32_wmma;
+}
+
+}  // namespace iom::rocm_detail
+
+namespace iom::rocm_detail {
+
 void inject_submission_fault_for_testing(
         SubmissionFault fault) noexcept {
     g_event_record_failures.store(
@@ -913,6 +930,12 @@ void inject_submission_fault_for_testing(
             fault == SubmissionFault::event_record ? 1 : 0,
             std::memory_order_release);
     g_submission_fault.store(fault, std::memory_order_release);
+}
+
+void sdpa_stage_checkpoint() {
+    if (consume_submission_fault(SubmissionFault::sdpa_launch)) {
+        throw std::runtime_error("ROCm SDPA QK stage launch failed");
+    }
 }
 
 namespace {
@@ -1003,20 +1026,36 @@ void region_to_host(
 std::unique_ptr<DeviceOps> make_queue(
         const Device& device,
         detail::QueueResourceProvider& resource_provider, int device_ordinal,
-        detail::RegistryState& registry_state) {
-    return std::make_unique<detail::GpuQueue<gpu_policy>>(
+        detail::RegistryState& registry_state, bool sdpa_capable) {
+    // The queue's policy is chosen once, from the runtime device fact, and
+    // never re-read by a submission or by the pure workspace query: a device
+    // with the checked native SDPA route queues the joined lowering, and a
+    // device without it keeps every other operation on its established path
+    // while reporting the operation `Unsupported`.
+    if (sdpa_capable) {
+        return std::make_unique<detail::GpuQueue<gpu_policy>>(
+                device, resource_provider, device_ordinal, registry_state);
+    }
+    return std::make_unique<detail::GpuQueue<gpu_policy_unsupported_sdpa>>(
             device, resource_provider, device_ordinal, registry_state);
 }
 
 #ifdef IOM_ENABLE_TESTING
-void queue_resource_snapshot_for_testing(
+namespace {
+
+// The observed fixed resource geometry of one live queue. Each capability
+// variant is a distinct instantiation of the shared queue template, so both
+// are tried before the queue is rejected as foreign.
+template <typename Policy>
+[[nodiscard]] bool queue_resource_snapshot_of(
         DeviceOps& queue, QueueResourceSnapshot& snapshot) {
-    auto* gpu_queue = dynamic_cast<detail::GpuQueue<gpu_policy>*>(&queue);
+    auto* gpu_queue = dynamic_cast<detail::GpuQueue<Policy>*>(&queue);
     if (gpu_queue == nullptr) {
-        throw std::logic_error("queue is not a live ROCm GpuQueue");
+        return false;
     }
     detail::MetadataSlotPool& pool = gpu_queue->metadata_pool_for_testing();
-    EventRingState& ring = gpu_queue->event_ring_for_testing();
+    typename detail::EventRingState<Policy>& ring =
+            gpu_queue->event_ring_for_testing();
     snapshot.slot_count = pool.slot_count();
     snapshot.device_base = pool.device_base();
     snapshot.slot_stride = pool.slot_stride();
@@ -1024,6 +1063,19 @@ void queue_resource_snapshot_for_testing(
     snapshot.events_in_use = ring.in_use_count_for_testing();
     snapshot.slots_in_use = pool.in_use_count();
     snapshot.slots_protected = pool.protected_count();
+    return true;
+}
+
+}  // namespace
+
+void queue_resource_snapshot_for_testing(
+        DeviceOps& queue, QueueResourceSnapshot& snapshot) {
+    if (queue_resource_snapshot_of<gpu_policy>(queue, snapshot)
+            || queue_resource_snapshot_of<gpu_policy_unsupported_sdpa>(
+                    queue, snapshot)) {
+        return;
+    }
+    throw std::logic_error("queue is not a live ROCm GpuQueue");
 }
 
 void reclaim_retained_queue_leases_for_testing(Device& device) {

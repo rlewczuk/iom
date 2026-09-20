@@ -626,17 +626,48 @@ TEST_CASE("ROCm conformance: sub-byte odd-length host reads stay within the stag
     CHECK_FALSE(gate.armed());
 }
 
+// Native causal grouped-query SDPA ordinals of one ROCm device, stated
+// independently of the port: the checked route is the GFX12 wave32 BF16 WMMA
+// image with its completed native QK/PV and nonmatrix stages, so only a
+// `gfx1201` wave32 device is admitted while the installed `gfx1036` must keep
+// reporting `Unsupported` for the operation rather than fail later.
+[[nodiscard]] bool rocm_native_sdpa_ordinal(int ordinal) {
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, ordinal) != hipSuccess) {
+        return false;
+    }
+    if (properties.warpSize != 32) {
+        return false;
+    }
+    const std::string_view architecture{properties.gcnArchName};
+    return architecture.starts_with("gfx1201");
+}
+
+// First enumerated ROCm device without the proven native route, or -1 when
+// the host exposes only admitted devices.
+[[nodiscard]] int rocm_unproved_sdpa_ordinal(int device_count) {
+    for (int ordinal = 0; ordinal < device_count; ++ordinal) {
+        if (!rocm_native_sdpa_ordinal(ordinal)) {
+            return ordinal;
+        }
+    }
+    return -1;
+}
+
 TEST_CASE("ROCm conformance: compute methods reject capability without submitting") {
     iom_conformance::TrafficGate gate;
     auto candidate = iom::make_rocm_device(
             0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    // The checked host exposes the GFX12 device at ordinal 0. An unavailable
+    // facility is a configuration failure, never a silently skipped case.
+    REQUIRE(rocm_native_sdpa_ordinal(0));
     iom_conformance::run_compute_capability_conformance(
             *candidate, candidate->supported_data_types(), &gate, "ROCm",
-            true, true);
+            true, true, true);
     CHECK_FALSE(gate.armed());
 }
 
-TEST_CASE("ROCm conformance: shared SDPA admission and unsupported matrix") {
+TEST_CASE("ROCm conformance: shared SDPA admission and native BF16 attention") {
     iom_conformance::TrafficGate gate;
     std::vector<std::byte> storage(64 * 1024 * 1024);
     iom::LinearAllocator reference_allocator(storage.data(), storage.size());
@@ -645,9 +676,180 @@ TEST_CASE("ROCm conformance: shared SDPA admission and unsupported matrix") {
             0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
     auto foreign = iom::make_rocm_device(
             0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    REQUIRE(rocm_native_sdpa_ordinal(0));
+    // The full tiled-storage oracle observes owner padding around every case,
+    // and the SDPA launch seam makes one accepted submission fail after its
+    // native QK stage, so the shared matrix covers numerical, admission,
+    // lifetime, and accepted-asynchronous-failure behaviour on one path.
+    HipStorageOracle native_storage;
+    const iom_conformance::SdpaNativeFailureSeam native_failure{
+            [] {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::sdpa_launch);
+            },
+            [] {
+                iom::rocm_detail::inject_submission_fault_for_testing(
+                        iom::rocm_detail::SubmissionFault::none);
+            },
+            "rocm_detail::sdpa_stage_checkpoint",
+            {}};
     const iom_conformance::SdpaConformanceConfig config{
-            {*reference, *candidate, *foreign}, {}, false, &gate};
+            {*reference, *candidate, *foreign},
+            iom_conformance::kSdpaCurrentSupportedDataTypes,
+            true,
+            &gate,
+            &native_storage,
+            {},
+            native_failure};
     iom_conformance::run_sdpa_conformance(config);
+    CHECK_FALSE(gate.armed());
+}
+
+// A ROCm device without the checked native route reports the operation
+// `Unsupported` for structurally valid BF16 input — pure query and submission
+// alike — with the output untouched and no accepted token, exactly as the
+// family rejects an unproved target instead of emulating it.
+TEST_CASE("ROCm conformance: unproved SDPA device keeps the operation unsupported") {
+    int device_count = 0;
+    REQUIRE(hipGetDeviceCount(&device_count) == hipSuccess);
+    const int unproved = rocm_unproved_sdpa_ordinal(device_count);
+    // The checked host enumerates the installed `gfx1036` beside the GFX12
+    // device. A host without an unproved ROCm device is a configuration
+    // failure, never a silently skipped rejection case.
+    REQUIRE_MESSAGE(
+            unproved >= 0,
+            "the ROCm host enumerates no device without the native SDPA route");
+    auto candidate = iom::make_rocm_device(
+            static_cast<std::uint32_t>(unproved),
+            iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom::TensorSpec q_spec{
+            iom::TensorShape{{2, 1, 16, 16}}, iom::DataType::BF16};
+    const iom::TensorSpec out_spec{
+            iom::TensorShape{{2, 16, 16}}, iom::DataType::BF16};
+    auto q = candidate->create_tensor(q_spec);
+    auto kv = candidate->create_tensor(q_spec);
+    auto out = candidate->create_tensor(out_spec);
+    iom_conformance::copy_from_host(
+            out->view(),
+            iom_conformance::sdpa_detail::pack_output_sentinel(
+                    out->view().spec(), std::byte{0xC3}));
+    const std::vector<std::byte> before =
+            iom_conformance::read_logical(out->view());
+    auto queue = candidate->create_ops();
+    iom_conformance::sdpa_detail::expect_query_exception(
+            *queue, q->view(), kv->view(), kv->view(), out->view(), 0, 16,
+            true, false);
+    CHECK_EQ(
+            queue->sdpa(
+                    q->view(), kv->view(), kv->view(), out->view(), 0, 16),
+            iom_conformance::sdpa_detail::unsupported_oid);
+    iom_conformance::require_logical_bytes(
+            out->view(), before, "unproved SDPA device");
+}
+
+// Public-path submission used by the native evidence record: it queries the
+// exact requirement, submits through the public facade, waits, and returns the
+// accepted token's sequence, so the profiler record binds the operation to its
+// kernels and geometry through the real queue/OID route.
+[[nodiscard]] std::uint64_t submit_native_record_case(
+        const iom_conformance::SdpaConformanceConfig& config,
+        const iom_conformance::SdpaReferenceCase& item) {
+    iom_conformance::sdpa_detail::OwnedOperands operands =
+            iom_conformance::sdpa_detail::make_operands(
+                    config.devices.candidate, item, item.data_type);
+    auto queue = config.devices.candidate.create_ops();
+    const iom::WorkspaceRequirements requirements =
+            queue->sdpa_workspace_requirements(
+                    operands.q->view(), operands.k->view(), operands.v->view(),
+                    operands.out->view(), item.position, item.length);
+    std::unique_ptr<iom::RawWorkspace> workspace;
+    if (requirements.bytes != 0) {
+        workspace = config.devices.candidate.create_workspace(
+                requirements.bytes);
+        REQUIRE(workspace != nullptr);
+    }
+    const iom::oid token = workspace
+            ? queue->sdpa(
+                      operands.q->view(), operands.k->view(),
+                      operands.v->view(), operands.out->view(),
+                      item.position, item.length, workspace->view())
+            : queue->sdpa(
+                      operands.q->view(), operands.k->view(),
+                      operands.v->view(), operands.out->view(),
+                      item.position, item.length);
+    REQUIRE(iom::oid_is_token(token));
+    queue->wait(token);
+    return iom_conformance::token_sequence(token);
+}
+
+// Native profiler target: the joined public path for an exact-capacity prefill
+// and its logical `R=1` cached decode successor, at non-tile `D`. The printed
+// record binds the accepted operation tokens to the exact geometry, and the
+// rocprof `--hip-trace` record of this case shows the native QK/PV kernels
+// together with the pack, softmax, merge, and store stages of those
+// submissions. The same two geometries are checked numerically against the
+// independent oracle by the shared driver.
+TEST_CASE("ROCm TinyLlama SDPA native QK/PV decode and prefill") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    REQUIRE(rocm_native_sdpa_ordinal(0));
+    HipStorageOracle native_storage;
+    const iom_conformance::SdpaConformanceConfig config{
+            {*reference, *candidate, *foreign},
+            iom_conformance::kSdpaCurrentSupportedDataTypes,
+            true,
+            &gate,
+            &native_storage,
+            {},
+            {}};
+    const iom_conformance::SdpaReferenceCase prefill =
+            iom_conformance::sdpa_oracle::make_exact_capacity_case(
+                    iom::DataType::BF16);
+    const iom_conformance::SdpaReferenceCase decode =
+            iom_conformance::sdpa_incremental_slice(
+                    prefill, prefill.rows - 1);
+    REQUIRE_EQ(prefill.rows, std::size_t{17});
+    REQUIRE_EQ(decode.rows, std::size_t{1});
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, prefill, "TinyLlama SDPA prefill");
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, decode, "TinyLlama SDPA decode");
+    const std::uint64_t prefill_token = submit_native_record_case(
+            config, prefill);
+    const std::uint64_t decode_token = submit_native_record_case(
+            config, decode);
+    const auto planes_of = [](const iom_conformance::SdpaReferenceCase& item) {
+        std::size_t planes = 1;
+        for (const std::size_t extent : item.leading_dimensions) {
+            planes *= extent;
+        }
+        return planes;
+    };
+    std::printf(
+            "rocm-sdpa-integration-record backend=ROCm "
+            "facility=gfx1201-wave32-bf16-wmma "
+            "kernels=sdpa_q_pack_kernel,sdpa_k_pack_kernel,"
+            "sdpa_qk_wmma_kernel,sdpa_softmax_kernel,sdpa_v_pack_kernel,"
+            "sdpa_pv_wmma_kernel,sdpa_merge_kernel,sdpa_output_store_kernel "
+            "prefill_sequence=%llu prefill_planes=%zu prefill_hq=%zu "
+            "prefill_hkv=%zu prefill_rows=%zu prefill_capacity=%zu "
+            "prefill_length=%zu prefill_position=%zu prefill_head_dim=%zu "
+            "decode_sequence=%llu decode_planes=%zu decode_hq=%zu "
+            "decode_hkv=%zu decode_rows=%zu decode_capacity=%zu "
+            "decode_length=%zu decode_position=%zu decode_head_dim=%zu\n",
+            static_cast<unsigned long long>(prefill_token),
+            planes_of(prefill), prefill.hq, prefill.hkv, prefill.rows,
+            prefill.capacity, prefill.length, prefill.position,
+            prefill.head_dim,
+            static_cast<unsigned long long>(decode_token),
+            planes_of(decode), decode.hq, decode.hkv, decode.rows,
+            decode.capacity, decode.length, decode.position, decode.head_dim);
     CHECK_FALSE(gate.armed());
 }
 
@@ -1550,7 +1752,11 @@ TEST_CASE("ROCm conformance: full shared suite") {
                     {}}};
     iom_conformance::run_backend_conformance(
             devices, candidate->supported_data_types().subspan(0, 1),
-            &gate, &oracle, true, true, &rope_contract);
+            &gate, &oracle, true, true, &rope_contract,
+            // ROCm queues the complete BF16 attention port, so the shared
+            // capability probe requires the positive accepted path - including
+            // the caller workspace the positive path needs.
+            true);
     CHECK_FALSE(gate.armed());
 }
 
