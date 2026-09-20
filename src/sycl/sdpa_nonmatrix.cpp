@@ -13,6 +13,11 @@ namespace iom::sycl_detail {
 namespace {
 
 constexpr std::size_t kAlignment = 32;
+// Standard tensor tiling of the merged destination plane.  This stage keeps
+// its own copy of the fixed 16x16 tile so it stays independent of the native
+// matrix sibling.
+constexpr std::size_t kTile = 16;
+constexpr std::size_t kTileSlots = kTile * kTile;
 constexpr std::uint32_t kF32ExponentMask = 0x7f800000u;
 constexpr std::uint32_t kF32FractionMask = 0x007fffffu;
 constexpr std::uint32_t kF32PositiveInfinity = 0x7f800000u;
@@ -170,14 +175,40 @@ void reject_overlap(
             + feature * request.head_feature_stride;
 }
 
+[[nodiscard]] inline std::size_t merged_leading_plane_base(
+        const SdpaNonmatrixRequest& request,
+        std::size_t plane) noexcept {
+    std::size_t result = request.merged_plane_offset;
+    std::size_t rest = plane;
+    for (std::size_t axis = request.merged_leading_rank; axis-- > 0;) {
+        const std::size_t coordinate =
+                rest % request.merged_leading_dimensions[axis];
+        rest /= request.merged_leading_dimensions[axis];
+        result += coordinate * request.merged_leading_strides[axis];
+    }
+    return result;
+}
+
+// Standard 16x16 tiled slot of one logical (row, column) output cell inside one
+// destination plane, matching `detail::standard_plane_slot`.  Device code
+// cannot call that host helper, so the formula is repeated here with checked
+// host-side inputs exactly like the queue's other backend-private writers.
+[[nodiscard]] inline std::size_t merged_plane_slot(
+        std::size_t row, std::size_t column, std::size_t rows,
+        std::size_t columns) noexcept {
+    const std::size_t tile_columns = columns / kTile + (columns % kTile != 0);
+    const std::size_t tile_index =
+            (row / kTile) * tile_columns + column / kTile;
+    return tile_index * kTileSlots + (row % kTile) * kTile + column % kTile;
+}
+
 [[nodiscard]] inline std::size_t merged_index(
         const SdpaNonmatrixRequest& request, std::size_t plane,
-        std::size_t row, std::size_t head, std::size_t feature) noexcept {
-    return request.merged_plane_offset
-            + plane * request.merged_plane_stride
-            + row * request.merged_row_stride
-            + head * request.merged_head_stride
-            + feature * request.merged_feature_stride;
+        std::size_t head, std::size_t row, std::size_t feature) noexcept {
+    return merged_leading_plane_base(request, plane)
+            + merged_plane_slot(
+                      row, head * request.head_dim + feature, request.rows,
+                      request.query_heads * request.head_dim);
 }
 
 inline void store_zero_tail(
@@ -274,7 +305,7 @@ inline void merge_head_element(
     const SdpaBf16 value = canonical_zero(request.head_bf16[
             head_index(request, plane, head, row, feature)]);
     request.merged_bf16[merged_index(
-            request, plane, row, head, feature)] = value;
+            request, plane, head, row, feature)] = value;
 }
 
 inline void convert_pv_element(
@@ -399,14 +430,27 @@ void validate_sdpa_nonmatrix_request(
                     "SYCL SDPA nonmatrix head row stride is zero");
     validate_stride(request.head_feature_stride,
                     "SYCL SDPA nonmatrix head feature stride is zero");
-    validate_stride(request.merged_plane_stride,
-                    "SYCL SDPA nonmatrix output plane stride is zero");
-    validate_stride(request.merged_row_stride,
-                    "SYCL SDPA nonmatrix output row stride is zero");
-    validate_stride(request.merged_head_stride,
-                    "SYCL SDPA nonmatrix output head stride is zero");
-    validate_stride(request.merged_feature_stride,
-                    "SYCL SDPA nonmatrix output feature stride is zero");
+    if (request.merged_leading_rank > kSdpaNonmatrixMaxLeadingRank) {
+        throw std::overflow_error(
+                "SYCL SDPA nonmatrix merged leading rank is too large");
+    }
+    for (std::size_t axis = 0; axis < request.merged_leading_rank; ++axis) {
+        if (request.merged_leading_dimensions[axis] == 0) {
+            throw std::invalid_argument(
+                    "SYCL SDPA nonmatrix merged leading dimension is zero");
+        }
+        validate_stride(
+                request.merged_leading_strides[axis],
+                "SYCL SDPA nonmatrix merged leading stride is zero");
+    }
+    for (std::size_t axis = request.merged_leading_rank;
+         axis < kSdpaNonmatrixMaxLeadingRank; ++axis) {
+        if (request.merged_leading_dimensions[axis] != 0
+                || request.merged_leading_strides[axis] != 0) {
+            throw std::invalid_argument(
+                    "SYCL SDPA nonmatrix merged leading map is not bounded");
+        }
+    }
 
     const std::size_t score_elements = indexed_extent(
             {{request.plane_count, request.score_plane_stride},
@@ -438,12 +482,34 @@ void validate_sdpa_nonmatrix_request(
              {request.rows, request.head_row_stride},
              {request.head_dim, request.head_feature_stride}},
             "SYCL SDPA nonmatrix head range overflows");
-    const std::size_t merged_elements = indexed_extent(
-            {{request.plane_count, request.merged_plane_stride},
-             {request.rows, request.merged_row_stride},
-             {request.query_heads, request.merged_head_stride},
-             {request.head_dim, request.merged_feature_stride}},
+    // Conservative element-slot extent of the standard tiled destination: the
+    // highest selected plane base plus the whole tiled plane span it can
+    // address.  `merged_plane_offset` is already part of the extent, so the
+    // range check below starts at offset zero.
+    const std::size_t merged_output_width = checked_mul(
+            request.query_heads, request.head_dim,
+            "SYCL SDPA nonmatrix output width overflows");
+    const std::size_t merged_plane_rows =
+            request.rows / kTile + (request.rows % kTile != 0);
+    const std::size_t merged_plane_columns =
+            merged_output_width / kTile + (merged_output_width % kTile != 0);
+    const std::size_t merged_plane_slots = checked_mul(
+            checked_mul(
+                    merged_plane_rows, merged_plane_columns,
+                    "SYCL SDPA nonmatrix merged plane slots overflow"),
+            kTileSlots, "SYCL SDPA nonmatrix merged plane slots overflow");
+    std::size_t merged_elements = checked_add(
+            request.merged_plane_offset, merged_plane_slots,
             "SYCL SDPA nonmatrix merged range overflows");
+    for (std::size_t axis = 0; axis < request.merged_leading_rank; ++axis) {
+        merged_elements = checked_add(
+                merged_elements,
+                checked_mul(
+                        request.merged_leading_dimensions[axis] - 1,
+                        request.merged_leading_strides[axis],
+                        "SYCL SDPA nonmatrix merged range overflows"),
+                "SYCL SDPA nonmatrix merged range overflows");
+    }
 
     const ByteRange scores = make_range(
             request.scores, request.score_plane_offset, score_elements,
@@ -461,7 +527,7 @@ void validate_sdpa_nonmatrix_request(
             request.head_bf16, request.head_plane_offset, head_elements,
             "SYCL SDPA nonmatrix head staging must be nonnull and 32-byte aligned");
     const ByteRange merged = make_range(
-            request.merged_bf16, request.merged_plane_offset, merged_elements,
+            request.merged_bf16, 0, merged_elements,
             "SYCL SDPA nonmatrix output must be nonnull and 32-byte aligned");
 
     const ByteRange* ranges[] = {&scores, &probabilities, &v, &pv, &head, &merged};

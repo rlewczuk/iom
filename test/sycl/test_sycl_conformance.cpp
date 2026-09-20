@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <memory>
 #include <new>
@@ -448,22 +449,15 @@ TEST_CASE("SYCL conformance: greedy token selection shared matrix and lifetime")
 
 TEST_CASE("SYCL conformance: compute methods reject unsupported capability without submitting") {
     SyclDevices devices;
-    // RMS normalization and linear projections have landed SYCL ports, so the
-    // shared probe queues their exact expectations through the real path;
-    // SiLU and SDPA stay `Unsupported`.
+    // RMS normalization, linear projections, SiLU, and SDPA all have landed
+    // SYCL ports, so the shared probe queues their exact expectations through
+    // the real path; the remaining unsupported leaves are rejected pure.
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "SYCL", true, true);
+            &devices.gate, "SYCL", true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("SYCL conformance: shared SDPA admission and unsupported matrix") {
-    SyclDevices devices;
-    const iom_conformance::SdpaConformanceConfig config{
-            devices.conformance(), {}, false, &devices.gate};
-    iom_conformance::run_sdpa_conformance(config);
-    CHECK_FALSE(devices.gate.armed());
-}
 TEST_CASE(
         "SYCL conformance: cache append reference, admission, and lifetime") {
     SyclDevices devices;
@@ -1155,35 +1149,6 @@ TEST_CASE(
     }
 }
 
-TEST_CASE("SYCL conformance: full shared suite") {
-    SyclDevices devices;
-    SyclStorageOracle oracle(*devices.candidate_context);
-    const iom_conformance::RopeContractConformanceConfig rope_contract{
-            devices.conformance(),
-            iom_conformance::rope_reference::kRopeSyclExpectedSupported,
-            &devices.gate,
-            iom_conformance::RopeNativeFailureSeam{
-                    [] {
-                        iom::sycl_detail::inject_submission_fault_for_testing(
-                                iom::sycl_detail::SubmissionFault::post_launch);
-                    },
-                    [] {
-                        iom::sycl_detail::inject_submission_fault_for_testing(
-                                iom::sycl_detail::SubmissionFault::none);
-                    },
-                    "sycl_detail::SubmissionFault::post_launch",
-                    {}}};
-    iom_conformance::run_backend_conformance(
-            devices.conformance(),
-            devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, &oracle, true, true, &rope_contract);
-    CHECK_FALSE(devices.gate.armed());
-}
-
-// ---------------------------------------------------------------------------
-// SYCL native BF16 linear projection.
-// ---------------------------------------------------------------------------
-
 // The device fact behind SYCL's native BF16 linear specialization, queried here
 // independently of the port and of its capability predicate: the pinned
 // extension revision, the Intel matrix aspect, subgroup 16, and a
@@ -1236,6 +1201,38 @@ TEST_CASE("SYCL conformance: full shared suite") {
 #endif  // defined(IOM_SYCL_TEST_BF16_MATRIX)
 }
 
+TEST_CASE("SYCL conformance: full shared suite") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    const iom_conformance::RopeContractConformanceConfig rope_contract{
+            devices.conformance(),
+            iom_conformance::rope_reference::kRopeSyclExpectedSupported,
+            &devices.gate,
+            iom_conformance::RopeNativeFailureSeam{
+                    [] {
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::post_launch);
+                    },
+                    [] {
+                        iom::sycl_detail::inject_submission_fault_for_testing(
+                                iom::sycl_detail::SubmissionFault::none);
+                    },
+                    "sycl_detail::SubmissionFault::post_launch",
+                    {}}};
+    const bool sdpa_available = sycl_bf16_matrix_available(
+            devices.candidate_context->get_devices().front());
+    iom_conformance::run_backend_conformance(
+            devices.conformance(),
+            devices.candidate->supported_data_types().subspan(0, 1),
+            &devices.gate, &oracle, true, true, &rope_contract,
+            sdpa_available);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// ---------------------------------------------------------------------------
+// SYCL native BF16 linear projection.
+// ---------------------------------------------------------------------------
+
 // SYCL's declared linear expectation: the complete 21-leaf applicable matrix
 // through the twenty-leaf scalar path plus the native BF16 specialization, the
 // frozen `{0, 1}` scratch path for the scalar leaves, the documented aligned
@@ -1280,6 +1277,145 @@ TEST_CASE("SYCL conformance: linear projection reference, admission, and lifetim
             declaration.device_available(iom::DataType::BF16),
             bf16_matrix_available);
     CHECK(declaration.device_available(iom::DataType::F32));
+}
+
+TEST_CASE("SYCL conformance: SDPA capability follows the queried matrix facility") {
+    // The native SDPA stages queue exactly the subgroup-16 BF16/BF16/FP32
+    // `joint_matrix` family the native `BF16` linear specialization proves, so
+    // the queue's immutable capability must agree with the device's own facts
+    // in both directions: the exact four-segment alignment-32 requirement on a
+    // capable device, and a pure capability rejection - no allocation,
+    // registration, lease, sequence, or output mutation - otherwise.
+    SyclDevices devices;
+    const sycl::device native_device =
+            devices.candidate_context->get_devices().front();
+    const bool matrix_available = sycl_bf16_matrix_available(native_device);
+    const auto queue = devices.candidate->create_ops();
+
+    auto q = devices.candidate->create_tensor(
+            iom::TensorSpec{iom::TensorShape{{1, 1, 1, 16}},
+                            iom::DataType::BF16});
+    auto kv = devices.candidate->create_tensor(
+            iom::TensorSpec{iom::TensorShape{{1, 1, 1, 16}},
+                            iom::DataType::BF16});
+    auto out = devices.candidate->create_tensor(
+            iom::TensorSpec{iom::TensorShape{{1, 1, 16}},
+                            iom::DataType::BF16});
+    const std::vector<std::byte> sentinel =
+            iom_conformance::read_logical(out->view());
+    if (matrix_available) {
+        // One plane of `R=1`, `L=1`: padded scores 16x16 FP32 (1024 B),
+        // probabilities 16x16 BF16 (512 B), PV 16x16 FP32 (1024 B), and head
+        // staging 16x16 BF16 (512 B), every segment 32-byte aligned.
+        const iom::WorkspaceRequirements requirements =
+                queue->sdpa_workspace_requirements(
+                        q->view(), kv->view(), kv->view(), out->view(), 0, 1);
+        CHECK_EQ(requirements, (iom::WorkspaceRequirements{3072, 32}));
+        const std::unique_ptr<iom::RawWorkspace> workspace =
+                devices.candidate->create_workspace(requirements.bytes);
+        REQUIRE(workspace != nullptr);
+        const iom::oid token = queue->sdpa(
+                q->view(), kv->view(), kv->view(), out->view(), 0, 1,
+                workspace->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+    } else {
+        CHECK_THROWS(
+                (void)queue->sdpa_workspace_requirements(
+                        q->view(), kv->view(), kv->view(), out->view(), 0, 1));
+        CHECK_EQ(
+                queue->sdpa(
+                        q->view(), kv->view(), kv->view(), out->view(), 0, 1),
+                iom::to_oid(iom::OidError::Unsupported));
+        CHECK_EQ(iom_conformance::read_logical(out->view()), sentinel);
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+TEST_CASE("SYCL conformance: SDPA reference, admission, and lifetime") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    const bool matrix_available = sycl_bf16_matrix_available(
+            devices.candidate_context->get_devices().front());
+    // SYCL's declared SDPA expectation: the current BF16 leaf through the
+    // shared independent oracle, the exact checked four-segment alignment-32
+    // workspace, four distinct tensor owners plus the caller workspace lease,
+    // and the accepted post-enqueue failure path. The positive matrix is
+    // claimed only on a device that exposes the queried native matrix facility;
+    // a device without it keeps BF16 a pure capability rejection, exactly like
+    // the linear `BF16` gate.
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(),
+            matrix_available
+                    ? std::span<const iom::DataType>(
+                              iom_conformance::kSdpaCurrentSupportedDataTypes)
+                    : std::span<const iom::DataType>{},
+            matrix_available,
+            &devices.gate,
+            &oracle,
+            {},
+            {[] {
+                 iom::sycl_detail::inject_submission_fault_for_testing(
+                         iom::sycl_detail::SubmissionFault::
+                                 sdpa_post_acceptance_failure);
+             },
+             [] {
+                 iom::sycl_detail::inject_submission_fault_for_testing(
+                         iom::sycl_detail::SubmissionFault::none);
+             },
+             "sycl_detail::SubmissionFault::sdpa_post_acceptance_failure",
+             {}}};
+    iom_conformance::run_sdpa_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// Native attribution of the two shapes the operation contract requires: one
+// logical `R=1` decode row with a nonzero causal offset and one prefill request
+// with the valid generic `L < a + R` case, a non-tile head dimension, and
+// distinct grouped query heads. Both run through the public facade against the
+// shared independent oracle, and the printed labels let a `SYCL_PI_TRACE=2`
+// run attribute the direct QK and PV kernel launches to each shape.
+TEST_CASE("SYCL conformance: SDPA native QK and PV stages for decode and prefill") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    const sycl::device native_device =
+            devices.candidate_context->get_devices().front();
+    REQUIRE_MESSAGE(
+            sycl_bf16_matrix_available(native_device),
+            "the native SDPA stages require the queried subgroup-16 "
+            "BF16/BF16/FP32 joint_matrix facility");
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kSdpaCurrentSupportedDataTypes,
+            true,
+            &devices.gate,
+            &oracle,
+            {},
+            {}};
+
+    const iom_conformance::SdpaReferenceCase decode =
+            iom_conformance::sdpa_incremental_slice(
+                    iom_conformance::sdpa_oracle::make_cached_incremental_case(
+                            iom::DataType::BF16),
+                    3);
+    std::printf(
+            "sdpa-native-stage shape=decode rows=%zu position=%zu length=%zu "
+            "capacity=%zu head_dim=%zu\n",
+            decode.rows, decode.position, decode.length, decode.capacity,
+            decode.head_dim);
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, decode, "native decode R=1");
+
+    const iom_conformance::SdpaReferenceCase prefill =
+            iom_conformance::sdpa_oracle::make_boundary_rows_case(
+                    iom::DataType::BF16, 16);
+    std::printf(
+            "sdpa-native-stage shape=prefill rows=%zu position=%zu length=%zu "
+            "capacity=%zu head_dim=%zu\n",
+            prefill.rows, prefill.position, prefill.length, prefill.capacity,
+            prefill.head_dim);
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, prefill, "native prefill R=16");
+    CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("SYCL conformance: RMS normalization capability follows the device FP64 aspect") {
