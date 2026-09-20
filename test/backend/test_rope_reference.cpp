@@ -33,9 +33,6 @@ TEST_CASE("RoPE reference classifies every data type and support span") {
     CHECK(kRopeUnsupportedDataTypes.size() == 14);
     CHECK(kRopeSyclExpectedSupported.size() == 8);
     CHECK(kRopeSyclExpectedSupported.back() == iom::DataType::F32);
-    CHECK(kRopeTtnnExpectedSupported
-          == std::array<iom::DataType, 2>{iom::DataType::BF16,
-                                          iom::DataType::F32});
 
     for (const iom::DataType type : kRopeApplicableDataTypes) {
         CHECK(rope_data_type_classification(type)

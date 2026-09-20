@@ -220,8 +220,7 @@ enum class RmsNormDataTypeClass : std::uint8_t {
     // Ordinary signed float: numeric conformance applies wherever the owning
     // backend advertises the leaf. CPU, CUDA, and ROCm support all nine;
     // SYCL supports the eight non-F64 leaves and F64 only with
-    // `aspect::fp64`; TTNN supports only BF16 and F32 and rejects the seven
-    // encoded-carrier leaves. Shared conformance combines this classification
+    // `aspect::fp64`; shared conformance combines this classification
     // with the backend capability span, never this header.
     applicable,
     // Unsupported everywhere: BOOL, the twelve integer leaves, and F8_E8M0

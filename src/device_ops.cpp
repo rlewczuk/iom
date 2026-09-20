@@ -476,7 +476,6 @@ namespace iom {
                 > std::numeric_limits<std::uintptr_t>::max() - base)
             throw std::overflow_error("workspace range end overflows");
         const std::uintptr_t range_end = base + workspace.byte_size();
-        const BackendKind backend = device.backend_kind();
         for (const TensorView& operand : operands) {
             if (&operand.device() != &device
                     || operand.owner_identity() == nullptr
@@ -484,13 +483,6 @@ namespace iom {
                 throw std::invalid_argument(
                         "workspace operand belongs to another device");
             }
-        }
-        // TTNN workspaces are caller-owned host mappings and TTNN operand
-        // handles identify device-side storage.  Their address domains are
-        // intentionally separate, so opaque TTNN handles do not participate
-        // in this common host-range overlap arithmetic.
-        if (backend == BackendKind::TTNN) {
-            return workspace;
         }
         for (const TensorView& operand : operands) {
             const std::uintptr_t operand_base =

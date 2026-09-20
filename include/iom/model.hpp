@@ -171,8 +171,8 @@ public:
      * `detail::WorkspaceValidation::validated` rules even when the supplied
      * workspace is empty: missing, insufficient, misaligned, foreign, dead, or
      * overlapping scratch fails before the first copied role. A zero-byte
-     * requirement of `{0, 1}` consumes no workspace, so the CPU and TTNN
-     * no-scratch policy keeps its unused-workspace behavior.
+     * requirement of `{0, 1}` consumes no workspace, so the CPU no-scratch
+     * policy keeps its unused-workspace behavior.
      *
      * The caller creates, provisions, and owns the destinations and any
      * workspace, and both must be quiescent and alive for the whole call; the

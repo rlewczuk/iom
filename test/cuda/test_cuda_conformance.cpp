@@ -365,8 +365,7 @@ TEST_CASE("CUDA conformance: cache append reference, admission, and lifetime") {
             &oracle,
             fault_seam,
             {},
-            nullptr,
-            true};
+            nullptr};
     iom_conformance::run_cache_append_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }

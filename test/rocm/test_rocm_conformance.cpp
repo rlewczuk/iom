@@ -356,8 +356,7 @@ TEST_CASE("ROCm conformance: cache append reference, admission, ordering, and li
             &oracle,
             fault_seam,
             {},
-            &gate,
-            true};
+            &gate};
     iom_conformance::run_cache_append_conformance(config);
     CHECK_FALSE(gate.armed());
 }

@@ -356,8 +356,7 @@ TEST_CASE("CPU conformance: cache row append reference, admission, and lifetime"
             &oracle,
             {},
             {},
-            &devices.gate,
-            true};
+            &devices.gate};
     // CPU has no post-acceptance failure seam by design; the shared
     // fault/repeat-wait section is intentionally unavailable here, while
     // successful repeated waits remain exercised by the common cases.

@@ -13,8 +13,8 @@
 // fixture directory, the source, the destination owners, and any caller
 // workspace through ordinary public APIs under RAII. It contains no
 // backend-kind switch, no accelerator header, no production failure-injection
-// seam, and no second inventory generator, so the CPU, CUDA, ROCm, SYCL, and
-// TTNN drivers call it unchanged, in that fixed integration order.
+// seam, and no second inventory generator, so the CPU, CUDA, ROCm, and SYCL
+// drivers call it unchanged, in that fixed integration order.
 
 #include <doctest/doctest.h>
 
@@ -172,7 +172,6 @@ inline iom::WorkspaceRequirements observed_maximum_requirement(
 // exactly the maximum serial per-owner requirement of the same binding, with
 // the documented zero-byte `{0, 1}` policy: the result is never a sum of
 // mutually exclusive scratch ranges, never an aggregate logical byte count,
-// and never a guessed size. A CPU or TTNN binding reports `{0, 1}` here
 // because every real owner query of that device reports it.
 inline iom::WorkspaceRequirements query_requirement(
         iom::Device& device, const iom::ModelSource& source,
@@ -197,8 +196,7 @@ inline iom::WorkspaceRequirements query_requirement(
 
 // Provisions the reusable caller scratch of one reported requirement, and only
 // when it is positive: a `{0, 1}` binding consumes no workspace at all and
-// therefore never calls a positive raw-workspace factory, which CPU and TTNN
-// reject.
+// therefore never calls a positive raw-workspace factory, which CPU rejects.
 inline std::unique_ptr<iom::RawWorkspace> provision_scratch(
         iom::Device& device, const iom::WorkspaceRequirements& reported) {
     if (reported.bytes == 0) {
@@ -714,8 +712,6 @@ inline const char* backend_kind_name(iom::BackendKind kind) noexcept {
         return "ROCm";
     case iom::BackendKind::SYCL:
         return "SYCL";
-    case iom::BackendKind::TTNN:
-        return "TTNN";
     }
     return "unknown";
 }
@@ -876,10 +872,11 @@ inline void real_model_loading_case(iom::Device& device) {
             "IOM_TEST_MODEL_ID",
             "the pinned checkpoint revision or digest-manifest identity");
 
-    // A standard-GPU caller reserves this arena at device construction; CPU and
-    // TTNN own their storage natively and supply none. When it is present the
-    // complete checkpoint must fit it, so an inadequate arena fails before the
-    // first data tensor exists instead of half-loading a model.
+    // A standard-GPU caller reserves this arena at device construction; CPU
+    // owns its storage through the caller allocator and supplies none. When
+    // it is present the complete checkpoint must fit it, so an inadequate
+    // arena fails before the first data tensor exists instead of half-loading
+    // a model.
     std::optional<std::size_t> arena;
     if (const std::optional<std::string> supplied =
                 optional_environment("IOM_TEST_MODEL_ARENA_BYTES")) {

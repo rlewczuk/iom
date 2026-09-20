@@ -150,7 +150,7 @@ namespace iom {
          * token/queue resource, metadata upload, submission, and no
          * dependence on free data-arena capacity, fragmentation, queue
          * occupancy, or completion state:
-         * CPU, TTNN, CUDA, and ROCm report `{0, 1}`; SYCL reports its
+         * CPU, CUDA, and ROCm report `{0, 1}`; SYCL reports its
          * checked whole-plane staging sum at alignment 32. Validation
          * failures surface as the corresponding exception
          * (`std::invalid_argument`, `std::overflow_error`, unsupported

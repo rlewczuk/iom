@@ -62,7 +62,7 @@ namespace iom {
         GGML_Q6_K,
         // ...
 
-        // Tenstorrent
+        // Vendor-specific formats
         TT_BFP2,
         TT_BFP2A,
         TT_BFP4,
@@ -76,7 +76,6 @@ namespace iom {
         CUDA,
         ROCM,
         SYCL,
-        TTNN,
     };
 
     /**
@@ -247,9 +246,9 @@ namespace iom {
      * and its backing range never relocate or retarget while views or
      * accepted work exist; the creating Device must outlive the workspace.
      * The owner registers its exact identity with the Device for the whole
-     * lifetime, which is what lets shared validation reject foreign and
-     * dead owners without dereferencing them. No CUDA, HIP, SYCL, or TTNN
-     * runtime type is exposed.
+     * lifetime, which is what lets shared validation reject foreign and dead
+     * owners without dereferencing them. No accelerator runtime type is
+     * exposed.
      */
     class RawWorkspace {
     public:
@@ -346,7 +345,7 @@ namespace iom {
         // 05). Each query validates the view specification with the same
         // checked arithmetic as the transfer itself and reports, without
         // any allocation, registration, leasing, or native effect:
-        // CPU and TTNN `{0, 1}`, and CUDA, ROCm, and SYCL
+        // CPU `{0, 1}`, and CUDA, ROCm, and SYCL
         // `{gpu_algorithm::compute_staging_size(logical_nbytes), 32}`.
         // The data-dependent BOOL byte check stays with the transfer
         // call: it is not a pure-query predicate.

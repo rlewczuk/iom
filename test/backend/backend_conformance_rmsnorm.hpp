@@ -538,9 +538,8 @@ private:
 // The device-less nonempty workspace of the workspace-policy probe. The frozen
 // requirement is exactly `{0, 1}`, so any supplied workspace view with a live
 // owner must be rejected before dispatch, and only an owned view can prove
-// that `RawWorkspaceView::empty` is the admitted predicate. A CPU or TTNN
-// device cannot manufacture positive scratch, so the probe owns the range
-// itself.
+// that `RawWorkspaceView::empty` is the admitted predicate. A CPU device
+// cannot manufacture positive scratch, so the probe owns the range itself.
 class RmsNormWorkspaceDouble final : public iom::RawWorkspace {
 public:
     RmsNormWorkspaceDouble(

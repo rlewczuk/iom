@@ -124,12 +124,6 @@ inline constexpr std::array<iom::DataType, 1> kLinearNativeBf16Span = {
         iom::DataType::BF16,
 };
 
-// TTNN's mandatory target: `BF16` alone. Its native TILE compute cannot
-// consume the encoded carriers of the other twenty applicable leaves without
-// the forbidden host staging, so the port declares and rejects exactly that.
-inline constexpr std::array<iom::DataType, 1> kLinearTtnnLeafSpan = {
-        iom::DataType::BF16,
-};
 
 // The two recognized but inapplicable leaves.
 inline constexpr std::array<iom::DataType, 2> kLinearInapplicableSpan = {
@@ -164,7 +158,7 @@ struct LinearShape {
 // The exact scratch path of one port path, from the frozen workspace table.
 enum class LinearWorkspacePath {
     // `{0, 1}`: CPU and CUDA for every applicable leaf, ROCm and SYCL for the
-    // twenty scalar leaves, and TTNN for `BF16`.
+    // twenty scalar leaves.
     zero,
     // ROCm `BF16`: alignment 32 over `A32(P*pad16(R)*pad16(I)*2) +
     // A32(P*pad16(R)*pad16(O)*2)`.
@@ -202,13 +196,13 @@ enum class LinearWorkspacePath {
 // One driver's explicit linear capability declaration.
 struct LinearDeclaration {
     // The complete leaf matrix this port must reach: `kLinearLeafSpan` on CPU,
-    // CUDA, ROCm, and SYCL, and `kLinearTtnnLeafSpan` on TTNN. It is the
-    // driver's own statement and never an echo of an implementation report.
+    // CUDA, ROCm, and SYCL. It is the driver's own statement and never an
+    // echo of an implementation report.
     std::span<const iom::DataType> target_leaves;
     // The leaves the port's non-BF16 scalar recurrence path covers.
     std::span<const iom::DataType> scalar_leaves;
-    // The leaves an additional native BF16 specialization covers. `BF16` on
-    // CUDA, ROCm, SYCL, and TTNN; empty on CPU, whose `BF16` uses the scalar
+    // the leaves an additional native BF16 specialization covers. `BF16` on
+    // CUDA, ROCm, and SYCL; empty on CPU, whose `BF16` uses the scalar
     // recurrence and whose scratch policy is therefore the scalar one.
     std::span<const iom::DataType> native_bf16_leaves;
     // The leaves this revision's port actually queues. Empty means unported:
@@ -1630,7 +1624,6 @@ struct LinearReference {
     expect(kLinearLeafSpan.size() == 21, "the applicable linear matrix is 21 leaves");
     expect(kLinearScalarLeafSpan.size() == 20, "the scalar path covers 20 leaves");
     expect(kLinearNativeBf16Span.size() == 1, "one native BF16 specialization leaf");
-    expect(kLinearTtnnLeafSpan.size() == 1, "TTNN's mandatory target is BF16 alone");
     for (const iom::DataType leaf : kLinearLeafSpan) {
         CAPTURE(static_cast<int>(leaf));
         expect(linear_applicable(leaf), "a published leaf is applicable");

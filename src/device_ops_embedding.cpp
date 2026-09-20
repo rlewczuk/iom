@@ -47,21 +47,15 @@ namespace iom {
         }
 
         // Reject one output/input relationship that the gather must never
-        // admit: the same owner identity anywhere, and — on standard-layout
-        // backends, whose owners expose a storage base and exact reserved
-        // extent — an identical storage handle or actual backing-range
-        // intersection. Native backends address storage opaquely and keep
-        // the conservative owner-identity rule only.
+        // admit: the same owner identity anywhere, and an identical storage
+        // handle or actual backing-range intersection. The checks use each
+        // backend's exposed storage handle and reserved extent.
         void reject_output_overlap(
-                BackendKind backend, const TensorView& out,
-                std::size_t out_storage_bytes, const TensorView& input,
-                std::size_t input_storage_bytes) {
+                const TensorView& out, std::size_t out_storage_bytes,
+                const TensorView& input, std::size_t input_storage_bytes) {
             if (out.owner_identity() == input.owner_identity()) {
                 throw std::invalid_argument(
                         "embedding output aliases an input owner");
-            }
-            if (backend == BackendKind::TTNN) {
-                return;
             }
             const void* const out_handle = out.native_handle();
             const void* const input_handle = input.native_handle();
@@ -154,12 +148,11 @@ namespace iom {
             const detail::CheckedViewFacts out_facts =
                     validate_checked_view(device, out, kAdmissionContext);
 
-            const BackendKind backend = device.backend_kind();
             reject_output_overlap(
-                    backend, out, out_facts.storage_bytes, table,
+                    out, out_facts.storage_bytes, table,
                     table_facts.storage_bytes);
             reject_output_overlap(
-                    backend, out, out_facts.storage_bytes, indices,
+                    out, out_facts.storage_bytes, indices,
                     index_facts.storage_bytes);
 
             if (table.spec().quantization != QuantizationFormat::NONE
