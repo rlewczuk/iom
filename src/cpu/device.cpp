@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "iom/iom.hpp"
+#include "iom/detail/aligned_storage.hpp"
 #include "../shared/standard_tiled_copy.hpp"
 
 namespace iom {
@@ -33,20 +34,34 @@ namespace {
 
 class CpuWorkspace final : public RawWorkspace {
 public:
-    CpuWorkspace(CpuDevice& device, std::size_t bytes)
-            : RawWorkspace(device, bytes) {}
+    CpuWorkspace(
+            CpuDevice& device, Allocator& allocator, std::size_t bytes)
+            : RawWorkspace(device, bytes), allocator_(allocator) {
+        if (bytes != 0) {
+            address_ = detail::allocate_aligned_storage(
+                    allocator_, bytes, [] {},
+                    "CPU workspace is not 32-byte aligned");
+        }
+    }
+
+    ~CpuWorkspace() noexcept override {
+        detail::release_aligned_storage(allocator_, address_);
+    }
+
+private:
+    [[nodiscard]] void* workspace_address() const noexcept override {
+        return address_;
+    }
+
+    Allocator& allocator_;
+    void* address_ = nullptr;
 };
 
 }  // namespace
 
 std::unique_ptr<RawWorkspace> CpuDevice::create_workspace(
         std::size_t bytes) {
-    if (bytes != 0) {
-        throw std::invalid_argument(
-                "CPU devices do not support positive raw workspace "
-                "allocation");
-    }
-    return std::make_unique<CpuWorkspace>(*this, 0);
+    return std::make_unique<CpuWorkspace>(*this, allocator_, bytes);
 }
 
 std::unique_ptr<Device> make_cpu_device(

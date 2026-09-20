@@ -1348,10 +1348,11 @@ TEST_CASE("CPU copies move logical planes without touching padding") {
 }
 
 // ---------------------------------------------------------------------------
-// CPU supports all four binary operations, SiLU, and the layout-aware linear
-// projection while retaining Unsupported for unrelated compute hooks.
+// CPU supports all four binary operations, SiLU, the layout-aware linear
+// projection, and BF16 causal grouped-query SDPA while retaining Unsupported
+// for unrelated compute hooks.
 // ---------------------------------------------------------------------------
-TEST_CASE("CPU supports binary and linear operations and rejects other compute capabilities") {
+TEST_CASE("CPU supports binary, linear, and SDPA operations and rejects other compute capabilities") {
     RecordingAllocator allocator;
     auto device = iom::make_cpu_device(allocator);
     auto queue = device->create_ops();
@@ -1372,8 +1373,6 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
     fill_storage(*y, kSentinel);
     fill_storage(*sdpa_out, kSentinel);
     fill_storage(*rmsnorm_out, kSentinel);
-    const std::vector<std::byte> sdpa_untouched =
-            snapshot_storage(*sdpa_out);
 
     const iom::oid add_token = queue->add(x->view(), x->view(), y->view());
     const iom::oid mul_token = queue->mul(x->view(), x->view(), y->view());
@@ -1446,8 +1445,8 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
                     linear_copy->view(), spec, kF32Sixteen));
 
     // The reported zero requirement admits only the empty default view: a
-    // supplied owner is invalid input, and the CPU device still refuses to
-    // create positive raw workspace at all.
+    // supplied owner is invalid input, while positive raw workspace is now
+    // available for the BF16 SDPA port but remains invalid for linear.
     const std::unique_ptr<iom::RawWorkspace> empty_workspace =
             device->create_workspace(0);
     CHECK_EQ(
@@ -1456,7 +1455,14 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
                     iom::LinearOutputLayout::ordinary, 1, 16,
                     empty_workspace->view()),
             iom::to_oid(iom::OidError::InvalidArgument));
-    CHECK_THROWS_AS(device->create_workspace(1), std::invalid_argument);
+    const std::unique_ptr<iom::RawWorkspace> positive_workspace =
+            device->create_workspace(32);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), y->view(), 0, 16,
+                    iom::LinearOutputLayout::ordinary, 1, 16,
+                    positive_workspace->view()),
+            iom::to_oid(iom::OidError::InvalidArgument));
 
     // RMSNorm is declared and admitted by common code, and the CPU port
     // implements it: the valid-shape request is accepted, executed on the
@@ -1478,12 +1484,27 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
             *rmsnorm_out,
             expected_uniform_rmsnorm_storage(
                     rmsnorm_out->view(), spec, f32.half));
-    CHECK_EQ(
-            queue->sdpa(
+    sdpa_q->view().copy_from_host(
+            uniform_logical(iom::DataType::BF16, 2 * 16 * 16, 0));
+    sdpa_kv->view().copy_from_host(
+            uniform_logical(iom::DataType::BF16, 2 * 16 * 16, 0));
+    const iom::WorkspaceRequirements sdpa_requirements =
+            queue->sdpa_workspace_requirements(
                     sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
-                    sdpa_out->view(), 0, 16),
-            iom::to_oid(iom::OidError::Unsupported));
-    expect_storage_matches(*sdpa_out, sdpa_untouched);
+                    sdpa_out->view(), 0, 16);
+    CHECK_EQ(sdpa_requirements, (iom::WorkspaceRequirements{3072, 32}));
+    const std::unique_ptr<iom::RawWorkspace> sdpa_workspace =
+            device->create_workspace(sdpa_requirements.bytes);
+    const iom::oid sdpa_token = queue->sdpa(
+            sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+            sdpa_out->view(), 0, 16, sdpa_workspace->view());
+    REQUIRE(iom::oid_is_token(sdpa_token));
+    CHECK_NOTHROW(queue->wait(sdpa_token));
+    CHECK_NOTHROW(queue->wait(sdpa_token));
+    expect_storage_matches(
+            *sdpa_out,
+            expected_uniform_rmsnorm_storage(
+                    sdpa_out->view(), sdpa_out->view().spec(), 0));
 
     // A recognized inapplicable leaf with a valid shape stays unsupported by
     // common admission on every backend, independent of any port, and leaves
@@ -1507,10 +1528,10 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
 
     // The four accepted binary operations consume the first four sequences, the
     // accepted SiLU the fifth, the accepted linear projection and its consumer
-    // the sixth and seventh, and the accepted RMSNorm the eighth, so the probe
-    // copy is the ninth.
+    // the sixth and seventh, the accepted RMSNorm the eighth, and the
+    // accepted SDPA the ninth, so the probe copy is the tenth.
     const iom::oid probe = queue->copy(x->view(), y->view());
-    CHECK_EQ(token_sequence(probe), 9);
+    CHECK_EQ(token_sequence(probe), 10);
     queue->wait(probe);
 }
 

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 
@@ -8,6 +12,81 @@
 #include "iom/detail/outstanding_work_registry.hpp"
 
 namespace iom {
+
+namespace cpu_detail {
+// Common CPU carrier behavior for the named scalar codecs. Keeping this
+// backend-private trait in one header prevents each CPU operation from
+// maintaining a separate copy of the IEEE helper surface.
+template <typename Carrier>
+struct CpuCarrierTraits {
+    using carrier_type = Carrier;
+
+    static Carrier exp(Carrier value) noexcept { return std::exp(value); }
+    static Carrier positive_infinity() noexcept {
+        return std::numeric_limits<Carrier>::infinity();
+    }
+    static Carrier quiet_nan() noexcept {
+        return std::numeric_limits<Carrier>::quiet_NaN();
+    }
+    static Carrier max_finite() noexcept {
+        return std::numeric_limits<Carrier>::max();
+    }
+    static bool isnan(Carrier value) noexcept { return std::isnan(value); }
+    static bool isinf(Carrier value) noexcept { return std::isinf(value); }
+    static bool signbit(Carrier value) noexcept {
+        return std::signbit(value);
+    }
+    static Carrier fabs(Carrier value) noexcept { return std::fabs(value); }
+    static Carrier floor(Carrier value) noexcept {
+        return std::floor(value);
+    }
+    static Carrier ldexp(Carrier value, int exponent) noexcept {
+        return std::ldexp(value, exponent);
+    }
+    static Carrier frexp(Carrier value, int* exponent) noexcept {
+        return std::frexp(value, exponent);
+    }
+};
+
+// The CPU SDPA worker receives only the fixed-size metadata that common
+// admission already validated and snapshotted. Keeping this adapter
+// backend-private avoids retaining a borrowed TensorView or constructing a
+// TensorSpec/vector in the deferred worker.
+struct SdpaView {
+    std::size_t rank = 0;
+    std::array<std::size_t, 8> dimensions{};
+    std::array<std::size_t, 6> plane_strides{};
+    std::size_t plane_offset = 0;
+    unsigned char* native_handle = nullptr;
+};
+
+struct SdpaRequest {
+    SdpaView q;
+    SdpaView k;
+    SdpaView v;
+    SdpaView out;
+    std::size_t a = 0;
+    std::size_t L = 0;
+    std::size_t Hq = 0;
+    std::size_t Hkv = 0;
+    std::size_t R = 0;
+    std::size_t C = 0;
+    std::size_t D = 0;
+    std::size_t grouping = 0;
+    std::size_t output_width = 0;
+    unsigned char* workspace = nullptr;
+};
+
+[[nodiscard]] WorkspaceRequirements sdpa_workspace_requirements(
+        std::size_t leading_planes, std::size_t heads, std::size_t rows,
+        std::size_t length);
+void sdpa_elements(const SdpaRequest& request);
+
+void arm_sdpa_failure() noexcept;
+void clear_sdpa_failure() noexcept;
+[[nodiscard]] bool consume_sdpa_failure() noexcept;
+
+}  // namespace cpu_detail
 
 class CpuDevice final : public Device {
 public:
@@ -30,3 +109,4 @@ private:
 };
 
 }  // namespace iom
+
