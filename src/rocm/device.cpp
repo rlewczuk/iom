@@ -123,8 +123,14 @@ namespace iom {
 
     [[nodiscard]] std::unique_ptr<DeviceOps> RocmDevice::create_ops() {
         activate();
+        // The native causal grouped-query SDPA capability is a runtime fact of
+        // this exact device and of the image the HIP runtime loaded for it, so
+        // it is resolved here, once per queue, and never re-read from a
+        // submission thread or from the pure workspace query.
         return rocm_detail::make_queue(
-                *this, *this, static_cast<int>(ordinal_), registry_state_);
+                *this, *this, static_cast<int>(ordinal_), registry_state_,
+                rocm_detail::sdpa_native_capability(
+                        static_cast<int>(ordinal_)));
     }
 
     [[nodiscard]] std::size_t

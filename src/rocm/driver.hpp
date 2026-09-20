@@ -31,6 +31,17 @@ enum class AllocationClass {
     other_iom_setup,
 };
 
+// Exact native causal grouped-query SDPA capability of one HIP device
+// ordinal, shaped like the CUDA backend's `linear_bf16_wmma_facility`
+// predicate: the operation's checked route is the GFX12 wave32 BF16 WMMA
+// image with its completed native QK/PV and nonmatrix stages, so the
+// installed `gfx1036`, a wave64 device, and any target whose WMMA execution
+// evidence is absent report false and keep the established `Unsupported`
+// behaviour instead of a broken or emulated route. The predicate reads
+// immutable device properties only: it allocates, registers, leases, submits,
+// and synchronizes nothing.
+[[nodiscard]] bool sdpa_native_capability(int device_ordinal) noexcept;
+
 enum class AllocationKind { allocate, free };
 
 enum class AllocationPhase { setup, post_publication };

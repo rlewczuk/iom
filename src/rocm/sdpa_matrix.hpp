@@ -47,7 +47,10 @@ struct SdpaMatrixWorkspaceRequirements {
 // A value-owned snapshot of one head-planar BF16 operand.  Plane offsets and
 // strides are element-plane units, as returned by TensorView.  `head_stride`
 // is the stride of the head axis and is kept separate from independent leading
-// plane strides so GQA never accidentally broadcasts a query head.
+// plane strides so GQA never accidentally broadcasts a query head.  The
+// pointed-to owner stays the engine's standard 16x16 tile-major BF16 storage:
+// the kernels address it through the logical tile grid with the operand's
+// logical extents, never through the packed scratch mapping.
 struct SdpaMatrixView {
     const void* native_handle = nullptr;
     std::size_t plane_offset = 0;
@@ -63,8 +66,11 @@ struct SdpaMatrixView {
 
 
 struct SdpaQkScratch {
-    // q_pack is [P,Hq,Mp,Dp] and kv_pack is [P,Hkv,Lp,Dp], both standard
-    // row-major 16x16-tiled BF16 payloads.  scores is [P,Hq,Mp,Lp] FP32.
+    // q_pack is [P,Hq,Mp,Dp] and kv_pack is [P,Hkv,Lp,Dp], both packed
+    // row-major payloads over the 16-padded extents: element
+    // (plane,row,column) lives at (plane*rows + row)*columns + column.
+    // scores is [P,Hq,Mp,Lp] FP32 in the same packed order, which is exactly
+    // the contiguous strided layout the private nonmatrix stages consume.
     void* q_pack = nullptr;
     std::size_t q_pack_bytes = 0;
     void* kv_pack = nullptr;
@@ -75,7 +81,8 @@ struct SdpaQkScratch {
 
 struct SdpaPvScratch {
     // p_bf16 is [P,Hq,Mp,Lp], kv_pack is reused for [P,Hkv,Lp,Dp], and
-    // pv_bf16 is [P,Hq,Mp,Dp].  All payloads are standard tiled BF16.
+    // pv_bf16 is [P,Hq,Mp,Dp].  All payloads are packed row-major over the
+    // 16-padded extents, matching the private nonmatrix stage layouts.
     const void* p_bf16 = nullptr;
     std::size_t p_bf16_bytes = 0;
     void* kv_pack = nullptr;

@@ -398,7 +398,12 @@ IOM_GPU_DEVICE void sdpa_store_bf16(
     reinterpret_cast<std::uint16_t*>(base)[slot] = value;
 }
 
-IOM_GPU_DEVICE std::uint64_t sdpa_slot(
+// Slot of one logical element inside a caller-owned tensor owner: the final
+// two axes are the engine's standard 16x16 tile-major storage with row-major
+// cells, and `rows`/`columns` are the logical extents that define the tile
+// grid. Q, K, V and the merged destination are read or written through this
+// mapping, never through the scratch mapping below.
+IOM_GPU_DEVICE std::uint64_t sdpa_tile_slot(
         std::uint64_t plane, std::uint64_t row, std::uint64_t column,
         std::uint64_t rows, std::uint64_t columns) noexcept {
     const std::uint64_t tile_columns = (columns + 15) / 16;
@@ -406,6 +411,19 @@ IOM_GPU_DEVICE std::uint64_t sdpa_slot(
     return (plane * tile_rows * tile_columns
             + (row / 16) * tile_columns + column / 16) * 256
             + (row % 16) * 16 + column % 16;
+}
+
+// Slot of one element inside a caller-owned packed scratch payload:
+// `(plane * rows + row) * columns + column` over the checked 16-padded
+// extents. q_pack, kv_pack, scores, p_bf16 and pv_bf16 are contiguous packed
+// ranges so the private nonmatrix stages (src/rocm/sdpa_softmax.hpp) read and
+// write the very same bytes through their plain element-strided layout, with
+// one shared addressing convention for the joined pipeline and no conversion
+// pass, extra segment, or hidden allocation between stages.
+IOM_GPU_DEVICE std::uint64_t sdpa_packed_slot(
+        std::uint64_t plane, std::uint64_t row, std::uint64_t column,
+        std::uint64_t rows, std::uint64_t columns) noexcept {
+    return (plane * rows + row) * columns + column;
 }
 
 IOM_GPU_DEVICE std::uint64_t sdpa_source_plane(
@@ -459,11 +477,12 @@ IOM_GPU_GLOBAL void sdpa_q_pack_kernel(SdpaQkDeviceMetadata m) {
                     sdpa_source_plane(m.q, plane, head);
             value = sdpa_daz_bf16(sdpa_load_bf16(
                     m.q.data,
-                    sdpa_slot(source_plane, row, column, m.R, m.D)));
+                    sdpa_tile_slot(source_plane, row, column, m.R, m.D)));
         }
         sdpa_store_bf16(
                 m.q_pack,
-                sdpa_slot(plane_head, row, column, m.Mp, m.Dp), value);
+                sdpa_packed_slot(plane_head, row, column, m.Mp, m.Dp),
+                value);
     }
 }
 
@@ -484,11 +503,12 @@ IOM_GPU_GLOBAL void sdpa_k_pack_kernel(SdpaQkDeviceMetadata m) {
                     sdpa_source_plane(m.k, plane, head);
             value = sdpa_daz_bf16(sdpa_load_bf16(
                     m.k.data,
-                    sdpa_slot(source_plane, row, column, m.C, m.D)));
+                    sdpa_tile_slot(source_plane, row, column, m.C, m.D)));
         }
         sdpa_store_bf16(
                 m.kv_pack,
-                sdpa_slot(plane_head, row, column, m.Lp, m.Dp), value);
+                sdpa_packed_slot(plane_head, row, column, m.Lp, m.Dp),
+                value);
     }
 }
 
@@ -528,7 +548,7 @@ IOM_GPU_GLOBAL void sdpa_qk_wmma_kernel(SdpaQkDeviceMetadata m) {
                         inner_tile * 16 + inner_in_tile + index;
                 lhs[index] = static_cast<short>(sdpa_load_bf16(
                         m.q_pack,
-                        sdpa_slot(
+                        sdpa_packed_slot(
                                 plane_head, row, column, m.Mp, m.Dp)));
                 const std::uint64_t key =
                         column_tile * 16 + column_in_tile;
@@ -536,7 +556,7 @@ IOM_GPU_GLOBAL void sdpa_qk_wmma_kernel(SdpaQkDeviceMetadata m) {
                         inner_tile * 16 + inner_in_tile + index;
                 rhs[index] = static_cast<short>(sdpa_load_bf16(
                         m.kv_pack,
-                        sdpa_slot(
+                        sdpa_packed_slot(
                                 kv_plane_head, key, feature,
                                 m.Lp, m.Dp)));
             }
@@ -547,7 +567,7 @@ IOM_GPU_GLOBAL void sdpa_qk_wmma_kernel(SdpaQkDeviceMetadata m) {
                     + (lane / 16u) * 8u + index;
             const std::uint64_t column = column_tile * 16
                     + column_in_tile;
-            m.scores[sdpa_slot(
+            m.scores[sdpa_packed_slot(
                     plane_head, row, column, m.Mp, m.Lp)] = accumulator[index];
         }
     }
@@ -570,11 +590,12 @@ IOM_GPU_GLOBAL void sdpa_v_pack_kernel(SdpaPvDeviceMetadata m) {
                     sdpa_source_plane(m.v, plane, head);
             value = sdpa_daz_bf16(sdpa_load_bf16(
                     m.v.data,
-                    sdpa_slot(source_plane, row, column, m.C, m.D)));
+                    sdpa_tile_slot(source_plane, row, column, m.C, m.D)));
         }
         sdpa_store_bf16(
                 m.kv_pack,
-                sdpa_slot(plane_head, row, column, m.Lp, m.Dp), value);
+                sdpa_packed_slot(plane_head, row, column, m.Lp, m.Dp),
+                value);
     }
 }
 
@@ -616,7 +637,7 @@ IOM_GPU_GLOBAL void sdpa_pv_wmma_kernel(SdpaPvDeviceMetadata m) {
                 if (row < m.R && key < m.L) {
                     probability = sdpa_daz_bf16(sdpa_load_bf16(
                             m.p_bf16,
-                            sdpa_slot(
+                            sdpa_packed_slot(
                                     plane_head, row, key, m.Mp, m.Lp)));
                 }
                 lhs[index] = static_cast<short>(probability);
@@ -625,7 +646,7 @@ IOM_GPU_GLOBAL void sdpa_pv_wmma_kernel(SdpaPvDeviceMetadata m) {
                 const std::uint64_t value_key = key;
                 rhs[index] = static_cast<short>(sdpa_load_bf16(
                         m.kv_pack,
-                        sdpa_slot(
+                        sdpa_packed_slot(
                                 kv_plane_head, value_key, feature,
                                 m.Lp, m.Dp)));
             }
@@ -642,7 +663,7 @@ IOM_GPU_GLOBAL void sdpa_pv_wmma_kernel(SdpaPvDeviceMetadata m) {
                     : sdpa_rne_bf16(value);
             sdpa_store_bf16(
                     m.pv_bf16,
-                    sdpa_slot(plane_head, row, column, m.Mp, m.Dp),
+                    sdpa_packed_slot(plane_head, row, column, m.Mp, m.Dp),
                     encoded);
         }
     }
