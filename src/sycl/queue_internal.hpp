@@ -25,14 +25,15 @@ namespace iom::sycl_detail {
         const sycl::device& device) noexcept;
 
 // Immutable capability of the implemented SiLU leaf set, defined next to the
-// SiLU kernels in `queue_silu.cpp`. This port queues exactly `BF16` and `F32`:
-// `F64` stays `Unsupported` regardless of `aspect::fp64`, the six packed
-// leaves belong to `10-sycl-silu-packed-formats`, and every semantically
-// inapplicable leaf (`BOOL`, the twelve integer leaves, and `F8_E8M0`) stays
-// `Unsupported`. It gates both the pure requirement query and the submission
-// before any sequence, registration, allocation, metadata mutation, or queue
-// resource, and it is the only authority on which carrier width the launcher
-// may derive.
+// SiLU kernels in `queue_silu.cpp`. This port queues exactly the eight
+// non-F64 floating leaves: `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`,
+// `F8_E5M2`, `F16`, `BF16`, and `F32`. `F64` stays `Unsupported` because this
+// path has no device-independent FP64 guarantee, regardless of
+// `aspect::fp64`; every semantically inapplicable leaf (`BOOL`, the twelve
+// integer leaves, and `F8_E8M0`) also stays `Unsupported`. It gates both the
+// pure requirement query and the submission before any sequence,
+// registration, allocation, metadata mutation, or queue resource, and it is
+// the only authority on which carrier width the launcher may derive.
 [[nodiscard]] bool silu_device_supported(DataType data_type) noexcept;
 
 class SyclQueue final : public DeviceOps {
@@ -165,15 +166,15 @@ public:
 
     [[nodiscard]] WorkspaceRequirements binary_workspace_requirements(
             const BinaryRequest& request) override;
-
     // Pure capability decision and exact raw-workspace requirement of the
-    // implemented SiLU leaf set: `BF16` and `F32` report the `{0, 1}`
-    // zero-workspace path, while the unported packed leaves, the unclaimed
-    // `F64`, and every semantically inapplicable leaf are `Unsupported`
-    // before any queue effect. The common facade consults this exact hook for
-    // both the call and the pure requirement query, so the two can never
-    // disagree about a leaf. Since the admitted capacity is zero, a supplied
-    // nonempty `RawWorkspaceView` is ignored rather than validated or leased.
+    // implemented eight-leaf SiLU set: the six packed/narrow additions plus
+    // `BF16` and `F32` report the `{0, 1}` zero-workspace path. `F64` remains
+    // `Unsupported` for lack of a device-independent FP64 guarantee, and all
+    // semantically inapplicable leaves are rejected before any queue effect.
+    // The common facade consults this exact hook for both the call and the
+    // pure requirement query, so the two can never disagree about a leaf.
+    // Since the admitted capacity is zero, a supplied nonempty
+    // `RawWorkspaceView` is ignored rather than validated or leased.
     [[nodiscard]] WorkspaceRequirements silu_workspace_requirements_impl(
             const SiLURequest& request) override;
 

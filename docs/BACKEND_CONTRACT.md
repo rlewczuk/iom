@@ -3430,6 +3430,36 @@ no claim about the other backends and no native-matrix claim of any kind.
   tile-padding invariants across full, transformed, and selected leading
   views, `runs` 1/15/16/17, non-tile feature sizes, and the CUDA
   fault/lifetime cases named in the queue clause above.
+##### SYCL SiLU implementation boundary and evidence
+
+The native SYCL SiLU port currently advertises exactly the eight applicable
+leaves `F4_E2M1`, `F6_E2M3`, `F6_E3M2`, `F8_E4M3FN`, `F8_E5M2`, `F16`, `BF16`,
+and `F32`. `F64` remains deterministically `Unsupported` with the named
+limitation that this path has no device-independent FP64 guarantee; the port
+does not lower or emulate `F64` through FP32. The semantically inapplicable
+`BOOL`, integer, and `F8_E8M0` leaves remain `Unsupported`.
+
+The implementation runs the accepted request through one native in-order SYCL
+device kernel. Each work item owns one physical output word for the 4-, 8-,
+16-, and 32-bit leaves, or one aligned three-word (96-bit) packet for the
+six-bit leaves; it reads those words, decodes, evaluates, and RNE-encodes each
+logical field in the packet exactly once, merges only logical bits, and stores
+each owned word once. The stable evaluator uses FP32 intermediates and the
+mandated negative half-exponential branch. Logical tiles, cross-word fields,
+partial final tile rows, and physical padding are covered by the shared
+storage observer.
+
+This boundary is evidenced by the SYCL-only oneAPI run on mirror
+`leaf006-09-sycl-packed`: `sycl-ls` enumerated two enabled Level Zero GPUs;
+configuration and `cmake --build build/sycl --target
+iom_sycl_conformance_tests` both succeeded; the focused SiLU selection passed
+2 test cases and 2,293 assertions; the focused RMSNorm control selection passed
+1 test case and 1,734 assertions; and the anchored
+`iom_sycl_conformance_tests` CTest selection passed 1/1. The focused driver
+also observed the explicit `F64` rejection without output mutation or
+admission side effects. A subsequent canonical-lock run on mirror
+`repair-10-sycl-packed` passed the direct no-filter binary three times, each
+with 38 test cases and 6,114,711 assertions, with no crash.
 
 ### 10. Model loading and weight layout
 
