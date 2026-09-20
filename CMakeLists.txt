@@ -144,6 +144,9 @@ if(CUDA_ENABLED)
         src/cuda/sdpa_nonmatrix.hpp
         src/cuda/sdpa_nonmatrix_request.hpp
         src/cuda/linear.cu
+        src/cuda/sdpa_matrix.cu
+        src/cuda/sdpa_matrix.hpp
+        src/cuda/sdpa_matrix_request.hpp
         src/cuda/driver.cpp
         src/cuda/driver.hpp
         src/shared/metadata_slot_pool.hpp

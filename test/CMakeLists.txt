@@ -289,6 +289,7 @@ if(CUDA_ENABLED)
         CONFORMANCE_MAIN_SOURCE cuda/test_cuda_conformance.cpp
         SMOKE_SOURCES cuda/test_cuda_smoke.cpp
         CONFORMANCE_SOURCES cuda/test_cuda_conformance.cpp
+        cuda/test_cuda_sdpa_matrix.cpp
         backend/backend_conformance_sdpa.hpp
         SMOKE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/cuda
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
