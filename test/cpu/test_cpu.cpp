@@ -1360,14 +1360,20 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
     auto x = device->create_tensor(spec);
     auto y = device->create_tensor(spec);
     auto w = device->create_tensor(spec);
-    auto attn = device->create_tensor(spec);
     auto scale = device->create_tensor(make_spec({1, 16}, iom::DataType::F32));
     auto rmsnorm_out = device->create_tensor(spec);
+    auto sdpa_q = device->create_tensor(
+            make_spec({2, 1, 16, 16}, iom::DataType::BF16));
+    auto sdpa_kv = device->create_tensor(
+            make_spec({2, 1, 16, 16}, iom::DataType::BF16));
+    auto sdpa_out = device->create_tensor(
+            make_spec({2, 16, 16}, iom::DataType::BF16));
 
     fill_storage(*y, kSentinel);
-    fill_storage(*attn, kSentinel);
+    fill_storage(*sdpa_out, kSentinel);
     fill_storage(*rmsnorm_out, kSentinel);
-    const std::vector<std::byte> attn_untouched = snapshot_storage(*attn);
+    const std::vector<std::byte> sdpa_untouched =
+            snapshot_storage(*sdpa_out);
 
     const iom::oid add_token = queue->add(x->view(), x->view(), y->view());
     const iom::oid mul_token = queue->mul(x->view(), x->view(), y->view());
@@ -1458,9 +1464,11 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
             expected_uniform_rmsnorm_storage(
                     rmsnorm_out->view(), spec, f32.half));
     CHECK_EQ(
-            queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
-                        attn->view()),
+            queue->sdpa(
+                    sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                    sdpa_out->view(), 0, 16),
             iom::to_oid(iom::OidError::Unsupported));
+    expect_storage_matches(*sdpa_out, sdpa_untouched);
 
     // A recognized inapplicable leaf with a valid shape stays unsupported by
     // common admission on every backend, independent of any port, and leaves
@@ -1481,7 +1489,6 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
             iom::to_oid(iom::OidError::Unsupported));
     expect_storage_matches(*integer_out, integer_out_untouched);
 
-    expect_storage_matches(*attn, attn_untouched);
 
     // The four accepted binary operations consume the first four sequences,
     // the accepted linear projection and its consumer the fifth and sixth, and

@@ -125,6 +125,12 @@ namespace iom {
 
         constexpr WorkspaceRequirements kSiluWorkspaceRequirements{0, 1};
         constexpr const char* kSiluContext = "SILU";
+        constexpr const char* kSdpaContext = "SDPA";
+
+        bool sdpa_current_leaf(DataType value) noexcept {
+            return value == DataType::BF16;
+        }
+
 
         // SiLU accepts only the nine ordinary floating leaves. Every
         // recognized boolean, integer, and exponent-only scale leaf is
@@ -191,6 +197,42 @@ namespace iom {
                     && input_begin < out_begin + out_facts.storage_bytes) {
                 throw std::invalid_argument(
                         "ROPE output storage range overlaps an input");
+            }
+        }
+
+        void reject_sdpa_output_overlap(
+                const TensorView& out,
+                const detail::CheckedViewFacts& out_facts,
+                const TensorView& input,
+                const detail::CheckedViewFacts& input_facts) {
+            if (out.owner_identity() == input.owner_identity()) {
+                throw std::invalid_argument(
+                        "SDPA output aliases an input owner");
+            }
+            const void* const out_handle = out.native_handle();
+            const void* const input_handle = input.native_handle();
+            if (out_handle == input_handle) {
+                throw std::invalid_argument(
+                        "SDPA output shares an input storage handle");
+            }
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out_handle);
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input_handle);
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_facts.storage_bytes > limit - out_begin
+                    || input_facts.storage_bytes > limit - input_begin) {
+                throw std::overflow_error(
+                        "SDPA storage range overflows");
+            }
+            const std::uintptr_t out_end =
+                    out_begin + out_facts.storage_bytes;
+            const std::uintptr_t input_end =
+                    input_begin + input_facts.storage_bytes;
+            if (out_begin < input_end && input_begin < out_end) {
+                throw std::invalid_argument(
+                        "SDPA output storage range overlaps an input");
             }
         }
         struct RopeValidationFacts {
@@ -468,6 +510,237 @@ namespace iom {
     }
 
 
+    DeviceOps::SdpaViewSnapshot DeviceOps::snapshot_sdpa_view(
+            const TensorView& view,
+            const detail::CheckedViewFacts& facts) {
+        SdpaViewSnapshot snapshot;
+        const std::span<const std::size_t> dimensions =
+                view.spec().shape.dimensions();
+        const std::span<const std::size_t> strides =
+                view.plane_strides();
+        snapshot.rank = dimensions.size();
+        for (std::size_t axis = 0; axis < dimensions.size(); ++axis) {
+            snapshot.dimensions[axis] = dimensions[axis];
+        }
+        for (std::size_t axis = 0; axis < strides.size(); ++axis) {
+            snapshot.plane_strides[axis] = strides[axis];
+        }
+        snapshot.plane_offset = view.plane_offset();
+        snapshot.data_type = view.spec().data_type;
+        snapshot.quantization = view.spec().quantization;
+        snapshot.device_identity = &view.device();
+        snapshot.owner_identity = view.owner_identity();
+        snapshot.native_handle = const_cast<void*>(view.native_handle());
+        snapshot.max_plane = facts.max_plane;
+        snapshot.addressed_bytes = facts.addressed_bytes;
+        snapshot.storage_bytes = facts.storage_bytes;
+        snapshot.logical_bytes = facts.logical_bytes;
+        return snapshot;
+    }
+
+    DeviceOps::SdpaRequest DeviceOps::validate_sdpa(
+            const Device& device, const TensorView& q,
+            const TensorView& k, const TensorView& v,
+            const TensorView& out, std::size_t a, std::size_t L) {
+        validate_checked_spec(q.spec(), kSdpaContext);
+        validate_checked_spec(k.spec(), kSdpaContext);
+        validate_checked_spec(v.spec(), kSdpaContext);
+        validate_checked_spec(out.spec(), kSdpaContext);
+
+        const std::span<const std::size_t> q_dimensions =
+                q.spec().shape.dimensions();
+        const std::span<const std::size_t> k_dimensions =
+                k.spec().shape.dimensions();
+        const std::span<const std::size_t> v_dimensions =
+                v.spec().shape.dimensions();
+        const std::span<const std::size_t> out_dimensions =
+                out.spec().shape.dimensions();
+        const std::size_t q_rank = q_dimensions.size();
+        const std::size_t out_rank = out_dimensions.size();
+        if (q_rank < 3 || q_rank > 8
+                || k_dimensions.size() != q_rank
+                || v_dimensions.size() != q_rank
+                || out_rank < 2 || out_rank > 7
+                || out_rank + 1 != q_rank) {
+            throw std::invalid_argument(
+                    "SDPA requires q/k/v ranks three through eight and "
+                    "out rank two through seven");
+        }
+
+        for (std::size_t axis = 0; axis < q_rank; ++axis) {
+            if (k_dimensions[axis] != v_dimensions[axis]) {
+                throw std::invalid_argument(
+                        "SDPA key and value shapes must match exactly");
+            }
+        }
+        const std::size_t leading_rank = q_rank - 3;
+        for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+            if (q_dimensions[axis] != k_dimensions[axis]
+                    || q_dimensions[axis] != out_dimensions[axis]) {
+                throw std::invalid_argument(
+                        "SDPA leading tuples must match exactly");
+            }
+        }
+
+        const std::size_t Hq = q_dimensions[q_rank - 3];
+        const std::size_t R = q_dimensions[q_rank - 2];
+        const std::size_t D = q_dimensions[q_rank - 1];
+        const std::size_t Hkv = k_dimensions[q_rank - 3];
+        const std::size_t C = k_dimensions[q_rank - 2];
+        if (Hq == 0 || Hkv == 0 || R == 0 || C == 0 || D == 0) {
+            throw std::invalid_argument(
+                    "SDPA head, row, feature, and cache extents must be "
+                    "nonzero");
+        }
+        if (Hq % Hkv != 0) {
+            throw std::invalid_argument(
+                    "SDPA query heads must be divisible by KV heads");
+        }
+        const std::size_t output_width = detail::checked_mul(
+                Hq, D, "SDPA output width overflows");
+        if (out_dimensions[out_rank - 2] != R
+                || out_dimensions[out_rank - 1] != output_width) {
+            throw std::invalid_argument(
+                    "SDPA output shape must be [B...,R,Hq*D]");
+        }
+
+        if (L == 0 || L > C) {
+            throw std::invalid_argument(
+                    "SDPA initialized length must satisfy 0 < L <= C");
+        }
+        if (a >= C) {
+            throw std::invalid_argument(
+                    "SDPA causal offset must be less than C");
+        }
+        // The guard establishes the subtraction precondition before the
+        // available-window calculation; this deliberately avoids a+R.
+        const std::size_t available_rows = C - a;
+        if (R > available_rows) {
+            throw std::invalid_argument(
+                    "SDPA query rows exceed the available causal window");
+        }
+
+        const auto validate_owner_spec = [](const TensorView& view) {
+            const Tensor* const owner = view.owner_identity();
+            if (owner != nullptr) {
+                validate_checked_spec(owner->view().spec(), kSdpaContext);
+            }
+        };
+        validate_owner_spec(q);
+        validate_owner_spec(k);
+        validate_owner_spec(v);
+        validate_owner_spec(out);
+
+        const detail::CheckedViewFacts q_facts =
+                validate_checked_view(device, q, kSdpaContext);
+        const detail::CheckedViewFacts k_facts =
+                validate_checked_view(device, k, kSdpaContext);
+        const detail::CheckedViewFacts v_facts =
+                validate_checked_view(device, v, kSdpaContext);
+        const detail::CheckedViewFacts out_facts =
+                validate_checked_view(device, out, kSdpaContext);
+
+        // Repeat operation-owned products so a backend receives no unchecked
+        // logical size, grouping, or causal-position intermediate.
+        const auto checked_elements = [](std::span<const std::size_t> dims,
+                                         const char* what) {
+            std::size_t elements = 1;
+            for (const std::size_t dimension : dims) {
+                elements = detail::checked_mul(elements, dimension, what);
+            }
+            return elements;
+        };
+        const std::size_t q_elements = checked_elements(
+                q_dimensions, "SDPA Q element count overflows");
+        const std::size_t k_elements = checked_elements(
+                k_dimensions, "SDPA K element count overflows");
+        const std::size_t v_elements = checked_elements(
+                v_dimensions, "SDPA V element count overflows");
+        const std::size_t out_elements = checked_elements(
+                out_dimensions, "SDPA output element count overflows");
+        const std::size_t q_bits = detail::checked_mul(
+                q_elements, detail::leaf_bits(q.spec().data_type),
+                "SDPA Q bit count overflows");
+        const std::size_t k_bits = detail::checked_mul(
+                k_elements, detail::leaf_bits(k.spec().data_type),
+                "SDPA K bit count overflows");
+        const std::size_t v_bits = detail::checked_mul(
+                v_elements, detail::leaf_bits(v.spec().data_type),
+                "SDPA V bit count overflows");
+        const std::size_t out_bits = detail::checked_mul(
+                out_elements, detail::leaf_bits(out.spec().data_type),
+                "SDPA output bit count overflows");
+        (void)detail::bits_to_bytes(q_bits, "SDPA Q byte count overflows");
+        (void)detail::bits_to_bytes(k_bits, "SDPA K byte count overflows");
+        (void)detail::bits_to_bytes(v_bits, "SDPA V byte count overflows");
+        (void)detail::bits_to_bytes(
+                out_bits, "SDPA output byte count overflows");
+        std::size_t leading_planes = 1;
+        for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+            leading_planes = detail::checked_mul(
+                    leading_planes, q_dimensions[axis],
+                    "SDPA leading plane count overflows");
+        }
+        (void)detail::checked_mul(
+                leading_planes, Hq, "SDPA Q head-plane count overflows");
+        (void)detail::checked_mul(
+                leading_planes, Hkv, "SDPA KV head-plane count overflows");
+        (void)detail::checked_mul(
+                detail::checked_mul(Hq, R, "SDPA Q row count overflows"), D,
+                "SDPA Q work size overflows");
+        (void)detail::checked_mul(
+                detail::checked_mul(Hkv, C, "SDPA KV row count overflows"), D,
+                "SDPA KV work size overflows");
+        (void)detail::checked_mul(
+                Hq, L, "SDPA initialized query work size overflows");
+        const std::size_t last_query_position = detail::checked_add(
+                a, R - 1, "SDPA causal position overflows");
+        const std::size_t first_row_visible_count = detail::checked_add(
+                a, 1, "SDPA visible-token count overflows");
+        const std::size_t visible_count =
+                L < first_row_visible_count ? L : first_row_visible_count;
+        if (visible_count == 0
+                || last_query_position >= C) {
+            throw std::invalid_argument(
+                    "SDPA every query row must have a nonempty visible set");
+        }
+
+        if (q.spec().data_type != k.spec().data_type
+                || q.spec().data_type != v.spec().data_type
+                || q.spec().data_type != out.spec().data_type
+                || q.spec().quantization != k.spec().quantization
+                || q.spec().quantization != v.spec().quantization
+                || q.spec().quantization != out.spec().quantization) {
+            throw std::invalid_argument(
+                    "SDPA operand specifications must agree");
+        }
+        if (q.spec().quantization != QuantizationFormat::NONE) {
+            throw UnsupportedOperation();
+        }
+
+        // Output storage is conservatively disjoint from every read operand;
+        // Q/K/V read aliases are intentionally left valid.
+        reject_sdpa_output_overlap(out, out_facts, q, q_facts);
+        reject_sdpa_output_overlap(out, out_facts, k, k_facts);
+        reject_sdpa_output_overlap(out, out_facts, v, v_facts);
+
+        if (!sdpa_current_leaf(q.spec().data_type)) {
+            throw UnsupportedOperation();
+        }
+
+        const SdpaViewSnapshot q_snapshot =
+                snapshot_sdpa_view(q, q_facts);
+        const SdpaViewSnapshot k_snapshot =
+                snapshot_sdpa_view(k, k_facts);
+        const SdpaViewSnapshot v_snapshot =
+                snapshot_sdpa_view(v, v_facts);
+        const SdpaViewSnapshot out_snapshot =
+                snapshot_sdpa_view(out, out_facts);
+        return SdpaRequest{
+                q_snapshot, k_snapshot, v_snapshot, out_snapshot,
+                a, L, Hq, Hkv, R, C, D, Hq / Hkv, output_width};
+    }
+
     void DeviceOps::validate_linear(
             const Device& device, const TensorView& x, const TensorView& w,
             const TensorView& out, std::size_t s, std::size_t R,
@@ -643,9 +916,12 @@ namespace iom {
     }
 
 
-    oid DeviceOps::sdpa_impl(
-            const TensorView&, const TensorView&, const TensorView&,
-            size_t, size_t, size_t, TensorView&) {
+    oid DeviceOps::sdpa_impl(const SdpaRequest&) {
+        throw UnsupportedOperation();
+    }
+
+    WorkspaceRequirements DeviceOps::sdpa_workspace_requirements_impl(
+            const SdpaRequest&) {
         throw UnsupportedOperation();
     }
 
@@ -780,19 +1056,46 @@ namespace iom {
 
     oid DeviceOps::sdpa(
             const TensorView& q, const TensorView& k, const TensorView& v,
-            size_t n_heads, size_t n_kv_heads, size_t head_dim,
-            TensorView& attn_out) noexcept {
+            TensorView& out, std::size_t a, std::size_t L,
+            RawWorkspaceView workspace) noexcept {
         try {
-            validate_views(queue_device(), {&q, &k, &v, &attn_out});
-            if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0
-                    || n_heads % n_kv_heads != 0) {
-                throw std::invalid_argument("invalid sdpa parameters");
+            const Device& device = queue_device();
+            const SdpaRequest request =
+                    validate_sdpa(device, q, k, v, out, a, L);
+            const WorkspaceRequirements requirements =
+                    sdpa_workspace_requirements_impl(request);
+            if (requirements.alignment == 0) {
+                throw std::invalid_argument(
+                        "SDPA workspace alignment requirement is zero");
             }
-            return invoke(sdpa_impl(
-                    q, k, v, n_heads, n_kv_heads, head_dim, attn_out));
+            const std::array<TensorView, 4> operands{q, k, v, out};
+            const RawWorkspaceView validated_workspace =
+                    detail::WorkspaceValidation::validated(
+                            device, workspace, requirements.bytes,
+                            requirements.alignment, operands);
+            return invoke(sdpa_impl(SdpaRequest{
+                    request.q, request.k, request.v, request.out,
+                    request.a, request.L, request.Hq, request.Hkv,
+                    request.R, request.C, request.D, request.grouping,
+                    request.output_width, validated_workspace, requirements,
+                    {}}));
         } catch (...) {
             return invoke_failure(std::current_exception());
         }
+    }
+
+    WorkspaceRequirements DeviceOps::sdpa_workspace_requirements(
+            const TensorView& q, const TensorView& k, const TensorView& v,
+            const TensorView& out, std::size_t a, std::size_t L) {
+        const SdpaRequest request =
+                validate_sdpa(queue_device(), q, k, v, out, a, L);
+        const WorkspaceRequirements requirements =
+                sdpa_workspace_requirements_impl(request);
+        if (requirements.alignment == 0) {
+            throw std::invalid_argument(
+                    "SDPA workspace alignment requirement is zero");
+        }
+        return requirements;
     }
 
 }  // namespace iom

@@ -552,6 +552,13 @@ inline void run_compute_capability_conformance(
     auto w = candidate.create_tensor(spec);
     auto attn = candidate.create_tensor(spec);
     auto scratch = candidate.create_tensor(spec);
+    const iom::TensorSpec sdpa_q_spec{
+            iom::TensorShape{{2, 1, 16, 16}}, iom::DataType::BF16};
+    auto sdpa_q = candidate.create_tensor(sdpa_q_spec);
+    auto sdpa_kv = candidate.create_tensor(sdpa_q_spec);
+    const iom::TensorSpec sdpa_out_spec{
+            iom::TensorShape{{2, 16, 16}}, iom::DataType::BF16};
+    auto sdpa_out = candidate.create_tensor(sdpa_out_spec);
     if (observer != nullptr) {
         observer->setup_complete();
     }
@@ -631,9 +638,11 @@ inline void run_compute_capability_conformance(
         CHECK_EQ(linear_token, unsupported);
     }
     const bool linear_submitted = iom::oid_is_token(linear_token);
-    CHECK_EQ(queue->sdpa(x->view(), x->view(), x->view(), 1, 1, 16,
-                         attn->view()),
-             unsupported);
+    CHECK_EQ(
+            queue->sdpa(
+                    sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                    sdpa_out->view(), 0, 16),
+            unsupported);
     (void)backend_label;
 
 
