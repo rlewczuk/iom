@@ -25,6 +25,7 @@
 #include "backend/backend_conformance_common.hpp"
 #include "backend/backend_conformance_copy_storage.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
+#include "backend/backend_conformance_token_selection.hpp"
 #include "backend/backend_conformance_embedding.hpp"
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
@@ -419,6 +420,27 @@ TEST_CASE("SYCL conformance: deferred queue lifetime and stability") {
     iom_conformance::run_lifetime_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("SYCL conformance: greedy token selection shared matrix and lifetime") {
+    SyclDevices devices;
+    SyclStorageOracle native_storage(*devices.candidate_context);
+    const iom::WorkspaceRequirements expected_device_scratch{
+            iom::gpu_algorithm::compute_staging_size(
+                    17 * sizeof(std::uint16_t)),
+            32};
+    const iom_conformance::TokenSelectionNativeFailureSeam native_failure{
+            {}, {}, "SYCL logical transfer failure",
+            "SYCL transfer path has no accepted post-readiness failure seam"};
+    const iom_conformance::TokenSelectionConformanceConfig config{
+            devices.conformance(),
+            devices.candidate->supported_data_types(),
+            &devices.gate,
+            &native_storage,
+            expected_device_scratch,
+            native_failure};
+    iom_conformance::run_token_selection_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 
