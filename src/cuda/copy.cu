@@ -361,14 +361,13 @@ void launch_cache_append_kernel(
 // codec and the shared stable evaluator in an FP64 carrier, and stored with
 // exactly one RNE encode in the destination format.
 //
-// Layout ownership: element slot `s` of one plane occupies bits
-// `[s * bits, (s + 1) * bits)` of that plane's packed stream. One chunk of a
-// 16-slot tile row is exactly `bits / 2` whole 32-bit words for every
-// applicable leaf width, so one thread owns its words exclusively: it reads an
-// owned word, replaces only the fields of the logical elements it owns, and
-// stores that word once. Physical tile padding and every cell outside the
-// logical `[..., rows, columns]` extent are never written, and no input cell
-// other than a logical element is ever read.
+// Layout ownership: one task is one 16-slot tile-row packet. The packet's
+// word span is `bits * 16 / 32` words, aligned for every applicable leaf, so
+// one thread owns all words touched by its fields exclusively. It evaluates
+// each logical element once, merges its single encoded value into the touched
+// packet words, and stores each touched word once. Physical tile padding and
+// every cell outside the logical `[..., rows, columns]` extent are never
+// written, and no input cell other than a logical element is ever read.
 // ---------------------------------------------------------------------------
 
 #define IOM_GPU_DEVICE __device__
@@ -382,7 +381,7 @@ namespace {
 
 constexpr unsigned int kSiluThreads = 256;
 constexpr unsigned int kSiluMaxBlocks = 65535;
-
+constexpr unsigned int kSiluMaxPacketWords = 32;
 // The FP64 carrier the SiLU contract requires for all nine applicable leaves.
 // The shared evaluator and the shared codec drive it through `::exp` and the
 // device math library's IEEE predicates, so no intermediate is narrowed to the
@@ -450,7 +449,7 @@ IOM_GPU_DEVICE std::uint64_t silu_load_field(
 }
 
 // One task is one (plane, row, 16-feature chunk) tuple: the granularity whose
-// owned word range is exclusive. Tasks and leading coordinates are derived
+// packet word range is exclusive. Tasks and leading coordinates are derived
 // exactly like the established shared tiled row kernels, so a transformed or
 // selected leading-plane view keeps its own plane offset and strides.
 IOM_GPU_GLOBAL void silu_kernel(SiluMetadata metadata) {
@@ -462,6 +461,8 @@ IOM_GPU_GLOBAL void silu_kernel(SiluMetadata metadata) {
             (columns + TensorSpec::TILE - 1) / TensorSpec::TILE;
     const std::uint64_t tasks =
             metadata.plane_count * rows * chunks_per_row;
+    const unsigned int packet_words =
+            bits * static_cast<unsigned int>(TensorSpec::TILE) / 32;
     const unsigned char* x_bytes = metadata.x;
     unsigned char* y_bytes = metadata.y;
 
@@ -489,44 +490,40 @@ IOM_GPU_GLOBAL void silu_kernel(SiluMetadata metadata) {
                 x_plane, row, first_feature, rows, columns) * bits;
         const std::uint64_t y_bit = plane_slot(
                 y_plane, row, first_feature, rows, columns) * bits;
-        const std::uint64_t last_word =
-                (y_bit + length * bits - 1) / 32;
-
+        const std::uint64_t first_word = y_bit / 32;
         auto* y_words = reinterpret_cast<std::uint32_t*>(y_bytes);
-        for (std::uint64_t word = y_bit / 32; word <= last_word; ++word) {
-            const std::uint64_t word_first_bit = word * 32;
-            const std::uint64_t word_end_bit = word_first_bit + 32;
-            // Only fields overlapping this owned word are visited, and every
-            // visited field overlaps it: a field that straddles the word start
-            // still owns this word's segment, while a field that already ended
-            // before the word contributes nothing and is never merged.
-            const std::uint64_t first_index =
-                    word_first_bit > y_bit
-                    ? (word_first_bit - y_bit) / bits
-                    : 0;
-            std::uint64_t last_index =
-                    (word_end_bit - y_bit + bits - 1) / bits;
-            if (last_index > length) {
-                last_index = length;
-            }
-            std::uint32_t merged = y_words[word];
-            for (std::uint64_t index = first_index; index < last_index;
-                 ++index) {
-                const std::uint64_t field_bit = y_bit + index * bits;
-                const std::uint64_t encoded =
-                        scalar_silu_detail::scalar_silu<SiluFp64Traits>(
-                                type,
-                                silu_load_field(
-                                        x_bytes, x_bit + index * bits,
-                                        bits));
+        std::uint32_t merged[kSiluMaxPacketWords]{};
+        bool owns_word[kSiluMaxPacketWords]{};
+        for (unsigned int local_word = 0;
+             local_word < packet_words; ++local_word) {
+            merged[local_word] = y_words[first_word + local_word];
+        }
+        for (std::uint64_t index = 0; index < length; ++index) {
+            const std::uint64_t field_bit = y_bit + index * bits;
+            const std::uint64_t encoded =
+                    scalar_silu_detail::scalar_silu<SiluFp64Traits>(
+                            type,
+                            silu_load_field(
+                                    x_bytes, x_bit + index * bits,
+                                    bits));
+            const std::uint64_t field_end = field_bit + bits;
+            const std::uint64_t first_output_word = field_bit / 32;
+            const std::uint64_t last_output_word = (field_end - 1) / 32;
+            for (std::uint64_t output_word = first_output_word;
+                 output_word <= last_output_word; ++output_word) {
+                if (output_word < first_word
+                        || output_word >= first_word + packet_words) {
+                    continue;
+                }
+                const std::uint64_t word_first_bit = output_word * 32;
                 const std::uint64_t overlap_first =
                         field_bit > word_first_bit
                         ? field_bit
                         : word_first_bit;
                 const std::uint64_t overlap_end =
-                        field_bit + bits < word_end_bit
-                        ? field_bit + bits
-                        : word_end_bit;
+                        field_end < word_first_bit + 32
+                        ? field_end
+                        : word_first_bit + 32;
                 const unsigned int count = static_cast<unsigned int>(
                         overlap_end - overlap_first);
                 const unsigned int position = static_cast<unsigned int>(
@@ -536,11 +533,21 @@ IOM_GPU_GLOBAL void silu_kernel(SiluMetadata metadata) {
                 const std::uint32_t segment =
                         static_cast<std::uint32_t>(encoded >> shift)
                         & field_mask(count);
-                merged = (merged
-                          & ~(field_mask(count) << position))
+                const unsigned int local_word = static_cast<unsigned int>(
+                        output_word - first_word);
+                merged[local_word] = (merged[local_word]
+                                      & ~(field_mask(count) << position))
                         | (segment << position);
+                owns_word[local_word] = true;
             }
-            store_word(y_words + word, merged);
+        }
+        for (unsigned int local_word = 0;
+             local_word < packet_words; ++local_word) {
+            if (owns_word[local_word]) {
+                store_word(
+                        y_words + first_word + local_word,
+                        merged[local_word]);
+            }
         }
     }
 }

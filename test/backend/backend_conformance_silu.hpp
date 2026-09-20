@@ -1688,18 +1688,31 @@ inline std::uint64_t silu_mul_expected(
     return silu_oracle::encode_f32(type, value);
 }
 
+inline std::uint64_t silu_add_expected(
+        iom::DataType type, std::uint64_t lhs, std::uint64_t rhs) noexcept {
+    if (type == iom::DataType::F64) {
+        return silu_oracle::encode_f64(
+                silu_oracle::decode_f64(lhs) + silu_oracle::decode_f64(rhs));
+    }
+    const float value = silu_oracle::decode_f32(type, lhs)
+            + silu_oracle::decode_f32(type, rhs);
+    return silu_oracle::encode_f32(type, value);
+}
+
 inline void run_silu_stored_mul_conformance(
         SiluConformanceConfig& config) {
     if (!silu_declares(config.supported_leaves, iom::DataType::F32)) return;
     constexpr iom::DataType type = iom::DataType::F32;
     const SiluReferenceCase fixture = silu_make_pattern_case(
             SiluReferenceCaseKind::ordinary, type, {2}, 2, 17,
-            "stored-mul/F32");
+            "stored-boundary/F32");
     const iom::TensorSpec spec = silu_case_spec(fixture);
     auto gate = config.devices.candidate.create_tensor(spec);
     auto up = config.devices.candidate.create_tensor(spec);
     auto activated = config.devices.candidate.create_tensor(spec);
     auto product = config.devices.candidate.create_tensor(spec);
+    auto residual = config.devices.candidate.create_tensor(spec);
+    auto summed = config.devices.candidate.create_tensor(spec);
     const std::vector<std::uint64_t> up_bits = [&] {
         std::vector<std::uint64_t> values(fixture.input_bits.size());
         for (std::size_t index = 0; index < values.size(); ++index) {
@@ -1708,13 +1721,36 @@ inline void run_silu_stored_mul_conformance(
         }
         return values;
     }();
+    const std::vector<std::uint64_t> residual_bits = [&] {
+        std::vector<std::uint64_t> values(fixture.input_bits.size());
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = silu_oracle::value_bits(
+                    type, index % 4 == 0 ? 1.5 : (index % 2 == 0 ? -0.25 : 0.5));
+        }
+        return values;
+    }();
+    CHECK(gate->view().owner_identity() != up->view().owner_identity());
+    CHECK(gate->view().owner_identity() != activated->view().owner_identity());
+    CHECK(gate->view().owner_identity() != product->view().owner_identity());
+    CHECK(gate->view().owner_identity() != residual->view().owner_identity());
+    CHECK(gate->view().owner_identity() != summed->view().owner_identity());
+    CHECK(activated->view().owner_identity() != product->view().owner_identity());
+    CHECK(activated->view().owner_identity() != summed->view().owner_identity());
+    CHECK(product->view().owner_identity() != summed->view().owner_identity());
+    CHECK(residual->view().owner_identity() != summed->view().owner_identity());
+    CHECK(activated->view().native_handle() != product->view().native_handle());
+    CHECK(product->view().native_handle() != summed->view().native_handle());
     copy_from_host(gate->view(), silu_pack_bits(type, fixture.input_bits));
     copy_from_host(up->view(), silu_pack_bits(type, up_bits));
+    copy_from_host(residual->view(), silu_pack_bits(type, residual_bits));
     copy_from_host(
             activated->view(),
             std::vector<std::byte>(spec.logical_nbytes(), kReadbackSentinel));
     copy_from_host(
             product->view(),
+            std::vector<std::byte>(spec.logical_nbytes(), kReadbackSentinel));
+    copy_from_host(
+            summed->view(),
             std::vector<std::byte>(spec.logical_nbytes(), kReadbackSentinel));
     auto queue = config.devices.candidate.create_ops();
     {
@@ -1722,23 +1758,48 @@ inline void run_silu_stored_mul_conformance(
         const iom::oid activation = queue->silu(
                 gate->view(), activated->view());
         REQUIRE(iom::oid_is_token(activation));
-        const iom::WorkspaceRequirements requirements =
+        const iom::WorkspaceRequirements mul_requirements =
                 queue->mul_workspace_requirements(
                         activated->view(), up->view(), product->view());
-        std::unique_ptr<iom::RawWorkspace> workspace;
-        if (requirements.bytes != 0) {
-            workspace = config.devices.candidate.create_workspace(
-                    requirements.bytes);
+        std::unique_ptr<iom::RawWorkspace> mul_workspace;
+        if (mul_requirements.bytes != 0) {
+            mul_workspace = config.devices.candidate.create_workspace(
+                    mul_requirements.bytes);
         }
-        const iom::oid product_token = workspace
+        const iom::oid product_token = mul_workspace
                 ? queue->mul(
                           activated->view(), up->view(), product->view(),
-                          workspace->view())
+                          mul_workspace->view())
                 : queue->mul(
                           activated->view(), up->view(), product->view());
         REQUIRE(iom::oid_is_token(product_token));
+        CHECK_EQ(
+                token_sequence(product_token),
+                token_sequence(activation) + 1);
+        const iom::WorkspaceRequirements add_requirements =
+                queue->add_workspace_requirements(
+                        product->view(), residual->view(), summed->view());
+        std::unique_ptr<iom::RawWorkspace> add_workspace;
+        if (add_requirements.bytes != 0) {
+            add_workspace = config.devices.candidate.create_workspace(
+                    add_requirements.bytes);
+        }
+        const iom::oid sum_token = add_workspace
+                ? queue->add(
+                          product->view(), residual->view(), summed->view(),
+                          add_workspace->view())
+                : queue->add(
+                          product->view(), residual->view(), summed->view());
+        REQUIRE(iom::oid_is_token(sum_token));
+        CHECK_EQ(
+                token_sequence(sum_token),
+                token_sequence(product_token) + 1);
+        // The final wait proves the in-order queue consumes the stored SiLU
+        // result through mul and then consumes the stored product through add.
+        CHECK_NOTHROW(queue->wait(sum_token));
+        CHECK_NOTHROW(queue->wait(sum_token));
         CHECK_NOTHROW(queue->wait(product_token));
-        CHECK_NOTHROW(queue->wait(product_token));
+        CHECK_NOTHROW(queue->wait(activation));
     }
     const std::vector<SiluReferenceValue> activated_expected =
             silu_evaluate(fixture);
@@ -1747,24 +1808,37 @@ inline void run_silu_stored_mul_conformance(
             "stored SiLU result");
     CHECK_MESSAGE(activated_mismatch.empty(), activated_mismatch);
     std::vector<std::uint64_t> product_expected;
+    std::vector<std::uint64_t> sum_expected;
     product_expected.reserve(up_bits.size());
+    sum_expected.reserve(up_bits.size());
     for (std::size_t index = 0; index < up_bits.size(); ++index) {
-        product_expected.push_back(
-                silu_mul_expected(type, activated_expected[index].bits,
-                                  up_bits[index]));
+        const std::uint64_t product_bits = silu_mul_expected(
+                type, activated_expected[index].bits, up_bits[index]);
+        product_expected.push_back(product_bits);
+        sum_expected.push_back(
+                silu_add_expected(type, product_bits, residual_bits[index]));
     }
-    const std::vector<SiluReferenceValue> product_values = [&] {
+    const auto as_reference_values = [type](std::span<const std::uint64_t> bits) {
         std::vector<SiluReferenceValue> values;
-        values.reserve(product_expected.size());
-        for (const std::uint64_t bits : product_expected) {
-            values.push_back({bits, silu_oracle::class_of_bits(type, bits)});
+        values.reserve(bits.size());
+        for (const std::uint64_t value : bits) {
+            values.push_back(
+                    {value, silu_oracle::class_of_bits(type, value)});
         }
         return values;
-    }();
+    };
+    const std::vector<SiluReferenceValue> product_values =
+            as_reference_values(product_expected);
     const std::string product_mismatch = silu_compare(
             type, read_logical(product->view()), product_values,
             "stored SiLU result composed with mul");
     CHECK_MESSAGE(product_mismatch.empty(), product_mismatch);
+    const std::vector<SiluReferenceValue> sum_values =
+            as_reference_values(sum_expected);
+    const std::string sum_mismatch = silu_compare(
+            type, read_logical(summed->view()), sum_values,
+            "stored SiLU result composed with mul and add");
+    CHECK_MESSAGE(sum_mismatch.empty(), sum_mismatch);
 }
 
 inline void run_silu_conformance(SiluConformanceConfig config) {

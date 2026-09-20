@@ -414,17 +414,18 @@ must record that fact rather than adding an example.
 
 ### 9. Other compute capabilities
 
-`silu` and `sdpa` remain unsupported and return negative `Unsupported` before
-submission, mutation, or token acceptance. The `linear` hooks are owned by
-[Linear projections](#linear-projections): CPU, CUDA, ROCm, and SYCL implement
-all twenty-one applicable leaves — the twenty non-BF16 leaves on the shared
-scalar projection path plus `BF16` on the scalar recurrence on CPU and on a
-separate native specialization on CUDA, ROCm, and SYCL, whose availability is a
-runtime device and loaded-image fact. A backend without its own linear port
-keeps reporting `Unsupported`. CUDA and ROCm provide source-inspected RMSNorm
-launch wrappers over the shared core, and SYCL provides its native row kernel
-with the `aspect::fp64` guard. The four-backend RMSNorm closure evidence and
-supported/limited matrix are recorded in [RMS normalization](#rms-normalization).
+`silu` is implemented on CPU, CUDA, ROCm, and SYCL; `sdpa` remains
+unsupported and returns negative `Unsupported` before submission, mutation, or
+token acceptance. The `linear` hooks are owned by [Linear projections](#linear-projections):
+CPU, CUDA, ROCm, and SYCL implement all twenty-one applicable leaves — the
+twenty non-BF16 leaves on the shared scalar projection path plus `BF16` on the
+scalar recurrence on CPU and on a separate native specialization on CUDA, ROCm,
+and SYCL, whose availability is a runtime device and loaded-image fact. A
+backend without its own linear port keeps reporting `Unsupported`. CUDA and
+ROCm provide source-inspected RMSNorm launch wrappers over the shared core, and
+SYCL provides its native row kernel with the `aspect::fp64` guard. The
+four-backend RMSNorm closure evidence and supported/limited matrix are recorded
+in [RMS normalization](#rms-normalization).
 
 #### TinyLlama forward layout — Embedding and projection boundaries
 
@@ -601,10 +602,10 @@ is implemented; an unsupported port never counts as numerical conformance.
 
 This subsection defines semantic applicability and shared numerical boundaries
 for embedding lookup, linear, RMSNorm, RoPE, cache-row append, SiLU, and SDPA.
-It does not advertise a current implementation: the neural hooks remain
-`Unsupported` as stated above until an actual backend port changes that
-capability. The binary rules in section 8 remain unchanged and are not
-restated here.
+It records the current implementation status of those contracts: SiLU is
+implemented on the four retained backends, while the other operation statuses
+remain as stated in their operation-owned sections. The binary rules in section
+8 remain unchanged and are not restated here.
 
 ##### Semantic applicability
 
@@ -705,7 +706,7 @@ The independent comparison ceilings are one target-format ULP for
 four ULP for `F32`; and eight ULP for `F64`. Special-value classes,
 signed-zero signs, exact zero behavior, and the two underflow-tail fixtures
 are exact checks in addition to those ceilings. The shared SiLU reference and
-all named behavior cases are owned by the planned
+all named behavior cases are owned by the implemented
 `test/backend/backend_conformance_silu.hpp` suite described by the
 [SiLU activation](#silu-activation) contract below.
 
@@ -799,10 +800,10 @@ probes migrate only when a backend is actually ported and do not constitute
 numerical conformance.
 #### TinyLlama forward layout — Normalization and MLP boundaries
 
-The following interfaces are the planned ABI of this subsection. The RMS
+The following interfaces are the frozen ABI of this subsection. The RMS
 normalization declarations and their admission contract are frozen and
 declared by [RMS normalization](#rms-normalization); the SiLU declarations are
-still planned and undeclared:
+also frozen, declared, and implemented:
 
 ```cpp
 oid rmsnorm(const TensorView& x, const TensorView& scale, TensorView& out,
@@ -917,11 +918,11 @@ the corresponding operation contract.
 The detailed datatype applicability, special-value behavior, references,
 tolerances, fixture provenance, snapshots/hooks, kernels, and evidenced
 backend limitations remain solely owned by the
-[RMS normalization](#rms-normalization) and planned **SiLU** operation
+[RMS normalization](#rms-normalization) and the implemented **SiLU** operation
 sections. RMSNorm's four retained-backend ports are closed by the focused
-conformance targets named in its section; SiLU remains a planned operation and
-continues to return negative `Unsupported` before submission, mutation, or
-token acceptance. This plan subsection declares no additional ABI.
+conformance targets named in its section; SiLU's four retained-backend ports
+are closed by the gate receipt in its operation section. This plan subsection
+declares no additional ABI.
 
 Delivery is operation-first, not mathematical-forward order: embedding,
 linear, RMSNorm, RoPE, cache append, SiLU, and finally SDPA. For each operation,
@@ -1435,7 +1436,7 @@ decoder-layer assembly and verification.
 #### TinyLlama forward layout — Workspace and execution
 
 This subsection records the shared facade boundary. The common layer now
-declares embedding, linear, RMSNorm, and RoPE; cache append, SiLU, and SDPA
+declares embedding, linear, RMSNorm, RoPE, and SiLU; cache append and SDPA
 remain planned until their own leaves land. The target `DeviceOps` facades
 return `oid`, are `noexcept`, and have exactly these signatures:
 
@@ -1634,11 +1635,12 @@ terminality is proved; otherwise it remains retained or quarantined. Token
 commit is separate from physical cache initialization, and no failed cache
 prefix may be published.
 
-The planned neural signatures and queries above are not current API
-declarations.
-The existing neural hooks remain `Unsupported` until their real operation
-ports land; this subsection changes no facade, kernel, queue, session, or
-selector implementation.
+The interfaces in this planning subsection that are not declared by an
+operation-owned section are not current API declarations. Existing neural hooks
+not covered by a retained operation port remain `Unsupported`; the implemented
+SiLU hook is governed by the [SiLU activation](#silu-activation) contract and
+its four-backend gate receipt. This subsection changes no other facade, kernel,
+queue, session, or selector implementation.
 
 #### TinyLlama forward layout — Final-logits selection and ownership
 
@@ -2135,8 +2137,9 @@ route is **supported for implementation feasibility** for ordinary and
 head-planar linear, QK, and PV at every required row count. Production status
 is **closed for linear** — the operation-owning port supplies the runtime
 numerical, conformance, and execution-connected evidence recorded in
-[Linear native evidence](#linear-native-evidence) — and remains **blocked for
-QK, PV, RoPE, SiLU, and SDPA** until their own ports supply the same evidence.
+`[Linear native evidence](#linear-native-evidence)` — and remains **blocked for
+QK, PV, RoPE, and SDPA** until their own ports supply the same evidence. The
+implemented SiLU port is closed separately by its operation-owned gate receipt.
 A device below compute capability 8.0 is **unsupported** for this BF16 WMMA
 route; it does not earn a fallback pass.
 
@@ -2481,8 +2484,10 @@ successful compilation, or one GEMM cannot substitute for that evidence.
 #### TinyLlama forward layout — ROCm matrix feasibility
 
 This is a bounded feasibility record for the planned ABI above, not a ROCm
-implementation or a support advertisement. The existing ROCm neural probes
-continue to return negative `Unsupported`; the observations below do not
+implementation or a support advertisement for the operations covered below.
+The existing ROCm neural probes not covered by a retained operation port
+continue to return negative `Unsupported`; the implemented SiLU port is
+covered by its operation-owned gate receipt. The observations below do not
 replace operation conformance, a production kernel run, or profiler evidence.
 They establish that compiler-native BF16 matrix instructions are a viable
 implementation route on a checked supporting target without adding a matrix
@@ -2742,14 +2747,14 @@ such dependency.
 #### TinyLlama forward layout — SYCL matrix feasibility
 
 This is the bounded feasibility record for the seven-operation ABI. Embedding
-lookup has its device-native raw-word `parallel_for` port, and linear
-projections are implemented as the twenty non-BF16 leaves on the
-operation-local in-order path plus the native BF16 `joint_matrix` route with
-explicit RNE packing, recorded in [Linear projections](#linear-projections).
-RMSNorm, RoPE, cache append, SiLU, and SDPA remain unimplemented. A future port
-MUST preserve the signatures, pure requirement queries, validation precedence,
-owner rules, and producer-wait schedule above; SYCL types remain
-backend-private.
+lookup has its device-native raw-word `parallel_for` port, linear projections
+are implemented as the twenty non-BF16 leaves on the operation-local in-order
+path plus the native BF16 `joint_matrix` route with explicit RNE packing,
+recorded in [Linear projections](#linear-projections), and SiLU is implemented
+by the native packet path recorded in its operation-owned section. RMSNorm,
+RoPE, cache append, and SDPA remain unimplemented. A future port MUST preserve
+the signatures, pure requirement queries, validation precedence, owner rules,
+and producer-wait schedule above; SYCL types remain backend-private.
 
 The evidence layers are deliberately separate:
 
@@ -3178,11 +3183,11 @@ backend-specific launch code remain owned by their own ports.
 
 #### SiLU activation
 
-This is the operation-owned contract for the planned `DeviceOps::silu`.
-The common facade currently keeps a well-formed SiLU request
-`Unsupported` until an actual backend port lands; that runtime status does
-not weaken the final semantic or capability matrix below, and an unsupported
-probe is not numerical conformance. The exact public surface is:
+This is the operation-owned contract for the implemented `DeviceOps::silu`.
+The common facade admits a well-formed SiLU request on each backend according to
+the capability matrix below; unsupported semantic or backend leaves still
+return `Unsupported` before submission, mutation, or token acceptance. The
+exact public surface is:
 
 ```cpp
 oid silu(const TensorView& x, TensorView& y,
@@ -3253,18 +3258,19 @@ capability.
    | `F16` | Applicable signed real format | Supported | Supported | Supported | Supported |
    | `BF16` | Applicable signed real format | Supported | Supported | Supported | Supported |
    | `F32` | Applicable signed real format | Supported | Supported | Supported | Supported |
-   | `F64` | Applicable signed real format; never silently narrowed | Supported | Supported | Supported | Supported only with `aspect::fp64`; otherwise `Unsupported` — device fp64 unavailable |
+   | `F64` | Applicable signed real format; never silently narrowed | Supported | Supported | Supported | `Unsupported` — no device-independent FP64 guarantee |
 
 CPU, CUDA, and ROCm therefore support all nine applicable leaves. SYCL supports
-the eight applicable leaves other than `F64` unconditionally and supports `F64`
-only when the device provides `aspect::fp64`; unavailable device FP64 is an
-explicit `Unsupported` capability. `BOOL`, all 12 integer leaves, and
-`F8_E8M0` remain `Unsupported` on every backend because they are semantically
-inapplicable. An unknown `DataType` enum is `InvalidArgument`, not a capability
-result. A recognized but unsupported applicable leaf returns `Unsupported` with
-the named capability reason only after structural admission checks. Only
-`QuantizationFormat::NONE` is in scope; an unknown quantization enum is
-`InvalidArgument`, and a recognized non-`NONE` format is `Unsupported`.
+exactly the eight applicable leaves other than `F64` and rejects `F64`
+deterministically with the named `Unsupported` capability reason that this path
+has no device-independent FP64 guarantee; it does not lower or emulate `F64`.
+`BOOL`, all 12 integer leaves, and `F8_E8M0` remain `Unsupported` on every
+backend because they are semantically inapplicable. An unknown `DataType` enum
+is `InvalidArgument`, not a capability result. A recognized but unsupported
+applicable leaf returns `Unsupported` with the named capability reason only
+after structural admission checks. Only `QuantizationFormat::NONE` is in scope;
+an unknown quantization enum is `InvalidArgument`, and a recognized non-`NONE`
+format is `Unsupported`.
 
 4. **Zero workspace and pure requirements.** Every backend's
    `silu_workspace_requirements(x, y)` returns exactly `{0, 1}`. Since the
@@ -3343,7 +3349,7 @@ the named capability reason only after structural admission checks. Only
    `src/shared/scalar_binary_codec.hpp` and MUST NOT use production SiLU as
    its sole oracle.
 
-10. **Shared SiLU conformance map.** The planned shared header
+10. **Shared SiLU conformance map.** The implemented shared header
     `test/backend/backend_conformance_silu.hpp` owns the following named
     cases; every rule above MUST be observable through one of them, and an
     unsupported backend keeps an explicit `Unsupported` probe rather than
@@ -3353,32 +3359,32 @@ the named capability reason only after structural admission checks. Only
     | --- | --- |
     | `api_and_query_purity_zero_workspace` | Exact ABI and pure query; deterministic `{0, 1}` requirements; nonempty workspace ignored without validation, leasing, retention, or state effects. |
     | `shape_rank_planes_runs_and_padding` | Rank 2..8, complete `[...,R,F]` mapping, independent leading planes, logical runs `R=1,15,16,17`, non-tile feature sizes, TILE padding poisoning, and output-padding isolation. |
-    | `dtype_classification_and_backend_matrix` | All 23 leaves, semantic inapplicability versus capability, `NONE` quantization, CPU/CUDA/ROCm nine-leaf support, and SYCL eight-plus-conditional-F64 support. |
+    | `dtype_classification_and_backend_matrix` | All 23 leaves, semantic inapplicability versus capability, `NONE` quantization, CPU/CUDA/ROCm nine-leaf support, and SYCL eight-leaf support plus deterministic `F64` rejection. |
     | `admission_alias_device_owner_and_overflow` | Shape/layout/dtype/device/owner/native-view admission, exact aliases and partial overlaps, transformed-view disjointness, checked element/tile/byte/stride/plane/address overflow, and negative OID categories. |
     | `stable_finite_reference_and_tails` | Independent scalar/raw reference, stable finite branches, FP32/FP64 intermediates, one output encode, no FTZ, `F32 -104` and `F64 -746` tails, and 1/4/8-ULP ceilings. |
     | `special_values_signed_zero_and_rounding` | Infinity and NaN classes, signed zeros, negative-zero underflow, finite-only format limits, saturation/subnormals, exact class/sign checks, and RNE encoding. |
     | `accepted_failure_repeat_wait_and_temporary_view` | Accepted asynchronous failures retained on positive OIDs, repeated identical waits, owner retention, temporary-view destruction safety, in-order queue behavior, and drain/reset boundaries. |
-    | `stored_result_composes_with_mul` | Distinct `[R,M]` or independent-plane `[P,R,M]` `ActivatedGate` storage, then existing `mul(ActivatedGate, Up, Product)` in that operand order with the stored rounding boundary intact. |
+    | `stored_result_composes_with_mul_and_add` | Distinct `[R,M]` or independent-plane `[P,R,M]` `ActivatedGate` storage, then existing `mul(ActivatedGate, Up, Product)` and `add(Product, Residual, Summed)` with stored rounding and ownership boundaries intact. |
 
     The shared cases cover exact output ownership, logical runs and features,
     independent planes, poisoned input/output padding, every applicable
     backend/dtype expectation, admission and overflow failures, special
     classes and rounding, accepted failures and repeated waits, and the
-    stored-result composition boundary. They do not add a generic unary,
-    SwiGLU, or MLP API.
+    stored-result composition boundary through existing `mul` and `add`. They
+    do not add a generic unary, SwiGLU, or MLP API.
 
 11. **MLP composition boundary.** The caller stores `SiLU(Gate)` in a
     distinct `[R,M]` result, or `[P,R,M]` for independent leading planes,
-    then calls existing `mul(ActivatedGate, Up, Product)` in that operand
-    order. SiLU MUST NOT fuse with multiplication, alter `mul` or `add`,
-    erase the stored-result rounding boundary, or add a generic unary or
-    fused SwiGLU/MLP operation. Existing residual, session, and model
-    boundaries remain outside this section.
+    then calls existing `mul(ActivatedGate, Up, Product)` followed by
+    `add(Product, Residual, Summed)`. SiLU MUST NOT fuse with multiplication or
+    addition, alter `mul` or `add`, erase the stored-result rounding boundary,
+    or add a generic unary or fused SwiGLU/MLP operation. Existing residual,
+    session, and model boundaries remain outside this section.
 
-The operation-specific conformance header and future backend drivers are the
-only test surface for this contract. No declaration, implementation, kernel,
-test, registration, model, or session file is changed by this documentation
-leaf; until a port lands, the current runtime hooks remain `Unsupported`.
+The operation-specific conformance header and the four backend drivers are the
+only test surface for this contract. The declaration, implementation, kernel,
+test registration, and queue integration are all present in the retained
+backends; the gate receipt below records the exact same-worktree evidence.
 
 ##### CUDA SiLU implementation boundary and evidence
 
@@ -3399,12 +3405,12 @@ no claim about the other backends and no native-matrix claim of any kind.
   descriptor into the queue's fixed metadata slot and then launches exactly one
   kernel on the queue's own nonblocking stream: no staging, hidden allocation,
   host round trip, second queue, or device-side detour through another
-  operation. One thread owns whole 32-bit words of one 16-slot tile-row chunk,
-  so every owned word is read, merged once, and stored once, each logical
-  element is evaluated exactly once, and neither physical tile padding nor any
-  packed padding bit outside the logical element set is written. Independent
-  leading planes, logical runs, and features keep their own transformed plane
-  offsets and strides.
+  operation. One thread owns one 16-feature tile-row packet and every word
+  touched by that packet, so every packet word is read, merged, and stored once,
+  each logical element is evaluated exactly once, and neither physical tile
+  padding nor any packed padding bit outside the logical element set is written.
+  Independent leading planes, logical runs, and features keep their own
+  transformed plane offsets and strides.
 - **Numerics.** `src/shared/scalar_binary_codec.hpp` remains the sole
   named-format codec and `src/shared/scalar_silu.hpp` the sole stable scalar
   evaluator; the CUDA translation unit instantiates both with an FP64 carrier
@@ -3419,17 +3425,40 @@ no claim about the other backends and no native-matrix claim of any kind.
   after submission and the accepted work still completes from retained
   storage; an unknown completion whose covering drain fails quarantines the
   queue lease until a covering proof reclaims its partition.
-- **Observed evidence.** A CUDA-only configuration (`-DCUDA_ENABLED=ON`, no
-  other optional backend) builds `iom_cuda_conformance_tests` without
-  diagnostics, and the anchored `ctest --test-dir build --output-on-failure
-  --timeout 300 -R '^iom_cuda_conformance_tests$'` passes on the reference
-  device (NVIDIA GeForce RTX 5090, compute capability 12.0, driver 595.71.05,
-  `nvcc` 13.2): 43 test cases with 6193239 assertions, every one passing. That
-  run covers the per-leaf device results for all nine leaves, the ULP, class,
-  and sign checks, the zero-workspace query, the logical-only write and
-  tile-padding invariants across full, transformed, and selected leading
-  views, `runs` 1/15/16/17, non-tile feature sizes, and the CUDA
-  fault/lifetime cases named in the queue clause above.
+- **Observed evidence.** The CUDA-only configuration (`-DCUDA_ENABLED=ON`, no
+  other optional backend) built `iom_cuda_conformance_tests`; `nvcc` emitted
+  pre-existing unused-function warnings in `src/cuda/linear.cu`, so this was
+  not a diagnostics-free build. On NVIDIA GeForce RTX 5090 (compute
+  capability 12.0, driver 595.71.05, CUDA `13.2`), the anchored CUDA CTest
+  target passed 1/1 and the focused `*SiLU*` selection passed 5/5 with 4,127
+  assertions. The run covers all nine leaves, the ULP, class, and sign checks,
+  zero-workspace query, logical-only write and tile-padding invariants across
+  full, transformed, and selected leading views, `runs` 1/15/16/17,
+  non-tile feature sizes, the stored `SiLU -> mul -> add` boundary, and the
+  CUDA fault/lifetime cases named in the queue clause above.
+
+##### ROCm SiLU implementation boundary and evidence
+
+ROCm's SiLU leaf is implemented in `src/rocm/copy.hip` behind the common
+`DeviceOps::silu` admission path, the shared queue seam, and the ROCm
+`gpu_policy` hooks. ROCm advertises the same nine applicable signed floating
+leaves as CPU and CUDA; all semantic integer, `BOOL`, `F8_E8M0`, and non-`NONE`
+quantization probes remain rejected by common admission.
+
+The HIP kernel assigns one thread to a 16-feature tile-row packet and all words
+touched by that packet. Each logical field is decoded, evaluated with the
+stable shared scalar SiLU evaluator, RNE-encoded, and stored exactly once;
+cross-word F6 fields therefore have one packet owner rather than two adjacent
+word owners. Physical tile padding is not written. The byte-wise word access
+helpers remain a conservative alignment-safe implementation detail; their
+cost is performance-only and does not change the logical contract.
+
+The final ROCm gate ran on AMD Radeon AI PRO R9700 (`gfx1201`) with HIP
+7.15.26333 / ROCm core 10.0. The anchored `iom_rocm_conformance_tests` CTest
+target passed 1/1, and the focused `*SiLU*` selection passed 5/5 with 4,172
+assertions, including the stored `SiLU -> mul -> add` boundary and native
+failure/lifetime checks.
+
 ##### SYCL SiLU implementation boundary and evidence
 
 The native SYCL SiLU port currently advertises exactly the eight applicable
@@ -3450,17 +3479,74 @@ partial final tile rows, and physical padding are covered by the shared
 storage observer.
 
 This boundary is evidenced by the SYCL-only oneAPI run on mirror
-`leaf006-09-sycl-packed`: `sycl-ls` enumerated two enabled Level Zero GPUs;
-configuration and `cmake --build build/sycl --target
-iom_sycl_conformance_tests` both succeeded; the focused SiLU selection passed
-2 test cases and 2,293 assertions; the focused RMSNorm control selection passed
-1 test case and 1,734 assertions; and the anchored
-`iom_sycl_conformance_tests` CTest selection passed 1/1. The focused driver
-also observed the explicit `F64` rejection without output mutation or
-admission side effects. A subsequent canonical-lock run on mirror
-`repair-10-sycl-packed` passed the direct no-filter binary three times, each
-with 38 test cases and 6,114,711 assertions, with no crash.
+`006-tinyllama-09-silu-gate-sycl`: `sycl-ls` enumerated two enabled Level Zero
+Intel(R) Arc(TM) Pro B60 Graphics GPUs; configuration and
+`cmake --build build --target iom_sycl_conformance_tests` both succeeded; the
+anchored `iom_sycl_conformance_tests` CTest target passed 1/1; and the focused
+`*SiLU*` selection passed 2/2 with 2,310 assertions. The focused driver also
+observed the explicit `F64` rejection without output mutation or admission
+side effects. The final shared scenario covered the stored `SiLU -> mul -> add`
+boundary without fusion.
 
+
+##### Five-backend SiLU gate receipt (same prepared worktree snapshot)
+
+The four backend rows below were run from the same prepared worktree snapshot:
+branch `run-task/006-tinyllama--09-silu-activation--13-silu-five-backend-gate`,
+base `HEAD` `185caa78771639054a7a332d4c9291995b670cba`, and worktree
+`/home/rlew/iom/src/iom/.work/006-tinyllama/09-silu-activation/13-silu-five-backend-gate`.
+The accelerator rows used a fresh `csw-remote-sync` immediately before each
+`csw-remote-exec`, the required bounded GPU lock and timeout, and the
+profile-specific mirrors `006-tinyllama-09-silu-gate-cuda`,
+`006-tinyllama-09-silu-gate-rocm`, and `006-tinyllama-09-silu-gate-sycl`.
+The retained helper transcript is
+`/home/rlew/iom/src/iom/.cswd/tasks/006-tinyllama/09-silu-activation/13-silu-five-backend-gate/remote.log`.
+
+- **CPU (local AMD Ryzen AI 9 HX 370 / Radeon 890M host).** Build:
+  `timeout --kill-after=30s 1800s cmake --build build --target iom_backend_conformance_cpu_tests -j2`.
+  Focused:
+  `timeout --kill-after=30s 900s ./build/test/iom_backend_conformance_cpu_tests --test-case='*SiLU*'`
+  — 2/2 test cases and 3,303/3,303 assertions passed. Complete target:
+  `timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_backend_conformance_cpu_tests$'`
+  — 1/1 passed.
+- **CUDA (NVIDIA GeForce RTX 5090, compute 12.0, driver 595.71.05,
+  CUDA 13.2).** Complete target:
+  `flock -w 600 /tmp/iom-cuda-gpu.lock timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300 -R ^iom_cuda_conformance_tests$`
+  — 1/1 passed. Focused:
+  `flock -w 600 /tmp/iom-cuda-gpu.lock timeout --kill-after=30s 900s ./build/test/iom_cuda_conformance_tests --test-case="*SiLU*"`
+  — 5/5 and 4,127/4,127 assertions passed.
+- **ROCm (AMD Radeon AI PRO R9700, `gfx1201`, HIP 7.15.26333,
+  ROCm core 10.0).** Complete target:
+  `flock -w 600 /tmp/iom-rocm-gpu.lock timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300 -R ^iom_rocm_conformance_tests$`
+  — 1/1 passed. Focused:
+  `flock -w 600 /tmp/iom-rocm-gpu.lock timeout --kill-after=30s 900s ./build/test/iom_rocm_conformance_tests --test-case="*SiLU*"`
+  — 5/5 and 4,172/4,172 assertions passed.
+- **SYCL (two Intel Arc Pro B60 Level Zero GPUs, runtime
+  `1.15.38646+7`, oneAPI DPC++ 2026.1.0).** Complete target:
+  `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-silu-setvars.log 2>&1; set -u; sycl-ls; flock -w 600 /tmp/iom-sycl-gpu.lock timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300 -R ^iom_sycl_conformance_tests$`
+  — 1/1 passed. Focused:
+  `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-silu-setvars.log 2>&1; set -u; sycl-ls; flock -w 600 /tmp/iom-sycl-gpu.lock timeout --kill-after=30s 900s ./build/test/iom_sycl_conformance_tests --test-case="*SiLU*"`
+  — 2/2 and 2,310/2,310 assertions passed.
+
+The shared capability assertions cover the 23 stored leaves: CPU/CUDA/ROCm
+support all nine applicable signed floating leaves; SYCL supports exactly eight
+and explicitly rejects `F64` with its named capability reason; semantic
+inapplicable leaves stay `Unsupported`; and unknown enums stay
+`InvalidArgument`. The shared stored-boundary case submits SiLU, existing
+`mul`, and existing `add` in order, then verifies values plus distinct
+owner/native/storage identities without fusion or operation-specific
+synchronization.
+
+Reconciliation dispositions are explicit. CUDA and ROCm now use exclusive
+16-feature packet ownership, eliminating the former cross-word F6 duplicate
+evaluation/RNE-store path; both focused and complete suites pass after that
+change. The CUDA documentation now records the observed `linear.cu` compiler
+warnings instead of claiming a diagnostics-free build. The shared-suite
+sequence/failure/lifetime observations, the leaf-06 zero-class/tail/latch
+observations, and the SYCL/ROCm helper-reuse and whole-byte observations do not
+change this gate's cross-backend result; they remain covered by the existing
+driver-specific controls or are performance/test-hygiene findings, so no
+behavioral weakening or unrelated cleanup was introduced here.
 ### 10. Model loading and weight layout
 
 Model ingestion begins with an explicit model directory and stays
@@ -4433,13 +4519,13 @@ in `test/CMakeLists.txt` and is not created through that helper.
 `test/backend/test_backend_coexistence.cpp` and target
 `iom_backend_coexistence_tests` provide the combined coexistence gate.
 
-The planned SiLU operation has one shared executable source map,
-`test/backend/backend_conformance_silu.hpp`, whose eight named cases cover
-its ABI, pure zero-workspace query, shape and padding mapping, all 23 leaves
-and the final backend matrix, admission and overflow, stable arithmetic and
-special values, accepted failures and repeat waits, and stored-result `mul`
-composition. Existing backend drivers remain the future consumers of that
-shared header; no second SiLU test project is permitted.
+The implemented SiLU operation has one shared executable source map,
+`test/backend/backend_conformance_silu.hpp`, whose named cases cover its ABI,
+pure zero-workspace query, shape and padding mapping, all 23 leaves and the
+final backend matrix, admission and overflow, stable arithmetic and special
+values, accepted failures and repeat waits, and the stored-result
+`SiLU -> mul -> add` composition. Existing backend drivers consume that shared
+header; no second SiLU test project is permitted.
 
 Planned shared cache append coverage belongs in
 `test/backend/backend_conformance_copy_storage.hpp`: its planned shared
@@ -4488,10 +4574,10 @@ Use these sources when changing or extending the contract:
   `test/test_iom.cpp` and the shared conformance scenarios in
   `test/backend/backend_conformance_rmsnorm.hpp`; CPU-local result probes
   remain in `test/cpu/test_cpu.cpp`;
-- planned SiLU ABI, scalar/raw reference, admission, zero-workspace,
-  capability, numerical, queue/lifetime, and MLP composition contract:
-  [SiLU activation](#silu-activation), `src/shared/scalar_binary_codec.hpp`,
-  and the planned shared `test/backend/backend_conformance_silu.hpp` cases;
+- implemented SiLU ABI, scalar/raw reference, admission, zero-workspace,
+  capability, numerical, queue/lifetime, and stored-result composition
+  contract: [SiLU activation](#silu-activation), `src/shared/scalar_binary_codec.hpp`,
+  and the shared `test/backend/backend_conformance_silu.hpp` cases;
 - cache append public facade, common admission, and current API/lifetime tests:
   `include/iom/iom.hpp` (`DeviceOps::cache_append` and
   `DeviceOps::cache_append_workspace_requirements`),
