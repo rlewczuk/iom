@@ -546,7 +546,8 @@ inline void run_compute_capability_conformance(
         ConformanceObserver* observer = nullptr,
         std::string_view backend_label = {},
         bool binary_supported = false,
-        std::optional<bool> linear_supported = std::nullopt) {
+        std::optional<bool> linear_supported = std::nullopt,
+        std::optional<bool> sdpa_supported = std::nullopt) {
     const iom::TensorSpec spec{iom::TensorShape{{2, 16, 16}}, iom::DataType::F32};
     auto x = candidate.create_tensor(spec);
     auto y = candidate.create_tensor(spec);
@@ -560,6 +561,17 @@ inline void run_compute_capability_conformance(
     const iom::TensorSpec sdpa_out_spec{
             iom::TensorShape{{2, 16, 16}}, iom::DataType::BF16};
     auto sdpa_out = candidate.create_tensor(sdpa_out_spec);
+    auto queue = candidate.create_ops();
+    std::unique_ptr<iom::RawWorkspace> sdpa_workspace;
+    if (sdpa_supported.value_or(false)) {
+        const iom::WorkspaceRequirements requirements =
+                queue->sdpa_workspace_requirements(
+                        sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                        sdpa_out->view(), 0, 16);
+        if (requirements.bytes != 0) {
+            sdpa_workspace = candidate.create_workspace(requirements.bytes);
+        }
+    }
     if (observer != nullptr) {
         observer->setup_complete();
     }
@@ -568,7 +580,6 @@ inline void run_compute_capability_conformance(
     const std::vector<std::byte> attn_pattern = encode_logical(spec, 42);
     iom_conformance::copy_from_host(y->view(), y_pattern);
     iom_conformance::copy_from_host(attn->view(), attn_pattern);
-    auto queue = candidate.create_ops();
     (void)backend_label;
     const iom::oid unsupported = iom::to_oid(iom::OidError::Unsupported);
     const auto submit_supported_binary =
@@ -638,11 +649,22 @@ inline void run_compute_capability_conformance(
         CHECK_EQ(linear_token, unsupported);
     }
     const bool linear_submitted = iom::oid_is_token(linear_token);
-    CHECK_EQ(
-            queue->sdpa(
-                    sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
-                    sdpa_out->view(), 0, 16),
-            unsupported);
+    const iom::oid sdpa_token = sdpa_workspace
+            ? queue->sdpa(
+                      sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                      sdpa_out->view(), 0, 16, sdpa_workspace->view())
+            : queue->sdpa(
+                      sdpa_q->view(), sdpa_kv->view(), sdpa_kv->view(),
+                      sdpa_out->view(), 0, 16);
+    if (!sdpa_supported.has_value()) {
+        CHECK_EQ(sdpa_token, unsupported);
+    } else if (*sdpa_supported) {
+        REQUIRE(iom::oid_is_token(sdpa_token));
+        CHECK_NOTHROW(queue->wait(sdpa_token));
+    } else {
+        CHECK_EQ(sdpa_token, unsupported);
+    }
+    const bool sdpa_submitted = iom::oid_is_token(sdpa_token);
     (void)backend_label;
 
 
@@ -655,7 +677,8 @@ inline void run_compute_capability_conformance(
     const iom::oid probe = queue->copy(x->view(), scratch->view());
     CHECK_EQ(
             token_sequence(probe),
-            (binary_supported ? 4 : 0) + (linear_submitted ? 1 : 0) + 1);
+            (binary_supported ? 4 : 0) + (linear_submitted ? 1 : 0)
+                    + (sdpa_submitted ? 1 : 0) + 1);
     queue->wait(probe);
     queue.reset();
 
@@ -677,7 +700,8 @@ inline void run_backend_conformance(
         AcceleratorStorageOracle* oracle = nullptr,
         bool binary_supported = false,
         std::optional<bool> linear_supported = std::nullopt,
-        const RopeContractConformanceConfig* rope_contract = nullptr) {
+        const RopeContractConformanceConfig* rope_contract = nullptr,
+        std::optional<bool> sdpa_supported = std::nullopt) {
     run_storage_and_transfer_conformance(devices, supported_types, observer);
     run_async_copy_conformance(devices, supported_types, observer, oracle);
     run_copy_error_conformance(devices, supported_types, observer);
@@ -688,7 +712,7 @@ inline void run_backend_conformance(
     run_memory_contract_conformance(devices);
     run_compute_capability_conformance(
             devices.candidate, supported_types, observer, {}, binary_supported,
-            linear_supported);
+            linear_supported, sdpa_supported);
     if (rope_contract != nullptr) {
         run_rope_contract_conformance(*rope_contract);
     }

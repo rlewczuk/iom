@@ -1,6 +1,7 @@
 #include "device_internal.hpp"
 #include "transfer_helpers.hpp"
 
+#include "../iom_internal.hpp"
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -25,49 +26,9 @@
 namespace iom {
 namespace {
 
-// Carrier traits of the shared named-format codecs and stable scalar
-// evaluators. A carrier is the CPU leaf's own evaluation domain, selected per
-// operation exactly as each operation documents; the codec rules themselves
-// stay in `src/shared/scalar_binary_codec.hpp`.
+
 template <typename Carrier>
-struct CpuCarrierTraits {
-    using carrier_type = Carrier;
-
-    static Carrier exp(Carrier value) noexcept {
-        return std::exp(value);
-    }
-
-    static Carrier positive_infinity() noexcept {
-        return std::numeric_limits<Carrier>::infinity();
-    }
-    static Carrier quiet_nan() noexcept {
-        return std::numeric_limits<Carrier>::quiet_NaN();
-    }
-    static Carrier max_finite() noexcept {
-        return std::numeric_limits<Carrier>::max();
-    }
-    static bool isnan(Carrier value) noexcept {
-        return std::isnan(value);
-    }
-    static bool isinf(Carrier value) noexcept {
-        return std::isinf(value);
-    }
-    static bool signbit(Carrier value) noexcept {
-        return std::signbit(value);
-    }
-    static Carrier fabs(Carrier value) noexcept {
-        return std::fabs(value);
-    }
-    static Carrier floor(Carrier value) noexcept {
-        return std::floor(value);
-    }
-    static Carrier ldexp(Carrier value, int exponent) noexcept {
-        return std::ldexp(value, exponent);
-    }
-    static Carrier frexp(Carrier value, int* exponent) noexcept {
-        return std::frexp(value, exponent);
-    }
-};
+using CpuCarrierTraits = cpu_detail::CpuCarrierTraits<Carrier>;
 
 template <typename Carrier>
 using CpuRopeCodec =
@@ -962,6 +923,120 @@ private:
             const RopeRequest&) override {
         return {0, 1};
     }
+    // ------------------------------------------------------------------
+    // SDPA: the common facade has completed all structural, view, device,
+    // dtype, alias, and workspace admission before this hook runs. The CPU
+    // adapter below copies only fixed-size metadata into the worker request;
+    // no borrowed TensorView reaches the FIFO task.
+    static cpu_detail::SdpaView make_cpu_sdpa_view(
+            const SdpaViewSnapshot& view) {
+        cpu_detail::SdpaView result;
+        result.rank = view.rank;
+        for (std::size_t axis = 0; axis < view.rank; ++axis) {
+            result.dimensions[axis] = view.dimensions[axis];
+        }
+        const std::size_t leading = view.rank - 2;
+        for (std::size_t axis = 0; axis < leading; ++axis) {
+            result.plane_strides[axis] = view.plane_strides[axis];
+        }
+        result.plane_offset = view.plane_offset;
+        result.native_handle =
+                static_cast<unsigned char*>(view.native_handle);
+        return result;
+    }
+
+    static cpu_detail::SdpaRequest make_cpu_sdpa_request(
+            const SdpaRequest& request) {
+        return {
+                make_cpu_sdpa_view(request.q),
+                make_cpu_sdpa_view(request.k),
+                make_cpu_sdpa_view(request.v),
+                make_cpu_sdpa_view(request.out),
+                request.a,
+                request.L,
+                request.Hq,
+                request.Hkv,
+                request.R,
+                request.C,
+                request.D,
+                request.grouping,
+                request.output_width,
+                static_cast<unsigned char*>(
+                        detail::WorkspaceValidation::address(
+                                request.workspace))};
+    }
+
+    [[nodiscard]] static std::size_t sdpa_leading_planes(
+            const SdpaRequest& request) {
+        const std::size_t leading_rank = request.q.rank - 3;
+        std::size_t planes = 1;
+        for (std::size_t axis = 0; axis < leading_rank; ++axis) {
+            planes = detail::checked_mul(
+                    planes, request.q.dimensions[axis],
+                    "CPU SDPA leading plane count overflows");
+        }
+        return planes;
+    }
+
+    oid sdpa_impl(const SdpaRequest& request) override {
+        const cpu_detail::SdpaRequest cpu_request =
+                make_cpu_sdpa_request(request);
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_sdpa(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this, cpu_request](
+                        std::uint64_t sequence,
+                        const SdpaRequest& captured,
+                        detail::SdpaEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries,
+                                 cpu_request] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        if (cpu_detail::consume_sdpa_failure()) {
+                                            throw std::runtime_error(
+                                                    "CPU SDPA injected "
+                                                    "post-acceptance failure");
+                                        }
+                                        cpu_detail::sdpa_elements(cpu_request);
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)
+                                            detail::release_or_invalidate_sdpa_entries(
+                                                    device_->registry_state()
+                                                            .registry,
+                                                    entries,
+                                                    static_cast<bool>(failure),
+                                                    true);
+                                    detail::complete_workspace_lease(
+                                            device_->registry_state(),
+                                            captured.workspace_lease, true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        detail::complete_workspace_lease(
+                                device_->registry_state(),
+                                captured.workspace_lease, true);
+                        throw;
+                    }
+                });
+    }
+
+    [[nodiscard]] WorkspaceRequirements
+            sdpa_workspace_requirements_impl(
+                    const SdpaRequest& request) override {
+        return cpu_detail::sdpa_workspace_requirements(
+                sdpa_leading_planes(request), request.Hq, request.R,
+                request.L);
+    }
+
 
 
     // ------------------------------------------------------------------

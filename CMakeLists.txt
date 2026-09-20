@@ -84,6 +84,7 @@ set(IOM_SOURCES
         src/token_selection.cpp
         src/cpu/device.cpp
         src/cpu/tensor.cpp
+        src/cpu/sdpa.cpp
         src/cpu/queue.cpp
         src/mmap.cpp
         src/safetensors.cpp

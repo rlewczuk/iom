@@ -110,16 +110,17 @@ iom::oid submit_temporary_rope(
 
 }  // namespace
 
-// Declared by the CPU port in `src/cpu/queue.cpp`: the SiLU leaf's own one-shot
-// post-acceptance failure latch. `libiom` is compiled without
-// `IOM_ENABLE_TESTING` — only the accelerator libraries receive it — so no
-// accelerator fault hook can reach the CPU port, and this minimal seam is what
-// its driver supplies to the shared `SiluNativeFailureSeam` that every other
-// backend fills with its own hook.
+// Declared by the CPU ports in `src/cpu/queue.cpp` and `src/cpu/sdpa.cpp`:
+// one-shot post-acceptance failure latches consumed inside the enqueued host
+// task. The SDPA seam lets the shared harness verify owner retention,
+// repeated failure observation, and healthy FIFO recovery without changing the
+// production request path.
 namespace iom::cpu_detail {
 
 void arm_silu_failure() noexcept;
 void clear_silu_failure() noexcept;
+void arm_sdpa_failure() noexcept;
+void clear_sdpa_failure() noexcept;
 
 }  // namespace iom::cpu_detail
 
@@ -273,7 +274,7 @@ TEST_CASE("CPU conformance: all binary operations through the real queue") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true, true);
+            &devices.gate, nullptr, true, true, nullptr, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
@@ -327,14 +328,24 @@ TEST_CASE("CPU conformance: binary operations are supported") {
     CpuDevices devices;
     iom_conformance::run_compute_capability_conformance(
             *devices.candidate, devices.candidate->supported_data_types(),
-            &devices.gate, "CPU", true, true);
+            &devices.gate, "CPU", true, true, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: shared SDPA admission and unsupported matrix") {
+TEST_CASE("CPU conformance: SDPA reference, admission, and lifetime") {
     CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
     const iom_conformance::SdpaConformanceConfig config{
-            devices.conformance(), {}, false, &devices.gate};
+            devices.conformance(),
+            iom_conformance::kSdpaCurrentSupportedDataTypes,
+            true,
+            &devices.gate,
+            &oracle,
+            {},
+            {&iom::cpu_detail::arm_sdpa_failure,
+             &iom::cpu_detail::clear_sdpa_failure,
+             "cpu_detail::sdpa",
+             {}}};
     iom_conformance::run_sdpa_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
@@ -355,11 +366,12 @@ TEST_CASE("CPU conformance: embedding lookup reference, admission, and lifetime"
             devices.conformance(), kCpuEmbeddingDeclaration, &devices.gate,
             &oracle);
     CHECK_FALSE(devices.gate.armed());
-    // The declared zero requirement is the whole CPU scratch contract: a
-    // positive CPU raw workspace stays impossible, so no embedding request can
-    // ever be handed positive CPU scratch.
-    CHECK_THROWS_AS(
-            devices.candidate->create_workspace(1), std::invalid_argument);
+    // The zero requirement still belongs to embedding admission, while the
+    // device now exposes positive owners for CPU SDPA as well.
+    const std::unique_ptr<iom::RawWorkspace> workspace =
+            devices.candidate->create_workspace(1);
+    REQUIRE(workspace != nullptr);
+    CHECK_EQ(workspace->byte_size(), 1);
 }
 
 // CPU's declared linear expectation: the complete 21-leaf applicable matrix,
@@ -716,16 +728,15 @@ TEST_CASE("CPU conformance: full shared suite composes every shared case") {
     iom_conformance::run_backend_conformance(
             devices.conformance(),
             devices.candidate->supported_data_types().subspan(0, 1),
-            &devices.gate, nullptr, true, true, &rope_contract);
+            &devices.gate, nullptr, true, true, &rope_contract, true);
     CHECK_FALSE(devices.gate.armed());
 }
 
 // The CPU reference instantiation of the shared model-loading scenario. Each
 // synthetic checkpoint is loaded through the production configuration and
 // mapped-source API, realized on the CPU reference and candidate devices, and
-// read back bit-for-bit against the fixture's independent role bytes. The
-// candidate binding reports `{0, 1}`, so it realizes with the default empty
-// scratch and never calls the CPU's unsupported positive workspace factory.
+// candidate binding reports `{0, 1}` for the model-loading operations, which
+// do not use the positive workspace owner reserved for CPU SDPA.
 TEST_CASE("CPU model loading realizes every published weight role of each synthetic checkpoint") {
     CpuDevices devices;
     iom_conformance::run_model_loading_conformance(devices.conformance());
@@ -979,7 +990,7 @@ TEST_CASE("CPU copy survives derived-view temporaries") {
     CHECK_FALSE(devices.gate.armed());
 }
 
-TEST_CASE("CPU conformance: raw workspace contract accepts only the empty owner") {
+TEST_CASE("CPU conformance: raw workspace contract supports empty and positive owners") {
     CpuDevices devices;
 
     // The empty workspace is valid on every backend and performs no
@@ -1004,15 +1015,23 @@ TEST_CASE("CPU conformance: raw workspace contract accepts only the empty owner"
     devices.gate.case_complete();
     CHECK_FALSE(devices.gate.armed());
 
-    // Positive scratch is unsupported CPU device storage: no dummy
-    // native storage is manufactured.
-    CHECK_THROWS_AS(
-            devices.candidate->create_workspace(1), std::invalid_argument);
-    CHECK_THROWS_AS(
-            devices.candidate->create_workspace(32), std::invalid_argument);
-    CHECK_THROWS_AS(
-            devices.reference->create_workspace(4096),
-            std::invalid_argument);
+    const std::unique_ptr<iom::RawWorkspace> candidate_workspace =
+            devices.candidate->create_workspace(1);
+    REQUIRE(candidate_workspace != nullptr);
+    CHECK_FALSE(candidate_workspace->empty());
+    CHECK_EQ(candidate_workspace->byte_size(), 1);
+    CHECK(&candidate_workspace->device() == devices.candidate.get());
+    const iom::RawWorkspaceView candidate_view = candidate_workspace->view();
+    CHECK(candidate_view.owner_identity() == candidate_workspace.get());
+    CHECK(&candidate_view.device() == devices.candidate.get());
+    CHECK_EQ(candidate_view.byte_size(), 1);
+
+    const std::unique_ptr<iom::RawWorkspace> reference_workspace =
+            devices.reference->create_workspace(4096);
+    REQUIRE(reference_workspace != nullptr);
+    CHECK_EQ(reference_workspace->byte_size(), 4096);
+    CHECK(
+            &reference_workspace->device() == devices.reference.get());
 }
 
 TEST_CASE("CPU conformance: workspace requirement queries report exact zero") {

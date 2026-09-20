@@ -414,9 +414,10 @@ must record that fact rather than adding an example.
 
 ### 9. Other compute capabilities
 
-`silu` is implemented on CPU, CUDA, ROCm, and SYCL; `sdpa` remains
-unsupported and returns negative `Unsupported` before submission, mutation, or
-token acceptance. The `linear` hooks are owned by [Linear projections](#linear-projections):
+`silu` is implemented on CPU, CUDA, ROCm, and SYCL; CPU `sdpa` now
+supports the BF16 leaf through its scalar FIFO port, while non-BF16 CPU
+leaves and accelerator SDPA ports remain explicitly unsupported until their
+operation-owned implementations land. The `linear` hooks are owned by
 CPU, CUDA, ROCm, and SYCL implement all twenty-one applicable leaves — the
 twenty non-BF16 leaves on the shared scalar projection path plus `BF16` on the
 scalar recurrence on CPU and on a separate native specialization on CUDA, ROCm,
@@ -1289,9 +1290,10 @@ waits, and the exact `1/15/16/17` offsets and row-length cases.
 
 This subsection freezes the planned TinyLlama caller boundary for the
 operation-owned [Scaled dot-product attention](#scaled-dot-product-attention)
-section. It does not add declarations or implementation. The current `sdpa`
-facade remains `Unsupported` before submission, output mutation, or token
-acceptance until that operation is implemented.
+section. It does not add declarations or implementation. The CPU port now
+accepts BF16 through this facade; the other CPU leaves and accelerator ports
+remain `Unsupported` before submission, output mutation, or token acceptance
+until their operation-owned implementations land.
 
 The clean-cutover target has exactly the following submission and pure
 workspace-query signatures:
@@ -1436,7 +1438,8 @@ decoder-layer assembly and verification.
 #### TinyLlama forward layout — Workspace and execution
 
 This subsection records the shared facade boundary. The common layer now
-declares embedding, linear, RMSNorm, RoPE, and SiLU; cache append and SDPA
+declares embedding, linear, RMSNorm, RoPE, and SiLU; cache append remains
+planned, while the CPU BF16 SDPA leaf has landed and accelerator SDPA ports
 remain planned until their own leaves land. The target `DeviceOps` facades
 return `oid`, are `noexcept`, and have exactly these signatures:
 
@@ -2060,9 +2063,9 @@ queries:
 | ROCm | The conservative assessed linear range contains checked aligned `x_pack` and `y_pack`. Its SDPA range contains `q_pack`, sequentially reused per-`Hkv` K/V pack, FP32 scores, BF16 probabilities, BF16 PV, and merged staging. |
 | SYCL | The assessed linear range contains checked FP32 product staging. Its conservative SDPA range contains FP32 scores, BF16 probabilities, FP32 PV, and BF16 head staging, with reuse only after the producing stage completes. |
 Standard CUDA/ROCm/SYCL tensor data and raw workspace subranges retain the
-existing 32-byte arena guarantees. CPU continues to reject positive
-`create_workspace` requests; a backend that needs positive scratch names its
-own queried requirement instead of inheriting a missing factory gap.
+existing 32-byte arena guarantees. CPU now provides the positive aligned
+caller-owned workspace required by BF16 SDPA; its other zero-workspace
+operations retain their `{0, 1}` requirement.
 Unknown capability-dependent requirements are recorded as missing evidence,
 not filled with a speculative constant.
 

@@ -6330,8 +6330,8 @@ TEST_CASE("CPU linear projections execute on the real queue with fixed result ca
           == iom::WorkspaceRequirements{0, 1});
 
     // The recorded zero requirement admits only the empty default view: a
-    // supplied owner is invalid input, and the CPU device still refuses to
-    // create positive raw workspace at all.
+    // supplied owner is invalid input, while the CPU device now exposes
+    // positive owners for BF16 SDPA.
     const std::unique_ptr<iom::RawWorkspace> empty_workspace =
             device->create_workspace(0);
     CHECK_EQ(
@@ -6339,7 +6339,14 @@ TEST_CASE("CPU linear projections execute on the real queue with fixed result ca
                     x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8,
                     empty_workspace->view()),
             invalid);
-    CHECK_THROWS_AS(device->create_workspace(1), std::invalid_argument);
+    const std::unique_ptr<iom::RawWorkspace> positive_workspace =
+            device->create_workspace(1);
+    REQUIRE(positive_workspace != nullptr);
+    CHECK_EQ(
+            queue->linear(
+                    x->view(), w->view(), out->view(), 0, 4, kOrdinary, 1, 8,
+                    positive_workspace->view()),
+            invalid);
 
     // A deterministic input pattern and an identity weight: the projection of
     // the selected rows reproduces exactly those input rows, in both layouts.

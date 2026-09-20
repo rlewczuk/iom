@@ -66,8 +66,9 @@ struct SdpaObservationHooks {
 struct SdpaConformanceConfig {
     ConformanceDevices devices;
     // A driver's own immutable statement of the leaves its SDPA port queues.
-    // The current contract permits BF16 only; all four current drivers pass an
-    // empty span and set `support_enabled` false.
+    // The current contract permits BF16 only; the CPU driver declares BF16
+    // support, while accelerator drivers may keep an empty span until their
+    // own ports land.
     std::span<const iom::DataType> supported_leaves;
     bool support_enabled = false;
     ConformanceObserver* observer = nullptr;
@@ -378,7 +379,6 @@ inline std::vector<std::byte> run_reference_case(
     copy_from_host(operands.out->view(), out_before);
 
     auto queue = config.devices.candidate.create_ops();
-    CaseWindow window(config.observer);
     const iom::WorkspaceRequirements first =
             queue->sdpa_workspace_requirements(
                     operands.q->view(), operands.k->view(), operands.v->view(),
@@ -395,6 +395,7 @@ inline std::vector<std::byte> run_reference_case(
     } else {
         CHECK_EQ(first.alignment, std::size_t{1});
     }
+    CaseWindow window(config.observer);
     const iom::oid token = workspace
             ? queue->sdpa(
                       operands.q->view(), operands.k->view(), operands.v->view(),
@@ -413,6 +414,89 @@ inline std::vector<std::byte> run_reference_case(
     check_reference_output(item.data_type, observed, expected, label);
     return observed;
 }
+// Exercise independently transformed leading planes and K/V head strides.
+// The K owner selects every other head plane while the V owner selects a
+// contiguous head window, then both views are permuted over their leading
+// dimensions. This keeps the logical fixture unchanged while ensuring the
+// worker must honor each captured view's own plane strides.
+inline void run_transformed_reference_case(
+        const SdpaConformanceConfig& config) {
+    const SdpaReferenceCase item =
+            sdpa_oracle::make_mixed_gqa_case(iom::DataType::BF16);
+    const std::vector<SdpaReferenceValue> expected = evaluate(item);
+    const iom::TensorSpec q_owner_spec = q_spec(item, item.data_type);
+    const iom::TensorSpec out_owner_spec = out_spec(item, item.data_type);
+    std::vector<std::size_t> expanded_dimensions = item.leading_dimensions;
+    expanded_dimensions.push_back(item.hkv * 2);
+    expanded_dimensions.push_back(item.capacity);
+    expanded_dimensions.push_back(item.head_dim);
+    const iom::TensorSpec expanded_kv_spec{
+            iom::TensorShape{std::move(expanded_dimensions)},
+            item.data_type};
+    auto q_owner = config.devices.candidate.create_tensor(q_owner_spec);
+    auto k_owner = config.devices.candidate.create_tensor(expanded_kv_spec);
+    auto v_owner = config.devices.candidate.create_tensor(expanded_kv_spec);
+    auto out_owner = config.devices.candidate.create_tensor(out_owner_spec);
+
+    const std::size_t head_axis = item.leading_dimensions.size();
+    const std::array<std::size_t, 3> qkv_order{1, 0, 2};
+    const std::array<std::size_t, 2> out_order{1, 0};
+    iom::TensorView k_slice =
+            k_owner->view().slice(head_axis, 0, item.hkv, 2);
+    iom::TensorView v_slice =
+            v_owner->view().slice(head_axis, 0, item.hkv, 1);
+    iom::TensorView q_view = q_owner->view().permute(
+            std::span<const std::size_t>(qkv_order));
+    iom::TensorView k_view = k_slice.permute(
+            std::span<const std::size_t>(qkv_order));
+    iom::TensorView v_view = v_slice.permute(
+            std::span<const std::size_t>(qkv_order));
+    iom::TensorView out_view = out_owner->view().permute(
+            std::span<const std::size_t>(out_order));
+
+    seed_logical(
+            config, q_view, q_owner_spec,
+            logical_case_bytes(item.data_type, item.q_bits));
+    seed_logical(
+            config, k_view, expanded_kv_spec,
+            logical_case_bytes(item.data_type, item.k_bits));
+    seed_logical(
+            config, v_view, expanded_kv_spec,
+            logical_case_bytes(item.data_type, item.v_bits));
+    copy_from_host(
+            out_view, case_output_bytes(out_owner_spec, std::byte{0xA5}));
+
+    auto queue = config.devices.candidate.create_ops();
+    const iom::WorkspaceRequirements requirements =
+            queue->sdpa_workspace_requirements(
+                    q_view, k_view, v_view, out_view, item.position,
+                    item.length);
+    CHECK_EQ(
+            requirements,
+            queue->sdpa_workspace_requirements(
+                    q_view, k_view, v_view, out_view, item.position,
+                    item.length));
+    auto workspace = config.devices.candidate.create_workspace(
+            requirements.bytes);
+    REQUIRE(workspace != nullptr);
+    CaseWindow window(config.observer);
+    const iom::oid token = queue->sdpa(
+            q_view, k_view, v_view, out_view, item.position, item.length,
+            workspace->view());
+    REQUIRE_MESSAGE(
+            iom::oid_is_token(token),
+            "transformed SDPA fixture did not accept");
+    CHECK_NOTHROW(queue->wait(token));
+    CHECK_NOTHROW(queue->wait(token));
+    window.complete();
+
+    const std::vector<std::byte> observed =
+            observe_logical(config, out_view, out_owner_spec);
+    check_reference_output(
+            item.data_type, observed, expected,
+            "transformed K/V head strides and leading permutation");
+}
+
 
 inline void run_supported_numeric_matrix(
         const SdpaConformanceConfig& config) {
@@ -468,6 +552,9 @@ inline void run_supported_numeric_matrix(
                         one.data(), index * bits, bits);
                 CHECK_EQ(actual, expected);
             }
+        }
+        if (type == iom::DataType::BF16) {
+            run_transformed_reference_case(config);
         }
     }
 }
