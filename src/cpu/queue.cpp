@@ -2,6 +2,7 @@
 #include "transfer_helpers.hpp"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -19,13 +20,22 @@
 
 #include "iom/iom.hpp"
 #include "../shared/scalar_add.hpp"
+#include "../shared/scalar_silu.hpp"
 
 namespace iom {
 namespace {
 
+// Carrier traits of the shared named-format codecs and stable scalar
+// evaluators. A carrier is the CPU leaf's own evaluation domain, selected per
+// operation exactly as each operation documents; the codec rules themselves
+// stay in `src/shared/scalar_binary_codec.hpp`.
 template <typename Carrier>
-struct CpuRopeCodecTraits {
+struct CpuCarrierTraits {
     using carrier_type = Carrier;
+
+    static Carrier exp(Carrier value) noexcept {
+        return std::exp(value);
+    }
 
     static Carrier positive_infinity() noexcept {
         return std::numeric_limits<Carrier>::infinity();
@@ -61,9 +71,39 @@ struct CpuRopeCodecTraits {
 
 template <typename Carrier>
 using CpuRopeCodec =
-        detail::scalar_binary_codec_detail::Codec<CpuRopeCodecTraits<Carrier>>;
+        detail::scalar_binary_codec_detail::Codec<CpuCarrierTraits<Carrier>>;
 
 }  // namespace
+
+namespace cpu_detail {
+
+namespace {
+
+std::atomic<bool> silu_failure_armed{false};
+
+}  // namespace
+
+// CPU-local failure construction for the SiLU port. `libiom` is compiled
+// without `IOM_ENABLE_TESTING` — only the accelerator libraries receive it —
+// so no accelerator fault hook can reach this translation unit and the CPU
+// SiLU driver owns this minimal seam instead. It is one process-wide one-shot
+// latch: the next enqueued SiLU task consumes it after acceptance and before
+// its element loop, so exactly that accepted sequence retains the failure while
+// every later submission stays healthy. It carries no other state and is inert
+// until a test arms it.
+void arm_silu_failure() noexcept {
+    silu_failure_armed.store(true, std::memory_order_release);
+}
+
+void clear_silu_failure() noexcept {
+    silu_failure_armed.store(false, std::memory_order_release);
+}
+
+[[nodiscard]] bool consume_silu_failure() noexcept {
+    return silu_failure_armed.exchange(false, std::memory_order_acq_rel);
+}
+
+}  // namespace cpu_detail
 
 
 class CpuQueue final : public DeviceOps {
@@ -920,6 +960,120 @@ private:
 
     [[nodiscard]] WorkspaceRequirements rope_workspace_requirements(
             const RopeRequest&) override {
+        return {0, 1};
+    }
+
+
+    // ------------------------------------------------------------------
+    // SiLU: an asynchronous, in-order scalar activation over caller-owned tiled
+    // storage. Nothing below allocates: the admitted request was already
+    // captured by value, every element is addressed through the shared checked
+    // layout helpers, and `src/shared/scalar_silu.hpp` is the only evaluator —
+    // it decodes the named destination format, evaluates the stable expression,
+    // and encodes each logical element exactly once with destination RNE. Only
+    // the selected logical element of a plane is read and only its own output
+    // element is written, so no padding, other plane, or other run
+    // contributes.
+
+    // Every independent leading plane of `x` and `y`, through its own selected
+    // plane offset and own transformed leading strides. The carrier is the CPU
+    // leaf's established evaluation split: FP32 through every leaf below F64,
+    // and FP64 for F64 itself, exactly as the RMSNorm, RoPE, and linear paths
+    // select it.
+    template <typename Carrier>
+    static void silu_elements(const SiLURequest& request) {
+        const std::span<const std::size_t> dimensions =
+                request.x.shape_dimensions();
+        const std::size_t rank = dimensions.size();
+        const std::size_t runs = dimensions[rank - 2];
+        const std::size_t features = dimensions[rank - 1];
+        const DataType data_type = request.x.data_type;
+        const auto* x_base =
+                static_cast<const unsigned char*>(request.x.native_handle);
+        auto* y_base =
+                static_cast<unsigned char*>(request.y.native_handle);
+        const std::span<const std::size_t> x_strides =
+                request.x.leading_plane_strides();
+        const std::span<const std::size_t> y_strides =
+                request.y.leading_plane_strides();
+        auto visit = [&](auto&& self, std::size_t axis, std::size_t x_plane,
+                         std::size_t y_plane) -> void {
+            if (axis + 2 == rank) {
+                for (std::size_t run = 0; run < runs; ++run) {
+                    for (std::size_t feature = 0; feature < features;
+                         ++feature) {
+                        const std::uint64_t raw =
+                                cpu_detail::load_logical_element(
+                                        x_base, dimensions, data_type, x_plane,
+                                        run, feature);
+                        cpu_detail::store_logical_element(
+                                y_base, dimensions, data_type, y_plane, run,
+                                feature,
+                                detail::scalar_silu_detail::scalar_silu<
+                                        CpuCarrierTraits<Carrier>>(
+                                        data_type, raw));
+                    }
+                }
+                return;
+            }
+            for (std::size_t index = 0; index < dimensions[axis]; ++index) {
+                self(self, axis + 1, x_plane + index * x_strides[axis],
+                     y_plane + index * y_strides[axis]);
+            }
+        };
+        visit(visit, 0, request.x.plane_offset, request.y.plane_offset);
+    }
+
+    // The value-captured request keeps every distinct owner registered until
+    // this sequence's completion is proven, so temporary views and a released
+    // owner stay safe; the kernel itself runs only on the existing FIFO worker,
+    // never on the caller thread. SiLU consumes no raw workspace, so no lease
+    // is acquired, and a failed completion invalidates its owners through the
+    // shared retainer rather than promising any rollback.
+    oid silu_impl(const SiLURequest& request) override {
+        std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
+        detail::Fence fence;
+        fence.invoke = &fence_pending;
+        return submit_silu(
+                request, device_->registry_state(), registry_queue_id_, fence,
+                [this](std::uint64_t sequence, const SiLURequest& captured,
+                       detail::BinaryEntryRegistration entries) {
+                    try {
+                        enqueue(HostTask{
+                                [this, sequence, captured, entries] {
+                                    std::exception_ptr failure;
+                                    try {
+                                        if (cpu_detail::consume_silu_failure()) {
+                                            throw std::runtime_error(
+                                                    "CPU SiLU injected "
+                                                    "post-acceptance failure");
+                                        }
+                                        if (captured.x.data_type
+                                                == DataType::F64) {
+                                            silu_elements<double>(captured);
+                                        } else {
+                                            silu_elements<float>(captured);
+                                        }
+                                    } catch (...) {
+                                        failure = std::current_exception();
+                                    }
+                                    (void)detail::release_or_invalidate_binary_entries(
+                                            device_->registry_state().registry,
+                                            entries,
+                                            static_cast<bool>(failure), true);
+                                    complete(sequence, std::move(failure));
+                                }});
+                    } catch (...) {
+                        device_->registry_state().registry.remove_entries(
+                                std::span<const detail::EntryId>(
+                                        entries.entries.data(), entries.count));
+                        throw;
+                    }
+                });
+    }
+
+    [[nodiscard]] WorkspaceRequirements silu_workspace_requirements_impl(
+            const SiLURequest&) override {
         return {0, 1};
     }
 

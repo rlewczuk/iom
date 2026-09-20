@@ -110,6 +110,19 @@ iom::oid submit_temporary_rope(
 
 }  // namespace
 
+// Declared by the CPU port in `src/cpu/queue.cpp`: the SiLU leaf's own one-shot
+// post-acceptance failure latch. `libiom` is compiled without
+// `IOM_ENABLE_TESTING` — only the accelerator libraries receive it — so no
+// accelerator fault hook can reach the CPU port, and this minimal seam is what
+// its driver supplies to the shared `SiluNativeFailureSeam` that every other
+// backend fills with its own hook.
+namespace iom::cpu_detail {
+
+void arm_silu_failure() noexcept;
+void clear_silu_failure() noexcept;
+
+}  // namespace iom::cpu_detail
+
 void require_storage_outside_view_is_zero(
         const iom::TensorSpec& owner_spec, const iom::TensorView& view) {
     std::vector<unsigned char> touched(
@@ -461,25 +474,131 @@ TEST_CASE("CPU conformance: RMSNorm reference, admission, and lifetime") {
     iom_conformance::run_rmsnorm_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
-// The SiLU leaf is intentionally rejection-only in this leaf: the CPU
-// implementation port changes the explicit driver span in its follow-on
-// task. The shared suite already owns the complete oracle and admission
-// matrix, so this test proves every unported leaf remains side-effect free.
+// CPU's declared SiLU expectation: the nine applicable signed floating leaves,
+// the frozen `{0, 1}` zero-workspace requirement, and positive execution through
+// the real in-order CPU queue, observed by the shared independent oracle over
+// rank-2..8 geometry, transformed views, non-tile dimensions, poisoned tile
+// padding, the rejection matrix, queue ordering, and the CPU port's own
+// post-acceptance failure latch.
 TEST_CASE("CPU conformance: SiLU reference, admission, and lifetime") {
     CpuDevices devices;
     iom_conformance::CpuStorageOracle oracle;
     iom_conformance::SiluConformanceConfig config{
             devices.conformance(),
-            iom_conformance::kNoSiluSpan,
+            iom_conformance::kSiluCpuExpectedSupported,
             &devices.gate,
             &oracle,
             iom_conformance::SiluNativeFailureSeam{
-                    {},
-                    {},
+                    &iom::cpu_detail::arm_silu_failure,
+                    &iom::cpu_detail::clear_silu_failure,
                     "cpu_detail::silu",
-                    "the CPU SiLU port is not present in this leaf; "
-                    "no accepted worker failure seam exists"}};
+                    {}}};
     iom_conformance::run_silu_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+// The shared native-failure scenario observes only the consumed sequence and the
+// healthy recovery, so this CPU case owns the remaining accepted-failure
+// evidence through the real queue: one submission whose operand owner is
+// released before any wait, in-order FIFO completion of a dependent copy, one
+// retained failure reported identically on every repeated wait with the OID
+// still positive, and a conforming submission on the same queue and owners
+// afterwards.
+TEST_CASE("CPU SiLU retains owners and repeats accepted failures") {
+    CpuDevices devices;
+    constexpr iom::DataType type = iom::DataType::F32;
+    const iom_conformance::SiluReferenceCase fixture =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::boundary_sizes,
+                    type, {2}, 2, 17, "cpu-silu-queue-order/F32");
+    const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+    const std::vector<std::byte> input_bytes =
+            iom_conformance::silu_pack_bits(type, fixture.input_bits);
+    const std::vector<iom_conformance::SiluReferenceValue> expected =
+            iom_conformance::silu_evaluate(fixture);
+    auto input = devices.candidate->create_tensor(spec);
+    auto activated = devices.candidate->create_tensor(spec);
+    auto consumed = devices.candidate->create_tensor(spec);
+    iom_conformance::copy_from_host(input->view(), input_bytes);
+    iom_conformance::copy_from_host(
+            activated->view(),
+            std::vector<std::byte>(
+                    spec.logical_nbytes(),
+                    iom_conformance::kReadbackSentinel));
+    iom_conformance::copy_from_host(
+            consumed->view(),
+            std::vector<std::byte>(
+                    spec.logical_nbytes(),
+                    iom_conformance::kReadbackSentinel));
+    auto queue = devices.candidate->create_ops();
+    iom::oid activation = 0;
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        activation = queue->silu(input->view(), activated->view());
+        REQUIRE(iom::oid_is_token(activation));
+        // The value-captured submission must retain this owner: the caller
+        // releases it here, before either wait, and the dependent copy still
+        // observes the activated data.
+        input.reset();
+        iom::TensorView consumed_view = consumed->view();
+        const iom::oid consumer =
+                queue->copy(activated->view(), consumed_view);
+        REQUIRE(iom::oid_is_token(consumer));
+        CHECK_EQ(
+                iom_conformance::token_sequence(consumer),
+                iom_conformance::token_sequence(activation) + 1);
+        CHECK_NOTHROW(queue->wait(consumer));
+        CHECK_NOTHROW(queue->wait(activation));
+        CHECK_NOTHROW(queue->wait(consumer));
+    }
+    const std::vector<std::byte> activated_bytes =
+            iom_conformance::read_logical(activated->view());
+    const std::string retained_mismatch = iom_conformance::silu_compare(
+            type, activated_bytes, expected, "cpu-silu retained owner");
+    CHECK_MESSAGE(retained_mismatch.empty(), retained_mismatch);
+    CHECK(iom_conformance::read_logical(consumed->view()) == activated_bytes);
+
+    const auto failure_text = [&](iom::oid token) {
+        std::string observed = "<an accepted SiLU failure reported no error>";
+        try {
+            queue->wait(token);
+        } catch (const std::runtime_error& error) {
+            observed = error.what();
+        } catch (const std::exception& error) {
+            observed = std::string("unexpected failure category: ")
+                    + error.what();
+        }
+        return observed;
+    };
+    iom::cpu_detail::arm_silu_failure();
+    auto failure_input = devices.candidate->create_tensor(spec);
+    iom_conformance::copy_from_host(failure_input->view(), input_bytes);
+    const iom::oid failed =
+            queue->silu(failure_input->view(), activated->view());
+    REQUIRE(iom::oid_is_token(failed));
+    CHECK_EQ(
+            iom_conformance::token_sequence(failed),
+            iom_conformance::token_sequence(activation) + 2);
+    // The positive OID keeps its retained runtime-error context on every wait.
+    const std::string first = failure_text(failed);
+    const std::string second = failure_text(failed);
+    CHECK_EQ(first, std::string("CPU SiLU injected post-acceptance failure"));
+    CHECK_EQ(second, first);
+    CHECK(iom::oid_is_token(failed));
+    // The latch is consumed by exactly one SiLU task, so the same queue and the
+    // same owners produce a conforming result again.
+    const iom::oid recovered =
+            queue->silu(failure_input->view(), activated->view());
+    REQUIRE(iom::oid_is_token(recovered));
+    CHECK_EQ(
+            iom_conformance::token_sequence(recovered),
+            iom_conformance::token_sequence(failed) + 1);
+    CHECK_NOTHROW(queue->wait(recovered));
+    CHECK_NOTHROW(queue->wait(recovered));
+    const std::string recovery_mismatch = iom_conformance::silu_compare(
+            type, iom_conformance::read_logical(activated->view()), expected,
+            "cpu-silu recovered submission");
+    CHECK_MESSAGE(recovery_mismatch.empty(), recovery_mismatch);
+    iom::cpu_detail::clear_silu_failure();
     CHECK_FALSE(devices.gate.armed());
 }
 // The CPU port covers the complete nine-leaf RoPE span. The runner owns the

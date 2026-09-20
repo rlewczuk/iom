@@ -1348,7 +1348,7 @@ TEST_CASE("CPU copies move logical planes without touching padding") {
 }
 
 // ---------------------------------------------------------------------------
-// CPU supports all four binary operations and the layout-aware linear
+// CPU supports all four binary operations, SiLU, and the layout-aware linear
 // projection while retaining Unsupported for unrelated compute hooks.
 // ---------------------------------------------------------------------------
 TEST_CASE("CPU supports binary and linear operations and rejects other compute capabilities") {
@@ -1388,9 +1388,24 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
     queue->wait(sub_token);
     queue->wait(div_token);
 
+    // SiLU is implemented by the CPU port as well: the frozen query reports the
+    // zero requirement without consuming a sequence, and the accepted request
+    // executes on the existing FIFO worker. Every logical element of `x` is
+    // negative infinity, whose contract result is the negative zero of the
+    // destination leaf, so the accepted request also pins the consumer-visible
+    // result while every padding byte of `y` stays the caller's sentinel.
     CHECK_EQ(
-            queue->silu(x->view(), y->view()),
-            iom::to_oid(iom::OidError::Unsupported));
+            queue->silu_workspace_requirements(x->view(), y->view()),
+            (iom::WorkspaceRequirements{0, 1}));
+    x->view().copy_from_host(
+            uniform_logical(iom::DataType::F32, 16 * 16, 0xFF800000u));
+    const iom::oid silu_token = queue->silu(x->view(), y->view());
+    REQUIRE(iom::oid_is_token(silu_token));
+    CHECK_NOTHROW(queue->wait(silu_token));
+    CHECK_NOTHROW(queue->wait(silu_token));
+    expect_storage_matches(
+            *y,
+            expected_uniform_rmsnorm_storage(y->view(), spec, 0x80000000u));
 
     // Linear is implemented by the CPU port: the accepted request executes on
     // the existing FIFO worker without any allocator traffic, and a following
@@ -1490,11 +1505,12 @@ TEST_CASE("CPU supports binary and linear operations and rejects other compute c
     expect_storage_matches(*integer_out, integer_out_untouched);
 
 
-    // The four accepted binary operations consume the first four sequences,
-    // the accepted linear projection and its consumer the fifth and sixth, and
-    // the accepted RMSNorm the seventh, so the probe copy is the eighth.
+    // The four accepted binary operations consume the first four sequences, the
+    // accepted SiLU the fifth, the accepted linear projection and its consumer
+    // the sixth and seventh, and the accepted RMSNorm the eighth, so the probe
+    // copy is the ninth.
     const iom::oid probe = queue->copy(x->view(), y->view());
-    CHECK_EQ(token_sequence(probe), 8);
+    CHECK_EQ(token_sequence(probe), 9);
     queue->wait(probe);
 }
 
