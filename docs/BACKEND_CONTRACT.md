@@ -1794,12 +1794,77 @@ scratch may contain partial private work after a failure, but logits, history,
 KV contents, owner identities, committed-token count, and initialized cache
 length remain unmodified by selection.
 
-This public seam adds no concrete greedy selector, selector source, permanent
-test target, session implementation, transfer strategy, allocation, facade,
-kernel, or current-support claim. Existing neural hooks remain `Unsupported`
-until their real operation ports land; the concrete selector sibling owns the
-deterministic implementation, oracle, and any exact reusable scratch
-requirements.
+The landed concrete implementation is `iom::GreedyTokenSelector final`
+([`include/iom/token_selection.hpp`](../include/iom/token_selection.hpp),
+[`src/token_selection.cpp`](../src/token_selection.cpp)). It declares and
+defines both overrides together, is stateless between calls, allocates nothing
+on the call path, and retains no view, span, queue, owner, or scratch reference
+after return. Its requirements query returns the checked logical byte count
+`host_bytes = 2 * V` with no host alignment requirement and delegates `device`
+exactly to `copy_to_host_workspace_requirements()`: the CPU owner reports zero
+workspace `{0, 1}`, while the standard accelerator owners report a
+32-byte-aligned `compute_staging_size(2 * V)` staging range that must be the
+queue device's exact-device, live, sufficiently sized, nonoverlapping
+caller-owned storage. `select` validates every host-checkable fact before any
+queue effect — unquantized BF16 `[1,V]`, nonzero extent exactly equal to `V`,
+queue and owner device identity, positive same-queue producing OID, history
+span, host-scratch capacity and logits nonoverlap, device-scratch admission,
+and checked byte arithmetic — then successfully waits `producer`, copies
+exactly the logical `2 * V` BF16 bytes through the existing
+`TensorView::copy_to_host` path, and scans IDs in ascending order with a
+strict `>` update so equal values, signed zero included, keep the lowest ID.
+Invalid input is `std::invalid_argument`, checked byte arithmetic overflow is
+`std::overflow_error`, a nonfinite logical logit is `std::runtime_error`, and
+producer wait or transfer failures propagate unchanged. The full-logical-extent
+host transfer and its O(V) host traffic are this policy's own strategy and
+known cost, not a requirement of the abstract seam; no backend-specific
+selector kernel, reduction, switch, hidden allocation, or fallback exists.
+
+**Same-revision retained-backend evidence.** All four retained backends execute
+the one shared dispatcher in
+[`test/backend/backend_conformance_token_selection.hpp`](../test/backend/backend_conformance_token_selection.hpp)
+through their existing conformance targets, linked from
+[`test/cpu/test_cpu_conformance.cpp`](../test/cpu/test_cpu_conformance.cpp),
+[`test/cuda/test_cuda_conformance.cpp`](../test/cuda/test_cuda_conformance.cpp),
+[`test/rocm/test_rocm_conformance.cpp`](../test/rocm/test_rocm_conformance.cpp),
+and [`test/sycl/test_sycl_conformance.cpp`](../test/sycl/test_sycl_conformance.cpp).
+The shared case set covers `V = 1` and practical `V = 32000` extents, poisoned
+physical padding with native observation, unique interior/last/first maxima,
+all-negative logits, signed-zero and equal-maxima lowest-ID ties, finite
+subnormal and extreme leaves, NaN/`+inf`/`-inf` in a losing position, pure and
+repeatable requirements, producer readiness, retained producer failure, the
+complete invalid/range/identity/scratch rejection matrix, no queue or
+input/history/owner mutation, and each backend's native transfer failure where
+one exists. The gate ran from the prepared closure worktree on branch
+`run-task/006-tinyllama--10-greedy-token-selection--10-five-backend-selection-gate`,
+which is based at revision `2ef3dc950ba16ed23a2c8acdff58dc3faf5c8eb0`; the only
+source change in this revision is the explicit unavailable-seam record added to
+the shared harness. Every accelerator command used its configured remote
+profile with a fresh sync immediately before execution, a bounded `flock -w`
+GPU lock, and remote-side `timeout --kill-after=30s`; the transcripts are
+retained in the task evidence
+`.cswd/tasks/006-tinyllama/10-greedy-token-selection/10-five-backend-selection-gate/remote.log`,
+and all three remote mirrors were removed after the run.
+
+| Backend and runtime identity | Executed gate evidence |
+| --- | --- |
+| CPU: local `x86_64`, AMD Ryzen AI 9 HX 370 w/ Radeon 890M | `cmake --build build --target iom_tests iom_cpu_tests iom_backend_conformance_cpu_tests -j8`; three anchored `ctest --test-dir build --output-on-failure --timeout 300 -R '^<target>$'` runs — `iom_tests` 1/1 (9.95 s), `iom_cpu_tests` 1/1 (0.15 s, the target hosting the `DeviceOps` queue-device identity fixture), `iom_backend_conformance_cpu_tests` 1/1 (83.51 s); `./build/test/iom_backend_conformance_cpu_tests --test-case='CPU conformance: greedy token selection shared matrix and lifetime'` — 1 case, 64859/64859 assertions passed. |
+| CUDA profile `bv1`: NVIDIA GeForce RTX 5090, driver `595.71.05`, CUDA `13.2`, `nvcc` `V13.2.78`, mirror `greedy-selection-10-cuda` | `cmake --build build --target iom_cuda_conformance_tests`; `./build/test/iom_cuda_conformance_tests --test-case='CUDA conformance: greedy token selection shared matrix and lifetime'` — 1 case, 64942/64942 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_cuda_conformance_tests$'` — 1/1 passed (78.42 s). The driver's counted native submission fault is consumed by the real staged logical transfer. |
+| ROCm profile `bv2`: AMD Radeon AI PRO R9700 (`gfx1036` also enumerated), HIP `7.15.26333`, mirror `greedy-selection-10-rocm` | `cmake --build build --target iom_rocm_conformance_tests`; `./build/test/iom_rocm_conformance_tests --test-case='ROCm conformance: greedy token selection shared matrix and lifetime'` — 1 case, 64942/64942 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_rocm_conformance_tests$'` — 1/1 passed (95.47 s). The driver's counted native submission fault is consumed by the real staged logical transfer. |
+| SYCL profile `bv2`: two Intel Arc Pro B60 Level Zero GPUs (`sycl-ls` enumerates `[level_zero:gpu][level_zero:0]` first), oneAPI/`icpx` `2026.1.0`, mirror `greedy-selection-10-sycl` | `cmake --build build --target iom_sycl_conformance_tests`; `./build/test/iom_sycl_conformance_tests --test-case='SYCL conformance: greedy token selection shared matrix and lifetime'` — 1 case, 64811/64811 assertions passed; `ctest --test-dir build --output-on-failure --timeout 300 -R '^iom_sycl_conformance_tests$'` — 1/1 passed (21.71 s). |
+
+The CPU and SYCL transfer paths expose no accepted post-readiness
+transfer-failure seam, so their shared case prints a
+`token-selection-native-failure-record ... coverage=unavailable` line with the
+exact reason instead of passing silently; CUDA and ROCm exercise the real
+transfer failure listed above. That record is a stated coverage limitation of
+those two test seams, not a selection-result or support regression.
+
+This section still adds no session implementation, facade, or kernel, and it
+claims no backend support beyond the four executed conformance targets above.
+Session integration, EOS/limit policy, and KV mutation remain owned by their
+later session siblings, and existing neural hooks remain `Unsupported` until
+their real operation ports land.
 #### TinyLlama forward layout — Session sizing and lifetime
 
 This subsection is the normative bounded-storage plan for the planned

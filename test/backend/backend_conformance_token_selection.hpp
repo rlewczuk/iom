@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -743,9 +744,24 @@ inline void run_native_failure_conformance(
         const TokenSelectionConformanceConfig& config,
         iom::GreedyTokenSelector& selector) {
     if (!config.native_failure.available()) {
-        CHECK_MESSAGE(
+        // A backend whose testing seams cannot reach its configured transfer
+        // path is a recorded coverage gap, never a silent pass: the driver
+        // must state why, and the gap is printed with the exact missing seam.
+        REQUIRE_MESSAGE(
+                !config.native_failure.name.empty(),
+                "an unavailable selector failure seam needs a stable adapter "
+                "name");
+        REQUIRE_MESSAGE(
                 !config.native_failure.unavailable_reason.empty(),
                 "an unavailable selector failure seam needs an explicit reason");
+        std::printf(
+                "token-selection-native-failure-record seam=%.*s "
+                "coverage=unavailable reason=%.*s\n",
+                static_cast<int>(config.native_failure.name.size()),
+                config.native_failure.name.data(),
+                static_cast<int>(
+                        config.native_failure.unavailable_reason.size()),
+                config.native_failure.unavailable_reason.data());
         return;
     }
     CHECK_MESSAGE(
