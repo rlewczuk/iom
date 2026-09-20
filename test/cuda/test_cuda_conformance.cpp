@@ -24,6 +24,7 @@
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_rope.hpp"
+#include "backend/backend_conformance_silu.hpp"
 #include "backend/backend_conformance_rope_contract.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
@@ -1108,6 +1109,24 @@ TEST_CASE("CUDA conformance: RMSNorm reference, admission, and lifetime") {
             "cuda_detail::SubmissionFault::event_record",
             {}};
     iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+TEST_CASE("CUDA conformance: SiLU reference, admission, and lifetime") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    CudaStorageOracle oracle;
+    iom_conformance::SiluConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kNoSiluSpan,
+            &devices.gate,
+            &oracle,
+            iom_conformance::SiluNativeFailureSeam{
+                    {},
+                    {},
+                    "cuda_detail::silu",
+                    "the CUDA SiLU port is not present in this leaf; "
+                    "no accepted worker failure seam exists"}};
+    iom_conformance::run_silu_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 

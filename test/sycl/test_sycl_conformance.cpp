@@ -30,6 +30,7 @@
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
+#include "backend/backend_conformance_silu.hpp"
 #include "backend/backend_conformance_rope.hpp"
 #include "backend/backend_conformance_rope_contract.hpp"
 #include "iom/alloc.hpp"
@@ -889,6 +890,23 @@ TEST_CASE("SYCL conformance: RMSNorm reference, admission, and lifetime") {
             "sycl_detail::SubmissionFault::post_launch",
             {}};
     iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(devices.gate.armed());
+}
+TEST_CASE("SYCL conformance: SiLU reference, admission, and lifetime") {
+    SyclDevices devices;
+    SyclStorageOracle oracle(*devices.candidate_context);
+    iom_conformance::SiluConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kNoSiluSpan,
+            &devices.gate,
+            &oracle,
+            iom_conformance::SiluNativeFailureSeam{
+                    {},
+                    {},
+                    "sycl_detail::silu",
+                    "the SYCL SiLU port is not present in this leaf; "
+                    "no accepted worker failure seam exists"}};
+    iom_conformance::run_silu_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
 

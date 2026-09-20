@@ -31,6 +31,7 @@
 #include "backend/backend_conformance_linear.hpp"
 #include "backend/backend_conformance_other.hpp"
 #include "backend/backend_conformance_rmsnorm.hpp"
+#include "backend/backend_conformance_silu.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
@@ -1109,6 +1110,32 @@ TEST_CASE("ROCm conformance: RMSNorm reference, admission, and lifetime") {
             "rocm_detail::SubmissionFault::event_record",
             {}};
     iom_conformance::run_rmsnorm_conformance(config);
+    CHECK_FALSE(gate.armed());
+}
+TEST_CASE("ROCm conformance: SiLU reference, admission, and lifetime") {
+    iom_conformance::TrafficGate gate;
+    std::vector<std::byte> storage(64 * 1024 * 1024);
+    iom::LinearAllocator reference_allocator(storage.data(), storage.size());
+    auto reference = iom::make_cpu_device(reference_allocator);
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    auto foreign = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const iom_conformance::ConformanceDevices devices{
+            *reference, *candidate, *foreign};
+    HipStorageOracle oracle;
+    iom_conformance::SiluConformanceConfig config{
+            devices,
+            iom_conformance::kNoSiluSpan,
+            &gate,
+            &oracle,
+            iom_conformance::SiluNativeFailureSeam{
+                    {},
+                    {},
+                    "rocm_detail::silu",
+                    "the ROCm SiLU port is not present in this leaf; "
+                    "no accepted worker failure seam exists"}};
+    iom_conformance::run_silu_conformance(config);
     CHECK_FALSE(gate.armed());
 }
 

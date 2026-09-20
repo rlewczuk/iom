@@ -614,7 +614,6 @@ inline void run_compute_capability_conformance(
                      unsupported);
         }
     }
-    CHECK_EQ(queue->silu(x->view(), y->view()), unsupported);
     // The frozen linear ABI selects row `s` for `R` rows of the rank-two
     // HF-oriented `[O,I]` weight: the rank-three probe fixture supplies that
     // weight as its first `[16,16]` plane, so the request stays valid-shaped
