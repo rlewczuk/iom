@@ -273,6 +273,7 @@ if(SYCL_ENABLED)
         src/sycl/queue_rmsnorm.cpp
         src/sycl/queue_rope.cpp
         src/sycl/queue_linear.cpp
+        src/sycl/queue_silu.cpp
         src/sycl/queue.cpp
         src/sycl/add.cpp
         src/sycl/runtime.hpp

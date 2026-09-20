@@ -24,6 +24,17 @@ namespace iom::sycl_detail {
 [[nodiscard]] bool bf16_linear_device_capable(
         const sycl::device& device) noexcept;
 
+// Immutable capability of the implemented SiLU leaf set, defined next to the
+// SiLU kernels in `queue_silu.cpp`. This port queues exactly `BF16` and `F32`:
+// `F64` stays `Unsupported` regardless of `aspect::fp64`, the six packed
+// leaves belong to `10-sycl-silu-packed-formats`, and every semantically
+// inapplicable leaf (`BOOL`, the twelve integer leaves, and `F8_E8M0`) stays
+// `Unsupported`. It gates both the pure requirement query and the submission
+// before any sequence, registration, allocation, metadata mutation, or queue
+// resource, and it is the only authority on which carrier width the launcher
+// may derive.
+[[nodiscard]] bool silu_device_supported(DataType data_type) noexcept;
+
 class SyclQueue final : public DeviceOps {
     struct Task {
         std::uint64_t sequence = 0;
@@ -53,6 +64,11 @@ class SyclQueue final : public DeviceOps {
         // common owner registrations retained until proven completion.
         std::optional<RopeRequest> rope_request;
         detail::BinaryEntryRegistration rope_entries;
+        // Immutable SiLU activation request captured by admission, plus the
+        // common owner registrations retained until proven completion. SiLU
+        // consumes no `RawWorkspace`, so no workspace lease is carried.
+        std::optional<SiLURequest> silu_request;
+        detail::BinaryEntryRegistration silu_entries;
     };
 
     struct SyclSequenceOutcome {
@@ -68,6 +84,11 @@ class SyclQueue final : public DeviceOps {
         std::optional<detail::BinaryEntryRegistration> linear_entries;
         std::optional<detail::BinaryEntryRegistration> rope_entries;
         std::optional<detail::BinaryEntryRegistration> cache_append_entries;
+        // SiLU registers the same deduplicated read/read owner set and
+        // consumes no raw workspace, so its outcome carries only those
+        // entries. Trailing so every existing aggregate initialization keeps
+        // its own field order.
+        std::optional<detail::BinaryEntryRegistration> silu_entries;
     };
 
 public:
@@ -145,6 +166,23 @@ public:
     [[nodiscard]] WorkspaceRequirements binary_workspace_requirements(
             const BinaryRequest& request) override;
 
+    // Pure capability decision and exact raw-workspace requirement of the
+    // implemented SiLU leaf set: `BF16` and `F32` report the `{0, 1}`
+    // zero-workspace path, while the unported packed leaves, the unclaimed
+    // `F64`, and every semantically inapplicable leaf are `Unsupported`
+    // before any queue effect. The common facade consults this exact hook for
+    // both the call and the pure requirement query, so the two can never
+    // disagree about a leaf. Since the admitted capacity is zero, a supplied
+    // nonempty `RawWorkspaceView` is ignored rather than validated or leased.
+    [[nodiscard]] WorkspaceRequirements silu_workspace_requirements_impl(
+            const SiLURequest& request) override;
+
+    // Registered in-order submission of one admitted SiLU request: the
+    // immutable request and both distinct owner identities are captured by
+    // value and registered transactionally before the device launcher runs,
+    // and the retained completion event is returned with a positive OID.
+    oid silu_impl(const SiLURequest& request) override;
+
     // Pure `{32, 32}` workspace requirement the SYCL gather reports: the
     // caller-supplied range owns one uint32 status word plus reserved
     // padding. Common validation precedes this hook so capability-stage
@@ -164,6 +202,13 @@ private:
     void execute_rmsnorm(Task& task);
     void execute_linear(Task& task);
     void execute_rope(Task& task);
+    void execute_silu(Task& task);
+    // Immutable descriptor-representation admission of the SYCL SiLU
+    // specialization, defined beside its kernels in `queue_silu.cpp`: it
+    // builds the rank-bounded leading-plane descriptor with checked plane,
+    // element, stride, and offset arithmetic and discards it, so a request the
+    // device launcher cannot represent is rejected before any queue effect.
+    static void validate_silu_representation(const SiLURequest& request);
     // Immutable capability predicate of the linear scalar leaf set, shared by
     // the pure requirement query and the admitted execution hook so the query
     // and the call can never disagree about `F64`.

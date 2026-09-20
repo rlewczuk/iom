@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "runtime.hpp"
+#include "../iom_internal.hpp"
 
 #define IOM_GPU_DEVICE
 #define IOM_GPU_GLOBAL
@@ -653,6 +654,55 @@ oid SyclQueue::cache_append_impl(const CacheAppendRequest& request) {
             });
 }
 
+WorkspaceRequirements SyclQueue::silu_workspace_requirements_impl(
+        const SiLURequest& request) {
+    // Pure capability decision of the implemented SiLU leaf set. The common
+    // facade has already completed every structural, device, owner, shape,
+    // layout, dtype, quantization, alias, and checked-arithmetic admission
+    // step, so this hook performs no allocation, registration, lease,
+    // sequence, submission, queue or arena inspection, or data access. An
+    // unported or semantically inapplicable leaf is `Unsupported` here; a
+    // queued leaf consumes no raw workspace and reports the exact zero path.
+    if (!silu_device_supported(request.x.data_type)) {
+        throw detail::UnsupportedOperation();
+    }
+    return WorkspaceRequirements{0, 1};
+}
+
+oid SyclQueue::silu_impl(const SiLURequest& request) {
+    std::lock_guard<std::mutex> submission_lock(
+            submission_order_mutex_);
+    // Capability and descriptor representation are decided before the
+    // submission sequence, the owner registration, the fixed queue resources,
+    // and any output mutation, so an unported leaf and an unrepresentable
+    // request are both rejected repeatably without side effects.
+    if (!silu_device_supported(request.x.data_type)) {
+        throw detail::UnsupportedOperation();
+    }
+    validate_silu_representation(request);
+    if (consume_submission_fault(SubmissionFault::state_allocation)) {
+        throw std::bad_alloc();
+    }
+    auto state = std::make_shared<SyclFenceState>();
+    if (consume_submission_fault(SubmissionFault::fence_construction)) {
+        throw std::bad_alloc();
+    }
+    detail::Fence fence = build_sycl_fence(state);
+    return submit_silu(
+            request, *state_, registry_queue_id_, fence,
+            [this, state](
+                    std::uint64_t sequence, const SiLURequest& captured,
+                    detail::BinaryEntryRegistration entries) {
+                Task task;
+                task.sequence = sequence;
+                task.state = state;
+                task.fence = state.get();
+                task.silu_request.emplace(captured);
+                task.silu_entries = entries;
+                worker_.submit_copy(std::move(task));
+            });
+}
+
 void SyclQueue::execute(Task& task) {
     if (task.embedding_request.has_value()) {
         execute_embedding(task);
@@ -676,6 +726,10 @@ void SyclQueue::execute(Task& task) {
     }
     if (task.rope_request.has_value()) {
         execute_rope(task);
+        return;
+    }
+    if (task.silu_request.has_value()) {
+        execute_silu(task);
         return;
     }
 
@@ -948,6 +1002,13 @@ void SyclQueue::complete_task(
             // deduplicated input/output owner registrations are released.
             (void)detail::release_or_invalidate_binary_entries(
                     state_->registry, *outcome.rope_entries, failed,
+                    fence_succeeded);
+        } else if (outcome.silu_entries.has_value()) {
+            // SiLU registers the same deduplicated read/read owner set and
+            // consumes no `RawWorkspace` at all: there is no lease to retire,
+            // and a supplied workspace range is never inspected or retained.
+            (void)detail::release_or_invalidate_binary_entries(
+                    state_->registry, *outcome.silu_entries, failed,
                     fence_succeeded);
         } else {
             (void)detail::release_or_invalidate_entries(
