@@ -209,15 +209,18 @@ SiLU hook is governed by the [SiLU activation](silu-activation.md#silu-activatio
 its four-backend gate receipt. This subsection changes no other facade, kernel,
 queue, session, or selector implementation.
 
-The first session-side composition of these facades is implemented: one
-private, allocation-free stage in `src/session.cpp` performs attention RMSNorm,
-the three independent head-planar Q/K/V projections, and the independent Q/K
-split-half rotations over caller-supplied views and caller-provisioned
-workspace, waits the normalization before submitting any projection, waits and
-drains all three projection OIDs before submitting either rotation, and
-publishes nothing after a rejection or retained failure. It adds no public
-stage API, graph, kernel, capability, or contract change; per-backend
-capability, workspace, status, and failure policy stay with the
-operation-owned sections above, and focused CPU coverage lives in
-`test/test_model_session.cpp`. Cache publication, attention, the residual and
-MLP path, whole-layer traversal, generation, and the CLI remain planned.
+The first session-side composition of these facades is implemented as a
+private, allocation-free exactly-one-layer checkpoint in `src/session.cpp`.
+It composes attention RMSNorm, the three independent head-planar Q/K/V
+projections, independent Q/K split-half rotations, separate K/V cache
+publication, causal grouped-query SDPA, the ordinary attention projection and
+first residual, then post-attention RMSNorm, independent gate/up projections,
+stored SiLU, multiply, down projection, and the second residual.  It waits
+every direct producer successfully, waits both append OIDs before publishing
+`initializedL` or submitting SDPA, preserves absolute positions and the
+GQA mapping, and drains accepted work after failure.  All stores, views, queue
+identity, and scratch remain caller-owned; this adds no public stage API,
+graph, kernel, capability, or contract change.  Focused synthetic CPU
+coverage lives in `test/test_model_session.cpp`.  N-layer orchestration,
+final normalization and LM-head logits, selection, generation, CLI behavior,
+and official-corpus validation remain later work.

@@ -704,16 +704,18 @@ This seam adds no event allocation, timing API, async selector task, or
 per-operation correctness wait solely for disabled tracing. Required
 producer-success waits remain mandatory regardless of attribution. SDPA closed
 its four-backend gate in the revision recorded below, removing the last
-operation prerequisite for complete mathematical layer assembly. Session
-integration belongs to its separate component, and its first composition —
-steps 1 to 3 of the forward sequence — is implemented as one private,
-allocation-free stage in `src/session.cpp`: attention RMSNorm is submitted and
-waited first, the Q/K/V projections are then submitted as independent branches
-over that normalized activation, all three projection OIDs are drained before
-either rotation is submitted, and Q and K rotate independently at the same
-absolute start with caller-owned views and caller-provisioned workspace. Cache
-publication, attention, the residual/MLP path, whole-layer traversal,
-generation, and the CLI remain with their own leaves and are not claimed here.
+operation prerequisite for complete mathematical layer assembly.  The first
+session-side checkpoint is implemented as one private, allocation-free
+exactly-one-layer composition in `src/session.cpp`: attention RMSNorm, the
+independent Q/K/V projections, Q/K RoPE, separate cache appends and causal
+GQA attention are followed by output projection, the first residual,
+post-attention RMSNorm, independent gate/up projections, stored SiLU,
+multiply, down projection, and the second residual.  Every direct producer is
+waited successfully; both append completions precede cache-prefix publication
+and SDPA; accepted failures poison and drain the layer state.  The composition
+uses caller-owned views and scratch and preserves absolute positions, GQA, and
+exact capacity.  N-layer orchestration, final norm/head, generation, selection,
+CLI behavior, and official-corpus validation remain with later leaves.
 
 Implementation delivery remains operation-first and deliberately differs from
 the mathematical forward order: embedding, linear, RMSNorm, RoPE, cache
