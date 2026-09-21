@@ -633,7 +633,7 @@ TEST_CASE("TinyLlama session resources retain an injected selector") {
 TEST_CASE("Inference metrics session load measures one instrumented success interval") {
     SessionFixture fixture;
     RecordingClock clock;
-    clock.instants = {1'000, 1'750};
+    clock.instants = {1'000, 1'750, 1'800, 1'900};
     iom::InferenceMetrics recorder(make_clock(clock));
     std::size_t destructions = 0;
 
@@ -655,17 +655,19 @@ TEST_CASE("Inference metrics session load measures one instrumented success inte
     CHECK_EQ(destructions, 0);
 
     // The recorder and its clock are borrowed, not owned: both stay intact and
-    // usable through request preparation and the destructor drain, which
-    // records nothing of its own.
+    // usable through request preparation and the destructor drain. The enabled
+    // submission path reads the supplied clock exactly at its two enqueue
+    // boundaries, and the drain observes nothing of its own.
     session->prepare_request(1, {0, 1}, {0, {0, 1}});
     const auto& banks = SessionAccess::prefill(*session);
+    const std::size_t submission_reads = clock.cursor;
     SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
         return queue.copy(banks.x->view(), banks.attention_norm->view());
     });
+    CHECK_EQ(clock.cursor, submission_reads + 2);
     session.reset();
     CHECK_EQ(destructions, 1);
     CHECK_EQ(fixture.allocator.live, 0);
-    CHECK_EQ(clock.cursor, 2);
     CHECK_FALSE(clock.exhausted);
     CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 750);
     CHECK(recorder.snapshot().request_admitted);
@@ -674,12 +676,13 @@ TEST_CASE("Inference metrics session load measures one instrumented success inte
 
     // The two-argument factory and the selector overload without a recorder
     // publish sessions with no attached recorder and read no clock.
+    const std::size_t plain_reads = clock.cursor;
     CHECK(SessionAccess::metrics(*fixture.load()) == nullptr);
     const auto plain = iom::load_tinyllama_session(
             fixture.directory.path(), *fixture.device,
             std::make_unique<ProbeSelector>(nullptr));
     CHECK(SessionAccess::metrics(*plain) == nullptr);
-    CHECK_EQ(clock.cursor, 2);
+    CHECK_EQ(clock.cursor, plain_reads);
     CHECK_FALSE(clock.exhausted);
 }
 
@@ -999,7 +1002,7 @@ TEST_CASE("Inference metrics session load publishes only the admitted request co
 TEST_CASE("Inference metrics session load preserves attribution after a poisoned failure") {
     SessionFixture fixture;
     RecordingClock clock;
-    clock.instants = {1, 2};
+    clock.instants = {1, 2, 5, 9, 13, 20};
     iom::InferenceMetrics recorder(make_clock(clock));
     auto session = iom::load_tinyllama_session(
             fixture.directory.path(), *fixture.device,
@@ -1007,23 +1010,31 @@ TEST_CASE("Inference metrics session load preserves attribution after a poisoned
     REQUIRE(session);
     session->prepare_request(1, {0, 1}, {38, {0, 1}});
     const auto& banks = SessionAccess::prefill(*session);
+    const std::size_t accepted_reads = clock.cursor;
     SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
         return queue.copy(banks.x->view(), banks.attention_norm->view());
     });
+    CHECK_EQ(clock.cursor, accepted_reads + 2);
 
     // A rejected synchronous submission poisons the session and keeps its
     // accepted OIDs. The recorder's outgoing admitted request and its scalar
-    // spans survive the refusal, and the ordinal does not advance.
+    // spans survive the refusal, and the ordinal does not advance. The refusal
+    // is measured like any other facade attempt but becomes no trace event and
+    // contributes no enqueue time.
+    const std::size_t refused_reads = clock.cursor;
     CHECK_THROWS_AS(SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
         return queue.copy(banks.x->view(), banks.gate->view());
     }), std::invalid_argument);
+    CHECK_EQ(clock.cursor, refused_reads + 2);
     CHECK(session->poisoned());
     recorder.record_tokenization(5, 25, iom::ObservationState::succeeded);
     CHECK_THROWS_AS(session->prepare_request(1, {0, 1}, {38, {0, 1}}),
                     std::logic_error);
     CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
     CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 20);
-    CHECK_EQ(clock.cursor, 2);
+    // The refusal contributes no enqueue time to either phase sum.
+    CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+             std::uint64_t{0});
     CHECK_FALSE(clock.exhausted);
 
     session.reset();
@@ -1069,7 +1080,10 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     // its TTFT, its committed counts, and its single decode interval, while the
     // load interval keeps covering only the instrumented factory. The prefill
     // span's two readings share the request-entry window, so they neither
-    // advance the script nor falsify a pinned instant.
+    // advance the script nor falsify a pinned instant. The per-facade enqueue
+    // sums compose with the same window: every measured facade-call interval
+    // inside one constant window is zero, so the phase host-enqueue sums stay
+    // zero and are provably not the request's wall spans.
     const iom::InferenceSnapshot& snapshot = recorder.snapshot();
     REQUIRE(snapshot.request_admitted);
     CHECK_EQ(snapshot.load.host_nanoseconds, 100);
@@ -1082,6 +1096,10 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK_EQ(snapshot.admitted.decode_token_count, 1);
     CHECK(snapshot.admitted.time_to_first_token_valid);
     CHECK(snapshot.admitted.decode_throughput_valid);
+    CHECK_EQ(snapshot.admitted.prefill_enqueue.host_nanoseconds,
+             std::uint64_t{0});
+    CHECK_EQ(snapshot.admitted.decode_enqueue.host_nanoseconds,
+             std::uint64_t{0});
     CHECK(snapshot.attempt.outcome == iom::AttemptOutcome::succeeded);
     CHECK_EQ(script.served, 2);
     CHECK_FALSE(clock.unarmed_read);
@@ -1112,11 +1130,16 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     // The failed attempt keeps its own published request, counts no commit,
     // and retains the original failure. The prefill span completed before the
     // selector failed, and its two readings share the armed window, so the
-    // clock stays fully scripted.
+    // clock stays fully scripted. Its measured prefill enqueue sum is zero for
+    // that same single constant window, and no decode phase ever ran.
     const iom::InferenceSnapshot& failed = failing_recorder.snapshot();
     REQUIRE(failed.request_admitted);
     CHECK_EQ(failed.admitted.ordinal, 1);
     CHECK_EQ(failed.admitted.generated_tokens, 0);
+    CHECK_EQ(failed.admitted.prefill_enqueue.host_nanoseconds,
+             std::uint64_t{0});
+    CHECK_EQ(failed.admitted.decode_enqueue.host_nanoseconds,
+             std::uint64_t{0});
     CHECK_FALSE(failed.admitted.stop_reason_valid);
     CHECK_FALSE(failed.admitted.decode_throughput_valid);
     CHECK(failed.admitted.failure != nullptr);
@@ -1661,7 +1684,10 @@ TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed c
         const iom::oid row = accepted_oid(1);
         recorder.record_enqueue(row, iom::InferencePhase::prefill,
                                 std::nullopt, 0, 2, 5, 9);
-        REQUIRE_EQ(recorder.operations().size(), 1);
+        // The completed prefill's three session submissions (embedding, the
+        // final normalization, and the final LM-head row) were measured, and
+        // this case's preseeded row is a distinct record of its own.
+        REQUIRE_EQ(recorder.operations().size(), 4);
 
         // A rejected prompt stages its own attempt and consumes its entry
         // instant without publishing anything.
@@ -1675,15 +1701,31 @@ TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed c
         CHECK(rejected.attempt.outcome == iom::AttemptOutcome::failed);
         CHECK(rejected.attempt.failure != nullptr);
         CHECK_EQ(rejected.attempt.prompt_tokens, 0);
-        // The outgoing admitted request, its counters, and its rows survive.
+        // The outgoing admitted request, its counters, and its rows survive:
+        // the completed prefill's three measured submissions plus the
+        // preseeded row above, still owned by that request and never
+        // reattributed to the rejected attempt.
         CHECK_EQ(rejected.admitted.ordinal, 1);
         CHECK_EQ(rejected.admitted.generated_tokens, 1);
         CHECK_EQ(rejected.admitted.time_to_first_token_ns, 200);
         CHECK(rejected.admitted.stop_reason_valid);
         CHECK(rejected.admitted.stop_reason
               == iom::GenerationStopReason::max_new_tokens);
-        REQUIRE_EQ(recorder.operations().size(), 1);
-        CHECK_EQ(recorder.operations()[0].operation, row);
+        REQUIRE_EQ(recorder.operations().size(), 4);
+        std::size_t measured_prefill = 0;
+        for (const iom::InferenceTraceRecord& record : recorder.operations()) {
+            CHECK_EQ(record.request_ordinal, 1);
+            if (record.operation == row) {
+                CHECK(record.phase == iom::InferencePhase::prefill);
+                CHECK_FALSE(record.decoder_layer.has_value());
+                CHECK_EQ(record.position_start, std::size_t{0});
+                CHECK_EQ(record.run_length, std::size_t{2});
+                continue;
+            }
+            CHECK(record.phase == iom::InferencePhase::prefill);
+            ++measured_prefill;
+        }
+        CHECK_EQ(measured_prefill, std::size_t{3});
         // The candidate consumed only its entry window and published nothing.
         CHECK_EQ(script.served, 1);
         CHECK_FALSE(clock.unarmed_read);
@@ -1702,7 +1744,13 @@ TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed c
         CHECK(published.admitted.stop_reason
               == iom::GenerationStopReason::max_new_tokens);
         CHECK(published.attempt.outcome == iom::AttemptOutcome::succeeded);
-        CHECK(recorder.operations().empty());
+        // The publication cleared the outgoing rows, and the new request's
+        // completed prefill measured its own three session submissions.
+        REQUIRE_EQ(recorder.operations().size(), 3);
+        for (const iom::InferenceTraceRecord& record : recorder.operations()) {
+            CHECK_EQ(record.request_ordinal, 2);
+            CHECK(record.phase == iom::InferencePhase::prefill);
+        }
         // The next selection consumed the second scripted window.
         CHECK_EQ(script.served, 2);
         CHECK_FALSE(clock.unarmed_read);
@@ -1730,7 +1778,9 @@ TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed c
         const iom::oid row = accepted_oid(4);
         recorder.record_enqueue(row, iom::InferencePhase::decode, std::nullopt,
                                 2, 1, 15, 45);
-        REQUIRE_EQ(recorder.operations().size(), 1);
+        // The completed prefill's three session submissions were measured, and
+        // this case's preseeded row is a distinct record of its own.
+        REQUIRE_EQ(recorder.operations().size(), 4);
 
         // An accepted append fails while the candidate request drains it, so
         // the candidate fails before it publishes anything.
@@ -1744,10 +1794,13 @@ TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed c
             ~ClearLatch() { iom::cpu_detail::clear_cache_append_failure(); }
         } clear_latch;
         iom::cpu_detail::arm_cache_append_failure();
-        SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
-            return queue.cache_append(banks.k->view(), caches[0].key->view(),
-                                      caches[0].initialized_length);
-        });
+        const iom::oid failed_append =
+                SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+                    return queue.cache_append(
+                            banks.k->view(), caches[0].key->view(),
+                            caches[0].initialized_length);
+                });
+        REQUIRE(iom::oid_is_token(failed_append));
         script.enter(2'000);
         CHECK_THROWS_AS(session->generate_tokens(prompt, 1),
                         std::runtime_error);
@@ -1759,12 +1812,36 @@ TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed c
         CHECK_EQ(failed.attempt.prompt_tokens, 2);
         CHECK(failed.attempt.failure != nullptr);
         // The failed old drain is attributed to the candidate attempt, never
-        // to the admitted request, which keeps its counters and its rows.
+        // to the admitted request, which keeps its counters and its rows: the
+        // completed prefill's three measured submissions, the accepted append
+        // this case submitted itself, and the preseeded row above.
         CHECK_EQ(failed.admitted.ordinal, 1);
         CHECK_EQ(failed.admitted.generated_tokens, 1);
         CHECK_EQ(failed.admitted.time_to_first_token_ns, 500);
-        REQUIRE_EQ(recorder.operations().size(), 1);
-        CHECK_EQ(recorder.operations()[0].operation, row);
+        REQUIRE_EQ(recorder.operations().size(), 5);
+        std::size_t measured_prefill = 0;
+        std::size_t append_rows = 0;
+        std::size_t preseeded_rows = 0;
+        for (const iom::InferenceTraceRecord& record : recorder.operations()) {
+            CHECK_EQ(record.request_ordinal, 1);
+            if (record.operation == failed_append) {
+                ++append_rows;
+                continue;
+            }
+            if (record.operation == row) {
+                ++preseeded_rows;
+                CHECK(record.phase == iom::InferencePhase::decode);
+                CHECK_FALSE(record.decoder_layer.has_value());
+                CHECK_EQ(record.position_start, std::size_t{2});
+                CHECK_EQ(record.run_length, std::size_t{1});
+                continue;
+            }
+            CHECK(record.phase == iom::InferencePhase::prefill);
+            ++measured_prefill;
+        }
+        CHECK_EQ(measured_prefill, std::size_t{3});
+        CHECK_EQ(append_rows, std::size_t{1});
+        CHECK_EQ(preseeded_rows, std::size_t{1});
         // The candidate consumed only its entry window and published nothing.
         CHECK_EQ(script.served, 1);
         CHECK_FALSE(clock.unarmed_read);
@@ -1803,6 +1880,7 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
     // The drain window below starts after the failing submission, so its
     // deltas cover exactly the existing drain waits.
     std::size_t drain_reads = 0;
+    iom::oid accepted_append = 0;
     {
         // The process-wide CPU latch rejects the accepted append, so the
         // replacement's drain reports the queue's original failure instead of
@@ -1811,7 +1889,7 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
             ~ResetFailure() { iom::cpu_detail::clear_cache_append_failure(); }
         } failure;
         iom::cpu_detail::arm_cache_append_failure();
-        SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        accepted_append = SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
             return queue.cache_append(banks.k->view(), caches[0].key->view(), 0);
         });
         drain_reads = clock.cursor;
@@ -1828,17 +1906,45 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
     CHECK_EQ(session->request_length(), 3);
     CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
     CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 40);
-    REQUIRE_EQ(recorder.operations().size(), 1);
-    CHECK_EQ(recorder.operations()[0].operation, row);
+    // The accepted append was measured while the outgoing preseeded row
+    // survived the failed replacement, so exactly one row per accepted OID and
+    // the preseeded attribution are both present.
+    const std::span<const iom::oid> accepted = SessionAccess::accepted(*session);
+    REQUIRE_EQ(accepted.size(), 1);
+    CHECK_EQ(accepted[0], accepted_append);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    std::size_t measured = 0;
+    std::size_t preserved = 0;
+    for (const iom::InferenceTraceRecord& record : recorder.operations()) {
+        if (record.operation == accepted_append) ++measured;
+        if (record.operation == row) ++preserved;
+    }
+    CHECK_EQ(measured, std::size_t{1});
+    CHECK_EQ(preserved, std::size_t{1});
+    // The enabled submission path measured the accepted append at its two
+    // enqueue boundaries; the failed drain observed nothing extra.
     CHECK_FALSE(clock.exhausted);
 
     session.reset();
-    // The destructor drain repeats that same wait and preserves both the
-    // recorded row and its first observation state.
+    // The destructor drain repeats that same wait: the accepted append's own
+    // measured row keeps its first retained failure, while the unregistered
+    // preseeded row stays unobserved and no additional wait is taken.
     CHECK_EQ(clock.cursor, drain_reads + 2);
-    REQUIRE_EQ(recorder.operations().size(), 1);
-    CHECK_EQ(recorder.operations()[0].operation, row);
-    CHECK(recorder.operations()[0].wait_state == iom::WaitState::not_observed);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    std::size_t append_failed = 0;
+    std::size_t preseeded_unobserved = 0;
+    for (const iom::InferenceTraceRecord& record : recorder.operations()) {
+        if (record.operation == accepted_append
+                && record.wait_state == iom::WaitState::failed) {
+            ++append_failed;
+        }
+        if (record.operation == row
+                && record.wait_state == iom::WaitState::not_observed) {
+            ++preseeded_unobserved;
+        }
+    }
+    CHECK_EQ(append_failed, std::size_t{1});
+    CHECK_EQ(preseeded_unobserved, std::size_t{1});
     // The CPU backend retains both operands of the failed append in its device
     // quarantine, so the session's own owners are released without resetting
     // the allocator.
@@ -2311,6 +2417,328 @@ TEST_CASE("Inference metrics waits preserve existing wait counts in both modes")
     CHECK_EQ(observed_outcome.initialized_length,
              plain_outcome.initialized_length);
     CHECK_FALSE(clock.exhausted);
+}
+
+// ---------------------------------------------------------------------------
+// Operation enqueue observations. The supplied clock advances by one fixed
+// step per read, so a facade-call interval is exactly one step no matter which
+// other observation hook reads the clock in between; an explicit jump models
+// host time that the phase host-enqueue sums must never include.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct AdvancingClock {
+    static constexpr std::uint64_t kStep = 7;
+
+    std::uint64_t instant = 0;
+    std::size_t reads = 0;
+
+    static std::uint64_t read(void* context) noexcept {
+        auto* self = static_cast<AdvancingClock*>(context);
+        ++self->reads;
+        self->instant += kStep;
+        return self->instant;
+    }
+
+    void jump(std::uint64_t delta) noexcept { instant += delta; }
+};
+
+[[nodiscard]] iom::HostClock advancing_clock(AdvancingClock& self) {
+    return iom::HostClock{&AdvancingClock::read, &self};
+}
+
+}  // namespace
+
+TEST_CASE("Inference metrics enqueue observation measures accepted submissions") {
+    using iom::session_detail::OperationContext;
+    SessionFixture fixture;
+    AdvancingClock clock;
+    iom::InferenceMetrics recorder(advancing_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<ProbeSelector>(nullptr), &recorder);
+    REQUIRE(session);
+    session->prepare_operation_trace();
+    session->prepare_request(2, {0, 1}, {0, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    REQUIRE(recorder.operations().empty());
+
+    // One accepted submission measured inside a decoder-layer scope: the owned
+    // row copies the phase, that configured layer index, and the absolute
+    // window, and the measured facade interval is the phase host-enqueue sum.
+    SessionAccess::set_operation_context(
+            *session,
+            OperationContext{iom::InferencePhase::prefill, 2, 0, 2});
+    const iom::oid prefill_operation = SessionAccess::submit(
+            *session, [&](iom::DeviceOps& queue) {
+                return queue.copy(
+                        banks.x->view(), banks.attention_norm->view());
+            });
+    REQUIRE(iom::oid_is_token(prefill_operation));
+    REQUIRE_EQ(recorder.operations().size(), 1);
+    const iom::InferenceTraceRecord& prefill_row = recorder.operations()[0];
+    CHECK_EQ(prefill_row.operation, prefill_operation);
+    CHECK(prefill_row.phase == iom::InferencePhase::prefill);
+    REQUIRE(prefill_row.decoder_layer.has_value());
+    CHECK_EQ(*prefill_row.decoder_layer, std::size_t{2});
+    CHECK_EQ(prefill_row.position_start, std::size_t{0});
+    CHECK_EQ(prefill_row.run_length, std::size_t{2});
+    CHECK_EQ(prefill_row.enqueue_end_ns - prefill_row.enqueue_begin_ns,
+             AdvancingClock::kStep);
+    CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+             AdvancingClock::kStep);
+    CHECK_EQ(recorder.snapshot().admitted.decode_enqueue.host_nanoseconds,
+             std::uint64_t{0});
+
+    // A later producer wait and the host time it consumes are not part of the
+    // enqueue sum, and the decode phase keeps its own sum with the fixed
+    // one-row window and no decoder-layer index.
+    SessionAccess::wait(*session, prefill_operation);
+    clock.jump(1'000'000);
+    SessionAccess::set_operation_context(
+            *session,
+            OperationContext{iom::InferencePhase::decode, std::nullopt, 3, 1});
+    const iom::oid decode_operation = SessionAccess::submit(
+            *session, [&](iom::DeviceOps& queue) {
+                return queue.copy(banks.gate->view(), banks.up->view());
+            });
+    REQUIRE(iom::oid_is_token(decode_operation));
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    const iom::InferenceTraceRecord& decode_row = recorder.operations()[1];
+    CHECK_EQ(decode_row.operation, decode_operation);
+    CHECK(decode_row.phase == iom::InferencePhase::decode);
+    CHECK_FALSE(decode_row.decoder_layer.has_value());
+    CHECK_EQ(decode_row.position_start, std::size_t{3});
+    CHECK_EQ(decode_row.run_length, std::size_t{1});
+    CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+             AdvancingClock::kStep);
+    CHECK_EQ(recorder.snapshot().admitted.decode_enqueue.host_nanoseconds,
+             AdvancingClock::kStep);
+
+    // The rows are the ledger's accepted OIDs in acceptance order; attribution
+    // never becomes a second correctness or scheduling ledger.
+    const std::span<const iom::oid> accepted = SessionAccess::accepted(*session);
+    REQUIRE_EQ(accepted.size(), recorder.operations().size());
+    for (std::size_t index = 0; index < accepted.size(); ++index) {
+        CHECK_EQ(accepted[index], recorder.operations()[index].operation);
+    }
+
+    // A failed replacement keeps the outgoing rows and the admitted ordinal;
+    // only a successful publication replaces them.
+    fixture.allocator.fail_after = fixture.allocator.allocations + 3;
+    CHECK_THROWS_AS(session->prepare_request(2, {0, 1}, {0, {0, 1}}),
+                    std::bad_alloc);
+    CHECK_EQ(recorder.operations().size(), std::size_t{2});
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, std::uint64_t{1});
+    fixture.allocator.fail_after = std::numeric_limits<std::size_t>::max();
+    session->prepare_request(2, {0, 1}, {0, {0, 1}});
+    CHECK(recorder.operations().empty());
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, std::uint64_t{2});
+    session.reset();
+}
+
+TEST_CASE("Inference metrics enqueue observation attributes the synthetic forward") {
+    ForwardFixture fixture("metrics-enqueue-forward", one_layer_config());
+    AdvancingClock clock;
+    iom::InferenceMetrics recorder(advancing_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{4, 2}),
+            &recorder);
+    REQUIRE(session);
+    session->prepare_operation_trace();
+    // The admitted request context is published before the forward, exactly as
+    // the composed generation entry publishes it, so the phase host-enqueue
+    // sums of this fixture belong to the admitted request.
+    session->prepare_request(2, {0, 1}, {0, {0, 1}});
+    SessionAccess::prepare_forward_request(*session, 2);
+    const std::array<std::size_t, 2> prompt{0, 1};
+
+    const iom::session_detail::ForwardResult prefill =
+            SessionAccess::forward_prefill(*session, prompt);
+    REQUIRE(iom::oid_is_token(prefill.producer));
+    // Embedding, the closing normalization, and the final LM head: one owned
+    // record per accepted session submission.
+    REQUIRE_EQ(recorder.operations().size(), 3);
+    for (std::size_t index = 0; index < 2; ++index) {
+        const iom::InferenceTraceRecord& row = recorder.operations()[index];
+        CHECK(row.phase == iom::InferencePhase::prefill);
+        CHECK_FALSE(row.decoder_layer.has_value());
+        CHECK_EQ(row.position_start, std::size_t{0});
+        CHECK_EQ(row.run_length, std::size_t{2});
+        CHECK_EQ(row.enqueue_end_ns - row.enqueue_begin_ns,
+                 AdvancingClock::kStep);
+    }
+    const iom::InferenceTraceRecord& head = recorder.operations()[2];
+    CHECK(head.phase == iom::InferencePhase::prefill);
+    CHECK_FALSE(head.decoder_layer.has_value());
+    CHECK_EQ(head.position_start, std::size_t{1});
+    CHECK_EQ(head.run_length, std::size_t{1});
+    CHECK_EQ(head.operation, prefill.producer);
+    CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+             3 * AdvancingClock::kStep);
+    CHECK_EQ(recorder.snapshot().admitted.decode_enqueue.host_nanoseconds,
+             std::uint64_t{0});
+    CHECK(recorder.snapshot().admitted.prefill.state
+          == iom::ObservationState::not_run);
+
+    const std::size_t cache_prefix =
+            SessionAccess::caches(*session)[0].initialized_length;
+    REQUIRE_EQ(cache_prefix, std::size_t{2});
+    const iom::session_detail::ForwardResult decode =
+            SessionAccess::forward_decode(*session, 5);
+    REQUIRE(iom::oid_is_token(decode.producer));
+    REQUIRE_EQ(recorder.operations().size(), 6);
+    for (std::size_t index = 3; index < 6; ++index) {
+        const iom::InferenceTraceRecord& row = recorder.operations()[index];
+        CHECK(row.phase == iom::InferencePhase::decode);
+        CHECK_FALSE(row.decoder_layer.has_value());
+        CHECK_EQ(row.position_start, cache_prefix);
+        CHECK_EQ(row.run_length, std::size_t{1});
+    }
+    CHECK_EQ(recorder.operations()[5].operation, decode.producer);
+    CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+             3 * AdvancingClock::kStep);
+    CHECK_EQ(recorder.snapshot().admitted.decode_enqueue.host_nanoseconds,
+             3 * AdvancingClock::kStep);
+
+    const std::span<const iom::oid> accepted = SessionAccess::accepted(*session);
+    REQUIRE_EQ(accepted.size(), recorder.operations().size());
+    for (std::size_t index = 0; index < accepted.size(); ++index) {
+        CHECK_EQ(accepted[index], recorder.operations()[index].operation);
+    }
+    session.reset();
+}
+
+TEST_CASE("Inference metrics enqueue observation adds no work when disabled") {
+    using iom::session_detail::OperationContext;
+    SessionFixture fixture;
+    AdvancingClock clock;
+    iom::InferenceMetrics recorder(advancing_clock(clock));
+    {
+        // Scalar-only mode: an attached recorder without explicitly prepared
+        // trace storage records the phase host-enqueue sum and creates no
+        // per-OID row.
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<ProbeSelector>(nullptr), &recorder);
+        REQUIRE(session);
+        CHECK_FALSE(recorder.trace_prepared());
+        session->prepare_request(1, {0, 1}, {0, {0, 1}});
+        const auto& banks = SessionAccess::prefill(*session);
+        SessionAccess::set_operation_context(
+                *session,
+                OperationContext{iom::InferencePhase::prefill, std::nullopt, 0,
+                                 1});
+        const std::size_t reads = clock.reads;
+        CHECK(iom::oid_is_token(SessionAccess::submit(
+                *session, [&](iom::DeviceOps& queue) {
+                    return queue.copy(
+                            banks.x->view(), banks.attention_norm->view());
+                })));
+        CHECK_EQ(clock.reads, reads + 2);
+        CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+                 AdvancingClock::kStep);
+        CHECK(recorder.operations().empty());
+        CHECK_EQ(recorder.trace_capacity_remaining(), std::size_t{0});
+        CHECK_EQ(recorder.snapshot().trace_rows_dropped, std::uint64_t{0});
+        session.reset();
+    }
+    {
+        // A null recorder keeps the submission path free of every observation
+        // read: the supplied clock of the unattached recorder stays untouched.
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<ProbeSelector>(nullptr));
+        REQUIRE(session);
+        CHECK_EQ(SessionAccess::metrics(*session), nullptr);
+        session->prepare_request(1, {0, 1}, {0, {0, 1}});
+        const auto& banks = SessionAccess::prefill(*session);
+        const std::size_t reads = clock.reads;
+        const auto context = OperationContext{
+                iom::InferencePhase::prefill, std::nullopt, 0, 1};
+        SessionAccess::set_operation_context(*session, context);
+        CHECK(iom::oid_is_token(SessionAccess::submit(
+                *session, [&](iom::DeviceOps& queue) {
+                    return queue.copy(
+                            banks.x->view(), banks.attention_norm->view());
+                })));
+        CHECK_EQ(clock.reads, reads);
+        CHECK_EQ(SessionAccess::accepted(*session).size(), std::size_t{1});
+        session.reset();
+    }
+}
+
+TEST_CASE("Inference metrics enqueue observation refuses unobservable submissions") {
+    using iom::session_detail::OperationContext;
+    SessionFixture fixture;
+    AdvancingClock clock;
+    iom::InferenceMetrics recorder(advancing_clock(clock));
+    {
+        // A rejected submission keeps its established exception category,
+        // becomes no trace event, and contributes no enqueue time.
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<ProbeSelector>(nullptr), &recorder);
+        REQUIRE(session);
+        session->prepare_operation_trace();
+        session->prepare_request(2, {0, 1}, {0, {0, 1}});
+        const auto& banks = SessionAccess::prefill(*session);
+        SessionAccess::set_operation_context(
+                *session,
+                OperationContext{iom::InferencePhase::prefill, std::nullopt, 0,
+                                 2});
+        const iom::oid accepted = SessionAccess::submit(
+                *session, [&](iom::DeviceOps& queue) {
+                    return queue.copy(
+                            banks.x->view(), banks.attention_norm->view());
+                });
+        REQUIRE_EQ(recorder.operations().size(), 1);
+        CHECK_THROWS_AS(SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+            return queue.copy(banks.x->view(), banks.gate->view());
+        }), std::invalid_argument);
+        CHECK(session->poisoned());
+        CHECK_EQ(recorder.operations().size(), std::size_t{1});
+        CHECK_EQ(recorder.operations()[0].operation, accepted);
+        CHECK_EQ(recorder.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+                 AdvancingClock::kStep);
+        CHECK_EQ(recorder.snapshot().trace_rows_dropped, std::uint64_t{0});
+        REQUIRE_EQ(SessionAccess::accepted(*session).size(), 1);
+        CHECK_EQ(SessionAccess::accepted(*session)[0], accepted);
+        session.reset();
+    }
+    {
+        // An explicitly prepared table with no remaining room is the smallest
+        // observable exhaustion of the fixed capacity: the prepared trace
+        // capacity is preflighted with the bounded ledger, so an accepted
+        // submission whose observation could not be retained is refused with
+        // the same checked-bound category, before the facade is invoked and
+        // without growing, dropping, or losing an accepted observation. The
+        // reservation never grows, so this case owns its own recorder.
+        iom::InferenceMetrics empty_trace(advancing_clock(clock));
+        empty_trace.prepare_trace(0);
+        REQUIRE(empty_trace.trace_prepared());
+        REQUIRE_EQ(empty_trace.trace_capacity_remaining(), std::size_t{0});
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<ProbeSelector>(nullptr), &empty_trace);
+        REQUIRE(session);
+        session->prepare_request(2, {0, 1}, {0, {0, 1}});
+        const auto& banks = SessionAccess::prefill(*session);
+        bool accepted = false;
+        CHECK_THROWS_AS(SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+            accepted = true;
+            return queue.copy(banks.x->view(), banks.attention_norm->view());
+        }), std::overflow_error);
+        CHECK_FALSE(accepted);
+        CHECK_FALSE(session->poisoned());
+        CHECK(empty_trace.operations().empty());
+        CHECK(SessionAccess::accepted(*session).empty());
+        CHECK_EQ(empty_trace.snapshot().admitted.prefill_enqueue.host_nanoseconds,
+                 std::uint64_t{0});
+        session.reset();
+    }
 }
 
 TEST_CASE("TinyLlama session resources check all cache bytes before allocation") {

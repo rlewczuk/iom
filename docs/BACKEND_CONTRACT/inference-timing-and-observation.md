@@ -345,6 +345,68 @@ adapter.
    fabricated by default construction. The recorder does not duplicate
    session stop policy.
 
+## Submission attribution and host enqueue
+
+1. Host enqueue is the sum of the individual facade-call intervals that
+   enqueue work for a phase. The session measures it in the existing
+   submission seam: with an attached recorder the supplied monotonic clock is
+   read immediately before and immediately after the single
+   `operation(session.queue())` invocation, and only that interval is
+   accumulated. Runtime blocking inside the facade is part of the host-enqueue
+   total; later producer waits, selector work, enqueue-independent host work,
+   and an entire forward wall span are not. A null recorder reads no clock,
+   constructs no record, registers nothing, allocates nothing, and performs no
+   observation work at all.
+2. The accumulated sums are the admitted request's
+   `admitted.prefill_enqueue` and `admitted.decode_enqueue`. A staged but
+   unpublished attempt never overwrites the outgoing admitted request's sums,
+   and a published request starts from zero. Scalar-only mode, that is an
+   attached recorder without explicitly prepared trace storage, records these
+   sums and creates no per-OID row; `prepare_trace` is the only storage for
+   rows, so no accepted observation is ever allocated during inference.
+3. With tracing enabled, exactly one owned row is appended for each positive
+   OID accepted from a session submission, in acceptance order, and located by
+   the recorder's sorted exact-OID lookup. Negative admission results remain
+   rejected submissions with their existing translation, poisoning, and drain
+   behavior: they become no trace row and contribute no enqueue time. The
+   accepted-OID ledger remains the correctness ledger; rows never drive
+   scheduling, workspace lifetime, queue order, or publication.
+4. The session-scoped operation context copied into each row is taken from the
+   forward entry points and their decoder-layer loop variables, never from a
+   timing sibling: the phase (`prefill` or `decode`), the optional configured
+   decoder-layer index, the absolute input-position start, and the run length.
+   The canonical windows are prefill whole-run `[0,R)` for embedding and the
+   final normalization, prefill final LM head `[R-1,R)`, decode whole-run
+   `[a,a+1)`, and the decode final LM head `[a,a+1)`, which is that run's own
+   final row. A submission made inside a decoder-layer iteration carries that
+   configured layer index; embedding, final normalization, and final LM-head
+   operations carry none. A session submission outside any forward scope keeps
+   the default attribution (`load` phase, no decoder layer, empty `[0,0)`
+   window) instead of borrowing a stale phase, layer, or window.
+5. Remaining prepared record capacity is preflighted with the bounded ledger
+   before the facade is invoked, so an accepted submission whose observation
+   could not be retained is refused with the same checked-bound category
+   instead of being dropped, grown, or silently lost after acceptance; after a
+   positive acceptance the append neither allocates nor throws. Rows of an
+   outgoing request survive a failed drain or a failed candidate validation,
+   setup, or preprocessing and are cleared or replaced only after a successful
+   publication, so a later request never retroactively establishes an earlier
+   success.
+6. Only session-submitted positive OIDs are observed. In the current forward
+   path those submissions are the embedding, the final normalization, and the
+   final LM-head projection of one prefill or one decode. Selector-internal
+   operations issued directly to an exposed queue, host-side transfers, and
+   the private decoder-layer stage submissions of the session's own queue
+   remain opaque; no generic queue instrumentation, queue registration, event,
+   native timer, mutex, wait, or synchronization is added for observation.
+7. Every value here is a host facade-call observation, never device or kernel
+   execution time. Genuine device duration is unavailable under current CPU
+   host execution, under CUDA completion events created
+   `cudaEventDisableTiming`, under ROCm completion events created
+   `hipEventDisableTiming`, and under SYCL queues constructed `in_order`
+   without profiling. No optional native timer, adapter, or universal timing
+   interface is introduced, and no enqueue sum may be reported as device time.
+
 ## Wait observations and retained failure
 
 1. The recorder observes exactly the waits the session already performs: the
