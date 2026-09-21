@@ -226,6 +226,121 @@ void validate_generation_prompt(
             std::move(generated.token_ids), text, generated.stop_reason};
 }
 
+// Raw/chat tokenization observation.
+//
+// `generate_raw` and `generate_chat` stage the attempt and the encode interval
+// here, and attach the observation only after the nested generation returned
+// or threw. Nothing is cleared at wrapper entry: `begin_generation` stages a
+// new attempt without touching the last admitted request, so a rejected
+// preprocessing attempt can neither steal nor overwrite the outgoing
+// request's attribution. Only `tokenizer.encode` is measured; chat rendering
+// completes before the measured begin, and generation, the post-generation ID
+// conversion, and the output decoding all happen after the measured end. A
+// null recorder disables every read and every write below.
+class TokenizationObservation final {
+public:
+    explicit TokenizationObservation(InferenceMetrics* metrics) noexcept
+            : metrics_(metrics) {
+        if (metrics_ == nullptr) {
+            return;
+        }
+        // Stage this preprocessing attempt before any rendering or encoding
+        // work. The low-level generation stage replaces the recorded entry
+        // instant and attempted cardinality for the same attempt, so TTFT
+        // still starts at generation entry; staging here only makes this
+        // attempt distinct from the last admitted request.
+        metrics_->begin_generation(metrics_->now(), 0);
+    }
+
+    /** Begin the measured interval immediately before the encoder call. */
+    void begin_encode() noexcept {
+        if (metrics_ == nullptr) {
+            return;
+        }
+        encode_begin_ = metrics_->now();
+        encode_observed_ = true;
+    }
+
+    /** Capture the encode end instant of a completed or failed encode. */
+    void end_encode() noexcept {
+        if (metrics_ == nullptr) {
+            return;
+        }
+        encode_end_ = metrics_->now();
+    }
+
+    // Report a failed formatter or encoder attempt. A formatter failure never
+    // reached the encoder, so tokenization stays `not_run`; an observed
+    // encoder failure is offered to the recorder as a failed tokenization
+    // observation instead of a fabricated success. In both cases the failure
+    // belongs to this attempt and never to a previously admitted request, and
+    // no OID, selector call, or generated token is fabricated.
+    void record_preprocessing_failure(std::exception_ptr failure) noexcept {
+        if (metrics_ == nullptr) {
+            return;
+        }
+        if (encode_observed_) {
+            metrics_->record_tokenization(
+                    encode_begin_, encode_end_, ObservationState::failed);
+        }
+        metrics_->record_preprocessing_failure(
+                encode_end_, std::move(failure));
+    }
+
+    // Attach the completed encode interval to the generation attempt that owns
+    // it. The recorder accepts it only while that attempt is the published
+    // request, so a failed drain, a pre-publication validation/setup failure,
+    // or a rejected preprocessing attempt leaves the outgoing request's
+    // observation intact and its own interval unattributed.
+    void attach() noexcept {
+        if (metrics_ == nullptr) {
+            return;
+        }
+        metrics_->record_tokenization(
+                encode_begin_, encode_end_, ObservationState::succeeded);
+    }
+
+private:
+    InferenceMetrics* metrics_ = nullptr;
+    std::uint64_t encode_begin_ = 0;
+    std::uint64_t encode_end_ = 0;
+    bool encode_observed_ = false;
+};
+
+// Run one raw/chat encode under the observation above: only the encoder call
+// itself lies between the captured begin and end instants, and a failed encode
+// keeps its original exception.
+template <class Encode>
+[[nodiscard]] std::vector<std::uint32_t> observed_encode(
+        TokenizationObservation& observation, Encode encode) {
+    try {
+        observation.begin_encode();
+        std::vector<std::uint32_t> encoded = encode();
+        observation.end_encode();
+        return encoded;
+    } catch (...) {
+        observation.end_encode();
+        observation.record_preprocessing_failure(std::current_exception());
+        throw;
+    }
+}
+
+// Complete a raw/chat attempt: attach the measured encode interval to the
+// request the nested generation produced, whether it returned or threw.
+[[nodiscard]] GenerationResult finish_text_generation(
+        TinyLlamaSession& session, std::vector<std::uint32_t> encoded,
+        std::size_t max_new_tokens, TokenizationObservation& observation) {
+    try {
+        GenerationResult result = finish_text_generation(
+                session, std::move(encoded), max_new_tokens);
+        observation.attach();
+        return result;
+    } catch (...) {
+        observation.attach();
+        throw;
+    }
+}
+
 struct ForwardLayerPlan {
     session_detail::DecoderLayerForwardViews prefill;
     session_detail::DecoderLayerForwardViews decode;
@@ -1099,22 +1214,37 @@ TokenGenerationResult TinyLlamaSession::generate_tokens(
 
 GenerationResult TinyLlamaSession::generate_raw(
         std::string_view text, std::size_t max_new_tokens) {
+    TokenizationObservation observation(
+            session_detail::SessionAccess::metrics(*this));
+    std::vector<std::uint32_t> encoded =
+            observed_encode(observation, [&] {
+                return tokenizer().encode(
+                        text, EncodeOptions{.add_special_tokens = true});
+            });
     return finish_text_generation(
-            *this,
-            tokenizer().encode(
-                    text, EncodeOptions{.add_special_tokens = true}),
-            max_new_tokens);
+            *this, std::move(encoded), max_new_tokens, observation);
 }
 
 GenerationResult TinyLlamaSession::generate_chat(
         std::span<const ChatMessageView> messages,
         std::size_t max_new_tokens) {
-    const std::string rendered = formatter().format(messages, true);
+    TokenizationObservation observation(
+            session_detail::SessionAccess::metrics(*this));
+    std::string rendered;
+    try {
+        // The complete supported chat rendering precedes the measured encode.
+        rendered = formatter().format(messages, true);
+    } catch (...) {
+        observation.record_preprocessing_failure(std::current_exception());
+        throw;
+    }
+    std::vector<std::uint32_t> encoded =
+            observed_encode(observation, [&] {
+                return tokenizer().encode(
+                        rendered, EncodeOptions{.add_special_tokens = true});
+            });
     return finish_text_generation(
-            *this,
-            tokenizer().encode(
-                    rendered, EncodeOptions{.add_special_tokens = true}),
-            max_new_tokens);
+            *this, std::move(encoded), max_new_tokens, observation);
 }
 
 std::size_t TinyLlamaSession::request_length() const noexcept {
@@ -3127,7 +3257,22 @@ void SessionAccess::prepare_forward_request(
     }
     impl.validate_scratch(*candidate, operation, selector_requirements);
     impl.reset_cache_prefix();
+    // Publish only after every owner, range, and workspace is complete.
     impl.request = std::move(candidate);
+
+    // This second publication site carries the same recorder bridge as the
+    // public request setup: the admitted request ordinal advances only here,
+    // after the forward request was actually published, so one publication
+    // replaces the admitted observation, clears the outgoing operation rows
+    // without freeing prepared trace storage, and publishes a staged attempt.
+    // Every earlier return above - a failed drain, a rejected length, or a
+    // failed candidate allocation - left the outgoing admitted observation and
+    // its rows untouched. Without this hook a raw/chat request could never
+    // publish its staged tokenization attempt, and a direct low-level request
+    // would keep inheriting the previous raw/chat tokenization observation.
+    if (impl.metrics != nullptr) {
+        impl.metrics->publish_generation();
+    }
 }
 
 ForwardResult SessionAccess::forward_prefill(

@@ -122,6 +122,50 @@ adapter.
    legitimate timing source for all load, tokenization, prefill, decode,
    and throughput measurements.
 
+## Tokenization
+
+1. The raw and chat entry points measure exactly one interval: the
+   `tokenizer.encode` call. `generate_raw` hands its text directly to the
+   encoder; `generate_chat` completes the supported chat rendering and then
+   encodes the rendered text, so rendering is never inside the measured
+   interval. Low-level generation, the post-generation ID conversion, and
+   the output text decoding all happen after the measured end.
+   `EncodeOptions`, the supported templates, BOS/EOS behavior, encoded
+   history, selected tokens, output text, and stop state are unchanged with
+   or without a recorder.
+2. The raw/chat wrapper stages its attempt at entry, before rendering or
+   encoding, with the supplied clock's entry instant and the zero-token
+   preprocessing cardinality. The low-level generation stage replaces that
+   instant and cardinality for the same attempt, so time-to-first-token
+   still starts at low-level generation entry. Staging never clears the
+   outgoing admitted request: only a successful request publication
+   replaces admitted fields.
+3. The measured interval is attached to the attempt after the nested
+   `generate_tokens` call returns or throws, and the recorder accepts it
+   only while that attempt is the published request. A failed old-request
+   drain, a pre-publication validation or setup failure, and a rejected
+   preprocessing attempt therefore leave the outgoing request's
+   tokenization observation intact and their own interval unattributed. Two
+   successive raw/chat calls replace the admitted tokenization observation
+   instead of accumulating it, and a direct low-level request never
+   inherits a previous raw/chat measurement.
+4. A formatter rejection is a failed preprocessing attempt with zero new
+   generation: the encoder was never reached, so no tokenization
+   observation is offered to the recorder and the admitted tokenization
+   field is untouched, which leaves a session that never published at
+   `not_run`. An encoder failure is also a failed preprocessing attempt,
+   but the encoder itself was observed: the captured interval is offered as
+   a failed tokenization observation instead of a fabricated success. A
+   preprocessing failure never publishes a request, so the recorder, which
+   attaches phase observations only to the published request, writes
+   neither failure into the outgoing admitted request: both are reported
+   through the attempt outcome and the retained original exception, which
+   is rethrown unchanged, and neither fabricates a selector call, positive
+   OID, or generated token.
+5. A disabled recorder adds no clock read, no allocation, no registration,
+   no wait, and no synchronization to either entry point, and leaves every
+   numerical, token, history, stop, and failure behavior unchanged.
+
 ## Record schema
 
 1. The recorder defines exactly four phases: `load`, `tokenization`,
