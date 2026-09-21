@@ -3,9 +3,10 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <span>
+#include <vector>
 
 #include "iom/chat_format.hpp"
-#include "iom/device.hpp"
 #include "iom/model.hpp"
 #include "iom/token_selection.hpp"
 #include "iom/tokenizer.hpp"
@@ -15,6 +16,19 @@ namespace iom {
 namespace session_detail {
 struct SessionAccess;
 }
+
+/**
+ * Why a low-level token generation request stopped.
+ */
+enum class GenerationStopReason { eos, max_new_tokens, context_capacity };
+
+/**
+ * Owned output of one low-level token generation request.
+ */
+struct TokenGenerationResult {
+    std::vector<std::size_t> token_ids;
+    GenerationStopReason stop_reason;
+};
 
 /**
  * Owning, reusable TinyLlama resource session.
@@ -58,6 +72,15 @@ public:
     void prepare_request(
             std::size_t run_length, WorkspaceRequirements operation,
             TokenSelectorScratchRequirements selector_scratch);
+ 
+    /**
+     * Run one synchronous greedy token-generation request from low-level token
+     * IDs.  The returned token storage is owned by the result and remains
+     * independent of later session reset or reuse.
+     */
+    [[nodiscard]] TokenGenerationResult generate_tokens(
+            std::span<const std::size_t> token_ids,
+            std::size_t max_new_tokens);
 
     [[nodiscard]] std::size_t request_length() const noexcept;
     [[nodiscard]] bool poisoned() const noexcept;

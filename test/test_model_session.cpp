@@ -237,6 +237,42 @@ private:
     iom::TokenSelectorScratchRequirements requirements_;
 };
 
+class SequenceSelector final : public iom::TokenSelector {
+public:
+    explicit SequenceSelector(std::vector<std::size_t> sequence)
+        : sequence_(std::move(sequence)) {}
+
+    [[nodiscard]] iom::TokenSelectorScratchRequirements scratch_requirements(
+            const iom::TensorView&, std::size_t) const override {
+        return {0, {0, 1}};
+    }
+
+    [[nodiscard]] std::size_t select(
+            iom::DeviceOps&, const iom::TensorView&, std::size_t,
+            iom::oid producer, std::span<const std::size_t> history,
+            iom::TokenSelectorScratch) override {
+        ++calls;
+        producers.push_back(producer);
+        histories.emplace_back(history.begin(), history.end());
+        if (throw_failure) {
+            throw std::runtime_error("injected selector failure");
+        }
+        if (next >= sequence_.size()) {
+            throw std::logic_error("injected selector sequence exhausted");
+        }
+        return sequence_[next++];
+    }
+
+    std::size_t calls = 0;
+    std::vector<iom::oid> producers;
+    std::vector<std::vector<std::size_t>> histories;
+    bool throw_failure = false;
+
+private:
+    std::vector<std::size_t> sequence_;
+    std::size_t next = 0;
+};
+
 
 // Use the existing bounded model owners to exercise genuine factory contract
 // failures without allocating enormous tensors or requiring accelerator memory.
@@ -957,6 +993,212 @@ TEST_CASE("TinyLlama full model logits reuse request owners") {
     CHECK(std::all_of(
             decode_logits.begin(), decode_logits.end(),
             [](float value) { return std::isfinite(value); }));
+}
+
+TEST_CASE(
+        "TinyLlama generation state machine validates admission and zero "
+        "limit") {
+    ForwardFixture fixture("generation-admission", one_layer_config());
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{4});
+    SequenceSelector* selector_observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector));
+
+    const std::array<std::size_t, 0> empty{};
+    CHECK_THROWS_AS(session->generate_tokens(empty, 1),
+            std::invalid_argument);
+
+    const std::vector<std::size_t> over_capacity(
+            session->config().max_position_embeddings + 1, 0);
+    CHECK_THROWS_AS(session->generate_tokens(over_capacity, 1),
+            std::invalid_argument);
+
+    const std::array<std::size_t, 1> invalid{
+            session->config().vocab_size};
+    CHECK_THROWS_AS(session->generate_tokens(invalid, 1),
+            std::invalid_argument);
+    CHECK_EQ(selector_observer->calls, 0);
+    CHECK_FALSE(session->poisoned());
+
+    const std::array<std::size_t, 2> prompt{0, 1};
+    const iom::TokenGenerationResult result =
+            session->generate_tokens(prompt, 0);
+    CHECK(result.token_ids.empty());
+    CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+    CHECK_EQ(selector_observer->calls, 0);
+    CHECK(SessionAccess::history(*session).empty());
+    CHECK(SessionAccess::accepted(*session).empty());
+}
+
+TEST_CASE(
+        "TinyLlama generation state machine applies EOS and limit "
+        "precedence") {
+    {
+        ForwardFixture fixture("generation-eos", one_layer_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{2});
+        SequenceSelector* observer = selector.get();
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const std::array<std::size_t, 2> prompt{0, 1};
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 1);
+        CHECK(result.token_ids == std::vector<std::size_t>{2});
+        CHECK(result.stop_reason == iom::GenerationStopReason::eos);
+        REQUIRE_EQ(observer->histories.size(), 1);
+        CHECK(observer->histories[0] == std::vector<std::size_t>{0, 1});
+        CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 2);
+    }
+
+    {
+        ForwardFixture fixture("generation-limit", one_layer_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4});
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const std::array<std::size_t, 2> prompt{0, 1};
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 1);
+        CHECK(result.token_ids == std::vector<std::size_t>{4});
+        CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+        CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 2);
+    }
+
+    {
+        ForwardFixture fixture("generation-context", one_layer_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4});
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const std::vector<std::size_t> prompt(
+                session->config().max_position_embeddings - 1, 0);
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 3);
+        CHECK(result.token_ids == std::vector<std::size_t>{4});
+        CHECK(result.stop_reason
+              == iom::GenerationStopReason::context_capacity);
+        CHECK_EQ(
+                SessionAccess::caches(*session)[0].initialized_length,
+                session->config().max_position_embeddings - 1);
+    }
+
+    {
+        // EOS wins when the selected token simultaneously reaches both the
+        // one-token limit and the final context row.
+        ForwardFixture fixture("generation-precedence", one_layer_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{2});
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const std::vector<std::size_t> prompt(
+                session->config().max_position_embeddings - 1, 0);
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 1);
+        CHECK(result.token_ids == std::vector<std::size_t>{2});
+        CHECK(result.stop_reason == iom::GenerationStopReason::eos);
+    }
+}
+
+TEST_CASE(
+        "TinyLlama generation state machine commits history and decodes "
+        "only for nonterminal tokens") {
+    ForwardFixture fixture("generation-transitions", one_layer_config());
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{4, 2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector));
+
+    const std::array<std::size_t, 2> prompt{0, 1};
+    const iom::TokenGenerationResult result =
+            session->generate_tokens(prompt, 4);
+    CHECK(result.token_ids == std::vector<std::size_t>{4, 2});
+    CHECK(result.stop_reason == iom::GenerationStopReason::eos);
+    REQUIRE_EQ(observer->calls, 2);
+    REQUIRE_EQ(observer->histories.size(), 2);
+    CHECK(observer->histories[0] == std::vector<std::size_t>{0, 1});
+    CHECK(observer->histories[1] == std::vector<std::size_t>{0, 1, 4});
+    REQUIRE_EQ(observer->producers.size(), 2);
+    CHECK(iom::oid_is_token(observer->producers[0]));
+    CHECK(iom::oid_is_token(observer->producers[1]));
+
+    // The first generated token required one cached decode row.  The EOS
+    // token was committed but did not grow the cache again.
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 3);
+
+    // Returning the owned vector detaches it from the request that the next
+    // call replaces.
+    const std::array<std::size_t, 1> next_prompt{3};
+    const iom::TokenGenerationResult zero =
+            session->generate_tokens(next_prompt, 0);
+    CHECK(zero.token_ids.empty());
+    CHECK(result.token_ids == std::vector<std::size_t>{4, 2});
+    CHECK(SessionAccess::history(*session).empty());
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 0);
+}
+
+TEST_CASE(
+        "TinyLlama generation state machine rejects selector failures "
+        "without reuse") {
+    {
+        ForwardFixture fixture("generation-range-failure", one_layer_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{19});
+        SequenceSelector* observer = selector.get();
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const std::array<std::size_t, 2> prompt{0, 1};
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 2),
+                std::invalid_argument);
+        CHECK(session->poisoned());
+        CHECK_EQ(observer->calls, 1);
+        REQUIRE_EQ(observer->histories.size(), 1);
+        CHECK(observer->histories[0] == std::vector<std::size_t>{0, 1});
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 0),
+                std::logic_error);
+    }
+
+    {
+        ForwardFixture fixture("generation-selector-failure", one_layer_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4});
+        SequenceSelector* observer = selector.get();
+        observer->throw_failure = true;
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const std::array<std::size_t, 2> prompt{0, 1};
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 2),
+                std::runtime_error);
+        CHECK(session->poisoned());
+        CHECK_EQ(observer->calls, 1);
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 0),
+                std::logic_error);
+    }
+}
+
+TEST_CASE(
+        "TinyLlama generation state machine poisons and drains prefill "
+        "failure") {
+    ForwardFixture fixture("generation-prefill-failure", one_layer_config());
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{4});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector));
+
+    iom::cpu_detail::arm_cache_append_failure();
+    struct ClearCacheAppendFailure {
+        ~ClearCacheAppendFailure() {
+            iom::cpu_detail::clear_cache_append_failure();
+        }
+    } clear_failure;
+
+    const std::array<std::size_t, 2> prompt{0, 1};
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 2),
+            std::runtime_error);
+    CHECK(session->poisoned());
+    CHECK_EQ(observer->calls, 0);
 }
 
 namespace {
