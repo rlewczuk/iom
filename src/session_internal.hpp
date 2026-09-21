@@ -187,5 +187,124 @@ private:
 void run_mlp_stage(DeviceOps& operations, MlpStageViews& views,
                    const MlpStageParams& params, const MlpWorkspace& workspace,
                    std::span<const oid> readiness, MlpStageFailure& failure);
+/**
+ * Implementation-private request of the TinyLlama cache/attention stage.
+ * This header is not installed, not part of the public include tree, and
+ * declares no reusable stage framework: `src/session.cpp` owns the
+ * numerical boundaries, and the enclosing session owns every tensor,
+ * cache, queue, workspace, and failure state named here.
+ *
+ * All supplied views are borrowed for the duration of one call. The stage
+ * allocates no tensor, workspace, host buffer, or OID storage; it copies
+ * no view, never expands a KV head, and never transposes a weight.
+ *
+ * Every view the stage writes must live in distinct owner storage from every
+ * other supplied view; that stage-wide disjointness is checked before any
+ * requirement query or submission. The two persistent caches are therefore
+ * distinct owners, no cache, attention, or residual store may alias an
+ * operand, a weight, or another store, and no cross-phase alias can let a
+ * later store destroy a value an earlier phase still needs (V rows overwriting
+ * the K cache, the merged attention overwriting the residual input, and so
+ * on). Read/read aliasing stays legal, exactly as the operation contracts
+ * allow it.
+ *
+ * Fixed logical geometry, with checked `F=Hq*D`:
+ *
+ *   rotated_q        `[Hq,R,D]`  rotated query rows for this run
+ *   rotated_k        `[Hkv,R,D]` rotated key rows appended at offset `a`
+ *   rotated_v        `[Hkv,R,D]` value rows appended at offset `a`
+ *   k_cache          `[Hkv,C,D]` persistent key cache owner
+ *   v_cache          `[Hkv,C,D]` persistent value cache owner
+ *   residual_input   `[R,F]`     layer input the first residual adds to
+ *   o_weight         `[F,F]`     Hugging Face `[out,in]` output weight
+ *   attention_merged `[R,F]`     merged causal SDPA output
+ *   attention_output `[R,F]`     output projection of the merged attention
+ *   residual_output  `[R,F]`     `residual_input + attention_output`
+ *
+ * `a` is the absolute cache row of the first appended row, `R` the number
+ * of appended/projected rows, and `C` the persistent cache capacity. The
+ * three scalars are explicit: no position, row window, or capacity is ever
+ * inferred from session state, and every output store is disjoint from
+ * every operand, weight, and cache it reads.
+ */
+struct CacheAttentionStageRequest {
+    TensorView rotated_q;
+    TensorView rotated_k;
+    TensorView rotated_v;
+    TensorView k_cache;
+    TensorView v_cache;
+    TensorView residual_input;
+    TensorView o_weight;
+    TensorView attention_merged;
+    TensorView attention_output;
+    TensorView residual_output;
+    std::size_t a = 0;
+    std::size_t R = 0;
+    std::size_t C = 0;
+};
+
+/**
+ * Caller-owned logical cache/attention state mutated by the stage. It
+ * carries the published initialized prefix of the two persistent caches
+ * and the session failure state; neither is inferred, cached, or duplicated
+ * by the stage.
+ *
+ * `initialized_length` is the logical cache prefix that is readable after
+ * the call. It must equal the append offset `a` on entry, so an append can
+ * only continue the prefix that is already published. It is advanced to
+ * the checked `a+R` only after both independent cache appends completed
+ * successfully; a rejected request or a failed append leaves it exactly
+ * as supplied, because a positive OID proves admission, never
+ * initialized cache data.
+ *
+ * `failed` is the session poison flag. Any admission or completion failure
+ * of an already attempted submission sets it: there is no cache rollback,
+ * retry, or reuse, and the stage refuses a poisoned state on entry. A
+ * rejection raised before any submission (checked request validation or
+ * caller-workspace rejection) leaves it false, because it changes no cache
+ * row and accepts no operation.
+ */
+struct CacheAttentionStageState {
+    std::size_t initialized_length = 0;
+    bool failed = false;
+};
+
+/**
+ * Publish one run of rotated K/V rows into the persistent caches and
+ * produce the first residual of one TinyLlama decoder layer.
+ *
+ * Order and failure contract:
+ *
+ * 1. Checked request, stage-wide storage-disjointness, and workspace
+ *    validation plus the admission preflight of every downstream operation
+ *    run before the first submission: SDPA, the output projection, and the
+ *    first residual are all admitted with their actual operands, and the
+ *    caller range is validated against the largest of their queried
+ *    requirements. A rejected request throws the
+ *    established category (`std::invalid_argument`, `std::overflow_error`,
+ *    `std::logic_error` for a poisoned state, or the operation's
+ *    unsupported-operation error) with no cache row written, no length
+ *    published, and no operation submitted. `workspace` is passed only to
+ *    an operation whose queried requirement is positive; an operation
+ *    reporting a zero requirement consumes no scratch and receives the
+ *    empty default.
+ * 2. K and V are submitted as two separate accepted operations at offset
+ *    `a`. A rejected submission never suppresses the other append attempt,
+ *    and both accepted OIDs are waited even when the first wait fails.
+ * 3. Only when both append waits succeed does the stage publish exactly the
+ *    checked `a+R` and submit causal GQA SDPA with `a` and that prefix,
+ *    reading no cache row outside `0<=t<a+R`. SDPA completes before the
+ *    output projection is submitted, and the projection completes before
+ *    the first residual is submitted.
+ * 4. Any admission or completion failure poisons `failed`, throws the first
+ *    failure, and submits no dependent work: no SDPA after a partial
+ *    append success, and no output projection or residual after a failed
+ *    SDPA. Physical rows written by an already completed append are not
+ *    rolled back, and residual drain/release policy stays with the
+ *    enclosing session lifecycle.
+ */
+void run_cache_attention_stage(
+        DeviceOps& ops, CacheAttentionStageRequest& request,
+        RawWorkspaceView workspace, CacheAttentionStageState& state);
 
 }  // namespace iom::session_detail

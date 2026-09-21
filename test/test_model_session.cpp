@@ -5,9 +5,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,21 +19,33 @@
 
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
+#include "iom/device.hpp"
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
 
 #include "../src/session_internal.hpp"
 
-// Declared by the CPU driver in `src/cpu/queue.cpp`: process-wide
-// post-acceptance failure latches consumed inside an already accepted host
-// task. The linear latch is the gate/up projection seam of this stage; the
-// SiLU latch is the existing seam of the later activation boundary.
+// Declared by the CPU driver in `src/cpu/queue.cpp` and by the SDPA port in
+// `src/cpu/sdpa.cpp`: process-wide post-acceptance failure latches consumed
+// inside an already accepted host task, before that task writes its logical
+// output. The linear latch is the gate/up projection seam of the MLP stage and
+// the SiLU latch is the existing activation seam of that later boundary; the
+// SDPA and cache append latches are the attention and publication seams of the
+// cache-attention stage, and the shared CPU conformance driver declares the
+// same production seams, so no stage-specific fault API is introduced here.
 namespace iom::cpu_detail {
 
 void arm_linear_failure(std::size_t healthy_before, std::size_t failures) noexcept;
 void clear_linear_failure() noexcept;
 void arm_silu_failure() noexcept;
 void clear_silu_failure() noexcept;
+void arm_sdpa_failure() noexcept;
+void clear_sdpa_failure() noexcept;
+void arm_cache_append_failure() noexcept;
+void clear_cache_append_failure() noexcept;
+void arm_cache_append_wait_observation() noexcept;
+void clear_cache_append_wait_observation() noexcept;
+[[nodiscard]] std::size_t observed_cache_append_waits() noexcept;
 
 }  // namespace iom::cpu_detail
 
@@ -586,6 +601,532 @@ void mlp_fill_stores(MlpBank& bank) {
     return image;
 }
 
+// ---------------------------------------------------------------------------
+// Independent BF16 codec and host arithmetic
+// ---------------------------------------------------------------------------
+
+// Round-to-nearest-even narrowing of one finite float to BF16 bits. The
+// fixtures stay finite and small, so NaN and infinity handling is not
+// exercised here.
+[[nodiscard]] std::uint16_t encode_bf16(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t rounding = 0x7FFFu + ((bits >> 16) & 1u);
+    return static_cast<std::uint16_t>((bits + rounding) >> 16);
+}
+
+[[nodiscard]] float decode_bf16(std::uint16_t bits) {
+    const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+    float value = 0.0f;
+    std::memcpy(&value, &wide, sizeof(value));
+    return value;
+}
+
+[[nodiscard]] float round_bf16(float value) {
+    return decode_bf16(encode_bf16(value));
+}
+
+// Distance in BF16 units of the expected magnitude, with an absolute floor so
+// elements that land close to zero are compared against the vector's own
+// scale instead of an arbitrarily fine local unit.
+[[nodiscard]] bool within_bf16_units(
+        float actual, float expected, int units, float floor) {
+    if (!std::isfinite(actual) || !std::isfinite(expected)) {
+        return false;
+    }
+    const float ulp = expected == 0.0f
+            ? 0.0f
+            : std::ldexp(1.0f, std::ilogb(expected) - 7);
+    return std::fabs(actual - expected)
+            <= static_cast<float>(units) * ulp + floor;
+}
+
+void check_close(const std::vector<float>& actual,
+                 const std::vector<float>& expected, int units, float floor,
+                 const std::string& label) {
+    REQUIRE(actual.size() == expected.size());
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        CHECK_MESSAGE(
+                within_bf16_units(actual[index], expected[index], units, floor),
+                label << " element " << index << ": " << actual[index]
+                      << " vs " << expected[index]);
+    }
+}
+
+void check_identical(const std::vector<float>& actual,
+                     const std::vector<float>& expected,
+                     const std::string& label) {
+    REQUIRE(actual.size() == expected.size());
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        CHECK_MESSAGE(actual[index] == expected[index],
+                      label << " element " << index << ": " << actual[index]
+                            << " vs " << expected[index]);
+    }
+}
+
+// Deterministic small values that are exactly representable in BF16.
+class Values {
+public:
+    explicit Values(std::uint64_t seed) : state_(seed) {}
+
+    float next() {
+        state_ = state_ * 6364136223846793005ull + 1442695040888963407ull;
+        const std::uint64_t mantissa = (state_ >> 11) & 0x1FFFFFull;
+        const float unit =
+                static_cast<float>(mantissa) / static_cast<float>(0x1FFFFF);
+        return round_bf16((unit * 2.0f - 1.0f) * 0.75f);
+    }
+
+private:
+    std::uint64_t state_;
+};
+
+// ---------------------------------------------------------------------------
+// Fixed synthetic geometry and supplied tensor inventory
+// ---------------------------------------------------------------------------
+
+struct Geometry {
+    std::size_t query_heads = 4;
+    std::size_t kv_heads = 2;
+    std::size_t head_width = 3;  // non-tile-aligned head width
+    std::size_t rows = 2;
+    std::size_t capacity = 7;
+    std::size_t offset = 2;  // nonzero absolute cache prefix
+
+    [[nodiscard]] std::size_t features() const noexcept {
+        return query_heads * head_width;
+    }
+};
+
+// One CPU device, one in-order queue, and the complete supplied tensor set of
+// one stage call. Host copies of every seeded logical value stay available for
+// the independent reference.
+struct StageFixture {
+    explicit StageFixture(const Geometry& geometry)
+        : geometry(geometry),
+          arena(1u << 20),
+          allocator(arena.data(), arena.size(), 32),
+          device(iom::make_cpu_device(allocator)),
+          queue(device->create_ops()),
+          rotated_q(create({geometry.query_heads, geometry.rows,
+                            geometry.head_width})),
+          rotated_k(
+                  create({geometry.kv_heads, geometry.rows,
+                          geometry.head_width})),
+          rotated_v(
+                  create({geometry.kv_heads, geometry.rows,
+                          geometry.head_width})),
+          k_cache(create({geometry.kv_heads, geometry.capacity,
+                          geometry.head_width})),
+          v_cache(create({geometry.kv_heads, geometry.capacity,
+                          geometry.head_width})),
+          residual_input(create({geometry.rows, geometry.features()})),
+          o_weight(create({geometry.features(), geometry.features()})),
+          attention_merged(create({geometry.rows, geometry.features()})),
+          attention_output(create({geometry.rows, geometry.features()})),
+          residual_output(create({geometry.rows, geometry.features()})) {
+        const iom::WorkspaceRequirements requirements =
+                queue->sdpa_workspace_requirements(
+                        rotated_q->view(), k_cache->view(), v_cache->view(),
+                        attention_merged->view(), geometry.offset,
+                        geometry.offset + geometry.rows);
+        sdpa_workspace = device->create_workspace(requirements.bytes);
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::Tensor> create(
+            std::vector<std::size_t> shape) const {
+        return device->create_tensor(iom::TensorSpec{
+                iom::TensorShape{std::move(shape)}, iom::DataType::BF16});
+    }
+
+    void upload(iom::Tensor& tensor, const std::vector<float>& values) {
+        const iom::TensorSpec& spec = tensor.view().spec();
+        REQUIRE(values.size() == spec.shape.element_count());
+        std::vector<std::byte> bytes(spec.logical_nbytes());
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const std::uint16_t bits = encode_bf16(values[index]);
+            std::memcpy(bytes.data() + index * 2, &bits, sizeof(bits));
+        }
+        tensor.view().copy_from_host(bytes);
+    }
+
+    [[nodiscard]] std::vector<float> read(const iom::Tensor& tensor) const {
+        const iom::TensorSpec& spec = tensor.view().spec();
+        std::vector<std::byte> bytes(spec.logical_nbytes());
+        tensor.view().copy_to_host(bytes);
+        std::vector<float> values(bytes.size() / 2);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            std::uint16_t bits = 0;
+            std::memcpy(&bits, bytes.data() + index * 2, sizeof(bits));
+            values[index] = decode_bf16(bits);
+        }
+        return values;
+    }
+
+    // Seeds every supplied tensor: each cache keeps a published history prefix
+    // below `offset`, a distinctive sentinel across the appended row window,
+    // and a different sentinel through the uninitialized capacity tail.
+    void seed_all(std::uint64_t seed) {
+        Values generator(seed);
+        rotated_q_values = sample(generator, rotated_q->view());
+        rotated_k_values = sample(generator, rotated_k->view());
+        rotated_v_values = sample(generator, rotated_v->view());
+        residual_input_values = sample(generator, residual_input->view());
+        o_weight_values = sample(generator, o_weight->view());
+
+        k_cache_values.assign(k_cache->view().spec().shape.element_count(),
+                              kHistorySentinel);
+        v_cache_values.assign(v_cache->view().spec().shape.element_count(),
+                              kHistorySentinel);
+        for (std::size_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::size_t row = 0; row < geometry.capacity; ++row) {
+                for (std::size_t feature = 0; feature < geometry.head_width;
+                     ++feature) {
+                    const std::size_t index = cache_index(head, row, feature);
+                    const bool history = row < geometry.offset;
+                    const bool appended = row >= geometry.offset
+                            && row < geometry.offset + geometry.rows;
+                    k_cache_values[index] = history
+                            ? generator.next()
+                            : (appended ? kAppendedSentinel : kTailSentinel);
+                    v_cache_values[index] = history
+                            ? generator.next()
+                            : (appended ? kAppendedSentinel : kTailSentinel);
+                }
+            }
+        }
+
+        attention_merged_values.assign(
+                attention_merged->view().spec().shape.element_count(),
+                kOutputSentinel);
+        attention_output_values.assign(
+                attention_output->view().spec().shape.element_count(),
+                kOutputSentinel);
+        residual_output_values.assign(
+                residual_output->view().spec().shape.element_count(),
+                kOutputSentinel);
+
+        upload_all();
+    }
+
+    void upload_all() {
+        upload(*rotated_q, rotated_q_values);
+        upload(*rotated_k, rotated_k_values);
+        upload(*rotated_v, rotated_v_values);
+        upload(*k_cache, k_cache_values);
+        upload(*v_cache, v_cache_values);
+        upload(*residual_input, residual_input_values);
+        upload(*o_weight, o_weight_values);
+        upload(*attention_merged, attention_merged_values);
+        upload(*attention_output, attention_output_values);
+        upload(*residual_output, residual_output_values);
+    }
+
+    [[nodiscard]] std::size_t cache_index(
+            std::size_t head, std::size_t row,
+            std::size_t feature) const noexcept {
+        return head * geometry.capacity * geometry.head_width
+                + row * geometry.head_width + feature;
+    }
+
+    [[nodiscard]] std::vector<float> sample(
+            Values& generator, const iom::TensorView& view) {
+        std::vector<float> values(view.spec().shape.element_count());
+        for (float& value : values) {
+            value = generator.next();
+        }
+        return values;
+    }
+
+    struct Overrides {
+        std::optional<std::size_t> offset;
+        std::optional<std::size_t> rows;
+        std::optional<std::size_t> capacity;
+        const iom::TensorView* rotated_q = nullptr;
+        const iom::TensorView* rotated_k = nullptr;
+        const iom::TensorView* rotated_v = nullptr;
+        const iom::TensorView* k_cache = nullptr;
+        const iom::TensorView* v_cache = nullptr;
+        const iom::TensorView* residual_input = nullptr;
+        const iom::TensorView* attention_merged = nullptr;
+        const iom::TensorView* attention_output = nullptr;
+        const iom::TensorView* residual_output = nullptr;
+    };
+
+    [[nodiscard]] iom::session_detail::CacheAttentionStageRequest make_request()
+            const {
+        return make_request(Overrides{});
+    }
+
+    [[nodiscard]] iom::session_detail::CacheAttentionStageRequest make_request(
+            const Overrides& overrides) const {
+        return iom::session_detail::CacheAttentionStageRequest{
+                .rotated_q = overrides.rotated_q != nullptr
+                        ? *overrides.rotated_q
+                        : rotated_q->view(),
+                .rotated_k = overrides.rotated_k != nullptr
+                        ? *overrides.rotated_k
+                        : rotated_k->view(),
+                .rotated_v = overrides.rotated_v != nullptr
+                        ? *overrides.rotated_v
+                        : rotated_v->view(),
+                .k_cache = overrides.k_cache != nullptr
+                        ? *overrides.k_cache
+                        : k_cache->view(),
+                .v_cache = overrides.v_cache != nullptr
+                        ? *overrides.v_cache
+                        : v_cache->view(),
+                .residual_input = overrides.residual_input != nullptr
+                        ? *overrides.residual_input
+                        : residual_input->view(),
+                .o_weight = o_weight->view(),
+                .attention_merged = overrides.attention_merged != nullptr
+                        ? *overrides.attention_merged
+                        : attention_merged->view(),
+                .attention_output = overrides.attention_output != nullptr
+                        ? *overrides.attention_output
+                        : attention_output->view(),
+                .residual_output = overrides.residual_output != nullptr
+                        ? *overrides.residual_output
+                        : residual_output->view(),
+                .a = overrides.offset.value_or(geometry.offset),
+                .R = overrides.rows.value_or(geometry.rows),
+                .C = overrides.capacity.value_or(geometry.capacity)};
+    }
+
+    [[nodiscard]] iom::RawWorkspaceView workspace() const {
+        return sdpa_workspace->view();
+    }
+
+    [[nodiscard]] iom::DeviceOps& ops() const {
+        return *queue;
+    }
+
+    static constexpr float kHistorySentinel = -9.5f;
+    static constexpr float kAppendedSentinel = 3.5f;
+    static constexpr float kTailSentinel = -7.5f;
+    static constexpr float kOutputSentinel = 9.25f;
+
+    Geometry geometry;
+    std::vector<std::byte> arena;
+    iom::ListAllocator allocator;
+    std::unique_ptr<iom::Device> device;
+    std::unique_ptr<iom::DeviceOps> queue;
+    std::unique_ptr<iom::Tensor> rotated_q;
+    std::unique_ptr<iom::Tensor> rotated_k;
+    std::unique_ptr<iom::Tensor> rotated_v;
+    std::unique_ptr<iom::Tensor> k_cache;
+    std::unique_ptr<iom::Tensor> v_cache;
+    std::unique_ptr<iom::Tensor> residual_input;
+    std::unique_ptr<iom::Tensor> o_weight;
+    std::unique_ptr<iom::Tensor> attention_merged;
+    std::unique_ptr<iom::Tensor> attention_output;
+    std::unique_ptr<iom::Tensor> residual_output;
+    std::unique_ptr<iom::RawWorkspace> sdpa_workspace;
+
+    std::vector<float> rotated_q_values;
+    std::vector<float> rotated_k_values;
+    std::vector<float> rotated_v_values;
+    std::vector<float> k_cache_values;
+    std::vector<float> v_cache_values;
+    std::vector<float> residual_input_values;
+    std::vector<float> o_weight_values;
+    std::vector<float> attention_merged_values;
+    std::vector<float> attention_output_values;
+    std::vector<float> residual_output_values;
+};
+
+// ---------------------------------------------------------------------------
+// Independent host reference of the documented stage equations
+// ---------------------------------------------------------------------------
+
+// Causal grouped-query SDPA over the published prefix `length`: scores and the
+// max-subtracted softmax in FP32, one BF16 probability boundary, and one BF16
+// store per merged output element.
+[[nodiscard]] std::vector<float> reference_merged(
+        const Geometry& geometry, std::size_t offset,
+        const std::vector<float>& queries,
+        const std::vector<float>& k_cache,
+        const std::vector<float>& v_cache, std::size_t length) {
+    const std::size_t heads = geometry.query_heads;
+    const std::size_t kv_heads = geometry.kv_heads;
+    const std::size_t width = geometry.head_width;
+    const std::size_t rows = geometry.rows;
+    const std::size_t features = geometry.features();
+    const std::size_t group = heads / kv_heads;
+    std::vector<float> merged(rows * features, 0.0f);
+    for (std::size_t head = 0; head < heads; ++head) {
+        const std::size_t kv_head = head / group;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t visible = std::min(length, offset + row + 1);
+            std::vector<float> scores(visible, 0.0f);
+            for (std::size_t token = 0; token < visible; ++token) {
+                float dot = 0.0f;
+                for (std::size_t feature = 0; feature < width; ++feature) {
+                    dot += queries[(head * rows + row) * width + feature]
+                           * k_cache[(kv_head * geometry.capacity + token)
+                                             * width
+                                     + feature];
+                }
+                scores[token] = dot / std::sqrt(static_cast<float>(width));
+            }
+            float maximum = scores[0];
+            for (const float score : scores) {
+                maximum = std::max(maximum, score);
+            }
+            float sum = 0.0f;
+            std::vector<float> probabilities(visible, 0.0f);
+            for (std::size_t token = 0; token < visible; ++token) {
+                probabilities[token] = std::exp(scores[token] - maximum);
+                sum += probabilities[token];
+            }
+            for (float& probability : probabilities) {
+                probability = round_bf16(probability / sum);
+            }
+            for (std::size_t feature = 0; feature < width; ++feature) {
+                float accumulated = 0.0f;
+                for (std::size_t token = 0; token < visible; ++token) {
+                    accumulated +=
+                            probabilities[token]
+                            * v_cache[(kv_head * geometry.capacity + token)
+                                              * width
+                                      + feature];
+                }
+                merged[row * features + head * width + feature] =
+                        round_bf16(accumulated);
+            }
+        }
+    }
+    return merged;
+}
+
+// Ordinary `[out,in]` output projection of one merged attention matrix.
+[[nodiscard]] std::vector<float> reference_projected(
+        const Geometry& geometry, const std::vector<float>& merged,
+        const std::vector<float>& weight) {
+    const std::size_t rows = geometry.rows;
+    const std::size_t features = geometry.features();
+    std::vector<float> projected(rows * features, 0.0f);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t out = 0; out < features; ++out) {
+            float accumulated = 0.0f;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                accumulated += merged[row * features + feature]
+                               * weight[out * features + feature];
+            }
+            projected[row * features + out] = round_bf16(accumulated);
+        }
+    }
+    return projected;
+}
+
+[[nodiscard]] std::vector<float> reference_residual(
+        const std::vector<float>& input,
+        const std::vector<float>& projected) {
+    REQUIRE(input.size() == projected.size());
+    std::vector<float> residual(input.size(), 0.0f);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        residual[index] = round_bf16(input[index] + projected[index]);
+    }
+    return residual;
+}
+
+// One cache with its appended row window replaced by `rows`, as [Hkv,R,D].
+[[nodiscard]] std::vector<float> with_appended_rows(
+        const Geometry& geometry, const std::vector<float>& cache,
+        const std::vector<float>& rows) {
+    std::vector<float> expected = cache;
+    for (std::size_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::size_t row = 0; row < geometry.rows; ++row) {
+            for (std::size_t feature = 0; feature < geometry.head_width;
+                 ++feature) {
+                expected[head * geometry.capacity * geometry.head_width
+                         + (geometry.offset + row) * geometry.head_width
+                         + feature] =
+                        rows[(head * geometry.rows + row) * geometry.head_width
+                             + feature];
+            }
+        }
+    }
+    return expected;
+}
+
+// The appended row window of one head-planar cache, in logical order.
+[[nodiscard]] std::vector<float> cache_window(
+        const Geometry& geometry, const std::vector<float>& rows) {
+    const std::size_t width = geometry.head_width;
+    std::vector<float> window(
+            geometry.kv_heads * geometry.rows * width, 0.0f);
+    for (std::size_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::size_t row = 0; row < geometry.rows; ++row) {
+            for (std::size_t feature = 0; feature < width; ++feature) {
+                window[(head * geometry.rows + row) * width + feature] =
+                        rows[head * geometry.capacity * width
+                             + (geometry.offset + row) * width + feature];
+            }
+        }
+    }
+    return window;
+}
+
+// Runs the private stage once and reports the mutated state plus the value of
+// every supplied store afterwards.
+struct StageOutcome {
+    iom::session_detail::CacheAttentionStageState state{};
+    std::vector<float> k_cache;
+    std::vector<float> v_cache;
+    std::vector<float> merged;
+    std::vector<float> projected;
+    std::vector<float> residual;
+    std::exception_ptr failure;
+};
+
+[[nodiscard]] StageOutcome run_stage(
+        StageFixture& fixture,
+        iom::session_detail::CacheAttentionStageRequest& request,
+        iom::RawWorkspaceView workspace) {
+    StageOutcome outcome;
+    outcome.state.initialized_length = request.a;
+    try {
+        iom::session_detail::run_cache_attention_stage(
+                fixture.ops(), request, workspace, outcome.state);
+    } catch (...) {
+        outcome.failure = std::current_exception();
+    }
+    outcome.k_cache = fixture.read(*fixture.k_cache);
+    outcome.v_cache = fixture.read(*fixture.v_cache);
+    outcome.merged = fixture.read(*fixture.attention_merged);
+    outcome.projected = fixture.read(*fixture.attention_output);
+    outcome.residual = fixture.read(*fixture.residual_output);
+    return outcome;
+}
+
+// The largest scratch requirement of the three sequential downstream
+// operations, computed exactly as the stage does from the actual operands.
+[[nodiscard]] iom::WorkspaceRequirements combined_requirement(
+        StageFixture& fixture) {
+    const iom::session_detail::CacheAttentionStageRequest request =
+            fixture.make_request();
+    const iom::WorkspaceRequirements sdpa =
+            fixture.ops().sdpa_workspace_requirements(
+                    request.rotated_q, request.k_cache, request.v_cache,
+                    request.attention_merged, request.a,
+                    request.a + request.R);
+    const iom::WorkspaceRequirements projection =
+            fixture.ops().linear_workspace_requirements(
+                    request.attention_merged, request.o_weight,
+                    request.attention_output, 0, request.R,
+                    iom::LinearOutputLayout::ordinary, 1,
+                    fixture.geometry.features());
+    const iom::WorkspaceRequirements residual =
+            fixture.ops().add_workspace_requirements(
+                    request.residual_input, request.attention_output,
+                    request.residual_output);
+    return {std::max({sdpa.bytes, projection.bytes, residual.bytes}),
+            std::max({sdpa.alignment, projection.alignment,
+                      residual.alignment})};
+}
+
 }  // namespace
 
 TEST_CASE("TinyLlama MLP stage matches an independent reference for prefill and R1 decode") {
@@ -941,5 +1482,710 @@ TEST_CASE("TinyLlama MLP stage drains both projection branches after an accepted
         mlp_check_untouched(*bank.product, "product");
         mlp_check_untouched(*bank.down, "down projection");
         mlp_check_untouched(*bank.next_x, "next residual");
+    }
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage publishes a checked prefix and "
+        "forms the first residual") {
+    StageFixture fixture{Geometry{}};
+    fixture.seed_all(0x5F1D2B3C4D5E6F70ull);
+    auto request = fixture.make_request();
+
+    // Both accepted append OIDs must be waited by the stage itself before it
+    // returns: the observation seam counts caller waits that observed an
+    // accepted append completion, which row contents alone cannot show.
+    iom::cpu_detail::arm_cache_append_wait_observation();
+    const StageOutcome outcome =
+            run_stage(fixture, request, fixture.workspace());
+    CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 2u);
+    iom::cpu_detail::clear_cache_append_wait_observation();
+    REQUIRE(outcome.failure == nullptr);
+
+    // Exactly the checked prefix is published, and both appends succeeded.
+    CHECK_EQ(outcome.state.initialized_length,
+             fixture.geometry.offset + fixture.geometry.rows);
+    CHECK_FALSE(outcome.state.failed);
+
+    // Rotated K and V rows landed independently in their own caches, and no
+    // other cache row changed.
+    check_identical(cache_window(fixture.geometry, outcome.k_cache),
+                    fixture.rotated_k_values, "appended K rows");
+    check_identical(cache_window(fixture.geometry, outcome.v_cache),
+                    fixture.rotated_v_values, "appended V rows");
+    check_identical(outcome.k_cache,
+                    with_appended_rows(fixture.geometry,
+                                       fixture.k_cache_values,
+                                       fixture.rotated_k_values),
+                    "K cache after publication");
+    check_identical(outcome.v_cache,
+                    with_appended_rows(fixture.geometry,
+                                       fixture.v_cache_values,
+                                       fixture.rotated_v_values),
+                    "V cache after publication");
+
+    // Attention, output projection, and first residual match the independent
+    // reference over the published prefix.
+    const std::vector<float> expected_merged = reference_merged(
+            fixture.geometry, fixture.geometry.offset, fixture.rotated_q_values,
+            with_appended_rows(fixture.geometry, fixture.k_cache_values,
+                               fixture.rotated_k_values),
+            with_appended_rows(fixture.geometry, fixture.v_cache_values,
+                               fixture.rotated_v_values),
+            fixture.geometry.offset + fixture.geometry.rows);
+    check_close(outcome.merged, expected_merged, 2, 1e-3f,
+                "merged attention");
+
+    const std::vector<float> expected_projected =
+            reference_projected(fixture.geometry, outcome.merged,
+                                fixture.o_weight_values);
+    check_close(outcome.projected, expected_projected, 2, 1e-3f,
+                "output projection");
+    check_close(outcome.residual,
+                reference_residual(fixture.residual_input_values,
+                                   outcome.projected),
+                2, 1e-3f, "first residual");
+
+    // The complete chain, recomputed from the supplied inputs alone, is
+    // compared within the propagated budget of the one stored boundary the
+    // device may deviate by: two merged units per element through `F` weighted
+    // terms. The tight checks above pin the exact stored values.
+    const std::vector<float> chained_projected = reference_projected(
+            fixture.geometry, expected_merged, fixture.o_weight_values);
+    check_close(outcome.projected, chained_projected, 2, 2e-2f,
+                "output projection from supplied inputs");
+    check_close(outcome.residual,
+                reference_residual(fixture.residual_input_values,
+                                   chained_projected),
+                2, 2e-2f, "first residual from supplied inputs");
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage masks future tokens and maps grouped "
+        "heads") {
+    const Geometry geometry{};
+    constexpr std::uint64_t seed = 0x0BADF00DCAFEF00Dull;
+    StageFixture base{geometry};
+    base.seed_all(seed);
+    auto base_request = base.make_request();
+    const StageOutcome base_outcome =
+            run_stage(base, base_request, base.workspace());
+    REQUIRE(base_outcome.failure == nullptr);
+
+    // The appended row at cache row `offset+1` is a future token for query row
+    // 0 and a visible token for query row 1: perturbing it must not move row 0
+    // at all while it does move row 1.
+    StageFixture future{geometry};
+    future.seed_all(seed);
+    std::vector<float> perturbed_k = future.rotated_k_values;
+    std::vector<float> perturbed_v = future.rotated_v_values;
+    for (std::size_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::size_t feature = 0; feature < geometry.head_width;
+             ++feature) {
+            const std::size_t index =
+                    (head * geometry.rows + 1) * geometry.head_width + feature;
+            perturbed_k[index] = round_bf16(perturbed_k[index] + 0.5f);
+            perturbed_v[index] = round_bf16(perturbed_v[index] - 0.25f);
+        }
+    }
+    REQUIRE(perturbed_k != future.rotated_k_values);
+    future.rotated_k_values = perturbed_k;
+    future.rotated_v_values = perturbed_v;
+    future.upload_all();
+    auto future_request = future.make_request();
+    const StageOutcome future_outcome =
+            run_stage(future, future_request, future.workspace());
+    REQUIRE(future_outcome.failure == nullptr);
+
+    const std::size_t features = geometry.features();
+    bool row_one_changed = false;
+    for (std::size_t index = 0; index < features; ++index) {
+        CHECK_MESSAGE(future_outcome.merged[index] == base_outcome.merged[index],
+                      "row 0 element " << index << ": "
+                                       << future_outcome.merged[index]
+                                       << " vs " << base_outcome.merged[index]);
+        row_one_changed =
+                row_one_changed
+                || future_outcome.merged[features + index]
+                           != base_outcome.merged[features + index];
+    }
+    CHECK(row_one_changed);
+
+    // Distinct grouped-query head mapping: KV head 0 feeds exactly query heads
+    // 0 and 1, and KV head 1 feeds exactly query heads 2 and 3.
+    StageFixture grouped{geometry};
+    grouped.seed_all(seed);
+    std::vector<float> grouped_k = grouped.rotated_k_values;
+    std::vector<float> grouped_v = grouped.rotated_v_values;
+    for (std::size_t row = 0; row < geometry.rows; ++row) {
+        for (std::size_t feature = 0; feature < geometry.head_width;
+             ++feature) {
+            const std::size_t index =
+                    (geometry.rows + row) * geometry.head_width + feature;
+            grouped_k[index] = round_bf16(grouped_k[index] + 0.5f);
+            grouped_v[index] = round_bf16(grouped_v[index] - 0.25f);
+        }
+    }
+    REQUIRE(grouped_k != grouped.rotated_k_values);
+    grouped.rotated_k_values = grouped_k;
+    grouped.rotated_v_values = grouped_v;
+    grouped.upload_all();
+    auto grouped_request = grouped.make_request();
+    const StageOutcome grouped_outcome =
+            run_stage(grouped, grouped_request, grouped.workspace());
+    REQUIRE(grouped_outcome.failure == nullptr);
+
+    const std::size_t group = geometry.query_heads / geometry.kv_heads;
+    bool grouped_changed = false;
+    for (std::size_t row = 0; row < geometry.rows; ++row) {
+        for (std::size_t head = 0; head < geometry.query_heads; ++head) {
+            for (std::size_t feature = 0; feature < geometry.head_width;
+                 ++feature) {
+                const std::size_t index =
+                        (row * geometry.query_heads + head)
+                                * geometry.head_width
+                        + feature;
+                if (head < group) {
+                    CHECK_MESSAGE(grouped_outcome.merged[index]
+                                          == base_outcome.merged[index],
+                                  "row " << row << " head " << head
+                                         << " feature " << feature << ": "
+                                         << grouped_outcome.merged[index]
+                                         << " vs "
+                                         << base_outcome.merged[index]);
+                } else if (grouped_outcome.merged[index]
+                           != base_outcome.merged[index]) {
+                    grouped_changed = true;
+                }
+            }
+        }
+    }
+    CHECK(grouped_changed);
+
+    // The uninitialized capacity tail is never read: a different tail sentinel
+    // changes no output, projection, or residual value.
+    StageFixture tail{geometry};
+    tail.seed_all(seed);
+    for (std::size_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::size_t row = geometry.offset + geometry.rows;
+             row < geometry.capacity; ++row) {
+            for (std::size_t feature = 0; feature < geometry.head_width;
+                 ++feature) {
+                tail.k_cache_values[tail.cache_index(head, row, feature)] =
+                        21.75f;
+                tail.v_cache_values[tail.cache_index(head, row, feature)] =
+                        -18.5f;
+            }
+        }
+    }
+    tail.upload_all();
+    auto tail_request = tail.make_request();
+    const StageOutcome tail_outcome =
+            run_stage(tail, tail_request, tail.workspace());
+    REQUIRE(tail_outcome.failure == nullptr);
+    check_identical(tail_outcome.merged, base_outcome.merged,
+                    "merged attention with a perturbed uninitialized tail");
+    check_identical(tail_outcome.projected, base_outcome.projected,
+                    "output projection with a perturbed uninitialized tail");
+    check_identical(tail_outcome.residual, base_outcome.residual,
+                    "first residual with a perturbed uninitialized tail");
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage fills exactly the published prefix at "
+        "exact capacity and on a decode row") {
+    // Prefill rows that exactly fill the persistent cache capacity.
+    Geometry prefill;
+    prefill.rows = 4;
+    prefill.capacity = 5;
+    prefill.offset = 1;
+    StageFixture full{prefill};
+    full.seed_all(0x1122334455667788ull);
+    auto full_request = full.make_request();
+    const StageOutcome full_outcome =
+            run_stage(full, full_request, full.workspace());
+    REQUIRE(full_outcome.failure == nullptr);
+    CHECK_EQ(full_outcome.state.initialized_length, prefill.capacity);
+    check_identical(cache_window(prefill, full_outcome.k_cache),
+                    full.rotated_k_values, "exact-capacity K rows");
+    check_identical(cache_window(prefill, full_outcome.v_cache),
+                    full.rotated_v_values, "exact-capacity V rows");
+    check_identical(full_outcome.k_cache,
+                    with_appended_rows(prefill, full.k_cache_values,
+                                       full.rotated_k_values),
+                    "exact-capacity K cache");
+    check_identical(full_outcome.v_cache,
+                    with_appended_rows(prefill, full.v_cache_values,
+                                       full.rotated_v_values),
+                    "exact-capacity V cache");
+    check_close(full_outcome.merged,
+                reference_merged(
+                        prefill, prefill.offset, full.rotated_q_values,
+                        with_appended_rows(prefill, full.k_cache_values,
+                                           full.rotated_k_values),
+                        with_appended_rows(prefill, full.v_cache_values,
+                                           full.rotated_v_values),
+                        prefill.capacity),
+                2, 1e-3f, "exact-capacity merged attention");
+
+    // One decode row at a nonzero absolute position, with `L < C`.
+    Geometry decode;
+    decode.rows = 1;
+    decode.capacity = 5;
+    decode.offset = 3;
+    StageFixture single{decode};
+    single.seed_all(0xC0FFEE0BADF00D11ull);
+    auto single_request = single.make_request();
+    const StageOutcome single_outcome =
+            run_stage(single, single_request, single.workspace());
+    REQUIRE(single_outcome.failure == nullptr);
+    CHECK_EQ(single_outcome.state.initialized_length, decode.offset + 1);
+    check_identical(cache_window(decode, single_outcome.k_cache),
+                    single.rotated_k_values, "decode K row");
+    check_identical(cache_window(decode, single_outcome.v_cache),
+                    single.rotated_v_values, "decode V row");
+    check_identical(single_outcome.k_cache,
+                    with_appended_rows(decode, single.k_cache_values,
+                                       single.rotated_k_values),
+                    "decode K cache");
+    check_identical(single_outcome.v_cache,
+                    with_appended_rows(decode, single.v_cache_values,
+                                       single.rotated_v_values),
+                    "decode V cache");
+    check_close(single_outcome.merged,
+                reference_merged(
+                        decode, decode.offset, single.rotated_q_values,
+                        with_appended_rows(decode, single.k_cache_values,
+                                           single.rotated_k_values),
+                        with_appended_rows(decode, single.v_cache_values,
+                                           single.rotated_v_values),
+                        decode.offset + 1),
+                2, 1e-3f, "decode merged attention");
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage refuses incomplete publication and "
+        "never submits SDPA") {
+    // A geometry whose append row window exactly covers the persistent cache
+    // lets a rejected append borrow its own destination as the source, which
+    // the cache append admission rejects before any effect.
+    Geometry geometry;
+    geometry.rows = 4;
+    geometry.capacity = 4;
+    geometry.offset = 0;
+    constexpr std::uint64_t seed = 0x2468ACE013579BDFull;
+
+    // An aliased K cache is rejected by the stage-wide disjointness check
+    // before any submission: no cache row moves, no store is touched, no
+    // prefix is published, the state is not poisoned, and neither armed latch
+    // is consumed.
+    {
+        StageFixture fixture{geometry};
+        fixture.seed_all(seed);
+        // Both latches must survive the rejected run: a consumed append latch
+        // would mean an append was submitted, and a consumed SDPA latch would
+        // mean the stage submitted attention after a partial append success.
+        iom::cpu_detail::arm_sdpa_failure();
+        iom::cpu_detail::arm_cache_append_failure();
+        const iom::TensorView aliased_k = fixture.k_cache->view();
+        auto request = fixture.make_request(
+                StageFixture::Overrides{.rotated_k = &aliased_k});
+
+        iom::session_detail::CacheAttentionStageState state;
+        state.initialized_length = request.a;
+        CHECK_THROWS_AS(
+                iom::session_detail::run_cache_attention_stage(
+                        fixture.ops(), request, fixture.workspace(), state),
+                std::invalid_argument);
+        CHECK_FALSE(state.failed);
+        CHECK_EQ(state.initialized_length, geometry.offset);
+
+        check_identical(fixture.read(*fixture.k_cache),
+                        fixture.k_cache_values,
+                        "K cache after a rejected aliased request");
+        check_identical(fixture.read(*fixture.v_cache),
+                        fixture.v_cache_values,
+                        "V cache after a rejected aliased request");
+        check_identical(fixture.read(*fixture.attention_merged),
+                        fixture.attention_merged_values,
+                        "merged attention after a rejected aliased request");
+        check_identical(fixture.read(*fixture.attention_output),
+                        fixture.attention_output_values,
+                        "attention output after a rejected aliased request");
+        check_identical(fixture.read(*fixture.residual_output),
+                        fixture.residual_output_values,
+                        "residual output after a rejected aliased request");
+
+        // The append latch is still armed, so no append was submitted: a
+        // direct, otherwise valid append consumes it and fails its wait.
+        const iom::oid append = fixture.ops().cache_append(
+                fixture.rotated_k->view(), fixture.k_cache->view(),
+                geometry.offset);
+        REQUIRE(iom::oid_is_token(append));
+        CHECK_THROWS_AS(fixture.ops().wait(append), std::runtime_error);
+        iom::cpu_detail::clear_cache_append_failure();
+
+        // The SDPA latch is still armed for the same reason.
+        const iom::oid token = fixture.ops().sdpa(
+                fixture.rotated_q->view(), fixture.k_cache->view(),
+                fixture.v_cache->view(), fixture.attention_merged->view(),
+                geometry.offset, geometry.offset + geometry.rows,
+                fixture.workspace());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_THROWS_AS(fixture.ops().wait(token), std::runtime_error);
+        iom::cpu_detail::clear_sdpa_failure();
+    }
+
+    // The mirror case: an aliased V cache is rejected before any submission
+    // with the same no-effect and no-poison guarantees, and the armed SDPA
+    // latch survives.
+    {
+        StageFixture fixture{geometry};
+        fixture.seed_all(seed);
+        iom::cpu_detail::arm_sdpa_failure();
+        const iom::TensorView aliased_v = fixture.v_cache->view();
+        auto request = fixture.make_request(
+                StageFixture::Overrides{.rotated_v = &aliased_v});
+
+        iom::session_detail::CacheAttentionStageState state;
+        state.initialized_length = request.a;
+        CHECK_THROWS_AS(
+                iom::session_detail::run_cache_attention_stage(
+                        fixture.ops(), request, fixture.workspace(), state),
+                std::invalid_argument);
+        CHECK_FALSE(state.failed);
+        CHECK_EQ(state.initialized_length, geometry.offset);
+
+        check_identical(fixture.read(*fixture.k_cache),
+                        fixture.k_cache_values,
+                        "K cache after a rejected aliased request");
+        check_identical(fixture.read(*fixture.v_cache),
+                        fixture.v_cache_values,
+                        "V cache after a rejected aliased request");
+        check_identical(fixture.read(*fixture.attention_merged),
+                        fixture.attention_merged_values,
+                        "merged attention after a rejected aliased request");
+        check_identical(fixture.read(*fixture.attention_output),
+                        fixture.attention_output_values,
+                        "attention output after a rejected aliased request");
+        check_identical(fixture.read(*fixture.residual_output),
+                        fixture.residual_output_values,
+                        "residual output after a rejected aliased request");
+
+        const iom::oid token = fixture.ops().sdpa(
+                fixture.rotated_q->view(), fixture.k_cache->view(),
+                fixture.v_cache->view(), fixture.attention_merged->view(),
+                geometry.offset, geometry.offset + geometry.rows,
+                fixture.workspace());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_THROWS_AS(fixture.ops().wait(token), std::runtime_error);
+        iom::cpu_detail::clear_sdpa_failure();
+    }
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage attempts both append waits after an "
+        "append completion failure") {
+    const Geometry geometry{};
+    constexpr std::uint64_t seed = 0x0A11CE0BEEF01234ull;
+
+    // K accepted and failed at completion while V was accepted and succeeded:
+    // the K wait throws, the independent V wait still runs, no prefix is
+    // published, and no downstream work is submitted.
+    {
+        StageFixture fixture{geometry};
+        fixture.seed_all(seed);
+        iom::cpu_detail::arm_cache_append_failure();
+        // The SDPA latch survives only when no SDPA was submitted after the
+        // append failure.
+        iom::cpu_detail::arm_sdpa_failure();
+        iom::cpu_detail::arm_cache_append_wait_observation();
+        auto request = fixture.make_request();
+        iom::session_detail::CacheAttentionStageState state;
+        state.initialized_length = request.a;
+        CHECK_THROWS_AS(
+                iom::session_detail::run_cache_attention_stage(
+                        fixture.ops(), request, fixture.workspace(), state),
+                std::runtime_error);
+        // K's throwing wait surfaces the injected completion failure, which
+        // proves that wait ran; the seam then proves the independent V wait ran
+        // too, because only a caller wait records V's accepted sequence.
+        CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 1u);
+        iom::cpu_detail::clear_cache_append_wait_observation();
+        iom::cpu_detail::clear_cache_append_failure();
+
+        CHECK(state.failed);
+        CHECK_EQ(state.initialized_length, geometry.offset);
+        // The failing append wrote no row, while the independently accepted V
+        // append completed.
+        check_identical(fixture.read(*fixture.k_cache),
+                        fixture.k_cache_values,
+                        "K cache after a failed K completion");
+        check_identical(fixture.read(*fixture.v_cache),
+                        with_appended_rows(geometry, fixture.v_cache_values,
+                                           fixture.rotated_v_values),
+                        "V cache after a successful V append");
+        check_identical(fixture.read(*fixture.attention_merged),
+                        fixture.attention_merged_values,
+                        "merged attention after an append completion failure");
+        check_identical(fixture.read(*fixture.attention_output),
+                        fixture.attention_output_values,
+                        "attention output after an append completion failure");
+        check_identical(fixture.read(*fixture.residual_output),
+                        fixture.residual_output_values,
+                        "residual output after an append completion failure");
+
+        // The latch is still armed, so the stage submitted no SDPA.
+        const iom::oid token = fixture.ops().sdpa(
+                fixture.rotated_q->view(), fixture.k_cache->view(),
+                fixture.v_cache->view(), fixture.attention_merged->view(),
+                geometry.offset, geometry.offset + geometry.rows,
+                fixture.workspace());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_THROWS_AS(fixture.ops().wait(token), std::runtime_error);
+        iom::cpu_detail::clear_sdpa_failure();
+    }
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage preflights downstream scratch before "
+        "any cache mutation") {
+    const Geometry geometry{};
+    StageFixture fixture{geometry};
+    fixture.seed_all(0x5EED0F5C2A7B9D31ull);
+
+    // SDPA, the output projection, and the first residual are admitted with
+    // their actual operands before the first submission.
+    const iom::WorkspaceRequirements combined = combined_requirement(fixture);
+    REQUIRE(combined.bytes > 0);
+    REQUIRE(combined.bytes <= fixture.workspace().byte_size());
+
+    // A range that satisfies the largest requirement completes the stage.
+    auto request = fixture.make_request();
+    const StageOutcome outcome =
+            run_stage(fixture, request, fixture.workspace());
+    REQUIRE(outcome.failure == nullptr);
+    CHECK_FALSE(outcome.state.failed);
+    CHECK_EQ(outcome.state.initialized_length,
+             geometry.offset + geometry.rows);
+
+    // One byte less than the largest requirement is rejected before the first
+    // append: no cache row moves, no output store is touched, and no prefix is
+    // published or failure state recorded.
+    StageFixture short_fixture{geometry};
+    short_fixture.seed_all(0x5EED0F5C2A7B9D31ull);
+    const std::unique_ptr<iom::RawWorkspace> short_workspace =
+            short_fixture.device->create_workspace(combined.bytes - 1);
+    auto short_request = short_fixture.make_request();
+    iom::session_detail::CacheAttentionStageState state;
+    state.initialized_length = short_request.a;
+    CHECK_THROWS_AS(
+            iom::session_detail::run_cache_attention_stage(
+                    short_fixture.ops(), short_request,
+                    short_workspace->view(), state),
+            std::invalid_argument);
+    CHECK_FALSE(state.failed);
+    CHECK_EQ(state.initialized_length, geometry.offset);
+    check_identical(short_fixture.read(*short_fixture.k_cache),
+                    short_fixture.k_cache_values,
+                    "K cache after a short scratch range");
+    check_identical(short_fixture.read(*short_fixture.v_cache),
+                    short_fixture.v_cache_values,
+                    "V cache after a short scratch range");
+    check_identical(short_fixture.read(*short_fixture.attention_merged),
+                    short_fixture.attention_merged_values,
+                    "merged attention after a short scratch range");
+    check_identical(short_fixture.read(*short_fixture.attention_output),
+                    short_fixture.attention_output_values,
+                    "attention output after a short scratch range");
+    check_identical(short_fixture.read(*short_fixture.residual_output),
+                    short_fixture.residual_output_values,
+                    "residual output after a short scratch range");
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage poisons the state after an accepted "
+        "SDPA failure") {
+    const Geometry geometry{};
+    StageFixture fixture{geometry};
+    fixture.seed_all(0x13572468ACE0BDF1ull);
+
+    iom::cpu_detail::arm_sdpa_failure();
+    auto request = fixture.make_request();
+    const StageOutcome outcome =
+            run_stage(fixture, request, fixture.workspace());
+    REQUIRE(outcome.failure != nullptr);
+    CHECK_THROWS_AS(std::rethrow_exception(outcome.failure), std::runtime_error);
+    iom::cpu_detail::clear_sdpa_failure();
+
+    // Both appends completed, so the checked prefix is published, while the
+    // failed SDPA submits no projection or residual.
+    CHECK(outcome.state.failed);
+    CHECK_EQ(outcome.state.initialized_length,
+             geometry.offset + geometry.rows);
+    check_identical(outcome.k_cache,
+                    with_appended_rows(geometry, fixture.k_cache_values,
+                                       fixture.rotated_k_values),
+                    "K cache after SDPA failure");
+    check_identical(outcome.v_cache,
+                    with_appended_rows(geometry, fixture.v_cache_values,
+                                       fixture.rotated_v_values),
+                    "V cache after SDPA failure");
+    check_identical(outcome.merged, fixture.attention_merged_values,
+                    "merged attention after SDPA failure");
+    check_identical(outcome.projected, fixture.attention_output_values,
+                    "attention output after SDPA failure");
+    check_identical(outcome.residual, fixture.residual_output_values,
+                    "residual output after SDPA failure");
+
+    // A poisoned state rejects reuse before any submission: no cache row is
+    // appended twice and no published length changes.
+    auto retry = fixture.make_request();
+    iom::session_detail::CacheAttentionStageState poisoned;
+    poisoned.initialized_length = retry.a;
+    poisoned.failed = true;
+    CHECK_THROWS_AS(
+            iom::session_detail::run_cache_attention_stage(
+                    fixture.ops(), retry, fixture.workspace(), poisoned),
+            std::logic_error);
+    CHECK_EQ(poisoned.initialized_length, geometry.offset);
+    check_identical(fixture.read(*fixture.k_cache), outcome.k_cache,
+                    "K cache after refused reuse");
+    check_identical(fixture.read(*fixture.v_cache), outcome.v_cache,
+                    "V cache after refused reuse");
+
+    // The queue itself stays healthy for later independent work.
+    const iom::oid token = fixture.ops().sdpa(
+            fixture.rotated_q->view(), fixture.k_cache->view(),
+            fixture.v_cache->view(), fixture.attention_merged->view(),
+            geometry.offset, geometry.offset + geometry.rows,
+            fixture.workspace());
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(fixture.ops().wait(token));
+}
+
+TEST_CASE(
+        "TinyLlama cache attention stage rejects malformed requests before any "
+        "submission") {
+    enum class Category { Invalid, Overflow, Logic };
+
+    const Geometry geometry{};
+    StageFixture fixture{geometry};
+    fixture.seed_all(0x77777777AAAAAAAAull);
+
+    const iom::TensorView rank_two = fixture.residual_input->view();
+    const iom::TensorView short_query =
+            fixture.rotated_q->view().slice(0, 0, 3);
+    const std::unique_ptr<iom::Tensor> narrow =
+            fixture.create({geometry.rows, geometry.features() - 1});
+    const iom::TensorView short_merged = narrow->view();
+    const iom::TensorView merged_view = fixture.attention_merged->view();
+    const iom::TensorView residual_input_view =
+            fixture.residual_input->view();
+    const iom::TensorView attention_output_view =
+            fixture.attention_output->view();
+    const iom::TensorView k_cache_view = fixture.k_cache->view();
+    const iom::TensorView v_cache_view = fixture.v_cache->view();
+    const iom::RawWorkspaceView empty_workspace{};
+    const iom::WorkspaceRequirements combined = combined_requirement(fixture);
+    REQUIRE(combined.bytes > 1);
+    const std::unique_ptr<iom::RawWorkspace> short_workspace =
+            fixture.device->create_workspace(combined.bytes - 1);
+    const iom::RawWorkspaceView short_workspace_view =
+            short_workspace->view();
+
+    struct Rejection {
+        const char* label;
+        StageFixture::Overrides overrides;
+        std::size_t initialized_length;
+        bool poisoned_state;
+        const iom::RawWorkspaceView* workspace;
+        Category category;
+    };
+    const Rejection rejections[] = {
+            {"zero rows", {.rows = 0}, geometry.offset, false, nullptr,
+             Category::Invalid},
+            {"zero capacity", {.capacity = 0}, geometry.offset, false, nullptr,
+             Category::Invalid},
+            {"offset beyond capacity", {.offset = geometry.capacity + 1},
+             geometry.capacity + 1, false, nullptr, Category::Invalid},
+            {"rows beyond capacity",
+             {.offset = geometry.capacity - 1, .rows = geometry.rows + 1},
+             geometry.capacity - 1, false, nullptr, Category::Invalid},
+            {"appended row count overflow",
+             {.offset = 1, .rows = std::numeric_limits<std::size_t>::max()}, 1,
+             false, nullptr, Category::Overflow},
+            {"rank-two query", {.rotated_q = &rank_two}, geometry.offset, false,
+             nullptr, Category::Invalid},
+            {"grouped head ratio", {.rotated_q = &short_query}, geometry.offset,
+             false, nullptr, Category::Invalid},
+            {"merged attention width", {.attention_merged = &short_merged},
+             geometry.offset, false, nullptr, Category::Invalid},
+            {"poisoned state", {}, geometry.offset, true, nullptr,
+             Category::Logic},
+            {"missing caller workspace", {}, geometry.offset, false,
+             &empty_workspace, Category::Invalid},
+            {"short caller workspace", {}, geometry.offset, false,
+             &short_workspace_view, Category::Invalid},
+            {"attention output aliases merged attention",
+             {.attention_output = &merged_view}, geometry.offset, false,
+             nullptr, Category::Invalid},
+            {"shared K/V cache storage", {.v_cache = &k_cache_view},
+             geometry.offset, false, nullptr, Category::Invalid},
+            {"K cache aliases the V cache", {.k_cache = &v_cache_view},
+             geometry.offset, false, nullptr, Category::Invalid},
+            {"merged attention aliases residual input",
+             {.attention_merged = &residual_input_view}, geometry.offset,
+             false, nullptr, Category::Invalid},
+            {"attention output aliases residual input",
+             {.attention_output = &residual_input_view}, geometry.offset, false,
+             nullptr, Category::Invalid},
+            {"residual output aliases residual input",
+             {.residual_output = &residual_input_view}, geometry.offset, false,
+             nullptr, Category::Invalid},
+            {"residual output aliases attention output",
+             {.residual_output = &attention_output_view}, geometry.offset,
+             false, nullptr, Category::Invalid},
+            {"stale published prefix", {}, geometry.offset + 1, false, nullptr,
+             Category::Invalid}};
+
+    for (const Rejection& rejection : rejections) {
+        auto request = fixture.make_request(rejection.overrides);
+        iom::session_detail::CacheAttentionStageState state;
+        state.initialized_length = rejection.initialized_length;
+        state.failed = rejection.poisoned_state;
+        const iom::RawWorkspaceView workspace = rejection.workspace != nullptr
+                ? *rejection.workspace
+                : fixture.workspace();
+        bool rejected = false;
+        try {
+            iom::session_detail::run_cache_attention_stage(
+                    fixture.ops(), request, workspace, state);
+        } catch (const std::invalid_argument&) {
+            rejected = rejection.category == Category::Invalid;
+        } catch (const std::overflow_error&) {
+            rejected = rejection.category == Category::Overflow;
+        } catch (const std::logic_error&) {
+            rejected = rejection.category == Category::Logic;
+        }
+        CHECK_MESSAGE(rejected, rejection.label);
+
+        // A rejected request changes nothing: no cache row moved, no output
+        // store was touched, and no prefix was published.
+        CHECK_EQ(state.initialized_length, rejection.initialized_length);
+        CHECK_EQ(state.failed, rejection.poisoned_state);
+        check_identical(fixture.read(*fixture.k_cache),
+                        fixture.k_cache_values, "rejected K cache");
+        check_identical(fixture.read(*fixture.v_cache),
+                        fixture.v_cache_values, "rejected V cache");
+        check_identical(fixture.read(*fixture.attention_merged),
+                        fixture.attention_merged_values,
+                        "rejected merged attention");
+        check_identical(fixture.read(*fixture.attention_output),
+                        fixture.attention_output_values,
+                        "rejected attention output");
+        check_identical(fixture.read(*fixture.residual_output),
+                        fixture.residual_output_values,
+                        "rejected residual output");
     }
 }
