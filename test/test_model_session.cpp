@@ -1408,6 +1408,730 @@ TEST_CASE("TinyLlama text chat generation owns results across session reuse") {
     CHECK(first.text == "hello");
     CHECK(first.stop_reason == iom::GenerationStopReason::max_new_tokens);
 }
+// ---------------------------------------------------------------------------
+// Composed synthetic generation traces.  These cases deliberately build the
+// expected logits without using a session forward seam or a production
+// selector.  The fixture is small enough to run on every configured host but
+// still exercises GQA, absolute RoPE positions, exact capacity, request
+// replacement, and the accepted-failure poison boundary.
+// ---------------------------------------------------------------------------
+
+namespace synthetic_session_test {
+
+constexpr float kSyntheticAtol = 0.05F;
+constexpr float kSyntheticRtol = 0.02F;
+constexpr float kSyntheticWinnerMargin = 0.50F;
+constexpr std::size_t kSyntheticCapacity = 5;
+constexpr std::size_t kSyntheticVocabulary = 8;
+constexpr std::size_t kSyntheticEos = 2;
+
+[[nodiscard]] float synthetic_round_bf16(float value) noexcept {
+    return forward_decode_bf16(forward_encode_bf16(value));
+}
+
+[[nodiscard]] std::string synthetic_weight_payload(
+        const std::vector<std::size_t>& shape, std::size_t entry) {
+    const std::size_t elements = iom_model_loading::element_count(shape);
+    const std::size_t hidden = shape.back();
+    std::vector<float> values(elements);
+    for (std::size_t element = 0; element < elements; ++element) {
+        float value = 0.20F
+                + 0.025F * static_cast<float>((entry + element) % 5);
+        if (entry == 1
+                || (entry >= 3 && ((entry - 3) % 9) < 2)) {
+            value = 1.0F
+                    + 0.02F * static_cast<float>((entry + element) % 3);
+        } else if (entry == 2) {
+            const std::size_t row = element / hidden;
+            value = row == 0 ? 2.0F : row == 1 ? 0.25F : 0.0F;
+        }
+        values[element] = synthetic_round_bf16(value);
+    }
+
+    std::string payload(elements * sizeof(std::uint16_t), '\0');
+    for (std::size_t element = 0; element < elements; ++element) {
+        const std::uint16_t bits = forward_encode_bf16(values[element]);
+        std::memcpy(payload.data() + element * sizeof(bits), &bits,
+                    sizeof(bits));
+    }
+    return payload;
+}
+
+struct Fixture {
+    TempDir directory;
+    HeapAllocator allocator;
+    std::unique_ptr<iom::Device> device;
+    nlohmann::json config;
+
+    Fixture(std::size_t layers, std::string tag)
+        : directory("session-synthetic-" + std::move(tag)),
+          config(two_layer_config()) {
+        config["num_hidden_layers"] = layers;
+        config["vocab_size"] = kSyntheticVocabulary;
+        config["max_position_embeddings"] = kSyntheticCapacity;
+        config["bos_token_id"] = 1;
+        config["eos_token_id"] = kSyntheticEos;
+        write_config(directory.path(), config);
+
+        auto entries = required_weight_entries(config);
+        for (std::size_t entry = 0; entry < entries.size(); ++entry) {
+            entries[entry].payload =
+                    synthetic_weight_payload(entries[entry].shape, entry);
+        }
+        write_safetensors_file(directory.path(), "model.safetensors", entries);
+        write_tokenizer(directory.path());
+        write_file(directory.path(), "tokenizer_config.json",
+                   tokenizer_config().dump());
+        device = iom::make_cpu_device(allocator);
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::TinyLlamaSession> load(
+            std::unique_ptr<iom::TokenSelector> selector) {
+        return iom::load_tinyllama_session(
+                directory.path(), *device, std::move(selector));
+    }
+};
+
+class RecordingGreedySelector final : public iom::TokenSelector {
+public:
+    [[nodiscard]] iom::TokenSelectorScratchRequirements scratch_requirements(
+            const iom::TensorView&, std::size_t) const override {
+        return {0, {0, 1}};
+    }
+
+    [[nodiscard]] std::size_t select(
+            iom::DeviceOps&, const iom::TensorView& logits, std::size_t,
+            iom::oid producer, std::span<const std::size_t> history,
+            iom::TokenSelectorScratch) override {
+        const std::vector<float> row = read_forward_tensor(logits);
+        logits_rows.push_back(row);
+        producers.push_back(producer);
+        histories.emplace_back(history.begin(), history.end());
+
+        std::size_t selected = 0;
+        for (std::size_t index = 1; index < row.size(); ++index) {
+            if (row[index] > row[selected]) selected = index;
+        }
+        selected_ids.push_back(selected);
+        return selected;
+    }
+
+    std::vector<std::vector<float>> logits_rows;
+    std::vector<iom::oid> producers;
+    std::vector<std::vector<std::size_t>> histories;
+    std::vector<std::size_t> selected_ids;
+};
+
+struct ReferenceModel {
+    iom::TinyLlamaConfig config;
+    std::vector<std::vector<float>> weights;
+
+    explicit ReferenceModel(const iom::TinyLlamaSession& session)
+        : config(session.config()) {
+        weights.reserve(session.model().weights().size());
+        for (std::size_t index = 0;
+             index < session.model().weights().size(); ++index) {
+            weights.push_back(read_forward_tensor(session.model().weight(index)));
+        }
+    }
+
+    [[nodiscard]] std::vector<float> logits(
+            std::span<const std::size_t> tokens) const {
+        const std::size_t rows = tokens.size();
+        const std::size_t features = config.hidden_size;
+        const std::size_t intermediate = config.intermediate_size;
+        const std::size_t query_heads = config.num_attention_heads;
+        const std::size_t kv_heads = config.num_key_value_heads;
+        const std::size_t head_dim = config.head_dim;
+        const std::size_t capacity = config.max_position_embeddings;
+        const std::size_t grouping = query_heads / kv_heads;
+
+        std::vector<float> hidden(rows * features);
+        const std::vector<float>& embedding = weights[0];
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                hidden[row * features + feature] =
+                        embedding[tokens[row] * features + feature];
+            }
+        }
+
+        for (std::size_t layer = 0; layer < config.num_hidden_layers;
+             ++layer) {
+            const auto layer_weight =
+                    [&](std::size_t role) -> const std::vector<float>& {
+                return weights[3 + layer * 9 + role];
+            };
+            const std::vector<float>& input_norm = layer_weight(0);
+            const std::vector<float>& post_norm = layer_weight(1);
+            const std::vector<float>& query_weight = layer_weight(2);
+            const std::vector<float>& key_weight = layer_weight(3);
+            const std::vector<float>& value_weight = layer_weight(4);
+            const std::vector<float>& output_weight = layer_weight(5);
+            const std::vector<float>& gate_weight = layer_weight(6);
+            const std::vector<float>& up_weight = layer_weight(7);
+            const std::vector<float>& down_weight = layer_weight(8);
+
+            std::vector<float> key_cache(kv_heads * capacity * head_dim, 0.0F);
+            std::vector<float> value_cache(
+                    kv_heads * capacity * head_dim, 0.0F);
+            std::vector<float> next(hidden.size());
+
+            for (std::size_t row = 0; row < rows; ++row) {
+                float square_sum = 0.0F;
+                for (std::size_t feature = 0; feature < features; ++feature) {
+                    const float value = hidden[row * features + feature];
+                    square_sum += value * value;
+                }
+                const float inverse = 1.0F / std::sqrt(
+                        square_sum / static_cast<float>(features)
+                        + config.rms_norm_eps);
+                std::vector<float> normalized(features);
+                for (std::size_t feature = 0; feature < features; ++feature) {
+                    normalized[feature] = synthetic_round_bf16(
+                            hidden[row * features + feature] * inverse
+                            * input_norm[feature]);
+                }
+
+                std::vector<float> query(query_heads * head_dim);
+                std::vector<float> key(kv_heads * head_dim);
+                std::vector<float> value(kv_heads * head_dim);
+                const auto project = [&](std::vector<float>& output,
+                                         const std::vector<float>& weight,
+                                         std::size_t heads) {
+                    for (std::size_t head = 0; head < heads; ++head) {
+                        for (std::size_t element = 0; element < head_dim;
+                             ++element) {
+                            float sum = 0.0F;
+                            const std::size_t weight_row =
+                                    head * head_dim + element;
+                            for (std::size_t feature = 0; feature < features;
+                                 ++feature) {
+                                sum = std::fma(
+                                        normalized[feature],
+                                        weight[weight_row * features + feature],
+                                        sum);
+                            }
+                            output[weight_row] = synthetic_round_bf16(sum);
+                        }
+                    }
+                };
+                project(query, query_weight, query_heads);
+                project(key, key_weight, kv_heads);
+                project(value, value_weight, kv_heads);
+
+                const auto rotate = [&](std::vector<float>& values,
+                                        std::size_t heads) {
+                    const std::size_t half = head_dim / 2;
+                    for (std::size_t head = 0; head < heads; ++head) {
+                        for (std::size_t pair = 0; pair < half; ++pair) {
+                            const std::size_t first_index =
+                                    head * head_dim + pair;
+                            const std::size_t second_index =
+                                    first_index + half;
+                            const double exponent =
+                                    (-2.0 * static_cast<double>(pair))
+                                    / static_cast<double>(head_dim);
+                            const float angle = static_cast<float>(
+                                    static_cast<double>(row)
+                                    * std::pow(config.rope_theta, exponent));
+                            const float first = values[first_index];
+                            const float second = values[second_index];
+                            const volatile float first_product =
+                                    first * std::cos(angle);
+                            const volatile float second_product =
+                                    second * std::sin(angle);
+                            const volatile float first_output =
+                                    first_product - second_product;
+                            const volatile float second_cosine_product =
+                                    second * std::cos(angle);
+                            const volatile float first_sine_product =
+                                    first * std::sin(angle);
+                            const volatile float second_output =
+                                    second_cosine_product + first_sine_product;
+                            values[first_index] =
+                                    synthetic_round_bf16(first_output);
+                            values[second_index] =
+                                    synthetic_round_bf16(second_output);
+                        }
+                    }
+                };
+                rotate(query, query_heads);
+                rotate(key, kv_heads);
+
+                for (std::size_t head = 0; head < kv_heads; ++head) {
+                    for (std::size_t element = 0; element < head_dim;
+                         ++element) {
+                        const std::size_t cache_index =
+                                (head * capacity + row) * head_dim + element;
+                        key_cache[cache_index] =
+                                key[head * head_dim + element];
+                        value_cache[cache_index] =
+                                value[head * head_dim + element];
+                    }
+                }
+
+                std::vector<float> merged(features, 0.0F);
+                for (std::size_t head = 0; head < query_heads; ++head) {
+                    const std::size_t kv_head = head / grouping;
+                    std::vector<float> scores(row + 1);
+                    for (std::size_t token = 0; token <= row; ++token) {
+                        float dot = 0.0F;
+                        for (std::size_t element = 0; element < head_dim;
+                             ++element) {
+                            const volatile float product =
+                                    query[head * head_dim + element]
+                                    * key_cache[(kv_head * capacity + token)
+                                                * head_dim + element];
+                            const volatile float next_score = dot + product;
+                            dot = next_score;
+                        }
+                        scores[token] =
+                                dot / std::sqrt(static_cast<float>(head_dim));
+                    }
+                    float maximum = scores[0];
+                    for (const float score : scores) {
+                        maximum = std::max(maximum, score);
+                    }
+                    // The production SDPA stores the normalized probability
+                    // only after the complete sum is known.
+                    std::vector<float> exponentials(row + 1);
+                    float sum = 0.0F;
+                    for (std::size_t token = 0; token <= row; ++token) {
+                        const volatile float shifted =
+                                scores[token] - maximum;
+                        const volatile float exponent = std::exp(shifted);
+                        const volatile float next_sum = sum + exponent;
+                        sum = next_sum;
+                        exponentials[token] = exponent;
+                    }
+                    for (std::size_t token = 0; token <= row; ++token) {
+                        scores[token] = synthetic_round_bf16(
+                                exponentials[token] / sum);
+                    }
+                    for (std::size_t element = 0; element < head_dim;
+                         ++element) {
+                        float result = 0.0F;
+                        for (std::size_t token = 0; token <= row; ++token) {
+                            const volatile float product =
+                                    scores[token]
+                                    * value_cache[(kv_head * capacity + token)
+                                                  * head_dim + element];
+                            const volatile float next_result = result + product;
+                            result = next_result;
+                        }
+                        merged[head * head_dim + element] =
+                                synthetic_round_bf16(result);
+                    }
+                }
+
+                std::vector<float> projected(features);
+                for (std::size_t output = 0; output < features; ++output) {
+                    float sum = 0.0F;
+                    for (std::size_t feature = 0; feature < features;
+                         ++feature) {
+                        sum = std::fma(
+                                merged[feature],
+                                output_weight[output * features + feature],
+                                sum);
+                    }
+                    projected[output] = synthetic_round_bf16(sum);
+                }
+
+                std::vector<float> residual(features);
+                for (std::size_t feature = 0; feature < features; ++feature) {
+                    residual[feature] = synthetic_round_bf16(
+                            hidden[row * features + feature]
+                            + projected[feature]);
+                }
+
+                square_sum = 0.0F;
+                for (const float value : residual) square_sum += value * value;
+                const float post_inverse = 1.0F / std::sqrt(
+                        square_sum / static_cast<float>(features)
+                        + config.rms_norm_eps);
+                std::vector<float> normalized_post(features);
+                for (std::size_t feature = 0; feature < features; ++feature) {
+                    normalized_post[feature] = synthetic_round_bf16(
+                            residual[feature] * post_inverse
+                            * post_norm[feature]);
+                }
+
+                std::vector<float> gate(intermediate);
+                std::vector<float> up(intermediate);
+                for (std::size_t output = 0; output < intermediate; ++output) {
+                    float gate_sum = 0.0F;
+                    float up_sum = 0.0F;
+                    for (std::size_t feature = 0; feature < features;
+                         ++feature) {
+                        gate_sum = std::fma(
+                                normalized_post[feature],
+                                gate_weight[output * features + feature],
+                                gate_sum);
+                        up_sum = std::fma(
+                                normalized_post[feature],
+                                up_weight[output * features + feature],
+                                up_sum);
+                    }
+                    gate[output] = synthetic_round_bf16(gate_sum);
+                    up[output] = synthetic_round_bf16(up_sum);
+                }
+                std::vector<float> product(intermediate);
+                for (std::size_t index = 0; index < intermediate; ++index) {
+                    const float activated = synthetic_round_bf16(
+                            gate[index]
+                            / (1.0F + std::exp(-gate[index])));
+                    product[index] =
+                            synthetic_round_bf16(activated * up[index]);
+                }
+                std::vector<float> down(features);
+                for (std::size_t output = 0; output < features; ++output) {
+                    float sum = 0.0F;
+                    for (std::size_t index = 0; index < intermediate; ++index) {
+                        sum = std::fma(
+                                product[index],
+                                down_weight[output * intermediate + index],
+                                sum);
+                    }
+                    down[output] = synthetic_round_bf16(sum);
+                    next[row * features + output] = synthetic_round_bf16(
+                            residual[output] + down[output]);
+                }
+            }
+            hidden.swap(next);
+        }
+
+        const std::vector<float>& final_norm = weights[1];
+        const std::vector<float>& lm_head = weights[2];
+        const std::size_t final_row = rows - 1;
+        float square_sum = 0.0F;
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            const float value = hidden[final_row * features + feature];
+            square_sum += value * value;
+        }
+        const float inverse = 1.0F / std::sqrt(
+                square_sum / static_cast<float>(features)
+                + config.rms_norm_eps);
+        std::vector<float> normalized(features);
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            normalized[feature] = synthetic_round_bf16(
+                    hidden[final_row * features + feature] * inverse
+                    * final_norm[feature]);
+        }
+
+        std::vector<float> result(config.vocab_size);
+        for (std::size_t output = 0; output < config.vocab_size; ++output) {
+            float sum = 0.0F;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                sum = std::fma(
+                        normalized[feature],
+                        lm_head[output * features + feature],
+                        sum);
+            }
+            result[output] = synthetic_round_bf16(sum);
+        }
+        return result;
+    }
+};
+
+[[nodiscard]] std::size_t reference_greedy(
+        std::span<const float> logits, std::size_t eos) {
+    REQUIRE(!logits.empty());
+    std::size_t selected = 0;
+    for (std::size_t index = 1; index < logits.size(); ++index) {
+        if (logits[index] > logits[selected]) selected = index;
+    }
+    float next = -std::numeric_limits<float>::infinity();
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        if (index != selected) next = std::max(next, logits[index]);
+    }
+    const bool winner_ok =
+            std::isfinite(logits[selected]) && std::isfinite(next)
+            && logits[selected] - next >= kSyntheticWinnerMargin;
+    REQUIRE_MESSAGE(
+            winner_ok,
+            "synthetic greedy winner has insufficient finite separation");
+    (void)eos;
+    return selected;
+}
+
+struct ExpectedTrace {
+    std::vector<std::vector<float>> logits;
+    std::vector<std::size_t> token_ids;
+    iom::GenerationStopReason stop_reason =
+            iom::GenerationStopReason::max_new_tokens;
+};
+
+[[nodiscard]] ExpectedTrace expected_trace(
+        const ReferenceModel& reference,
+        std::span<const std::size_t> prompt, std::size_t max_new_tokens) {
+    ExpectedTrace expected;
+    std::vector<std::size_t> prefix(prompt.begin(), prompt.end());
+    for (;;) {
+        expected.logits.push_back(reference.logits(prefix));
+        const std::size_t selected =
+                reference_greedy(expected.logits.back(),
+                                 reference.config.eos_token_id);
+        expected.token_ids.push_back(selected);
+        prefix.push_back(selected);
+        if (selected == reference.config.eos_token_id) {
+            expected.stop_reason = iom::GenerationStopReason::eos;
+            break;
+        }
+        if (expected.token_ids.size() >= max_new_tokens) {
+            expected.stop_reason = iom::GenerationStopReason::max_new_tokens;
+            break;
+        }
+        if (prefix.size() >= reference.config.max_position_embeddings) {
+            expected.stop_reason =
+                    iom::GenerationStopReason::context_capacity;
+            break;
+        }
+    }
+    return expected;
+}
+
+void compare_logits(
+        std::span<const float> actual, std::span<const float> expected,
+        const char* label) {
+    REQUIRE_EQ(actual.size(), expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const bool finite = std::isfinite(actual[index])
+                && std::isfinite(expected[index]);
+        REQUIRE_MESSAGE(
+                finite,
+                label << " has non-finite vocabulary index " << index);
+        const float difference = std::abs(actual[index] - expected[index]);
+        const float bound =
+                kSyntheticAtol + kSyntheticRtol * std::abs(expected[index]);
+        CHECK_MESSAGE(
+                difference <= bound,
+                label << " differs at vocabulary index " << index
+                      << " by " << difference << " (bound " << bound << ")");
+    }
+}
+
+void compare_trace(
+        const ExpectedTrace& expected,
+        const RecordingGreedySelector& selector,
+        const iom::TokenGenerationResult& result,
+        std::span<const std::size_t> prompt, const char* label) {
+    REQUIRE_EQ(selector.logits_rows.size(), expected.logits.size());
+    REQUIRE_EQ(selector.selected_ids, expected.token_ids);
+    CHECK(result.token_ids == expected.token_ids);
+    CHECK(result.stop_reason == expected.stop_reason);
+    for (std::size_t step = 0; step < expected.logits.size(); ++step) {
+        compare_logits(
+                selector.logits_rows[step], expected.logits[step], label);
+    }
+
+    REQUIRE_EQ(selector.histories.size(), expected.logits.size());
+    std::vector<std::size_t> history(prompt.begin(), prompt.end());
+    for (std::size_t step = 0; step < selector.histories.size(); ++step) {
+        CHECK(selector.histories[step] == history);
+        history.push_back(expected.token_ids[step]);
+    }
+    for (const iom::oid producer : selector.producers) {
+        CHECK(iom::oid_is_token(producer));
+    }
+}
+
+}  // namespace synthetic_session_test
+
+TEST_CASE(
+        "TinyLlama synthetic session integration validates composed "
+        "one-and two-layer parity at exact capacity") {
+    using namespace synthetic_session_test;
+    const std::array<std::size_t, 3> prompt{1, 3, 4};
+
+    for (const std::size_t layers : {std::size_t{1}, std::size_t{2}}) {
+        Fixture fixture(layers, "parity-" + std::to_string(layers));
+        auto selector = std::make_unique<RecordingGreedySelector>();
+        RecordingGreedySelector* observer = selector.get();
+        auto session = fixture.load(std::move(selector));
+        const ReferenceModel reference(*session);
+        const ExpectedTrace expected = expected_trace(reference, prompt, 3);
+        REQUIRE_EQ(expected.token_ids.size(), 2);
+        REQUIRE(
+                expected.stop_reason
+                == iom::GenerationStopReason::context_capacity);
+
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 3);
+        compare_trace(expected, *observer, result, prompt, "cached trace");
+        CHECK_EQ(observer->logits_rows.size(), 2);
+        CHECK_EQ(observer->histories[1].size(), 4);
+        CHECK_EQ(observer->histories[1][3], expected.token_ids[0]);
+        for (const auto& cache : SessionAccess::caches(*session)) {
+            CHECK_EQ(cache.initialized_length, 4);
+        }
+        CHECK_EQ(SessionAccess::history(*session).size(), kSyntheticCapacity);
+        CHECK(SessionAccess::results(*session).empty());
+    }
+}
+
+TEST_CASE(
+        "TinyLlama synthetic session integration isolates completed request "
+        "reuse from a fresh session") {
+    using namespace synthetic_session_test;
+    const std::array<std::size_t, 3> first_prompt{1, 2, 3};
+    const std::array<std::size_t, 1> second_prompt{5};
+
+    for (const std::size_t layers : {std::size_t{1}, std::size_t{2}}) {
+        Fixture fixture(layers, "reuse-" + std::to_string(layers));
+        auto reused_selector = std::make_unique<RecordingGreedySelector>();
+        RecordingGreedySelector* reused_observer = reused_selector.get();
+        auto reused = fixture.load(std::move(reused_selector));
+        const ReferenceModel reference(*reused);
+
+        const ExpectedTrace first_expected =
+                expected_trace(reference, first_prompt, 1);
+        const iom::TokenGenerationResult first_result =
+                reused->generate_tokens(first_prompt, 1);
+        compare_trace(
+                first_expected, *reused_observer, first_result, first_prompt,
+                "first request");
+        REQUIRE_EQ(first_result.token_ids.size(), 1);
+        const std::vector<std::size_t> saved_first_result =
+                first_result.token_ids;
+
+        const ExpectedTrace second_expected =
+                expected_trace(reference, second_prompt, 2);
+        const std::size_t second_start = reused_observer->logits_rows.size();
+        const iom::TokenGenerationResult reused_result =
+                reused->generate_tokens(second_prompt, 2);
+        RecordingGreedySelector reused_second_observer;
+        reused_second_observer.logits_rows.assign(
+                reused_observer->logits_rows.begin()
+                        + static_cast<std::ptrdiff_t>(second_start),
+                reused_observer->logits_rows.end());
+        reused_second_observer.histories.assign(
+                reused_observer->histories.begin()
+                        + static_cast<std::ptrdiff_t>(second_start),
+                reused_observer->histories.end());
+        reused_second_observer.producers.assign(
+                reused_observer->producers.begin()
+                        + static_cast<std::ptrdiff_t>(second_start),
+                reused_observer->producers.end());
+        reused_second_observer.selected_ids.assign(
+                reused_observer->selected_ids.begin()
+                        + static_cast<std::ptrdiff_t>(second_start),
+                reused_observer->selected_ids.end());
+        compare_trace(
+                second_expected, reused_second_observer, reused_result,
+                second_prompt, "reused second request");
+        CHECK(reused_observer->histories[second_start] == std::vector<std::size_t>{5});
+        CHECK(reused_observer->histories[second_start + 1]
+              == std::vector<std::size_t>{5, second_expected.token_ids[0]});
+        CHECK(reused_result.stop_reason
+              == iom::GenerationStopReason::max_new_tokens);
+        CHECK(reused_result.token_ids == second_expected.token_ids);
+        CHECK(first_result.token_ids == saved_first_result);
+
+        auto fresh_selector = std::make_unique<RecordingGreedySelector>();
+        RecordingGreedySelector* fresh_observer = fresh_selector.get();
+        auto fresh = fixture.load(std::move(fresh_selector));
+        const iom::TokenGenerationResult fresh_result =
+                fresh->generate_tokens(second_prompt, 2);
+        compare_trace(
+                second_expected, *fresh_observer, fresh_result, second_prompt,
+                "fresh second request");
+        CHECK(fresh_result.token_ids == reused_result.token_ids);
+        CHECK(fresh_result.stop_reason == reused_result.stop_reason);
+        REQUIRE_EQ(fresh_observer->logits_rows.size(),
+                   reused_second_observer.logits_rows.size());
+        for (std::size_t step = 0; step < fresh_observer->logits_rows.size();
+             ++step) {
+            compare_logits(
+                    reused_second_observer.logits_rows[step],
+                    fresh_observer->logits_rows[step],
+                    "reused/fresh logits");
+        }
+        for (const auto& cache : SessionAccess::caches(*reused)) {
+            CHECK_EQ(cache.initialized_length, 2);
+        }
+        for (const auto& cache : SessionAccess::caches(*fresh)) {
+            CHECK_EQ(cache.initialized_length, 2);
+        }
+    }
+}
+
+TEST_CASE(
+        "TinyLlama synthetic session integration recovers after accepted "
+        "failure at the poison boundary") {
+    using namespace synthetic_session_test;
+    const std::array<std::size_t, 3> failed_prompt{1, 3, 4};
+    const std::array<std::size_t, 1> recovery_prompt{6};
+
+    for (const std::size_t layers : {std::size_t{1}, std::size_t{2}}) {
+        Fixture fixture(layers, "failure-" + std::to_string(layers));
+        auto failed_selector = std::make_unique<RecordingGreedySelector>();
+        RecordingGreedySelector* failed_observer = failed_selector.get();
+        auto failed = fixture.load(std::move(failed_selector));
+
+        iom::cpu_detail::arm_cache_append_wait_observation();
+        iom::cpu_detail::arm_cache_append_failure();
+        struct ClearFailureLatches {
+            void clear() noexcept {
+                iom::cpu_detail::clear_cache_append_failure();
+                iom::cpu_detail::clear_cache_append_wait_observation();
+            }
+
+            ~ClearFailureLatches() { clear(); }
+        } clear_latches;
+
+        CHECK_THROWS_AS(
+                failed->generate_tokens(failed_prompt, 2),
+                std::runtime_error);
+        CHECK(failed->poisoned());
+        CHECK_EQ(failed->request_length(), failed_prompt.size());
+        REQUIRE(!SessionAccess::accepted(*failed).empty());
+        // The poisoned request remains inaccessible through normal resource
+        // accessors; its accepted operations are retained for safe teardown.
+        CHECK_THROWS_AS(SessionAccess::history(*failed), std::logic_error);
+        CHECK_THROWS_AS(SessionAccess::results(*failed), std::logic_error);
+        // K's accepted wait fails, but the independent V append is still
+        // waited.  The CPU seam records each append sequence once even when
+        // the session's later drain repeats that wait.
+        CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 1u);
+        CHECK_THROWS_AS(
+                failed->generate_tokens(recovery_prompt, 2),
+                std::logic_error);
+        clear_latches.clear();
+        failed.reset();
+
+        auto recovered_selector = std::make_unique<RecordingGreedySelector>();
+        RecordingGreedySelector* recovered_observer = recovered_selector.get();
+        auto recovered = fixture.load(std::move(recovered_selector));
+        const ReferenceModel reference(*recovered);
+        const ExpectedTrace expected =
+                expected_trace(reference, recovery_prompt, 2);
+        const iom::TokenGenerationResult recovered_result =
+                recovered->generate_tokens(recovery_prompt, 2);
+        compare_trace(
+                expected, *recovered_observer, recovered_result,
+                recovery_prompt, "recovered request");
+
+        auto fresh_selector = std::make_unique<RecordingGreedySelector>();
+        RecordingGreedySelector* fresh_observer = fresh_selector.get();
+        auto fresh = fixture.load(std::move(fresh_selector));
+        const iom::TokenGenerationResult fresh_result =
+                fresh->generate_tokens(recovery_prompt, 2);
+        compare_trace(
+                expected, *fresh_observer, fresh_result, recovery_prompt,
+                "fresh after failure");
+        CHECK(fresh_result.token_ids == recovered_result.token_ids);
+        CHECK(fresh_result.stop_reason == recovered_result.stop_reason);
+        REQUIRE_EQ(fresh_observer->logits_rows.size(),
+                   recovered_observer->logits_rows.size());
+        for (std::size_t step = 0; step < fresh_observer->logits_rows.size();
+             ++step) {
+            compare_logits(
+                    recovered_observer->logits_rows[step],
+                    fresh_observer->logits_rows[step],
+                    "recovered/fresh logits");
+        }
+    }
+}
 
 namespace {
 using iom::session_detail::MlpStageFailure;
