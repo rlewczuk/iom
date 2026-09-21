@@ -36,6 +36,7 @@
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/device.hpp"
+#include "iom/inference_metrics.hpp"
 #include "iom/iom.hpp"
 #include "iom/session.hpp"
 #include "iom/tensor.hpp"
@@ -297,10 +298,14 @@ public:
 
 class ResourceProbeDevice final : public iom::Device {
 public:
+    static constexpr std::array<iom::DataType, 2> kDefaultSupported{
+            iom::DataType::BF16, iom::DataType::U32};
+
     std::size_t tensors = 0;
     std::size_t workspaces = 0;
     std::size_t queues = 0;
     mutable std::size_t capability_queries = 0;
+    std::span<const iom::DataType> supported{kDefaultSupported};
     void* workspace_address = nullptr;
     std::size_t workspace_stride = 0;
     iom::Device* workspace_device = nullptr;
@@ -314,8 +319,6 @@ public:
     std::uint32_t backend_device() const noexcept override { return 0; }
     std::span<const iom::DataType> supported_data_types() const noexcept override {
         ++capability_queries;
-        static constexpr std::array supported{iom::DataType::BF16,
-                                             iom::DataType::U32};
         return supported;
     }
     std::unique_ptr<iom::Tensor> create_tensor(const iom::TensorSpec& spec) override {
@@ -374,6 +377,63 @@ void check_run_banks(const iom::session_detail::RunBanks& banks, std::size_t R) 
             banks.final_norm.get()};
     for (std::size_t i = 0; i < owners.size(); ++i)
         for (std::size_t j = 0; j < i; ++j) CHECK(owners[i] != owners[j]);
+}
+
+// Deterministic supplied host clock of one attached observation recorder. The
+// `exhausted` flag is the observable proof that no unexpected clock read
+// happened: a session observation path that reads the clock without an
+// instant to consume flips it instead of silently reading a wall clock.
+struct RecordingClock {
+    std::vector<std::uint64_t> instants{};
+    std::size_t cursor = 0;
+    bool exhausted = false;
+
+    static std::uint64_t read(void* context) noexcept {
+        auto* self = static_cast<RecordingClock*>(context);
+        if (self->cursor >= self->instants.size()) {
+            self->exhausted = true;
+            return 0;
+        }
+        return self->instants[self->cursor++];
+    }
+};
+
+[[nodiscard]] iom::HostClock make_clock(RecordingClock& recorder) {
+    return iom::HostClock{&RecordingClock::read, &recorder};
+}
+
+// Queue id 16, sequence `sequence`: one canonical positive accepted OID.
+[[nodiscard]] iom::oid accepted_oid(std::uint64_t sequence) {
+    return static_cast<iom::oid>((std::uint64_t{16} << 55) | sequence);
+}
+
+// Loads through the caller-supplied selector and returns the message of the
+// failure the call must report, so an instrumented load's rethrown exception
+// is comparable with the uninstrumented one.
+[[nodiscard]] std::string load_failure_message(
+        const std::filesystem::path& directory, iom::Device& device,
+        std::unique_ptr<iom::TokenSelector> selector,
+        iom::InferenceMetrics* metrics = nullptr) {
+    try {
+        static_cast<void>(iom::load_tinyllama_session(
+                directory, device, std::move(selector), metrics));
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    REQUIRE_MESSAGE(false,
+                    "expected a load failure for " << directory.string());
+    return std::string();
+}
+
+// The one-layer off-tile configuration with a position count far outside any
+// real context. No required weight shape depends on
+// `max_position_embeddings`, and the bounded probe device allocates no cache
+// storage, so a session whose accepted-OID bound or reservation cannot be
+// represented is still loadable.
+[[nodiscard]] nlohmann::json wide_position_config(
+        nlohmann::json config, std::size_t positions) {
+    config["max_position_embeddings"] = positions;
+    return config;
 }
 
 }  // namespace
@@ -442,6 +502,469 @@ TEST_CASE("TinyLlama session resources retain an injected selector") {
     session.reset();
     CHECK_EQ(destructions, 1);
     CHECK_EQ(fixture.allocator.live, 0);
+}
+
+TEST_CASE("Inference metrics session load measures one instrumented success interval") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = {1'000, 1'750};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    std::size_t destructions = 0;
+
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<ProbeSelector>(&destructions), &recorder);
+
+    REQUIRE(session);
+    // Exactly the entry and the publication clock read: the caller-supplied
+    // selector was constructed before the measured interval, and nothing else
+    // in the factory reads the supplied clock.
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+    CHECK(recorder.snapshot().load.state == iom::ObservationState::succeeded);
+    CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 750);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 0);
+    CHECK_FALSE(recorder.snapshot().request_admitted);
+    CHECK_EQ(SessionAccess::metrics(*session), &recorder);
+    CHECK_EQ(destructions, 0);
+
+    // The recorder and its clock are borrowed, not owned: both stay intact and
+    // usable through request preparation and the destructor drain, which
+    // records nothing of its own.
+    session->prepare_request(1, {0, 1}, {0, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.copy(banks.x->view(), banks.attention_norm->view());
+    });
+    session.reset();
+    CHECK_EQ(destructions, 1);
+    CHECK_EQ(fixture.allocator.live, 0);
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+    CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 750);
+    CHECK(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
+
+    // The two-argument factory and the selector overload without a recorder
+    // publish sessions with no attached recorder and read no clock.
+    CHECK(SessionAccess::metrics(*fixture.load()) == nullptr);
+    const auto plain = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<ProbeSelector>(nullptr));
+    CHECK(SessionAccess::metrics(*plain) == nullptr);
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+}
+
+TEST_CASE("Inference metrics session load records enabled failures and rethrows them") {
+    // A null selector is still the rejected null-selector call: no capability
+    // query and no owner, with the failure published to the recorder.
+    {
+        ResourceProbeDevice device;
+        RecordingClock clock;
+        clock.instants = {4, 9};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        CHECK_THROWS_AS(
+                iom::load_tinyllama_session(
+                        std::filesystem::path("/definitely/missing/model"),
+                        device, std::unique_ptr<iom::TokenSelector>{},
+                        &recorder),
+                std::invalid_argument);
+        CHECK_EQ(device.capability_queries, 0);
+        CHECK_EQ(device.tensors, 0);
+        CHECK_EQ(device.workspaces, 0);
+        CHECK_EQ(device.queues, 0);
+        CHECK_EQ(clock.cursor, 2);
+        CHECK_FALSE(clock.exhausted);
+        CHECK(recorder.snapshot().load.state == iom::ObservationState::failed);
+        // A failed load publishes no duration and no session.
+        CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 0);
+        CHECK_FALSE(recorder.snapshot().request_admitted);
+        CHECK_EQ(recorder.snapshot().admitted.ordinal, 0);
+    }
+
+    // A device without the required storage capabilities is rejected before
+    // any model work and still reports the original category.
+    {
+        SessionFixture fixture;
+        ResourceProbeDevice device;
+        device.supported = iom_model_loading::kSupportedWithoutBf16;
+        RecordingClock clock;
+        clock.instants = {11, 12};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        std::size_t destructions = 0;
+        CHECK_THROWS_AS(
+                iom::load_tinyllama_session(
+                        fixture.directory.path(), device,
+                        std::make_unique<ProbeSelector>(&destructions),
+                        &recorder),
+                std::invalid_argument);
+        CHECK_EQ(device.capability_queries, 1);
+        CHECK_EQ(device.tensors, 0);
+        CHECK_EQ(device.queues, 0);
+        CHECK_EQ(destructions, 1);
+        CHECK(recorder.snapshot().load.state == iom::ObservationState::failed);
+        CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 0);
+    }
+
+    // A rejected configuration reports the same message with and without the
+    // recorder, so an enabled failure rethrows the original exception
+    // unchanged, and no owner survives it.
+    {
+        SessionFixture fixture;
+        nlohmann::json rejected = one_layer_config();
+        rejected["num_attention_heads"] = 3;
+        write_config(fixture.directory.path(), rejected);
+        RecordingClock clock;
+        clock.instants = {20, 40};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        const std::string without = load_failure_message(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<ProbeSelector>(nullptr));
+        const std::string with = load_failure_message(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<ProbeSelector>(nullptr), &recorder);
+        CHECK_EQ(with, without);
+        CHECK_FALSE(with.empty());
+        CHECK(recorder.snapshot().load.state == iom::ObservationState::failed);
+        CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 0);
+        // Only the instrumented call reads the supplied clock, exactly twice.
+        CHECK_EQ(clock.cursor, 2);
+        CHECK_FALSE(clock.exhausted);
+        CHECK_EQ(fixture.allocator.live, 0);
+    }
+
+    // A setup allocation failure keeps its category and its cleanup, and is
+    // published as a failed load with no duration.
+    {
+        SessionFixture fixture;
+        RecordingClock clock;
+        clock.instants = {5, 7, 5, 7};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        for (const std::size_t after : {std::size_t{13}, std::size_t{33}}) {
+            fixture.allocator.fail_after = fixture.allocator.allocations + after;
+            CHECK_THROWS_AS(
+                    iom::load_tinyllama_session(
+                            fixture.directory.path(), *fixture.device,
+                            std::make_unique<ProbeSelector>(nullptr),
+                            &recorder),
+                    std::bad_alloc);
+            CHECK_EQ(fixture.allocator.live, 0);
+            CHECK_EQ(fixture.allocator.resets, 0);
+        }
+        CHECK(recorder.snapshot().load.state == iom::ObservationState::failed);
+        CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 0);
+        CHECK_EQ(clock.cursor, 4);
+        CHECK_FALSE(clock.exhausted);
+    }
+}
+
+TEST_CASE("Inference metrics session load prepares trace storage before the first request") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = {10, 40};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+    REQUIRE(session);
+    REQUIRE_EQ(SessionAccess::metrics(*session), &recorder);
+
+    // Scalar observation requires no reservation at all.
+    CHECK_FALSE(recorder.trace_prepared());
+    CHECK(recorder.operations().empty());
+    CHECK_EQ(recorder.trace_capacity_remaining(), 0);
+
+    // The reservation reuses the request ledger's accepted-OID bound, so one
+    // complete request always fits the prepared table.
+    const std::size_t accepted_bound =
+            session->config().max_position_embeddings
+            * (session->config().num_hidden_layers * 24 + 32);
+    const std::size_t allocations = fixture.allocator.allocations;
+    session->prepare_operation_trace();
+
+    CHECK(recorder.trace_prepared());
+    CHECK(recorder.operations().empty());
+    CHECK_GE(recorder.trace_capacity_remaining(), accepted_bound);
+    // Host bookkeeping only: no device work and no clock read.
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+
+    // The request handoff then establishes the admitted observation context.
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    CHECK(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+}
+
+TEST_CASE("Inference metrics session load requires an attached recorder before the first request") {
+    // An absent recorder is its own configuration failure: `load(path,
+    // device, nullptr)` never means disabled instrumentation.
+    {
+        SessionFixture fixture;
+        const auto session = fixture.load();
+        CHECK_THROWS_AS(session->prepare_operation_trace(),
+                        std::invalid_argument);
+    }
+
+    // Late configuration is rejected without partially enabling tracing and
+    // without disturbing the published request.
+    {
+        SessionFixture fixture;
+        RecordingClock clock;
+        clock.instants = {3, 6};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+        REQUIRE(session);
+        session->prepare_request(1, {0, 1}, {38, {0, 1}});
+        CHECK_THROWS_AS(session->prepare_operation_trace(), std::logic_error);
+        CHECK_FALSE(recorder.trace_prepared());
+        CHECK(recorder.operations().empty());
+        CHECK_EQ(recorder.trace_capacity_remaining(), 0);
+        CHECK_EQ(session->request_length(), 1);
+        CHECK(recorder.snapshot().request_admitted);
+        CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+        CHECK_EQ(clock.cursor, 2);
+        CHECK_FALSE(clock.exhausted);
+    }
+}
+
+TEST_CASE("Inference metrics session load reports unrepresentable and unallocatable trace capacity") {
+    // One third past the byte limit of the shared checked bound: the
+    // reservation reports its own overflow failure before any inference work.
+    // The single-plane off-tile geometry keeps its bf16 cache inside the
+    // checked tiled bit count at this position count, so the failure is the
+    // accepted-OID bound's own arithmetic and not a cache-size rejection.
+    {
+        SessionFixture fixture;
+        const nlohmann::json base = iom_model_loading::h18_config();
+        const std::size_t bound_bytes =
+                std::numeric_limits<std::size_t>::max() / sizeof(iom::oid);
+        write_config(
+                fixture.directory.path(),
+                wide_position_config(base, (bound_bytes / (24 + 32)) * 4 / 3));
+        write_safetensors_file(fixture.directory.path(), "model.safetensors",
+                               required_weight_entries(base));
+        ResourceProbeDevice device;
+        RecordingClock clock;
+        clock.instants = {100, 220};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), device,
+                std::make_unique<ProbeSelector>(nullptr), &recorder);
+        REQUIRE(session);
+        const std::size_t tensors = device.tensors;
+        const std::size_t workspaces = device.workspaces;
+
+        CHECK_THROWS_AS(session->prepare_operation_trace(),
+                        std::overflow_error);
+        CHECK_FALSE(recorder.trace_prepared());
+        CHECK(recorder.operations().empty());
+        CHECK_EQ(recorder.trace_capacity_remaining(), 0);
+        // No device work and no clock read: the failure precedes inference.
+        CHECK_EQ(device.tensors, tensors);
+        CHECK_EQ(device.workspaces, workspaces);
+        CHECK_EQ(device.queues, 1);
+        CHECK_EQ(clock.cursor, 2);
+        CHECK_FALSE(clock.exhausted);
+
+        session.reset();
+        CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_tensors, 0);
+    }
+
+    // A representable bound whose reservation cannot be satisfied reports the
+    // allocation failure instead, with tracing still disabled.
+    {
+        SessionFixture fixture;
+        write_config(fixture.directory.path(),
+                     wide_position_config(
+                             one_layer_config(),
+                             std::numeric_limits<std::size_t>::max() >> 22));
+        ResourceProbeDevice device;
+        RecordingClock clock;
+        clock.instants = {7, 9};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), device,
+                std::make_unique<ProbeSelector>(nullptr), &recorder);
+        REQUIRE(session);
+
+        CHECK_THROWS_AS(session->prepare_operation_trace(), std::bad_alloc);
+        CHECK_FALSE(recorder.trace_prepared());
+        CHECK_EQ(recorder.trace_capacity_remaining(), 0);
+        CHECK(recorder.operations().empty());
+        CHECK_EQ(clock.cursor, 2);
+        CHECK_FALSE(clock.exhausted);
+
+        session.reset();
+        CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_tensors, 0);
+    }
+}
+
+TEST_CASE("Inference metrics session load publishes only the admitted request context") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = {1, 2};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+    REQUIRE(session);
+    session->prepare_operation_trace();
+    const std::size_t accepted_bound =
+            session->config().max_position_embeddings
+            * (session->config().num_hidden_layers * 24 + 32);
+
+    // A direct request with no staged attempt establishes an empty admitted
+    // context at the next ordinal.
+    session->prepare_request(5, {0, 1}, {38, {0, 1}});
+    CHECK(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK_EQ(recorder.snapshot().attempt.ordinal, 1);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
+    CHECK_EQ(recorder.snapshot().admitted.prompt_tokens, 0);
+    CHECK_FALSE(recorder.snapshot().admitted.stop_reason_valid);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 0);
+
+    // The rows and scalar spans belong to the admitted request until a later
+    // successful publication replaces them.
+    const iom::oid row = accepted_oid(1);
+    recorder.record_enqueue(row, iom::InferencePhase::prefill, std::nullopt, 0,
+                            5, 10, 30);
+    recorder.record_tokenization(40, 90, iom::ObservationState::succeeded);
+    REQUIRE_EQ(recorder.operations().size(), 1);
+    CHECK_EQ(recorder.operations()[0].operation, row);
+
+    // A failed candidate setup preserves the outgoing admitted request and its
+    // rows and leaves the ordinal alone.
+    fixture.allocator.fail_after = fixture.allocator.allocations + 3;
+    CHECK_THROWS_AS(session->prepare_request(3, {0, 1}, {38, {0, 1}}),
+                    std::bad_alloc);
+    CHECK_EQ(session->request_length(), 5);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 50);
+    REQUIRE_EQ(recorder.operations().size(), 1);
+    CHECK_EQ(recorder.operations()[0].operation, row);
+
+    // Successful publication advances the ordinal, replaces the scalar spans,
+    // and clears the rows without freeing the prepared capacity.
+    fixture.allocator.fail_after = std::numeric_limits<std::size_t>::max();
+    session->prepare_request(3, {0, 1}, {38, {0, 1}});
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 2);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 0);
+    CHECK(recorder.operations().empty());
+    CHECK_GE(recorder.trace_capacity_remaining(), accepted_bound);
+
+    // A staged attempt is published by the next successful handoff.
+    recorder.begin_generation(70, 9);
+    CHECK_EQ(recorder.snapshot().attempt.ordinal, 3);
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 3);
+    CHECK_EQ(recorder.snapshot().admitted.prompt_tokens, 9);
+    CHECK_EQ(recorder.snapshot().attempt.ordinal, 3);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+}
+
+TEST_CASE("Inference metrics session load preserves attribution after a poisoned failure") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = {1, 2};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+    REQUIRE(session);
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.copy(banks.x->view(), banks.attention_norm->view());
+    });
+
+    // A rejected synchronous submission poisons the session and keeps its
+    // accepted OIDs. The recorder's outgoing admitted request and its scalar
+    // spans survive the refusal, and the ordinal does not advance.
+    CHECK_THROWS_AS(SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.copy(banks.x->view(), banks.gate->view());
+    }), std::invalid_argument);
+    CHECK(session->poisoned());
+    recorder.record_tokenization(5, 25, iom::ObservationState::succeeded);
+    CHECK_THROWS_AS(session->prepare_request(1, {0, 1}, {38, {0, 1}}),
+                    std::logic_error);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 20);
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+
+    session.reset();
+    CHECK_EQ(fixture.allocator.live, 0);
+}
+
+TEST_CASE("Inference metrics session load leaves generation behavior unchanged") {
+    ForwardFixture fixture("metrics-session-generation", one_layer_config());
+    const std::vector<std::size_t> prompt{0, 1};
+
+    auto plain = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{4, 2}));
+    REQUIRE(plain);
+    CHECK_EQ(SessionAccess::metrics(*plain), nullptr);
+    const iom::TokenGenerationResult expected =
+            plain->generate_tokens(prompt, 4);
+    CHECK(expected.token_ids == std::vector<std::size_t>{4, 2});
+    CHECK(expected.stop_reason == iom::GenerationStopReason::eos);
+
+    RecordingClock clock;
+    clock.instants = {200, 260, 200, 260};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto observed = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{4, 2}),
+            &recorder);
+    REQUIRE(observed);
+    const iom::TokenGenerationResult result =
+            observed->generate_tokens(prompt, 4);
+    CHECK(result.token_ids == expected.token_ids);
+    CHECK(result.stop_reason == expected.stop_reason);
+    CHECK_EQ(SessionAccess::caches(*observed)[0].initialized_length,
+             SessionAccess::caches(*plain)[0].initialized_length);
+
+    // The attachment alone adds no clock read and no observation to the
+    // generation path: only the load interval was measured.
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+    CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 60);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 0);
+    CHECK_FALSE(recorder.snapshot().request_admitted);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
+    CHECK(recorder.operations().empty());
+
+    // A selector failure keeps its category and its poisoning with and without
+    // an attached recorder.
+    const auto load_failing = [&](iom::InferenceMetrics* metrics) {
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4});
+        selector->throw_failure = true;
+        return iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                metrics);
+    };
+    auto failing_plain = load_failing(nullptr);
+    CHECK_THROWS_AS(failing_plain->generate_tokens(prompt, 2),
+                    std::runtime_error);
+    CHECK(failing_plain->poisoned());
+    auto failing_observed = load_failing(&recorder);
+    CHECK_THROWS_AS(failing_observed->generate_tokens(prompt, 2),
+                    std::runtime_error);
+    CHECK(failing_observed->poisoned());
+    CHECK_EQ(clock.cursor, 4);
+    CHECK_FALSE(clock.exhausted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 0);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
 }
 
 
@@ -553,6 +1076,63 @@ void clear_cache_append_wait_observation() noexcept;
 [[nodiscard]] std::size_t observed_cache_append_waits() noexcept;
 
 }  // namespace iom::cpu_detail
+
+TEST_CASE("Inference metrics session load preserves attribution across a failed drain") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = {3, 8};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+    REQUIRE(session);
+    session->prepare_operation_trace();
+    session->prepare_request(3, {0, 1}, {38, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    const auto caches = SessionAccess::caches(*session);
+    std::vector<std::byte> bytes(banks.k->view().spec().logical_nbytes(),
+                                 std::byte{0});
+    banks.k->view().copy_from_host(bytes);
+    banks.v->view().copy_from_host(bytes);
+    recorder.record_tokenization(30, 70, iom::ObservationState::succeeded);
+    const iom::oid row = accepted_oid(4);
+    recorder.record_enqueue(row, iom::InferencePhase::prefill, std::nullopt, 0,
+                            3, 15, 45);
+    REQUIRE_EQ(recorder.operations().size(), 1);
+
+    {
+        // The process-wide CPU latch rejects the accepted append, so the
+        // replacement's drain reports the queue's original failure instead of
+        // publishing anything.
+        struct ResetFailure {
+            ~ResetFailure() { iom::cpu_detail::clear_cache_append_failure(); }
+        } failure;
+        iom::cpu_detail::arm_cache_append_failure();
+        SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+            return queue.cache_append(banks.k->view(), caches[0].key->view(), 0);
+        });
+        CHECK_THROWS_AS(session->prepare_request(1, {0, 1}, {38, {0, 1}}),
+                        std::runtime_error);
+    }
+
+    CHECK(session->poisoned());
+    CHECK_EQ(session->request_length(), 3);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 40);
+    REQUIRE_EQ(recorder.operations().size(), 1);
+    CHECK_EQ(recorder.operations()[0].operation, row);
+    CHECK_EQ(clock.cursor, 2);
+    CHECK_FALSE(clock.exhausted);
+
+    session.reset();
+    // The CPU backend retains both operands of the failed append in its device
+    // quarantine, so the session's own owners are released without resetting
+    // the allocator.
+    CHECK_EQ(fixture.allocator.live, 2);
+    fixture.device.reset();
+    CHECK_EQ(fixture.allocator.live, 0);
+    CHECK_EQ(fixture.allocator.resets, 0);
+}
 
 TEST_CASE("TinyLlama session resources check all cache bytes before allocation") {
     SessionFixture fixture;

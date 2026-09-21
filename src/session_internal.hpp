@@ -70,6 +70,14 @@ struct SessionAccess {
     static std::vector<std::size_t>& results(TinyLlamaSession&);
     static std::span<const oid> accepted(const TinyLlamaSession&);
 
+    // Borrowed, nullable observation recorder published by the instrumented
+    // load overload. The session never owns, copies, or replaces it, and the
+    // caller keeps it and its supplied clock context alive through session
+    // destruction and drain. A null return means every observation hook is
+    // disabled, so callers read no clock and record nothing.
+    [[nodiscard]] static InferenceMetrics* metrics(
+            TinyLlamaSession& session) noexcept;
+
     // Full-model setup and execution remain an implementation-local seam.  The
     // returned logits pointer borrows the session-owned fixed [1,V] tensor.
     static void prepare_forward_request(

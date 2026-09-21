@@ -522,7 +522,12 @@ has a different `R`.
 selector, and one queue on the borrowed device. The device must outlive the
 session. The injected-selector overload rejects null before any session work;
 the other overload owns a greedy selector. The session retains the model's
-canonical uploaded owners without another weight or checkpoint copy.
+canonical uploaded owners without another weight or checkpoint copy. The
+selector overload also accepts one optional borrowed `InferenceMetrics`
+recorder, which the caller keeps alive through session destruction and drain:
+an attached recorder receives exactly one load interval, and
+`prepare_operation_trace` reserves its bounded operation table before the
+first request. A null recorder disables every observation hook.
 
 Inside the model factory, weight realization follows create, preflight,
 provision, realize: it creates one persistent BF16 tensor per inventory entry,
