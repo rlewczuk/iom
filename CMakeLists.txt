@@ -90,6 +90,7 @@ set(IOM_SOURCES
         src/safetensors.cpp
         src/tokenizer.cpp
         src/model.cpp
+        src/session.cpp
         src/chat_format.cpp
         src/alloc.cpp
 )

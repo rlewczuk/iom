@@ -41,6 +41,7 @@ namespace cpu_detail {
 namespace {
 
 std::atomic<bool> silu_failure_armed{false};
+std::atomic<std::uint64_t> linear_failure_plan{0};
 
 }  // namespace
 
@@ -62,6 +63,46 @@ void clear_silu_failure() noexcept {
 
 [[nodiscard]] bool consume_silu_failure() noexcept {
     return silu_failure_armed.exchange(false, std::memory_order_acq_rel);
+}
+
+// The matching seam for the linear port, which shares this driver's shape: it
+// is one process-wide plan consumed by later enqueued linear tasks after
+// acceptance and before their element loops, so an accepted projection can
+// retain a post-acceptance failure while every later submission stays healthy.
+// The plan lets `healthy_before` submissions pass first and then fails
+// `failures` consecutive ones, which is what distinguishes an independent
+// failure in either one of two sibling projection branches from a failure in
+// both of them. One call sets the whole plan, and arming is meaningful while
+// no linear task is executing. It carries no other state and is inert until a
+// test arms it.
+void arm_linear_failure(
+        std::size_t healthy_before, std::size_t failures) noexcept {
+    linear_failure_plan.store(
+            (static_cast<std::uint64_t>(healthy_before) << 32)
+                    | static_cast<std::uint64_t>(failures),
+            std::memory_order_release);
+}
+
+void clear_linear_failure() noexcept {
+    linear_failure_plan.store(0, std::memory_order_release);
+}
+
+[[nodiscard]] bool consume_linear_failure() noexcept {
+    std::uint64_t plan = linear_failure_plan.load(std::memory_order_acquire);
+    for (;;) {
+        const std::size_t healthy = static_cast<std::size_t>(plan >> 32);
+        const std::size_t failures =
+                static_cast<std::size_t>(plan & 0xFFFFFFFFu);
+        if (healthy == 0 && failures == 0) return false;
+        const std::uint64_t next = healthy != 0
+                ? plan - (std::uint64_t{1} << 32)
+                : plan - 1;
+        if (linear_failure_plan.compare_exchange_weak(
+                    plan, next, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+            return healthy == 0;
+        }
+    }
 }
 
 }  // namespace cpu_detail
@@ -1370,6 +1411,12 @@ private:
                                 [this, sequence, captured, entries] {
                                     std::exception_ptr failure;
                                     try {
+                                        if (cpu_detail::consume_linear_failure()) {
+                                            throw std::runtime_error(
+                                                    "CPU linear projection "
+                                                    "injected post-acceptance "
+                                                    "failure");
+                                        }
                                         linear_elements(captured);
                                     } catch (...) {
                                         failure = std::current_exception();

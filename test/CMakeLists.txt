@@ -100,6 +100,7 @@ add_executable(iom_tests
         test_tokenizer.cpp
         test_model_loading.cpp
         test_chat_format.cpp
+        test_model_session.cpp
         test_alloc.cpp
         test_gpu_status.cpp
 )
