@@ -51,6 +51,14 @@ struct CacheOwner {
     std::size_t initialized_length = 0;
 };
 
+struct ForwardResult {
+    // Borrowed selector-ready logits storage.  The request owns the tensor;
+    // callers must keep the session alive and wait `producer` before reading
+    // or passing this view to the synchronous selector.
+    const TensorView* logits = nullptr;
+    oid producer = 0;
+};
+
 struct SessionAccess {
     static const RunBanks& prefill(TinyLlamaSession&);
     static const RunBanks& decode(TinyLlamaSession&);
@@ -62,6 +70,15 @@ struct SessionAccess {
     static std::vector<std::size_t>& results(TinyLlamaSession&);
     static std::span<const oid> accepted(const TinyLlamaSession&);
 
+    // Full-model setup and execution remain an implementation-local seam.  The
+    // returned logits pointer borrows the session-owned fixed [1,V] tensor.
+    static void prepare_forward_request(
+            TinyLlamaSession&, std::size_t run_length);
+    [[nodiscard]] static ForwardResult forward_prefill(
+            TinyLlamaSession&, std::span<const std::size_t> token_ids);
+    [[nodiscard]] static ForwardResult forward_decode(
+            TinyLlamaSession&, std::size_t token_id);
+
     // Check the bounded ledger BEFORE submission, then retain the returned
     // positive OID without allocation. Independent branches can be submitted
     // separately before waiting. No second queue or type-erased callback.
@@ -71,8 +88,8 @@ struct SessionAccess {
         return record_submission(session, operation(session.queue()));
     }
 
-    // Failure is sticky; waits remain repeatable and a failed wait drains
-    // every other accepted OID before rethrowing the original exception.
+    // Failure is sticky; waits remain repeatable; a failed wait drains every
+    // other accepted OID before rethrowing the original exception.
     static void wait(TinyLlamaSession&, oid);
     static void drain(TinyLlamaSession&);
 
@@ -80,6 +97,7 @@ private:
     static void require_submission(TinyLlamaSession&);
     static oid record_submission(TinyLlamaSession&, oid);
 };
+
 
 // ---------------------------------------------------------------------------
 // Post-attention SwiGLU MLP stage (leaf 05-mlp-stage).

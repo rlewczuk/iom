@@ -39,6 +39,7 @@ namespace {
 
 using iom_model_loading::TempDir;
 using iom_model_loading::one_layer_config;
+using iom_model_loading::two_layer_config;
 using iom_model_loading::required_weight_entries;
 using iom_model_loading::write_config;
 using iom_model_loading::write_file;
@@ -133,6 +134,82 @@ struct SessionFixture {
         return iom::load_tinyllama_session(directory.path(), *device);
     }
 };
+
+[[nodiscard]] std::uint16_t forward_encode_bf16(float value) noexcept {
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+    const std::uint32_t lsb = (bits >> 16) & 1U;
+    return static_cast<std::uint16_t>((bits + 0x7FFFU + lsb) >> 16);
+}
+
+[[nodiscard]] float forward_decode_bf16(std::uint16_t bits) noexcept {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+}
+
+[[nodiscard]] std::string forward_finite_payload(
+        const std::vector<std::size_t>& shape, std::size_t entry) {
+    const std::size_t elements = iom_model_loading::element_count(shape);
+    std::string payload(elements * sizeof(std::uint16_t), '\0');
+    for (std::size_t element = 0; element < elements; ++element) {
+        float value = 0.015F
+                * static_cast<float>(1 + ((entry + element) % 7));
+        if (entry == 1
+                || (entry >= 3 && ((entry - 3) % 9) < 2)) {
+            value = 1.0F + 0.015F
+                    * static_cast<float>((entry + element) % 3);
+        }
+        const std::uint16_t bits = forward_encode_bf16(value);
+        std::memcpy(payload.data() + element * sizeof(bits), &bits,
+                    sizeof(bits));
+    }
+    return payload;
+}
+
+void write_forward_weights(
+        const std::filesystem::path& directory,
+        const nlohmann::json& config) {
+    auto entries = required_weight_entries(config);
+    for (std::size_t entry = 0; entry < entries.size(); ++entry) {
+        entries[entry].payload =
+                forward_finite_payload(entries[entry].shape, entry);
+    }
+    write_safetensors_file(directory, "model.safetensors", entries);
+}
+
+struct ForwardFixture {
+    TempDir directory;
+    HeapAllocator allocator;
+    std::unique_ptr<iom::Device> device;
+
+    ForwardFixture(std::string tag, const nlohmann::json& config)
+        : directory("session-forward-" + std::move(tag)) {
+        write_config(directory.path(), config);
+        write_forward_weights(directory.path(), config);
+        write_tokenizer(directory.path());
+        write_file(directory.path(), "tokenizer_config.json",
+                   tokenizer_config().dump());
+        device = iom::make_cpu_device(allocator);
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::TinyLlamaSession> load() {
+        return iom::load_tinyllama_session(directory.path(), *device);
+    }
+};
+
+[[nodiscard]] std::vector<float> read_forward_tensor(
+        const iom::TensorView& view) {
+    REQUIRE(view.spec().data_type == iom::DataType::BF16);
+    const std::size_t elements = view.spec().shape.element_count();
+    std::vector<std::byte> bytes(elements * sizeof(std::uint16_t));
+    view.copy_to_host(bytes);
+    std::vector<float> values(elements);
+    for (std::size_t element = 0; element < elements; ++element) {
+        std::uint16_t bits = 0;
+        std::memcpy(&bits, bytes.data() + element * sizeof(bits), sizeof(bits));
+        values[element] = forward_decode_bf16(bits);
+    }
+    return values;
+}
+
 
 class ProbeSelector final : public iom::TokenSelector {
 public:
@@ -745,10 +822,147 @@ TEST_CASE("TinyLlama session resources retain context sized buffers without deco
     CHECK_EQ(fixture.allocator.allocations, allocations);
 }
 
-namespace {
+TEST_CASE("TinyLlama full model logits execute every configured layer") {
+    ForwardFixture one_fixture("one-layer", one_layer_config());
+    ForwardFixture two_fixture("two-layer", two_layer_config());
+    auto one = one_fixture.load();
+    auto two = two_fixture.load();
 
+    SessionAccess::prepare_forward_request(*one, 2);
+    SessionAccess::prepare_forward_request(*two, 2);
+    const std::array<std::size_t, 2> prompt{0, 1};
+    const auto one_result = SessionAccess::forward_prefill(*one, prompt);
+    const auto two_result = SessionAccess::forward_prefill(*two, prompt);
+    REQUIRE(iom::oid_is_token(one_result.producer));
+    REQUIRE(iom::oid_is_token(two_result.producer));
+    REQUIRE(one_result.logits);
+    REQUIRE(two_result.logits);
+    SessionAccess::wait(*one, one_result.producer);
+    SessionAccess::wait(*two, two_result.producer);
+
+    CHECK(iom_model_loading::dims_of(one_result.logits->spec().shape)
+          == std::vector<std::size_t>{1, 19});
+    CHECK(iom_model_loading::dims_of(two_result.logits->spec().shape)
+          == std::vector<std::size_t>{1, 19});
+    CHECK(one_result.logits == &SessionAccess::logits(*one));
+    CHECK(two_result.logits == &SessionAccess::logits(*two));
+    const auto one_logits = read_forward_tensor(*one_result.logits);
+    const auto two_logits = read_forward_tensor(*two_result.logits);
+    REQUIRE_EQ(one_logits.size(), 19);
+    REQUIRE_EQ(two_logits.size(), 19);
+    CHECK(std::all_of(one_logits.begin(), one_logits.end(),
+                      [](float value) { return std::isfinite(value); }));
+    CHECK(std::all_of(two_logits.begin(), two_logits.end(),
+                      [](float value) { return std::isfinite(value); }));
+    bool layer_changed_output = false;
+    for (std::size_t index = 0; index < one_logits.size(); ++index) {
+        if (std::abs(one_logits[index] - two_logits[index]) > 0.01F) {
+            layer_changed_output = true;
+            break;
+        }
+    }
+    CHECK(layer_changed_output);
+    CHECK_EQ(SessionAccess::caches(*one)[0].initialized_length, 2);
+    CHECK_EQ(SessionAccess::caches(*two)[0].initialized_length, 2);
+    REQUIRE_EQ(SessionAccess::caches(*two).size(), 2);
+    CHECK_EQ(SessionAccess::caches(*two)[1].initialized_length, 2);
+}
+
+TEST_CASE("TinyLlama full model logits match cached decode at the same row") {
+    ForwardFixture fixture("parity", two_layer_config());
+    auto direct = fixture.load();
+    auto cached = fixture.load();
+    SessionAccess::prepare_forward_request(*direct, 2);
+    SessionAccess::prepare_forward_request(*cached, 1);
+
+    const std::array<std::size_t, 2> full_prompt{0, 1};
+    const std::array<std::size_t, 1> prefix{0};
+    const auto direct_result = SessionAccess::forward_prefill(
+            *direct, full_prompt);
+    const auto prefix_result = SessionAccess::forward_prefill(*cached, prefix);
+    REQUIRE(iom::oid_is_token(direct_result.producer));
+    REQUIRE(iom::oid_is_token(prefix_result.producer));
+    SessionAccess::wait(*direct, direct_result.producer);
+    SessionAccess::wait(*cached, prefix_result.producer);
+
+    const auto decode_result = SessionAccess::forward_decode(*cached, 1);
+    REQUIRE(iom::oid_is_token(decode_result.producer));
+    REQUIRE(decode_result.logits);
+    SessionAccess::wait(*cached, decode_result.producer);
+    const auto direct_logits = read_forward_tensor(*direct_result.logits);
+    const auto decode_logits = read_forward_tensor(*decode_result.logits);
+    REQUIRE_EQ(direct_logits.size(), decode_logits.size());
+    for (std::size_t index = 0; index < direct_logits.size(); ++index) {
+        CHECK_MESSAGE(
+                std::abs(direct_logits[index] - decode_logits[index]) < 0.02F,
+                "cached decode differs at vocabulary index " << index);
+    }
+    CHECK(iom_model_loading::dims_of(decode_result.logits->spec().shape)
+          == std::vector<std::size_t>{1, 19});
+    CHECK_EQ(SessionAccess::caches(*cached)[0].initialized_length, 2);
+    CHECK_EQ(SessionAccess::caches(*cached)[1].initialized_length, 2);
+}
+
+TEST_CASE("TinyLlama full model logits reject invalid token requests") {
+    ForwardFixture fixture("validation", one_layer_config());
+    auto session = fixture.load();
+    CHECK_THROWS_AS(
+            SessionAccess::prepare_forward_request(*session, 0),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            SessionAccess::prepare_forward_request(
+                    *session, session->config().max_position_embeddings + 1),
+            std::invalid_argument);
+
+    SessionAccess::prepare_forward_request(*session, 1);
+    const std::array<std::size_t, 0> empty{};
+    CHECK_THROWS_AS(
+            SessionAccess::forward_prefill(*session, empty),
+            std::invalid_argument);
+    const std::array<std::size_t, 1> invalid{
+            session->config().vocab_size};
+    CHECK_THROWS_AS(
+            SessionAccess::forward_prefill(*session, invalid),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            SessionAccess::forward_decode(
+                    *session, session->config().vocab_size),
+            std::invalid_argument);
+    CHECK_FALSE(session->poisoned());
+    CHECK(SessionAccess::accepted(*session).empty());
+}
+
+TEST_CASE("TinyLlama full model logits reuse request owners") {
+    ForwardFixture fixture("reuse", one_layer_config());
+    auto session = fixture.load();
+    SessionAccess::prepare_forward_request(*session, 2);
+    const auto allocations = fixture.allocator.allocations;
+    CHECK(iom_model_loading::dims_of(
+                  SessionAccess::prefill(*session).x->view().spec().shape)
+          == std::vector<std::size_t>{2, 8});
+    CHECK(iom_model_loading::dims_of(
+                  SessionAccess::decode(*session).x->view().spec().shape)
+          == std::vector<std::size_t>{1, 8});
+
+    const std::array<std::size_t, 2> prompt{0, 1};
+    const auto prefill = SessionAccess::forward_prefill(*session, prompt);
+    REQUIRE(iom::oid_is_token(prefill.producer));
+    SessionAccess::wait(*session, prefill.producer);
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+    const auto decode = SessionAccess::forward_decode(*session, 2);
+    REQUIRE(iom::oid_is_token(decode.producer));
+    SessionAccess::wait(*session, decode.producer);
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+    const auto decode_logits = read_forward_tensor(*decode.logits);
+    CHECK(std::all_of(
+            decode_logits.begin(), decode_logits.end(),
+            [](float value) { return std::isfinite(value); }));
+}
+
+namespace {
 using iom::session_detail::MlpStageFailure;
 using iom::session_detail::MlpStageParams;
+
 using iom::session_detail::MlpStageViews;
 using iom::session_detail::MlpWorkspace;
 using iom::session_detail::MlpWorkspaceRequirements;
