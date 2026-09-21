@@ -163,6 +163,50 @@ void validate_generation_prompt(
     }
 }
 
+[[nodiscard]] std::vector<std::size_t> widen_token_ids(
+        std::span<const std::uint32_t> token_ids) {
+    validate_vector_capacity<std::size_t>(token_ids.size());
+    std::vector<std::size_t> widened;
+    widened.reserve(token_ids.size());
+    for (const std::uint32_t token_id : token_ids) {
+        if constexpr (std::numeric_limits<std::size_t>::max()
+                      < std::numeric_limits<std::uint32_t>::max()) {
+            if (token_id > std::numeric_limits<std::size_t>::max()) {
+                throw std::overflow_error(
+                        "TinyLlama generation prompt token ID cannot be "
+                        "represented by size_t");
+            }
+        }
+        widened.push_back(static_cast<std::size_t>(token_id));
+    }
+    return widened;
+}
+
+[[nodiscard]] GenerationResult finish_text_generation(
+        TinyLlamaSession& session, std::vector<std::uint32_t> encoded,
+        std::size_t max_new_tokens) {
+    std::vector<std::size_t> prompt = widen_token_ids(encoded);
+    TokenGenerationResult generated =
+            session.generate_tokens(prompt, max_new_tokens);
+
+    validate_vector_capacity<std::uint32_t>(generated.token_ids.size());
+    std::vector<std::uint32_t> generated_ids;
+    generated_ids.reserve(generated.token_ids.size());
+    for (const std::size_t token_id : generated.token_ids) {
+        if (token_id > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error(
+                    "TinyLlama generated token ID cannot be represented by "
+                    "the tokenizer");
+        }
+        generated_ids.push_back(static_cast<std::uint32_t>(token_id));
+    }
+
+    const std::string text = session.tokenizer().decode(
+            generated_ids, DecodeOptions{.skip_special_tokens = true});
+    return GenerationResult{
+            std::move(generated.token_ids), text, generated.stop_reason};
+}
+
 struct ForwardLayerPlan {
     session_detail::DecoderLayerForwardViews prefill;
     session_detail::DecoderLayerForwardViews decode;
@@ -929,6 +973,26 @@ TokenGenerationResult TinyLlamaSession::generate_tokens(
         current = session_detail::SessionAccess::forward_decode(
                 *this, selected);
     }
+}
+
+GenerationResult TinyLlamaSession::generate_raw(
+        std::string_view text, std::size_t max_new_tokens) {
+    return finish_text_generation(
+            *this,
+            tokenizer().encode(
+                    text, EncodeOptions{.add_special_tokens = true}),
+            max_new_tokens);
+}
+
+GenerationResult TinyLlamaSession::generate_chat(
+        std::span<const ChatMessageView> messages,
+        std::size_t max_new_tokens) {
+    const std::string rendered = formatter().format(messages, true);
+    return finish_text_generation(
+            *this,
+            tokenizer().encode(
+                    rendered, EncodeOptions{.add_special_tokens = true}),
+            max_new_tokens);
 }
 
 std::size_t TinyLlamaSession::request_length() const noexcept {
