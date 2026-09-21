@@ -93,6 +93,7 @@ set(IOM_SOURCES
         src/session.cpp
         src/chat_format.cpp
         src/alloc.cpp
+        src/inference_metrics.cpp
 )
 
 set(IOM_HEADERS
@@ -110,6 +111,7 @@ set(IOM_HEADERS
         include/iom/tensor.hpp
         include/iom/token_selection.hpp
         include/iom/session.hpp
+        include/iom/inference_metrics.hpp
 )
 
 

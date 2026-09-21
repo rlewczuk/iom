@@ -103,6 +103,7 @@ add_executable(iom_tests
         test_model_session.cpp
         test_alloc.cpp
         test_gpu_status.cpp
+        test_inference_metrics.cpp
 )
 set_source_files_properties(test_iom.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
