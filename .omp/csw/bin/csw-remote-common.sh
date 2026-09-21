@@ -131,5 +131,5 @@ remote_dir_for() {
 
 quote_single() {
   # Print a shell-safe single-quoted string.
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
+  printf "'%s'" "${1//\'/\'\\\'\'}"
 }

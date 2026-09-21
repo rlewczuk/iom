@@ -103,6 +103,44 @@ class VerifierTests(unittest.TestCase):
         return self.command(VERIFY, "verify", task, "--plan", json.dumps(plan or self.plan(task)),
                             "--summary", "Persisted value verified", ok=ok, expected=expected)
 
+
+    def backend_verify(self, task, mirror="mirror", plan=None, ok=True, expected=None):
+        args = ["verify", task, "--backend-tests", mirror]
+        if plan is not None:
+            args.extend(["--plan", json.dumps(plan)])
+        args.extend(["--summary", "Backend tests verified"])
+        return self.command(VERIFY, *args, ok=ok, expected=expected)
+
+    def install_backend_scripts(self, failures=None, children=False):
+        failures = failures or {}
+        directory = self.repo / ".omp" / "csw" / "bin"
+        directory.mkdir(parents=True)
+        for backend in ("cpu", "cuda", "rocm", "sycl"):
+            fail = int(failures.get(backend, 0))
+            child_code = ""
+            child_write = ""
+            if children:
+                child_code = (
+                    "p=subprocess.Popen([sys.executable,'-c',"
+                    "\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)\"]); "
+                )
+                child_write = f"Path(task / 'child-{backend}.pid').write_text(str(p.pid)); "
+            finish = f"raise SystemExit({fail})\n" if not children else "time.sleep(60)\n"
+            source = (
+                "#!/usr/bin/env python3\n"
+                "import os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                f"backend={backend!r}; task=Path(os.environ['CSW_REMOTE_TASK_DIR'])\n"
+                "assert len(sys.argv) == 2 and sys.argv[1] == 'mirror-id'\n"
+                f"{child_code}{child_write}"
+                "(task / ('start-' + backend)).write_text('started')\n"
+                "while not all((task / ('start-' + item)).exists() for item in ('cpu','cuda','rocm','sycl')):\n"
+                "    time.sleep(0.01)\n"
+                f"{finish}"
+            )
+            path = directory / f"test_{backend}"
+            path.write_text(source, encoding="utf-8")
+            path.chmod(0o755)
     def status(self, task):
         return self.command(VERIFY, "status", task)
 
@@ -168,6 +206,54 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(self.git("rev-list", "--count", f"{receipt['base']}..HEAD"), "1")
         evidence = self.status(task)["state"]["review_receipt"]["review_file"]
         self.assertEqual(Path(evidence).read_text().count("## Review round"), 1)
+    def test_backend_runners_start_concurrently_and_receipt_reuses(self):
+        task, _ = self.ready("backend-concurrent")
+        self.install_backend_scripts()
+        first = self.backend_verify(task, "mirror-id")
+        self.assertTrue(first["ok"])
+        self.assertEqual(
+            [gate["name"] for gate in first["receipt"]["gates"]],
+            ["backend-cpu", "backend-cuda", "backend-rocm", "backend-sycl"],
+        )
+        self.assertTrue(all(Path(gate["log"]).is_file() for gate in first["receipt"]["gates"]))
+        second = self.backend_verify(task, "mirror-id")
+        self.assertTrue(second["reused"])
+
+    def test_backend_failure_retains_all_parallel_results_and_blocks_extras(self):
+        task, _ = self.ready("backend-failure")
+        self.install_backend_scripts({"cuda": 7})
+        marker = self.root / "extra-ran"
+        extra = self.plan(task, f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')")
+        outcome = self.backend_verify(task, "mirror-id", extra, ok=False)
+        self.assertEqual(outcome["code"], "gate_failed")
+        self.assertEqual(len(outcome["receipt"]["gates"]), 4)
+        self.assertEqual([gate["name"] for gate in outcome["receipt"]["gates"]], [
+            "backend-cpu", "backend-cuda", "backend-rocm", "backend-sycl",
+        ])
+        self.assertEqual(outcome["problem"]["remote"]["profile"], "cuda")
+        self.assertEqual(outcome["problem"]["remote"]["task_id"], "mirror-id-cuda")
+        self.assertEqual(len(outcome["problems"]), 1)
+        self.assertFalse(marker.exists())
+
+    def test_backend_sigterm_stops_every_parallel_process_group(self):
+        task, _ = self.ready("backend-interrupt")
+        self.install_backend_scripts(children=True)
+        process = subprocess.Popen(
+            [str(VERIFY), "--repo", str(self.repo), "verify", task,
+             "--backend-tests", "mirror-id", "--summary", "Interrupt backend tests"],
+            env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        markers = [self.repo / ".cswd" / "tasks" / task / f"start-{backend}"
+                   for backend in ("cpu", "cuda", "rocm", "sycl")]
+        self.wait_files(markers, [process])
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertEqual(json.loads(stdout)["code"], "interrupted")
+        for backend in ("cpu", "cuda", "rocm", "sycl"):
+            self.assert_not_running(int((self.repo / ".cswd" / "tasks" / task /
+                                         f"child-{backend}.pid").read_text()))
+
 
     def test_failed_gate_retains_failure_and_cannot_integrate(self):
         task, _ = self.ready()
@@ -227,6 +313,25 @@ class VerifierTests(unittest.TestCase):
         stat = Path(f"/proc/{pid}/stat")
         if stat.exists():
             self.assertEqual(stat.read_text().split(") ", 1)[1][0], "Z")
+
+    def test_raw_backend_runner_plan_requires_integration_path_and_prepared_env(self):
+        task, wt = self.ready("backend-plan")
+        task_directory = self.repo / ".cswd" / "tasks" / task
+        plan = {
+            "commands": [{
+                "name": "cpu runner",
+                "argv": ["/tmp/test_cpu", "mirror-id"],
+                "env": {
+                    "CSW_REMOTE_TASK_DIR": str(task_directory),
+                    "CSW_REMOTE_WORKSPACE": str(wt),
+                },
+                "timeout_seconds": 5,
+            }],
+            "total_timeout_seconds": 10,
+        }
+        with self.assertRaisesRegex(API.worker.TaskError, "integration test_cpu"):
+            API.validate_remote_plan(API.command_plan(json.dumps(plan)), self.repo, task, wt)
+
 
     def test_test_timeout_stops_even_term_ignoring_descendants(self):
         task, _ = self.ready()
