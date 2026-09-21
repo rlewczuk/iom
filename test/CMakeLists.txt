@@ -113,6 +113,11 @@ target_link_libraries(iom_tests
         doctest::doctest
         libiom
 )
+add_dependencies(iom_tests iom_generate)
+target_compile_definitions(iom_tests
+    PRIVATE
+        IOM_GENERATE_EXECUTABLE="$<TARGET_FILE:iom_generate>"
+)
 
 add_test(NAME iom_tests COMMAND iom_tests)
 

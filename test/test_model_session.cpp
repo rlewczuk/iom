@@ -4,13 +4,16 @@
 #include <bit>
 #include <chrono>
 
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -23,6 +26,10 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
@@ -5267,3 +5274,185 @@ TEST_CASE(
 }
 
 }  // namespace decoder_layer_forward_test
+
+namespace generation_cli_test {
+
+#ifndef IOM_GENERATE_EXECUTABLE
+#define IOM_GENERATE_EXECUTABLE ""
+#endif
+
+struct ProcessResult {
+    int exit_code = -1;
+    std::string stdout_text;
+    std::string stderr_text;
+};
+
+[[nodiscard]] std::string read_capture(
+        const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    return std::string(
+            std::istreambuf_iterator<char>(stream),
+            std::istreambuf_iterator<char>());
+}
+
+[[nodiscard]] ProcessResult invoke(std::vector<std::string> arguments) {
+    static std::size_t sequence = 0;
+    const std::string tag = "iom-generate-cli-"
+            + std::to_string(static_cast<long long>(::getpid()))
+            + "-" + std::to_string(++sequence);
+    const std::filesystem::path directory =
+            std::filesystem::temp_directory_path();
+    const std::filesystem::path stdout_path = directory / (tag + ".out");
+    const std::filesystem::path stderr_path = directory / (tag + ".err");
+
+    arguments.insert(arguments.begin(), IOM_GENERATE_EXECUTABLE);
+    const pid_t child = ::fork();
+    REQUIRE_MESSAGE(child >= 0, "fork failed: " << std::strerror(errno));
+    if (child < 0) {
+        return {};
+    }
+
+    if (child == 0) {
+        const int stdout_fd = ::open(
+                stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int stderr_fd = ::open(
+                stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (stdout_fd < 0 || stderr_fd < 0
+                || ::dup2(stdout_fd, STDOUT_FILENO) < 0
+                || ::dup2(stderr_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        ::close(stdout_fd);
+        ::close(stderr_fd);
+
+        std::vector<char*> child_arguments;
+        child_arguments.reserve(arguments.size() + 1);
+        for (std::string& argument : arguments) {
+            child_arguments.push_back(argument.data());
+        }
+        child_arguments.push_back(nullptr);
+        ::execv(child_arguments.front(), child_arguments.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+
+    ProcessResult result;
+    if (WIFEXITED(status)) {
+        result.exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        result.exit_code = 128 + WTERMSIG(status);
+    }
+    result.stdout_text = read_capture(stdout_path);
+    result.stderr_text = read_capture(stderr_path);
+    std::error_code error;
+    std::filesystem::remove(stdout_path, error);
+    std::filesystem::remove(stderr_path, error);
+    return result;
+}
+
+[[nodiscard]] std::vector<std::string> required_cpu_arguments(
+        const std::filesystem::path& model_directory) {
+    return {
+            "--model-dir", model_directory.string(),
+            "--backend", "cpu",
+            "--device", "0",
+            "--max-new-tokens", "0",
+    };
+}
+
+}  // namespace generation_cli_test
+
+TEST_CASE("TinyLlama generation CLI rejects malformed process input") {
+    using generation_cli_test::invoke;
+
+    const auto missing = invoke({});
+    CHECK_EQ(missing.exit_code, 2);
+    CHECK(missing.stderr_text.find("usage/input") != std::string::npos);
+
+    auto negative = invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "-1",
+            "--prompt", "hello"});
+    CHECK_EQ(negative.exit_code, 2);
+    CHECK(negative.stderr_text.find("usage/input") != std::string::npos);
+
+    auto overflowing = invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens",
+            std::to_string(std::numeric_limits<std::size_t>::max()) + "0",
+            "--prompt", "hello"});
+    CHECK_EQ(overflowing.exit_code, 2);
+    CHECK(overflowing.stderr_text.find("usage/input") != std::string::npos);
+
+    auto wrong_cpu_ordinal = invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "1", "--max-new-tokens", "0",
+            "--prompt", "hello"});
+    CHECK_EQ(wrong_cpu_ordinal.exit_code, 2);
+    CHECK(wrong_cpu_ordinal.stderr_text.find("usage/input")
+          != std::string::npos);
+
+    auto missing_arena = invoke({
+            "--model-dir", "/missing", "--backend", "cuda",
+            "--device", "0", "--max-new-tokens", "0",
+            "--prompt", "hello"});
+    CHECK_EQ(missing_arena.exit_code, 2);
+    CHECK(missing_arena.stderr_text.find("usage/input")
+          != std::string::npos);
+
+    auto conflicting_input = invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0",
+            "--prompt", "hello", "--message", "user", "world"});
+    CHECK_EQ(conflicting_input.exit_code, 2);
+    CHECK(conflicting_input.stderr_text.find("usage/input")
+          != std::string::npos);
+}
+
+TEST_CASE("TinyLlama generation CLI classifies backend setup failures") {
+    const auto result = generation_cli_test::invoke({
+            "--model-dir", "/missing", "--backend", "cuda",
+            "--device", "0", "--tensor-arena-bytes", "32",
+            "--max-new-tokens", "0", "--prompt", "hello"});
+    CHECK_EQ(result.exit_code, 3);
+    CHECK(result.stdout_text.empty());
+    CHECK(result.stderr_text.find("setup/load") != std::string::npos);
+}
+
+TEST_CASE(
+        "TinyLlama generation CLI runs raw and structured chat process "
+        "forms") {
+    ForwardFixture fixture("generation-cli-process", text_generation_config());
+    const std::vector<std::string> base =
+            generation_cli_test::required_cpu_arguments(fixture.directory.path());
+
+    std::vector<std::string> raw_arguments = base;
+    raw_arguments.push_back("--prompt");
+    raw_arguments.push_back("hello");
+    const auto raw = generation_cli_test::invoke(std::move(raw_arguments));
+    CHECK_EQ(raw.exit_code, 0);
+    CHECK(raw.stdout_text.empty());
+    CHECK(raw.stderr_text.empty());
+
+    std::vector<std::string> chat_arguments = base;
+    chat_arguments.insert(
+            chat_arguments.end(),
+            {"--message", "system", "Be concise.",
+             "--message", "user", "hello"});
+    const auto chat = generation_cli_test::invoke(std::move(chat_arguments));
+    CHECK_EQ(chat.exit_code, 0);
+    CHECK(chat.stdout_text.empty());
+    CHECK(chat.stderr_text.empty());
+
+    std::vector<std::string> unsupported_role = base;
+    unsupported_role.insert(
+            unsupported_role.end(), {"--message", "tool", "hello"});
+    const auto rejected =
+            generation_cli_test::invoke(std::move(unsupported_role));
+    CHECK_EQ(rejected.exit_code, 2);
+    CHECK(rejected.stdout_text.empty());
+    CHECK(rejected.stderr_text.find("usage/input") != std::string::npos);
+}
