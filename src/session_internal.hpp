@@ -10,8 +10,10 @@
 // public header.
 
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -20,6 +22,21 @@
 #include "iom/tensor.hpp"
 
 namespace iom::session_detail {
+
+// Session-scoped attribution copied by value into every accepted enqueue
+// observation. The forward entry points set the phase and the absolute input
+// window once per request, each decoder-layer iteration adds that configured
+// layer index, and the final LM-head submission carries its one-row window.
+// `SessionAccess::submit` copies these values into the owned recorder row, so
+// no stage borrow or loop variable outlives the submission and no value is
+// ever inferred from a timing sibling. A submission outside any forward scope
+// keeps this default: `load` phase, no decoder layer, empty window.
+struct OperationContext {
+    InferencePhase phase = InferencePhase::load;
+    std::optional<std::size_t> decoder_layer;
+    std::size_t position_start = 0;
+    std::size_t run_length = 0;
+};
 
 // Resource-only access for the later private forward/generation routines.
 // Owners and their full views stay fixed; none of these types is installed.
@@ -87,13 +104,39 @@ struct SessionAccess {
     [[nodiscard]] static ForwardResult forward_decode(
             TinyLlamaSession&, std::size_t token_id);
 
-    // Check the bounded ledger BEFORE submission, then retain the returned
+    // Set the session-scoped attribution of the accepted submissions that
+    // follow. The forward entry points and their decoder-layer loops own these
+    // values; a null recorder keeps no attribution bookkeeping at all.
+    static void set_operation_context(
+            TinyLlamaSession& session, const OperationContext& context) noexcept;
+
+    // Check the bounded ledger and the prepared trace capacity BEFORE
+    // submission, then measure the one facade call and retain the returned
     // positive OID without allocation. Independent branches can be submitted
     // separately before waiting. No second queue or type-erased callback.
+    //
+    // With an attached recorder the supplied monotonic clock is read
+    // immediately before and immediately after the facade invocation, so host
+    // enqueue is exactly that facade-call interval: runtime blocking inside
+    // the facade counts, and later producer waits, selector work, and the
+    // whole forward span do not. The accepted OID is appended as one owned
+    // observation copied from the session-scoped context; a rejected
+    // submission keeps its existing translation, becomes no trace event, and
+    // contributes no enqueue time. A null recorder reads no clock and records
+    // nothing.
     template <class Submit>
     static oid submit(TinyLlamaSession& session, Submit&& operation) {
         require_submission(session);
-        return record_submission(session, operation(session.queue()));
+        InferenceMetrics* recorder = metrics(session);
+        if (recorder == nullptr) {
+            return record_submission(session, operation(session.queue()));
+        }
+        const std::uint64_t enqueue_begin = recorder->now();
+        const oid token = operation(session.queue());
+        const std::uint64_t enqueue_end = recorder->now();
+        const oid accepted = record_submission(session, token);
+        observe_submission(session, accepted, enqueue_begin, enqueue_end);
+        return accepted;
     }
 
     // Failure is sticky; waits remain repeatable; a failed wait drains every
@@ -104,6 +147,13 @@ struct SessionAccess {
 private:
     static void require_submission(TinyLlamaSession&);
     static oid record_submission(TinyLlamaSession&, oid);
+
+    // Append one accepted positive OID as an owned enqueue observation. The
+    // recorder accumulates the measured facade interval into the phase
+    // host-enqueue sum and creates a per-OID row only from explicitly prepared
+    // trace storage; both steps are allocation-free and non-throwing.
+    static void observe_submission(
+            TinyLlamaSession&, oid, std::uint64_t, std::uint64_t) noexcept;
 };
 
 

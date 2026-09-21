@@ -30,6 +30,7 @@ namespace {
 using detail::checked_add;
 using detail::checked_mul;
 using session_detail::CacheOwner;
+using session_detail::OperationContext;
 using session_detail::RunBanks;
 constexpr std::size_t kBaseWorkspaceAlignment = 32;
 constexpr std::size_t kAcceptedOidsPerLayer = 24;
@@ -745,6 +746,13 @@ struct TinyLlamaSession::Impl {
     // drain; the session never owns, copies, replaces, or rejects it. A null
     // value means every observation hook is disabled.
     InferenceMetrics* metrics = nullptr;
+
+    // Attribution copied into every accepted enqueue observation. The forward
+    // entry points and their decoder-layer loops set these values from the
+    // request and loop variables they already own; a submission outside any
+    // forward scope keeps the default empty attribution. Disabled observation
+    // keeps no bookkeeping here because the setter ignores a null recorder.
+    OperationContext operation_context;
 
     // Declaration order is intentional.  The queue is destroyed first so it
     // can close and drain while every tensor/workspace owner remains alive.
@@ -1490,11 +1498,44 @@ InferenceMetrics* SessionAccess::metrics(TinyLlamaSession& session) noexcept {
     return session.impl_->metrics;
 }
 
+void SessionAccess::set_operation_context(
+        TinyLlamaSession& session, const OperationContext& context) noexcept {
+    if (session.impl_->metrics == nullptr) {
+        // Fully disabled observation keeps no attribution bookkeeping at all.
+        return;
+    }
+    session.impl_->operation_context = context;
+}
+
 void SessionAccess::require_submission(TinyLlamaSession& session) {
     session.impl_->require_request();
     const auto& tokens = session.impl_->request->accepted_oids;
     if (tokens.size() == tokens.capacity())
         throw std::overflow_error("TinyLlama session submission bound exceeded");
+    // The prepared trace table is the only storage for accepted observations,
+    // and its fixed capacity is bounded by the same checked accepted-OID
+    // bound as the ledger above. An accepted submission whose observation
+    // could not be prepared is refused here with the same checked-bound
+    // category instead of being dropped, grown, or silently lost after the
+    // facade accepted it.
+    const InferenceMetrics* recorder = session.impl_->metrics;
+    if (recorder != nullptr && recorder->trace_prepared()
+            && recorder->trace_capacity_remaining() == 0) {
+        throw std::overflow_error(
+                "TinyLlama session operation trace capacity exceeded");
+    }
+}
+
+void SessionAccess::observe_submission(
+        TinyLlamaSession& session, oid accepted,
+        std::uint64_t enqueue_begin, std::uint64_t enqueue_end) noexcept {
+    // Requires an attached recorder, which the submit template established
+    // before it measured the facade call.
+    const OperationContext& context = session.impl_->operation_context;
+    session.impl_->metrics->record_enqueue(
+            accepted, context.phase, context.decoder_layer,
+            context.position_start, context.run_length, enqueue_begin,
+            enqueue_end);
 }
 
 oid SessionAccess::record_submission(TinyLlamaSession& session, oid token) {
@@ -3377,6 +3418,14 @@ ForwardResult SessionAccess::forward_prefill(
     encode_token_ids(
             token_ids, impl.config().vocab_size,
             std::span<std::uint32_t>(request.prefill_indices));
+    // The accepted submissions of this prefill carry the whole-run prompt
+    // window `[0,R)` and, inside a decoder-layer iteration, that configured
+    // layer index. The closing normalization stays whole-run and the final
+    // LM-head submission carries the one-row window `[R-1,R)`.
+    SessionAccess::set_operation_context(
+            session,
+            OperationContext{InferencePhase::prefill, std::nullopt, 0,
+                             request.run_length});
     try {
         const RawWorkspaceView sequential = forward_workspace_slice(
                 request, request.forward->workspace.sequential_offset,
@@ -3400,6 +3449,10 @@ ForwardResult SessionAccess::forward_prefill(
             CacheOwner& cache = impl.caches[layer_index];
             layer.prefill_params.a = 0;
             layer.prefill.attention.a = 0;
+            SessionAccess::set_operation_context(
+                    session,
+                    OperationContext{InferencePhase::prefill, layer_index, 0,
+                                     request.run_length});
             DecoderLayerForwardState state{
                     cache.initialized_length, false};
             const DecoderLayerForwardWorkspace workspace =
@@ -3412,6 +3465,10 @@ ForwardResult SessionAccess::forward_prefill(
             readiness = {};
         }
 
+        SessionAccess::set_operation_context(
+                session,
+                OperationContext{InferencePhase::prefill, std::nullopt, 0,
+                                 request.run_length});
         const oid final_norm = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
                     return operations.rmsnorm(
@@ -3423,6 +3480,10 @@ ForwardResult SessionAccess::forward_prefill(
                             impl.config().rms_norm_eps, sequential);
                 });
         SessionAccess::wait(session, final_norm);
+        SessionAccess::set_operation_context(
+                session,
+                OperationContext{InferencePhase::prefill, std::nullopt,
+                                 request.run_length - 1, 1});
         const oid producer = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
                     return operations.linear(
@@ -3465,6 +3526,14 @@ ForwardResult SessionAccess::forward_decode(
         }
     }
     request.decode_index = static_cast<std::uint32_t>(token_id);
+    // The accepted submissions of this decode carry the current initialized
+    // prefix as their absolute start with the fixed one-row run, and each
+    // decoder-layer iteration adds its configured layer index. The one-row
+    // run makes the closing normalization and the final LM-head row share the
+    // same `[a,a+1)` window, so one no-layer attribution covers both.
+    SessionAccess::set_operation_context(
+            session,
+            OperationContext{InferencePhase::decode, std::nullopt, position, 1});
     try {
         const RawWorkspaceView sequential = forward_workspace_slice(
                 request, request.forward->workspace.sequential_offset,
@@ -3488,6 +3557,10 @@ ForwardResult SessionAccess::forward_decode(
             CacheOwner& cache = impl.caches[layer_index];
             layer.decode_params.a = position;
             layer.decode.attention.a = position;
+            SessionAccess::set_operation_context(
+                    session,
+                    OperationContext{InferencePhase::decode, layer_index,
+                                     position, 1});
             DecoderLayerForwardState state{
                     cache.initialized_length, false};
             const DecoderLayerForwardWorkspace workspace =
@@ -3500,6 +3573,10 @@ ForwardResult SessionAccess::forward_decode(
             readiness = {};
         }
 
+        SessionAccess::set_operation_context(
+                session,
+                OperationContext{InferencePhase::decode, std::nullopt, position,
+                                 1});
         const oid final_norm = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
                     return operations.rmsnorm(
