@@ -1104,111 +1104,178 @@ void TinyLlamaSession::prepare_operation_trace() {
 TokenGenerationResult TinyLlamaSession::generate_tokens(
         std::span<const std::size_t> token_ids,
         std::size_t max_new_tokens) {
-    const TinyLlamaConfig& config = impl_->config();
-    validate_generation_prompt(config, token_ids);
-
-    session_detail::SessionAccess::prepare_forward_request(
-            *this, token_ids.size());
-    auto& history = session_detail::SessionAccess::history(*this);
-    auto& results = session_detail::SessionAccess::results(*this);
-    const auto finish = [&](GenerationStopReason reason) {
-        return TokenGenerationResult{std::move(results), reason};
-    };
-
-    // A zero limit still admits and provisions the nonempty prompt, but never
-    // submits prefill work or asks the selector to inspect logits.
-    if (max_new_tokens == 0) {
-        return finish(GenerationStopReason::max_new_tokens);
+    // Low-level timing starts here, before validation and provisioning, and
+    // stages the attempted input cardinality.  The attempt is published by
+    // `prepare_forward_request` only after it replaced the request, so a
+    // validation, setup, or old-drain failure is reported as this attempt's
+    // failure and never overwrites the outgoing admitted request, its
+    // completed counters, or its operation rows.
+    InferenceMetrics* const metrics = impl_->metrics;
+    std::uint64_t decode_begin = 0;
+    bool decode_pending = false;
+    bool current_from_decode = false;
+    if (metrics != nullptr) {
+        metrics->begin_generation(metrics->now(), token_ids.size());
     }
+    try {
+        const TinyLlamaConfig& config = impl_->config();
+        validate_generation_prompt(config, token_ids);
 
-    session_detail::ForwardResult current =
-            session_detail::SessionAccess::forward_prefill(
-                    *this, token_ids);
+        session_detail::SessionAccess::prepare_forward_request(
+                *this, token_ids.size());
+        auto& history = session_detail::SessionAccess::history(*this);
+        auto& results = session_detail::SessionAccess::results(*this);
+        const auto finish = [&](GenerationStopReason reason) {
+            if (metrics != nullptr) {
+                // The recorder stores no finish instant, so no clock read is
+                // owed to one.
+                metrics->end_generation(0, reason);
+            }
+            return TokenGenerationResult{std::move(results), reason};
+        };
 
-    const auto require_ready_result =
-            [&](const session_detail::ForwardResult& result) {
-                const bool shape_ok = result.logits != nullptr
-                        && result.logits == &impl_->logits->view()
-                        && result.logits->spec().data_type == DataType::BF16
-                        && result.logits->spec().quantization
-                                == QuantizationFormat::NONE
-                        && result.logits->spec().shape.rank() == 2
-                        && result.logits->spec().shape.dimensions()[0] == 1
-                        && result.logits->spec().shape.dimensions()[1]
-                                == config.vocab_size
-                        && &result.logits->device() == impl_->device
-                        && result.logits->owner_identity()
-                                == impl_->logits.get();
-                const auto accepted = session_detail::SessionAccess::accepted(
-                        *this);
-                const bool producer_ok = oid_is_token(result.producer)
-                        && std::find(
-                                   accepted.begin(), accepted.end(),
-                                   result.producer)
-                                != accepted.end();
-                if (!shape_ok || !producer_ok) {
-                    impl_->poison_and_drain();
-                    throw std::logic_error(
-                            "TinyLlama generation received an invalid "
-                            "final-logit producer");
-                }
-            };
-
-    const auto select_next = [&](const session_detail::ForwardResult& result) {
-        require_ready_result(result);
-        try {
-            // Selection is synchronous.  The selector repeats this wait for
-            // the established seam, while this barrier also protects injected
-            // selectors that only observe their borrowed arguments.
-            session_detail::SessionAccess::wait(*this, result.producer);
-            return impl_->selector->select(
-                    *impl_->queue, *result.logits, config.vocab_size,
-                    result.producer, history,
-                    session_detail::SessionAccess::selector_scratch(*this));
-        } catch (...) {
-            impl_->poison_and_drain();
-            throw;
-        }
-    };
-
-    require_ready_result(current);
-    session_detail::SessionAccess::wait(*this, current.producer);
-    history.assign(token_ids.begin(), token_ids.end());
-
-    if (history.size() == config.max_position_embeddings) {
-        return finish(GenerationStopReason::context_capacity);
-    }
-
-    for (;;) {
-        const std::size_t selected = select_next(current);
-        if (selected >= config.vocab_size) {
-            impl_->poison_and_drain();
-            throw std::invalid_argument(
-                    "TinyLlama generation selector returned a token outside "
-                    "the vocabulary");
-        }
-
-        // Request setup reserves both vectors to context capacity, so a
-        // successful token commit performs no per-token allocation.
-        history.push_back(selected);
-        results.push_back(selected);
-
-        // Stop precedence is deliberately independent of cache publication:
-        // EOS wins, then the requested generation limit, then context.
-        if (selected == config.eos_token_id) {
-            return finish(GenerationStopReason::eos);
-        }
-        if (results.size() >= max_new_tokens) {
+        // A zero limit still admits and provisions the nonempty prompt, but
+        // never submits prefill work or asks the selector to inspect logits.
+        if (max_new_tokens == 0) {
             return finish(GenerationStopReason::max_new_tokens);
         }
-        if (history.size() >= config.max_position_embeddings) {
+
+        session_detail::ForwardResult current =
+                session_detail::SessionAccess::forward_prefill(
+                        *this, token_ids);
+
+        const auto require_ready_result =
+                [&](const session_detail::ForwardResult& result) {
+                    const bool shape_ok = result.logits != nullptr
+                            && result.logits == &impl_->logits->view()
+                            && result.logits->spec().data_type == DataType::BF16
+                            && result.logits->spec().quantization
+                                    == QuantizationFormat::NONE
+                            && result.logits->spec().shape.rank() == 2
+                            && result.logits->spec().shape.dimensions()[0] == 1
+                            && result.logits->spec().shape.dimensions()[1]
+                                    == config.vocab_size
+                            && &result.logits->device() == impl_->device
+                            && result.logits->owner_identity()
+                                    == impl_->logits.get();
+                    const auto accepted =
+                            session_detail::SessionAccess::accepted(*this);
+                    const bool producer_ok = oid_is_token(result.producer)
+                            && std::find(
+                                       accepted.begin(), accepted.end(),
+                                       result.producer)
+                                    != accepted.end();
+                    if (!shape_ok || !producer_ok) {
+                        impl_->poison_and_drain();
+                        throw std::logic_error(
+                                "TinyLlama generation received an invalid "
+                                "final-logit producer");
+                    }
+                };
+
+        const auto select_next =
+                [&](const session_detail::ForwardResult& result) {
+                    require_ready_result(result);
+                    try {
+                        // Selection is synchronous.  The selector repeats this
+                        // wait for the established seam, while this barrier
+                        // also protects injected selectors that only observe
+                        // their borrowed arguments.
+                        session_detail::SessionAccess::wait(
+                                *this, result.producer);
+                        if (metrics != nullptr && decode_pending) {
+                            // This is the existing first final-logits wait for
+                            // the decode forward, so it ends both its
+                            // completion-observed span and its successful
+                            // readiness observation.  The interval opened
+                            // before the forward stays open until the token
+                            // that forward produces is committed.
+                            const std::uint64_t ready = metrics->now();
+                            metrics->record_decode(
+                                    decode_begin, ready,
+                                    ObservationState::succeeded);
+                            metrics->record_decode_forward(ready);
+                            decode_pending = false;
+                        }
+                        return impl_->selector->select(
+                                *impl_->queue, *result.logits,
+                                config.vocab_size, result.producer, history,
+                                session_detail::SessionAccess::
+                                        selector_scratch(*this));
+                    } catch (...) {
+                        impl_->poison_and_drain();
+                        throw;
+                    }
+                };
+
+        require_ready_result(current);
+        session_detail::SessionAccess::wait(*this, current.producer);
+        history.assign(token_ids.begin(), token_ids.end());
+
+        if (history.size() == config.max_position_embeddings) {
             return finish(GenerationStopReason::context_capacity);
         }
 
-        // A nonterminal token is the next decode input.  The decoder updates
-        // initialized cache length only after both K/V appends complete.
-        current = session_detail::SessionAccess::forward_decode(
-                *this, selected);
+        for (;;) {
+            const std::size_t selected = select_next(current);
+            if (selected >= config.vocab_size) {
+                impl_->poison_and_drain();
+                throw std::invalid_argument(
+                        "TinyLlama generation selector returned a token outside "
+                        "the vocabulary");
+            }
+
+            // Request setup reserves both vectors to context capacity, so a
+            // successful token commit performs no per-token allocation.
+            history.push_back(selected);
+            results.push_back(selected);
+            if (metrics != nullptr) {
+                // Every actual commit counts, including a terminal token; the
+                // first one ends TTFT and a decode-produced one closes its
+                // decode interval.
+                metrics->commit_token(metrics->now(), current_from_decode);
+            }
+
+            // Stop precedence is deliberately independent of cache
+            // publication: EOS wins, then the requested generation limit, then
+            // context.
+            if (selected == config.eos_token_id) {
+                return finish(GenerationStopReason::eos);
+            }
+            if (results.size() >= max_new_tokens) {
+                return finish(GenerationStopReason::max_new_tokens);
+            }
+            if (history.size() >= config.max_position_embeddings) {
+                return finish(GenerationStopReason::context_capacity);
+            }
+
+            // A nonterminal token is the next decode input.  The decoder
+            // updates initialized cache length only after both K/V appends
+            // complete.
+            if (metrics != nullptr) {
+                // The decode interval opens immediately before the forward and
+                // closes at the committed token that forward produces.
+                decode_begin = metrics->now();
+                metrics->record_decode_interval(decode_begin);
+                decode_pending = true;
+                current_from_decode = true;
+            }
+            current = session_detail::SessionAccess::forward_decode(
+                    *this, selected);
+        }
+    } catch (...) {
+        // The original exception category is rethrown unchanged.  A decode
+        // interval whose readiness was never observed is a failed observation,
+        // and a failed phase stores no duration, so its interval start is the
+        // observation instant.
+        if (metrics != nullptr) {
+            if (decode_pending) {
+                metrics->record_decode(
+                        decode_begin, decode_begin, ObservationState::failed);
+            }
+            metrics->end_generation_failure(0, std::current_exception());
+        }
+        throw;
     }
 }
 

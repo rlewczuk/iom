@@ -193,6 +193,69 @@ adapter.
    earlier OID succeeded, and a failed wait observation is not proof of
    device termination.
 
+## Generation counts, TTFT, and decode
+
+1. Low-level generation observation starts at `generate_tokens` entry,
+   before prompt validation and request provisioning, and stages the
+   attempted input cardinality with that entry instant. Validation order is
+   unchanged. A request that is rejected, refused, or fails before
+   publication is reported as its own attempted request and never
+   overwrites the outgoing admitted observation, its completed counters, or
+   its operation rows; a failed old-request drain is never attributed to the
+   candidate request.
+2. The staged attempt is published exactly once, by the session's request
+   publication point, and only after the replacement request was actually
+   published. That publication replaces the admitted observation, resets its
+   tokenization, prefill, decode, host-enqueue, counter, TTFT, and rate
+   fields, and clears the outgoing operation rows without freeing the
+   prepared trace storage, so a new request never inherits the outgoing
+   request's scalars.
+3. Time-to-first-token starts at the generation entry instant and ends at
+   the first validated committed token, captured after the existing history
+   and result pushes. It therefore includes prompt validation, request
+   setup, prefill, and the first selector completion, and excludes session
+   load, tokenization, chat formatting, and output decoding. With no
+   committed token, TTFT is unavailable, never zero.
+4. `generated_tokens` advances by exactly one for every actual commit,
+   including a terminal EOS, limit, or context token. An invalid or
+   out-of-range selector result and a selector exception commit nothing and
+   leave the count unchanged for that selection.
+5. `decode_forward_count` advances once per successful one-row
+   `forward_decode` whose final-logits readiness is observed at the existing
+   first producer wait of the selection boundary. It is independent of a
+   later selector success, and it adds no wait, poll, or synchronization.
+6. `decode_token_count` advances only for committed tokens produced by a
+   decode forward; the first prefill-produced token is excluded. Neither
+   count is ever inferred from KV growth, a cache-length delta, or a later
+   request.
+7. Every decode interval opens immediately before its `forward_decode`, and
+   the completion-observed decode span for that forward ends at the same
+   existing first final-logits readiness wait. A successful decode-produced
+   commit adds that decode-start-to-commit elapsed interval to the
+   throughput denominator, intentionally including synchronous selector
+   time; a prefill-produced commit closes no interval, and a forward or
+   readiness failure leaves only a failed, duration-free decode
+   observation.
+8. Decode throughput is `decode_token_count / seconds(sum of successful
+   decode-start-to-corresponding-valid-commit intervals)` and becomes
+   available when the request completes successfully. It is unavailable -
+   never infinity, NaN, or a fabricated zero - for a zero numerator, a zero
+   denominator, a failed, incomplete, or otherwise unobserved request, and
+   it makes no claim that unobserved operations succeeded.
+9. A retained later failure invalidates the owning request's rate while
+   keeping every completed counter inspectable, and an invalidated rate is
+   never recomputed as valid. The original exception category, session
+   poisoning, and drain behavior are preserved: a failed request rethrows
+   the unchanged exception after recording the failed attempt.
+10. Terminal counting is independent of cache growth: a terminal token is
+    counted as generated without a decode append, and the existing stop
+    precedence (`EOS > limit > context`), history, result, KV, and
+    stop-reason behavior are unchanged.
+11. A null recorder adds no clock read, no allocation, no registration, no
+    wait, and no synchronization to low-level generation, and enabled
+    observation changes no selected token, commit, KV or history transition,
+    stop reason, or exception.
+
 ## Frozen formulas
 
 1. The load span covers only the instrumented factory interval, captured
