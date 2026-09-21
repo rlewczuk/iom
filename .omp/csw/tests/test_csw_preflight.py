@@ -154,9 +154,12 @@ class CswPreflightTests(unittest.TestCase):
             result.append({"selector": "openai/slow", "provider": "openai", "id": "slow", "thinking": ["high"]})
         return result
 
-    def run_helper(self, workflow="csw-run"):
+    def run_helper(self, workflow="csw-run", implementers=None):
+        command = [str(HELPER), "--repo", str(self.repo), "--workflow", workflow, "--omp", str(self.omp)]
+        for name in implementers or ():
+            command.extend(("--implementer", name))
         return subprocess.run(
-            [str(HELPER), "--repo", str(self.repo), "--workflow", workflow, "--omp", str(self.omp)],
+            command,
             text=True,
             capture_output=True,
             check=False,
@@ -201,6 +204,82 @@ class CswPreflightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(set(payload["agents"]), {"csw-debug", "csw-yodacoder"})
+
+
+    def test_explicit_yoda_selection_does_not_require_default_implementer(self):
+        (self.repo / ".omp" / "agents" / "csw-implementer.md").unlink()
+        config = self.config(**{"task.disabledAgents": ["csw-implementer"]})
+        self.write_omp(config, self.models())
+        result = self.run_helper("csw-run", ["csw-yodacoder"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("csw-implementer", payload["agents"])
+        self.assertEqual(set(payload["agents"]), {
+            "csw-yodacoder", "csw-debug", "csw-verifier", "csw-review", "csw-review-2",
+        })
+
+    def test_explicit_mixed_default_and_custom_implementers(self):
+        self.write_profile("custom-strong", "openai/strong", BUILDER, "[]")
+        models = self.models()
+        models.append({"selector": "openai/strong", "provider": "openai", "id": "strong", "thinking": ["high"]})
+        self.write_omp(self.config(), models)
+        result = self.run_helper("csw-run", ["csw-implementer", "custom-strong"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["agents"]["custom-strong"]["resolved"], "openai/strong")
+
+    def test_explicit_custom_implementer_requires_builder_profile(self):
+        self.write_profile("custom-readonly", "openai/task", READ_ONLY, "[]")
+        self.write_omp(self.config(), self.models())
+        result = self.run_helper("csw-run-worker", ["custom-readonly"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("must include" in error for error in payload["errors"]))
+
+    def test_explicit_missing_profile_is_a_json_blocker(self):
+        self.write_omp(self.config(), self.models())
+        result = self.run_helper("csw-run-worker", ["custom-missing"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("custom-missing.md" in error for error in payload["errors"]))
+
+    def test_explicit_name_validation_is_rejected(self):
+        result = self.run_helper("csw-run-worker", ["../escape"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("unsafe implementation profile name" in error for error in payload["errors"]))
+
+    def test_selected_profile_unavailable_and_override_are_blockers(self):
+        self.write_profile("custom-strong", "openai/missing", BUILDER, "[]")
+        config = self.config(**{"task.agentModelOverrides": {"custom-strong": "@slow"}})
+        self.write_omp(config, self.models(slow=False))
+        result = self.run_helper("csw-run-worker", ["custom-strong"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("exact profile model" in error for error in payload["errors"]))
+        self.assertTrue(any("unavailable" in error for error in payload["errors"]))
+
+    def test_implementer_option_is_rejected_for_boss(self):
+        result = self.run_helper("boss", ["scout"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("not supported for the boss workflow" in error for error in payload["errors"]))
+
+    def test_selected_profile_cannot_bypass_first_rescue_stage(self):
+        self.write_profile("custom-strong", "@slow", BUILDER, "[csw-yodacoder]")
+        self.write_omp(self.config(), self.models())
+        result = self.run_helper("csw-run-worker", ["custom-strong"])
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("csw-implementer", payload["agents"])
 
     def test_missing_yoda_alias_blocks_standalone_worker(self):
         config = self.config()

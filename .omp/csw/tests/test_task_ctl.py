@@ -132,6 +132,45 @@ class TaskCtlTests(unittest.TestCase):
             )
         self.assertEqual((directory / "task.yml").read_bytes(), before)
 
+    def test_implementer_is_optional_validated_and_atomic(self) -> None:
+        parse = self.api["parse_config"]
+        self.assertEqual(
+            parse("type: impl\nstatus: ready\nimplementer: runner_2\n")["implementer"],
+            "runner_2",
+        )
+        for invalid in ("", "-runner", "runner/name", "runner.name"):
+            with self.assertRaisesRegex(self.TaskCtlError, "implementer"):
+                parse(f"type: impl\nstatus: ready\nimplementer: {invalid!r}\n")
+        with self.assertRaisesRegex(self.TaskCtlError, "implementer"):
+            parse("type: impl\nstatus: ready\nimplementer: 123\n")
+
+        directory = self.make_dir(".cswd/tasks/item")
+        self.set_task(
+            ".cswd/tasks/item",
+            {"type": "impl", "status": "ready", "priority": "P1"},
+        )
+        before = (directory / "task.yml").read_bytes()
+        with self.assertRaisesRegex(self.TaskCtlError, "implementer"):
+            self.api["set_task"](
+                self.repo,
+                ".cswd/tasks/item",
+                {"implementer": "runner/name"},
+            )
+        self.assertEqual((directory / "task.yml").read_bytes(), before)
+
+        updated = self.run_cli("set", "item", "--implementer", "runner-2")
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(yaml.safe_load(updated.stdout)["implementer"], "runner-2")
+        selected = self.run_cli("get", "item", "--implementer")
+        self.assertEqual((selected.returncode, selected.stdout), (0, "runner-2\n"))
+
+        before = (directory / "task.yml").read_bytes()
+        invalid = self.run_cli("set", "item", "--implementer", "runner/name")
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("implementer", invalid.stderr)
+        self.assertEqual((directory / "task.yml").read_bytes(), before)
+
+
     def test_complete_hld_requires_nonempty_all_done_children_to_unlock_dependents(self) -> None:
         parent = ".cswd/tasks/parent"
         self.set_task(parent, {"type": "hld", "status": "planned"})
@@ -169,10 +208,14 @@ class TaskCtlTests(unittest.TestCase):
 
     def test_cli_whole_yaml_fields_and_conflicts(self) -> None:
         self.make_dir(".cswd/tasks/item")
-        whole = "type: impl\nstatus: ready\nblocked-by: []\nsource: .cswd/tasks/item/spec.md"
+        whole = (
+            "type: impl\nstatus: ready\nimplementer: whole-agent\n"
+            "blocked-by: []\nsource: .cswd/tasks/item/spec.md"
+        )
         result = self.run_cli("set", "item", "--all", whole)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(yaml.safe_load(result.stdout)["type"], "impl")
+        self.assertEqual(yaml.safe_load(result.stdout)["implementer"], "whole-agent")
 
         defaulted = self.run_cli("set", "new-whole", "--all", "priority: P3\n")
         self.assertEqual(defaulted.returncode, 0, defaulted.stderr)
@@ -208,6 +251,17 @@ class TaskCtlTests(unittest.TestCase):
         duplicate = self.run_cli("set", "item", "--status", "new", "--status", "done")
         self.assertEqual(duplicate.returncode, 2)
         self.assertIn("only once", duplicate.stderr)
+        self.assertEqual((self.repo / ".cswd/tasks/item/task.yml").read_bytes(), before)
+
+        implementer_conflict = self.run_cli(
+            "set",
+            "item",
+            "type: hld\nstatus: new",
+            "--implementer",
+            "runner",
+        )
+        self.assertEqual(implementer_conflict.returncode, 2)
+        self.assertIn("mutually exclusive", implementer_conflict.stderr)
         self.assertEqual((self.repo / ".cswd/tasks/item/task.yml").read_bytes(), before)
 
     def test_cli_blocked_records_replace_the_complete_list(self) -> None:
@@ -740,6 +794,68 @@ class TaskCtlTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(self.TaskCtlError, "dependency cycle"):
             self.api["plan_tasks"](self.repo, ".cswd/tasks/parent", cyclic)
+
+    def test_plan_inherits_explicit_implementer_through_hld_and_absence(self) -> None:
+        parent_id = ".cswd/tasks/parent"
+        parent = self.make_dir(parent_id)
+        (parent / "spec.md").write_text("# Parent\n", encoding="utf-8")
+        self.set_task(
+            parent_id,
+            {"type": "hld", "status": "critic", "implementer": "custom_agent"},
+        )
+        proposals = self.api["plan_tasks"](
+            self.repo,
+            parent_id,
+            [
+                {"slug": "design", "type": "hld", "priority": "P0"},
+                {"slug": "leaf", "type": "impl", "priority": "P1"},
+            ],
+        )
+        self.assertEqual(
+            [proposal["implementer"] for proposal in proposals],
+            ["custom_agent", "custom_agent"],
+        )
+
+        nested_id = proposals[0]["task-id"]
+        self.make_dir(nested_id)
+        self.set_task(
+            nested_id,
+            {key: value for key, value in proposals[0].items() if key not in {"task-id", "collision"}},
+            replace=True,
+        )
+        (self.repo / nested_id / "spec.md").write_text("# Nested\n", encoding="utf-8")
+        nested = self.api["plan_tasks"](
+            self.repo,
+            nested_id,
+            [{"slug": "nested-leaf", "type": "impl", "priority": "P1"}],
+        )
+        self.assertEqual(nested[0]["implementer"], "custom_agent")
+
+        absent_id = ".cswd/tasks/spec-only"
+        absent = self.make_dir(absent_id)
+        (absent / "spec.md").write_text("# Spec only\n", encoding="utf-8")
+        proposals = self.api["plan_tasks"](
+            self.repo,
+            absent_id,
+            [{"slug": "leaf", "type": "impl", "priority": "P1"}],
+        )
+        self.assertNotIn("implementer", proposals[0])
+        self.assertFalse((absent / "task.yml").exists())
+
+    def test_plan_rejects_invalid_existing_parent_control_without_mutation(self) -> None:
+        parent_id = ".cswd/tasks/malformed"
+        parent = self.make_dir(parent_id)
+        (parent / "spec.md").write_text("# Malformed\n", encoding="utf-8")
+        control = parent / "task.yml"
+        control.write_text("type: hld\nstatus: new\nimplementer: bad/name\n", encoding="utf-8")
+        before = control.read_bytes()
+        with self.assertRaisesRegex(self.TaskCtlError, "implementer"):
+            self.api["plan_tasks"](
+                self.repo,
+                parent_id,
+                [{"slug": "leaf", "type": "impl", "priority": "P1"}],
+            )
+        self.assertEqual(control.read_bytes(), before)
 
     def test_plan_cli_accepts_block_yaml_and_requires_parent_spec(self) -> None:
         self.make_dir(".cswd/tasks/parent")

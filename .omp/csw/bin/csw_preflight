@@ -4,7 +4,7 @@
 Usage:
     .omp/csw/bin/csw_preflight [--repo PATH]
         [--workflow boss|csw-run|csw-run-worker]
-        [--omp PROGRAM] [--pretty]
+        [--implementer NAME ...] [--omp PROGRAM] [--pretty]
 
 The program resolves PATH to its Git worktree root, records HEAD, branch, and
 the complete porcelain status, then runs ``omp config list --json`` and
@@ -13,6 +13,15 @@ profiles required by the selected workflow.  It resolves effective model role
 chains and per-agent overrides, checks model/thinking availability, and
 validates each profile's fixed model, tools, spawn, advisor, and prewalk
 contract.  No OMP configuration file or database is read directly.
+
+``--implementer NAME`` is repeatable for the CSW run workflows. Explicit
+selections replace csw-run's default implementation profile requirement;
+without this option csw-run uses csw-implementer and csw-run-worker checks
+only its rescue profiles. Required rescue, verifier, and reviewer contracts
+remain unchanged. Additional project profiles must declare their model,
+provide builder tools, and permit either no delegation, csw-debug alone, or
+csw-debug followed by csw-yodacoder. Missing or incompatible selections fail
+closed rather than falling back to the default implementation profile.
 
 Output is one stable JSON object with ``schema_version``, ``workflow``, ``ok``,
 ``git``, selected effective ``settings``, normalized ``roles``, the relevant
@@ -43,6 +52,7 @@ from typing import Any
 
 THINKING_LEVELS = frozenset(("off", "minimal", "low", "medium", "high", "xhigh", "max"))
 THINKING_SUFFIX = re.compile(r":([A-Za-z][A-Za-z0-9_-]*)$")
+SAFE_AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 CONFIG_PATHS = (
     "modelRoles",
     "task.agentModelOverrides",
@@ -61,12 +71,12 @@ DISCOVERY_TIMEOUT_SECONDS = 60
 @dataclass(frozen=True)
 class AgentContract:
     name: str
-    model: str
+    model: str | None
     tools: tuple[str, ...]
     spawns: tuple[str, ...] = ()
     required_fields: tuple[str, ...] = ()
     fixed_settings: tuple[tuple[str, Any], ...] = ()
-
+    dynamic_implementer: bool = False
 
 BOSS_AGENTS = (
     AgentContract("boss-errand", "@smol", LOOKUP_TOOLS),
@@ -84,20 +94,20 @@ BOSS_AGENTS = (
     AgentContract("boss-advocate-strong", "@slow", LOOKUP_TOOLS),
     AgentContract("csw-plan-facts", "@task", READ_ONLY_TOOLS),
 )
-CSW_RUN_WORKER_AGENTS = (
-    AgentContract("csw-debug", "@slow", (*READ_ONLY_TOOLS, "bash")),
-    AgentContract(
-        "csw-yodacoder",
-        "@csw-yoda",
-        BUILDER_TOOLS,
-        (),
-        ("spawns", "advisor", "prewalk"),
-        (("advisor", False), ("prewalk", False)),
-    ),
+CSW_DEBUG_CONTRACT = AgentContract("csw-debug", "@slow", (*READ_ONLY_TOOLS, "bash"))
+CSW_YODA_CONTRACT = AgentContract(
+    "csw-yodacoder",
+    "@csw-yoda",
+    BUILDER_TOOLS,
+    (),
+    ("spawns", "advisor", "prewalk"),
+    (("advisor", False), ("prewalk", False)),
 )
-SPEC_RUN_ALL_AGENTS = (
-    AgentContract("csw-implementer", "@implementer", BUILDER_TOOLS, ("csw-debug", "csw-yodacoder")),
-    *CSW_RUN_WORKER_AGENTS,
+CSW_IMPLEMENTER_CONTRACT = AgentContract(
+    "csw-implementer", "@implementer", BUILDER_TOOLS, ("csw-debug", "csw-yodacoder")
+)
+CSW_RUN_WORKER_AGENTS = (CSW_DEBUG_CONTRACT, CSW_YODA_CONTRACT)
+CSW_RUN_TAIL_AGENTS = (
     AgentContract(
         "csw-verifier",
         "@csw-verifier",
@@ -123,20 +133,55 @@ SPEC_RUN_ALL_AGENTS = (
         (("advisor", False), ("prewalk", False)),
     ),
 )
+SPEC_RUN_ALL_AGENTS = (CSW_IMPLEMENTER_CONTRACT, *CSW_RUN_WORKER_AGENTS, *CSW_RUN_TAIL_AGENTS)
 WORKFLOWS = {
     "boss": (BOSS_AGENTS, 1),
     "csw-run": (SPEC_RUN_ALL_AGENTS, 2),
     "csw-run-worker": (CSW_RUN_WORKER_AGENTS, 2),
 }
 
-
 class Preflight:
-    def __init__(self, repo: Path, omp: str, workflow: str) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        omp: str,
+        workflow: str,
+        implementers: tuple[str, ...] | None = None,
+    ) -> None:
         self.repo = repo.resolve()
         self.omp = omp
         self.workflow = workflow
-        self.contracts, self.minimum_depth = WORKFLOWS[workflow]
         self.errors: list[str] = []
+        requested_implementers = tuple(dict.fromkeys(implementers or ()))
+        self.implementers = tuple(
+            name for name in requested_implementers
+            if isinstance(name, str) and SAFE_AGENT_NAME.fullmatch(name)
+        )
+        for name in requested_implementers:
+            if not isinstance(name, str) or not SAFE_AGENT_NAME.fullmatch(name):
+                self.errors.append(f"unsafe implementation profile name {name!r}")
+        if implementers is not None and workflow == "boss":
+            self.errors.append("--implementer is not supported for the boss workflow")
+        default_contracts, self.minimum_depth = WORKFLOWS[workflow]
+        if implementers is None or workflow == "boss":
+            self.contracts = default_contracts
+        else:
+            selected: list[AgentContract] = []
+            known = {
+                "csw-implementer": CSW_IMPLEMENTER_CONTRACT,
+                "csw-yodacoder": CSW_YODA_CONTRACT,
+                "csw-debug": CSW_DEBUG_CONTRACT,
+            }
+            for name in self.implementers:
+                selected.append(
+                    known.get(
+                        name,
+                        AgentContract(name, None, BUILDER_TOOLS, dynamic_implementer=True),
+                    )
+                )
+            required = (*CSW_RUN_WORKER_AGENTS, *CSW_RUN_TAIL_AGENTS) if workflow == "csw-run" else CSW_RUN_WORKER_AGENTS
+            by_name = {contract.name: contract for contract in (*selected, *required)}
+            self.contracts = tuple(by_name.values())
         self.config: dict[str, Any] | None = None
         self.models: list[dict[str, Any]] = []
         self.settings: dict[str, Any] = {}
@@ -454,7 +499,8 @@ class Preflight:
         agents: dict[str, Any] = {}
         for contract in self.contracts:
             profile = self.profile_data.get(contract.name, {})
-            requested = self.overrides.get(contract.name, profile.get("model"))
+            declared_model = profile.get("model")
+            requested = self.overrides.get(contract.name, declared_model)
             agent_errors: list[str] = []
             detail: dict[str, Any] = {
                 "requested": requested,
@@ -470,26 +516,55 @@ class Preflight:
                 description = profile.get("description")
                 if not isinstance(description, str) or not description.strip():
                     agent_errors.append("profile must declare a nonempty description")
-                if profile.get("model") != contract.model:
-                    agent_errors.append(
-                        f"profile must request exact model alias {contract.model!r}; got {profile.get('model')!r}"
-                    )
-                tools = self._list_field(profile.get("tools"))
-                if tools is None or set(tools) != set(contract.tools):
-                    agent_errors.append(f"profile tools must be exactly {list(contract.tools)!r}; got {tools!r}")
-                spawns = self._list_field(profile.get("spawns"))
-                if spawns is None or tuple(spawns) != contract.spawns:
-                    agent_errors.append(f"profile must spawn exactly {list(contract.spawns)!r}; got {spawns!r}")
-                for field in contract.required_fields:
-                    if field not in profile:
-                        agent_errors.append(f"profile must declare {field}")
-                for setting, expected in contract.fixed_settings:
-                    valid = not self._enabled(profile.get(setting)) if expected is False else profile.get(setting) == expected
-                    if not valid:
-                        agent_errors.append(f"profile {setting} must be {expected!r}")
+                if contract.dynamic_implementer:
+                    if not isinstance(declared_model, str) or not declared_model.strip():
+                        agent_errors.append("implementation profile must declare a nonempty model")
+                    elif declared_model != declared_model.strip():
+                        agent_errors.append("implementation profile model must not have surrounding whitespace")
+                    if self.overrides.get(contract.name) is not None and requested != declared_model:
+                        agent_errors.append(
+                            f"effective model request is {requested!r}; exact profile model requires {declared_model!r}"
+                        )
+                    tools = self._list_field(profile.get("tools"))
+                    if tools is None or not set(tools).issuperset(BUILDER_TOOLS):
+                        agent_errors.append(
+                            f"implementation profile tools must include {list(BUILDER_TOOLS)!r}; got {tools!r}"
+                        )
+                    spawns = self._list_field(profile.get("spawns"))
+                    if spawns not in ((), ("csw-debug",), ("csw-debug", "csw-yodacoder")):
+                        agent_errors.append(
+                            "implementation profile spawns must be [], [csw-debug], or "
+                            f"[csw-debug, csw-yodacoder]; got {spawns!r}"
+                        )
+                else:
+                    if profile.get("model") != contract.model:
+                        agent_errors.append(
+                            f"profile must request exact model alias {contract.model!r}; got {profile.get('model')!r}"
+                        )
+                    tools = self._list_field(profile.get("tools"))
+                    if tools is None or set(tools) != set(contract.tools):
+                        agent_errors.append(f"profile tools must be exactly {list(contract.tools)!r}; got {tools!r}")
+                    spawns = self._list_field(profile.get("spawns"))
+                    if spawns is None or tuple(spawns) != contract.spawns:
+                        agent_errors.append(f"profile must spawn exactly {list(contract.spawns)!r}; got {spawns!r}")
+                    for field in contract.required_fields:
+                        if field not in profile:
+                            agent_errors.append(f"profile must declare {field}")
+                    for setting, expected in contract.fixed_settings:
+                        valid = not self._enabled(profile.get(setting)) if expected is False else profile.get(setting) == expected
+                        if not valid:
+                            agent_errors.append(f"profile {setting} must be {expected!r}")
+
                 for setting in ("advisor", "prewalk"):
                     if setting in profile and self._enabled(profile[setting]):
                         agent_errors.append(f"profile enables {setting}; fixed dispatch requires it off")
+            if contract.name in self.implementers and not contract.dynamic_implementer:
+                tools = self._list_field(profile.get("tools"))
+                if tools is None or not set(tools).issuperset(BUILDER_TOOLS):
+                    agent_errors.append(
+                        f"selected implementation profile tools must include {list(BUILDER_TOOLS)!r}; got {tools!r}"
+                    )
+
 
             if contract.name in self.disabled:
                 agent_errors.append("profile is disabled by task.disabledAgents")
@@ -501,7 +576,7 @@ class Preflight:
             if not isinstance(requested, str) or not requested.strip():
                 agent_errors.append("agent has no effective model request")
             else:
-                if requested != contract.model:
+                if not contract.dynamic_implementer and requested != contract.model:
                     agent_errors.append(
                         f"effective model request is {requested!r}; exact contract requires {contract.model!r}"
                     )
@@ -616,28 +691,52 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--repo", default=Path.cwd(), type=Path, help="repository to inspect (default: current directory)")
     result.add_argument("--workflow", choices=tuple(WORKFLOWS), default="boss", help="profile contract to validate")
+    result.add_argument(
+        "--implementer",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="implementation profile to validate (repeatable; csw-run workflows only)",
+    )
     result.add_argument("--omp", default="omp", help="omp executable (or test double)")
     result.add_argument("--pretty", action="store_true", help="indent the JSON result")
     return result
 
 
+def failure_payload(workflow: str, errors: list[str]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "workflow": workflow,
+        "ok": False,
+        "git": {},
+        "settings": {},
+        "roles": {},
+        "models": [],
+        "model_count": 0,
+        "agents": {},
+        "errors": sorted(dict.fromkeys(errors)),
+    }
+
+
 def main() -> int:
     args = parser().parse_args()
-    if not args.repo.is_dir():
-        payload = {
-            "schema_version": 1,
-            "workflow": args.workflow,
-            "ok": False,
-            "git": {},
-            "settings": {},
-            "roles": {},
-            "models": [],
-            "model_count": 0,
-            "agents": {},
-            "errors": [f"repository is not a directory: {args.repo}"],
-        }
+    implementers = args.implementer
+    invocation_errors: list[str] = []
+    if implementers is not None:
+        if args.workflow == "boss":
+            invocation_errors.append("--implementer is not supported for the boss workflow")
+        invocation_errors.extend(
+            f"unsafe implementation profile name {name!r}"
+            for name in implementers
+            if not SAFE_AGENT_NAME.fullmatch(name)
+        )
+    if invocation_errors:
+        payload = failure_payload(args.workflow, invocation_errors)
+    elif not args.repo.is_dir():
+        payload = failure_payload(args.workflow, [f"repository is not a directory: {args.repo}"])
     else:
-        payload = Preflight(args.repo, args.omp, args.workflow).result()
+        selected = tuple(implementers) if implementers is not None else None
+        payload = Preflight(args.repo, args.omp, args.workflow, selected).result()
     json.dump(payload, sys.stdout, indent=2 if args.pretty else None, sort_keys=True)
     sys.stdout.write("\n")
     return 0 if payload["ok"] else 2
