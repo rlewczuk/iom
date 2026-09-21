@@ -1023,4 +1023,106 @@ std::unique_ptr<ModelSource> load_tinyllama_safetensors(
     return std::unique_ptr<ModelSource>(new ModelSource(std::move(impl)));
 }
 
+// ---------------------------------------------------------------------------
+// Device-realized model
+// ---------------------------------------------------------------------------
+
+struct TinyLlamaModel::Impl {
+    // The complete mapped source is retained for the whole model lifetime, so
+    // every source-backed accessor stays valid after the factory-local
+    // parsing and mapping temporaries are gone.
+    std::unique_ptr<ModelSource> source;
+
+    // One independent device owner per canonical inventory entry, in exactly
+    // the published order. Equal-shaped entries, including the `[1, H]`
+    // normalization scales, hold distinct owners.
+    std::vector<std::unique_ptr<Tensor>> owners;
+
+    // The ordered full owner views, snapshotted once from each owner's stable
+    // `Tensor::view()`. No slice, reshape, permutation, alias, retarget, or
+    // final-axis transform is involved, and every view stays valid and
+    // address-stable for the whole model lifetime.
+    std::vector<TensorView> views;
+
+    // Borrowed, never owned: the caller's Device must outlive this model,
+    // which releases every owner above while that device is still alive.
+    Device* device = nullptr;
+};
+
+TinyLlamaModel::TinyLlamaModel(std::unique_ptr<Impl> impl)
+        : impl_(std::move(impl)) {
+}
+
+TinyLlamaModel::~TinyLlamaModel() = default;
+
+const TinyLlamaConfig& TinyLlamaModel::config() const noexcept {
+    return impl_->source->config();
+}
+
+std::span<const ModelWeightInfo> TinyLlamaModel::weights() const noexcept {
+    return impl_->source->weights();
+}
+
+const TensorView& TinyLlamaModel::weight(std::size_t index) const {
+    return impl_->views.at(index);
+}
+
+std::unique_ptr<TinyLlamaModel> load_tinyllama_model(
+        const std::filesystem::path& model_directory, Device& device) {
+    // The complete mapped source is loaded and retained first: it is the only
+    // source of the canonical inventory, of every entry's selected
+    // specification, and of the synchronous realization, so a rejected
+    // configuration, container, or weight schema stops this factory before a
+    // single tensor, workspace, or copy exists.
+    std::unique_ptr<ModelSource> source =
+            load_tinyllama_safetensors(model_directory);
+
+    // Exactly one independent BF16/NONE owner per published entry, created
+    // from that entry's own selected specification in canonical order.
+    std::vector<std::unique_ptr<Tensor>> owners;
+    owners.reserve(source->weights().size());
+    for (std::size_t index = 0; index < source->weights().size(); ++index) {
+        owners.push_back(device.create_tensor(source->tensor_spec(index)));
+    }
+
+    // The complete ordered binding is preflighted before any transfer
+    // workspace exists, so its reported maximum is the only source of the
+    // transfer requirement: a wrong, incomplete, repeated, foreign, or
+    // otherwise invalid binding fails here with no scratch provisioned.
+    std::vector<Tensor*> destinations;
+    destinations.reserve(owners.size());
+    for (const std::unique_ptr<Tensor>& owner : owners) {
+        destinations.push_back(owner.get());
+    }
+    const std::span<Tensor* const> binding{destinations};
+    const WorkspaceRequirements requirements =
+            source->upload_workspace_requirements(device, binding);
+
+    // Positive scratch is provisioned only after that complete preflight, and
+    // exactly once; a `{0, 1}` requirement consumes no workspace at all, so
+    // the CPU no-scratch policy never calls the positive workspace factory.
+    std::unique_ptr<RawWorkspace> workspace;
+    if (requirements.bytes != 0) {
+        workspace = device.create_workspace(requirements.bytes);
+    }
+    const RawWorkspaceView scratch =
+            workspace == nullptr ? RawWorkspaceView{} : workspace->view();
+
+    // Synchronous realization, and the only publication permission. Any
+    // failure here propagates its original category while every setup-owned
+    // resource above is destroyed through RAII: no model, no view, and no
+    // scratch escapes, and no partially realized model is published.
+    source->upload_weights(device, binding, scratch);
+
+    auto impl = std::make_unique<TinyLlamaModel::Impl>();
+    impl->source = std::move(source);
+    impl->owners = std::move(owners);
+    impl->views.reserve(impl->owners.size());
+    for (const std::unique_ptr<Tensor>& owner : impl->owners) {
+        impl->views.push_back(owner->view());
+    }
+    impl->device = &device;
+    return std::unique_ptr<TinyLlamaModel>(new TinyLlamaModel(std::move(impl)));
+}
+
 }  // namespace iom

@@ -10,6 +10,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -411,6 +412,73 @@ inline void check_inventory(const iom::ModelSource& source,
     }
 }
 
+// Checks a realized model's immutable accessors against the same independent
+// expectation: every published entry, the indexed full view of every index,
+// and the distinct device owner behind it. A wrong role, layer, or logical
+// shape fails here, and so does a published slice, reshape, permutation,
+// retarget, or one owner serving two roles.
+inline void check_model_inventory(const iom::TinyLlamaModel& model,
+                                  const std::vector<ExpectedWeight>& expected) {
+    const std::span<const iom::ModelWeightInfo> weights = model.weights();
+    REQUIRE(weights.size() == expected.size());
+    std::vector<const iom::Tensor*> owners;
+    owners.reserve(expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        CAPTURE(index);
+        const ExpectedWeight& want = expected[index];
+        const iom::ModelWeightInfo& info = weights[index];
+        CHECK(info.id.role == want.id.role);
+        CHECK(info.id.layer == want.id.layer);
+        CHECK(dims_of(info.logical_shape) == want.logical_shape);
+
+        const iom::TensorView& view = model.weight(index);
+        const iom::Tensor* const owner = view.owner_identity();
+        REQUIRE(owner != nullptr);
+        // The published view is that owner's own full view: identical
+        // specification, plane offset, plane strides, and native handle.
+        const iom::TensorView& full = owner->view();
+        CHECK(view.spec() == full.spec());
+        CHECK(view.plane_offset() == full.plane_offset());
+        CHECK(std::equal(view.plane_strides().begin(),
+                         view.plane_strides().end(),
+                         full.plane_strides().begin(),
+                         full.plane_strides().end()));
+        CHECK(view.native_handle() == full.native_handle());
+
+        CHECK(dims_of(view.spec().shape) == want.logical_shape);
+        CHECK(view.spec().data_type == iom::DataType::BF16);
+        CHECK(view.spec().quantization == iom::QuantizationFormat::NONE);
+        CHECK(view.spec().logical_nbytes() ==
+              2 * element_count(want.logical_shape));
+        owners.push_back(owner);
+    }
+
+    // Every published index holds its own independent owner, so two roles with
+    // equal logical metadata may not share one.
+    std::sort(owners.begin(), owners.end(),
+              std::less<const iom::Tensor*>{});
+    for (std::size_t index = 1; index < owners.size(); ++index) {
+        CAPTURE(index);
+        CHECK(owners[index] != owners[index - 1]);
+    }
+}
+
+// Realizes `directory` as a model on `device` and returns the message of the
+// `std::invalid_argument` rejection it must produce.
+inline std::string rejected_model_message(
+        const std::filesystem::path& directory, iom::Device& device) {
+    try {
+        const std::unique_ptr<iom::TinyLlamaModel> model =
+                iom::load_tinyllama_model(directory, device);
+        (void)model;
+    } catch (const std::invalid_argument& error) {
+        return error.what();
+    }
+    REQUIRE_MESSAGE(false,
+                    "expected std::invalid_argument for " << directory.string());
+    return std::string();
+}
+
 // Loads `directory` as a mapped weight source and returns the message of the
 // `std::invalid_argument` schema rejection it must produce.
 inline std::string rejected_source_message(
@@ -478,6 +546,26 @@ inline std::vector<std::byte> sentinel_storage() {
     return std::vector<std::byte>(4, std::byte{0xA5});
 }
 
+// Process-wide books of the bounded fixture owners. A realized model owns and
+// destroys the destinations that the factory created internally, so their
+// per-owner records are gone once the call returned; these counters keep the
+// creation, requirement-query, and upload effects of exactly one call
+// observable anyway. They never influence fixture behavior, move only
+// symmetrically with owner lifetime, and doctest runs the cases of one
+// executable sequentially, so every check is phrased as a delta around one
+// call.
+struct FixtureLiveness {
+    std::size_t live_tensors = 0;
+    std::size_t live_workspaces = 0;
+    std::size_t requirement_queries = 0;
+    std::size_t uploads = 0;
+
+    static FixtureLiveness& shared() noexcept {
+        static FixtureLiveness books;
+        return books;
+    }
+};
+
 // One bounded destination owner without a backend, an arena, or native
 // storage. It records the requirement queries and upload calls its owner
 // receives, so a test can prove what a preflight or a synchronous realization
@@ -492,7 +580,13 @@ public:
                WorkspacePolicy policy = {})
         : iom::Tensor(std::move(spec), device),
           policy_(policy),
-          storage_(sentinel_storage()) {}
+          storage_(sentinel_storage()) {
+        ++FixtureLiveness::shared().live_tensors;
+    }
+
+    ~FakeTensor() override {
+        --FixtureLiveness::shared().live_tensors;
+    }
 
     // Host-transfer requirement queries this owner has received.
     [[nodiscard]] std::size_t requirement_queries() const noexcept {
@@ -508,6 +602,16 @@ public:
     [[nodiscard]] const std::vector<std::byte>& storage() const noexcept {
         return storage_;
     }
+    // The raw workspace owner and the exact byte size of the view the last
+    // upload received. The recorded identity is only ever compared and never
+    // dereferenced: a caller that provisioned that scratch may already have
+    // destroyed it.
+    [[nodiscard]] const iom::RawWorkspace* upload_workspace() const noexcept {
+        return upload_workspace_;
+    }
+    [[nodiscard]] std::size_t upload_workspace_bytes() const noexcept {
+        return upload_workspace_bytes_;
+    }
 
     // Makes the upload whose 1-based ordinal on this owner matches `ordinal`
     // throw `category` instead of recording bytes. Every received upload is
@@ -522,6 +626,7 @@ public:
             host_transfer_workspace_requirements(
                     std::size_t checked_logical_nbytes) const override {
         ++requirement_queries_;
+        ++FixtureLiveness::shared().requirement_queries;
         if (policy_.multiplier == 0) {
             return iom::WorkspaceRequirements{0, 1};
         }
@@ -536,8 +641,11 @@ public:
 
     void region_from_host(const iom::TensorView&,
                           std::span<const std::byte> source,
-                          iom::RawWorkspaceView) override {
+                          iom::RawWorkspaceView workspace) override {
         ++from_host_calls_;
+        ++FixtureLiveness::shared().uploads;
+        upload_workspace_ = workspace.owner_identity();
+        upload_workspace_bytes_ = workspace.byte_size();
         if (from_host_calls_ == failing_upload_) {
             if (upload_failure_ == UploadFailure::allocation) {
                 throw std::bad_alloc();
@@ -563,6 +671,8 @@ private:
     std::size_t failing_upload_ = 0;
     mutable std::size_t requirement_queries_ = 0;
     std::size_t from_host_calls_ = 0;
+    const iom::RawWorkspace* upload_workspace_ = nullptr;
+    std::size_t upload_workspace_bytes_ = 0;
     std::vector<std::byte> uploaded_bytes_;
     std::vector<std::byte> storage_;
 };
@@ -575,7 +685,13 @@ private:
 class FakeWorkspace final : public iom::RawWorkspace {
 public:
     FakeWorkspace(iom::Device& device, std::size_t bytes)
-        : iom::RawWorkspace(device, bytes) {}
+        : iom::RawWorkspace(device, bytes) {
+        ++FixtureLiveness::shared().live_workspaces;
+    }
+
+    ~FakeWorkspace() override {
+        --FixtureLiveness::shared().live_workspaces;
+    }
 
 private:
     [[nodiscard]] void* workspace_address() const noexcept override {
@@ -594,7 +710,13 @@ private:
 class BoundedWorkspace final : public iom::RawWorkspace {
 public:
     BoundedWorkspace(iom::Device& device, std::size_t bytes, void* address)
-        : iom::RawWorkspace(device, bytes), address_(address) {}
+        : iom::RawWorkspace(device, bytes), address_(address) {
+        ++FixtureLiveness::shared().live_workspaces;
+    }
+
+    ~BoundedWorkspace() override {
+        --FixtureLiveness::shared().live_workspaces;
+    }
 
 private:
     [[nodiscard]] void* workspace_address() const noexcept override {
@@ -633,19 +755,41 @@ public:
     [[nodiscard]] std::unique_ptr<iom::Tensor> create_tensor(
             const iom::TensorSpec& spec) override {
         ++tensor_creations_;
-        return std::make_unique<FakeTensor>(spec, *this, policy_);
+        const bool mismapped = tensor_creations_ == mismapped_tensor_;
+        const iom::TensorSpec& selected = mismapped ? *mismapped_spec_ : spec;
+        std::unique_ptr<FakeTensor> owner =
+                std::make_unique<FakeTensor>(selected, *this, policy_);
+        if (tensor_creations_ == failing_tensor_) {
+            owner->fail_upload_at(1, upload_failure_);
+        }
+        return owner;
     }
 
-    // Mirrors the CPU policy: zero bytes are a valid allocation-free owner,
-    // and positive bytes are unsupported device scratch.
+    // Mirrors the CPU policy by default: zero bytes are a valid allocation-free
+    // owner, and positive bytes are unsupported device scratch. A configured
+    // positive range hands out a `BoundedWorkspace` of exactly the requested
+    // size instead, so the positive transfer-scratch path stays observable, and
+    // exhausts as `std::bad_alloc` beyond that capacity.
     [[nodiscard]] std::unique_ptr<iom::RawWorkspace> create_workspace(
             std::size_t bytes) override {
         ++workspace_creations_;
-        if (bytes != 0) {
+        tensor_creations_at_workspace_creation_ = tensor_creations_;
+        if (bytes == 0) {
+            return std::make_unique<FakeWorkspace>(*this, 0);
+        }
+        if (positive_workspace_address_ == nullptr) {
             throw std::invalid_argument(
                     "the bounded fixture device has no positive workspace");
         }
-        return std::make_unique<FakeWorkspace>(*this, 0);
+        if (bytes > positive_workspace_capacity_) {
+            throw std::bad_alloc();
+        }
+        std::unique_ptr<BoundedWorkspace> owner =
+                std::make_unique<BoundedWorkspace>(
+                        *this, bytes, positive_workspace_address_);
+        last_workspace_identity_ = owner.get();
+        last_workspace_bytes_ = bytes;
+        return owner;
     }
 
     [[nodiscard]] std::unique_ptr<iom::DeviceOps> create_ops() override {
@@ -656,6 +800,30 @@ public:
     // The policy every subsequent `create_tensor` uses.
     void set_workspace_policy(WorkspacePolicy policy) noexcept {
         policy_ = policy;
+    }
+
+    // Provisions the positive workspace of this device over the caller-owned
+    // bounded range `address` of `capacity` bytes.
+    void enable_positive_workspace(void* address, std::size_t capacity) noexcept {
+        positive_workspace_address_ = address;
+        positive_workspace_capacity_ = capacity;
+    }
+
+    // Makes the destination whose 1-based creation ordinal is `ordinal` fail
+    // its first upload with `category`; zero disables the injection. A test
+    // cannot reach the owners a factory creates internally, so the device
+    // applies the policy as each of them is created.
+    void fail_upload_at(std::size_t ordinal, UploadFailure category) noexcept {
+        failing_tensor_ = ordinal;
+        upload_failure_ = category;
+    }
+
+    // Makes the destination whose 1-based creation ordinal is `ordinal` report
+    // `spec` instead of the requested specification, so a backend that hands
+    // back a wrong-shaped destination stays observable.
+    void mismap_tensor_at(std::size_t ordinal, iom::TensorSpec spec) {
+        mismapped_tensor_ = ordinal;
+        mismapped_spec_ = std::move(spec);
     }
 
     // Raw-workspace provisioning attempted on this device.
@@ -669,11 +837,38 @@ public:
         return tensor_creations_;
     }
 
+    // The destination-creation count observed when this device last handed out
+    // a workspace, so the create-before-provision order stays observable.
+    [[nodiscard]] std::size_t tensor_creations_at_workspace_creation() const
+            noexcept {
+        return tensor_creations_at_workspace_creation_;
+    }
+
+    // Identity and exact size of the last handed-out positive workspace. The
+    // identity is only ever compared and never dereferenced, because its owner
+    // may already be destroyed.
+    [[nodiscard]] const iom::RawWorkspace* last_workspace_identity() const
+            noexcept {
+        return last_workspace_identity_;
+    }
+    [[nodiscard]] std::size_t last_workspace_bytes() const noexcept {
+        return last_workspace_bytes_;
+    }
+
 private:
     std::span<const iom::DataType> supported_;
     WorkspacePolicy policy_;
+    void* positive_workspace_address_ = nullptr;
+    std::size_t positive_workspace_capacity_ = 0;
+    const iom::RawWorkspace* last_workspace_identity_ = nullptr;
+    std::size_t last_workspace_bytes_ = 0;
     std::size_t workspace_creations_ = 0;
     std::size_t tensor_creations_ = 0;
+    std::size_t tensor_creations_at_workspace_creation_ = 0;
+    std::size_t failing_tensor_ = 0;
+    UploadFailure upload_failure_ = UploadFailure::none;
+    std::size_t mismapped_tensor_ = 0;
+    std::optional<iom::TensorSpec> mismapped_spec_;
 };
 
 // Creates one bounded destination owner per published inventory entry, in
