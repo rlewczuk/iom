@@ -197,6 +197,60 @@ adapter.
    fabricated by default construction. The recorder does not duplicate
    session stop policy.
 
+## Wait observations and retained failure
+
+1. The recorder observes exactly the waits the session already performs: the
+   session-controlled wait for one accepted producer, and every drain of the
+   accepted-OID ledger, including the drain a failed wait triggers and the
+   drain performed during session destruction. Observation happens
+   immediately at that existing wait's return or catch. The hooks add no
+   wait, poll, retry, event query, or synchronization primitive that the
+   existing queue/runtime does not already require, and they leave existing
+   per-producer waits inside a forward stage, duplicate selector readiness
+   waits, and generic queue instrumentation unchanged.
+2. A completion-observed wait outcome is host observation of the existing
+   wait result. It is not a native device timestamp, not device duration, and
+   not proof that all predecessor work is complete: a successful observation
+   reports that the queue reported completion for that exact operation, and a
+   failed observation reports only that this wait retained that failure.
+3. For each owned positive OID at most one outcome is retained: the first
+   successful observation or the first retained failure, with its supplied
+   host instant and the copied request context captured at enqueue. Repeated
+   waits, poison/drain recursion, and destructor cleanup preserve that first
+   outcome and its retained `std::exception_ptr` instead of adding a row,
+   rewriting the first instant, or selecting a different error. A later
+   successful OID never proves that an earlier OID succeeded.
+4. Failure ownership is established from the existing accepted-OID ledger,
+   never from the presence of a trace row. A failed wait is observed
+   immediately, and the original exception is saved before any subsequent
+   drain, poisoning, or cleanup activity, so the existing error path keeps
+   its original exception, first-error selection, poisoning, and rethrow
+   behavior. Only a failure of the current admitted request's accepted
+   ledger passes that verified ordinal to the recorder, which invalidates the
+   owning request's rate while retaining its completed counters; an
+   invalidated rate is never recomputed as valid.
+5. An unowned failure never invalidates an unrelated request's rate, even
+   when a trace row exists for the OID. Unknown, unregistered, foreign-queue,
+   and selector-internal OIDs submitted directly to the exposed queue
+   acquire no row and no copied context: the trace covers session-submitted
+   positive OIDs only, their wait attribution comes from that exact ledger
+   entry, and no generic queue instrumentation is added.
+6. A failed wait observation is not a device-terminality proof. Registry and
+   quarantine rules, resource destruction, and the queue's own retained
+   failure semantics stay untouched.
+7. Scalar-only mode needs no wait hook for a successful wait: it reads no
+   clock and registers no OID. A retained failure in scalar-only mode
+   invalidates the verified owning request's rate without a clock read and
+   without per-OID registration. With tracing prepared, a wait observation
+   may read the supplied host clock and update the already-owned row of that
+   exact OID. A null recorder performs no observation work at all.
+8. Genuine device timing stays unavailable for wait observations under the
+   same limitations as every other observation: the CPU backend has no
+   device clock, CUDA completion events are created `cudaEventDisableTiming`,
+   ROCm completion events are created `hipEventDisableTiming`, and SYCL queues
+   are constructed `in_order` without profiling. No optional native timer,
+   event adapter, or universal timing adapter is introduced here.
+
 ## Honest backend limitations
 
 1. **CPU.** The CPU backend has no device clock. Every measurement is a

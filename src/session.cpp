@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -665,6 +666,70 @@ struct TinyLlamaSession::Impl {
         }
     }
 
+    // The published admitted request's ordinal, or zero when no observed
+    // request is admitted. The accepted-OID ledger belongs to exactly that
+    // request, so a token found in the ledger is owned by this ordinal.
+    [[nodiscard]] std::uint64_t admitted_request_ordinal() const noexcept {
+        if (metrics == nullptr || !metrics->snapshot().request_admitted) {
+            return 0;
+        }
+        return metrics->snapshot().admitted.ordinal;
+    }
+
+    // Verify one exact accepted OID against the existing accepted-OID ledger.
+    // Wait attribution and failure ownership come from that ledger, never from
+    // the presence of a trace row: an OID this request never accepted - an
+    // unknown sequence, an OID of another queue, or selector-internal work
+    // submitted directly to the exposed queue - reports zero and can neither
+    // invalidate the admitted request's rate nor fabricate copied request
+    // context.
+    [[nodiscard]] std::uint64_t owning_request_ordinal(
+            oid token) const noexcept {
+        const std::uint64_t ordinal = admitted_request_ordinal();
+        if (ordinal == 0 || request == nullptr) {
+            return 0;
+        }
+        const std::vector<oid>& accepted = request->accepted_oids;
+        return std::find(accepted.begin(), accepted.end(), token)
+                        != accepted.end()
+                ? ordinal
+                : 0;
+    }
+
+    // Observe one existing session-controlled wait outcome on the attached
+    // recorder, immediately at that existing wait's return or catch. The
+    // hooks are allocation-free and non-throwing: they add no wait, poll, or
+    // synchronization work, they never replace or delay the existing error
+    // path, and a null recorder performs no observation at all. A scalar-only
+    // success needs neither a clock read nor a record; a scalar-only failure
+    // may invalidate the verified owning request's rate without reading the
+    // clock or registering a per-OID row. The recorder itself preserves the
+    // first successful observation or the first retained failure of each
+    // owned OID, so repeated waits, drain recursion, and destructor cleanup
+    // add no row and select no different error.
+    void observe_wait_success(oid token) noexcept {
+        if (metrics == nullptr || !metrics->trace_prepared()) {
+            return;
+        }
+        // A successful observation never invalidates a rate, so the owning
+        // ordinal - consumed by the recorder only for a failed observation -
+        // stays zero and this path needs no ledger proof.
+        metrics->record_wait(token, 0, metrics->now(),
+                             ObservationState::succeeded, nullptr);
+    }
+
+    void observe_wait_failure(oid token, std::exception_ptr failure) noexcept {
+        if (metrics == nullptr) {
+            return;
+        }
+        std::optional<InferenceMetrics::value_type> host_instant;
+        if (metrics->trace_prepared()) {
+            host_instant = metrics->now();
+        }
+        metrics->record_wait(token, owning_request_ordinal(token), host_instant,
+                             ObservationState::failed, std::move(failure));
+    }
+
     void drain_request() {
         if (!request) {
             return;
@@ -675,9 +740,16 @@ struct TinyLlamaSession::Impl {
             try {
                 queue->wait(token);
             } catch (...) {
-                if (!first) first = std::current_exception();
+                // Save the original failure before any observation, poisoning,
+                // drain, or cleanup activity; the wait observation and the
+                // preserved first error both consume this exact exception.
+                const std::exception_ptr failure = std::current_exception();
+                observe_wait_failure(token, failure);
+                if (!first) first = failure;
                 poisoned = true;
+                continue;
             }
+            observe_wait_success(token);
         }
         request->draining = false;
         if (first) {
@@ -1233,10 +1305,16 @@ void SessionAccess::wait(TinyLlamaSession& session, oid token) {
     try {
         session.impl_->queue->wait(token);
     } catch (...) {
+        // Save the original failure before any observation, poison, or drain
+        // activity: the wait observation and the retained error both consume
+        // this exact exception, and the existing error path stays unchanged.
+        const std::exception_ptr failure = std::current_exception();
+        session.impl_->observe_wait_failure(token, failure);
         session.impl_->poisoned = true;
         try { session.impl_->drain_request(); } catch (...) {}
         throw;
     }
+    session.impl_->observe_wait_success(token);
 }
 
 void SessionAccess::drain(TinyLlamaSession& session) {

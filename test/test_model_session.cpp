@@ -407,6 +407,65 @@ struct RecordingClock {
     return static_cast<iom::oid>((std::uint64_t{16} << 55) | sequence);
 }
 
+// The CPU post-acceptance cache append failure the accepted-failure fixtures
+// inject: one armed latch is consumed by exactly the next accepted append, and
+// the failure stays retained and repeatable through every later wait.
+constexpr const char* kCacheAppendFailureMessage =
+        "CPU cache append injected post-acceptance failure";
+
+// One owned trace row of an observation recorder, or null when the recorder
+// owns no row for that exact OID.
+[[nodiscard]] const iom::InferenceTraceRecord* find_operation_record(
+        const iom::InferenceMetrics& recorder, iom::oid operation) {
+    for (const iom::InferenceTraceRecord& row : recorder.operations()) {
+        if (row.operation == operation) return &row;
+    }
+    return nullptr;
+}
+
+// The copied operation context of one owned row: exactly the fields a wait
+// observation must never rewrite. The wait outcome fields are deliberately
+// excluded, so comparing them proves that an observed wait updates only its
+// own exact positive OID's outcome and preserves the copied context.
+void check_operation_context(
+        const iom::InferenceTraceRecord& observed,
+        const iom::InferenceTraceRecord& expected) {
+    CHECK_EQ(observed.request_ordinal, expected.request_ordinal);
+    CHECK_EQ(observed.operation, expected.operation);
+    CHECK(observed.phase == expected.phase);
+    CHECK(observed.decoder_layer == expected.decoder_layer);
+    CHECK_EQ(observed.position_start, expected.position_start);
+    CHECK_EQ(observed.run_length, expected.run_length);
+    CHECK_EQ(observed.enqueue_begin_ns, expected.enqueue_begin_ns);
+    CHECK_EQ(observed.enqueue_end_ns, expected.enqueue_end_ns);
+}
+
+// The message of one retained failure without consuming it: `exception_ptr`
+// copies stay rethrowable, so the first retained exception is inspectable
+// before and after its owning session is destroyed.
+[[nodiscard]] std::string retained_failure_message(std::exception_ptr failure) {
+    if (failure == nullptr) return std::string{"<none>"};
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        return error.what();
+    } catch (...) {
+        return std::string{"<non-standard>"};
+    }
+}
+
+// A generous deterministic instant sequence for an observed session. The two
+// load instants come first; every observed wait then reads exactly one further
+// instant, and each test asserts the read count it expects instead of relying
+// on exhaustion.
+[[nodiscard]] std::vector<std::uint64_t> wait_clock_instants() {
+    std::vector<std::uint64_t> instants{10, 20};
+    for (std::uint64_t step = 1; step <= 96; ++step) {
+        instants.push_back(1'000 + step * 10);
+    }
+    return instants;
+}
+
 // Loads through the caller-supplied selector and returns the message of the
 // failure the call must report, so an instrumented load's rethrown exception
 // is comparable with the uninstrumented one.
@@ -1080,7 +1139,7 @@ void clear_cache_append_wait_observation() noexcept;
 TEST_CASE("Inference metrics session load preserves attribution across a failed drain") {
     SessionFixture fixture;
     RecordingClock clock;
-    clock.instants = {3, 8};
+    clock.instants = wait_clock_instants();
     iom::InferenceMetrics recorder(make_clock(clock));
     auto session = iom::load_tinyllama_session(
             fixture.directory.path(), *fixture.device,
@@ -1100,6 +1159,9 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
                             3, 15, 45);
     REQUIRE_EQ(recorder.operations().size(), 1);
 
+    // The drain window below starts after the failing submission, so its
+    // deltas cover exactly the existing drain waits.
+    std::size_t drain_reads = 0;
     {
         // The process-wide CPU latch rejects the accepted append, so the
         // replacement's drain reports the queue's original failure instead of
@@ -1111,9 +1173,15 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
         SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
             return queue.cache_append(banks.k->view(), caches[0].key->view(), 0);
         });
+        drain_reads = clock.cursor;
         CHECK_THROWS_AS(session->prepare_request(1, {0, 1}, {38, {0, 1}}),
                         std::runtime_error);
     }
+    // The replacement's drain observed exactly one existing wait: the failing
+    // append's OID is a real accepted ledger entry whose wait observation reads
+    // one host instant, while the unregistered preseeded row is never
+    // fabricated into an additional record.
+    CHECK_EQ(clock.cursor, drain_reads + 1);
 
     CHECK(session->poisoned());
     CHECK_EQ(session->request_length(), 3);
@@ -1121,10 +1189,15 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
     CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 40);
     REQUIRE_EQ(recorder.operations().size(), 1);
     CHECK_EQ(recorder.operations()[0].operation, row);
-    CHECK_EQ(clock.cursor, 2);
     CHECK_FALSE(clock.exhausted);
 
     session.reset();
+    // The destructor drain repeats that same wait and preserves both the
+    // recorded row and its first observation state.
+    CHECK_EQ(clock.cursor, drain_reads + 2);
+    REQUIRE_EQ(recorder.operations().size(), 1);
+    CHECK_EQ(recorder.operations()[0].operation, row);
+    CHECK(recorder.operations()[0].wait_state == iom::WaitState::not_observed);
     // The CPU backend retains both operands of the failed append in its device
     // quarantine, so the session's own owners are released without resetting
     // the allocator.
@@ -1132,6 +1205,471 @@ TEST_CASE("Inference metrics session load preserves attribution across a failed 
     fixture.device.reset();
     CHECK_EQ(fixture.allocator.live, 0);
     CHECK_EQ(fixture.allocator.resets, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Wait observation cases.
+//
+// The recorder's wait hooks are the only observers of the existing
+// session-controlled waits. These cases drive real accepted positive OIDs
+// through the existing `SessionAccess` seam, preseed the already-owned trace
+// rows with the recorder's core `record_enqueue` API and frozen copied
+// context, and then exercise the real wait, repeated waits, an explicitly
+// observed retained failure, the failure-driven drain, and destructor
+// cleanup. They never require the enqueue-hook implementation: the preseeded
+// row is exactly the already-owned record a duplicate acceptance ignores, and
+// wait attribution and failure ownership come from the accepted-OID ledger,
+// never from the presence of a row.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Inference metrics waits observe each accepted OID once across drains") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = wait_clock_instants();
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+    REQUIRE(session);
+    session->prepare_operation_trace();
+    session->prepare_request(3, {0, 1}, {38, {0, 1}});
+    REQUIRE(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+
+    // A completed decode observation gives the admitted request a valid rate,
+    // so a retained wait failure's rate invalidation is observable against it.
+    recorder.record_decode_interval(1'000);
+    recorder.commit_token(2'000, true);
+    recorder.end_generation(3'000, iom::GenerationStopReason::eos);
+    REQUIRE(recorder.snapshot().admitted.decode_throughput_valid);
+
+    const auto& banks = SessionAccess::prefill(*session);
+    const auto caches = SessionAccess::caches(*session);
+    std::vector<std::byte> zeros(banks.k->view().spec().logical_nbytes(),
+                                 std::byte{0});
+    banks.k->view().copy_from_host(zeros);
+    banks.v->view().copy_from_host(zeros);
+
+    // The first accepted append retains the CPU seam's post-acceptance
+    // failure; the second accepted operation stays healthy. Both are real
+    // positive OIDs in the accepted-OID ledger.
+    struct ResetFailure {
+        ~ResetFailure() { iom::cpu_detail::clear_cache_append_failure(); }
+    } failure;
+    iom::cpu_detail::arm_cache_append_failure();
+    const iom::oid failed =
+            SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+                return queue.cache_append(banks.k->view(),
+                                          caches[0].key->view(), 0);
+            });
+    const iom::oid healthy =
+            SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+                return queue.copy(banks.x->view(),
+                                  banks.attention_norm->view());
+            });
+    REQUIRE(iom::oid_is_token(failed));
+    REQUIRE(iom::oid_is_token(healthy));
+    REQUIRE_EQ(SessionAccess::accepted(*session).size(), 2);
+    CHECK(SessionAccess::accepted(*session)[0] == failed);
+    CHECK(SessionAccess::accepted(*session)[1] == healthy);
+
+    // The rows the wait hooks update are the already-owned core records of
+    // those exact positive OIDs, carrying copied frozen context.
+    recorder.record_enqueue(failed, iom::InferencePhase::decode, 4, 6, 1, 100,
+                            140);
+    recorder.record_enqueue(healthy, iom::InferencePhase::prefill,
+                            std::nullopt, 0, 3, 200, 260);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    const iom::InferenceTraceRecord* const failed_before =
+            find_operation_record(recorder, failed);
+    const iom::InferenceTraceRecord* const healthy_before =
+            find_operation_record(recorder, healthy);
+    REQUIRE(failed_before != nullptr);
+    REQUIRE(healthy_before != nullptr);
+    CHECK_EQ(failed_before->request_ordinal, 1);
+    CHECK_EQ(healthy_before->request_ordinal, 1);
+    CHECK(failed_before->wait_state == iom::WaitState::not_observed);
+    CHECK(healthy_before->wait_state == iom::WaitState::not_observed);
+    const iom::InferenceTraceRecord failed_context = *failed_before;
+    const iom::InferenceTraceRecord healthy_context = *healthy_before;
+
+    // One successful observation: exactly one host instant is read and the
+    // exact OID's first completion outcome is recorded without touching its
+    // copied context.
+    const std::size_t healthy_reads = clock.cursor;
+    SessionAccess::wait(*session, healthy);
+    CHECK_EQ(clock.cursor, healthy_reads + 1);
+    const iom::InferenceTraceRecord* const healthy_after =
+            find_operation_record(recorder, healthy);
+    REQUIRE(healthy_after != nullptr);
+    CHECK(healthy_after->wait_state == iom::WaitState::succeeded);
+    CHECK_EQ(healthy_after->wait_observed_ns.value_or(0),
+             clock.instants[healthy_reads]);
+    check_operation_context(*healthy_after, healthy_context);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+
+    // Repeated waits preserve the first successful observation: no row is
+    // added and the first instant stays selected.
+    SessionAccess::wait(*session, healthy);
+    SessionAccess::wait(*session, healthy);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    const iom::InferenceTraceRecord* const healthy_repeat =
+            find_operation_record(recorder, healthy);
+    REQUIRE(healthy_repeat != nullptr);
+    CHECK(healthy_repeat->wait_state == iom::WaitState::succeeded);
+    CHECK_EQ(healthy_repeat->wait_observed_ns.value_or(0),
+             clock.instants[healthy_reads]);
+    check_operation_context(*healthy_repeat, healthy_context);
+
+    // The failed wait is observed immediately at its catch: the original
+    // exception is saved first, the exact OID retains it with its host
+    // instant, and the existing poisoning and failure-driven drain follow
+    // unchanged. This window contains three existing waits: the failing OID,
+    // then the drain of the failing and the healthy ledger OIDs.
+    const std::size_t failed_reads = clock.cursor;
+    CHECK_THROWS_WITH_AS(SessionAccess::wait(*session, failed),
+                         kCacheAppendFailureMessage, std::runtime_error);
+    CHECK(session->poisoned());
+    CHECK_EQ(clock.cursor, failed_reads + 3);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    const iom::InferenceTraceRecord* const failed_after =
+            find_operation_record(recorder, failed);
+    REQUIRE(failed_after != nullptr);
+    CHECK(failed_after->wait_state == iom::WaitState::failed);
+    CHECK_EQ(failed_after->wait_observed_ns.value_or(0),
+             clock.instants[failed_reads]);
+    CHECK_EQ(retained_failure_message(failed_after->wait_failure),
+             kCacheAppendFailureMessage);
+    check_operation_context(*failed_after, failed_context);
+
+    // A later successful OID never certifies the earlier failed one, and the
+    // healthy OID's first success survives the failure-driven drain.
+    const iom::InferenceTraceRecord* const healthy_drained =
+            find_operation_record(recorder, healthy);
+    REQUIRE(healthy_drained != nullptr);
+    CHECK(healthy_drained->wait_state == iom::WaitState::succeeded);
+    CHECK_EQ(healthy_drained->wait_observed_ns.value_or(0),
+             clock.instants[healthy_reads]);
+    check_operation_context(*healthy_drained, healthy_context);
+
+    // The retained wait failure invalidates the owning request's rate and
+    // keeps every completed counter; it is no proof that the device failed.
+    CHECK_FALSE(recorder.snapshot().admitted.decode_throughput_valid);
+    CHECK_EQ(recorder.snapshot().admitted.tokens_per_second, 0.0);
+    CHECK_EQ(recorder.snapshot().admitted.generated_tokens, 1);
+    CHECK_EQ(recorder.snapshot().admitted.decode_token_count, 1);
+    CHECK_EQ(recorder.snapshot().admitted.decode_throughput_denominator_ns,
+             1'000);
+
+    // A repeated wait of the failed OID rethrows the same retained exception
+    // without adding a row, rewriting the first instant, or selecting another
+    // error.
+    const std::size_t repeat_reads = clock.cursor;
+    CHECK_THROWS_WITH_AS(SessionAccess::wait(*session, failed),
+                         kCacheAppendFailureMessage, std::runtime_error);
+    CHECK_EQ(clock.cursor, repeat_reads + 3);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    const iom::InferenceTraceRecord* const failed_repeat =
+            find_operation_record(recorder, failed);
+    REQUIRE(failed_repeat != nullptr);
+    CHECK(failed_repeat->wait_state == iom::WaitState::failed);
+    CHECK_EQ(failed_repeat->wait_observed_ns.value_or(0),
+             clock.instants[failed_reads]);
+    CHECK_EQ(retained_failure_message(failed_repeat->wait_failure),
+             kCacheAppendFailureMessage);
+
+    // Destructor cleanup repeats the same two existing waits: both rows and
+    // the first retained failure are preserved unchanged.
+    const std::size_t destructor_reads = clock.cursor;
+    session.reset();
+    CHECK_EQ(clock.cursor, destructor_reads + 2);
+    REQUIRE_EQ(recorder.operations().size(), 2);
+    const iom::InferenceTraceRecord* const failed_final =
+            find_operation_record(recorder, failed);
+    REQUIRE(failed_final != nullptr);
+    CHECK(failed_final->wait_state == iom::WaitState::failed);
+    CHECK_EQ(failed_final->wait_observed_ns.value_or(0),
+             clock.instants[failed_reads]);
+    CHECK_EQ(retained_failure_message(failed_final->wait_failure),
+             kCacheAppendFailureMessage);
+    check_operation_context(*failed_final, failed_context);
+    CHECK_FALSE(clock.exhausted);
+
+    // The failed wait observation is not a device-terminality proof: the CPU
+    // device keeps its own quarantine policy for the failed append.
+    CHECK_EQ(fixture.allocator.live, 2);
+    fixture.device.reset();
+    CHECK_EQ(fixture.allocator.live, 0);
+    CHECK_EQ(fixture.allocator.resets, 0);
+}
+
+TEST_CASE("Inference metrics waits never attribute unowned or scalar-only waits") {
+    // Selector-internal work submitted directly to the exposed queue is
+    // opaque: its real positive OID is never accepted by the ledger, so an
+    // observed wait cannot fabricate a row, cannot rewrite the frozen context
+    // of an existing row, and cannot invalidate the admitted request's rate
+    // even though a trace row exists.
+    {
+        SessionFixture fixture;
+        RecordingClock clock;
+        clock.instants = wait_clock_instants();
+        iom::InferenceMetrics recorder(make_clock(clock));
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+        REQUIRE(session);
+        session->prepare_operation_trace();
+        session->prepare_request(3, {0, 1}, {38, {0, 1}});
+        const auto& banks = SessionAccess::prefill(*session);
+        const auto caches = SessionAccess::caches(*session);
+        std::vector<std::byte> zeros(banks.k->view().spec().logical_nbytes(),
+                                     std::byte{0});
+        banks.k->view().copy_from_host(zeros);
+
+        recorder.record_decode_interval(1'000);
+        recorder.commit_token(2'000, true);
+        recorder.end_generation(3'000, iom::GenerationStopReason::eos);
+        REQUIRE(recorder.snapshot().admitted.decode_throughput_valid);
+        const double rate = recorder.snapshot().admitted.tokens_per_second;
+
+        const iom::oid internal = session->queue().copy(
+                banks.x->view(), banks.attention_norm->view());
+        const iom::oid unrecorded = session->queue().copy(
+                banks.x->view(), banks.attention_merged->view());
+        REQUIRE(iom::oid_is_token(internal));
+        REQUIRE(iom::oid_is_token(unrecorded));
+        CHECK(SessionAccess::accepted(*session).empty());
+
+        recorder.record_enqueue(internal, iom::InferencePhase::decode, 3, 9, 1,
+                                21, 23);
+        REQUIRE_EQ(recorder.operations().size(), 1);
+        const iom::InferenceTraceRecord frozen = recorder.operations()[0];
+        CHECK_EQ(frozen.operation, internal);
+
+        const std::size_t internal_reads = clock.cursor;
+        SessionAccess::wait(*session, internal);
+        CHECK_EQ(clock.cursor, internal_reads + 1);
+        const std::size_t unrecorded_reads = clock.cursor;
+        SessionAccess::wait(*session, unrecorded);
+        CHECK_EQ(clock.cursor, unrecorded_reads + 1);
+
+        // The unrecorded OID acquired no row, and the owned row keeps exactly
+        // the frozen context the test recorded for it.
+        REQUIRE_EQ(recorder.operations().size(), 1);
+        const iom::InferenceTraceRecord* const observed =
+                find_operation_record(recorder, internal);
+        REQUIRE(observed != nullptr);
+        CHECK(observed->wait_state == iom::WaitState::succeeded);
+        CHECK_EQ(observed->wait_observed_ns.value_or(0),
+                 clock.instants[internal_reads]);
+        check_operation_context(*observed, frozen);
+        CHECK_EQ(observed->phase, iom::InferencePhase::decode);
+        CHECK_EQ(observed->decoder_layer.value_or(0), 3);
+        CHECK_EQ(observed->position_start, 9);
+        CHECK_EQ(observed->run_length, 1);
+        CHECK_EQ(observed->enqueue_begin_ns, 21);
+        CHECK_EQ(observed->enqueue_end_ns, 23);
+
+        // A successful unowned wait never touches the admitted request.
+        CHECK(recorder.snapshot().admitted.decode_throughput_valid);
+        CHECK_EQ(recorder.snapshot().admitted.tokens_per_second, rate);
+
+        // A failed unowned wait keeps its own row's retained failure but never
+        // invalidates the admitted request's rate: ownership comes from the
+        // accepted-OID ledger, not from the presence of a trace row.
+        struct ResetFailure {
+            ~ResetFailure() { iom::cpu_detail::clear_cache_append_failure(); }
+        } failure;
+        iom::cpu_detail::arm_cache_append_failure();
+        const iom::oid failed_internal = session->queue().cache_append(
+                banks.k->view(), caches[0].key->view(), 0);
+        REQUIRE(iom::oid_is_token(failed_internal));
+        recorder.record_enqueue(failed_internal, iom::InferencePhase::decode,
+                                3, 12, 1, 31, 33);
+        REQUIRE_EQ(recorder.operations().size(), 2);
+        const std::size_t failed_reads = clock.cursor;
+        CHECK_THROWS_WITH_AS(SessionAccess::wait(*session, failed_internal),
+                             kCacheAppendFailureMessage, std::runtime_error);
+        // The direct wait observed one failure, and the failure-driven drain
+        // had an empty accepted ledger to inspect.
+        CHECK_EQ(clock.cursor, failed_reads + 1);
+        REQUIRE_EQ(recorder.operations().size(), 2);
+        const iom::InferenceTraceRecord* const failed_row =
+                find_operation_record(recorder, failed_internal);
+        REQUIRE(failed_row != nullptr);
+        CHECK(failed_row->wait_state == iom::WaitState::failed);
+        CHECK_EQ(failed_row->wait_observed_ns.value_or(0),
+                 clock.instants[failed_reads]);
+        CHECK_EQ(retained_failure_message(failed_row->wait_failure),
+                 kCacheAppendFailureMessage);
+        CHECK(recorder.snapshot().admitted.decode_throughput_valid);
+        CHECK_EQ(recorder.snapshot().admitted.tokens_per_second, rate);
+
+        session.reset();
+        fixture.device.reset();
+        CHECK_EQ(fixture.allocator.live, 0);
+        CHECK_FALSE(clock.exhausted);
+    }
+
+    // Scalar-only mode: a successful wait adds neither a clock read nor a
+    // record, while a failed wait of a verified owning request invalidates
+    // that request's rate without a clock read, a row, or per-OID
+    // registration.
+    {
+        SessionFixture fixture;
+        RecordingClock clock;
+        clock.instants = wait_clock_instants();
+        iom::InferenceMetrics recorder(make_clock(clock));
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+        REQUIRE(session);
+        REQUIRE_FALSE(recorder.trace_prepared());
+        session->prepare_request(3, {0, 1}, {38, {0, 1}});
+        const auto& banks = SessionAccess::prefill(*session);
+        const auto caches = SessionAccess::caches(*session);
+        std::vector<std::byte> zeros(banks.k->view().spec().logical_nbytes(),
+                                     std::byte{0});
+        banks.k->view().copy_from_host(zeros);
+
+        recorder.record_decode_interval(1'000);
+        recorder.commit_token(2'000, true);
+        recorder.end_generation(3'000, iom::GenerationStopReason::eos);
+        REQUIRE(recorder.snapshot().admitted.decode_throughput_valid);
+
+        const iom::oid healthy =
+                SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+                    return queue.copy(banks.x->view(),
+                                      banks.attention_norm->view());
+                });
+        REQUIRE(iom::oid_is_token(healthy));
+        // Scalar-only recording creates no per-OID storage at all.
+        recorder.record_enqueue(healthy, iom::InferencePhase::prefill,
+                                std::nullopt, 0, 3, 200, 260);
+        const std::size_t healthy_reads = clock.cursor;
+        SessionAccess::wait(*session, healthy);
+        CHECK_EQ(clock.cursor, healthy_reads);
+        CHECK(recorder.operations().empty());
+
+        struct ResetFailure {
+            ~ResetFailure() { iom::cpu_detail::clear_cache_append_failure(); }
+        } failure;
+        iom::cpu_detail::arm_cache_append_failure();
+        const iom::oid failed =
+                SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+                    return queue.cache_append(banks.k->view(),
+                                              caches[0].key->view(), 0);
+                });
+        REQUIRE(iom::oid_is_token(failed));
+        const std::size_t failed_reads = clock.cursor;
+        CHECK_THROWS_WITH_AS(SessionAccess::wait(*session, failed),
+                             kCacheAppendFailureMessage, std::runtime_error);
+        CHECK_EQ(clock.cursor, failed_reads);
+        CHECK(recorder.operations().empty());
+        CHECK(session->poisoned());
+        // The verified owning request loses its rate; completed counters stay.
+        CHECK_FALSE(recorder.snapshot().admitted.decode_throughput_valid);
+        CHECK_EQ(recorder.snapshot().admitted.tokens_per_second, 0.0);
+        CHECK_EQ(recorder.snapshot().admitted.generated_tokens, 1);
+        CHECK_EQ(recorder.snapshot().admitted.decode_token_count, 1);
+        CHECK_EQ(recorder.snapshot().admitted.decode_throughput_denominator_ns,
+                 1'000);
+
+        // Destructor cleanup repeats the same scalar-only waits without
+        // reading a clock or creating any row.
+        const std::size_t destructor_reads = clock.cursor;
+        session.reset();
+        CHECK_EQ(clock.cursor, destructor_reads);
+        CHECK(recorder.operations().empty());
+        CHECK_EQ(fixture.allocator.live, 2);
+        fixture.device.reset();
+        CHECK_EQ(fixture.allocator.live, 0);
+    }
+}
+
+TEST_CASE("Inference metrics waits preserve existing wait counts in both modes") {
+    SessionFixture fixture;
+    RecordingClock clock;
+    clock.instants = wait_clock_instants();
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto plain = fixture.load();
+    auto observed = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<iom::GreedyTokenSelector>(), &recorder);
+    REQUIRE(plain);
+    REQUIRE(observed);
+    CHECK_EQ(SessionAccess::metrics(*plain), nullptr);
+    CHECK_EQ(SessionAccess::metrics(*observed), &recorder);
+    observed->prepare_operation_trace();
+    plain->prepare_request(3, {0, 1}, {38, {0, 1}});
+    observed->prepare_request(3, {0, 1}, {38, {0, 1}});
+
+    struct Outcome {
+        std::size_t accepted = 0;
+        std::size_t waits = 0;
+        std::string failure;
+        bool poisoned = false;
+        std::size_t initialized_length = 0;
+    };
+    const auto run = [](iom::TinyLlamaSession& session) {
+        struct Reset {
+            ~Reset() {
+                iom::cpu_detail::clear_cache_append_failure();
+                iom::cpu_detail::clear_cache_append_wait_observation();
+            }
+        } reset;
+        iom::cpu_detail::arm_cache_append_failure();
+        iom::cpu_detail::arm_cache_append_wait_observation();
+        const auto& banks = SessionAccess::prefill(session);
+        const auto caches = SessionAccess::caches(session);
+        std::vector<std::byte> zeros(banks.k->view().spec().logical_nbytes(),
+                                     std::byte{0});
+        banks.k->view().copy_from_host(zeros);
+        banks.v->view().copy_from_host(zeros);
+        const iom::oid failed =
+                SessionAccess::submit(session, [&](iom::DeviceOps& queue) {
+                    return queue.cache_append(banks.k->view(),
+                                              caches[0].key->view(), 0);
+                });
+        const iom::oid healthy =
+                SessionAccess::submit(session, [&](iom::DeviceOps& queue) {
+                    return queue.cache_append(banks.v->view(),
+                                              caches[0].value->view(), 0);
+                });
+        Outcome outcome;
+        outcome.accepted = SessionAccess::accepted(session).size();
+        outcome.failure = "<none>";
+        if (iom::oid_is_token(failed) && iom::oid_is_token(healthy)) {
+            try {
+                SessionAccess::wait(session, failed);
+            } catch (const std::runtime_error& error) {
+                outcome.failure = error.what();
+            }
+        }
+        outcome.poisoned = session.poisoned();
+        outcome.waits = iom::cpu_detail::observed_cache_append_waits();
+        outcome.initialized_length = caches[0].initialized_length;
+        return outcome;
+    };
+
+    const Outcome plain_outcome = run(*plain);
+    const Outcome observed_outcome = run(*observed);
+
+    // The existing waits, their counts, the retained error, poisoning, and the
+    // published cache prefix are identical with and without the attached
+    // recorder: the observation adds no wait of its own.
+    CHECK_EQ(plain_outcome.accepted, 2);
+    CHECK_EQ(observed_outcome.accepted, plain_outcome.accepted);
+    CHECK_EQ(plain_outcome.waits, 1);
+    CHECK_EQ(observed_outcome.waits, plain_outcome.waits);
+    CHECK_EQ(plain_outcome.failure, kCacheAppendFailureMessage);
+    CHECK_EQ(observed_outcome.failure, plain_outcome.failure);
+    CHECK(plain_outcome.poisoned);
+    CHECK_EQ(observed_outcome.poisoned, plain_outcome.poisoned);
+    CHECK_EQ(plain_outcome.initialized_length, 0);
+    CHECK_EQ(observed_outcome.initialized_length,
+             plain_outcome.initialized_length);
+    CHECK_FALSE(clock.exhausted);
 }
 
 TEST_CASE("TinyLlama session resources check all cache bytes before allocation") {
