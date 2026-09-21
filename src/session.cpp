@@ -139,6 +139,30 @@ void validate_persistent_storage(const TinyLlamaConfig& config) {
     validate_vector_capacity<CacheOwner>(config.num_hidden_layers);
 }
 
+void validate_generation_prompt(
+        const TinyLlamaConfig& config,
+        std::span<const std::size_t> token_ids) {
+    if (token_ids.empty()) {
+        throw std::invalid_argument(
+                "TinyLlama generation prompt must be nonempty");
+    }
+    if (token_ids.size() > config.max_position_embeddings) {
+        throw std::invalid_argument(
+                "TinyLlama generation prompt exceeds model context");
+    }
+    static_cast<void>(checked_mul(
+            token_ids.size(), sizeof(std::uint32_t),
+            "TinyLlama generation prompt bytes overflow"));
+    validate_vector_capacity<std::size_t>(
+            config.max_position_embeddings);
+    for (const std::size_t token_id : token_ids) {
+        if (token_id >= config.vocab_size) {
+            throw std::invalid_argument(
+                    "TinyLlama generation prompt token exceeds vocabulary");
+        }
+    }
+}
+
 struct ForwardLayerPlan {
     session_detail::DecoderLayerForwardViews prefill;
     session_detail::DecoderLayerForwardViews decode;
@@ -594,6 +618,16 @@ struct TinyLlamaSession::Impl {
         if (!poisoned) request->accepted_oids.clear();
     }
 
+    void poison_and_drain() noexcept {
+        poisoned = true;
+        try {
+            drain_request();
+        } catch (...) {
+            // The original generation failure remains the observable error;
+            // drain_request has still attempted every accepted OID.
+        }
+    }
+
     void reset_cache_prefix() noexcept {
         for (CacheOwner& cache : caches) {
             cache.initialized_length = 0;
@@ -784,6 +818,117 @@ void TinyLlamaSession::prepare_request(
         std::size_t run_length, WorkspaceRequirements operation,
         TokenSelectorScratchRequirements selector_scratch) {
     impl_->prepare_request(run_length, operation, selector_scratch);
+}
+
+TokenGenerationResult TinyLlamaSession::generate_tokens(
+        std::span<const std::size_t> token_ids,
+        std::size_t max_new_tokens) {
+    const TinyLlamaConfig& config = impl_->config();
+    validate_generation_prompt(config, token_ids);
+
+    session_detail::SessionAccess::prepare_forward_request(
+            *this, token_ids.size());
+    auto& history = session_detail::SessionAccess::history(*this);
+    auto& results = session_detail::SessionAccess::results(*this);
+    const auto finish = [&](GenerationStopReason reason) {
+        return TokenGenerationResult{std::move(results), reason};
+    };
+
+    // A zero limit still admits and provisions the nonempty prompt, but never
+    // submits prefill work or asks the selector to inspect logits.
+    if (max_new_tokens == 0) {
+        return finish(GenerationStopReason::max_new_tokens);
+    }
+
+    session_detail::ForwardResult current =
+            session_detail::SessionAccess::forward_prefill(
+                    *this, token_ids);
+
+    const auto require_ready_result =
+            [&](const session_detail::ForwardResult& result) {
+                const bool shape_ok = result.logits != nullptr
+                        && result.logits == &impl_->logits->view()
+                        && result.logits->spec().data_type == DataType::BF16
+                        && result.logits->spec().quantization
+                                == QuantizationFormat::NONE
+                        && result.logits->spec().shape.rank() == 2
+                        && result.logits->spec().shape.dimensions()[0] == 1
+                        && result.logits->spec().shape.dimensions()[1]
+                                == config.vocab_size
+                        && &result.logits->device() == impl_->device
+                        && result.logits->owner_identity()
+                                == impl_->logits.get();
+                const auto accepted = session_detail::SessionAccess::accepted(
+                        *this);
+                const bool producer_ok = oid_is_token(result.producer)
+                        && std::find(
+                                   accepted.begin(), accepted.end(),
+                                   result.producer)
+                                != accepted.end();
+                if (!shape_ok || !producer_ok) {
+                    impl_->poison_and_drain();
+                    throw std::logic_error(
+                            "TinyLlama generation received an invalid "
+                            "final-logit producer");
+                }
+            };
+
+    const auto select_next = [&](const session_detail::ForwardResult& result) {
+        require_ready_result(result);
+        try {
+            // Selection is synchronous.  The selector repeats this wait for
+            // the established seam, while this barrier also protects injected
+            // selectors that only observe their borrowed arguments.
+            session_detail::SessionAccess::wait(*this, result.producer);
+            return impl_->selector->select(
+                    *impl_->queue, *result.logits, config.vocab_size,
+                    result.producer, history,
+                    session_detail::SessionAccess::selector_scratch(*this));
+        } catch (...) {
+            impl_->poison_and_drain();
+            throw;
+        }
+    };
+
+    require_ready_result(current);
+    session_detail::SessionAccess::wait(*this, current.producer);
+    history.assign(token_ids.begin(), token_ids.end());
+
+    if (history.size() == config.max_position_embeddings) {
+        return finish(GenerationStopReason::context_capacity);
+    }
+
+    for (;;) {
+        const std::size_t selected = select_next(current);
+        if (selected >= config.vocab_size) {
+            impl_->poison_and_drain();
+            throw std::invalid_argument(
+                    "TinyLlama generation selector returned a token outside "
+                    "the vocabulary");
+        }
+
+        // Request setup reserves both vectors to context capacity, so a
+        // successful token commit performs no per-token allocation.
+        history.push_back(selected);
+        results.push_back(selected);
+
+        // Stop precedence is deliberately independent of cache publication:
+        // EOS wins, then the requested generation limit, then context.
+        if (selected == config.eos_token_id) {
+            return finish(GenerationStopReason::eos);
+        }
+        if (results.size() >= max_new_tokens) {
+            return finish(GenerationStopReason::max_new_tokens);
+        }
+        if (history.size() >= config.max_position_embeddings) {
+            return finish(GenerationStopReason::context_capacity);
+        }
+
+        // A nonterminal token is the next decode input.  The decoder updates
+        // initialized cache length only after both K/V appends complete.
+        current = session_detail::SessionAccess::forward_decode(
+                *this, selected);
+    }
 }
 
 std::size_t TinyLlamaSession::request_length() const noexcept {
