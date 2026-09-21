@@ -139,17 +139,45 @@ void validate_persistent_storage(const TinyLlamaConfig& config) {
     validate_vector_capacity<CacheOwner>(config.num_hidden_layers);
 }
 
+struct ForwardLayerPlan {
+    session_detail::DecoderLayerForwardViews prefill;
+    session_detail::DecoderLayerForwardViews decode;
+    session_detail::DecoderLayerForwardParams prefill_params;
+    session_detail::DecoderLayerForwardParams decode_params;
+};
+
+struct ForwardWorkspaceLayout {
+    std::array<WorkspaceRequirements, 3> qkv_requirements{};
+    WorkspaceRequirements attention_requirement{};
+    session_detail::MlpWorkspaceRequirements mlp_requirements{};
+    WorkspaceRequirements sequential_requirement{};
+    std::array<std::size_t, 3> qkv_offsets{};
+    std::size_t attention_offset = 0;
+    std::size_t mlp_offset = 0;
+    std::size_t sequential_offset = 0;
+    WorkspaceRequirements total{};
+};
+
+struct ForwardPlan {
+    std::vector<ForwardLayerPlan> layers;
+    ForwardWorkspaceLayout workspace;
+};
+
 struct RequestState {
     std::size_t run_length = 0;
     RunBanks banks;
+    std::unique_ptr<ForwardPlan> forward;
     std::unique_ptr<RawWorkspace> operation_workspace;
     std::vector<std::byte> selector_host_scratch;
     std::unique_ptr<RawWorkspace> selector_device_scratch;
+    std::vector<std::uint32_t> prefill_indices;
+    std::uint32_t decode_index = 0;
     std::vector<std::size_t> history;
     std::vector<std::size_t> results;
     std::vector<oid> accepted_oids;
     bool draining = false;
 };
+
 
 [[nodiscard]] RunBanks allocate_run_banks(
         Device& device, const TinyLlamaConfig& config, std::size_t R) {
@@ -185,12 +213,304 @@ struct RequestState {
 
 [[nodiscard]] std::array<const Tensor*, 19> bank_owners(const RunBanks& banks) {
     return {banks.token_indices.get(), banks.x.get(), banks.attention_norm.get(),
+
             banks.q.get(), banks.k.get(), banks.v.get(), banks.rotated_q.get(),
             banks.rotated_k.get(), banks.attention_merged.get(),
             banks.attention_output.get(), banks.residual_after_attention.get(),
             banks.mlp_norm.get(), banks.gate.get(), banks.up.get(),
             banks.silu.get(), banks.product.get(), banks.down.get(),
             banks.residual_after_mlp.get(), banks.final_norm.get()};
+}
+[[nodiscard]] WorkspaceRequirements requirement_max(
+        WorkspaceRequirements lhs, WorkspaceRequirements rhs) {
+    if (rhs.bytes == 0) {
+        if (rhs.alignment != 1) {
+            throw std::invalid_argument(
+                    "TinyLlama forward zero-byte requirement has invalid "
+                    "alignment");
+        }
+        return lhs;
+    }
+    if (rhs.alignment == 0
+            || (rhs.alignment & (rhs.alignment - 1)) != 0
+            || rhs.alignment < kBaseWorkspaceAlignment) {
+        throw std::invalid_argument(
+                "TinyLlama forward requirement has invalid alignment");
+    }
+    if (lhs.bytes == 0) {
+        return {rhs.bytes, rhs.alignment};
+    }
+    return {std::max(lhs.bytes, rhs.bytes),
+            std::max(lhs.alignment, rhs.alignment)};
+}
+
+void include_requirement(
+        WorkspaceRequirements& destination, WorkspaceRequirements requirement) {
+    destination = requirement_max(destination, requirement);
+}
+
+void include_mlp_requirements(
+        session_detail::MlpWorkspaceRequirements& destination,
+        const session_detail::MlpWorkspaceRequirements& requirement) {
+    include_requirement(destination.gate, requirement.gate);
+    include_requirement(destination.up, requirement.up);
+    include_requirement(destination.mul, requirement.mul);
+    include_requirement(destination.down, requirement.down);
+    include_requirement(destination.residual, requirement.residual);
+}
+
+[[nodiscard]] std::size_t layer_weight_index(
+        std::size_t layer, std::size_t role_offset) {
+    return checked_add(
+            3, checked_add(
+                       checked_mul(
+                               layer, std::size_t{9},
+                               "TinyLlama forward layer weight index overflows"),
+                       role_offset,
+                       "TinyLlama forward layer weight index overflows"),
+            "TinyLlama forward layer weight index overflows");
+}
+
+[[nodiscard]] session_detail::DecoderLayerForwardViews make_layer_views(
+        const TinyLlamaModel& model, const RunBanks& banks,
+        CacheOwner& cache, std::size_t layer) {
+    const auto weight = [&](std::size_t role_offset) -> const TensorView& {
+        return model.weight(layer_weight_index(layer, role_offset));
+    };
+    const TensorView& input = (layer & 1U) == 0
+            ? banks.x->view()
+            : banks.residual_after_mlp->view();
+    const TensorView& output = (layer & 1U) == 0
+            ? banks.residual_after_mlp->view()
+            : banks.x->view();
+    return session_detail::DecoderLayerForwardViews{
+            session_detail::QkvRopeStageViews{
+                    input, weight(0), weight(2), weight(3), weight(4),
+                    banks.attention_norm->view(), banks.q->view(),
+                    banks.k->view(), banks.v->view(),
+                    banks.rotated_q->view(), banks.rotated_k->view()},
+            session_detail::CacheAttentionStageRequest{
+                    banks.rotated_q->view(), banks.rotated_k->view(),
+                    banks.v->view(), cache.key->view(), cache.value->view(),
+                    input, weight(5), banks.attention_merged->view(),
+                    banks.attention_output->view(),
+                    banks.residual_after_attention->view(), 0,
+                    input.spec().shape.dimensions()[0],
+                    model.config().max_position_embeddings},
+            session_detail::MlpStageViews{
+                    banks.residual_after_attention->view(), weight(1),
+                    weight(6), weight(7), weight(8),
+                    banks.mlp_norm->view(), banks.gate->view(), banks.up->view(),
+                    banks.silu->view(), banks.product->view(), banks.down->view(),
+                    output}};
+}
+
+[[nodiscard]] const TensorView& final_layer_output(
+        const RunBanks& banks, std::size_t layer_count) {
+    return (layer_count & 1U) == 0
+            ? banks.x->view()
+            : banks.residual_after_mlp->view();
+}
+
+[[nodiscard]] std::size_t align_up(
+        std::size_t value, std::size_t alignment, const char* message) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        throw std::invalid_argument(message);
+    }
+    return checked_add(value, alignment - 1, message) & ~(alignment - 1);
+}
+
+void reserve_slice(
+        std::size_t& cursor, std::size_t& offset, WorkspaceRequirements req,
+        const char* label) {
+    if (req.bytes == 0) {
+        offset = 0;
+        return;
+    }
+    const std::size_t alignment =
+            std::max(kBaseWorkspaceAlignment, req.alignment);
+    offset = align_up(cursor, alignment, label);
+    cursor = checked_add(offset, req.bytes, label);
+}
+
+[[nodiscard]] ForwardPlan make_forward_plan(
+        const TinyLlamaModel& model, const RunBanks& prefill,
+        const RunBanks& decode, const TensorView& logits,
+        std::span<CacheOwner> caches, DeviceOps& operations,
+        std::size_t run_length) {
+    const TinyLlamaConfig& config = model.config();
+    const std::size_t features = config.hidden_size;
+    const std::size_t intermediate = config.intermediate_size;
+    const std::size_t capacity = config.max_position_embeddings;
+    const std::size_t query_heads = config.num_attention_heads;
+    const std::size_t kv_heads = config.num_key_value_heads;
+    const std::size_t head_dim = config.head_dim;
+    const std::size_t vocabulary = config.vocab_size;
+    ForwardPlan plan;
+    plan.layers.reserve(config.num_hidden_layers);
+    for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+        plan.layers.emplace_back(ForwardLayerPlan{
+                make_layer_views(model, prefill, caches[layer], layer),
+                make_layer_views(model, decode, caches[layer], layer),
+                session_detail::DecoderLayerForwardParams{
+                        0, run_length, capacity, features, intermediate,
+                        config.rope_theta, config.rms_norm_eps,
+                        config.rms_norm_eps},
+                session_detail::DecoderLayerForwardParams{
+                        0, 1, capacity, features, intermediate,
+                        config.rope_theta, config.rms_norm_eps,
+                        config.rms_norm_eps}});
+    }
+
+    const auto add_sequential = [&](WorkspaceRequirements requirement) {
+        include_requirement(plan.workspace.sequential_requirement, requirement);
+    };
+    const auto add_qkv = [&](std::size_t branch,
+                             WorkspaceRequirements requirement) {
+        include_requirement(plan.workspace.qkv_requirements[branch],
+                            requirement);
+    };
+    const auto add_attention = [&](WorkspaceRequirements requirement) {
+        include_requirement(plan.workspace.attention_requirement, requirement);
+    };
+
+    add_sequential(operations.embedding_workspace_requirements(
+            model.weight(0), prefill.token_indices->view(), prefill.x->view()));
+    add_sequential(prefill.token_indices->view()
+                           .copy_from_host_workspace_requirements());
+    add_sequential(operations.embedding_workspace_requirements(
+            model.weight(0), decode.token_indices->view(), decode.x->view()));
+    add_sequential(decode.token_indices->view()
+                           .copy_from_host_workspace_requirements());
+
+    for (ForwardLayerPlan& layer : plan.layers) {
+        const auto query_run = [&](const RunBanks& banks,
+                                   session_detail::DecoderLayerForwardViews& views,
+                                   std::size_t rows, std::size_t a,
+                                   std::size_t length,
+                                   session_detail::DecoderLayerForwardParams&
+                                           params) {
+            params.a = a;
+            views.attention.a = a;
+            views.attention.R = rows;
+            views.attention.C = capacity;
+
+            add_sequential(operations.rmsnorm_workspace_requirements(
+                    views.qkv.activation, views.qkv.attention_scale,
+                    views.qkv.normalized, config.rms_norm_eps));
+            add_qkv(0, operations.linear_workspace_requirements(
+                              views.qkv.normalized, views.qkv.query_weight,
+                              views.qkv.query, 0, rows,
+                              LinearOutputLayout::head_planar, query_heads,
+                              head_dim));
+            add_qkv(1, operations.linear_workspace_requirements(
+                              views.qkv.normalized, views.qkv.key_weight,
+                              views.qkv.key, 0, rows,
+                              LinearOutputLayout::head_planar, kv_heads,
+                              head_dim));
+            add_qkv(2, operations.linear_workspace_requirements(
+                              views.qkv.normalized, views.qkv.value_weight,
+                              views.qkv.value, 0, rows,
+                              LinearOutputLayout::head_planar, kv_heads,
+                              head_dim));
+            add_sequential(operations.rope_workspace_requirements(
+                    views.qkv.query, views.qkv.rotated_query, a,
+                    config.rope_theta));
+            add_sequential(operations.rope_workspace_requirements(
+                    views.qkv.key, views.qkv.rotated_key, a,
+                    config.rope_theta));
+            add_sequential(operations.cache_append_workspace_requirements(
+                    views.attention.rotated_k, views.attention.k_cache, a));
+            add_sequential(operations.cache_append_workspace_requirements(
+                    views.attention.rotated_v, views.attention.v_cache, a));
+            add_attention(operations.sdpa_workspace_requirements(
+                    views.attention.rotated_q, views.attention.k_cache,
+                    views.attention.v_cache, views.attention.attention_merged,
+                    a, length));
+            add_attention(operations.linear_workspace_requirements(
+                    views.attention.attention_merged,
+                    views.attention.o_weight,
+                    views.attention.attention_output, 0, rows,
+                    LinearOutputLayout::ordinary, 1, features));
+            add_attention(operations.add_workspace_requirements(
+                    views.attention.residual_input,
+                    views.attention.attention_output,
+                    views.attention.residual_output));
+            add_sequential(operations.rmsnorm_workspace_requirements(
+                    views.mlp.x2, views.mlp.post_attention_scale,
+                    views.mlp.n2, config.rms_norm_eps));
+            add_sequential(operations.silu_workspace_requirements(
+                    views.mlp.gate, views.mlp.activated_gate));
+
+            const session_detail::MlpWorkspaceRequirements mlp =
+                    session_detail::mlp_workspace_requirements(
+                            operations, views.mlp, views.mlp);
+            include_mlp_requirements(plan.workspace.mlp_requirements, mlp);
+            add_sequential(operations.linear_workspace_requirements(
+                    views.mlp.product, views.mlp.down_weight, views.mlp.down,
+                    0, rows, LinearOutputLayout::ordinary, 1, features));
+            add_sequential(operations.add_workspace_requirements(
+                    views.mlp.x2, views.mlp.down, views.mlp.next_x));
+            (void)banks;
+        };
+
+        query_run(prefill, layer.prefill, run_length, 0, run_length,
+                  layer.prefill_params);
+        query_run(
+                decode, layer.decode, 1, capacity - 1, capacity,
+                layer.decode_params);
+    }
+
+    const TensorView& prefill_input =
+            final_layer_output(prefill, config.num_hidden_layers);
+    add_sequential(operations.rmsnorm_workspace_requirements(
+            prefill_input, model.weight(1), prefill.final_norm->view(),
+            config.rms_norm_eps));
+    add_sequential(operations.linear_workspace_requirements(
+            prefill.final_norm->view(), model.weight(2), logits, run_length - 1,
+            1, LinearOutputLayout::ordinary, 1, vocabulary));
+    const TensorView& decode_input =
+            final_layer_output(decode, config.num_hidden_layers);
+    add_sequential(operations.rmsnorm_workspace_requirements(
+            decode_input, model.weight(1), decode.final_norm->view(),
+            config.rms_norm_eps));
+    add_sequential(operations.linear_workspace_requirements(
+            decode.final_norm->view(), model.weight(2), logits, 0, 1,
+            LinearOutputLayout::ordinary, 1, vocabulary));
+
+    const session_detail::MlpWorkspaceRequirements& mlp =
+            plan.workspace.mlp_requirements;
+    const WorkspaceRequirements mlp_total = mlp.total();
+    std::size_t cursor = 0;
+    for (std::size_t branch = 0; branch < plan.workspace.qkv_requirements.size();
+         ++branch) {
+        reserve_slice(cursor, plan.workspace.qkv_offsets[branch],
+                      plan.workspace.qkv_requirements[branch],
+                      "TinyLlama forward QKV workspace overflows");
+    }
+    reserve_slice(cursor, plan.workspace.attention_offset,
+                  plan.workspace.attention_requirement,
+                  "TinyLlama forward attention workspace overflows");
+    reserve_slice(cursor, plan.workspace.mlp_offset, mlp_total,
+                  "TinyLlama forward MLP workspace overflows");
+    reserve_slice(cursor, plan.workspace.sequential_offset,
+                  plan.workspace.sequential_requirement,
+                  "TinyLlama forward sequential workspace overflows");
+    if (cursor == 0) {
+        plan.workspace.total = {0, 1};
+    } else {
+        plan.workspace.total = {
+                cursor,
+                std::max(
+                        {kBaseWorkspaceAlignment,
+                         plan.workspace.qkv_requirements[0].alignment,
+                         plan.workspace.qkv_requirements[1].alignment,
+                         plan.workspace.qkv_requirements[2].alignment,
+                         plan.workspace.attention_requirement.alignment,
+                         mlp_total.alignment,
+                         plan.workspace.sequential_requirement.alignment})};
+    }
+    return plan;
 }
 
 void validate_workspace_owner(
@@ -2311,6 +2631,309 @@ void run_decoder_layer_forward(
     } catch (...) {
         state.failed = true;
         throw;
+    }
+}
+
+namespace {
+
+void encode_token_ids(
+        std::span<const std::size_t> source, std::size_t vocabulary,
+        std::span<std::uint32_t> destination) {
+    if (source.empty() || source.size() != destination.size()) {
+        throw std::invalid_argument(
+                "TinyLlama forward token sequence has invalid length");
+    }
+    static_cast<void>(checked_mul(
+            source.size(), sizeof(std::uint32_t),
+            "TinyLlama forward token upload bytes overflow"));
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        if (source[index] >= vocabulary) {
+            throw std::invalid_argument(
+                    "TinyLlama forward token index exceeds vocabulary");
+        }
+        destination[index] = static_cast<std::uint32_t>(source[index]);
+    }
+}
+
+[[nodiscard]] RawWorkspaceView forward_workspace_slice(
+        const RequestState& request, std::size_t offset,
+        WorkspaceRequirements requirement) {
+    if (requirement.bytes == 0) return RawWorkspaceView{};
+    if (!request.operation_workspace) {
+        throw std::logic_error(
+                "TinyLlama forward workspace owner is missing");
+    }
+    return request.operation_workspace->view().subrange(
+            offset, requirement.bytes);
+}
+
+[[nodiscard]] DecoderLayerForwardWorkspace forward_layer_workspace(
+        const Device& device, const RequestState& request,
+        const ForwardPlan& plan) {
+    const ForwardWorkspaceLayout& layout = plan.workspace;
+    const QkvRopeStageWorkspace qkv{
+            forward_workspace_slice(
+                    request, layout.qkv_offsets[0],
+                    layout.qkv_requirements[0]),
+            forward_workspace_slice(
+                    request, layout.qkv_offsets[1],
+                    layout.qkv_requirements[1]),
+            forward_workspace_slice(
+                    request, layout.qkv_offsets[2],
+                    layout.qkv_requirements[2])};
+    const RawWorkspaceView attention = forward_workspace_slice(
+            request, layout.attention_offset,
+            layout.attention_requirement);
+    const WorkspaceRequirements mlp_total =
+            layout.mlp_requirements.total();
+    const RawWorkspaceView mlp_range = forward_workspace_slice(
+            request, layout.mlp_offset, mlp_total);
+    const MlpWorkspace mlp = resolve_mlp_workspace(
+            device, layout.mlp_requirements, mlp_range);
+    return DecoderLayerForwardWorkspace{qkv, attention, mlp};
+}
+
+
+}  // namespace
+
+void SessionAccess::prepare_forward_request(
+        TinyLlamaSession& session, std::size_t run_length) {
+    TinyLlamaSession::Impl& impl = *session.impl_;
+    if (run_length == 0) {
+        throw std::invalid_argument(
+                "TinyLlama forward request length must be nonzero");
+    }
+    if (run_length > impl.config().max_position_embeddings) {
+        throw std::invalid_argument(
+                "TinyLlama forward request exceeds model context");
+    }
+    if (impl.poisoned) {
+        throw std::logic_error("TinyLlama session is poisoned");
+    }
+    validate_vector_capacity<std::uint32_t>(run_length);
+    validate_vector_capacity<std::size_t>(
+            impl.config().max_position_embeddings);
+    const TokenSelectorScratchRequirements selector_requirements =
+            impl.selector->scratch_requirements(
+                    impl.logits->view(), impl.config().vocab_size);
+    validate_workspace_requirement(
+            selector_requirements.device, "selector device");
+    validate_vector_capacity<std::byte>(selector_requirements.host_bytes);
+
+    // Drain the previous request before any replacement owner or query is
+    // published.  A failed drain leaves the old request and poison state
+    // intact, exactly as the public resource setup boundary promises.
+    impl.drain_request();
+
+    auto candidate = std::make_unique<RequestState>();
+    candidate->run_length = run_length;
+    candidate->banks = allocate_run_banks(
+            *impl.device, impl.config(), run_length);
+    candidate->prefill_indices.resize(run_length);
+    candidate->history.reserve(impl.config().max_position_embeddings);
+    candidate->results.reserve(impl.config().max_position_embeddings);
+    const std::size_t per_run = checked_add(
+            checked_mul(
+                    impl.config().num_hidden_layers, kAcceptedOidsPerLayer,
+                    "TinyLlama forward accepted-OID capacity overflows"),
+            kAcceptedOidBase,
+            "TinyLlama forward accepted-OID capacity overflows");
+    const std::size_t oid_capacity = checked_mul(
+            impl.config().max_position_embeddings, per_run,
+            "TinyLlama forward accepted-OID capacity overflows");
+    validate_vector_capacity<oid>(oid_capacity);
+    candidate->accepted_oids.reserve(oid_capacity);
+
+    ForwardPlan plan = make_forward_plan(
+            *impl.model, candidate->banks, impl.fixed, impl.logits->view(),
+            impl.caches, *impl.queue, run_length);
+    candidate->forward =
+            std::make_unique<ForwardPlan>(std::move(plan));
+
+    const WorkspaceRequirements operation =
+            candidate->forward->workspace.total;
+    validate_workspace_requirement(operation, "operation");
+    if (operation.bytes != 0) {
+        candidate->operation_workspace =
+                impl.device->create_workspace(operation.bytes);
+        validate_workspace_owner(
+                candidate->operation_workspace.get(), *impl.device, operation,
+                "operation");
+    }
+    candidate->selector_host_scratch.resize(
+            selector_requirements.host_bytes);
+    if (selector_requirements.device.bytes != 0) {
+        candidate->selector_device_scratch = impl.device->create_workspace(
+                selector_requirements.device.bytes);
+        validate_workspace_owner(
+                candidate->selector_device_scratch.get(), *impl.device,
+                selector_requirements.device, "selector device");
+    }
+    impl.validate_scratch(*candidate, operation, selector_requirements);
+    impl.reset_cache_prefix();
+    impl.request = std::move(candidate);
+}
+
+ForwardResult SessionAccess::forward_prefill(
+        TinyLlamaSession& session, std::span<const std::size_t> token_ids) {
+    TinyLlamaSession::Impl& impl = *session.impl_;
+    impl.require_request();
+    RequestState& request = *impl.request;
+    if (token_ids.size() != request.run_length) {
+        throw std::invalid_argument(
+                "TinyLlama forward prefill length does not match setup");
+    }
+    encode_token_ids(
+            token_ids, impl.config().vocab_size,
+            std::span<std::uint32_t>(request.prefill_indices));
+    try {
+        const RawWorkspaceView sequential = forward_workspace_slice(
+                request, request.forward->workspace.sequential_offset,
+                request.forward->workspace.sequential_requirement);
+        request.banks.token_indices->view().copy_from_host(
+                std::as_bytes(std::span<const std::uint32_t>(
+                        request.prefill_indices)),
+                sequential);
+        const oid embedding = SessionAccess::submit(
+                session, [&](DeviceOps& operations) {
+                    return operations.embedding(
+                            impl.model->weight(0),
+                            request.banks.token_indices->view(),
+                            request.banks.x->view(), sequential);
+                });
+        std::span<const oid> readiness(&embedding, 1);
+        for (std::size_t layer_index = 0;
+             layer_index < request.forward->layers.size(); ++layer_index) {
+            ForwardLayerPlan& layer =
+                    request.forward->layers[layer_index];
+            CacheOwner& cache = impl.caches[layer_index];
+            layer.prefill_params.a = 0;
+            layer.prefill.attention.a = 0;
+            DecoderLayerForwardState state{
+                    cache.initialized_length, false};
+            const DecoderLayerForwardWorkspace workspace =
+                    forward_layer_workspace(
+                            *impl.device, request, *request.forward);
+            run_decoder_layer_forward(
+                    *impl.queue, layer.prefill, layer.prefill_params,
+                    workspace, readiness, state);
+            cache.initialized_length = state.initialized_length;
+            readiness = {};
+        }
+
+        const oid final_norm = SessionAccess::submit(
+                session, [&](DeviceOps& operations) {
+                    return operations.rmsnorm(
+                            final_layer_output(
+                                    request.banks,
+                                    impl.config().num_hidden_layers),
+                            impl.model->weight(1),
+                            request.banks.final_norm->view(),
+                            impl.config().rms_norm_eps, sequential);
+                });
+        SessionAccess::wait(session, final_norm);
+        const oid producer = SessionAccess::submit(
+                session, [&](DeviceOps& operations) {
+                    return operations.linear(
+                            request.banks.final_norm->view(),
+                            impl.model->weight(2), impl.logits->view(),
+                            request.run_length - 1, 1,
+                            LinearOutputLayout::ordinary, 1,
+                            impl.config().vocab_size, sequential);
+                });
+        return ForwardResult{&impl.logits->view(), producer};
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        impl.poisoned = true;
+        try { impl.drain_request(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+}
+
+ForwardResult SessionAccess::forward_decode(
+        TinyLlamaSession& session, std::size_t token_id) {
+    TinyLlamaSession::Impl& impl = *session.impl_;
+    impl.require_request();
+    RequestState& request = *impl.request;
+    if (token_id >= impl.config().vocab_size) {
+        throw std::invalid_argument(
+                "TinyLlama forward decode token exceeds vocabulary");
+    }
+    if (impl.caches.empty()) {
+        throw std::logic_error("TinyLlama forward session has no layers");
+    }
+    const std::size_t position = impl.caches.front().initialized_length;
+    if (position >= impl.config().max_position_embeddings) {
+        throw std::invalid_argument(
+                "TinyLlama forward decode exceeds cache capacity");
+    }
+    for (const CacheOwner& cache : impl.caches) {
+        if (cache.initialized_length != position) {
+            throw std::logic_error(
+                    "TinyLlama forward layer caches have different prefixes");
+        }
+    }
+    request.decode_index = static_cast<std::uint32_t>(token_id);
+    try {
+        const RawWorkspaceView sequential = forward_workspace_slice(
+                request, request.forward->workspace.sequential_offset,
+                request.forward->workspace.sequential_requirement);
+        impl.fixed.token_indices->view().copy_from_host(
+                std::as_bytes(std::span<const std::uint32_t>(
+                        &request.decode_index, 1)),
+                sequential);
+        const oid embedding = SessionAccess::submit(
+                session, [&](DeviceOps& operations) {
+                    return operations.embedding(
+                            impl.model->weight(0),
+                            impl.fixed.token_indices->view(),
+                            impl.fixed.x->view(), sequential);
+                });
+        std::span<const oid> readiness(&embedding, 1);
+        for (std::size_t layer_index = 0;
+             layer_index < request.forward->layers.size(); ++layer_index) {
+            ForwardLayerPlan& layer =
+                    request.forward->layers[layer_index];
+            CacheOwner& cache = impl.caches[layer_index];
+            layer.decode_params.a = position;
+            layer.decode.attention.a = position;
+            DecoderLayerForwardState state{
+                    cache.initialized_length, false};
+            const DecoderLayerForwardWorkspace workspace =
+                    forward_layer_workspace(
+                            *impl.device, request, *request.forward);
+            run_decoder_layer_forward(
+                    *impl.queue, layer.decode, layer.decode_params,
+                    workspace, readiness, state);
+            cache.initialized_length = state.initialized_length;
+            readiness = {};
+        }
+
+        const oid final_norm = SessionAccess::submit(
+                session, [&](DeviceOps& operations) {
+                    return operations.rmsnorm(
+                            final_layer_output(
+                                    impl.fixed,
+                                    impl.config().num_hidden_layers),
+                            impl.model->weight(1),
+                            impl.fixed.final_norm->view(),
+                            impl.config().rms_norm_eps, sequential);
+                });
+        SessionAccess::wait(session, final_norm);
+        const oid producer = SessionAccess::submit(
+                session, [&](DeviceOps& operations) {
+                    return operations.linear(
+                            impl.fixed.final_norm->view(),
+                            impl.model->weight(2), impl.logits->view(), 0, 1,
+                            LinearOutputLayout::ordinary, 1,
+                            impl.config().vocab_size, sequential);
+                });
+        return ForwardResult{&impl.logits->view(), producer};
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        impl.poisoned = true;
+        try { impl.drain_request(); } catch (...) {}
+        std::rethrow_exception(failure);
     }
 }
 
