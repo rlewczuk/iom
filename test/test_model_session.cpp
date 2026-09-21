@@ -992,13 +992,15 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK_EQ(SessionAccess::caches(*observed)[0].initialized_length,
              SessionAccess::caches(*plain)[0].initialized_length);
 
-    // The attachment alone adds no clock read and no observation to the
-    // generation path: only the load interval was measured.
+    // The attachment adds no clock read to the generation path: only the load
+    // interval was measured. Request publication is the one point that
+    // advances the admitted ordinal, so the completed generation is admitted
+    // through the same bridge as every other published request.
     CHECK_EQ(clock.cursor, 2);
     CHECK_FALSE(clock.exhausted);
     CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 60);
-    CHECK_EQ(recorder.snapshot().admitted.ordinal, 0);
-    CHECK_FALSE(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK(recorder.snapshot().request_admitted);
     CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
     CHECK(recorder.operations().empty());
 
@@ -1022,7 +1024,7 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK(failing_observed->poisoned());
     CHECK_EQ(clock.cursor, 4);
     CHECK_FALSE(clock.exhausted);
-    CHECK_EQ(recorder.snapshot().admitted.ordinal, 0);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 2);
     CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
 }
 
@@ -2331,6 +2333,273 @@ TEST_CASE(
             std::runtime_error);
     CHECK(session->poisoned());
     CHECK_EQ(observer->calls, 0);
+}
+
+namespace {
+
+// Strictly increasing, non-uniform supplied instants: consecutive differences
+// grow monotonically, so a recorded phase window identifies the exact read pair
+// it observed and a window that began or ended at the wrong read cannot
+// reproduce the same difference. The supplied count is headroom: the wrapped
+// call and every sibling observation between its endpoint reads consume
+// instants, so the sequence is deliberately longer than the window asserted
+// here.
+void fill_distinct_instants(RecordingClock& clock, std::size_t count) {
+    clock.instants.resize(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        clock.instants[index] = 1'000 + 3 * index * index + 5 * index;
+    }
+}
+
+// Message of a retained observation failure, rethrown from its owned handle.
+[[nodiscard]] std::string retained_message(std::exception_ptr failure) {
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return std::string();
+}
+
+// The wrapped raw/chat attempt consumes the first three instants of its call
+// (attempt entry, encode begin, encode end); the recorded span must be exactly
+// the encode pair of that prefix.
+[[nodiscard]] std::uint64_t window_after_entry(
+        const RecordingClock& clock, std::size_t entry) {
+    return clock.instants[entry + 2] - clock.instants[entry + 1];
+}
+
+}  // namespace
+
+TEST_CASE("Inference metrics tokenization measures only the raw and chat encode span") {
+    ForwardFixture fixture("metrics-tokenization-encode", text_generation_config());
+    const iom::ChatMessageView messages[] = {
+            {"system", "x"}, {"user", "x"}, {"assistant", "x"}};
+
+    // Reference session without a recorder: the same deterministic fixture and
+    // selector plan must produce identical generation behavior.
+    RecordingClock detached;
+    fill_distinct_instants(detached, 4);
+    iom::InferenceMetrics detached_recorder(make_clock(detached));
+    auto plain_selector =
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{2, 2});
+    SequenceSelector* plain_observer = plain_selector.get();
+    auto plain = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(plain_selector));
+    REQUIRE(plain);
+    CHECK_EQ(SessionAccess::metrics(*plain), nullptr);
+    const iom::GenerationResult plain_raw = plain->generate_raw("hello", 1);
+    const iom::GenerationResult plain_chat = plain->generate_chat(messages, 1);
+    CHECK(plain_raw.token_ids == std::vector<std::size_t>{2});
+    CHECK(plain_chat.token_ids == std::vector<std::size_t>{2});
+    // Disabled observation performs no clock read and touches no recorder.
+    CHECK_EQ(detached.cursor, 0);
+    CHECK_FALSE(detached.exhausted);
+    CHECK_FALSE(detached_recorder.snapshot().request_admitted);
+
+    RecordingClock clock;
+    fill_distinct_instants(clock, 4096);
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto selector =
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{2, 2, 2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(session);
+    CHECK_EQ(recorder.snapshot().load.host_nanoseconds,
+             clock.instants[1] - clock.instants[0]);
+
+    // Raw: the wrapper's first three reads are the attempt entry, the encode
+    // begin, and the encode end, so the recorded span is exactly the encode
+    // window - never entry-to-end and never extended into generation.
+    const std::size_t raw_entry = clock.cursor;
+    const iom::GenerationResult raw = session->generate_raw("hello", 1);
+    REQUIRE(clock.cursor - raw_entry >= 3);
+    CHECK(raw.token_ids == plain_raw.token_ids);
+    CHECK(raw.text == plain_raw.text);
+    CHECK(raw.stop_reason == plain_raw.stop_reason);
+    CHECK(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK(recorder.snapshot().admitted.tokenization.state
+          == iom::ObservationState::succeeded);
+    const std::uint64_t raw_span = window_after_entry(clock, raw_entry);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, raw_span);
+
+    // Multi-message chat: rendering completes before the measured begin, and
+    // the second admission replaces the span instead of accumulating it.
+    const std::size_t chat_entry = clock.cursor;
+    const iom::GenerationResult chat = session->generate_chat(messages, 1);
+    REQUIRE(clock.cursor - chat_entry >= 3);
+    CHECK(chat.token_ids == plain_chat.token_ids);
+    CHECK(chat.text == plain_chat.text);
+    CHECK(chat.stop_reason == plain_chat.stop_reason);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 2);
+    CHECK(recorder.snapshot().admitted.tokenization.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds,
+             window_after_entry(clock, chat_entry));
+
+    // The encoded history and the KV prefix are identical with probes on/off.
+    REQUIRE_EQ(observer->histories.size(), 2);
+    REQUIRE_EQ(plain_observer->histories.size(), 2);
+    CHECK(observer->histories[0] == plain_observer->histories[0]);
+    CHECK(observer->histories[1] == plain_observer->histories[1]);
+    CHECK(observer->histories[0] == std::vector<std::size_t>{1, 268});
+    CHECK_EQ(session->request_length(), plain->request_length());
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length,
+             SessionAccess::caches(*plain)[0].initialized_length);
+    CHECK_FALSE(session->poisoned());
+
+    // A direct low-level request never inherits raw/chat tokenization: the
+    // publication bridge clears the admitted span and no wrapper is involved.
+    const std::vector<std::size_t> prompt{0, 1};
+    const iom::TokenGenerationResult direct = session->generate_tokens(prompt, 1);
+    CHECK(direct.token_ids == std::vector<std::size_t>{2});
+    CHECK(direct.stop_reason == iom::GenerationStopReason::eos);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 3);
+    CHECK(recorder.snapshot().admitted.tokenization.state
+          == iom::ObservationState::not_run);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, 0);
+}
+
+TEST_CASE("Inference metrics tokenization attributes preprocessing failures to their own attempt") {
+    ForwardFixture fixture("metrics-tokenization-failures",
+                           text_generation_config());
+    RecordingClock clock;
+    fill_distinct_instants(clock, 4096);
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto selector =
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{2, 2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(session);
+
+    // Request 1 is admitted with its own measured span.
+    const std::size_t first_entry = clock.cursor;
+    const iom::GenerationResult first = session->generate_raw("hello", 1);
+    CHECK(first.token_ids == std::vector<std::size_t>{2});
+    REQUIRE(recorder.snapshot().request_admitted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    const std::uint64_t first_span = window_after_entry(clock, first_entry);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, first_span);
+    const std::size_t calls_after_first = observer->calls;
+    const std::size_t accepted_after_first =
+            SessionAccess::accepted(*session).size();
+    const std::size_t length_after_first = session->request_length();
+    REQUIRE_EQ(calls_after_first, 1);
+
+    // Encoder failure: the encoder itself was observed, so the attempt failed
+    // after a captured encode window, while request 1 keeps its own span.
+    std::string invalid_utf8(2, '\0');
+    invalid_utf8[0] = static_cast<char>(0xC3);
+    invalid_utf8[1] = static_cast<char>(0x28);
+    const std::size_t encoder_entry = clock.cursor;
+    CHECK_THROWS_AS(session->generate_raw(invalid_utf8, 1),
+                    std::invalid_argument);
+    CHECK_EQ(clock.cursor - encoder_entry, 3);
+    CHECK_FALSE(clock.exhausted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK(recorder.snapshot().admitted.tokenization.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, first_span);
+    CHECK_EQ(recorder.snapshot().attempt.ordinal, 2);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::failed);
+    CHECK_MESSAGE(
+            retained_message(recorder.snapshot().attempt.failure)
+                            .find("invalid UTF-8") != std::string::npos,
+            retained_message(recorder.snapshot().attempt.failure));
+    CHECK_EQ(observer->calls, calls_after_first);
+    CHECK_EQ(SessionAccess::accepted(*session).size(), accepted_after_first);
+    CHECK_EQ(session->request_length(), length_after_first);
+    CHECK_FALSE(session->poisoned());
+
+    // Formatter rejection: a distinct failed attempt that never reached the
+    // encoder, so it reads no encode instants and records no tokenization.
+    const iom::ChatMessageView invalid_role[] = {{"User", "hello"}};
+    const std::size_t formatter_entry = clock.cursor;
+    CHECK_THROWS_AS(session->generate_chat(invalid_role, 1),
+                    std::invalid_argument);
+    CHECK_EQ(clock.cursor - formatter_entry, 1);
+    CHECK_FALSE(clock.exhausted);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK(recorder.snapshot().admitted.tokenization.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, first_span);
+    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::failed);
+    CHECK_MESSAGE(
+            retained_message(recorder.snapshot().attempt.failure)
+                            .find("requires the role string")
+                    != std::string::npos,
+            retained_message(recorder.snapshot().attempt.failure));
+    CHECK_EQ(observer->calls, calls_after_first);
+    CHECK_EQ(session->request_length(), length_after_first);
+    CHECK_FALSE(session->poisoned());
+
+    // Recovery replaces the admitted span with the new request's own window.
+    const std::size_t recovered_entry = clock.cursor;
+    const iom::GenerationResult recovered = session->generate_raw("hello", 1);
+    CHECK(recovered.token_ids == std::vector<std::size_t>{2});
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 2);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds,
+             window_after_entry(clock, recovered_entry));
+    CHECK_EQ(observer->calls, calls_after_first + 1);
+}
+
+TEST_CASE("Inference metrics tokenization preserves prior attribution across a failed drain") {
+    ForwardFixture fixture("metrics-tokenization-drain", text_generation_config());
+    RecordingClock clock;
+    fill_distinct_instants(clock, 4096);
+    iom::InferenceMetrics recorder(make_clock(clock));
+    auto selector =
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{2, 2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(session);
+
+    const std::size_t first_entry = clock.cursor;
+    const iom::GenerationResult first = session->generate_raw("hello", 1);
+    CHECK(first.token_ids == std::vector<std::size_t>{2});
+    REQUIRE(recorder.snapshot().request_admitted);
+    const std::uint64_t first_span = window_after_entry(clock, first_entry);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, first_span);
+    const std::size_t length_after_first = session->request_length();
+    const std::size_t calls_after_first = observer->calls;
+
+    // A pending accepted append that fails at its wait: the replacement's drain
+    // reports the queue's original failure instead of publishing anything.
+    const auto& banks = SessionAccess::prefill(*session);
+    const auto caches = SessionAccess::caches(*session);
+    std::vector<std::byte> bytes(banks.k->view().spec().logical_nbytes(),
+                                 std::byte{0});
+    banks.k->view().copy_from_host(bytes);
+    banks.v->view().copy_from_host(bytes);
+    {
+        struct ResetFailure {
+            ~ResetFailure() { iom::cpu_detail::clear_cache_append_failure(); }
+        } failure;
+        iom::cpu_detail::arm_cache_append_failure();
+        SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+            return queue.cache_append(banks.k->view(), caches[0].key->view(), 0);
+        });
+        const std::size_t drain_entry = clock.cursor;
+        CHECK_THROWS_AS(session->generate_raw("hello", 1), std::runtime_error);
+        // The rejected candidate's encode window was measured but never
+        // attributed: the failed drain precedes publication.
+        CHECK(clock.cursor - drain_entry >= 3);
+    }
+
+    CHECK(session->poisoned());
+    CHECK_EQ(session->request_length(), length_after_first);
+    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
+    CHECK(recorder.snapshot().admitted.tokenization.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(recorder.snapshot().admitted.tokenization.host_nanoseconds, first_span);
+    CHECK_EQ(observer->calls, calls_after_first);
 }
 
 TEST_CASE("TinyLlama text chat generation composes raw tokenizer input") {
