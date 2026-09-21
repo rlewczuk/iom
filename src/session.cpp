@@ -1,12 +1,16 @@
 #include "session_internal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <new>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include "iom/device.hpp"
@@ -475,6 +479,470 @@ void run_mlp_stage(DeviceOps& operations, MlpStageViews& views,
     if (!spool.accept(residual)) spool.publish();
     spool.wait(operations, residual);
     if (spool.failed()) spool.publish();
+}
+
+/*
+ * Private TinyLlama session implementation.
+ *
+ * This translation unit owns the numerical stages of the session forward
+ * path. Every stage is a private, allocation-free helper over caller-owned
+ * views, the session's single `DeviceOps` queue, supplied parameters, and
+ * caller-owned workspace; nothing here creates a public stage API, a graph,
+ * a scheduler, or an owner.
+ */
+
+namespace {
+
+    using detail::UnsupportedOperation;
+    using detail::checked_add;
+    using detail::checked_mul;
+
+    // Supplied head-planar geometry `[H,R,D]` of one rank-three view.
+    struct HeadPlane {
+        std::size_t heads = 0;
+        std::size_t rows = 0;
+        std::size_t features = 0;
+    };
+
+    // Supplied matrix geometry `[R,F]` of one rank-two view.
+    struct Matrix {
+        std::size_t rows = 0;
+        std::size_t features = 0;
+    };
+
+    // Checked stage facts derived before any submission.
+    struct CheckedStage {
+        std::size_t merged_width = 0;
+        std::size_t initialized_length = 0;
+    };
+
+    // One supplied view of the stage, with the role name used in rejection
+    // text and whether the stage writes it.
+    struct StageOwnership {
+        const TensorView* view;
+        const char* role;
+        bool store;
+    };
+
+    [[noreturn]] void reject(
+            std::string_view role, std::string_view requirement) {
+        throw std::invalid_argument(
+                "cache attention stage " + std::string(role) + " "
+                + std::string(requirement));
+    }
+
+    /**
+     * Stage-wide conservative storage disjointness. The K/V cache appends,
+     * SDPA, the output projection, and the first residual run in sequence over
+     * the supplied views, so a store sharing storage with another supplied
+     * view can destroy a value that an earlier or later phase still needs: V
+     * rows would overwrite the K cache, the merged attention would overwrite
+     * the residual input, and so on. Every store must therefore live in
+     * distinct owner storage from every other supplied view, which is the same
+     * conservative owner-overlap policy the operation facades apply locally.
+     * Read/read aliasing stays legal, exactly as those contracts allow.
+     */
+    void require_distinct_stores(
+            const std::array<StageOwnership, 10>& views) {
+        for (std::size_t first = 0; first < views.size(); ++first) {
+            for (std::size_t second = first + 1; second < views.size();
+                 ++second) {
+                if (!views[first].store && !views[second].store) continue;
+                if (views[first].view->owner_identity()
+                        != views[second].view->owner_identity()) {
+                    continue;
+                }
+                reject(views[first].role,
+                       std::string("must not share owner storage with the ")
+                               + views[second].role);
+            }
+        }
+    }
+
+    [[nodiscard]] const TensorSpec& require_bf16(
+            const Device& device, const TensorView& view,
+            std::string_view role) {
+        if (&view.device() != &device) {
+            reject(role, "belongs to a different device");
+        }
+        const TensorSpec& spec = view.spec();
+        if (spec.data_type != DataType::BF16
+                || spec.quantization != QuantizationFormat::NONE) {
+            reject(role, "must be an unquantized BF16 tensor");
+        }
+        return spec;
+    }
+
+    [[nodiscard]] HeadPlane require_heads(
+            const Device& device, const TensorView& view,
+            std::string_view role) {
+        const std::span<const std::size_t> dimensions =
+                require_bf16(device, view, role).shape.dimensions();
+        if (dimensions.size() != 3) {
+            reject(role, "must have rank three");
+        }
+        return {dimensions[0], dimensions[1], dimensions[2]};
+    }
+
+    [[nodiscard]] Matrix require_matrix(
+            const Device& device, const TensorView& view,
+            std::string_view role) {
+        const std::span<const std::size_t> dimensions =
+                require_bf16(device, view, role).shape.dimensions();
+        if (dimensions.size() != 2) {
+            reject(role, "must have rank two");
+        }
+        return {dimensions[0], dimensions[1]};
+    }
+
+    /**
+     * Checked request admission. Everything here is derived from supplied
+     * values and borrowed view metadata, so a rejection happens before the
+     * stage submits an operation, mutates a cache row, or publishes a
+     * length.
+     */
+    [[nodiscard]] CheckedStage validate_stage(
+            const DeviceOps& ops, const CacheAttentionStageRequest& request,
+            const CacheAttentionStageState& state) {
+        if (state.failed) {
+            throw std::logic_error(
+                    "cache attention stage refuses a failed session state");
+        }
+        if (request.R == 0) {
+            throw std::invalid_argument(
+                    "cache attention stage requires nonzero rows");
+        }
+        if (request.C == 0) {
+            throw std::invalid_argument(
+                    "cache attention stage requires a nonzero cache "
+                    "capacity");
+        }
+        // The order is contractual: the capacity relation is established
+        // before `a+R` is formed, so the sum can never wrap.
+        if (request.a > request.C) {
+            throw std::invalid_argument(
+                    "cache attention stage offset exceeds the cache "
+                    "capacity");
+        }
+        const std::size_t initialized_length = checked_add(
+                request.a, request.R,
+                "cache attention stage initialized length overflows");
+        if (initialized_length > request.C) {
+            throw std::invalid_argument(
+                    "cache attention stage rows exceed the cache capacity");
+        }
+        if (state.initialized_length != request.a) {
+            throw std::invalid_argument(
+                    "cache attention stage offset must continue the "
+                    "published cache prefix");
+        }
+
+        const Device& device = ops.device();
+        const HeadPlane q =
+                require_heads(device, request.rotated_q, "rotated Q");
+        const std::size_t merged_width = checked_mul(
+                q.heads, q.features,
+                "cache attention stage merged attention width overflows");
+        if (merged_width == 0) {
+            reject("rotated Q", "must have nonzero head and feature extents");
+        }
+        if (q.rows != request.R) {
+            reject("rotated Q", "must have exactly R rows");
+        }
+
+        const HeadPlane k =
+                require_heads(device, request.rotated_k, "rotated K");
+        const HeadPlane v =
+                require_heads(device, request.rotated_v, "rotated V");
+        if (k.heads != v.heads || k.rows != v.rows
+                || k.features != v.features) {
+            reject("rotated K",
+                   "and rotated V must share head, row, and feature "
+                   "extents");
+        }
+        const std::size_t kv_width = checked_mul(
+                k.heads, k.features,
+                "cache attention stage K/V merge width overflows");
+        if (kv_width == 0) {
+            reject("rotated K/V", "must have nonzero head and feature extents");
+        }
+        if (k.rows != request.R) {
+            reject("rotated K/V", "must have exactly R rows");
+        }
+        if (k.features != q.features) {
+            reject("rotated K/V", "must use the query head width");
+        }
+        if (q.heads % k.heads != 0) {
+            reject("rotated Q",
+                   "head count must be a multiple of the KV head count");
+        }
+
+        // Distinct append boundaries: each cache keeps its own owner,
+        // head geometry, feature width, and capacity row extent.
+        const HeadPlane k_cache =
+                require_heads(device, request.k_cache, "K cache");
+        const HeadPlane v_cache =
+                require_heads(device, request.v_cache, "V cache");
+        if (k_cache.heads != v_cache.heads
+                || k_cache.rows != v_cache.rows
+                || k_cache.features != v_cache.features) {
+            reject("K cache",
+                   "and V cache must share head, row, and feature extents");
+        }
+        if (k_cache.rows != request.C) {
+            reject("K cache",
+                   "row extent must equal the supplied cache capacity");
+        }
+        if (k_cache.heads != k.heads
+                || k_cache.features != k.features) {
+            reject("K cache", "geometry must match the appended K/V rows");
+        }
+
+        const Matrix input =
+                require_matrix(device, request.residual_input,
+                               "residual input");
+        if (input.rows != request.R || input.features != merged_width) {
+            reject("residual input", "must be [R,F]");
+        }
+        const Matrix weight =
+                require_matrix(device, request.o_weight, "output weight");
+        if (weight.rows != merged_width
+                || weight.features != merged_width) {
+            reject("output weight", "must be [F,F]");
+        }
+        const Matrix merged =
+                require_matrix(device, request.attention_merged,
+                               "merged attention");
+        if (merged.rows != request.R || merged.features != merged_width) {
+            reject("merged attention", "must be [R,F]");
+        }
+        const Matrix projected =
+                require_matrix(device, request.attention_output,
+                               "attention output");
+        if (projected.rows != request.R
+                || projected.features != merged_width) {
+            reject("attention output", "must be [R,F]");
+        }
+        const Matrix residual =
+                require_matrix(device, request.residual_output,
+                               "residual output");
+        if (residual.rows != request.R
+                || residual.features != merged_width) {
+            reject("residual output", "must be [R,F]");
+        }
+
+        // Every supplied view carries its stage role and whether the stage
+        // writes it. Both caches are stores, so distinct K and V owners are
+        // enforced here rather than by the individual append facades, and the
+        // same check rejects every cross-phase alias that would let a later
+        // store destroy an earlier input (for example the merged attention
+        // overwriting the residual input before the closing residual).
+        require_distinct_stores(std::array<StageOwnership, 10>{{
+                {&request.rotated_q, "rotated Q", false},
+                {&request.rotated_k, "rotated K", false},
+                {&request.rotated_v, "rotated V", false},
+                {&request.k_cache, "K cache", true},
+                {&request.v_cache, "V cache", true},
+                {&request.residual_input, "residual input", false},
+                {&request.o_weight, "output weight", false},
+                {&request.attention_merged, "merged attention", true},
+                {&request.attention_output, "attention output", true},
+                {&request.residual_output, "residual output", true}}});
+
+        return {merged_width, initialized_length};
+    }
+
+    /**
+     * Mirrors the facade's synchronous error mapping so a rejected
+     * submission surfaces through the established exception categories
+     * instead of a bare negative token.
+     */
+    [[noreturn]] void throw_oid_failure(
+            oid value, std::string_view role) {
+        if (!oid_is_error(value)) {
+            throw std::logic_error(
+                    "cache attention stage received a non-error oid");
+        }
+        const std::string what =
+                "cache attention stage " + std::string(role);
+        switch (static_cast<OidError>(value)) {
+            case OidError::InvalidArgument:
+                throw std::invalid_argument(
+                        what + " rejected its operands");
+            case OidError::Unsupported:
+                throw UnsupportedOperation();
+            case OidError::Overflow:
+                throw std::overflow_error(what + " overflowed");
+            case OidError::ResourceExhausted:
+                throw std::bad_alloc();
+            case OidError::DeviceError:
+                throw std::runtime_error(what + " failed on its device");
+            case OidError::InternalError:
+                break;
+        }
+        throw std::runtime_error(what + " failed internally");
+    }
+
+    [[nodiscard]] std::exception_ptr oid_failure(
+            oid value, std::string_view role) noexcept {
+        try {
+            throw_oid_failure(value, role);
+        } catch (...) {
+            return std::current_exception();
+        }
+    }
+
+    /**
+     * Waits one submitted step and returns its first failure without
+     * throwing, so a caller can record one failure and still complete
+     * every remaining mandatory wait.
+     */
+    [[nodiscard]] std::exception_ptr completed(
+            DeviceOps& ops, oid token, std::string_view role) noexcept {
+        if (oid_is_error(token)) {
+            return oid_failure(token, role);
+        }
+        try {
+            ops.wait(token);
+        } catch (...) {
+            return std::current_exception();
+        }
+        return nullptr;
+    }
+
+}  // namespace
+
+void run_cache_attention_stage(
+        DeviceOps& ops, CacheAttentionStageRequest& request,
+        RawWorkspaceView workspace, CacheAttentionStageState& state) {
+    const CheckedStage stage = validate_stage(ops, request, state);
+
+    // Every downstream operation is preflighted with its actual operands
+    // and scratch before the first submission. SDPA, the output projection,
+    // and the first residual are three strictly sequential consumers of one
+    // caller-owned range, so that range must satisfy the largest of their
+    // queried requirements: a backend whose projection or residual needs
+    // positive staging rejects an insufficient range here, before any cache
+    // row is written or a prefix is published.
+    const WorkspaceRequirements sdpa_requirement =
+            ops.sdpa_workspace_requirements(
+                    request.rotated_q, request.k_cache, request.v_cache,
+                    request.attention_merged, request.a,
+                    stage.initialized_length);
+    const WorkspaceRequirements projection_requirement =
+            ops.linear_workspace_requirements(
+                    request.attention_merged, request.o_weight,
+                    request.attention_output, 0, request.R,
+                    LinearOutputLayout::ordinary, 1, stage.merged_width);
+    const WorkspaceRequirements residual_requirement =
+            ops.add_workspace_requirements(
+                    request.residual_input, request.attention_output,
+                    request.residual_output);
+    const WorkspaceRequirements combined_requirement{
+            std::max({sdpa_requirement.bytes, projection_requirement.bytes,
+                      residual_requirement.bytes}),
+            std::max({sdpa_requirement.alignment,
+                      projection_requirement.alignment,
+                      residual_requirement.alignment})};
+
+    // The shared validator compares the caller range against one borrowed
+    // operand at a time: its checks are pairwise, and copying a borrowed
+    // `TensorView` would allocate its plane-stride vector. Every operand
+    // read or written by those three operations is checked, so no later
+    // rejection can leave accepted append work behind.
+    const auto validate_against_operand = [&](const TensorView& operand) {
+        const TensorView* borrowed = &operand;
+        (void)detail::WorkspaceValidation::validated(
+                ops.device(), workspace, combined_requirement.bytes,
+                combined_requirement.alignment,
+                std::span<const TensorView>(borrowed, 1));
+    };
+    validate_against_operand(request.rotated_q);
+    validate_against_operand(request.k_cache);
+    validate_against_operand(request.v_cache);
+    validate_against_operand(request.attention_merged);
+    validate_against_operand(request.o_weight);
+    validate_against_operand(request.attention_output);
+    validate_against_operand(request.residual_input);
+    validate_against_operand(request.residual_output);
+
+    // An operation whose queried requirement is zero consumes no scratch
+    // and accepts only the empty default; each positive requirement gets the
+    // validated reusable range, which stays live until its own wait.
+    const RawWorkspaceView sdpa_workspace =
+            sdpa_requirement.bytes == 0 ? RawWorkspaceView{} : workspace;
+    const RawWorkspaceView projection_workspace =
+            projection_requirement.bytes == 0 ? RawWorkspaceView{}
+                                              : workspace;
+    const RawWorkspaceView residual_workspace =
+            residual_requirement.bytes == 0 ? RawWorkspaceView{}
+                                            : workspace;
+
+    // K and V have distinct cache owners and distinct OIDs. Both
+    // submissions are attempted, and both accepted OIDs are waited, even
+    // when the first result already failed.
+    std::array<oid, 2> appends{0, 0};
+    appends[0] =
+            ops.cache_append(request.rotated_k, request.k_cache, request.a);
+    appends[1] =
+            ops.cache_append(request.rotated_v, request.v_cache, request.a);
+
+    std::exception_ptr failure;
+    for (std::size_t index = 0; index < appends.size(); ++index) {
+        const std::string_view role =
+                index == 0 ? "K append" : "V append";
+        if (oid_is_error(appends[index])) {
+            if (failure == nullptr) {
+                failure = oid_failure(appends[index], role);
+            }
+            continue;
+        }
+        if (std::exception_ptr waited =
+                    completed(ops, appends[index], role);
+                waited != nullptr && failure == nullptr) {
+            failure = std::move(waited);
+        }
+    }
+    if (failure != nullptr) {
+        // A possibly written physical cache row is never rolled back,
+        // retried, or reused, and no new prefix is published.
+        state.failed = true;
+        std::rethrow_exception(failure);
+    }
+
+    // Both independent append barriers succeeded: publish exactly the
+    // checked prefix and read no cache row beyond it.
+    state.initialized_length = stage.initialized_length;
+
+    failure = completed(
+            ops,
+            ops.sdpa(
+                    request.rotated_q, request.k_cache, request.v_cache,
+                    request.attention_merged, request.a,
+                    stage.initialized_length, sdpa_workspace),
+            "SDPA");
+    if (failure == nullptr) {
+        failure = completed(
+                ops,
+                ops.linear(
+                        request.attention_merged, request.o_weight,
+                        request.attention_output, 0, request.R,
+                        LinearOutputLayout::ordinary, 1,
+                        stage.merged_width, projection_workspace),
+                "output projection");
+    }
+    if (failure == nullptr) {
+        failure = completed(
+                ops,
+                ops.add(
+                        request.residual_input, request.attention_output,
+                        request.residual_output, residual_workspace),
+                "first residual");
+    }
+    if (failure != nullptr) {
+        state.failed = true;
+        std::rethrow_exception(failure);
+    }
 }
 
 }  // namespace iom::session_detail

@@ -42,6 +42,18 @@ namespace {
 
 std::atomic<bool> silu_failure_armed{false};
 std::atomic<std::uint64_t> linear_failure_plan{0};
+std::atomic<bool> cache_append_failure_armed{false};
+
+// Wait observation state. The armed flag, the recorded accepted append
+// sequences with their one-shot waited flags, and the observation count are the
+// whole seam: no production path reads it, and nothing is recorded while a test
+// leaves the seam disarmed.
+constexpr std::size_t kObservedAppendCapacity = 8;
+std::atomic<bool> cache_append_wait_observation_armed{false};
+std::atomic<std::size_t> observed_append_sequence_count{0};
+std::atomic<std::uint64_t> observed_append_sequences[kObservedAppendCapacity]{};
+std::atomic<bool> observed_append_waited[kObservedAppendCapacity]{};
+std::atomic<std::size_t> observed_append_wait_count{0};
 
 }  // namespace
 
@@ -105,6 +117,79 @@ void clear_linear_failure() noexcept {
     }
 }
 
+// CPU-local failure construction for the cache append port. Like the SiLU and
+// SDPA latches it is one process-wide one-shot latch armed only by tests: the
+// next enqueued cache append task consumes it after acceptance and before its
+// element loop, so exactly that accepted sequence retains the failure while
+// every later submission stays healthy. A rejected submission never reaches a
+// task and therefore never consumes it.
+void arm_cache_append_failure() noexcept {
+    cache_append_failure_armed.store(true, std::memory_order_release);
+}
+
+void clear_cache_append_failure() noexcept {
+    cache_append_failure_armed.store(false, std::memory_order_release);
+}
+
+[[nodiscard]] bool consume_cache_append_failure() noexcept {
+    return cache_append_failure_armed.exchange(
+            false, std::memory_order_acq_rel);
+}
+
+// Wait observation seam. `record_observed_cache_append` runs on the submitting
+// thread for every accepted cache append while the seam is armed; the queue's
+// `fence_through_sequence` hook then reports each caller wait that observed one
+// of those sequences through a successful completion, counting a sequence once
+// even when the wait is repeated.
+void record_observed_cache_append(std::uint64_t sequence) noexcept {
+    if (!cache_append_wait_observation_armed.load(std::memory_order_acquire)) {
+        return;
+    }
+    const std::size_t index =
+            observed_append_sequence_count.load(std::memory_order_relaxed);
+    if (index >= kObservedAppendCapacity) return;
+    observed_append_sequences[index].store(sequence, std::memory_order_relaxed);
+    observed_append_waited[index].store(false, std::memory_order_relaxed);
+    observed_append_sequence_count.store(index + 1, std::memory_order_release);
+}
+
+void observe_cache_append_wait(std::uint64_t sequence) noexcept {
+    if (!cache_append_wait_observation_armed.load(std::memory_order_acquire)) {
+        return;
+    }
+    const std::size_t count =
+            observed_append_sequence_count.load(std::memory_order_acquire);
+    for (std::size_t index = 0; index < count; ++index) {
+        if (observed_append_sequences[index].load(std::memory_order_relaxed)
+                != sequence) {
+            continue;
+        }
+        if (!observed_append_waited[index].exchange(
+                    true, std::memory_order_acq_rel)) {
+            observed_append_wait_count.fetch_add(1, std::memory_order_acq_rel);
+        }
+        return;
+    }
+}
+
+void arm_cache_append_wait_observation() noexcept {
+    cache_append_wait_observation_armed.store(false, std::memory_order_release);
+    for (std::size_t index = 0; index < kObservedAppendCapacity; ++index) {
+        observed_append_waited[index].store(false, std::memory_order_relaxed);
+    }
+    observed_append_sequence_count.store(0, std::memory_order_release);
+    observed_append_wait_count.store(0, std::memory_order_release);
+    cache_append_wait_observation_armed.store(true, std::memory_order_release);
+}
+
+void clear_cache_append_wait_observation() noexcept {
+    cache_append_wait_observation_armed.store(false, std::memory_order_release);
+}
+
+[[nodiscard]] std::size_t observed_cache_append_waits() noexcept {
+    return observed_append_wait_count.load(std::memory_order_acquire);
+}
+
 }  // namespace cpu_detail
 
 
@@ -132,6 +217,14 @@ public:
         }
         device_->registry_state().registry.invalidate_entries_for_queue(
                 registry_queue_id_);
+    }
+
+    // The common wait calls this hook once it has observed completion and
+    // before it can rethrow a retained failure; the CPU queue owns no fence
+    // work here, so the override only feeds the cache append wait observation
+    // seam.
+    void fence_through_sequence(std::uint64_t sequence) noexcept override {
+        cpu_detail::observe_cache_append_wait(sequence);
     }
 
     oid copy_impl(const TensorView& source, TensorView& destination) override {
@@ -192,10 +285,16 @@ public:
                         const CacheAppendRequest& captured,
                         detail::BinaryEntryRegistration entries) {
                     try {
+                        cpu_detail::record_observed_cache_append(sequence);
                         enqueue(HostTask{
                                 [this, sequence, captured, entries] {
                                     std::exception_ptr failure;
                                     try {
+                                        if (cpu_detail::consume_cache_append_failure()) {
+                                            throw std::runtime_error(
+                                                    "CPU cache append injected "
+                                                    "post-acceptance failure");
+                                        }
                                         cache_append_elements(captured);
                                     } catch (...) {
                                         failure = std::current_exception();

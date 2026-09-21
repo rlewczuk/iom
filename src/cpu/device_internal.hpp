@@ -86,6 +86,25 @@ void arm_sdpa_failure() noexcept;
 void clear_sdpa_failure() noexcept;
 [[nodiscard]] bool consume_sdpa_failure() noexcept;
 
+// CPU-local failure construction for the cache append port, with the same
+// one-shot semantics as the SDPA and SiLU latches: the next enqueued cache
+// append task consumes it after acceptance and before its element loop.
+void arm_cache_append_failure() noexcept;
+void clear_cache_append_failure() noexcept;
+[[nodiscard]] bool consume_cache_append_failure() noexcept;
+
+// Narrow test observation seam for the cache append wait contract. While it is
+// armed, the sequence of every accepted cache append is recorded and each
+// caller wait that observes one of those sequences through a successful
+// completion is counted once. A focused test can then prove that an accepted
+// append OID was waited before the submitting stage returned, which row
+// contents alone cannot show. The seam carries no other state and is inert
+// until a test arms it.
+void arm_cache_append_wait_observation() noexcept;
+void clear_cache_append_wait_observation() noexcept;
+void observe_cache_append_wait(std::uint64_t sequence) noexcept;
+[[nodiscard]] std::size_t observed_cache_append_waits() noexcept;
+
 }  // namespace cpu_detail
 
 class CpuDevice final : public Device {
