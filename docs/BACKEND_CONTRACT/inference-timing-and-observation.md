@@ -106,6 +106,47 @@ adapter.
    no backend-kind switch, no native timer or event adapter, and make no
    device-duration or kernel-time claim.
 
+## Prefill observation
+
+1. Prefill is one completion-observed span per request that submits a
+   prefill forward. The begin instant is read immediately before the
+   existing prefill forward submission and the end instant is read
+   immediately after the already-required initial final-logits readiness
+   wait for that forward's producer, which is the session's existing
+   pre-history boundary: the wait precedes history publication and the
+   selector. The forward method already contains its own correctness waits,
+   so the span deliberately includes them and is never host-enqueue-only
+   time; the per-facade host-enqueue sum of the `Submission attribution and
+   host enqueue` formula is a separate observation and is neither
+   implemented nor required by prefill completion observation.
+2. The attribute value is written to the admitted request observation the
+   request-publication bridge established for the request that submits the
+   forward. Prefill observation adds no ordinal, attempt, or publication
+   logic of its own, and it never advances, clears, or rewrites the
+   published identity or the operation rows.
+3. A prefill forward or readiness-wait failure records the incomplete
+   attempt as `failed` with no duration at the catch and rethrows the
+   original exception category unchanged. No drain, second wait, callback,
+   or altered error path is added, and a failed attempt is never reported
+   as a successful completion. Poisoning, retained accepted operations, and
+   repeated-wait behavior stay exactly as the existing failure path defines
+   them.
+4. `require_ready_result` validation, history publication, and the
+   full-context return keep their current order, so the recorded span ends
+   before history publication. A selector failure after a completed prefill
+   is not attributed to prefill: the span is already recorded as a
+   successful completion.
+5. A request with `max_new_tokens == 0` keeps its early return: no prefill
+   forward is submitted, prefill stays `not_run`, and no clock read, submit,
+   or wait is added. A full-capacity prompt with a nonzero limit still
+   submits exactly one prefill and records its completion-observed span
+   before the request returns `context_capacity` with no selected token.
+6. Every prefill observation is guarded by the nullable `SessionAccess`
+   recorder accessor, so a session with no attached recorder reads no clock
+   and records nothing. The borrowed forward result, its readiness
+   producer, and the numerical, KV, history, token, stop, scheduling, and
+   poisoning behavior are unchanged with observation disabled and enabled.
+
 ## Host clock
 
 1. The recorder's only timing source is a supplied monotonic host clock

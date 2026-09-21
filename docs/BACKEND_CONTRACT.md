@@ -129,11 +129,11 @@ earlier one already fixes.
   `ARCHITECTURE.md`, and this contract move together.
 - [14. Inference timing and observation](BACKEND_CONTRACT/inference-timing-and-observation.md) —
   the caller-owned, backend-neutral `InferenceMetrics` recorder, its optional
-  session attachment with load and generation observation, prompt/generated
-  counts, time-to-first-token and stop-aware decode throughput, and explicit
-  trace preparation, its scalar and bounded trace schemas, the supplied
-  monotonic host clock, and the honest CPU, CUDA, ROCm, and SYCL limitations
-  on genuine device duration.
+  session attachment with load, prefill completion, and generation
+  observation, prompt/generated counts, time-to-first-token and stop-aware
+  decode throughput, and explicit trace preparation, its scalar and bounded
+  trace schemas, the supplied monotonic host clock, and the honest CPU, CUDA,
+  ROCm, and SYCL limitations on genuine device duration.
 
 ### Part III — Operation contracts
 
