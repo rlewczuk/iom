@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "iom/chat_format.hpp"
@@ -27,6 +29,15 @@ enum class GenerationStopReason { eos, max_new_tokens, context_capacity };
  */
 struct TokenGenerationResult {
     std::vector<std::size_t> token_ids;
+    GenerationStopReason stop_reason;
+};
+
+/**
+ * Owning output of one high-level text or structured-chat generation request.
+ */
+struct GenerationResult {
+    std::vector<std::size_t> token_ids;
+    std::string text;
     GenerationStopReason stop_reason;
 };
 
@@ -80,6 +91,19 @@ public:
      */
     [[nodiscard]] TokenGenerationResult generate_tokens(
             std::span<const std::size_t> token_ids,
+            std::size_t max_new_tokens);
+
+    /**
+     * Generate from raw text using the session-owned tokenizer directly.
+     */
+    [[nodiscard]] GenerationResult generate_raw(
+            std::string_view text, std::size_t max_new_tokens);
+
+    /**
+     * Render structured chat with a generation prompt, then tokenize it.
+     */
+    [[nodiscard]] GenerationResult generate_chat(
+            std::span<const ChatMessageView> messages,
             std::size_t max_new_tokens);
 
     [[nodiscard]] std::size_t request_length() const noexcept;

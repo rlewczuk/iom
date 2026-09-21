@@ -195,6 +195,13 @@ struct ForwardFixture {
     }
 };
 
+[[nodiscard]] nlohmann::json text_generation_config() {
+    nlohmann::json config = one_layer_config();
+    config["vocab_size"] = 32'000;
+    config["max_position_embeddings"] = 64;
+    return config;
+}
+
 [[nodiscard]] std::vector<float> read_forward_tensor(
         const iom::TensorView& view) {
     REQUIRE(view.spec().data_type == iom::DataType::BF16);
@@ -1199,6 +1206,200 @@ TEST_CASE(
             std::runtime_error);
     CHECK(session->poisoned());
     CHECK_EQ(observer->calls, 0);
+}
+
+TEST_CASE("TinyLlama text chat generation composes raw tokenizer input") {
+    ForwardFixture fixture("text-chat-raw-entrypoints",
+                           text_generation_config());
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{2, 2, 2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector));
+
+    const iom::GenerationResult hello = session->generate_raw("hello", 1);
+    CHECK(hello.token_ids == std::vector<std::size_t>{2});
+    CHECK(hello.text.empty());
+    CHECK(hello.stop_reason == iom::GenerationStopReason::eos);
+    REQUIRE_EQ(observer->histories.size(), 1);
+    CHECK(observer->histories[0] == std::vector<std::size_t>{1, 268});
+
+    std::string d7ff(3, '\0');
+    d7ff[0] = static_cast<char>(0xED);
+    d7ff[1] = static_cast<char>(0x9F);
+    d7ff[2] = static_cast<char>(0xBF);
+    const iom::GenerationResult byte_fallback =
+            session->generate_raw(d7ff, 1);
+    CHECK(byte_fallback.token_ids == std::vector<std::size_t>{2});
+    CHECK(byte_fallback.text.empty());
+    CHECK(byte_fallback.stop_reason == iom::GenerationStopReason::eos);
+    REQUIRE_EQ(observer->histories.size(), 2);
+    CHECK(observer->histories[1]
+          == std::vector<std::size_t>{1, 259, 240, 162, 194});
+
+    const iom::GenerationResult whitespace = session->generate_raw(" ", 1);
+    CHECK(whitespace.token_ids == std::vector<std::size_t>{2});
+    CHECK(whitespace.text.empty());
+    CHECK(whitespace.stop_reason == iom::GenerationStopReason::eos);
+    REQUIRE_EQ(observer->histories.size(), 3);
+    CHECK(observer->histories[2] == std::vector<std::size_t>{1, 259, 259});
+}
+
+TEST_CASE("TinyLlama text chat generation renders roles and assistant prefix") {
+    ForwardFixture fixture("text-chat-structured-entrypoints",
+                           text_generation_config());
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{268, 2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector));
+
+    const iom::ChatMessageView messages[] = {
+            {"system", "x"}, {"user", "x"}, {"assistant", "x"}};
+    CHECK(session->formatter().format(messages, true)
+          == "x</s>x</s>x</s><|assistant|>");
+    const iom::GenerationResult structured =
+            session->generate_chat(messages, 1);
+    CHECK(structured.token_ids == std::vector<std::size_t>{268});
+    CHECK(structured.text == "hello");
+    CHECK(structured.stop_reason == iom::GenerationStopReason::max_new_tokens);
+    REQUIRE_EQ(observer->histories.size(), 1);
+    CHECK(observer->histories[0]
+          == std::vector<std::size_t>{
+                  1,   259, 123, 2,   259, 123, 2,   259, 123, 2,
+                  259, 63,  127, 100, 118, 118, 108, 118, 119, 100,
+                  113, 119, 127, 65});
+
+    const iom::ChatMessageView empty_user[] = {{"user", ""}};
+    CHECK(session->formatter().format(empty_user, true)
+          == "</s><|assistant|>");
+    const iom::GenerationResult empty_content =
+            session->generate_chat(empty_user, 1);
+    CHECK(empty_content.token_ids == std::vector<std::size_t>{2});
+    CHECK(empty_content.text.empty());
+    CHECK(empty_content.stop_reason == iom::GenerationStopReason::eos);
+    REQUIRE_EQ(observer->histories.size(), 2);
+    CHECK(observer->histories[1]
+          == std::vector<std::size_t>{
+                  1, 2, 259, 63, 127, 100, 118, 118, 108, 118,
+                  119, 100, 113, 119, 127, 65});
+}
+
+TEST_CASE("TinyLlama text chat generation forwards every stop reason") {
+    {
+        ForwardFixture fixture("text-chat-stop-eos", text_generation_config());
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<SequenceSelector>(
+                        std::vector<std::size_t>{2}));
+        const iom::GenerationResult result =
+                session->generate_raw("hello", 3);
+        CHECK(result.token_ids == std::vector<std::size_t>{2});
+        CHECK(result.text.empty());
+        CHECK(result.stop_reason == iom::GenerationStopReason::eos);
+    }
+
+    {
+        ForwardFixture fixture("text-chat-stop-limit", text_generation_config());
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<SequenceSelector>(
+                        std::vector<std::size_t>{268}));
+        const iom::GenerationResult result =
+                session->generate_raw("hello", 1);
+        CHECK(result.token_ids == std::vector<std::size_t>{268});
+        CHECK(result.text == "hello");
+        CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+    }
+
+    {
+        nlohmann::json config = text_generation_config();
+        config["max_position_embeddings"] = 17;
+        ForwardFixture fixture("text-chat-stop-context", config);
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device,
+                std::make_unique<SequenceSelector>(
+                        std::vector<std::size_t>{268}));
+        std::string near_capacity = "hello";
+        for (std::size_t index = 1; index < 15; ++index)
+            near_capacity += " hello";
+        const iom::GenerationResult result =
+                session->generate_raw(near_capacity, 3);
+        CHECK(result.token_ids == std::vector<std::size_t>{268});
+        CHECK(result.text == "hello");
+        CHECK(result.stop_reason == iom::GenerationStopReason::context_capacity);
+    }
+
+    {
+        ForwardFixture fixture("text-chat-stop-zero", text_generation_config());
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{});
+        SequenceSelector* observer = selector.get();
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector));
+        const iom::GenerationResult result = session->generate_raw("hello", 0);
+        CHECK(result.token_ids.empty());
+        CHECK(result.text.empty());
+        CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+        CHECK_EQ(observer->calls, 0);
+        CHECK(session->request_length() == 2);
+        CHECK(SessionAccess::history(*session).empty());
+    }
+}
+
+TEST_CASE("TinyLlama text chat generation rejects preprocessing errors atomically") {
+    ForwardFixture fixture("text-chat-invalid-input", text_generation_config());
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{2});
+    SequenceSelector* observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector));
+
+    std::string invalid_utf8(2, '\0');
+    invalid_utf8[0] = static_cast<char>(0xC3);
+    invalid_utf8[1] = static_cast<char>(0x28);
+    CHECK_THROWS_AS(session->generate_raw(invalid_utf8, 1),
+                    std::invalid_argument);
+
+    const iom::ChatMessageView invalid_role[] = {{"User", "hello"}};
+    CHECK_THROWS_AS(session->generate_chat(invalid_role, 1),
+                    std::invalid_argument);
+    const iom::ChatMessageView invalid_content[] = {
+            {"user", std::string_view("\xC3\x28", 2)}};
+    CHECK_THROWS_AS(session->generate_chat(invalid_content, 1),
+                    std::invalid_argument);
+
+    CHECK_EQ(observer->calls, 0);
+    CHECK(session->request_length() == 0);
+    CHECK_FALSE(session->poisoned());
+
+    const iom::GenerationResult recovered = session->generate_raw("hello", 1);
+    CHECK(recovered.token_ids == std::vector<std::size_t>{2});
+    CHECK(recovered.text.empty());
+    CHECK(recovered.stop_reason == iom::GenerationStopReason::eos);
+    CHECK_EQ(observer->calls, 1);
+}
+
+TEST_CASE("TinyLlama text chat generation owns results across session reuse") {
+    ForwardFixture fixture("text-chat-result-ownership", text_generation_config());
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<SequenceSelector>(
+                    std::vector<std::size_t>{268, 2}));
+
+    const iom::GenerationResult first = session->generate_raw("hello", 1);
+    REQUIRE(first.token_ids == std::vector<std::size_t>{268});
+    REQUIRE(first.text == "hello");
+    REQUIRE(first.stop_reason == iom::GenerationStopReason::max_new_tokens);
+
+    const iom::GenerationResult second = session->generate_raw("hello", 1);
+    CHECK(second.token_ids == std::vector<std::size_t>{2});
+    CHECK(second.text.empty());
+    CHECK(second.stop_reason == iom::GenerationStopReason::eos);
+
+    CHECK(first.token_ids == std::vector<std::size_t>{268});
+    CHECK(first.text == "hello");
+    CHECK(first.stop_reason == iom::GenerationStopReason::max_new_tokens);
 }
 
 namespace {
