@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,6 +17,38 @@ REMOTE_SYNC = Path(__file__).parents[1] / "bin" / "csw-remote-sync"
 
 
 class RemoteSyncTests(unittest.TestCase):
+    def test_remote_exec_preserves_quoted_commands_and_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="remote-exec-") as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh = fake_bin / "ssh"
+            ssh.write_text('#!/bin/sh\nexec /bin/sh -c "$2"\n', encoding="utf-8")
+            ssh.chmod(0o755)
+            remote_base = root / "remote host's directory"
+            destination = remote_base / "quoted"
+            destination.mkdir(parents=True)
+            config = root / "hosts.conf"
+            config.write_text(f"cpu|test-host|{remote_base}|\n", encoding="utf-8")
+            environment = os.environ | {
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "CSW_REMOTE_CONFIG": str(config),
+                "CSW_REMOTE_WORKSPACE": str(workspace),
+                "CSW_REMOTE_TASK_DIR": str(root),
+            }
+            arguments = ["argument with spaces", "apostrophe's value", "$(touch injected)"]
+            command = shlex.join(["printf", "%s\\n", *arguments])
+            result = subprocess.run(
+                [str(REMOTE_EXEC), "cpu", "quoted", command],
+                cwd=workspace, env=environment, text=True, capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "\n".join(arguments) + "\n")
+            self.assertFalse((destination / "injected").exists())
+
     def test_cswd_directories_and_links_are_excluded_but_sources_sync(self) -> None:
         with tempfile.TemporaryDirectory(prefix="remote-sync-") as temporary:
             temporary_root = Path(temporary)

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Bounded csw-run verification, review evidence, and locked integration.
 
-verify TASK --plan FILE --summary TEXT
+verify TASK --backend-tests MIRROR_ID [--plan FILE] --summary TEXT
+  Runs integration test_cpu, test_cuda, test_rocm and test_sycl concurrently,
+  then optional sequential plan gates only after all four backends pass.
+  Each runner receives the prepared task/worktree environment and appends its
+  backend to MIRROR_ID. All backend results and failures remain in the receipt.
+  --plan without --backend-tests retains sequential custom-gate verification.
   Plan: {"commands":[{"name":"gate","argv":["program","arg"],
   "env":{"NAME":"value"},"timeout_seconds":900}],
   "total_timeout_seconds":7200}. Nonempty; no shell interpolation. All commands
@@ -76,10 +81,11 @@ ALIASES = {"@csw-review", "@csw-review-2"}
 SEVERITIES = ("low", "medium", "high", "critical")
 ISSUE = re.compile(r"^\s*(\d+)\.\s+\*\*\[(critical|high|medium|low)\]", re.MULTILINE | re.IGNORECASE)
 MAX_ATTEMPT_SECONDS = 7200
+BACKENDS = ("cpu", "cuda", "rocm", "sycl")
+SAFE_MIRROR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 STATE_FILE = "csw-verifier-state.json"
 ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REMOTE_HELPERS = {"csw-remote-sync", "csw-remote-exec", "csw-remote-clean"}
-
 
 def result(ok: bool, code: str = "ok", **fields: Any) -> dict[str, Any]:
     return {"schema_version": 1, "ok": ok, "code": code, **fields}
@@ -184,6 +190,68 @@ def command_plan(value: str) -> dict[str, Any]:
     return {"commands": normalized, "total_timeout_seconds": float(total)}
 
 
+def validate_mirror_id(value: str) -> str:
+    if not isinstance(value, str) or not SAFE_MIRROR_ID.fullmatch(value):
+        raise worker.TaskError(
+            "backend mirror ID must start with an alphanumeric character and contain only "
+            "letters, digits, '.', '_' or '-'"
+        )
+    return value
+
+
+def backend_plan(repo: Path, task: str, wt: Path, mirror_id: str,
+                 extras: dict[str, Any] | None = None) -> dict[str, Any]:
+    mirror_id = validate_mirror_id(mirror_id)
+    total = extras["total_timeout_seconds"] if extras is not None else float(MAX_ATTEMPT_SECONDS)
+    task_directory = str(worker.task_directory(repo, task).resolve())
+    workspace = str(wt.resolve())
+    commands = []
+    for backend in BACKENDS:
+        commands.append({
+            "name": f"backend-{backend}",
+            "argv": [str((repo / ".omp" / "csw" / "bin" / f"test_{backend}").resolve()),
+                     mirror_id],
+            "env": {
+                "CSW_REMOTE_TASK_DIR": task_directory,
+                "CSW_REMOTE_WORKSPACE": workspace,
+            },
+            "timeout_seconds": total,
+        })
+    if extras is not None:
+        commands.extend(extras["commands"])
+    return command_plan(json.dumps({"commands": commands, "total_timeout_seconds": total}))
+
+
+def backend_runner(gate: dict[str, Any]) -> str | None:
+    argv = gate.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return None
+    name = Path(argv[0]).name
+    return name[len("test_"):] if name.startswith("test_") and name[len("test_"):] in BACKENDS else None
+
+
+def validate_backend_runner(gate: dict[str, Any], backend: str, repo: Path,
+                            task: str, wt: Path) -> None:
+    argv, environment = gate.get("argv"), gate.get("env")
+    expected = (repo / ".omp" / "csw" / "bin" / f"test_{backend}").resolve()
+    if (not isinstance(argv, list) or len(argv) != 2
+            or Path(argv[0]).resolve() != expected):
+        raise worker.TaskError(
+            f"test_{backend}: runner must be the integration test_{backend} with one mirror ID"
+        )
+    validate_mirror_id(argv[1])
+    expected_task_dir = worker.task_directory(repo, task).resolve()
+    expected_worktree = wt.resolve()
+    if (not isinstance(environment, dict)
+            or environment.get("CSW_REMOTE_TASK_DIR") != str(expected_task_dir)
+            or environment.get("CSW_REMOTE_WORKSPACE") != str(expected_worktree)):
+        raise worker.TaskError(
+            f"test_{backend}: prepared CSW_REMOTE_TASK_DIR and CSW_REMOTE_WORKSPACE are required"
+        )
+
+
+
+
 def remote_helper(gate: dict[str, Any]) -> str | None:
     name = Path(gate["argv"][0]).name
     return name if name in REMOTE_HELPERS else None
@@ -196,6 +264,10 @@ def validate_remote_plan(plan: dict[str, Any], repo: Path, task: str, wt: Path) 
     executed: set[tuple[str, str]] = set()
     remote_exec_seen = False
     for gate in plan["commands"]:
+        backend = backend_runner(gate)
+        if backend is not None:
+            validate_backend_runner(gate, backend, repo, task, wt)
+            continue
         helper = remote_helper(gate)
         if helper is None:
             continue
@@ -248,21 +320,47 @@ def validate_remote_plan(plan: dict[str, Any], repo: Path, task: str, wt: Path) 
         raise worker.TaskError("remote verification plan requires at least one csw-remote-exec gate")
 
 
-def stop_group(process: subprocess.Popen) -> None:
+def group_alive(process: subprocess.Popen) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, 0)
     except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    finally:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_groups(processes: list[subprocess.Popen]) -> None:
+    processes = list(dict.fromkeys(processes))
+    for process in processes:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    pending = processes
+    end = time.monotonic() + 5
+    while pending and time.monotonic() < end:
+        pending = [
+            process for process in pending
+            if process.poll() is None or group_alive(process)
+        ]
+        if pending:
+            time.sleep(0.02)
+    for process in pending:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.wait(timeout=5)
+    for process in pending:
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def stop_group(process: subprocess.Popen) -> None:
+    stop_groups([process])
+
 
 
 def run_gate(wt: Path, gate: dict[str, Any], deadline: float, log: Path) -> dict[str, Any]:
@@ -328,6 +426,15 @@ def failure_problem(failed: dict[str, Any], plan: dict[str, Any]) -> dict[str, A
             "task_id": failed["argv"][2],
             "remote_log": str(task_directory / "remote.log"),
         }
+    backend = backend_runner(gate)
+    if backend is not None:
+        task_directory = Path(gate["env"]["CSW_REMOTE_TASK_DIR"]).resolve()
+        problem["remote"] = {
+            "helper": f"test_{backend}",
+            "profile": backend,
+            "task_id": f"{failed['argv'][1]}-{backend}",
+            "remote_log": str(task_directory / "remote.log"),
+        }
     scope = "remote verification" if "remote" in problem else "verification"
     detail = diagnostic or problem["error"] or "command produced no diagnostic output"
     problem["summary"] = (
@@ -337,6 +444,90 @@ def failure_problem(failed: dict[str, Any], plan: dict[str, Any]) -> dict[str, A
     if "remote" in problem:
         problem["summary"] += f"; remote_log={problem['remote']['remote_log']}"
     return problem
+
+def run_backend_gates(wt: Path, gates: list[dict[str, Any]], deadline: float,
+                      log_dir: Path) -> list[dict[str, Any]]:
+    """Run the fixed backend set concurrently without worker threads."""
+    observed = [
+        {"name": gate["name"], "argv": gate["argv"],
+         "log": str(log_dir / f"gate-{index + 1}.log"),
+         "ok": False, "timed_out": False, "returncode": None}
+        for index, gate in enumerate(gates)
+    ]
+    running: dict[int, tuple[subprocess.Popen, Any, float]] = {}
+    streams: dict[int, Any] = {}
+    try:
+        for index, gate in enumerate(gates):
+            started = time.monotonic()
+            log = Path(observed[index]["log"])
+            stream = log.open("wb")
+            streams[index] = stream
+            remaining = min(gate["timeout_seconds"], deadline - started)
+            if remaining <= 0:
+                observed[index].update(
+                    timed_out=True, error="total verification deadline exceeded"
+                )
+                stream.close()
+                continue
+            try:
+                environment = os.environ.copy()
+                environment.update(gate["env"])
+                process = subprocess.Popen(
+                    gate["argv"], cwd=wt, env=environment, stdout=stream,
+                    stderr=subprocess.STDOUT, start_new_session=True,
+                )
+                running[index] = (process, stream, started)
+            except OSError as exc:
+                observed[index]["error"] = str(exc)
+                stream.close()
+        while running:
+            now = time.monotonic()
+            expired = []
+            for index, (process, stream, started) in list(running.items()):
+                gate = gates[index]
+                returncode = process.poll()
+                if returncode is not None:
+                    observed[index]["returncode"] = returncode
+                    observed[index]["ok"] = returncode == 0
+                    if group_alive(process):
+                        observed[index].update(
+                            ok=False, error="gate left background processes running"
+                        )
+                        stop_group(process)
+                    observed[index]["elapsed_seconds"] = round(
+                        time.monotonic() - started, 3
+                    )
+                    stream.close()
+                    del running[index]
+                    continue
+                if now >= min(deadline, started + gate["timeout_seconds"]):
+                    observed[index].update(
+                        timed_out=True, returncode=process.returncode,
+                        error=("total verification deadline exceeded"
+                               if now >= deadline else "gate timeout"),
+                    )
+                    observed[index]["elapsed_seconds"] = round(
+                        time.monotonic() - started, 3
+                    )
+                    expired.append((index, process, stream))
+            if expired:
+                stop_groups([process for _, process, _ in expired])
+                for index, process, stream in expired:
+                    observed[index]["returncode"] = process.returncode
+                    stream.close()
+                    del running[index]
+            if running:
+                time.sleep(0.02)
+    except BaseException:
+        # The signal handler raises in this polling thread. Stop every process
+        # before propagating so no child can mutate the worktree afterward.
+        stop_groups([process for process, _, _ in running.values()])
+        raise
+    finally:
+        for stream in streams.values():
+            if not stream.closed:
+                stream.close()
+    return observed
 
 
 def snapshot(repo: Path, task: str) -> dict[str, Any]:
@@ -443,8 +634,16 @@ def conflict(repo: Path, task: str, wt: Path, error: str) -> dict[str, Any]:
                   onto=state.get("pending_rebase_onto"), conflicts=[path for path in paths if path], error=error)
 
 
-def verify(repo: Path, task: str, wt: Path, plan_arg: str, summary: str) -> dict[str, Any]:
-    plan = command_plan(plan_arg)
+def verify(repo: Path, task: str, wt: Path, plan_arg: str | None, summary: str,
+           backend_tests: str | None = None) -> dict[str, Any]:
+    backend_mode = backend_tests is not None
+    if backend_mode:
+        extras = command_plan(plan_arg) if plan_arg is not None else None
+        plan = backend_plan(repo, task, wt, backend_tests, extras)
+    else:
+        if plan_arg is None:
+            raise worker.TaskError("verify requires --plan unless --backend-tests is supplied")
+        plan = command_plan(plan_arg)
     validate_remote_plan(plan, repo, task, wt)
     summary = worker.single_line(summary, "verification summary")
     deadline = time.monotonic() + plan["total_timeout_seconds"]
@@ -480,32 +679,50 @@ def verify(repo: Path, task: str, wt: Path, plan_arg: str, summary: str) -> dict
         "commit": current["commit"], "base": current["base"], "plan": plan, "log_dir": str(log_dir),
     }
     save(wt, data)
-    gates = []
-    for index, gate in enumerate(plan["commands"]):
-        gates.append(run_gate(wt, gate, deadline, log_dir / f"gate-{index + 1}.log"))
-        if not gates[-1]["ok"]:
-            break
+    if backend_mode:
+        standard = plan["commands"][:len(BACKENDS)]
+        gates = run_backend_gates(wt, standard, deadline, log_dir)
+        if all(gate["ok"] for gate in gates):
+            for index, gate in enumerate(plan["commands"][len(BACKENDS):], start=len(BACKENDS)):
+                gates.append(run_gate(wt, gate, deadline, log_dir / f"gate-{index + 1}.log"))
+                if not gates[-1]["ok"]:
+                    break
+    else:
+        gates = []
+        for index, gate in enumerate(plan["commands"]):
+            gates.append(run_gate(wt, gate, deadline, log_dir / f"gate-{index + 1}.log"))
+            if not gates[-1]["ok"]:
+                break
     receipt = {key: current[key] for key in ("commit", "base", "tree", "worktree")}
     receipt.update(plan=plan, gates=gates, summary=summary, log_dir=str(log_dir))
+    failures = [gate for gate in gates if not gate["ok"]]
+    problems = [failure_problem(gate, plan) for gate in failures]
+    if problems:
+        receipt["problems"] = problems
     data["last_attempt"] = receipt
     data.pop("active_attempt", None)
     save(wt, data)
     with worker.integration_lock(repo):
-        if not all(gate["ok"] for gate in gates):
-            failed = gates[-1]
-            problem = failure_problem(failed, plan)
+        if failures:
+            problem = problems[0]
             receipt["problem"] = problem
             try:
                 unchanged = snapshot(repo, task)
                 if matching(receipt, unchanged):
-                    worker.annotate_task(repo, task, task, "failed", summary, [], [problem["summary"]])
+                    worker.annotate_task(
+                        repo, task, task, "failed", summary, [],
+                        [item["summary"] for item in problems],
+                    )
                     retained = worker.commit_task(repo, task, unchanged["status"], None)
                     receipt["retained_commit"] = retained["commit"]
             except (worker.TaskError, worker.TaskCtlError, OSError) as exc:
                 receipt["evidence_error"] = str(exc)
             save(wt, data)
-            return result(False, "gate_timeout" if failed["timed_out"] else "gate_failed",
-                          task=task, problem=problem, receipt=receipt)
+            return result(
+                False,
+                "gate_timeout" if any(item["timed_out"] for item in failures) else "gate_failed",
+                task=task, problem=problem, problems=problems, receipt=receipt,
+            )
         if not matching(receipt, snapshot(repo, task)):
             raise worker.TaskError("gate changed the candidate commit, tree or base")
         if worker.head(repo) != current["base"]:
@@ -785,7 +1002,8 @@ def parser() -> argparse.ArgumentParser:
     sub = command.add_subparsers(dest="command", required=True)
     gate = sub.add_parser("verify")
     gate.add_argument("task")
-    gate.add_argument("--plan", required=True)
+    gate.add_argument("--plan")
+    gate.add_argument("--backend-tests")
     gate.add_argument("--summary", required=True)
     for name in ("review", "assess-rebase"):
         packet_cmd = sub.add_parser(name)
@@ -808,7 +1026,7 @@ def main() -> int:
         task = worker.validate_target(args.task, branch_safe=True)
         with leaf_lock(repo, task) as wt:
             if args.command == "verify":
-                output = verify(repo, task, wt, args.plan, args.summary)
+                output = verify(repo, task, wt, args.plan, args.summary, args.backend_tests)
             elif args.command == "integrate":
                 output = integrate(repo, task, wt)
             else:

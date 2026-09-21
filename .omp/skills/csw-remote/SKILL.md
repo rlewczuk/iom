@@ -5,7 +5,7 @@ description: Perform implementation work in a local Git workspace while building
 
 # CSW Remote
 
-Use this skill when implementation must be validated on a specific remote Linux machine, for example CUDA, ROCm, or SYCL hardware.
+Use this skill for CPU, CUDA, ROCm, and SYCL remote validation. All CPU-backend and general unit tests run on the configured `cpu` profile, not the local workstation.
 
 ## Core rule
 
@@ -50,6 +50,31 @@ Use the integration checkout's current remote helper scripts while selecting the
 
 The worktree's `.cswd` link exposes local task specifications, lifecycle controls, and evidence only. Read specifications and update task status locally through the task helpers. Never run task-control helpers remotely, resolve remote paths through `.cswd`, or require task metadata in a remote build/test command. Pass the needed code paths and command arguments explicitly.
 
+## Standard backend suites
+
+Use the integration checkout's current executable scripts rather than assembling standard CMake/CTest commands:
+
+| Script | Remote profile | Tests |
+| --- | --- | --- |
+| `.omp/csw/bin/test_cpu` | `cpu` | All CPU-only CTest entries: general/reference unit tests, CPU tests, CPU conformance, and the registered CPU benchmark. |
+| `.omp/csw/bin/test_cuda` | `cuda` | CUDA unit/smoke/conformance, including nonmatrix SDPA, plus backend coexistence. |
+| `.omp/csw/bin/test_rocm` | `rocm` | ROCm unit/smoke/conformance, including nonmatrix SDPA, plus backend coexistence. |
+| `.omp/csw/bin/test_sycl` | `sycl` | SYCL unit/smoke/conformance plus backend coexistence, after Level Zero GPU enumeration. |
+
+Each script accepts one unique mirror prefix and requires the same local task/workspace environment as the remote helpers:
+
+```bash
+CSW_REMOTE_TASK_DIR="/repo/.cswd/tasks/change/leaf" \
+CSW_REMOTE_WORKSPACE="/repo/.work/change/leaf" \
+  /repo/.omp/csw/bin/test_cpu leaf-attempt-7
+```
+
+The runner appends `-cpu`, `-cuda`, `-rocm`, or `-sycl` to the prefix, preventing mirror collisions even when profiles share an SSH host. It configures a Release build with only the requested accelerator enabled, builds, and runs the complete standard selection with CTest `--no-tests=error --output-on-failure --timeout 300`. General and CPU tests are not rerun on accelerator profiles. Artifact-dependent real-model tests remain opt-in; any specification requiring them needs an additional explicit gate.
+
+The scripts own sync-before-exec, remote-side build/test deadlines, logs and SYCL's outside-checkout no-setup profile override/nounset-safe initialization. Every accelerator test phase automatically acquires the **same host-wide** `/tmp/agent-gpu0.lock` with bounded acquisition. This conservatively serializes accelerator tests across profiles/mirrors sharing a host, while builds remain concurrent. CPU tests take no device lock. Additional focused accelerator commands must cooperate with this lock.
+
+Configure all four profiles in `.remote-hosts.conf`; the example includes a dedicated CPU alias. Existing installations may map CPU and CUDA to the same SSH host; CPU remains a separate profile and mirror.
+
 ## Typical workflow
 
 Assume the selected workspace is the local task/worktree root.
@@ -68,7 +93,7 @@ Assume the selected workspace is the local task/worktree root.
   'timeout --kill-after=30s 1800s cmake --build build -j'
 .omp/csw/bin/csw-remote-sync rocm task-123
 .omp/csw/bin/csw-remote-exec rocm task-123 \
-  'timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300'
+  'flock -w 120 /tmp/agent-gpu0.lock timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300 --no-tests=error'
 ```
 
 4. Continue editing locally and repeat sync + remote execution as needed.
@@ -80,37 +105,20 @@ Assume the selected workspace is the local task/worktree root.
 
 Every helper failure prints the failed local operation, exit status, and local `remote.log` path to stderr. Preserve that line and the log; do not report only “remote failed.”
 
-### `csw_verify` gate plans
+### `csw_verify` backend verification
 
-`csw-run` leaf verification invokes the helpers as ordered `csw_verify` gates. Use absolute helper paths from the integration checkout and explicit per-gate environment:
+For `csw-run` leaf verification, use one command from the assigned worktree:
 
-```json
-{
-  "commands": [
-    {
-      "name": "cuda sync leaf-7",
-      "argv": ["/repo/.omp/csw/bin/csw-remote-sync", "cuda", "leaf-7"],
-      "env": {
-        "CSW_REMOTE_TASK_DIR": "/repo/.cswd/tasks/change/leaf",
-        "CSW_REMOTE_WORKSPACE": "/repo/.work/change/leaf"
-      },
-      "timeout_seconds": 300
-    },
-    {
-      "name": "cuda conformance leaf-7",
-      "argv": ["/repo/.omp/csw/bin/csw-remote-exec", "cuda", "leaf-7", "timeout --kill-after=30s 900s ctest --test-dir build --output-on-failure --timeout 300"],
-      "env": {
-        "CSW_REMOTE_TASK_DIR": "/repo/.cswd/tasks/change/leaf",
-        "CSW_REMOTE_WORKSPACE": "/repo/.work/change/leaf"
-      },
-      "timeout_seconds": 960
-    }
-  ],
-  "total_timeout_seconds": 7200
-}
+```text
+/repo/.omp/csw/bin/csw_verify --repo /repo verify change/leaf \
+  --backend-tests leaf-attempt-7 --summary "Verified required behavior"
 ```
 
-`csw_verify` fails closed if helper paths are not the integration checkout's current scripts, evidence paths do not resolve to the prepared task/worktree, any exec lacks its own preceding sync for the same profile/mirror, the remote command lacks `timeout --kill-after`, or `flock` has no acquisition timeout. Its failure result contains a developer-presentable `problem` with the operation, profile, mirror, exit/timeout, diagnostic excerpt, gate log, and `remote.log`.
+The helper supplies the prepared `CSW_REMOTE_TASK_DIR` and `CSW_REMOTE_WORKSPACE`, runs all four integration-checkout backend scripts **concurrently**, and waits for every runner before returning. Each backend has its own gate log and result; remote helper output also remains in the task's `remote.log`. All four must pass. The total attempt is bounded to 7200 seconds; remote builds and tests retain their own deadlines.
+
+Do not write a manual standard-backend gate plan. Only specification-required scenarios absent from the scripts need an additional `--plan <outside-checkout-file>`; those gates run sequentially after all four scripts pass. A plan-only invocation remains available for workflow/helper checks that do not require backend suites, but general unit tests still execute on the CPU remote host.
+
+Additional remote gates use absolute integration-checkout `csw-remote-sync`/`csw-remote-exec` paths and explicit prepared task/worktree environment. Every exec needs its own preceding sync for the same profile/mirror, remote-side `timeout --kill-after`, and bounded `/tmp/agent-gpu0.lock` acquisition for accelerator tests. `csw_verify` rejects mismatched paths or missing bounds. Supplemental SYCL commands require the no-setup profile override described below; the standard `test_sycl` script handles it automatically. Failure evidence includes every failed backend and a primary developer-presentable `problem` with operation/profile/mirror, exit/timeout, diagnostics, gate log, and `remote.log`.
 
 ## Parallel work
 
@@ -120,7 +128,7 @@ For concurrent tasks:
 - use a unique `task-id` for every task;
 - never share the same remote task directory between agents;
 - multiple tasks may target the same host if that host has enough CPU/GPU capacity;
-- if tests require exclusive GPU access, bound both lock acquisition and command execution:
+- accelerator tests must acquire the same host-wide lock used by the standard scripts; bound both acquisition and execution, but do not lock CPU tests:
 
 ```bash
 .omp/csw/bin/csw-remote-exec rocm task-123 \
@@ -148,11 +156,12 @@ Use `tmux` or the site's scheduler on the remote host when a job should survive 
 - SSH key authentication should already be configured in `~/.ssh/config` or via the normal OpenSSH key mechanisms.
 - Prefer SSH host aliases so `ProxyJump`, usernames, ports, and keys remain in standard OpenSSH configuration.
 - Remote setup commands should activate toolchains only; avoid destructive shell state changes.
-- SYCL `remote-exec` profiles used by this repository must omit `REMOTE_SETUP`: the helper starts with nounset enabled, while oneAPI setup reads unset variables. Create an outside-checkout config override containing the same host/base with an empty setup field, set `CSW_REMOTE_CONFIG` to it in every SYCL gate's `env`, then begin each remote command with `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-setvars.log 2>&1; set -u;` before the bounded build/test command.
+- SYCL `remote-exec` profiles used by this repository must omit `REMOTE_SETUP`: the helper starts with nounset enabled, while oneAPI setup reads unset variables. `test_sycl` handles this automatically. For supplemental commands, create an outside-checkout config override containing the same host/base with an empty setup field, set `CSW_REMOTE_CONFIG` to it in every SYCL gate's `env`, then begin each remote command with `set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-setvars.log 2>&1; set -u;` before the bounded build/test command.
 
 ## Files
 
 - `.omp/csw/bin/csw-remote-sync` — one-way rsync from local workspace to remote task directory.
 - `.omp/csw/bin/csw-remote-exec` — execute a command inside the remote task directory.
 - `.omp/csw/bin/csw-remote-clean` — delete the remote task directory.
+- `.omp/csw/bin/test_{cpu,cuda,rocm,sycl}` — complete standard backend suites through the remote helpers; GPU test locking is automatic.
 - `references/hosts.example.conf` — simple host profile format.
