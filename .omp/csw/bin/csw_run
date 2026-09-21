@@ -62,6 +62,7 @@ def scan(repo: Path, target: str) -> dict[str, Any]:
             "order": config.get("order"),
             "source": config.get("source"),
             "priority": config.get("priority"),
+            "implementer": config.get("implementer", "csw-implementer"),
             "blocked_by": config.get("blocked-by", []),
         }
         if not spec.is_file():

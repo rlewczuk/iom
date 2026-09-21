@@ -382,6 +382,7 @@ def inspect_target(repo: Path, target: str) -> dict[str, Any]:
                 "source": config.get("source"),
                 "order": config.get("order"),
                 "priority": config.get("priority"),
+                "implementer": config.get("implementer", "csw-implementer"),
                 "blocked_by": dependency_records,
                 "explicitly_ready": config["status"] in {"new", "critic", "planned", "ready"}
                 and all(dependency["satisfied"] for dependency in dependency_records),
@@ -631,6 +632,7 @@ def prepare_task(
         "control_path": str(wt / task_id / "task.yml"),
         "annotation_path": str(wt / task_id / "task.md"),
         "lifecycle_status": config["status"],
+        "implementer": config.get("implementer", "csw-implementer"),
         "rollup_only": rollup_only,
         "base": base,
         "head": head(wt),
@@ -979,6 +981,7 @@ def show_task(repo: Path, task: str) -> dict[str, Any]:
     worktree, state = load_state(repo, task)
     validate_integration(state)
     task_id = canonical_task(task)
+    config = task_config(worktree, task)
     return {
         "task_id": task_id,
         "task_path": task,
@@ -987,7 +990,8 @@ def show_task(repo: Path, task: str) -> dict[str, Any]:
         "spec_path": str(worktree / task_id / "spec.md"),
         "control_path": str(worktree / task_id / "task.yml"),
         "annotation_path": str(worktree / task_id / "task.md"),
-        "lifecycle_status": task_config(worktree, task)["status"],
+        "lifecycle_status": config["status"],
+        "implementer": config.get("implementer", "csw-implementer"),
         "base": state["base"],
         "head": head(worktree),
         "pending_rebase_onto": state.get("pending_rebase_onto"),

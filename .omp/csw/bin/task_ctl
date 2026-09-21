@@ -33,6 +33,7 @@ A control is a YAML mapping containing only these keys, in this form::
 
     type: impl                    # impl or hld
     status: ready                 # new, critic, planned, ready, verified, done, cancelled
+    implementer: csw-implementer  # optional agent identifier
     order: 2                      # optional nonnegative integer; bool is invalid
     priority: P1                  # optional P0, P1, P2, or P3
     blocked-by:                   # optional; unique exact task IDs
@@ -41,9 +42,10 @@ A control is a YAML mapping containing only these keys, in this form::
     source: .cswd/tasks/parent/spec.md  # optional safe repo-relative spec.md
 
 ``impl`` identifies a direct executable leaf.  ``hld`` identifies a design or
-container that must be decomposed before implementation.  Priority ordering is
-P0 (highest) through P3 (lowest); it is a stable scheduling tie-breaker, not a
-dependency.
+container that must be decomposed before implementation.  ``implementer`` is
+an optional nonempty agent identifier matching
+``[A-Za-z0-9][A-Za-z0-9_-]*``.  Priority ordering is P0 (highest) through P3
+(lowest); it is a stable scheduling tie-breaker, not a dependency.
 
 ``new`` is newly recorded, ``critic`` means its specification critique is
 complete, ``planned`` means its required decomposition is complete, ``ready``
@@ -81,17 +83,19 @@ All commands accept global ``--repo PATH`` before the command; it defaults to
 the current directory and may name an explicit worktree.
 
 ``get TASK [SELECTOR]`` reads one control.  At most one of ``--all``,
-``--type``, ``--status``, ``--order``, ``--priority``, ``--blocked``,
-``--source``, and ``--spec`` may be supplied.  No selector and ``--all`` both
-emit the stored mapping as block YAML.  Scalar selectors emit their plain
-scalar value; a missing optional scalar emits an empty line.  ``--blocked``
-always emits YAML and defaults to ``[]`` when absent.  When a task directory
-contains ``task.md`` or ``spec.md`` but no control, querying it recreates a
-default control.  ``--spec`` only prints the safe absolute task-local sibling
-``spec.md`` path; it does not read the task or recreate a missing control.
+``--type``, ``--status``, ``--implementer``, ``--order``, ``--priority``,
+``--blocked``, ``--source``, and ``--spec`` may be supplied.  No selector and
+``--all`` both emit the stored mapping as block YAML.  Scalar selectors emit
+their plain scalar value; a missing optional scalar emits an empty line.
+``--blocked`` always emits YAML and defaults to ``[]`` when absent.  When a
+task directory contains ``task.md`` or ``spec.md`` but no control, querying
+it recreates a default control.  ``--spec`` only prints the safe absolute
+task-local sibling ``spec.md`` path; it does not read the task or recreate a
+missing control.
 
-``set TASK [field options]`` merges ``--type``, ``--status``, ``--order``,
-``--priority``, ``--source``, and repeatable ``--blocked YAML`` updates.
+``set TASK [field options]`` merges ``--type``, ``--status``,
+``--implementer``, ``--order``, ``--priority``, ``--source``, and repeatable
+``--blocked YAML`` updates.
 Each ``--blocked`` value may be one blocker mapping or a list of mappings;
 ``--blocked '[]'`` clears the list.  ``set TASK YAML`` and
 ``set TASK --all YAML`` are equivalent whole replacements.  Whole YAML,
@@ -146,9 +150,9 @@ leaves and keeps a leaf only when every exact dependency exists and is
 descendants.  With ``--recursive``, every candidate also requires all ancestor
 ``hld`` tasks, including TASK when it has a control, to have no unmet
 dependencies; a cancelled ancestor is not ready.  Missing dependencies wait
-rather than satisfy.  Existing dependency cycles among nonterminal tasks are
-errors; completed and cancelled tasks are terminals, but only completed tasks
-satisfy dependents.
+ rather than satisfy.  Existing dependency cycles among nonterminal tasks are
+ errors; completed and cancelled tasks are terminals, but only completed tasks
+ satisfy dependents.
 
 ``plan PARENT YAML`` is read-only mechanical planning.  PARENT must have a
 safe existing task-local ``spec.md``.  YAML is a list in requirement order;
@@ -158,9 +162,10 @@ either another candidate slug or an exact canonical external ID.  The command
 rejects cycles, performs a stable topological sort (ready candidates by P0
 through P3, then input order), assigns contiguous orders from 1 and at-least
 two-digit ``NN-slug`` child IDs, converts candidate blockers to those final
-IDs, sets ``status: new`` and ``source: PARENT/spec.md``, and emits the proposed
-records with a ``collision`` boolean.  It never creates or changes files;
-the caller resolves semantic equivalence and collisions and reruns.
+IDs, sets ``status: new`` and ``source: PARENT/spec.md``, copies an explicit
+parent ``implementer`` to every proposal, and emits the proposed records with
+a ``collision`` boolean.  It never creates or changes files; the caller
+resolves semantic equivalence and collisions and reruns.
 
 The caller supplies the dependency graph; ``plan`` neither infers blockers
 from input order, priority, or numbered IDs nor removes unnecessary supplied
@@ -204,12 +209,13 @@ import yaml
 
 
 ROOTS = (".cswd/tasks",)
-CONFIG_KEYS = ("type", "status", "order", "priority", "blocked-by", "source")
+CONFIG_KEYS = ("type", "status", "implementer", "order", "priority", "blocked-by", "source")
 BLOCKERS_FILE = ".cswd/blockers.yml"
 CONFIG_KEY_SET = frozenset(CONFIG_KEYS)
 TYPES = frozenset(("impl", "hld"))
 STATUSES = frozenset(("new", "critic", "planned", "ready", "verified", "done", "cancelled"))
 PRIORITIES = frozenset(("P0", "P1", "P2", "P3"))
+IMPLEMENTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 SLUG_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
 
@@ -447,6 +453,13 @@ def _validate_config(value: Any) -> dict[str, Any]:
         raise TaskCtlError(
             "status must be new, critic, planned, ready, verified, done, or cancelled"
         )
+    if "implementer" in candidate:
+        implementer = candidate["implementer"]
+        if not isinstance(implementer, str) or not IMPLEMENTER_RE.fullmatch(implementer):
+            raise TaskCtlError(
+                "implementer must be a nonempty agent identifier matching "
+                "[A-Za-z0-9][A-Za-z0-9_-]*"
+            )
     if "order" in candidate:
         order = candidate["order"]
         if isinstance(order, bool) or not isinstance(order, int) or order < 0:
@@ -988,6 +1001,12 @@ def plan_tasks(repo: Path, parent_id: str, candidates: Any) -> list[dict[str, An
     _resolved_inside(root, spec.relative_to(root).as_posix(), "parent specification")
     if not spec.is_file():
         raise TaskCtlError(f"parent specification not found: {spec}")
+    parent_control = parent_directory / "task.yml"
+    _resolved_inside(root, parent_control.relative_to(root).as_posix(), "parent task control")
+    parent_implementer: str | None = None
+    if parent_control.exists() or parent_control.is_symlink():
+        parent_config = get_task(root, parent)
+        parent_implementer = parent_config.get("implementer")
     if not isinstance(candidates, list):
         raise TaskCtlError("plan input must be a YAML list")
 
@@ -1078,16 +1097,17 @@ def plan_tasks(repo: Path, parent_id: str, candidates: Any) -> list[dict[str, An
             if "remarks" in blocker:
                 converted["remarks"] = blocker["remarks"]
             blockers.append(converted)
-        config = _validate_config(
-            {
-                "type": candidate["type"],
-                "status": "new",
-                "order": order,
-                "priority": candidate["priority"],
-                "blocked-by": blockers,
-                "source": source,
-            }
-        )
+        proposal = {
+            "type": candidate["type"],
+            "status": "new",
+            "order": order,
+            "priority": candidate["priority"],
+            "blocked-by": blockers,
+            "source": source,
+        }
+        if parent_implementer is not None:
+            proposal["implementer"] = parent_implementer
+        config = _validate_config(proposal)
         destination = task_dir(root, ids[slug])
         collision = destination.exists() or destination.is_symlink()
         proposals.append({"task-id": ids[slug], **config, "collision": collision})
@@ -1111,6 +1131,7 @@ def _set_updates(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     scalar_values = {
         "type": _single_option(args.types, "--type"),
         "status": _single_option(args.statuses, "--status"),
+        "implementer": _single_option(args.implementers, "--implementer"),
         "order": _single_option(args.orders, "--order"),
         "priority": _single_option(args.priorities, "--priority"),
         "source": _single_option(args.sources, "--source"),
@@ -1179,6 +1200,7 @@ def _build_parser() -> argparse.ArgumentParser:
     get_selectors.add_argument("--all", dest="selector", action="store_const", const="all")
     get_selectors.add_argument("--type", dest="selector", action="store_const", const="type")
     get_selectors.add_argument("--status", dest="selector", action="store_const", const="status")
+    get_selectors.add_argument("--implementer", dest="selector", action="store_const", const="implementer")
     get_selectors.add_argument("--order", dest="selector", action="store_const", const="order")
     get_selectors.add_argument("--priority", dest="selector", action="store_const", const="priority")
     get_selectors.add_argument("--blocked", dest="selector", action="store_const", const="blocked-by")
@@ -1191,6 +1213,7 @@ def _build_parser() -> argparse.ArgumentParser:
     set_parser.add_argument("--all", dest="all_yaml", help="whole replacement YAML mapping")
     set_parser.add_argument("--type", dest="types", action="append")
     set_parser.add_argument("--status", dest="statuses", action="append")
+    set_parser.add_argument("--implementer", dest="implementers", action="append")
     set_parser.add_argument("--order", dest="orders", action="append")
     set_parser.add_argument("--priority", dest="priorities", action="append")
     set_parser.add_argument("--source", dest="sources", action="append")

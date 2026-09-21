@@ -13,7 +13,7 @@ Read `skill://csw-run` and `skill://csw-run-worker`. The parent supplies **contr
 
 ## Control mode
 
-Own one invocation's preflight record and outside-checkout state. Run `csw_run session`, `scan`, `queue`; run `csw_preflight --workflow csw-run` **once**, preserving complete JSON before preparation. Do not rerun failed preflight or perform separate model discovery. Stop on routing/tool/Git failure; do not substitute models.
+Own one invocation's preflight record and outside-checkout state. Run `csw_run session`, `scan`, `queue`; collect every distinct effective `implementer` from valid unfinished implementation leaves, including dependency-waiting leaves. Run `csw_preflight --workflow csw-run --implementer <name> ...` **once**, repeating the option for those selections and preserving complete JSON before preparation. Do not require an unused default implementer, rerun failed preflight, or perform separate model discovery. Forward prepared records with their exact `implementer` and its successful preflight entry; an unvalidated new selection blocks dispatch until a new invocation. Stop on routing/tool/Git failure; do not substitute models.
 
 Use `csw_run prepare` in returned order, preserving independent blockers. Use `csw_run outcome` to mark successful preparations running before returning them for dispatch. Preserve existing implementer scheduling/result semantics. Apply root-supplied supplemental canonical dependencies without removing canonical blockers; use the scripted state commands. Never implement, review, run gates, or integrate in this mode.
 

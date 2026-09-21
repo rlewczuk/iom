@@ -28,6 +28,8 @@ For target `<target>`, resolve paths and metadata through `.omp/csw/bin/task_ctl
 
 Below, `task_ctl` always means `.omp/csw/bin/task_ctl --repo '<project-root>'`; use that executable, not an assumed PATH installation. It requires Python 3 and PyYAML; its module docstring and `--help` contain the complete CLI contract.
 
+An optional parent control field `implementer: <agent-name>` selects the eventual implementation agent (for example `csw-yodacoder`); omission keeps the execution default `csw-implementer`. Read it through `task_ctl get '<task-id>' --all` or `--implementer`. Every generated child MUST inherit the parent's explicit value, for both `impl` and `hld` and in every generation mode. `task_ctl plan` includes it in each proposal; preserve it through writer briefs and `task_ctl set`. An `hld` child carries it into its later planning pass. When absent, do not invent or persist a default on new children. This selects implementation routing only: it does not change planning-time agents, leaf-readiness, or the breadth/depth policy.
+
 ## Task types and generation modes
 
 Every generated task MUST have `type: impl` or `type: hld` in its control file, set through `task_ctl`:
@@ -113,7 +115,7 @@ Resolve the parent with `task_ctl get '<task-id>' --spec` and read its complete 
 - named files, symbols, commands, tests, examples, and external or local references;
 - every actionable fixme remark;
 - unresolved decisions and assumptions.
-- the parent control type returned by the script and the effective generation mode.
+- the parent control type, optional explicit `implementer`, and the effective generation mode returned by the script.
 
 Build one coherent requirement set using the precedence rules above. A fixme correction replaces the conflicting parent requirement; do not preserve both alternatives. Do not propagate brainstorming, rejected alternatives, or editorial commentary as implementation work.
 
@@ -208,7 +210,7 @@ Assign a priority:
 
 All generated tasks are required; P2 never means optional. The control schema also accepts P3, but this workflow's priority policy remains P0–P2. Supply root-approved candidates to `task_ctl plan '<task-id>' '<candidate-list-as-yaml>'` in parent requirement order. Each candidate supplies a precise lowercase kebab-case `slug`, `type`, `priority`, and an explicit `blocked-by` list. For an edge to another proposed candidate, use its slug as the planning input's `task-id`; the script replaces it with the exact generated task ID. Use canonical IDs for existing external prerequisites. Although `remarks` is optional in the general control schema, this planner MUST supply the output-specific rationale required by the dependency-minimization gate for every edge.
 
-The script returns dependency-first order, breaking ties by priority and then input order, assigns orders starting at 1 and `<NN>-<slug>` destinations, and reports occupied destinations. Preserve its returned IDs, orders, source paths, and blocker records verbatim. Do not hand-sort, allocate numbers, or infer dependencies from prefixes. This is a stable display/scheduling order, not a serial execution mandate: numbering or priority never adds blockers. Independent consumers may share a genuine prerequisite but have no mutual blockers; tasks with no genuine prerequisites keep empty lists.
+The script returns dependency-first order, breaking ties by priority and then input order, assigns orders starting at 1 and `<NN>-<slug>` destinations, copies any explicit parent `implementer` into every proposal, and reports occupied destinations. Preserve its returned IDs, orders, source paths, implementer selection, and blocker records verbatim in the frozen assignment table and writer briefs. Do not supply per-candidate implementer overrides or infer a model from complexity. Do not hand-sort, allocate numbers, or infer dependencies from prefixes. This is a stable display/scheduling order, not a serial execution mandate: numbering or priority never adds blockers. Independent consumers may share a genuine prerequisite but have no mutual blockers; tasks with no genuine prerequisites keep empty lists.
 
 Use short slugs describing delivered behavior, not `setup`, `misc`, `changes`, or `cleanup`. Never silently overwrite an occupied destination. If it is the same source and outcome, revise carefully; otherwise choose a distinct precise slug, rerun `plan`, and report the collision. Equivalence is a root judgment; collision detection is script-owned.
 
@@ -220,9 +222,9 @@ Each mini-spec is either a direct implementation contract (`impl`) or a bounded 
 
 Do not reintroduce hidden dependencies in prose, references, or acceptance criteria: no “after the previous task,” reliance on an unfinished sibling as the only implementation recipe, or unrelated sibling-completion gate. Carry the frozen shared contract and owned edit scope into each independent leaf. If writing reveals an actual missing prerequisite or overlapping mutation contract, report it to the root for resolution and a revised frozen graph; do not silently add sequencing.
 
-Create or update each child's control with `task_ctl set '<exact-child-id>' --type '<impl|hld>' --status new --order '<integer>' --priority '<P0|P1|P2>' --blocked '<YAML-list-of-task-id-and-optional-remarks-records>' --source '<parent-spec-path>'`. Use the frozen table's values verbatim. Preserve a revised existing task's lifecycle unless the root explicitly determines the revision invalidates that state; never reset completion incidentally. A whole configuration may instead be passed to `set --all`; this is script input, never file content written by the model.
+Create or update each child's control with `task_ctl set '<exact-child-id>' --type '<impl|hld>' --status new --order '<integer>' --priority '<P0|P1|P2>' --blocked '<YAML-list-of-task-id-and-optional-remarks-records>' --source '<parent-spec-path>'`, adding `--implementer '<inherited-agent-name>'` whenever the proposal contains it. Use the frozen table's values verbatim, including implementer for every child, not only `impl` leaves. With no parent selection, omit that option; preserve an existing child's explicit selection on a merge update rather than resetting it incidentally. Preserve a revised existing task's lifecycle unless the root explicitly determines the revision invalidates that state; never reset completion incidentally. A whole configuration may instead be passed to `set --all`; include the inherited field when present and preserve applicable existing fields. This is script input, never file content written by the model.
 
-Use this shared Markdown structure; omit only body sections that truly do not apply. Do not duplicate type, status, order, priority, blockers, or source as Markdown control headers. Keep any substantive priority rationale in relevant requirements, not a second metadata field. Apply the type-specific rules below.
+Use this shared Markdown structure; omit only body sections that truly do not apply. Do not duplicate type, status, order, priority, implementer, blockers, or source as Markdown control headers. Keep any substantive priority rationale in relevant requirements, not a second metadata field. Apply the type-specific rules below.
 
 ```markdown
 # <Task title>
@@ -301,6 +303,7 @@ Before completing:
 - repeat the dependency-minimization gate against the final controls and prose: every edge has a concrete required-output rationale; no hidden sequencing, unnecessary direct edge, or artificial transitive path orders independent tasks;
 - explicitly check backend siblings, tensor-operation siblings, shared-file ownership, HLD ancestor blockers, and cross-cutting joins where present; all useful safe parallelism must survive, and every retained serial chain must be necessary rather than merely convenient;
 - confirm each script-returned type satisfies the selected mode and leaf-readiness check;
+- verify every generated or revised child's stored `implementer` matches the explicit parent selection when present, including `hld` children; with no selection, new children must leave it absent and revised children preserve their existing explicit choice.
 - in Implementation mode, confirm all tasks are `impl`; in Design and Automatic modes, confirm refinement toward direct leaves was attempted and every retained `hld` passes the admission check; mode selection alone never justifies an HLD layer;
 - enforce the breadth/depth gate: target 10–20 immediate children, permit fewer only with a concrete specification-shortage rationale, justify more than 20, and normally end all branches at level 1 or 2 relative to the original root;
 - reject every one- or two-leaf HLD wrapper and every unjustified extra level; verify each HLD's projected useful leaf count, necessary remaining planning work, and shortest route to implementation before accepting the set;
