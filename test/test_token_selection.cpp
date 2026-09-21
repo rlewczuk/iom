@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <condition_variable>
+#include <array>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -861,4 +862,61 @@ TEST_CASE(
             0);
     check_scratch_contents(host, encode_bf16(final_values), kTail);
     CHECK_EQ(device_scratch.owner_identity(), workspace_identity);
+}
+
+TEST_CASE("greedy token selection does not treat opaque logits as a host range") {
+    struct Descriptor {
+        int tag = 7;
+        std::array<std::byte, 16> host;
+    } descriptor;
+    class OpaqueLogits final : public iom::Tensor {
+    public:
+        OpaqueLogits(iom::Device& device, Descriptor& descriptor, void* key)
+                : Tensor(logits_spec(3), device), descriptor_(descriptor),
+                  key_(key), payload_(encode_bf16(
+                          std::vector<std::uint16_t>{0xbf80, 0x4000, 0x3f80})) {}
+    private:
+        iom::WorkspaceRequirements host_transfer_workspace_requirements(
+                std::size_t) const override { return {0, 1}; }
+        void* storage_handle() noexcept override { return &descriptor_; }
+        iom::detail::StorageIdentity storage_identity() const noexcept override {
+            return {key_, nullptr};
+        }
+        void region_from_host(const iom::TensorView&,
+                std::span<const std::byte>, iom::RawWorkspaceView) override {
+            throw std::logic_error("read-only logits fixture");
+        }
+        void region_to_host(const iom::TensorView&,
+                std::span<std::byte> destination, iom::RawWorkspaceView) const override {
+            std::copy(payload_.begin(), payload_.end(), destination.begin());
+        }
+        Descriptor& descriptor_;
+        void* key_;
+        std::vector<std::byte> payload_;
+    };
+    CpuFixture fixture;
+    char key;
+    OpaqueLogits logits(*fixture.device, descriptor, &key);
+    ManualQueue queue(*fixture.device);
+    const auto producer = queue.probe();
+    queue.complete(ManualQueue::sequence(producer));
+    iom::GreedyTokenSelector selector;
+    descriptor.host.fill(std::byte{0x5a});
+    const auto before = descriptor.host;
+    CHECK_THROWS_AS(selector.select(
+            queue, logits.view(), 3, iom::to_oid(iom::OidError::Unsupported),
+            {}, {descriptor.host, {}}), std::invalid_argument);
+    CHECK(descriptor.host == before);
+    CHECK_THROWS_AS(selector.select(
+            queue, logits.view(), 3, producer, {},
+            {std::span<std::byte>(descriptor.host).first(5), {}}),
+            std::invalid_argument);
+    CHECK(descriptor.host == before);
+    // Host scratch lies immediately after the real execution descriptor,
+    // inside its would-be tiled byte range, but not inside opaque backing.
+    CHECK_EQ(selector.select(
+            queue, logits.view(), 3, producer, {}, {descriptor.host, {}}), 1);
+    check_scratch_contents(descriptor.host,
+            encode_bf16(std::vector<std::uint16_t>{0xbf80, 0x4000, 0x3f80}),
+            std::byte{0x5a});
 }

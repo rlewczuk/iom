@@ -129,6 +129,10 @@ namespace iom {
                     || handle != owner->view().native_handle()) {
                 reject_operand(operation, "view has no stable owner handle");
             }
+            const StorageIdentity backing = StorageAccess::identity(view);
+            if (backing.key == nullptr) {
+                reject_operand(operation, "view has no backing identity");
+            }
 
             const TensorSpec& spec = view.spec();
             const TensorSpec& owner_spec = owner->view().spec();
@@ -202,7 +206,7 @@ namespace iom {
                     logical_bits, "logical byte size overflows");
             return CheckedViewFacts{
                     max_plane, addressed_bytes, storage_bytes,
-                    logical_bytes};
+                    logical_bytes, backing};
         }
 
     }  // namespace detail
@@ -464,18 +468,18 @@ namespace iom {
         if (workspace.byte_size() < required_capacity)
             throw std::invalid_argument(
                     "workspace is smaller than the required capacity");
-        const void* raw_address = workspace.range_address();
-        if (raw_address == nullptr)
-            throw std::invalid_argument("workspace range has no address");
-        const std::uintptr_t base =
-                reinterpret_cast<std::uintptr_t>(raw_address);
-        if (base % required_alignment != 0)
+        const detail::StorageIdentity backing =
+                detail::StorageAccess::identity(*owner);
+        const detail::StorageRange origin = detail::checked_storage_range(
+                backing, workspace.offset(), 0, "workspace range end overflows");
+        const std::uintptr_t alignment_origin = backing.base == nullptr
+                ? workspace.offset()
+                : reinterpret_cast<std::uintptr_t>(origin.address());
+        if (alignment_origin % required_alignment != 0)
             throw std::invalid_argument(
                     "workspace range alignment is insufficient");
-        if (workspace.byte_size()
-                > std::numeric_limits<std::uintptr_t>::max() - base)
-            throw std::overflow_error("workspace range end overflows");
-        const std::uintptr_t range_end = base + workspace.byte_size();
+        const detail::StorageRange range =
+                detail::WorkspaceValidation::range(workspace);
         for (const TensorView& operand : operands) {
             if (&operand.device() != &device
                     || operand.owner_identity() == nullptr
@@ -485,17 +489,12 @@ namespace iom {
             }
         }
         for (const TensorView& operand : operands) {
-            const std::uintptr_t operand_base =
-                    reinterpret_cast<std::uintptr_t>(operand.native_handle());
-            const std::size_t operand_bytes = operand.owner_identity()->view()
-                    .spec().tiled_storage_nbytes();
-            if (operand_bytes
-                    > std::numeric_limits<std::uintptr_t>::max()
-                            - operand_base)
-                throw std::overflow_error(
-                        "workspace operand storage range overflows");
-            const std::uintptr_t operand_end = operand_base + operand_bytes;
-            if (base < operand_end && operand_base < range_end)
+            const detail::StorageRange operand_range =
+                    detail::checked_storage_range(
+                            operand, operand.owner_identity()->view()
+                                    .spec().tiled_storage_nbytes(),
+                            "workspace operand storage range overflows");
+            if (detail::storage_ranges_overlap(range, operand_range))
                 throw std::invalid_argument(
                         "workspace range overlaps an operand or output "
                         "storage range");
@@ -505,6 +504,17 @@ namespace iom {
     void* detail::WorkspaceValidation::address(
             const RawWorkspaceView& workspace) noexcept {
         return workspace.range_address();
+    }
+    detail::StorageRange detail::WorkspaceValidation::range(
+            const RawWorkspaceView& workspace) {
+        const RawWorkspace* owner = workspace.owner_identity();
+        // Call only after exact-live-owner admission, never on an unused view.
+        if (workspace.offset() > owner->byte_size()
+                || workspace.byte_size() > owner->byte_size() - workspace.offset())
+            throw std::invalid_argument("workspace range exceeds its owner");
+        return detail::checked_storage_range(
+                detail::StorageAccess::identity(*owner), workspace.offset(),
+                workspace.byte_size(), "workspace range end overflows");
     }
     DeviceOps::~DeviceOps() {
         close_and_drain();

@@ -5,6 +5,8 @@
 #include <span>
 #include <vector>
 
+#include "detail/storage_identity.hpp"
+
 namespace iom {
 
     enum class DataType {
@@ -151,6 +153,7 @@ namespace iom {
         // without exposing workspace addresses for construction; defined
         // with the iom.hpp operation contract.
         class WorkspaceValidation;
+        class StorageAccess;
 
     }  // namespace detail
 
@@ -278,9 +281,13 @@ namespace iom {
         // empty (zero-byte) workspace. Backends report their arena
         // suballocation here.
         [[nodiscard]] virtual void* workspace_address() const noexcept;
+        // Default owners are addressable. Native owners override this with
+        // a canonical non-null key and null base; no byte address is invented.
+        [[nodiscard]] virtual detail::StorageIdentity storage_identity() const noexcept;
 
     private:
         friend class RawWorkspaceView;
+        friend class detail::StorageAccess;
         const Device* device_;
         std::size_t bytes_;
     };
@@ -395,6 +402,9 @@ namespace iom {
                         std::size_t checked_logical_nbytes) const = 0;
 
         [[nodiscard]] virtual void* storage_handle() noexcept = 0;
+        // Separate backing identity from the execution descriptor. Views and
+        // all their transforms inherit this exact owner's complete identity.
+        [[nodiscard]] virtual detail::StorageIdentity storage_identity() const noexcept;
         virtual void region_from_host(
                 const TensorView& destination,
                 std::span<const std::byte> source,
@@ -406,8 +416,24 @@ namespace iom {
 
     private:
         friend class TensorView;
+        friend class detail::StorageAccess;
         Device* device_;
         TensorView full_view_;
     };
+
+    namespace detail {
+        // Internal access only; caller-facing tensor/workspace APIs are unchanged.
+        class StorageAccess {
+        public:
+            [[nodiscard]] static StorageIdentity identity(
+                    const TensorView& view) noexcept {
+                return view.owner_identity()->storage_identity();
+            }
+            [[nodiscard]] static StorageIdentity identity(
+                    const RawWorkspace& owner) noexcept {
+                return owner.storage_identity();
+            }
+        };
+    }  // namespace detail
 
 }

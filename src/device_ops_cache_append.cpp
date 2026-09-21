@@ -31,10 +31,6 @@ namespace iom {
         constexpr std::size_t kMinimumRank = 3;
         constexpr std::size_t kMaximumRank = 8;
 
-        struct PhysicalRange {
-            std::uintptr_t begin = 0;
-            std::uintptr_t end = 0;
-        };
 
         [[nodiscard]] std::size_t padded_extent(
                 std::size_t extent, const char* what) {
@@ -55,22 +51,6 @@ namespace iom {
             return planes;
         }
 
-        [[nodiscard]] PhysicalRange checked_storage_range(
-                const TensorView& view, const detail::CheckedViewFacts& facts) {
-            const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(
-                    view.native_handle());
-            if (facts.storage_bytes
-                    > std::numeric_limits<std::uintptr_t>::max() - begin) {
-                throw std::overflow_error(
-                        "cache append storage range overflows");
-            }
-            return {begin, begin + facts.storage_bytes};
-        }
-
-        [[nodiscard]] bool ranges_overlap(
-                const PhysicalRange& lhs, const PhysicalRange& rhs) noexcept {
-            return lhs.begin < rhs.end && rhs.begin < lhs.end;
-        }
 
         void validate_view_arithmetic(
                 const TensorView& view, const detail::CheckedViewFacts& facts,
@@ -235,10 +215,12 @@ namespace iom {
         // Check complete owner ranges, not merely the logical windows.  This
         // conservatively covers every transformed leading plane and padded
         // tile owned by either operand.
-        const PhysicalRange source_range = checked_storage_range(
-                source, source_facts);
-        const PhysicalRange destination_range = checked_storage_range(
-                destination, destination_facts);
+        const auto source_range = detail::checked_storage_range(
+                source_facts.backing, 0, source_facts.storage_bytes,
+                "cache append storage range overflows");
+        const auto destination_range = detail::checked_storage_range(
+                destination_facts.backing, 0, destination_facts.storage_bytes,
+                "cache append storage range overflows");
 
         if (source.spec().data_type != destination.spec().data_type
                 || source.spec().quantization
@@ -247,7 +229,7 @@ namespace iom {
                     "cache append operand specifications do not match");
         }
         if (source.owner_identity() == destination.owner_identity()
-                || ranges_overlap(source_range, destination_range)) {
+                || detail::storage_ranges_overlap(source_range, destination_range)) {
             throw std::invalid_argument(
                     "cache append source/destination overlap is forbidden");
         }

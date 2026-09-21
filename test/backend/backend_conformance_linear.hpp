@@ -3554,7 +3554,7 @@ public:
                     registry_.registry, record.entries, record.retained_failure,
                     !record.retained_failure);
             iom::detail::complete_workspace_lease(
-                    registry_, record.workspace_lease, true);
+                    registry_, record.workspace_lease.entry_id, true);
             complete(sequence);
             return;
         }
