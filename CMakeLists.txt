@@ -341,6 +341,61 @@ if(SYCL_ENABLED)
 endif()
 
 
+add_executable(iom_generate
+    tools/iom_generate.cpp
+)
+
+target_link_libraries(iom_generate
+    PRIVATE
+        libiom
+)
+
+if(CUDA_ENABLED)
+    target_compile_definitions(iom_generate
+        PRIVATE
+            IOM_GENERATE_CUDA_ENABLED
+    )
+    target_link_libraries(iom_generate
+        PRIVATE
+            iom_cuda
+            CUDA::cuda_driver
+            CUDA::cudart
+    )
+endif()
+
+if(ROCM_ENABLED)
+    target_compile_definitions(iom_generate
+        PRIVATE
+            IOM_GENERATE_ROCM_ENABLED
+            __HIP_PLATFORM_AMD__
+    )
+    target_link_libraries(iom_generate
+        PRIVATE
+            iom_rocm
+            hip::host
+    )
+endif()
+
+if(SYCL_ENABLED)
+    target_compile_definitions(iom_generate
+        PRIVATE
+            IOM_GENERATE_SYCL_ENABLED
+    )
+    target_compile_options(iom_generate
+        PRIVATE
+            -fsycl
+    )
+    target_link_options(iom_generate
+        PRIVATE
+            -fsycl
+    )
+    target_link_libraries(iom_generate
+        PRIVATE
+            iom_sycl
+    )
+endif()
+
+
 include(CTest)
 if(BUILD_TESTING)
     if(CUDA_ENABLED)

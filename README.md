@@ -93,6 +93,46 @@ ctest --test-dir build/all --output-on-failure \
   -R '^iom_backend_coexistence_tests$'
 ```
 
+## TinyLlama generation CLI
+
+`iom_generate` performs one explicit TinyLlama generation request. It never
+chooses a model directory from the current directory or an environment
+variable, downloads a checkpoint, or uses a hardcoded path. Every invocation
+must name the model directory, backend, device ordinal, and generation limit,
+and must provide exactly one raw prompt or one or more ordered chat messages:
+
+```text
+iom_generate --model-dir DIR --backend cpu|cuda|rocm|sycl \
+  --device ORDINAL --max-new-tokens N --prompt TEXT
+
+iom_generate --model-dir DIR --backend cpu|cuda|rocm|sycl \
+  --device ORDINAL --max-new-tokens N \
+  --message ROLE CONTENT [--message ROLE CONTENT ...]
+```
+
+CPU accepts only `--device 0` and does not use a tensor arena option. CUDA,
+ROCm, and SYCL require an explicit `--tensor-arena-bytes N` value in addition
+to the options above; it must be nonzero and divisible by 32:
+
+```text
+iom_generate --model-dir ./tinyllama --backend cuda --device 0 \
+  --tensor-arena-bytes 1073741824 --max-new-tokens 32 \
+  --prompt "Write one sentence."
+
+iom_generate --model-dir ./tinyllama --backend cpu --device 0 \
+  --max-new-tokens 32 --message system "Be concise." \
+  --message user "Summarize this input."
+```
+
+On success, stdout contains only the owned decoded generated text. The CLI
+does not add a diagnostic label or a trailing newline. Diagnostics are written
+to stderr. Exit status 2 denotes usage or input validation (including
+malformed numbers, conflicting forms, and unsupported chat roles), 3 denotes
+backend, model, tokenizer, allocator, device, or session setup/load failure,
+and 4 denotes queue, generation, result, token-selection, or output-execution
+failure. The normal EOS, maximum-token, and context-capacity stop reasons all
+return status 0.
+
 ## Elementwise operation contract
 
 `DeviceOps` exposes four exact three-view asynchronous facades:
