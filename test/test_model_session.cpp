@@ -12,6 +12,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -266,6 +267,9 @@ public:
             iom::DeviceOps&, const iom::TensorView&, std::size_t,
             iom::oid producer, std::span<const std::size_t> history,
             iom::TokenSelectorScratch) override {
+        if (before_select) {
+            before_select(calls);
+        }
         ++calls;
         producers.push_back(producer);
         histories.emplace_back(history.begin(), history.end());
@@ -282,6 +286,10 @@ public:
     std::vector<iom::oid> producers;
     std::vector<std::vector<std::size_t>> histories;
     bool throw_failure = false;
+    // Optional case hook invoked with the number of selections already served,
+    // so a case can act - for example arm a backend failure latch - at one
+    // exact generation step.
+    std::function<void(std::size_t)> before_select;
 
 private:
     std::vector<std::size_t> sequence_;
@@ -401,6 +409,65 @@ struct RecordingClock {
 [[nodiscard]] iom::HostClock make_clock(RecordingClock& recorder) {
     return iom::HostClock{&RecordingClock::read, &recorder};
 }
+
+// Deterministic supplied clock for the generation-path cases.
+//
+// The instrumented load consumes its fixed leading instants first.  Every later
+// read returns the current window value, which the case advances at the
+// generation observation points it owns: one window per request entry and one
+// per selection boundary.  A pinned TTFT or decode-throughput delta therefore
+// does not depend on how many reads the instrumented stages make inside one
+// window - this leaf's commits and decode intervals, the prefill span, the
+// per-facade enqueue sums, and the wait observations all share the same window.
+// A read before the first window is armed is flagged instead of silently
+// reading a wall clock.
+struct ObservationWindowClock {
+    std::vector<std::uint64_t> load_instants{};
+    std::size_t load_cursor = 0;
+    std::uint64_t window = 0;
+    bool armed = false;
+    bool unarmed_read = false;
+
+    static std::uint64_t read(void* context) noexcept {
+        auto* self = static_cast<ObservationWindowClock*>(context);
+        if (self->load_cursor < self->load_instants.size()) {
+            return self->load_instants[self->load_cursor++];
+        }
+        if (!self->armed) {
+            self->unarmed_read = true;
+        }
+        return self->window;
+    }
+
+    // Enter a window at a generation observation point.
+    void arm(std::uint64_t value) noexcept {
+        window = value;
+        armed = true;
+    }
+};
+
+[[nodiscard]] iom::HostClock make_clock(ObservationWindowClock& recorder) {
+    return iom::HostClock{&ObservationWindowClock::read, &recorder};
+}
+
+// Window script of one generation-path case: the case arms the window for each
+// request entry with `enter`, and every selection advances to the next scripted
+// window.  The served count stays observable so a case can pin how many
+// selections and window steps it observed.
+struct GenerationWindowScript {
+    ObservationWindowClock& clock;
+    std::vector<std::uint64_t> windows;
+    std::size_t served = 0;
+
+    void enter(std::uint64_t value) noexcept { clock.arm(value); }
+
+    void on_select() noexcept {
+        if (served < windows.size()) {
+            clock.arm(windows[served]);
+        }
+        ++served;
+    }
+};
 
 // Queue id 16, sequence `sequence`: one canonical positive accepted OID.
 [[nodiscard]] iom::oid accepted_oid(std::uint64_t sequence) {
@@ -977,14 +1044,20 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK(expected.token_ids == std::vector<std::size_t>{4, 2});
     CHECK(expected.stop_reason == iom::GenerationStopReason::eos);
 
-    RecordingClock clock;
-    clock.instants = {200, 260, 200, 260};
+    ObservationWindowClock clock;
+    clock.load_instants = {100, 200};
     iom::InferenceMetrics recorder(make_clock(clock));
+    // Behavior parity and the observed outcomes only: the supplied clock
+    // advances once per selection, so this case pins no generation instant.
+    GenerationWindowScript script{clock, {21'000, 22'000}};
+    auto selector =
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{4, 2});
+    selector->before_select = [&script](std::size_t) { script.on_select(); };
     auto observed = iom::load_tinyllama_session(
-            fixture.directory.path(), *fixture.device,
-            std::make_unique<SequenceSelector>(std::vector<std::size_t>{4, 2}),
+            fixture.directory.path(), *fixture.device, std::move(selector),
             &recorder);
     REQUIRE(observed);
+    script.enter(20'000);
     const iom::TokenGenerationResult result =
             observed->generate_tokens(prompt, 4);
     CHECK(result.token_ids == expected.token_ids);
@@ -992,20 +1065,27 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK_EQ(SessionAccess::caches(*observed)[0].initialized_length,
              SessionAccess::caches(*plain)[0].initialized_length);
 
-    // The attachment adds no clock read to the generation path: only the load
-    // interval was measured. Request publication is the one point that
-    // advances the admitted ordinal, so the completed generation is admitted
-    // through the same bridge as every other published request.
-    CHECK_EQ(clock.cursor, 2);
-    CHECK_FALSE(clock.exhausted);
-    CHECK_EQ(recorder.snapshot().load.host_nanoseconds, 60);
-    CHECK_EQ(recorder.snapshot().admitted.ordinal, 1);
-    CHECK(recorder.snapshot().request_admitted);
-    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
-    CHECK(recorder.operations().empty());
+    // The generation path observes exactly the admitted request it published:
+    // its TTFT, its committed counts, and its single decode interval, while the
+    // load interval keeps covering only the instrumented factory.
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    REQUIRE(snapshot.request_admitted);
+    CHECK_EQ(snapshot.load.host_nanoseconds, 100);
+    CHECK_EQ(snapshot.admitted.ordinal, 1);
+    CHECK_EQ(snapshot.admitted.prompt_tokens, 2);
+    CHECK(snapshot.admitted.stop_reason_valid);
+    CHECK(snapshot.admitted.stop_reason == iom::GenerationStopReason::eos);
+    CHECK_EQ(snapshot.admitted.generated_tokens, 2);
+    CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+    CHECK_EQ(snapshot.admitted.decode_token_count, 1);
+    CHECK(snapshot.admitted.time_to_first_token_valid);
+    CHECK(snapshot.admitted.decode_throughput_valid);
+    CHECK(snapshot.attempt.outcome == iom::AttemptOutcome::succeeded);
+    CHECK_EQ(script.served, 2);
+    CHECK_FALSE(clock.unarmed_read);
 
     // A selector failure keeps its category and its poisoning with and without
-    // an attached recorder.
+    // an attached recorder, and is reported as its own failed attempt.
     const auto load_failing = [&](iom::InferenceMetrics* metrics) {
         auto selector = std::make_unique<SequenceSelector>(
                 std::vector<std::size_t>{4});
@@ -1018,14 +1098,25 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK_THROWS_AS(failing_plain->generate_tokens(prompt, 2),
                     std::runtime_error);
     CHECK(failing_plain->poisoned());
-    auto failing_observed = load_failing(&recorder);
+
+    ObservationWindowClock failing_clock;
+    failing_clock.load_instants = {30'000, 30'100};
+    iom::InferenceMetrics failing_recorder(make_clock(failing_clock));
+    auto failing_observed = load_failing(&failing_recorder);
+    failing_clock.arm(31'000);
     CHECK_THROWS_AS(failing_observed->generate_tokens(prompt, 2),
                     std::runtime_error);
     CHECK(failing_observed->poisoned());
-    CHECK_EQ(clock.cursor, 4);
-    CHECK_FALSE(clock.exhausted);
-    CHECK_EQ(recorder.snapshot().admitted.ordinal, 2);
-    CHECK(recorder.snapshot().attempt.outcome == iom::AttemptOutcome::none);
+    const iom::InferenceSnapshot& failed = failing_recorder.snapshot();
+    REQUIRE(failed.request_admitted);
+    CHECK_EQ(failed.admitted.ordinal, 1);
+    CHECK_EQ(failed.admitted.generated_tokens, 0);
+    CHECK_FALSE(failed.admitted.stop_reason_valid);
+    CHECK_FALSE(failed.admitted.decode_throughput_valid);
+    CHECK(failed.admitted.failure != nullptr);
+    CHECK(failed.attempt.outcome == iom::AttemptOutcome::failed);
+    CHECK(failed.attempt.failure != nullptr);
+    CHECK_FALSE(failing_clock.unarmed_read);
 }
 
 
@@ -1137,6 +1228,548 @@ void clear_cache_append_wait_observation() noexcept;
 [[nodiscard]] std::size_t observed_cache_append_waits() noexcept;
 
 }  // namespace iom::cpu_detail
+
+TEST_CASE("Inference metrics generation measures TTFT and decode throughput") {
+    ForwardFixture fixture("metrics-generation-throughput",
+                           one_layer_config());
+    const std::vector<std::size_t> prompt{0, 1};
+    const std::vector<std::size_t> sequence{4, 5, 2};
+
+    // The unobserved generation of the same request fixes the expected tokens,
+    // stop reason, and cache transition.
+    auto plain = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<SequenceSelector>(sequence));
+    REQUIRE(plain);
+    const iom::TokenGenerationResult expected =
+            plain->generate_tokens(prompt, 4);
+    CHECK(expected.token_ids == sequence);
+    CHECK(expected.stop_reason == iom::GenerationStopReason::eos);
+
+    ObservationWindowClock clock;
+    clock.load_instants = {100, 200};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    // One window per selection: the first covers the prefill-produced commit
+    // and its decode interval, the following two close one decode interval
+    // each.
+    GenerationWindowScript script{clock, {1'200, 1'500, 1'900}};
+    auto selector = std::make_unique<SequenceSelector>(sequence);
+    selector->before_select = [&script](std::size_t) { script.on_select(); };
+    auto observed = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(observed);
+    script.enter(1'000);
+    const iom::TokenGenerationResult result =
+            observed->generate_tokens(prompt, 4);
+    CHECK(result.token_ids == expected.token_ids);
+    CHECK(result.stop_reason == expected.stop_reason);
+    CHECK_EQ(SessionAccess::caches(*observed)[0].initialized_length,
+             SessionAccess::caches(*plain)[0].initialized_length);
+
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    REQUIRE(snapshot.request_admitted);
+    CHECK_EQ(snapshot.admitted.ordinal, 1);
+    CHECK_EQ(snapshot.admitted.prompt_tokens, 2);
+    CHECK(snapshot.admitted.stop_reason_valid);
+    CHECK(snapshot.admitted.stop_reason == iom::GenerationStopReason::eos);
+    CHECK_EQ(snapshot.admitted.generated_tokens, 3);
+    CHECK_EQ(snapshot.admitted.decode_forward_count, 2);
+    CHECK_EQ(snapshot.admitted.decode_token_count, 2);
+    // TTFT starts at generation entry, before validation and setup, and ends
+    // at the first commit; the prefill-produced token is not a decode token.
+    CHECK(snapshot.admitted.time_to_first_token_valid);
+    CHECK_EQ(snapshot.admitted.time_to_first_token_ns, 200);
+    // The supplied clock advances only at a selection boundary, so a decode
+    // forward's readiness observation reads the same window as its interval
+    // start and the completion span is that window's zero elapsed time - which
+    // also rules out a span that wrongly ended at the later commit instant.
+    CHECK(snapshot.admitted.decode.state == iom::ObservationState::succeeded);
+    CHECK_EQ(snapshot.admitted.decode.host_nanoseconds, 0);
+    // The denominator sums both decode-start-to-commit intervals, which include
+    // the synchronous selection time.
+    CHECK(snapshot.admitted.decode_throughput_valid);
+    CHECK_EQ(snapshot.admitted.decode_throughput_denominator_ns, 700);
+    CHECK_EQ(snapshot.admitted.tokens_per_second,
+             doctest::Approx(2.0 / (700.0 / 1'000'000'000.0)));
+    CHECK(snapshot.attempt.outcome == iom::AttemptOutcome::succeeded);
+    // Every scripted window was consumed by exactly one selection.
+    CHECK_EQ(script.served, 3);
+    CHECK_FALSE(clock.unarmed_read);
+}
+
+TEST_CASE("Inference metrics generation counts a first-token EOS without decode work") {
+    ForwardFixture fixture("metrics-generation-first-eos", one_layer_config());
+    const std::vector<std::size_t> prompt{0, 1};
+    const std::vector<std::size_t> sequence{2};
+
+    auto plain = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<SequenceSelector>(sequence));
+    REQUIRE(plain);
+    const iom::TokenGenerationResult expected =
+            plain->generate_tokens(prompt, 4);
+    CHECK(expected.token_ids == sequence);
+    CHECK(expected.stop_reason == iom::GenerationStopReason::eos);
+
+    ObservationWindowClock clock;
+    clock.load_instants = {100, 200};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    GenerationWindowScript script{clock, {1'700}};
+    auto selector = std::make_unique<SequenceSelector>(sequence);
+    selector->before_select = [&script](std::size_t) { script.on_select(); };
+    auto observed = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(observed);
+    script.enter(1'000);
+    const iom::TokenGenerationResult result =
+            observed->generate_tokens(prompt, 4);
+    CHECK(result.token_ids == expected.token_ids);
+    CHECK(result.stop_reason == expected.stop_reason);
+
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    REQUIRE(snapshot.request_admitted);
+    CHECK(snapshot.admitted.stop_reason_valid);
+    CHECK(snapshot.admitted.stop_reason == iom::GenerationStopReason::eos);
+    CHECK_EQ(snapshot.admitted.generated_tokens, 1);
+    CHECK_EQ(snapshot.admitted.decode_forward_count, 0);
+    CHECK_EQ(snapshot.admitted.decode_token_count, 0);
+    CHECK(snapshot.admitted.time_to_first_token_valid);
+    CHECK_EQ(snapshot.admitted.time_to_first_token_ns, 700);
+    CHECK(snapshot.admitted.decode.state == iom::ObservationState::not_run);
+    CHECK_EQ(snapshot.admitted.decode_throughput_denominator_ns, 0);
+    CHECK_FALSE(snapshot.admitted.decode_throughput_valid);
+    CHECK_EQ(snapshot.admitted.tokens_per_second, 0.0);
+    // A first-token EOS is counted without a decode forward or a cache append.
+    CHECK_EQ(SessionAccess::caches(*observed)[0].initialized_length, 2);
+    CHECK_EQ(SessionAccess::caches(*observed)[0].initialized_length,
+             SessionAccess::caches(*plain)[0].initialized_length);
+    CHECK_EQ(script.served, 1);
+    CHECK_FALSE(clock.unarmed_read);
+}
+
+TEST_CASE("Inference metrics generation keeps terminal limit and context counting") {
+    const std::vector<std::size_t> prompt{0, 1};
+    const std::vector<std::size_t> sequence{4, 5, 6};
+
+    SUBCASE("requested limit") {
+        ForwardFixture fixture("metrics-generation-limit",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {1'200, 1'500}};
+        auto selector = std::make_unique<SequenceSelector>(sequence);
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        script.enter(1'000);
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 2);
+        CHECK(result.token_ids == std::vector<std::size_t>{4, 5});
+        CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+        const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+        CHECK(snapshot.admitted.stop_reason_valid);
+        CHECK(snapshot.admitted.stop_reason
+              == iom::GenerationStopReason::max_new_tokens);
+        CHECK_EQ(snapshot.admitted.generated_tokens, 2);
+        CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+        CHECK_EQ(snapshot.admitted.decode_token_count, 1);
+        CHECK_EQ(snapshot.admitted.decode_throughput_denominator_ns, 300);
+        CHECK(snapshot.admitted.decode_throughput_valid);
+        CHECK_EQ(script.served, 2);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+
+    SUBCASE("context capacity") {
+        nlohmann::json config = one_layer_config();
+        config["max_position_embeddings"] = 4;
+        ForwardFixture fixture("metrics-generation-context", config);
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {1'200, 1'500}};
+        auto selector = std::make_unique<SequenceSelector>(sequence);
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        script.enter(1'000);
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 8);
+        CHECK(result.token_ids == std::vector<std::size_t>{4, 5});
+        CHECK(result.stop_reason
+              == iom::GenerationStopReason::context_capacity);
+        const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+        CHECK(snapshot.admitted.stop_reason
+              == iom::GenerationStopReason::context_capacity);
+        CHECK_EQ(snapshot.admitted.generated_tokens, 2);
+        CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+        CHECK_EQ(snapshot.admitted.decode_token_count, 1);
+        // The terminal context token is counted without growing the cache.
+        CHECK_EQ(SessionAccess::history(*session).size(), 4);
+        CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 3);
+        CHECK_EQ(script.served, 2);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+}
+
+TEST_CASE("Inference metrics generation leaves zero-limit and zero-elapsed requests unrated") {
+    const std::vector<std::size_t> prompt{0, 1};
+
+    SUBCASE("zero limit") {
+        ForwardFixture fixture("metrics-generation-zero-limit",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        // A zero limit submits no selection at all, so no window is scripted.
+        GenerationWindowScript script{clock, {}};
+        auto selector =
+                std::make_unique<SequenceSelector>(std::vector<std::size_t>{4});
+        SequenceSelector* selector_observer = selector.get();
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        script.enter(1'000);
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 0);
+        CHECK(result.token_ids.empty());
+        CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+        const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+        REQUIRE(snapshot.request_admitted);
+        CHECK_EQ(snapshot.admitted.prompt_tokens, 2);
+        CHECK(snapshot.admitted.stop_reason_valid);
+        CHECK(snapshot.admitted.stop_reason
+              == iom::GenerationStopReason::max_new_tokens);
+        CHECK_EQ(snapshot.admitted.generated_tokens, 0);
+        CHECK_EQ(snapshot.admitted.decode_forward_count, 0);
+        CHECK_EQ(snapshot.admitted.decode_token_count, 0);
+        CHECK_FALSE(snapshot.admitted.time_to_first_token_valid);
+        CHECK_EQ(snapshot.admitted.time_to_first_token_ns, 0);
+        CHECK_FALSE(snapshot.admitted.decode_throughput_valid);
+        // The zero limit still provisions the prompt and submits no selection
+        // work; the generation entry is the only added clock read.
+        CHECK_EQ(selector_observer->calls, 0);
+        CHECK_EQ(session->request_length(), 2);
+        CHECK_FALSE(session->poisoned());
+        CHECK_EQ(script.served, 0);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+
+    SUBCASE("zero elapsed time") {
+        ForwardFixture fixture("metrics-generation-zero-elapsed",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {5'000, 5'000};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {5'000, 5'000}};
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4, 2});
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        script.enter(5'000);
+        const iom::TokenGenerationResult result =
+                session->generate_tokens(prompt, 4);
+        CHECK(result.token_ids == std::vector<std::size_t>{4, 2});
+        const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+        CHECK(snapshot.admitted.time_to_first_token_valid);
+        CHECK_EQ(snapshot.admitted.time_to_first_token_ns, 0);
+        CHECK_EQ(snapshot.admitted.generated_tokens, 2);
+        CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+        CHECK_EQ(snapshot.admitted.decode_token_count, 1);
+        CHECK(snapshot.admitted.decode.state == iom::ObservationState::succeeded);
+        CHECK_EQ(snapshot.admitted.decode.host_nanoseconds, 0);
+        // A zero denominator never fabricates a rate.
+        CHECK_EQ(snapshot.admitted.decode_throughput_denominator_ns, 0);
+        CHECK_FALSE(snapshot.admitted.decode_throughput_valid);
+        CHECK_EQ(snapshot.admitted.tokens_per_second, 0.0);
+        CHECK_EQ(script.served, 2);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+}
+
+TEST_CASE("Inference metrics generation refuses invalid selections after a completed decode") {
+    const std::vector<std::size_t> prompt{0, 1};
+
+    SUBCASE("out-of-range selection") {
+        ForwardFixture fixture("metrics-generation-out-of-range",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {1'200, 1'300}};
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{std::size_t{4}, std::size_t{19}});
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        script.enter(1'000);
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 4),
+                        std::invalid_argument);
+        CHECK(session->poisoned());
+        const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+        // The completed decode advanced only its completed-forward count; the
+        // invalid selection committed nothing and disabled the overall rate.
+        CHECK_EQ(snapshot.admitted.generated_tokens, 1);
+        CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+        CHECK_EQ(snapshot.admitted.decode_token_count, 0);
+        CHECK(snapshot.admitted.decode.state == iom::ObservationState::succeeded);
+        CHECK_FALSE(snapshot.admitted.decode_throughput_valid);
+        CHECK_EQ(snapshot.admitted.tokens_per_second, 0.0);
+        CHECK(snapshot.admitted.failure != nullptr);
+        CHECK(snapshot.attempt.outcome == iom::AttemptOutcome::failed);
+        CHECK(snapshot.attempt.failure != nullptr);
+        CHECK_EQ(script.served, 2);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+
+    SUBCASE("selector failure") {
+        ForwardFixture fixture("metrics-generation-selector-failure",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {1'200, 1'300}};
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4, 5});
+        SequenceSelector* selector_observer = selector.get();
+        // The failure is injected at the second selection, after the decode
+        // forward whose readiness was observed.
+        selector_observer->before_select = [selector_observer, &script](
+                                                   std::size_t served) {
+            if (served == 1) {
+                selector_observer->throw_failure = true;
+            }
+            script.on_select();
+        };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        script.enter(1'000);
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 4),
+                        std::runtime_error);
+        CHECK(session->poisoned());
+        const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+        CHECK_EQ(snapshot.admitted.generated_tokens, 1);
+        CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+        CHECK_EQ(snapshot.admitted.decode_token_count, 0);
+        CHECK_FALSE(snapshot.admitted.decode_throughput_valid);
+        CHECK(snapshot.admitted.failure != nullptr);
+        CHECK(snapshot.attempt.outcome == iom::AttemptOutcome::failed);
+        CHECK(snapshot.attempt.failure != nullptr);
+        CHECK_EQ(script.served, 2);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+}
+
+TEST_CASE("Inference metrics generation records a failed decode phase and keeps counters") {
+    ForwardFixture fixture("metrics-generation-decode-failure",
+                           one_layer_config());
+    const std::vector<std::size_t> prompt{0, 1};
+    ObservationWindowClock clock;
+    clock.load_instants = {100, 200};
+    iom::InferenceMetrics recorder(make_clock(clock));
+    GenerationWindowScript script{clock, {1'200, 1'500}};
+
+    auto selector = std::make_unique<SequenceSelector>(
+            std::vector<std::size_t>{4, 5, 6});
+    // The one-shot CPU append latch fails the second decode forward after its
+    // task was accepted, so the failure surfaces at that forward's existing
+    // readiness wait.
+    selector->before_select = [&script](std::size_t served) {
+        if (served == 1) {
+            iom::cpu_detail::arm_cache_append_failure();
+        }
+        script.on_select();
+    };
+    struct ClearLatch {
+        ~ClearLatch() { iom::cpu_detail::clear_cache_append_failure(); }
+    } clear_latch;
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(session);
+    script.enter(1'000);
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 4), std::runtime_error);
+    CHECK(session->poisoned());
+
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    // Completed work of the failed request stays inspectable; only the
+    // unobserved decode forward is recorded as a failed phase.
+    CHECK_EQ(snapshot.admitted.generated_tokens, 2);
+    CHECK_EQ(snapshot.admitted.decode_forward_count, 1);
+    CHECK_EQ(snapshot.admitted.decode_token_count, 1);
+    CHECK(snapshot.admitted.decode.state == iom::ObservationState::failed);
+    CHECK_EQ(snapshot.admitted.decode.host_nanoseconds, 0);
+    CHECK_FALSE(snapshot.admitted.decode_throughput_valid);
+    CHECK(snapshot.admitted.failure != nullptr);
+    CHECK(snapshot.attempt.outcome == iom::AttemptOutcome::failed);
+    CHECK(snapshot.attempt.failure != nullptr);
+    CHECK_EQ(script.served, 2);
+    CHECK_FALSE(clock.unarmed_read);
+
+    session.reset();
+    // The retained failing append keeps both operands in the device quarantine
+    // until the device is released.
+    CHECK_EQ(fixture.allocator.live, 2);
+    fixture.device.reset();
+    CHECK_EQ(fixture.allocator.live, 0);
+    CHECK_EQ(fixture.allocator.resets, 0);
+}
+
+TEST_CASE("Inference metrics generation keeps outgoing attribution on a failed candidate") {
+    const std::vector<std::size_t> prompt{0, 1};
+
+    SUBCASE("validation rejection") {
+        ForwardFixture fixture("metrics-generation-rejected-attempt",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {1'200, 2'900}};
+        auto selector = std::make_unique<SequenceSelector>(
+                std::vector<std::size_t>{4, 5});
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        session->prepare_operation_trace();
+        script.enter(1'000);
+        const iom::TokenGenerationResult first =
+                session->generate_tokens(prompt, 1);
+        CHECK(first.token_ids == std::vector<std::size_t>{4});
+        const iom::oid row = accepted_oid(1);
+        recorder.record_enqueue(row, iom::InferencePhase::prefill,
+                                std::nullopt, 0, 2, 5, 9);
+        REQUIRE_EQ(recorder.operations().size(), 1);
+
+        // A rejected prompt stages its own attempt and consumes its entry
+        // instant without publishing anything.
+        const std::array<std::size_t, 0> empty{};
+        CHECK_THROWS_AS(session->generate_tokens(empty, 1),
+                        std::invalid_argument);
+        CHECK_FALSE(session->poisoned());
+        CHECK_EQ(session->request_length(), 2);
+        const iom::InferenceSnapshot& rejected = recorder.snapshot();
+        CHECK_EQ(rejected.attempt.ordinal, 2);
+        CHECK(rejected.attempt.outcome == iom::AttemptOutcome::failed);
+        CHECK(rejected.attempt.failure != nullptr);
+        CHECK_EQ(rejected.attempt.prompt_tokens, 0);
+        // The outgoing admitted request, its counters, and its rows survive.
+        CHECK_EQ(rejected.admitted.ordinal, 1);
+        CHECK_EQ(rejected.admitted.generated_tokens, 1);
+        CHECK_EQ(rejected.admitted.time_to_first_token_ns, 200);
+        CHECK(rejected.admitted.stop_reason_valid);
+        CHECK(rejected.admitted.stop_reason
+              == iom::GenerationStopReason::max_new_tokens);
+        REQUIRE_EQ(recorder.operations().size(), 1);
+        CHECK_EQ(recorder.operations()[0].operation, row);
+        // The candidate consumed only its entry window and published nothing.
+        CHECK_EQ(script.served, 1);
+        CHECK_FALSE(clock.unarmed_read);
+
+        // The next published request takes the next ordinal and resets the
+        // request-scoped scalars and rows.
+        script.enter(2'500);
+        const iom::TokenGenerationResult second =
+                session->generate_tokens(prompt, 1);
+        CHECK(second.token_ids == std::vector<std::size_t>{5});
+        const iom::InferenceSnapshot& published = recorder.snapshot();
+        CHECK_EQ(published.admitted.ordinal, 2);
+        CHECK_EQ(published.admitted.prompt_tokens, 2);
+        CHECK_EQ(published.admitted.generated_tokens, 1);
+        CHECK_EQ(published.admitted.time_to_first_token_ns, 400);
+        CHECK(published.admitted.stop_reason
+              == iom::GenerationStopReason::max_new_tokens);
+        CHECK(published.attempt.outcome == iom::AttemptOutcome::succeeded);
+        CHECK(recorder.operations().empty());
+        // The next selection consumed the second scripted window.
+        CHECK_EQ(script.served, 2);
+        CHECK_FALSE(clock.unarmed_read);
+    }
+
+    SUBCASE("failed old drain") {
+        ForwardFixture fixture("metrics-generation-failed-drain",
+                               one_layer_config());
+        ObservationWindowClock clock;
+        clock.load_instants = {100, 200};
+        iom::InferenceMetrics recorder(make_clock(clock));
+        GenerationWindowScript script{clock, {1'500}};
+        auto selector =
+                std::make_unique<SequenceSelector>(std::vector<std::size_t>{4});
+        selector->before_select = [&script](std::size_t) { script.on_select(); };
+        auto session = iom::load_tinyllama_session(
+                fixture.directory.path(), *fixture.device, std::move(selector),
+                &recorder);
+        REQUIRE(session);
+        session->prepare_operation_trace();
+        script.enter(1'000);
+        const iom::TokenGenerationResult first =
+                session->generate_tokens(prompt, 1);
+        CHECK(first.token_ids == std::vector<std::size_t>{4});
+        const iom::oid row = accepted_oid(4);
+        recorder.record_enqueue(row, iom::InferencePhase::decode, std::nullopt,
+                                2, 1, 15, 45);
+        REQUIRE_EQ(recorder.operations().size(), 1);
+
+        // An accepted append fails while the candidate request drains it, so
+        // the candidate fails before it publishes anything.
+        const auto& banks = SessionAccess::prefill(*session);
+        const auto caches = SessionAccess::caches(*session);
+        std::vector<std::byte> bytes(banks.k->view().spec().logical_nbytes(),
+                                     std::byte{0});
+        banks.k->view().copy_from_host(bytes);
+        banks.v->view().copy_from_host(bytes);
+        struct ClearLatch {
+            ~ClearLatch() { iom::cpu_detail::clear_cache_append_failure(); }
+        } clear_latch;
+        iom::cpu_detail::arm_cache_append_failure();
+        SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+            return queue.cache_append(banks.k->view(), caches[0].key->view(),
+                                      caches[0].initialized_length);
+        });
+        script.enter(2'000);
+        CHECK_THROWS_AS(session->generate_tokens(prompt, 1),
+                        std::runtime_error);
+        CHECK(session->poisoned());
+
+        const iom::InferenceSnapshot& failed = recorder.snapshot();
+        CHECK_EQ(failed.attempt.ordinal, 2);
+        CHECK(failed.attempt.outcome == iom::AttemptOutcome::failed);
+        CHECK_EQ(failed.attempt.prompt_tokens, 2);
+        CHECK(failed.attempt.failure != nullptr);
+        // The failed old drain is attributed to the candidate attempt, never
+        // to the admitted request, which keeps its counters and its rows.
+        CHECK_EQ(failed.admitted.ordinal, 1);
+        CHECK_EQ(failed.admitted.generated_tokens, 1);
+        CHECK_EQ(failed.admitted.time_to_first_token_ns, 500);
+        REQUIRE_EQ(recorder.operations().size(), 1);
+        CHECK_EQ(recorder.operations()[0].operation, row);
+        // The candidate consumed only its entry window and published nothing.
+        CHECK_EQ(script.served, 1);
+        CHECK_FALSE(clock.unarmed_read);
+
+        session.reset();
+        CHECK_EQ(fixture.allocator.live, 2);
+        fixture.device.reset();
+        CHECK_EQ(fixture.allocator.live, 0);
+        CHECK_EQ(fixture.allocator.resets, 0);
+    }
+}
 
 TEST_CASE("Inference metrics session load preserves attribution across a failed drain") {
     SessionFixture fixture;
