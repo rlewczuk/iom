@@ -2,18 +2,22 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2189,3 +2193,1067 @@ TEST_CASE(
                         "rejected residual output");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attention-normalization, QKV projection, and Q/K RoPE stage cases
+// (leaf 03-qkv-rope-stage).
+//
+// Every case builds supplied BF16 tensors directly on a CPU device and calls
+// the private stage through its implementation-private declaration. No
+// session, model checkpoint, tokenizer, cache, selector, generation, or CLI
+// resource is constructed, so the stage is proven usable before session
+// resource ownership exists.
+//
+// The reference is independent: it decodes the supplied BF16 codes itself,
+// re-derives the RMSNorm reduction, the Hugging Face `[out,in]` head-planar
+// projection, and the split-half rotation from the operation-owned equations,
+// and never calls production arithmetic. Each stage boundary is compared
+// under the shared conformance harness' BF16 policy
+// `max(one destination ULP, 2^-7, 2^-6 * |reference|)`; the downstream
+// boundary references consume the *observed* upstream BF16 values, so a
+// rounding at one boundary cannot be amplified into an unrelated mismatch.
+// ---------------------------------------------------------------------------
+
+namespace qkv_rope_stage_test {
+
+    using iom::Device;
+    using iom::DeviceOps;
+    using iom::Tensor;
+    using iom::TensorShape;
+    using iom::TensorSpec;
+    using iom::TensorView;
+    using iom::oid;
+
+    constexpr iom::DataType kLeaf = iom::DataType::BF16;
+
+    // ------------------------------------------------------------------
+    // Independent BF16 codec, reference arithmetic, and comparison policy.
+    // ------------------------------------------------------------------
+
+    [[nodiscard]] std::uint16_t bf16_code(double value) {
+        const float narrowed = static_cast<float>(value);
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &narrowed, sizeof(bits));
+        const std::uint32_t sign = bits & 0x80000000u;
+        const std::uint32_t magnitude = bits & 0x7fffffffu;
+        // Round to nearest, ties to even, over the 16 discarded bits.
+        const std::uint32_t rounded =
+                magnitude + 0x7fffu + ((magnitude >> 16) & 1u);
+        return static_cast<std::uint16_t>((sign >> 16) | (rounded >> 16));
+    }
+
+    [[nodiscard]] double bf16_value(std::uint16_t code) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(code) << 16;
+        float narrowed = 0.0F;
+        std::memcpy(&narrowed, &bits, sizeof(narrowed));
+        return static_cast<double>(narrowed);
+    }
+
+    [[nodiscard]] double bf16_ulp(double value) {
+        if (value == 0.0) {
+            return std::ldexp(1.0, -133);
+        }
+        return std::ldexp(1.0, std::ilogb(std::fabs(value)) - 7);
+    }
+
+    // One stored BF16 operation boundary.
+    [[nodiscard]] double stored(double value) {
+        return bf16_value(bf16_code(value));
+    }
+
+    [[nodiscard]] std::vector<double> reference_normalization(
+            std::span<const double> activation, std::size_t rows,
+            std::size_t features, std::span<const double> scale,
+            float epsilon) {
+        std::vector<double> normalized(activation.size());
+        const double divisor = static_cast<double>(features);
+        for (std::size_t row = 0; row < rows; ++row) {
+            double sum = 0.0;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                const double value = activation[row * features + feature];
+                sum += value * value;
+            }
+            const double inverse =
+                    1.0 / std::sqrt(sum / divisor + static_cast<double>(epsilon));
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                normalized[row * features + feature] =
+                        stored(activation[row * features + feature] * inverse
+                               * scale[feature]);
+            }
+        }
+        return normalized;
+    }
+
+    // `out[h,r,d] = sum_i normalized[r,i] * weight[h*D+d,i]` with the
+    // Hugging Face `[out,in]` weight consumed unchanged.
+    [[nodiscard]] std::vector<double> reference_head_planar(
+            std::span<const double> normalized, std::size_t rows,
+            std::size_t features, std::span<const double> weight,
+            std::size_t heads, std::size_t head_dim) {
+        std::vector<double> projected(heads * rows * head_dim);
+        for (std::size_t head = 0; head < heads; ++head) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                for (std::size_t element = 0; element < head_dim;
+                        ++element) {
+                    const std::size_t output_row = head * head_dim + element;
+                    double sum = 0.0;
+                    for (std::size_t feature = 0; feature < features;
+                            ++feature) {
+                        sum += normalized[row * features + feature]
+                                * weight[output_row * features + feature];
+                    }
+                    projected[(head * rows + row) * head_dim + element] =
+                            stored(sum);
+                }
+            }
+        }
+        return projected;
+    }
+
+    // Split-half rotation at absolute position `a + r`.
+    [[nodiscard]] std::vector<double> reference_rope(
+            std::span<const double> projected, std::size_t heads,
+            std::size_t rows, std::size_t head_dim, std::size_t a,
+            double theta) {
+        std::vector<double> rotated(projected.size());
+        const std::size_t half = head_dim / 2;
+        for (std::size_t head = 0; head < heads; ++head) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const double position = static_cast<double>(a + row);
+                const std::size_t base = (head * rows + row) * head_dim;
+                for (std::size_t pair = 0; pair < half; ++pair) {
+                    const double angle = position
+                            * std::pow(theta,
+                                       -2.0 * static_cast<double>(pair)
+                                               / static_cast<double>(head_dim));
+                    const double cosine = std::cos(angle);
+                    const double sine = std::sin(angle);
+                    const double first = projected[base + pair];
+                    const double second = projected[base + half + pair];
+                    rotated[base + pair] =
+                            stored(first * cosine - second * sine);
+                    rotated[base + half + pair] =
+                            stored(second * cosine + first * sine);
+                }
+            }
+        }
+        return rotated;
+    }
+
+    void require_reference(
+            std::span<const double> observed,
+            std::span<const double> reference, const char* label) {
+        REQUIRE(observed.size() == reference.size());
+        for (std::size_t index = 0; index < observed.size(); ++index) {
+            const double expected = stored(reference[index]);
+            const double bound = std::max(
+                    {bf16_ulp(expected), std::ldexp(1.0, -7),
+                     std::ldexp(1.0, -6) * std::fabs(expected)});
+            INFO(label << " element " << index << ": observed "
+                       << observed[index] << ", reference " << expected);
+            REQUIRE(std::isfinite(observed[index]));
+            REQUIRE(std::fabs(observed[index] - expected) <= bound);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Supplied tensors, synthetic values, and caller-provisioned views.
+    // ------------------------------------------------------------------
+
+    class HeapAllocator final : public iom::Allocator {
+    public:
+        void* alloc(std::size_t bytes) override {
+            return ::operator new(
+                    std::max<std::size_t>(bytes, 1), std::align_val_t{32});
+        }
+
+        void free(void* address) override {
+            ::operator delete(address, std::align_val_t{32});
+        }
+
+        void reset() override {}
+    };
+
+    struct CpuFixture {
+        HeapAllocator allocator;
+        std::unique_ptr<Device> device = iom::make_cpu_device(allocator);
+        std::unique_ptr<DeviceOps> queue = device->create_ops();
+    };
+
+    // Head geometry of one invocation. `features` is `Hq*D` and the KV
+    // weights have `Hkv*D` output rows, so grouped-query attention is
+    // represented without any repeated KV head.
+    struct Geometry {
+        std::size_t rows = 0;
+        std::size_t query_heads = 0;
+        std::size_t kv_heads = 0;
+        std::size_t head_dim = 0;
+
+        [[nodiscard]] std::size_t features() const noexcept {
+            return query_heads * head_dim;
+        }
+
+        [[nodiscard]] std::size_t key_value_outputs() const noexcept {
+            return kv_heads * head_dim;
+        }
+    };
+
+    // Nonsymmetric, role-specific values on a small dyadic grid, so a
+    // swapped Q/K/V role, an off-by-one row, or a shared head mapping is
+    // observably wrong and both operands of every product are exactly
+    // representable in BF16.
+    [[nodiscard]] double sample(std::size_t role, std::size_t index) {
+        const std::size_t pattern =
+                (role * 5 + index * 3 + (index / 7) * 11) % 23;
+        const double magnitude =
+                0.25 * static_cast<double>(pattern % 9 + 1);
+        return (pattern % 2 == 0) ? magnitude : -magnitude;
+    }
+
+    [[nodiscard]] std::vector<double> sampled(
+            std::size_t role, std::size_t count) {
+        std::vector<double> values(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            values[index] = sample(role, index);
+        }
+        return values;
+    }
+
+    [[nodiscard]] std::vector<double> constant(
+            double value, std::size_t count) {
+        return std::vector<double>(count, value);
+    }
+
+    [[nodiscard]] TensorSpec matrix_spec(
+            std::size_t planes, std::size_t rows, std::size_t columns) {
+        if (planes == 1) {
+            return TensorSpec{TensorShape{{rows, columns}}, kLeaf};
+        }
+        return TensorSpec{TensorShape{{planes, rows, columns}}, kLeaf};
+    }
+
+    [[nodiscard]] TensorSpec head_spec(std::size_t planes,
+            std::size_t heads, std::size_t rows, std::size_t head_dim) {
+        if (planes == 1) {
+            return TensorSpec{TensorShape{{heads, rows, head_dim}}, kLeaf};
+        }
+        return TensorSpec{
+                TensorShape{{planes, heads, rows, head_dim}}, kLeaf};
+    }
+
+    // Owner storage of one invocation. `planes == 2` places every operand in
+    // the second plane of a larger owner, so the stage receives genuinely
+    // offset, transformed views.
+    struct StageBundle {
+        std::unique_ptr<Tensor> activation;
+        std::unique_ptr<Tensor> attention_scale;
+        std::unique_ptr<Tensor> query_weight;
+        std::unique_ptr<Tensor> key_weight;
+        std::unique_ptr<Tensor> value_weight;
+        std::unique_ptr<Tensor> normalized;
+        std::unique_ptr<Tensor> query;
+        std::unique_ptr<Tensor> key;
+        std::unique_ptr<Tensor> value;
+        std::unique_ptr<Tensor> rotated_query;
+        std::unique_ptr<Tensor> rotated_key;
+        std::size_t planes = 1;
+
+        StageBundle(Device& device, const Geometry& geometry,
+                    std::size_t plane_count)
+            : planes(plane_count) {
+            const std::size_t features = geometry.features();
+            const std::size_t key_value_outputs = geometry.key_value_outputs();
+            activation = device.create_tensor(
+                    matrix_spec(planes, geometry.rows, features));
+            attention_scale = device.create_tensor(
+                    matrix_spec(planes, 1, features));
+            query_weight = device.create_tensor(
+                    matrix_spec(planes, features, features));
+            key_weight = device.create_tensor(
+                    matrix_spec(planes, key_value_outputs, features));
+            value_weight = device.create_tensor(
+                    matrix_spec(planes, key_value_outputs, features));
+            normalized = device.create_tensor(
+                    matrix_spec(planes, geometry.rows, features));
+            query = device.create_tensor(head_spec(planes,
+                    geometry.query_heads, geometry.rows,
+                    geometry.head_dim));
+            key = device.create_tensor(head_spec(planes, geometry.kv_heads,
+                    geometry.rows, geometry.head_dim));
+            value = device.create_tensor(head_spec(planes,
+                    geometry.kv_heads, geometry.rows, geometry.head_dim));
+            rotated_query = device.create_tensor(head_spec(planes,
+                    geometry.query_heads, geometry.rows,
+                    geometry.head_dim));
+            rotated_key = device.create_tensor(head_spec(planes,
+                    geometry.kv_heads, geometry.rows, geometry.head_dim));
+        }
+
+        [[nodiscard]] std::size_t selected_plane() const noexcept {
+            return planes - 1;
+        }
+
+        [[nodiscard]] TensorView plane_view(
+                Tensor& owner, std::size_t plane) const {
+            if (planes == 1) {
+                return owner.view();
+            }
+            return owner.view().select(0, plane);
+        }
+
+        [[nodiscard]] TensorView selected(Tensor& owner) const {
+            return plane_view(owner, selected_plane());
+        }
+
+        [[nodiscard]] iom::session_detail::QkvRopeStageViews views() {
+            const std::size_t plane = selected_plane();
+            return iom::session_detail::QkvRopeStageViews{
+                    plane_view(*activation, plane),
+                    plane_view(*attention_scale, plane),
+                    plane_view(*query_weight, plane),
+                    plane_view(*key_weight, plane),
+                    plane_view(*value_weight, plane),
+                    plane_view(*normalized, plane),
+                    plane_view(*query, plane),
+                    plane_view(*key, plane),
+                    plane_view(*value, plane),
+                    plane_view(*rotated_query, plane),
+                    plane_view(*rotated_key, plane)};
+        }
+    };
+
+    // Supplied host values of one invocation.
+    struct StageCase {
+        Geometry geometry;
+        std::size_t a = 0;
+        double theta = 10000.0;
+        float epsilon = 1.0e-5F;
+        std::vector<double> activation;
+        std::vector<double> attention_scale;
+        std::vector<double> query_weight;
+        std::vector<double> key_weight;
+        std::vector<double> value_weight;
+
+        [[nodiscard]] iom::session_detail::QkvRopeStageParams params() const {
+            return iom::session_detail::QkvRopeStageParams{
+                    a, geometry.rows, theta, epsilon};
+        }
+    };
+
+    [[nodiscard]] StageCase make_case(
+            const Geometry& geometry, std::size_t a, double theta) {
+        StageCase fixture;
+        fixture.geometry = geometry;
+        fixture.a = a;
+        fixture.theta = theta;
+        const std::size_t features = geometry.features();
+        const std::size_t key_value_outputs = geometry.key_value_outputs();
+        fixture.activation = sampled(1, geometry.rows * features);
+        fixture.attention_scale = sampled(2, features);
+        fixture.query_weight = sampled(3, features * features);
+        fixture.key_weight = sampled(4, key_value_outputs * features);
+        fixture.value_weight = sampled(5, key_value_outputs * features);
+        return fixture;
+    }
+
+    void upload(TensorView view, std::span<const double> values) {
+        REQUIRE(values.size() == view.spec().shape.element_count());
+        std::vector<std::byte> bytes(values.size() * 2);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const std::uint16_t code = bf16_code(values[index]);
+            bytes[2 * index] = static_cast<std::byte>(code & 0xffu);
+            bytes[2 * index + 1] = static_cast<std::byte>(code >> 8);
+        }
+        view.copy_from_host(bytes);
+    }
+
+    [[nodiscard]] std::vector<double> read(const TensorView& view) {
+        std::vector<std::byte> bytes(view.spec().logical_nbytes());
+        view.copy_to_host(bytes);
+        std::vector<double> values(bytes.size() / 2);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const std::uint16_t code = static_cast<std::uint16_t>(
+                    std::to_integer<std::uint16_t>(bytes[2 * index]))
+                    | static_cast<std::uint16_t>(
+                            std::to_integer<std::uint16_t>(
+                                    bytes[2 * index + 1]) << 8);
+            values[index] = bf16_value(code);
+        }
+        return values;
+    }
+
+    // Fills every physical padding slot of one owner with `code`, so a
+    // padded read is observable and a padding-independent result is proven.
+    void poison_padding(Tensor& owner, std::uint16_t code) {
+        const TensorSpec spec = owner.view().spec();
+        const std::span<const std::size_t> dimensions =
+                spec.shape.dimensions();
+        const std::size_t rows = dimensions[dimensions.size() - 2];
+        const std::size_t columns = dimensions[dimensions.size() - 1];
+        const TensorShape padded = spec.standard_padded_shape();
+        const std::size_t padded_rows =
+                padded.dimension(dimensions.size() - 2);
+        const std::size_t padded_columns =
+                padded.dimension(dimensions.size() - 1);
+        std::size_t planes = 1;
+        for (std::size_t axis = 0; axis + 2 < dimensions.size(); ++axis) {
+            planes *= dimensions[axis];
+        }
+        auto* storage =
+                static_cast<std::uint8_t*>(owner.view().native_handle());
+        for (std::size_t plane = 0; plane < planes; ++plane) {
+            for (std::size_t row = 0; row < padded_rows; ++row) {
+                for (std::size_t column = 0; column < padded_columns;
+                        ++column) {
+                    if (row < rows && column < columns) {
+                        continue;
+                    }
+                    const std::size_t slot = iom::detail::standard_plane_slot(
+                            spec, plane, row, column);
+                    storage[2 * slot] =
+                            static_cast<std::uint8_t>(code & 0xffu);
+                    storage[2 * slot + 1] =
+                            static_cast<std::uint8_t>(code >> 8);
+                }
+            }
+        }
+    }
+
+    // Loads the real operands into the view's plane, a distinguishable decoy
+    // into every other plane, and `padding_code` into every padding slot.
+    void load_case(StageBundle& bundle, const StageCase& fixture,
+                   std::uint16_t padding_code) {
+        const std::size_t plane = bundle.selected_plane();
+        upload(bundle.plane_view(*bundle.activation, plane),
+               fixture.activation);
+        upload(bundle.plane_view(*bundle.attention_scale, plane),
+               fixture.attention_scale);
+        upload(bundle.plane_view(*bundle.query_weight, plane),
+               fixture.query_weight);
+        upload(bundle.plane_view(*bundle.key_weight, plane),
+               fixture.key_weight);
+        upload(bundle.plane_view(*bundle.value_weight, plane),
+               fixture.value_weight);
+        if (bundle.planes == 2) {
+            upload(bundle.plane_view(*bundle.activation, 0),
+                   constant(9.0, fixture.activation.size()));
+            upload(bundle.plane_view(*bundle.attention_scale, 0),
+                   constant(7.5, fixture.attention_scale.size()));
+            upload(bundle.plane_view(*bundle.query_weight, 0),
+                   constant(-6.5, fixture.query_weight.size()));
+            upload(bundle.plane_view(*bundle.key_weight, 0),
+                   constant(5.5, fixture.key_weight.size()));
+            upload(bundle.plane_view(*bundle.value_weight, 0),
+                   constant(-4.5, fixture.value_weight.size()));
+        }
+        poison_padding(*bundle.activation, padding_code);
+        poison_padding(*bundle.attention_scale, padding_code);
+        poison_padding(*bundle.query_weight, padding_code);
+        poison_padding(*bundle.key_weight, padding_code);
+        poison_padding(*bundle.value_weight, padding_code);
+        poison_padding(*bundle.normalized, padding_code);
+        poison_padding(*bundle.query, padding_code);
+        poison_padding(*bundle.key, padding_code);
+        poison_padding(*bundle.value, padding_code);
+        poison_padding(*bundle.rotated_query, padding_code);
+        poison_padding(*bundle.rotated_key, padding_code);
+    }
+
+    struct StageObservation {
+        std::vector<double> normalized;
+        std::vector<double> query;
+        std::vector<double> key;
+        std::vector<double> value;
+        std::vector<double> rotated_query;
+        std::vector<double> rotated_key;
+    };
+
+    // Runs one invocation over the supplied tensors. RMSNorm and RoPE
+    // consume no raw workspace on any retained backend, and this CPU device
+    // cannot create positive scratch, so the caller-provisioned projection
+    // slices are the admitted empty default.
+    [[nodiscard]] StageObservation run_stage(DeviceOps& queue,
+            StageBundle& bundle,
+            const iom::session_detail::QkvRopeStageParams& params) {
+        iom::session_detail::run_qkv_rope_stage(
+                queue, bundle.views(), params,
+                iom::session_detail::QkvRopeStageWorkspace{});
+        StageObservation observed;
+        observed.normalized = read(bundle.selected(*bundle.normalized));
+        observed.query = read(bundle.selected(*bundle.query));
+        observed.key = read(bundle.selected(*bundle.key));
+        observed.value = read(bundle.selected(*bundle.value));
+        observed.rotated_query = read(bundle.selected(*bundle.rotated_query));
+        observed.rotated_key = read(bundle.selected(*bundle.rotated_key));
+        return observed;
+    }
+
+    void require_differs(std::span<const double> first,
+            std::span<const double> second, const char* label) {
+        REQUIRE(first.size() == second.size());
+        bool differs = false;
+        for (std::size_t index = 0; index < first.size(); ++index) {
+            if (std::fabs(first[index] - second[index]) > 1.0e-3) {
+                differs = true;
+            }
+        }
+        INFO(label);
+        REQUIRE(differs);
+    }
+
+    void require_identical(std::span<const double> first,
+            std::span<const double> second, const char* label) {
+        REQUIRE(first.size() == second.size());
+        for (std::size_t index = 0; index < first.size(); ++index) {
+            INFO(label << " element " << index << ": " << first[index]
+                       << " vs " << second[index]);
+            REQUIRE(first[index] == second[index]);
+        }
+    }
+
+    void require_all_equal(std::span<const double> values, double expected,
+                           const char* label) {
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            INFO(label << " element " << index << ": " << values[index]);
+            REQUIRE(values[index] == expected);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Recording stub queue: observes the stage's submission order and its
+    // branch waits, and injects a branch failure through the established
+    // accepted-failure / admission-rejection seam.
+    // ------------------------------------------------------------------
+
+    class ProbeQueue final : public DeviceOps {
+    public:
+        explicit ProbeQueue(const Device& device) : DeviceOps(device) {}
+
+        void defer(bool enabled) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            deferred_ = enabled;
+        }
+
+        // `index` counts linear submissions. An empty message rejects that
+        // branch synchronously; a message makes it an accepted branch whose
+        // completion retains the failure.
+        void fail_linear(std::size_t index, std::string message) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failed_index_ = index;
+            failure_message_ = std::move(message);
+        }
+
+        [[nodiscard]] std::vector<std::string> trace() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return trace_;
+        }
+
+        [[nodiscard]] std::size_t pending() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return pending_.size();
+        }
+
+        [[nodiscard]] std::vector<oid> accepted() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return accepted_;
+        }
+
+        [[nodiscard]] std::vector<oid> failed() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return failed_;
+        }
+
+        // Completes every currently pending deferred submission in
+        // submission order.
+        void release() {
+            std::vector<std::uint64_t> pending;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pending.swap(pending_);
+            }
+            for (const std::uint64_t sequence : pending) {
+                complete(sequence);
+            }
+        }
+
+        // Waits for one submission checkpoint: the expected number of
+        // recorded submissions is present *and* the expected number of them
+        // is still incomplete, so a missing producer wait is observable.
+        [[nodiscard]] bool await_state(
+                std::size_t trace_size, std::size_t pending) const {
+            const auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(10);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (trace().size() >= trace_size
+                        && pending_count() == pending) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return trace().size() >= trace_size && pending_count() == pending;
+        }
+
+        [[nodiscard]] std::size_t pending_count() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return pending_.size();
+        }
+
+        // Keeps completing accepted work until the stage has nothing left in
+        // flight. It bounds a failing implementation's ordering test instead
+        // of letting a missed wait hang the joining thread.
+        void settle() {
+            const auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(10);
+            std::size_t last = trace().size();
+            while (std::chrono::steady_clock::now() < deadline) {
+                defer(false);
+                release();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                if (trace().size() == last && pending() == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    if (trace().size() == last && pending() == 0) {
+                        return;
+                    }
+                }
+                last = trace().size();
+            }
+        }
+
+    protected:
+        oid rmsnorm_impl(const RmsnormRequest&) override {
+            record("rmsnorm");
+            return submit_named(std::string{});
+        }
+
+        oid linear_impl(const LinearRequest&) override {
+            bool reject = false;
+            std::string message;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const std::size_t index = linear_submissions_++;
+                reject = failed_index_ == index
+                        && failure_message_.empty();
+                if (failed_index_ == index) {
+                    message = failure_message_;
+                }
+            }
+            record("linear");
+            if (reject) {
+                throw std::invalid_argument(
+                        "probe queue rejected a projection branch");
+            }
+            return submit_named(std::move(message));
+        }
+
+        oid rope_impl(const RopeRequest&) override {
+            record("rope");
+            return submit_named(std::string{});
+        }
+
+        [[nodiscard]] bool rmsnorm_supported(
+                iom::DataType data_type) const override {
+            return data_type == kLeaf;
+        }
+
+        [[nodiscard]] iom::WorkspaceRequirements
+        linear_workspace_requirements_impl(const TensorView&,
+                const TensorView&, const TensorView&, std::size_t,
+                std::size_t, iom::LinearOutputLayout, std::size_t,
+                std::size_t) override {
+            return {0, 1};
+        }
+
+        [[nodiscard]] iom::WorkspaceRequirements rope_workspace_requirements(
+                const RopeRequest&) override {
+            return {0, 1};
+        }
+
+    private:
+        void record(const char* name) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            trace_.emplace_back(name);
+        }
+
+        [[nodiscard]] oid submit_named(std::string failure_message) {
+            const bool retains_failure = !failure_message.empty();
+            const oid token = submit(
+                    [this, message = std::move(failure_message)](
+                            std::uint64_t sequence) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (!message.empty()) {
+                            commit_failure(
+                                    sequence,
+                                    std::make_exception_ptr(
+                                            std::runtime_error(message)));
+                            complete(sequence);
+                            return;
+                        }
+                        pending_.push_back(sequence);
+                        if (!deferred_) {
+                            pending_.pop_back();
+                            complete(sequence);
+                        }
+                    });
+            std::lock_guard<std::mutex> lock(mutex_);
+            accepted_.push_back(token);
+            if (retains_failure) {
+                failed_.push_back(token);
+            }
+            return token;
+        }
+
+        mutable std::mutex mutex_;
+        std::vector<std::string> trace_;
+        std::vector<std::uint64_t> pending_;
+        std::vector<oid> accepted_;
+        std::vector<oid> failed_;
+        std::size_t linear_submissions_ = 0;
+        std::size_t failed_index_ = static_cast<std::size_t>(-1);
+        std::string failure_message_;
+        bool deferred_ = false;
+    };
+
+    // ------------------------------------------------------------------
+    // Cases.
+    // ------------------------------------------------------------------
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage prefill matches an independent "
+            "reference") {
+        CpuFixture fixture;
+        const Geometry geometry{15, 4, 2, 4};
+        const StageCase values = make_case(geometry, 3, 1234.5);
+        StageBundle bundle{*fixture.device, geometry, 1};
+        load_case(bundle, values, 0x7e00);
+        const StageObservation observed =
+                run_stage(*fixture.queue, bundle, values.params());
+
+        require_reference(observed.normalized,
+                reference_normalization(values.activation,
+                        geometry.rows, geometry.features(),
+                        values.attention_scale, values.epsilon),
+                "normalized activation");
+        // Downstream boundaries consume the observed upstream BF16 values,
+        // so the reference isolates one operation boundary at a time.
+        require_reference(observed.query,
+                reference_head_planar(observed.normalized, geometry.rows,
+                        geometry.features(), values.query_weight,
+                        geometry.query_heads, geometry.head_dim),
+                "query projection");
+        require_reference(observed.key,
+                reference_head_planar(observed.normalized, geometry.rows,
+                        geometry.features(), values.key_weight,
+                        geometry.kv_heads, geometry.head_dim),
+                "key projection");
+        require_reference(observed.value,
+                reference_head_planar(observed.normalized, geometry.rows,
+                        geometry.features(), values.value_weight,
+                        geometry.kv_heads, geometry.head_dim),
+                "value projection");
+        require_reference(observed.rotated_query,
+                reference_rope(observed.query, geometry.query_heads,
+                        geometry.rows, geometry.head_dim, values.a,
+                        values.theta),
+                "rotated query");
+        require_reference(observed.rotated_key,
+                reference_rope(observed.key, geometry.kv_heads,
+                        geometry.rows, geometry.head_dim, values.a,
+                        values.theta),
+                "rotated key");
+
+        // Rotation is applied to Q and K, K and V rows are independent, and
+        // the grouped-query head counts stay distinct.
+        require_differs(observed.rotated_query, observed.query,
+                "rotated query must differ from the query projection");
+        require_differs(observed.rotated_key, observed.key,
+                "rotated key must differ from the key projection");
+        require_differs(
+                std::span<const double>(observed.key).subspan(
+                        0, geometry.kv_heads * geometry.head_dim),
+                std::span<const double>(observed.value).subspan(
+                        0, geometry.kv_heads * geometry.head_dim),
+                "key and value rows must be distinct");
+    }
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage one-row decode uses the absolute "
+            "position") {
+        CpuFixture fixture;
+        const Geometry geometry{1, 4, 2, 2};
+        const StageCase values = make_case(geometry, 9, 10000.0);
+        StageBundle bundle{*fixture.device, geometry, 1};
+        load_case(bundle, values, 0x7c00);
+        const StageObservation positioned =
+                run_stage(*fixture.queue, bundle, values.params());
+
+        require_reference(positioned.normalized,
+                reference_normalization(values.activation,
+                        geometry.rows, geometry.features(),
+                        values.attention_scale, values.epsilon),
+                "decode normalized activation");
+        require_reference(positioned.rotated_query,
+                reference_rope(positioned.query, geometry.query_heads,
+                        geometry.rows, geometry.head_dim, values.a,
+                        values.theta),
+                "decode rotated query");
+        require_reference(positioned.rotated_key,
+                reference_rope(positioned.key, geometry.kv_heads,
+                        geometry.rows, geometry.head_dim, values.a,
+                        values.theta),
+                "decode rotated key");
+
+        StageCase origin = values;
+        origin.a = 0;
+        const StageObservation initial =
+                run_stage(*fixture.queue, bundle, origin.params());
+        // Only the rotation depends on the absolute position: the
+        // projections are identical, the rotated results are not.
+        require_identical(initial.normalized, positioned.normalized,
+                "normalization must not depend on the position");
+        require_identical(initial.query, positioned.query,
+                "query projection must not depend on the position");
+        require_identical(initial.key, positioned.key,
+                "key projection must not depend on the position");
+        require_differs(initial.rotated_query, positioned.rotated_query,
+                "rotated query must depend on the absolute position");
+        require_differs(initial.rotated_key, positioned.rotated_key,
+                "rotated key must depend on the absolute position");
+    }
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage isolates padding and offset views") {
+        CpuFixture fixture;
+        const Geometry geometry{15, 4, 2, 4};
+        const StageCase values = make_case(geometry, 2, 4096.0);
+        StageBundle bundle{*fixture.device, geometry, 2};
+        load_case(bundle, values, 0x7f00);
+        const StageObservation first =
+                run_stage(*fixture.queue, bundle, values.params());
+
+        require_reference(first.normalized,
+                reference_normalization(values.activation,
+                        geometry.rows, geometry.features(),
+                        values.attention_scale, values.epsilon),
+                "offset normalized activation");
+        require_reference(first.query,
+                reference_head_planar(first.normalized, geometry.rows,
+                        geometry.features(), values.query_weight,
+                        geometry.query_heads, geometry.head_dim),
+                "offset query projection");
+        require_reference(first.rotated_key,
+                reference_rope(first.key, geometry.kv_heads,
+                        geometry.rows, geometry.head_dim, values.a,
+                        values.theta),
+                "offset rotated key");
+
+        // Different physical padding and a different decoy plane may not
+        // change one logical result.
+        upload(bundle.plane_view(*bundle.activation, 0),
+               constant(-3.25, values.activation.size()));
+        upload(bundle.plane_view(*bundle.query_weight, 0),
+               constant(11.5, values.query_weight.size()));
+        for (Tensor* owner :
+                {bundle.activation.get(), bundle.attention_scale.get(),
+                 bundle.query_weight.get(), bundle.key_weight.get(),
+                 bundle.value_weight.get(), bundle.normalized.get(),
+                 bundle.query.get(), bundle.key.get(), bundle.value.get(),
+                 bundle.rotated_query.get(), bundle.rotated_key.get()}) {
+            poison_padding(*owner, 0x0001);
+        }
+        const StageObservation second =
+                run_stage(*fixture.queue, bundle, values.params());
+        require_identical(first.normalized, second.normalized,
+                "normalization must ignore padding and other planes");
+        require_identical(first.query, second.query,
+                "query projection must ignore padding and other planes");
+        require_identical(first.key, second.key,
+                "key projection must ignore padding and other planes");
+        require_identical(first.value, second.value,
+                "value projection must ignore padding and other planes");
+        require_identical(first.rotated_query, second.rotated_query,
+                "rotated query must ignore padding and other planes");
+        require_identical(first.rotated_key, second.rotated_key,
+                "rotated key must ignore padding and other planes");
+    }
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage preflights scalar and position "
+            "rejections") {
+        CpuFixture fixture;
+        const Geometry geometry{1, 2, 1, 2};
+        const StageCase values = make_case(geometry, 0, 10000.0);
+        StageBundle bundle{*fixture.device, geometry, 1};
+        load_case(bundle, values, 0x7d00);
+        ProbeQueue queue(*fixture.device);
+
+        auto invalid_theta = values.params();
+        invalid_theta.theta = 0.5;
+        CHECK_THROWS_AS(run_stage(queue, bundle, invalid_theta),
+                std::invalid_argument);
+        CHECK(queue.trace().empty());
+        CHECK(queue.pending() == 0);
+
+        auto overflowing_position = values.params();
+        overflowing_position.a =
+                std::numeric_limits<std::size_t>::max();
+        CHECK_THROWS_AS(run_stage(queue, bundle, overflowing_position),
+                std::overflow_error);
+        CHECK(queue.trace().empty());
+        CHECK(queue.pending() == 0);
+    }
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage orders projection and rotation "
+            "branches") {
+        CpuFixture fixture;
+        const Geometry geometry{4, 2, 1, 2};
+        const StageCase values = make_case(geometry, 1, 10000.0);
+        StageBundle bundle{*fixture.device, geometry, 1};
+        for (Tensor* owner :
+                {bundle.activation.get(), bundle.attention_scale.get(),
+                 bundle.query_weight.get(), bundle.key_weight.get(),
+                 bundle.value_weight.get()}) {
+            upload(owner->view(), constant(1.0,
+                    owner->view().spec().shape.element_count()));
+        }
+        ProbeQueue queue(*fixture.device);
+        queue.defer(true);
+
+        std::exception_ptr failure;
+        std::thread runner([&] {
+            try {
+                run_stage(queue, bundle, values.params());
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+
+        // The normalization is submitted and waited before any projection.
+        const bool normalized_submitted = queue.await_state(1, 1);
+        const std::vector<std::string> after_normalization = queue.trace();
+        const std::size_t pending_after_normalization = queue.pending();
+        queue.release();
+
+        // All three projections are submitted and none completes before
+        // either rotation is submitted.
+        const bool projections_submitted = queue.await_state(4, 3);
+        const std::vector<std::string> after_projections = queue.trace();
+        const std::size_t pending_after_projections = queue.pending();
+        queue.release();
+
+        // Only then are the two independent rotations submitted.
+        const bool rotations_submitted = queue.await_state(6, 2);
+        const std::vector<std::string> after_rotations = queue.trace();
+        const std::size_t pending_after_rotations = queue.pending();
+        queue.release();
+        queue.settle();
+        runner.join();
+
+        CHECK(normalized_submitted);
+        CHECK(after_normalization == std::vector<std::string>{"rmsnorm"});
+        CHECK(pending_after_normalization == 1);
+        CHECK(projections_submitted);
+        CHECK(after_projections
+                == std::vector<std::string>{
+                        "rmsnorm", "linear", "linear", "linear"});
+        CHECK(pending_after_projections == 3);
+        CHECK(rotations_submitted);
+        CHECK(after_rotations
+                == std::vector<std::string>{
+                        "rmsnorm", "linear", "linear", "linear", "rope",
+                        "rope"});
+        CHECK(pending_after_rotations == 2);
+        CHECK(failure == nullptr);
+    }
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage drains accepted branches after a "
+            "projection failure") {
+        CpuFixture fixture;
+        const Geometry geometry{4, 2, 1, 2};
+        const StageCase values = make_case(geometry, 5, 10000.0);
+        StageBundle bundle{*fixture.device, geometry, 1};
+        for (Tensor* owner :
+                {bundle.activation.get(), bundle.attention_scale.get(),
+                 bundle.query_weight.get(), bundle.key_weight.get(),
+                 bundle.value_weight.get(), bundle.normalized.get(),
+                 bundle.query.get(), bundle.key.get(), bundle.value.get(),
+                 bundle.rotated_query.get(), bundle.rotated_key.get()}) {
+            upload(owner->view(), constant(1.0,
+                    owner->view().spec().shape.element_count()));
+        }
+        ProbeQueue queue(*fixture.device);
+        queue.fail_linear(1, "key projection branch failed");
+
+        bool threw = false;
+        try {
+            run_stage(queue, bundle, values.params());
+        } catch (const std::exception& error) {
+            threw = std::string(error.what())
+                    == "key projection branch failed";
+        }
+        CHECK(threw);
+
+        // No dependent rotation was submitted, and every accepted branch of
+        // the stage is terminal.
+        CHECK(queue.trace()
+                == std::vector<std::string>{
+                        "rmsnorm", "linear", "linear", "linear"});
+        CHECK(queue.pending() == 0);
+        const std::vector<oid> failed = queue.failed();
+        REQUIRE(failed.size() == 1);
+        // The retained failure stays observable on repeated waits, and the
+        // drained branches stay repeat-waitable.
+        CHECK_THROWS_AS(queue.wait(failed[0]), std::runtime_error);
+        CHECK_THROWS_AS(queue.wait(failed[0]), std::runtime_error);
+        for (const oid token : queue.accepted()) {
+            if (token != failed[0]) {
+                CHECK_NOTHROW(queue.wait(token));
+            }
+        }
+        // No output was published as usable.
+        require_all_equal(read(bundle.selected(*bundle.rotated_query)), 1.0,
+                "rotated query must stay unpublished");
+        require_all_equal(read(bundle.selected(*bundle.rotated_key)), 1.0,
+                "rotated key must stay unpublished");
+    }
+
+    TEST_CASE(
+            "TinyLlama QKV RoPE stage drains accepted branches after a "
+            "rejected projection") {
+        CpuFixture fixture;
+        const Geometry geometry{4, 2, 1, 2};
+        const StageCase values = make_case(geometry, 5, 10000.0);
+        StageBundle bundle{*fixture.device, geometry, 1};
+        for (Tensor* owner :
+                {bundle.activation.get(), bundle.attention_scale.get(),
+                 bundle.query_weight.get(), bundle.key_weight.get(),
+                 bundle.value_weight.get(), bundle.normalized.get(),
+                 bundle.query.get(), bundle.key.get(), bundle.value.get(),
+                 bundle.rotated_query.get(), bundle.rotated_key.get()}) {
+            upload(owner->view(), constant(1.0,
+                    owner->view().spec().shape.element_count()));
+        }
+        ProbeQueue queue(*fixture.device);
+        queue.fail_linear(1, std::string{});
+
+        CHECK_THROWS_AS(run_stage(queue, bundle, values.params()),
+                std::invalid_argument);
+
+        CHECK(queue.trace()
+                == std::vector<std::string>{
+                        "rmsnorm", "linear", "linear", "linear"});
+        CHECK(queue.pending() == 0);
+        CHECK(queue.failed().empty());
+        for (const oid token : queue.accepted()) {
+            CHECK_NOTHROW(queue.wait(token));
+        }
+        require_all_equal(read(bundle.selected(*bundle.query)), 1.0,
+                "query projection must stay unpublished");
+        require_all_equal(read(bundle.selected(*bundle.rotated_query)), 1.0,
+                "rotated query must stay unpublished");
+        require_all_equal(read(bundle.selected(*bundle.rotated_key)), 1.0,
+                "rotated key must stay unpublished");
+    }
+
+}  // namespace qkv_rope_stage_test
