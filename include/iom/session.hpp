@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "iom/chat_format.hpp"
+#include "iom/inference_metrics.hpp"
 #include "iom/model.hpp"
 #include "iom/token_selection.hpp"
 #include "iom/tokenizer.hpp"
@@ -83,6 +84,20 @@ public:
     void prepare_request(
             std::size_t run_length, WorkspaceRequirements operation,
             TokenSelectorScratchRequirements selector_scratch);
+
+    /**
+     * Explicitly reserve this session's bounded operation trace before the
+     * first request.  The call is valid only with an attached
+     * `InferenceMetrics` recorder and only before the first request: an absent
+     * recorder is rejected with `std::invalid_argument`, and a call after
+     * request preparation is rejected with `std::logic_error`.  The
+     * reservation reuses the request ledger's checked accepted-OID capacity
+     * bound and may report `std::overflow_error` or `std::bad_alloc` before
+     * any inference work exists; tracing is enabled only after the reservation
+     * succeeds.  It performs no device work, adds no wait, and is not required
+     * for scalar observation.
+     */
+    void prepare_operation_trace();
  
     /**
      * Run one synchronous greedy token-generation request from low-level token
@@ -121,14 +136,25 @@ private:
             const std::filesystem::path&, Device&);
     friend std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
             const std::filesystem::path&, Device&,
-            std::unique_ptr<TokenSelector>);
+            std::unique_ptr<TokenSelector>, InferenceMetrics*);
 };
 
 [[nodiscard]] std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
         const std::filesystem::path& model_directory, Device& device);
 
+/**
+ * Load one session whose selector is supplied by the caller, optionally
+ * attaching one borrowed, caller-owned observation recorder.  The recorder is
+ * measured exactly once from this overload's entry through successful session
+ * publication or the failed unwind; the caller-supplied selector is
+ * constructed outside that interval, and outer device or allocator setup is
+ * never part of it.  A null recorder leaves every observation hook disabled.
+ * `load_tinyllama_session(path, device, nullptr)` is still the rejected
+ * null-selector call and never means disabled instrumentation.
+ */
 [[nodiscard]] std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
         const std::filesystem::path& model_directory, Device& device,
-        std::unique_ptr<TokenSelector> selector);
+        std::unique_ptr<TokenSelector> selector,
+        InferenceMetrics* metrics = nullptr);
 
 }  // namespace iom

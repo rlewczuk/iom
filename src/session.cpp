@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "iom/device.hpp"
+#include "iom/inference_metrics.hpp"
 #include "iom/iom.hpp"
 #include "iom/oid.hpp"
 #include "iom_internal.hpp"
@@ -122,6 +123,23 @@ void validate_vector_capacity(std::size_t count) {
     if (count > std::vector<T>{}.max_size()) {
         throw std::overflow_error("TinyLlama session host capacity overflows");
     }
+}
+
+// The one checked accepted-OID capacity bound of a validated configuration:
+// one prefill plus at most C-1 decode runs, including the per-run
+// embedding/final/transfer work rather than merely the prompt's R rows.
+// Request ledger sizing and explicit trace preparation share this bound, so a
+// prepared operation trace can always hold one complete request.
+[[nodiscard]] std::size_t accepted_oid_capacity(
+        const TinyLlamaConfig& config, const char* overflow_message) {
+    const std::size_t per_run = checked_add(
+            checked_mul(config.num_hidden_layers, kAcceptedOidsPerLayer,
+                        overflow_message),
+            kAcceptedOidBase, overflow_message);
+    const std::size_t capacity = checked_mul(
+            config.max_position_embeddings, per_run, overflow_message);
+    validate_vector_capacity<oid>(capacity);
+    return capacity;
 }
 
 void validate_persistent_storage(const TinyLlamaConfig& config) {
@@ -606,6 +624,12 @@ void validate_workspace_owner(
 struct TinyLlamaSession::Impl {
     Device* device = nullptr;
 
+    // Borrowed opt-in observation recorder. The caller owns it and keeps it
+    // and its supplied clock context alive through session destruction and
+    // drain; the session never owns, copies, replaces, or rejects it. A null
+    // value means every observation hook is disabled.
+    InferenceMetrics* metrics = nullptr;
+
     // Declaration order is intentional.  The queue is destroyed first so it
     // can close and drain while every tensor/workspace owner remains alive.
     std::unique_ptr<TinyLlamaModel> model;
@@ -750,17 +774,8 @@ struct TinyLlamaSession::Impl {
         validate_vector_capacity<std::byte>(selector_requirements.host_bytes);
         validate_vector_capacity<std::size_t>(config().max_position_embeddings);
         static_cast<void>(run_storage_bytes(config(), R));
-        // One prefill plus at most C-1 decode runs. Include the per-run
-        // embedding/final/transfer work, not merely the prompt's R rows.
-        const std::size_t per_run = checked_add(
-                checked_mul(config().num_hidden_layers, kAcceptedOidsPerLayer,
-                            "TinyLlama session accepted-OID capacity overflows"),
-                kAcceptedOidBase,
-                "TinyLlama session accepted-OID capacity overflows");
-        const std::size_t oid_capacity = checked_mul(
-                config().max_position_embeddings, per_run,
-                "TinyLlama session accepted-OID capacity overflows");
-        validate_vector_capacity<oid>(oid_capacity);
+        const std::size_t oid_capacity = accepted_oid_capacity(
+                config(), "TinyLlama session accepted-OID capacity overflows");
 
         // The caller must pass the exact requirement of this selector and the
         // fixed logical-R1 logits bank.  Querying is pure and happens before
@@ -814,6 +829,37 @@ struct TinyLlamaSession::Impl {
 
         // Publish only after every owner, range, and workspace is complete.
         request = std::move(candidate);
+
+        // The recorder ordinal advances only here, after the request was
+        // actually published: one publication replaces the admitted
+        // observation, clears the outgoing operation rows without freeing
+        // prepared trace storage, and publishes a staged attempt. Every
+        // earlier return above - a failed drain, a rejected requirement, or a
+        // failed candidate allocation - left the outgoing admitted observation
+        // and its rows untouched.
+        if (metrics != nullptr) {
+            metrics->publish_generation();
+        }
+    }
+
+    void prepare_operation_trace() {
+        if (metrics == nullptr) {
+            throw std::invalid_argument(
+                    "TinyLlama session operation trace requires an attached"
+                    " inference metrics recorder");
+        }
+        if (request != nullptr) {
+            throw std::logic_error(
+                    "TinyLlama session operation trace must be prepared before"
+                    " the first request");
+        }
+        // The reservation reuses the request ledger's checked accepted-OID
+        // bound, so a prepared trace always fits one complete request.
+        // Capacity overflow and allocation failure propagate from here, before
+        // any inference work exists, and tracing stays disabled because the
+        // recorder enables it only after its reservation succeeded.
+        metrics->prepare_trace(accepted_oid_capacity(
+                config(), "TinyLlama session accepted-OID capacity overflows"));
     }
 };
 
@@ -862,6 +908,10 @@ void TinyLlamaSession::prepare_request(
         std::size_t run_length, WorkspaceRequirements operation,
         TokenSelectorScratchRequirements selector_scratch) {
     impl_->prepare_request(run_length, operation, selector_scratch);
+}
+
+void TinyLlamaSession::prepare_operation_trace() {
+    impl_->prepare_operation_trace();
 }
 
 TokenGenerationResult TinyLlamaSession::generate_tokens(
@@ -1012,60 +1062,83 @@ std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
 
 std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
         const std::filesystem::path& model_directory, Device& device,
-        std::unique_ptr<TokenSelector> selector) {
-    // This is deliberately the first operation: a null selector is rejected
-    // before the session, queue, model, tokenizer, formatter, tensor, cache,
-    // workspace, history, result, or scratch allocation paths are touched.
-    if (!selector) {
-        throw std::invalid_argument(
-                "TinyLlama session selector must not be null");
+        std::unique_ptr<TokenSelector> selector, InferenceMetrics* metrics) {
+    // The instrumented interval starts here, before any validation, and ends
+    // at successful publication or the failed unwind below. Outer
+    // device/allocator setup and the construction of the caller-supplied
+    // selector are outside it. A null recorder reads no clock at all.
+    std::uint64_t load_begin = 0;
+    if (metrics != nullptr) {
+        load_begin = metrics->now();
     }
-    const auto supported = device.supported_data_types();
-    for (const DataType type : {DataType::BF16, DataType::U32}) {
-        if (std::find(supported.begin(), supported.end(), type) == supported.end())
+    try {
+        // This is deliberately the first operation: a null selector is rejected
+        // before the session, queue, model, tokenizer, formatter, tensor, cache,
+        // workspace, history, result, or scratch allocation paths are touched.
+        if (!selector) {
             throw std::invalid_argument(
-                    "TinyLlama session requires BF16 and U32 storage");
-    }
+                    "TinyLlama session selector must not be null");
+        }
+        const auto supported = device.supported_data_types();
+        for (const DataType type : {DataType::BF16, DataType::U32}) {
+            if (std::find(supported.begin(), supported.end(), type) == supported.end())
+                throw std::invalid_argument(
+                        "TinyLlama session requires BF16 and U32 storage");
+        }
 
-    auto impl = std::make_unique<TinyLlamaSession::Impl>();
-    impl->device = &device;
-    impl->selector = std::move(selector);
+        auto impl = std::make_unique<TinyLlamaSession::Impl>();
+        impl->device = &device;
+        impl->metrics = metrics;
+        impl->selector = std::move(selector);
 
-    // The model factory is the sole source of mapped checkpoint ownership and
-    // canonical uploaded weight owners.  No session-level weight copy exists.
-    impl->model = load_tinyllama_model(model_directory, device);
-    validate_persistent_storage(impl->model->config());
-    impl->tokenizer = load_tokenizer(model_directory);
-    impl->formatter = load_chat_formatter(model_directory);
-    impl->queue = device.create_ops();
-    if (!impl->queue) {
-        throw std::runtime_error(
-                "TinyLlama session device returned a null operation queue");
-    }
-    if (&impl->queue->device() != &device) {
-        throw std::invalid_argument(
-                "TinyLlama session queue belongs to another Device instance");
-    }
+        // The model factory is the sole source of mapped checkpoint ownership and
+        // canonical uploaded weight owners.  No session-level weight copy exists.
+        impl->model = load_tinyllama_model(model_directory, device);
+        validate_persistent_storage(impl->model->config());
+        impl->tokenizer = load_tokenizer(model_directory);
+        impl->formatter = load_chat_formatter(model_directory);
+        impl->queue = device.create_ops();
+        if (!impl->queue) {
+            throw std::runtime_error(
+                    "TinyLlama session device returned a null operation queue");
+        }
+        if (&impl->queue->device() != &device) {
+            throw std::invalid_argument(
+                    "TinyLlama session queue belongs to another Device instance");
+        }
 
-    // Persistent cache owners and all fixed-R1 decode roles are constructed
-    // only after model/configuration validation and exactly once per session.
-    const TinyLlamaConfig& config = impl->model->config();
-    impl->caches.reserve(config.num_hidden_layers);
-    for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
-        CacheOwner cache;
-        cache.key = make_tensor(device, {config.num_key_value_heads,
-                                         config.max_position_embeddings,
-                                         config.head_dim});
-        cache.value = make_tensor(device, {config.num_key_value_heads,
-                                           config.max_position_embeddings,
-                                           config.head_dim});
-        impl->caches.push_back(std::move(cache));
-    }
-    impl->fixed = allocate_run_banks(device, config, 1);
-    impl->logits = make_tensor(device, {1, config.vocab_size});
+        // Persistent cache owners and all fixed-R1 decode roles are constructed
+        // only after model/configuration validation and exactly once per session.
+        const TinyLlamaConfig& config = impl->model->config();
+        impl->caches.reserve(config.num_hidden_layers);
+        for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+            CacheOwner cache;
+            cache.key = make_tensor(device, {config.num_key_value_heads,
+                                             config.max_position_embeddings,
+                                             config.head_dim});
+            cache.value = make_tensor(device, {config.num_key_value_heads,
+                                               config.max_position_embeddings,
+                                               config.head_dim});
+            impl->caches.push_back(std::move(cache));
+        }
+        impl->fixed = allocate_run_banks(device, config, 1);
+        impl->logits = make_tensor(device, {1, config.vocab_size});
 
-    return std::unique_ptr<TinyLlamaSession>(
-            new TinyLlamaSession(std::move(impl)));
+        auto session = std::unique_ptr<TinyLlamaSession>(
+                new TinyLlamaSession(std::move(impl)));
+        if (metrics != nullptr) {
+            metrics->record_load(load_begin, metrics->now());
+        }
+        return session;
+    } catch (...) {
+        // The original exception category is rethrown unchanged; an enabled
+        // failure is recorded with no session, no timestamp, and no duration.
+        if (metrics != nullptr) {
+            metrics->record_load(load_begin, metrics->now(),
+                                 ObservationState::failed);
+        }
+        throw;
+    }
 }
 
 }  // namespace iom
@@ -1119,6 +1192,10 @@ std::span<const oid> SessionAccess::accepted(const TinyLlamaSession& session) {
     return session.impl_->request
             ? std::span<const oid>{session.impl_->request->accepted_oids}
             : std::span<const oid>{};
+}
+
+InferenceMetrics* SessionAccess::metrics(TinyLlamaSession& session) noexcept {
+    return session.impl_->metrics;
 }
 
 void SessionAccess::require_submission(TinyLlamaSession& session) {
@@ -2941,16 +3018,8 @@ void SessionAccess::prepare_forward_request(
     candidate->prefill_indices.resize(run_length);
     candidate->history.reserve(impl.config().max_position_embeddings);
     candidate->results.reserve(impl.config().max_position_embeddings);
-    const std::size_t per_run = checked_add(
-            checked_mul(
-                    impl.config().num_hidden_layers, kAcceptedOidsPerLayer,
-                    "TinyLlama forward accepted-OID capacity overflows"),
-            kAcceptedOidBase,
-            "TinyLlama forward accepted-OID capacity overflows");
-    const std::size_t oid_capacity = checked_mul(
-            impl.config().max_position_embeddings, per_run,
-            "TinyLlama forward accepted-OID capacity overflows");
-    validate_vector_capacity<oid>(oid_capacity);
+    const std::size_t oid_capacity = accepted_oid_capacity(
+            impl.config(), "TinyLlama forward accepted-OID capacity overflows");
     candidate->accepted_oids.reserve(oid_capacity);
 
     ForwardPlan plan = make_forward_plan(

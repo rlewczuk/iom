@@ -128,9 +128,10 @@ earlier one already fixes.
   extending the contract, and the rule that implementation, conformance,
   `ARCHITECTURE.md`, and this contract move together.
 - [14. Inference timing and observation](BACKEND_CONTRACT/inference-timing-and-observation.md) —
-  the caller-owned, backend-neutral `InferenceMetrics` recorder, its scalar and
-  bounded trace schemas, the supplied monotonic host clock, and the honest CPU,
-  CUDA, ROCm, and SYCL limitations on genuine device duration.
+  the caller-owned, backend-neutral `InferenceMetrics` recorder, its optional
+  session attachment with load observation and explicit trace preparation, its
+  scalar and bounded trace schemas, the supplied monotonic host clock, and the
+  honest CPU, CUDA, ROCm, and SYCL limitations on genuine device duration.
 
 ### Part III — Operation contracts
 

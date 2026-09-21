@@ -48,6 +48,64 @@ adapter.
    not add a wait, poll, or synchronization primitive that the existing
    queue/runtime does not already require.
 
+## Attachment, lifetime, and load
+
+1. At most one recorder is attached to one active nonreentrant session, and
+   it is borrowed, never owned. The session stores the nullable pointer; it
+   has no registry, callback, ownership transfer, queue wrapper, or
+   concurrency support, and it never replaces or rejects an attached
+   recorder. The caller owns the recorder and must keep it and its supplied
+   clock context alive until the session's ordinary destruction and drain
+   have completed. A null recorder means fully disabled observation: the
+   session reads no clock, allocates nothing for observation, registers
+   nothing, adds no wait, and adds no synchronization.
+2. `load_tinyllama_session(path, Device&, std::unique_ptr<TokenSelector>,
+   InferenceMetrics* = nullptr)` is the only instrumented factory. The
+   two-argument factory and the selector overload without a recorded
+   argument publish a session with no attached recorder. A null selector is
+   still rejected with `std::invalid_argument` before any capability query,
+   owner, or clock-dependent work: `load(path, device, nullptr)` is never a
+   request to disable instrumentation.
+3. The load span is measured exactly once per instrumented call, from that
+   call's entry through successful session publication or the failed
+   unwind. It covers the null-selector and capability validation, the
+   synchronous mapped-model upload, the tokenizer, the formatter, the
+   queue, the cache, scratch, and logits owners, and successful publication.
+   Outer device or allocator setup and the construction of the
+   caller-supplied selector are outside it. An enabled failure records the
+   failed load state with no duration, publishes no session, and rethrows
+   the original exception category unchanged; an enabled success records the
+   interval.
+4. `TinyLlamaSession::prepare_operation_trace()` is an explicit,
+   caller-controlled configuration operation. It is valid only with an
+   attached recorder and before the first request: an absent recorder is
+   rejected with `std::invalid_argument`, and a call after request
+   preparation is rejected with `std::logic_error`. The reservation reuses
+   the request ledger's checked accepted-OID capacity bound, so one prepared
+   trace always fits one complete request, and it may report
+   `std::overflow_error` (unrepresentable bound or table) or
+   `std::bad_alloc` (reservation failure) before any inference work exists.
+   Tracing is enabled only after the reservation succeeds, so a failed
+   preparation never partially enables it. The call performs no device work
+   and adds no wait, and scalar observation never requires it.
+5. Request publication is the only point that advances the admitted request
+   ordinal. Immediately after a successful request publication the session
+   publishes the staged attempt on the recorder, which replaces the admitted
+   observation and clears the outgoing operation rows without freeing the
+   prepared trace storage. A direct request with no staged attempt
+   establishes an empty admitted observation context. Failed drains, refused
+   poisoned requests, and failed candidate validation, allocation, or setup
+   leave the outgoing admitted observation and its rows untouched; a staged
+   attempt that never reached successful publication is reported as its own
+   attempt without overwriting the outgoing admitted request.
+6. Genuine device timing is unavailable with current CPU host execution,
+   with CUDA completion events created `cudaEventDisableTiming`, with ROCm
+   completion events created `hipEventDisableTiming`, and with SYCL queues
+   constructed `in_order` without profiling. Session attachment and load
+   observation therefore record host timing only: they add no vendor header,
+   no backend-kind switch, no native timer or event adapter, and make no
+   device-duration or kernel-time claim.
+
 ## Host clock
 
 1. The recorder's only timing source is a supplied monotonic host clock
