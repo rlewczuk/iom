@@ -517,12 +517,18 @@ bounded per-layer caches and fixed logical-run-one decode banks. Those owners
 remain at stable addresses and are not recreated merely because a later prompt
 has a different `R`.
 
-Weight realization follows create, preflight, provision, realize: session
-setup creates one persistent BF16 weight tensor per published inventory entry,
-preflights that complete ordered binding with
-`ModelSource::upload_workspace_requirements`, provisions the reusable
-host-transfer scratch its maximum requirement reports only after that query,
-and then calls `ModelSource::upload_weights` with that binding and scratch. The
+`load_tinyllama_session` owns one `TinyLlamaModel` returned by
+`load_tinyllama_model`, the same directory's tokenizer and chat formatter, one
+selector, and one queue on the borrowed device. The device must outlive the
+session. The injected-selector overload rejects null before any session work;
+the other overload owns a greedy selector. The session retains the model's
+canonical uploaded owners without another weight or checkpoint copy.
+
+Inside the model factory, weight realization follows create, preflight,
+provision, realize: it creates one persistent BF16 tensor per inventory entry,
+preflights that complete binding with
+`ModelSource::upload_workspace_requirements`, provisions the reported transfer
+scratch, and calls `ModelSource::upload_weights` with the binding and scratch. The
 preflight creates nothing, allocates no device scratch, and mutates no
 destination, so an invalid, foreign, or incomplete binding leaves session setup
 without an allocated transfer workspace. The realization itself allocates no
@@ -580,6 +586,18 @@ enough reusable workspace for the actual prefill, decode, host-transfer, and
 selector paths. A new request with a different `R` first drains every accepted
 OID from the old request, including failures, and only then replaces its
 prefill banks or workspace.
+
+The resource layer receives the exact operation/transfer maximum from its
+caller, checks the selector's separately reported scratch requirement, and
+validates sizes, alignments, ownership, and disjoint ranges before publication.
+All bank geometry, aggregate cache storage, history/result capacity, and the
+context-bounded accepted-OID ledger are checked before device allocation.
+Private resource access in `src/session_internal.hpp` retains each accepted
+submission without growing request buffers. A failed wait drains the other
+accepted OIDs and leaves poison sticky; replacement is refused. A synchronous
+candidate-allocation failure preserves the old, drained request. Destruction
+drains and closes the queue before releasing owners, preserving backend
+quarantine until the borrowed device can safely reclaim failed work.
 
 There is no family containing one bank for every possible `R`, no
 capacity-row logical-padding trick, no final-axis slice, no retargeted

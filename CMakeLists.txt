@@ -109,6 +109,7 @@ set(IOM_HEADERS
         include/iom/device.hpp
         include/iom/tensor.hpp
         include/iom/token_selection.hpp
+        include/iom/session.hpp
 )
 
 

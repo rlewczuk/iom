@@ -11,11 +11,75 @@
 
 #include <cstddef>
 #include <exception>
+#include <memory>
 #include <span>
+#include <vector>
+
 #include "iom/iom.hpp"
+#include "iom/session.hpp"
 #include "iom/tensor.hpp"
 
 namespace iom::session_detail {
+
+// Resource-only access for the later private forward/generation routines.
+// Owners and their full views stay fixed; none of these types is installed.
+struct RunBanks {
+    std::unique_ptr<Tensor> token_indices;
+    std::unique_ptr<Tensor> x;
+    std::unique_ptr<Tensor> attention_norm;
+    std::unique_ptr<Tensor> q;
+    std::unique_ptr<Tensor> k;
+    std::unique_ptr<Tensor> v;
+    std::unique_ptr<Tensor> rotated_q;
+    std::unique_ptr<Tensor> rotated_k;
+    std::unique_ptr<Tensor> attention_merged;
+    std::unique_ptr<Tensor> attention_output;
+    std::unique_ptr<Tensor> residual_after_attention;
+    std::unique_ptr<Tensor> mlp_norm;
+    std::unique_ptr<Tensor> gate;
+    std::unique_ptr<Tensor> up;
+    std::unique_ptr<Tensor> silu;
+    std::unique_ptr<Tensor> product;
+    std::unique_ptr<Tensor> down;
+    std::unique_ptr<Tensor> residual_after_mlp;
+    std::unique_ptr<Tensor> final_norm;
+};
+
+struct CacheOwner {
+    std::unique_ptr<Tensor> key;
+    std::unique_ptr<Tensor> value;
+    std::size_t initialized_length = 0;
+};
+
+struct SessionAccess {
+    static const RunBanks& prefill(TinyLlamaSession&);
+    static const RunBanks& decode(TinyLlamaSession&);
+    static TensorView& logits(TinyLlamaSession&);
+    static std::span<CacheOwner> caches(TinyLlamaSession&);
+    static RawWorkspaceView workspace(TinyLlamaSession&);
+    static TokenSelectorScratch selector_scratch(TinyLlamaSession&);
+    static std::vector<std::size_t>& history(TinyLlamaSession&);
+    static std::vector<std::size_t>& results(TinyLlamaSession&);
+    static std::span<const oid> accepted(const TinyLlamaSession&);
+
+    // Check the bounded ledger BEFORE submission, then retain the returned
+    // positive OID without allocation. Independent branches can be submitted
+    // separately before waiting. No second queue or type-erased callback.
+    template <class Submit>
+    static oid submit(TinyLlamaSession& session, Submit&& operation) {
+        require_submission(session);
+        return record_submission(session, operation(session.queue()));
+    }
+
+    // Failure is sticky; waits remain repeatable and a failed wait drains
+    // every other accepted OID before rethrowing the original exception.
+    static void wait(TinyLlamaSession&, oid);
+    static void drain(TinyLlamaSession&);
+
+private:
+    static void require_submission(TinyLlamaSession&);
+    static oid record_submission(TinyLlamaSession&, oid);
+};
 
 // ---------------------------------------------------------------------------
 // Post-attention SwiGLU MLP stage (leaf 05-mlp-stage).

@@ -1,13 +1,15 @@
 #include <doctest/doctest.h>
-
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -18,16 +20,388 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/device.hpp"
 #include "iom/iom.hpp"
+#include "iom/session.hpp"
 #include "iom/tensor.hpp"
-
 #include "../src/session_internal.hpp"
+#include "model_loading_fixture.hpp"
+#include "tokenizer_fixture.hpp"
+namespace {
+
+using iom_model_loading::TempDir;
+using iom_model_loading::one_layer_config;
+using iom_model_loading::required_weight_entries;
+using iom_model_loading::write_config;
+using iom_model_loading::write_file;
+using iom_model_loading::write_safetensors_file;
+using iom_tokenizer_test::write_tokenizer;
+using iom::session_detail::SessionAccess;
+
+class HeapAllocator final : public iom::Allocator {
+public:
+    std::size_t fail_after = std::numeric_limits<std::size_t>::max();
+    std::size_t allocations = 0;
+    std::size_t live = 0;
+    std::size_t resets = 0;
+
+    void* alloc(std::size_t bytes) override {
+        if (allocations++ >= fail_after) {
+            throw std::bad_alloc();
+        }
+        void* address = ::operator new(std::max<std::size_t>(bytes, 1),
+                                       std::align_val_t{32});
+        ++live;
+        return address;
+    }
+
+    void free(void* address) override {
+        --live;
+        ::operator delete(address, std::align_val_t{32});
+    }
+
+    void reset() override { ++resets; }
+};
+
+[[nodiscard]] nlohmann::json tokenizer_config() {
+    const auto metadata = [](const char* content) {
+        return nlohmann::json{{"content", content},
+                              {"lstrip", false},
+                              {"normalized", false},
+                              {"rstrip", false},
+                              {"single_word", false},
+                              {"special", true}};
+    };
+    return nlohmann::json{
+            {"added_tokens_decoder",
+             nlohmann::json{{"0", metadata("<unk>")},
+                            {"1", metadata("<s>")},
+                            {"2", metadata("</s>")}}},
+            {"bos_token", "<s>"},
+            {"chat_template",
+             "{% for message in messages %}"
+             "{% if message['role'] == 'system' %}"
+             "{{ message['content'] + eos_token }}"
+             "{% elif message['role'] == 'user' %}"
+             "{{ message['content'] + eos_token }}"
+             "{% elif message['role'] == 'assistant' %}"
+             "{{ message['content'] + eos_token }}"
+             "{% endif %}"
+             "{% if loop.last and add_generation_prompt %}"
+             "{{ '<|assistant|>' }}"
+             "{% endif %}"
+             "{% endfor %}"},
+            {"clean_up_tokenization_spaces", false},
+            {"eos_token", "</s>"},
+            {"legacy", false},
+            {"model_max_length", 2048},
+            {"pad_token", "</s>"},
+            {"padding_side", "right"},
+            {"sp_model_kwargs", nlohmann::json::object()},
+            {"tokenizer_class", "LlamaTokenizer"},
+            {"unk_token", "<unk>"},
+            {"use_default_system_prompt", false},
+    };
+}
+
+struct SessionFixture {
+    TempDir directory{"session-resources"};
+    HeapAllocator allocator;
+    std::unique_ptr<iom::Device> device;
+
+    SessionFixture() {
+        const nlohmann::json config = one_layer_config();
+        write_config(directory.path(), config);
+        write_safetensors_file(
+                directory.path(), "model.safetensors",
+                required_weight_entries(config));
+        write_tokenizer(directory.path());
+        write_file(directory.path(), "tokenizer_config.json",
+                   tokenizer_config().dump());
+        device = iom::make_cpu_device(allocator);
+    }
+
+    [[nodiscard]] std::unique_ptr<iom::TinyLlamaSession> load() {
+        return iom::load_tinyllama_session(directory.path(), *device);
+    }
+};
+
+class ProbeSelector final : public iom::TokenSelector {
+public:
+    explicit ProbeSelector(
+            std::size_t* destructions = nullptr,
+            iom::TokenSelectorScratchRequirements requirements = {0, {0, 1}})
+        : destructions_(destructions), requirements_(requirements) {}
+
+    ~ProbeSelector() override {
+        if (destructions_) ++*destructions_;
+    }
+
+    [[nodiscard]] iom::TokenSelectorScratchRequirements scratch_requirements(
+            const iom::TensorView&, std::size_t) const override {
+        return requirements_;
+    }
+
+    [[nodiscard]] std::size_t select(
+            iom::DeviceOps&, const iom::TensorView&, std::size_t, iom::oid,
+            std::span<const std::size_t>, iom::TokenSelectorScratch) override {
+        return 0;
+    }
+private:
+    std::size_t* destructions_;
+    iom::TokenSelectorScratchRequirements requirements_;
+};
+
+
+// Use the existing bounded model owners to exercise genuine factory contract
+// failures without allocating enormous tensors or requiring accelerator memory.
+class ResourceProbeQueue final : public iom::DeviceOps {
+public:
+    explicit ResourceProbeQueue(const iom::Device& device) : DeviceOps(device) {}
+};
+
+class ResourceProbeDevice final : public iom::Device {
+public:
+    std::size_t tensors = 0;
+    std::size_t workspaces = 0;
+    std::size_t queues = 0;
+    mutable std::size_t capability_queries = 0;
+    void* workspace_address = nullptr;
+    std::size_t workspace_stride = 0;
+    iom::Device* workspace_device = nullptr;
+    std::optional<std::size_t> workspace_bytes;
+    std::optional<iom::TensorSpec> wrong_tensor;
+    iom::Device* queue_device = nullptr;
+
+    iom::BackendKind backend_kind() const noexcept override {
+        return iom::BackendKind::CPU;
+    }
+    std::uint32_t backend_device() const noexcept override { return 0; }
+    std::span<const iom::DataType> supported_data_types() const noexcept override {
+        ++capability_queries;
+        static constexpr std::array supported{iom::DataType::BF16,
+                                             iom::DataType::U32};
+        return supported;
+    }
+    std::unique_ptr<iom::Tensor> create_tensor(const iom::TensorSpec& spec) override {
+        ++tensors;
+        return std::make_unique<iom_model_loading::FakeTensor>(
+                wrong_tensor ? *wrong_tensor : spec, *this);
+    }
+    std::unique_ptr<iom::RawWorkspace> create_workspace(std::size_t bytes) override {
+        ++workspaces;
+        if (!workspace_address) throw std::invalid_argument("no device scratch");
+        return std::make_unique<iom_model_loading::BoundedWorkspace>(
+                workspace_device ? *workspace_device : *this,
+                workspace_bytes.value_or(bytes),
+                reinterpret_cast<void*>(
+                        reinterpret_cast<std::uintptr_t>(workspace_address)
+                        + (workspaces - 1) * workspace_stride));
+    }
+    std::unique_ptr<iom::DeviceOps> create_ops() override {
+        ++queues;
+        return std::make_unique<ResourceProbeQueue>(
+                queue_device ? *queue_device : *this);
+    }
+};
+
+void check_run_banks(const iom::session_detail::RunBanks& banks, std::size_t R) {
+    const auto check = [](const iom::Tensor* tensor,
+                          std::initializer_list<std::size_t> shape,
+                          iom::DataType type = iom::DataType::BF16) {
+        REQUIRE(tensor);
+        CHECK(iom_model_loading::dims_of(tensor->view().spec().shape)
+              == std::vector<std::size_t>(shape));
+        CHECK(tensor->view().spec().data_type == type);
+        CHECK(tensor->view().spec().quantization == iom::QuantizationFormat::NONE);
+    };
+    check(banks.token_indices.get(), {1, R}, iom::DataType::U32);
+    const std::array feature_banks{
+            banks.x.get(), banks.attention_norm.get(), banks.attention_merged.get(),
+            banks.attention_output.get(), banks.residual_after_attention.get(),
+            banks.mlp_norm.get(), banks.down.get(), banks.residual_after_mlp.get(),
+            banks.final_norm.get()};
+    for (const auto* tensor : feature_banks) check(tensor, {R, 8});
+    for (const auto* tensor : {banks.gate.get(), banks.up.get(), banks.silu.get(),
+                               banks.product.get()})
+        check(tensor, {R, 12});
+    for (const auto* tensor : {banks.q.get(), banks.rotated_q.get()})
+        check(tensor, {4, R, 2});
+    for (const auto* tensor : {banks.k.get(), banks.v.get(), banks.rotated_k.get()})
+        check(tensor, {2, R, 2});
+    const std::array owners{
+            banks.token_indices.get(), banks.x.get(), banks.attention_norm.get(),
+            banks.q.get(), banks.k.get(), banks.v.get(), banks.rotated_q.get(),
+            banks.rotated_k.get(), banks.attention_merged.get(),
+            banks.attention_output.get(), banks.residual_after_attention.get(),
+            banks.mlp_norm.get(), banks.gate.get(), banks.up.get(), banks.silu.get(),
+            banks.product.get(), banks.down.get(), banks.residual_after_mlp.get(),
+            banks.final_norm.get()};
+    for (std::size_t i = 0; i < owners.size(); ++i)
+        for (std::size_t j = 0; j < i; ++j) CHECK(owners[i] != owners[j]);
+}
+
+}  // namespace
+
+TEST_CASE("TinyLlama session resources expose one nonmovable owning boundary") {
+    static_assert(!std::is_copy_constructible_v<iom::TinyLlamaSession>);
+    static_assert(!std::is_copy_assignable_v<iom::TinyLlamaSession>);
+    static_assert(!std::is_move_constructible_v<iom::TinyLlamaSession>);
+    static_assert(!std::is_move_assignable_v<iom::TinyLlamaSession>);
+
+    SessionFixture fixture;
+    const std::unique_ptr<iom::TinyLlamaSession> session = fixture.load();
+
+    REQUIRE(session);
+    CHECK_EQ(&session->device(), fixture.device.get());
+    CHECK_EQ(&session->queue().device(), fixture.device.get());
+    CHECK_EQ(session->config().max_position_embeddings, 17);
+    iom_model_loading::check_model_inventory(
+            session->model(), iom_model_loading::expected_inventory(one_layer_config()));
+    CHECK(dynamic_cast<iom::GreedyTokenSelector*>(&session->selector()) != nullptr);
+    session->prepare_request(5, {0, 1}, {38, {0, 1}});
+    check_run_banks(SessionAccess::prefill(*session), 5);
+    check_run_banks(SessionAccess::decode(*session), 1);
+    const auto caches = SessionAccess::caches(*session);
+    REQUIRE_EQ(caches.size(), 1);
+    CHECK(caches[0].key.get() != caches[0].value.get());
+    for (const auto* tensor : {caches[0].key.get(), caches[0].value.get()}) {
+        CHECK(iom_model_loading::dims_of(tensor->view().spec().shape)
+              == std::vector<std::size_t>{2, 17, 2});
+    }
+    CHECK_EQ(caches[0].initialized_length, 0);
+    CHECK(iom_model_loading::dims_of(SessionAccess::logits(*session).spec().shape)
+          == std::vector<std::size_t>{1, 19});
+    CHECK(session->request_length() == 5);
+    CHECK_FALSE(session->poisoned());
+}
+
+TEST_CASE("TinyLlama session resources reject null selector before model work") {
+    ResourceProbeDevice device;
+
+    CHECK_THROWS_AS(
+            iom::load_tinyllama_session(
+                    std::filesystem::path("/definitely/missing/model"),
+                    device, std::unique_ptr<iom::TokenSelector>{}),
+            std::invalid_argument);
+    CHECK_EQ(device.capability_queries, 0);
+    CHECK_EQ(device.tensors, 0);
+    CHECK_EQ(device.workspaces, 0);
+    CHECK_EQ(device.queues, 0);
+}
+
+TEST_CASE("TinyLlama session resources retain an injected selector") {
+    SessionFixture fixture;
+    std::size_t destructions = 0;
+    auto selector = std::make_unique<ProbeSelector>(&destructions);
+    auto session =
+            iom::load_tinyllama_session(
+                    fixture.directory.path(), *fixture.device,
+                    std::move(selector));
+
+    session->prepare_request(
+            1, iom::WorkspaceRequirements{0, 1},
+            iom::TokenSelectorScratchRequirements{0, {0, 1}});
+    CHECK_EQ(session->request_length(), 1);
+    CHECK_EQ(destructions, 0);
+    session.reset();
+    CHECK_EQ(destructions, 1);
+    CHECK_EQ(fixture.allocator.live, 0);
+}
+
+
+TEST_CASE("TinyLlama session resources preserve allocation failure cleanup") {
+    SessionFixture fixture;
+    // Fail after weights, in the cache pair and at the last decode bank.
+    // Each partially constructed session must release every successful owner.
+    for (const std::size_t after : {std::size_t{13}, std::size_t{33}}) {
+        fixture.allocator.fail_after = fixture.allocator.allocations + after;
+        CHECK_THROWS_AS(fixture.load(), std::bad_alloc);
+        CHECK_EQ(fixture.allocator.live, 0);
+        CHECK_EQ(fixture.allocator.resets, 0);
+    }
+}
+
+TEST_CASE("TinyLlama session resources validate exact request bounds") {
+    SessionFixture fixture;
+    const std::unique_ptr<iom::TinyLlamaSession> session = fixture.load();
+    const iom::WorkspaceRequirements operation{0, 1};
+    const iom::TokenSelectorScratchRequirements selector{38, {0, 1}};
+    const auto allocations = fixture.allocator.allocations;
+
+    CHECK_THROWS_AS(session->prepare_request(0, operation, selector),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(session->prepare_request(18, operation, selector),
+                    std::invalid_argument);
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+
+    session->prepare_request(17, operation, selector);
+    CHECK_EQ(session->request_length(), 17);
+    check_run_banks(SessionAccess::prefill(*session), 17);
+    CHECK_FALSE(session->poisoned());
+
+    session->prepare_request(1, operation, selector);
+    CHECK_EQ(session->request_length(), 1);
+    CHECK_FALSE(session->poisoned());
+}
+
+TEST_CASE("TinyLlama session resources reject guessed or malformed scratch") {
+    SessionFixture fixture;
+    const std::unique_ptr<iom::TinyLlamaSession> session = fixture.load();
+    const iom::TokenSelectorScratchRequirements selector{38, {0, 1}};
+
+    CHECK_THROWS_AS(
+            session->prepare_request(
+                    1, iom::WorkspaceRequirements{1, 16}, selector),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            session->prepare_request(
+                    1, iom::WorkspaceRequirements{0, 0}, selector),
+            std::invalid_argument);
+    CHECK_THROWS_AS(
+            session->prepare_request(
+                    1, iom::WorkspaceRequirements{0, 1},
+                    iom::TokenSelectorScratchRequirements{37, {0, 1}}),
+            std::invalid_argument);
+}
+
+TEST_CASE("TinyLlama session resources reject host scratch overflow before request allocation") {
+    SessionFixture fixture;
+    const iom::TokenSelectorScratchRequirements requirements{
+            std::numeric_limits<std::size_t>::max(), {0, 1}};
+    const auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device,
+            std::make_unique<ProbeSelector>(nullptr, requirements));
+    const auto allocations = fixture.allocator.allocations;
+    fixture.allocator.fail_after = allocations;
+    CHECK_THROWS_AS(session->prepare_request(1, {0, 1}, requirements),
+                    std::overflow_error);
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+    CHECK_EQ(session->request_length(), 0);
+}
+
+TEST_CASE("TinyLlama session resources reject workspace overflow before allocation") {
+    SessionFixture fixture;
+    const auto session = fixture.load();
+    const std::size_t allocations = fixture.allocator.allocations;
+    fixture.allocator.fail_after = allocations;
+    CHECK_THROWS_AS(
+            session->prepare_request(
+                    1, {std::numeric_limits<std::size_t>::max(), 32},
+                    {38, {0, 1}}),
+            std::overflow_error);
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+    CHECK_EQ(session->request_length(), 0);
+}
+
 
 // Declared by the CPU driver in `src/cpu/queue.cpp` and by the SDPA port in
 // `src/cpu/sdpa.cpp`: process-wide post-acceptance failure latches consumed
@@ -53,6 +427,324 @@ void clear_cache_append_wait_observation() noexcept;
 
 }  // namespace iom::cpu_detail
 
+TEST_CASE("TinyLlama session resources check all cache bytes before allocation") {
+    SessionFixture fixture;
+    auto config = one_layer_config();
+    config["max_position_embeddings"] = std::numeric_limits<std::size_t>::max() / 16;
+    write_config(fixture.directory.path(), config);
+    ResourceProbeDevice device;
+    std::size_t destructions = 0;
+    CHECK_THROWS_AS(
+            iom::load_tinyllama_session(
+                    fixture.directory.path(), device,
+                    std::make_unique<ProbeSelector>(&destructions)),
+            std::overflow_error);
+    // The sole canonical model loaded; no cache, bank, or queue was allocated.
+    CHECK_EQ(device.tensors, 12);
+    CHECK_EQ(device.queues, 0);
+    CHECK_EQ(destructions, 1);
+    CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_tensors, 0);
+}
+
+TEST_CASE("TinyLlama session resources reject foreign queues and wrong bank owners") {
+    SessionFixture fixture;
+    ResourceProbeDevice device;
+    ResourceProbeDevice other;
+    device.queue_device = &other;
+    CHECK_THROWS_AS(
+            iom::load_tinyllama_session(fixture.directory.path(), device),
+            std::invalid_argument);
+    CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_tensors, 0);
+    device.queue_device = nullptr;
+    auto session = iom::load_tinyllama_session(fixture.directory.path(), device);
+    CHECK_EQ(device.queues, 2); // one rejected factory, one published session
+    CHECK_EQ(device.tensors, 12 + 34);
+    device.wrong_tensor = iom::TensorSpec{
+            iom::TensorShape{{1, 1}}, iom::DataType::BF16};
+    CHECK_THROWS_AS(session->prepare_request(3, {0, 1}, {38, {0, 1}}),
+                    std::invalid_argument);
+    CHECK_EQ(session->request_length(), 0);
+    session.reset();
+    CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_tensors, 0);
+}
+
+TEST_CASE("TinyLlama session resources provision exact separate scratch ranges") {
+    SessionFixture fixture;
+    ResourceProbeDevice device;
+    alignas(128) std::array<std::byte, 1024> storage{};
+    device.workspace_address = storage.data();
+    device.workspace_stride = 256;
+    const iom::TokenSelectorScratchRequirements requirements{13, {65, 32}};
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), device,
+            std::make_unique<ProbeSelector>(nullptr, requirements));
+    session->prepare_request(3, {129, 128}, requirements);
+    const auto operation = SessionAccess::workspace(*session);
+    const auto scratch = SessionAccess::selector_scratch(*session);
+    CHECK_EQ(operation.byte_size(), 129);
+    CHECK_EQ(scratch.host.size(), 13);
+    CHECK_EQ(scratch.device.byte_size(), 65);
+    CHECK(operation.owner_identity() != scratch.device.owner_identity());
+    CHECK_EQ(device.workspaces, 2);
+    session.reset();
+    CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_workspaces, 0);
+}
+
+TEST_CASE("TinyLlama session resources validate supplied workspace ownership and ranges") {
+    SessionFixture fixture;
+    ResourceProbeDevice device;
+    ResourceProbeDevice other;
+    alignas(128) std::array<std::byte, 1024> storage{};
+    device.workspace_address = storage.data();
+    auto session = iom::load_tinyllama_session(fixture.directory.path(), device);
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    REQUIRE(SessionAccess::workspace(*session).empty());
+    const auto* bank = SessionAccess::prefill(*session).x.get();
+
+    SUBCASE("insufficient base alignment") {
+        device.workspace_address = storage.data() + 1;
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, {38, {0, 1}}),
+                        std::invalid_argument);
+    }
+    SUBCASE("requirement exceeds the base guarantee") {
+        device.workspace_address = storage.data() + 32;
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 128}, {38, {0, 1}}),
+                        std::invalid_argument);
+    }
+    SUBCASE("foreign device owner") {
+        device.workspace_device = &other;
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, {38, {0, 1}}),
+                        std::invalid_argument);
+    }
+    SUBCASE("inexact capacity") {
+        device.workspace_bytes = 32;
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, {38, {0, 1}}),
+                        std::invalid_argument);
+    }
+    SUBCASE("address range overflow") {
+        device.workspace_address = reinterpret_cast<void*>(
+                std::numeric_limits<std::uintptr_t>::max() - 31);
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, {38, {0, 1}}),
+                        std::overflow_error);
+    }
+    SUBCASE("workspace overlaps canonical weight storage") {
+        const auto weight = reinterpret_cast<std::uintptr_t>(
+                session->model().weight(0).native_handle());
+        device.workspace_address = reinterpret_cast<void*>(weight & ~std::uintptr_t{31});
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, {38, {0, 1}}),
+                        std::invalid_argument);
+    }
+    SUBCASE("backend rejects positive scratch") {
+        device.workspace_address = nullptr;
+        CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, {38, {0, 1}}),
+                        std::invalid_argument);
+    }
+    CHECK_EQ(session->request_length(), 1);
+    CHECK(SessionAccess::prefill(*session).x.get() == bank);
+    CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_workspaces, 0);
+}
+
+TEST_CASE("TinyLlama session resources reject overlapping operation and selector scratch") {
+    SessionFixture fixture;
+    ResourceProbeDevice device;
+    alignas(32) std::array<std::byte, 512> storage{};
+    device.workspace_address = storage.data();
+    const iom::TokenSelectorScratchRequirements requirements{13, {64, 32}};
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), device,
+            std::make_unique<ProbeSelector>(nullptr, requirements));
+    CHECK_THROWS_AS(session->prepare_request(3, {64, 32}, requirements),
+                    std::invalid_argument);
+    CHECK_EQ(session->request_length(), 0);
+    CHECK_EQ(iom_model_loading::FixtureLiveness::shared().live_workspaces, 0);
+}
+
+TEST_CASE("TinyLlama session resources keep every layer cache independent across requests") {
+    SessionFixture fixture;
+    const auto config = iom_model_loading::two_layer_config();
+    write_config(fixture.directory.path(), config);
+    write_safetensors_file(fixture.directory.path(), "model.safetensors",
+                           required_weight_entries(config));
+    auto session = fixture.load();
+    session->prepare_request(17, {0, 1}, {38, {0, 1}});
+    auto caches = SessionAccess::caches(*session);
+    REQUIRE_EQ(caches.size(), 2);
+    const std::array owners{caches[0].key.get(), caches[0].value.get(),
+                            caches[1].key.get(), caches[1].value.get()};
+    for (std::size_t i = 0; i < owners.size(); ++i)
+        for (std::size_t j = 0; j < i; ++j) CHECK(owners[i] != owners[j]);
+    for (auto& cache : caches) cache.initialized_length = 17;
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    CHECK(caches[0].key.get() == owners[0]);
+    CHECK(caches[0].value.get() == owners[1]);
+    CHECK(caches[1].key.get() == owners[2]);
+    CHECK(caches[1].value.get() == owners[3]);
+    for (const auto& cache : caches) CHECK_EQ(cache.initialized_length, 0);
+}
+
+TEST_CASE("TinyLlama session resources preserve the old request on partial allocation failure") {
+    SessionFixture fixture;
+    auto session = fixture.load();
+    session->prepare_request(5, {0, 1}, {38, {0, 1}});
+    const auto* bank = SessionAccess::prefill(*session).x.get();
+    const auto* decode = SessionAccess::decode(*session).x.get();
+    const auto* cache = SessionAccess::caches(*session)[0].key.get();
+    SessionAccess::history(*session).push_back(7);
+    SessionAccess::results(*session).push_back(8);
+    SessionAccess::caches(*session)[0].initialized_length = 5;
+    const std::size_t live = fixture.allocator.live;
+    fixture.allocator.fail_after = fixture.allocator.allocations + 3;
+    CHECK_THROWS_AS(session->prepare_request(3, {0, 1}, {38, {0, 1}}),
+                    std::bad_alloc);
+    CHECK_EQ(fixture.allocator.live, live);
+    CHECK_EQ(session->request_length(), 5);
+    CHECK(SessionAccess::prefill(*session).x.get() == bank);
+    CHECK(SessionAccess::history(*session) == std::vector<std::size_t>{7});
+    CHECK(SessionAccess::results(*session) == std::vector<std::size_t>{8});
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 5);
+
+    fixture.allocator.fail_after = std::numeric_limits<std::size_t>::max();
+    session->prepare_request(3, {0, 1}, {38, {0, 1}});
+    CHECK(SessionAccess::prefill(*session).x.get() != bank);
+    CHECK(SessionAccess::decode(*session).x.get() == decode);
+    CHECK(SessionAccess::caches(*session)[0].key.get() == cache);
+    CHECK(SessionAccess::history(*session).empty());
+    CHECK(SessionAccess::results(*session).empty());
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 0);
+    CHECK_EQ(fixture.allocator.resets, 0);
+}
+
+TEST_CASE("TinyLlama session resources drain both cache writers before different R replacement") {
+    SessionFixture fixture;
+    auto session = fixture.load();
+    session->prepare_request(5, {0, 1}, {38, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    auto caches = SessionAccess::caches(*session);
+    std::vector<std::byte> bytes(banks.k->view().spec().logical_nbytes(), std::byte{0});
+    banks.k->view().copy_from_host(bytes);
+    banks.v->view().copy_from_host(bytes);
+    iom::cpu_detail::arm_cache_append_wait_observation();
+    struct ResetObservation {
+        ~ResetObservation() { iom::cpu_detail::clear_cache_append_wait_observation(); }
+    } observation;
+    SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.cache_append(banks.k->view(), caches[0].key->view(), 0);
+    });
+    SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.cache_append(banks.v->view(), caches[0].value->view(), 0);
+    });
+    CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 0);
+    session->prepare_request(3, {0, 1}, {38, {0, 1}});
+    CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 2);
+    CHECK(SessionAccess::accepted(*session).empty());
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 0);
+    check_run_banks(SessionAccess::prefill(*session), 3);
+}
+
+TEST_CASE("TinyLlama session resources retain accepted failures and drain before destruction") {
+    SessionFixture fixture;
+    auto session = fixture.load();
+    session->prepare_request(3, {0, 1}, {38, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    auto caches = SessionAccess::caches(*session);
+    std::vector<std::byte> bytes(banks.k->view().spec().logical_nbytes(), std::byte{0});
+    banks.k->view().copy_from_host(bytes);
+    banks.v->view().copy_from_host(bytes);
+    iom::cpu_detail::arm_cache_append_wait_observation();
+    iom::cpu_detail::arm_cache_append_failure();
+    struct ResetFailure {
+        ~ResetFailure() {
+            iom::cpu_detail::clear_cache_append_failure();
+            iom::cpu_detail::clear_cache_append_wait_observation();
+        }
+    } failure;
+    const auto failed = SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.cache_append(banks.k->view(), caches[0].key->view(), 0);
+    });
+    const auto healthy = SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.cache_append(banks.v->view(), caches[0].value->view(), 0);
+    });
+    SUBCASE("observed failure poisons dependent work and retains every OID") {
+        CHECK_THROWS_AS(SessionAccess::wait(*session, failed), std::runtime_error);
+        CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 1);
+        CHECK(session->poisoned());
+        REQUIRE_EQ(SessionAccess::accepted(*session).size(), 2);
+        CHECK(SessionAccess::accepted(*session)[0] == failed);
+        CHECK(SessionAccess::accepted(*session)[1] == healthy);
+        const auto allocations = fixture.allocator.allocations;
+        CHECK_THROWS_AS(session->prepare_request(1, {0, 1}, {38, {0, 1}}),
+                        std::logic_error);
+        bool submitted = false;
+        CHECK_THROWS_AS(SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+            submitted = true;
+            return queue.copy(banks.k->view(), banks.v->view());
+        }), std::logic_error);
+        CHECK_FALSE(submitted);
+        CHECK_EQ(fixture.allocator.allocations, allocations);
+        CHECK_THROWS_AS(SessionAccess::wait(*session, failed), std::runtime_error);
+    }
+    SUBCASE("destruction observes failures without an earlier caller wait") {
+        CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 0);
+    }
+    session.reset();
+    CHECK_EQ(iom::cpu_detail::observed_cache_append_waits(), 1);
+    // CPU retains both operands of the failed append in its device quarantine;
+    // session teardown must not bypass that policy or reset the allocator.
+    CHECK_EQ(fixture.allocator.live, 2);
+    fixture.device.reset();
+    CHECK_EQ(fixture.allocator.live, 0);
+    CHECK_EQ(fixture.allocator.resets, 0);
+}
+
+TEST_CASE("TinyLlama session resources reject synchronous admission without losing prior work") {
+    SessionFixture fixture;
+    auto session = fixture.load();
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    const auto& banks = SessionAccess::prefill(*session);
+    const auto accepted = SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.copy(banks.x->view(), banks.attention_norm->view());
+    });
+    CHECK_THROWS_AS(SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+        return queue.copy(banks.x->view(), banks.gate->view());
+    }), std::invalid_argument);
+    CHECK(session->poisoned());
+    REQUIRE_EQ(SessionAccess::accepted(*session).size(), 1);
+    CHECK_EQ(SessionAccess::accepted(*session)[0], accepted);
+    session.reset();
+    CHECK_EQ(fixture.allocator.live, 0);
+}
+
+TEST_CASE("TinyLlama session resources retain context sized buffers without decode allocation") {
+    SessionFixture fixture;
+    auto session = fixture.load();
+    session->prepare_request(1, {0, 1}, {38, {0, 1}});
+    const auto& banks = SessionAccess::decode(*session);
+    auto& history = SessionAccess::history(*session);
+    auto& results = SessionAccess::results(*session);
+    const auto* history_data = history.data();
+    const auto* result_data = results.data();
+    const auto* oid_data = SessionAccess::accepted(*session).data();
+    const auto allocations = fixture.allocator.allocations;
+    const auto scratch = SessionAccess::selector_scratch(*session);
+    for (std::size_t row = 0; row < session->config().max_position_embeddings; ++row) {
+        history.push_back(row);
+        results.push_back(row + 1);
+        for (std::size_t operation = 0; operation < 24; ++operation) {
+            const auto token = SessionAccess::submit(*session, [&](iom::DeviceOps& queue) {
+                return queue.copy(banks.x->view(), banks.attention_norm->view());
+            });
+            SessionAccess::wait(*session, token);
+        }
+    }
+    CHECK_EQ(history.back(), 16);
+    CHECK_EQ(results.back(), 17);
+    CHECK(history.data() == history_data);
+    CHECK(results.data() == result_data);
+    CHECK(SessionAccess::accepted(*session).data() == oid_data);
+    CHECK(SessionAccess::selector_scratch(*session).host.data() == scratch.host.data());
+    CHECK_EQ(fixture.allocator.allocations, allocations);
+}
+
 namespace {
 
 using iom::session_detail::MlpStageFailure;
@@ -63,9 +755,9 @@ using iom::session_detail::MlpWorkspaceRequirements;
 
 // Value in every result store before a run, so a store that the stage must not
 // publish is distinguishable from every reference value.
-constexpr float kUntouched = 64.0F;
+constexpr float kMlpUntouched = 64.0F;
 
-class HeapAllocator final : public iom::Allocator {
+class MlpHeapAllocator final : public iom::Allocator {
 public:
     void* alloc(std::size_t bytes) override {
         return ::operator new(
@@ -79,23 +771,23 @@ public:
     void reset() override {}
 };
 
-struct CpuFixture {
-    HeapAllocator allocator;
+struct MlpCpuFixture {
+    MlpHeapAllocator allocator;
     std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
 };
 
 // Disarms every armed post-acceptance occurrence on scope exit, so an
 // interrupted case cannot leak a fault into a later one.
-class FailureLatches final {
+class MlpFailureLatches final {
 public:
-    FailureLatches() = default;
-    ~FailureLatches() {
+    MlpFailureLatches() = default;
+    ~MlpFailureLatches() {
         iom::cpu_detail::clear_linear_failure();
         iom::cpu_detail::clear_silu_failure();
     }
 
-    FailureLatches(const FailureLatches&) = delete;
-    FailureLatches& operator=(const FailureLatches&) = delete;
+    MlpFailureLatches(const MlpFailureLatches&) = delete;
+    MlpFailureLatches& operator=(const MlpFailureLatches&) = delete;
 };
 
 // ---------------------------------------------------------------------------
@@ -350,13 +1042,13 @@ void mlp_compute_reference(MlpBank& bank);
     mlp_write(*bank.gate_weight, bank.gate_weight_values);
     mlp_write(*bank.up_weight, bank.up_weight_values);
     mlp_write(*bank.down_weight, bank.down_weight_values);
-    mlp_fill(*bank.n2, kUntouched);
-    mlp_fill(*bank.gate, kUntouched);
-    mlp_fill(*bank.up, kUntouched);
-    mlp_fill(*bank.activated, kUntouched);
-    mlp_fill(*bank.product, kUntouched);
-    mlp_fill(*bank.down, kUntouched);
-    mlp_fill(*bank.next_x, kUntouched);
+    mlp_fill(*bank.n2, kMlpUntouched);
+    mlp_fill(*bank.gate, kMlpUntouched);
+    mlp_fill(*bank.up, kMlpUntouched);
+    mlp_fill(*bank.activated, kMlpUntouched);
+    mlp_fill(*bank.product, kMlpUntouched);
+    mlp_fill(*bank.down, kMlpUntouched);
+    mlp_fill(*bank.next_x, kMlpUntouched);
 
     mlp_compute_reference(bank);
     return bank;
@@ -372,7 +1064,6 @@ void mlp_compute_reference(MlpBank& bank) {
     const double epsilon = static_cast<double>(bank.epsilon);
     const std::size_t activation_plane = rows * features;
     const std::size_t projection_plane = rows * intermediate;
-
     bank.ref_n2.assign(bank.planes * activation_plane, 0.0F);
     bank.ref_gate.assign(bank.planes * projection_plane, 0.0F);
     bank.ref_up.assign(bank.planes * projection_plane, 0.0F);
@@ -550,7 +1241,7 @@ void mlp_check(
 // stage: no dependent stage was published.
 void mlp_check_untouched(iom::Tensor& store, const char* boundary) {
     const std::vector<float> observed = mlp_read(store);
-    const std::uint16_t sentinel = mlp_bf16_bits(kUntouched);
+    const std::uint16_t sentinel = mlp_bf16_bits(kMlpUntouched);
     std::string first_mismatch;
     for (std::size_t index = 0; index < observed.size(); ++index) {
         if (mlp_bf16_bits(observed[index]) == sentinel) continue;
@@ -584,13 +1275,13 @@ void mlp_check_inputs(const MlpBank& bank) {
 }
 
 void mlp_fill_stores(MlpBank& bank) {
-    mlp_fill(*bank.n2, kUntouched);
-    mlp_fill(*bank.gate, kUntouched);
-    mlp_fill(*bank.up, kUntouched);
-    mlp_fill(*bank.activated, kUntouched);
-    mlp_fill(*bank.product, kUntouched);
-    mlp_fill(*bank.down, kUntouched);
-    mlp_fill(*bank.next_x, kUntouched);
+    mlp_fill(*bank.n2, kMlpUntouched);
+    mlp_fill(*bank.gate, kMlpUntouched);
+    mlp_fill(*bank.up, kMlpUntouched);
+    mlp_fill(*bank.activated, kMlpUntouched);
+    mlp_fill(*bank.product, kMlpUntouched);
+    mlp_fill(*bank.down, kMlpUntouched);
+    mlp_fill(*bank.next_x, kMlpUntouched);
 }
 
 [[nodiscard]] std::vector<float> mlp_store_image(const MlpBank& bank) {
@@ -1146,7 +1837,7 @@ TEST_CASE("TinyLlama MLP stage matches an independent reference for prefill and 
             {15, 8, 12, 1}, {1, 8, 12, 2}, {17, 8, 12, 3}};
 
     for (const Shape& shape : shapes) {
-        CpuFixture fixture;
+        MlpCpuFixture fixture;
         MlpBank bank = mlp_make_bank(
                 *fixture.device, 1, shape.rows, shape.features,
                 shape.intermediate, shape.tag);
@@ -1163,7 +1854,7 @@ TEST_CASE("TinyLlama MLP stage matches an independent reference for prefill and 
 }
 
 TEST_CASE("TinyLlama MLP stage isolates tiled padding and independent leading planes") {
-    CpuFixture fixture;
+    MlpCpuFixture fixture;
     // Two identical banks of independent leading planes whose physical padding
     // carries different sentinels: one is the nonfinite pattern a padding read
     // would poison, the other a finite pattern.
@@ -1213,7 +1904,7 @@ TEST_CASE("TinyLlama MLP stage isolates tiled padding and independent leading pl
 }
 
 TEST_CASE("TinyLlama MLP stage rejects inconsistent views, aliases, and readiness before submission") {
-    CpuFixture fixture;
+    MlpCpuFixture fixture;
     MlpBank bank = mlp_make_bank(*fixture.device, 1, 15, 8, 12, 5);
     auto operations = fixture.device->create_ops();
     MlpWorkspace workspace = mlp_workspace(*operations, bank, bank);
@@ -1329,9 +2020,9 @@ TEST_CASE("TinyLlama MLP stage rejects inconsistent views, aliases, and readines
 }
 
 TEST_CASE("TinyLlama MLP stage drains both projection branches after an accepted failure") {
-    CpuFixture fixture;
+    MlpCpuFixture fixture;
     auto operations = fixture.device->create_ops();
-    FailureLatches latches;
+    MlpFailureLatches latches;
 
     // One failing gate branch while the up branch succeeds.
     {
@@ -1436,7 +2127,7 @@ TEST_CASE("TinyLlama MLP stage drains both projection branches after an accepted
         // A weight owner of another device is a plain BF16 [M,F] view, so the
         // rejection happens at the projection's own admission rather than in
         // the stage's local shape check.
-        HeapAllocator foreign_allocator;
+        MlpHeapAllocator foreign_allocator;
         std::unique_ptr<iom::Device> foreign_device =
                 iom::make_cpu_device(foreign_allocator);
         auto foreign_weight = foreign_device->create_tensor(
@@ -1523,8 +2214,7 @@ TEST_CASE(
                                        fixture.rotated_k_values),
                     "K cache after publication");
     check_identical(outcome.v_cache,
-                    with_appended_rows(fixture.geometry,
-                                       fixture.v_cache_values,
+                    with_appended_rows(fixture.geometry, fixture.v_cache_values,
                                        fixture.rotated_v_values),
                     "V cache after publication");
 
