@@ -235,4 +235,81 @@ private:
 std::unique_ptr<ModelSource> load_tinyllama_safetensors(
         const std::filesystem::path& model_directory);
 
+/**
+ * Fully realized, immutable TinyLlama model: the retained mapped weight source
+ * plus one persistent device weight owner for every published inventory entry,
+ * realized synchronously before the model exists.
+ *
+ * The model is published only after `ModelSource::upload_weights` returned
+ * normally, so no partially initialized object, ready wrapper, or in-progress
+ * upload is ever observable. It privately retains the mapped source for its
+ * whole lifetime, which keeps `config()`, `weights()`, and every source-backed
+ * metadata view valid after all factory-local parsing and mapping temporaries
+ * are gone, and it retains every device tensor owner, so each indexed full view
+ * stays stable and usable until model destruction. The device is borrowed, not
+ * owned: the caller's `Device` must outlive the model, and model destruction
+ * releases the model-owned tensors while that device is still alive.
+ *
+ * No accessor exposes mutable, replaceable, or retargetable storage: `config()`
+ * and `weights()` are immutable borrowed accessors, `weight(index)` is the
+ * indexed owner's own full view in `weights()` order, never a slice, reshape,
+ * permutation, alias, or retargeted view, and the ordinary `std::out_of_range`
+ * reports an invalid index.
+ */
+class TinyLlamaModel final {
+public:
+    ~TinyLlamaModel();
+    TinyLlamaModel(const TinyLlamaModel&) = delete;
+    TinyLlamaModel& operator=(const TinyLlamaModel&) = delete;
+    TinyLlamaModel(TinyLlamaModel&&) = delete;
+    TinyLlamaModel& operator=(TinyLlamaModel&&) = delete;
+
+    const TinyLlamaConfig& config() const noexcept;
+    std::span<const ModelWeightInfo> weights() const noexcept;
+    const TensorView& weight(std::size_t index) const;
+
+private:
+    struct Impl;
+    explicit TinyLlamaModel(std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
+
+    friend std::unique_ptr<TinyLlamaModel> load_tinyllama_model(
+            const std::filesystem::path& model_directory, Device& device);
+};
+
+/**
+ * Realizes one immutable model of `model_directory` on `device` and returns it
+ * only after the complete ordered weight binding was transferred
+ * synchronously.
+ *
+ * The path is first loaded as a complete `ModelSource` and retained, so a
+ * rejected configuration, container, or weight schema stops this factory
+ * before a single device tensor, workspace, or copy exists, with the
+ * established source categories and message context unchanged. Every published
+ * entry then receives exactly one independent BF16/NONE tensor, created from
+ * that entry's own `tensor_spec(index)` on `device` and bound once to the same
+ * canonical inventory index: equal-shaped entries, including the `[1, H]`
+ * normalization scales, still receive distinct owners. The complete ordered
+ * `Tensor*` binding is passed to `ModelSource::upload_workspace_requirements`
+ * before any transfer workspace exists, so that preflight is the only source of
+ * the transfer requirement: a `{0, 1}` result provisions no workspace at all,
+ * and a positive one provisions exactly one caller-owned `RawWorkspace` after
+ * the binding passed, whose full view then realizes the weights through
+ * `ModelSource::upload_weights`.
+ *
+ * Nothing is enqueued, deferred, or wrapped: any failure of source loading,
+ * tensor creation, binding preflight, workspace provisioning, or a later
+ * synchronous upload propagates its original category, destroys every
+ * setup-owned resource through RAII, and publishes no model and no partially
+ * realized view. A later upload failure leaves no rollback or retry promise:
+ * earlier caller-owned destinations may already hold copied bytes and the
+ * published source stays usable for an explicit later attempt.
+ *
+ * The caller owns `device` and must keep it alive until the returned model is
+ * destroyed; the model neither copies nor extends that device lifetime.
+ */
+std::unique_ptr<TinyLlamaModel> load_tinyllama_model(
+        const std::filesystem::path& model_directory, Device& device);
+
 }  // namespace iom

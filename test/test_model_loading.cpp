@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <new>
 #include <optional>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -28,12 +30,16 @@ using iom_model_loading::as_destinations;
 using iom_model_loading::bf16_entry;
 using iom_model_loading::BoundedWorkspace;
 using iom_model_loading::check_inventory;
+using iom_model_loading::check_model_inventory;
 using iom_model_loading::destination_pointers;
 using iom_model_loading::deterministic_payload;
 using iom_model_loading::dims_of;
 using iom_model_loading::element_count;
 using iom_model_loading::expected_inventory;
 using iom_model_loading::FakeDevice;
+using iom_model_loading::FakeTensor;
+using iom_model_loading::FixtureLiveness;
+using iom_model_loading::h18_config;
 using iom_model_loading::kSupportedWithoutBf16;
 using iom_model_loading::make_destinations;
 using iom_model_loading::mutable_observed;
@@ -41,6 +47,7 @@ using iom_model_loading::observed;
 using iom_model_loading::one_layer_config;
 using iom_model_loading::rejected_config_message;
 using iom_model_loading::rejected_container_message;
+using iom_model_loading::rejected_model_message;
 using iom_model_loading::rejected_source_message;
 using iom_model_loading::required_weight_entries;
 using iom_model_loading::same_config;
@@ -1573,6 +1580,359 @@ TEST_CASE("Model loading realization propagates a later synchronous upload failu
     CHECK(observed(allocation_destinations, 4).from_host_calls() == 1);
     CHECK(observed(allocation_destinations, 5).from_host_calls() == 1);
     check_untouched_after(allocation_destinations, 6);
+}
+
+// ---------------------------------------------------------------------------
+// Device-realized model
+// ---------------------------------------------------------------------------
+
+// The published model boundary borrows and exposes immutable storage only: the
+// model cannot be copied or moved, and no accessor hands back a mutable or
+// retargetable owner.
+static_assert(!std::is_copy_constructible_v<iom::TinyLlamaModel>);
+static_assert(!std::is_move_constructible_v<iom::TinyLlamaModel>);
+static_assert(!std::is_copy_assignable_v<iom::TinyLlamaModel>);
+static_assert(!std::is_move_assignable_v<iom::TinyLlamaModel>);
+static_assert(std::is_same_v<
+              decltype(std::declval<const iom::TinyLlamaModel&>().config()),
+              const iom::TinyLlamaConfig&>);
+static_assert(std::is_same_v<
+              decltype(std::declval<const iom::TinyLlamaModel&>().weights()),
+              std::span<const iom::ModelWeightInfo>>);
+static_assert(std::is_same_v<
+              decltype(std::declval<const iom::TinyLlamaModel&>().weight(0)),
+              const iom::TensorView&>);
+
+// Writes one complete checkpoint into `dir` and returns its fixture entries.
+std::vector<SafetensorsEntry> write_model_case(const TempDir& dir,
+                                               const nlohmann::json& document) {
+    std::vector<SafetensorsEntry> entries = required_weight_entries(document);
+    write_checkpoint(dir, document, entries);
+    return entries;
+}
+
+// The bounded destination owner a realized model published at `index`.
+const FakeTensor& realized_owner(const iom::TinyLlamaModel& model,
+                                 std::size_t index) {
+    const iom::TensorView& view = model.weight(index);
+    REQUIRE(view.owner_identity() != nullptr);
+    return static_cast<const FakeTensor&>(*view.owner_identity());
+}
+
+// Requires one realized destination owner to hold exactly the fixture entry of
+// its published index.
+void check_realized_entry(const FakeTensor& owner,
+                          const SafetensorsEntry& entry) {
+    REQUIRE(owner.uploaded_bytes().size() == entry.payload.size());
+    CHECK(std::memcmp(owner.uploaded_bytes().data(), entry.payload.data(),
+                      entry.payload.size()) == 0);
+}
+
+TEST_CASE("TinyLlama model device realization publishes the complete nonsymmetric one-layer inventory") {
+    const TempDir dir("model-realization-nonsymmetric");
+    const nlohmann::json document = h18_config();
+    const std::vector<SafetensorsEntry> entries = write_model_case(dir, document);
+    const iom::TinyLlamaConfig expected_config =
+            iom::load_tinyllama_config(dir.path());
+
+    std::array<std::byte, 1u << 16> arena{};
+    iom::ListAllocator allocator(arena.data(), arena.size());
+    const std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
+    const std::size_t free_before = allocator.free_bytes();
+
+    // The caller's device is borrowed: the model is created and destroyed
+    // while that device stays alive, and the device outlives it.
+    std::unique_ptr<iom::TinyLlamaModel> model =
+            iom::load_tinyllama_model(dir.path(), *device);
+    REQUIRE(model != nullptr);
+
+    // Both checkpoint artifacts are gone before any accessor, readback, or
+    // metadata check runs, so only the retained mapping can serve them.
+    std::error_code error;
+    REQUIRE(std::filesystem::remove(dir.path() / "model.safetensors", error));
+    REQUIRE(std::filesystem::remove(dir.path() / "config.json", error));
+
+    CHECK(same_config(model->config(), expected_config));
+    CHECK(model->config().num_hidden_layers == 1);
+    CHECK(model->config().hidden_size == 18);
+    CHECK(model->config().intermediate_size == 22);
+    CHECK(model->config().head_dim == 6);
+    CHECK(model->weights().size() == entries.size());
+    check_model_inventory(*model, expected_inventory(document));
+
+    // Every published index reads back exactly its own checkpoint bytes through
+    // its indexed full view: the distinct rank-one normalization vectors
+    // realized into their `[1, 18]` destinations, the `[6, 18]` grouped K/V
+    // projections, and the nonsquare `[18, 22]` down projection included.
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        CAPTURE(index);
+        const iom::TensorView& view = model->weight(index);
+        std::vector<std::byte> readback(view.spec().logical_nbytes(),
+                                        std::byte{0xAA});
+        view.copy_to_host(readback);
+        REQUIRE(readback.size() == entries[index].payload.size());
+        CHECK(std::memcmp(readback.data(), entries[index].payload.data(),
+                          readback.size()) == 0);
+    }
+
+    // The indexed full view is one stable object per index, and the index is
+    // bounds checked with the ordinary category.
+    const iom::TensorView* stable_view = &model->weight(3);
+    CHECK(&model->weight(3) == stable_view);
+    CHECK_THROWS_AS(model->weight(model->weights().size()), std::out_of_range);
+    CHECK_THROWS_AS(
+            model->weight(std::numeric_limits<std::size_t>::max()),
+            std::out_of_range);
+
+    // The borrowed device stays usable while the model holds its own owners
+    // and does not share the caller's arena accounting.
+    {
+        const std::unique_ptr<iom::Tensor> probe = device->create_tensor(
+                iom::TensorSpec{iom::TensorShape{{19, 18}},
+                                iom::DataType::BF16,
+                                iom::QuantizationFormat::NONE});
+        REQUIRE(probe != nullptr);
+        const std::vector<std::byte> payload(2 * 19 * 18, std::byte{0x5A});
+        probe->view().copy_from_host(payload);
+        std::vector<std::byte> readback(payload.size(), std::byte{0});
+        probe->view().copy_to_host(readback);
+        CHECK(readback == payload);
+    }
+
+    // Destroying the model releases every device owner it created while the
+    // borrowed device is still alive; the device itself is destroyed only
+    // afterwards, at the end of this case.
+    model.reset();
+    CHECK(allocator.free_bytes() == free_before);
+}
+
+TEST_CASE("TinyLlama model device realization consumes no transfer workspace for a zero-byte requirement") {
+    const TempDir dir("model-realization-zero-workspace");
+    const nlohmann::json document = two_layer_config();
+    const std::vector<SafetensorsEntry> entries = write_model_case(dir, document);
+
+    // The bounded device mirrors the CPU policy: every destination reports the
+    // zero-byte `{0, 1}` requirement, and a positive workspace factory call
+    // would fail this case outright.
+    FakeDevice device;
+    const std::size_t uploads_before = FixtureLiveness::shared().uploads;
+
+    const std::unique_ptr<iom::TinyLlamaModel> model =
+            iom::load_tinyllama_model(dir.path(), device);
+    REQUIRE(model != nullptr);
+
+    CHECK(device.tensor_creations() == entries.size());
+    CHECK(device.workspace_creations() == 0);
+    CHECK(FixtureLiveness::shared().live_tensors == entries.size());
+    CHECK(FixtureLiveness::shared().uploads - uploads_before == entries.size());
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        CAPTURE(index);
+        const FakeTensor& owner = realized_owner(*model, index);
+        CHECK(owner.from_host_calls() == 1);
+        // A zero-byte requirement consumes no workspace: every upload received
+        // the empty default view and never a provisioned range.
+        CHECK(owner.upload_workspace() == nullptr);
+        CHECK(owner.upload_workspace_bytes() == 0);
+        check_realized_entry(owner, entries[index]);
+    }
+}
+
+TEST_CASE("TinyLlama model device realization provisions one preflighted workspace for a positive requirement") {
+    const TempDir dir("model-realization-positive-workspace");
+    const nlohmann::json document = two_layer_config();
+    const std::vector<SafetensorsEntry> entries = write_model_case(dir, document);
+
+    // The requirement of this binding is the maximum serial per-owner
+    // requirement of its widest role, computed here from the fixture's own
+    // entry bytes: never a sum of the mutually exclusive per-role ranges and
+    // never an aggregate logical byte count.
+    std::size_t widest = 0;
+    for (const SafetensorsEntry& entry : entries) {
+        widest = std::max(widest, entry.payload.size());
+    }
+    const std::size_t expected_scratch = 2 * widest;
+    REQUIRE(expected_scratch == 608);
+
+    FakeDevice device;
+    alignas(32) std::array<std::byte, 1024> scratch{};
+    device.set_workspace_policy(WorkspacePolicy{2, 32});
+    device.enable_positive_workspace(scratch.data(), scratch.size());
+    const std::size_t queries_before =
+            FixtureLiveness::shared().requirement_queries;
+    const std::size_t uploads_before = FixtureLiveness::shared().uploads;
+
+    const std::unique_ptr<iom::TinyLlamaModel> model =
+            iom::load_tinyllama_model(dir.path(), device);
+    REQUIRE(model != nullptr);
+
+    // Exactly one scratch range was provisioned, with the byte count the
+    // complete-binding preflight reported, and only after every destination
+    // owner of the binding existed.
+    CHECK(device.tensor_creations() == entries.size());
+    CHECK(device.tensor_creations_at_workspace_creation() == entries.size());
+    CHECK(device.workspace_creations() == 1);
+    CHECK(device.last_workspace_bytes() == expected_scratch);
+    // The temporary scratch was released at publication, while the borrowed
+    // device stayed alive.
+    CHECK(FixtureLiveness::shared().live_workspaces == 0);
+
+    // Every owner is queried once by the preflight and once more by the
+    // realization's own complete-binding validation, and each of them was
+    // uploaded exactly once through that one scratch owner.
+    CHECK(FixtureLiveness::shared().requirement_queries - queries_before ==
+          2 * entries.size());
+    CHECK(FixtureLiveness::shared().uploads - uploads_before == entries.size());
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        CAPTURE(index);
+        const FakeTensor& owner = realized_owner(*model, index);
+        CHECK(owner.from_host_calls() == 1);
+        CHECK(owner.upload_workspace() == device.last_workspace_identity());
+        CHECK(owner.upload_workspace_bytes() == expected_scratch);
+        check_realized_entry(owner, entries[index]);
+    }
+}
+
+TEST_CASE("TinyLlama model device realization rejects an invalid binding before provisioning scratch") {
+    const TempDir dir("model-realization-reject");
+    const nlohmann::json document = two_layer_config();
+    const std::vector<SafetensorsEntry> entries = write_model_case(dir, document);
+
+    // The positive workspace range this device would hand out is available, so
+    // a premature provisioning stays observable as a creation count instead of
+    // failing as its own fixture rejection.
+    alignas(32) std::array<std::byte, 1024> scratch{};
+    const auto rejected = [&dir, &scratch, &entries](FakeDevice& device,
+                                                     const char* what) {
+        CAPTURE(what);
+        const std::size_t tensors_before = FixtureLiveness::shared().live_tensors;
+        const std::size_t queries_before =
+                FixtureLiveness::shared().requirement_queries;
+        CHECK_THROWS_AS((void)iom::load_tinyllama_model(dir.path(), device),
+                        std::invalid_argument);
+        // The complete ordered binding is validated before any per-owner
+        // requirement query, so a rejected binding neither provisions the
+        // positive scratch this device offers nor keeps a setup-owned
+        // destination alive, and no model exists.
+        CHECK(device.tensor_creations() == entries.size());
+        CHECK(device.workspace_creations() == 0);
+        CHECK(FixtureLiveness::shared().requirement_queries == queries_before);
+        CHECK(FixtureLiveness::shared().live_tensors == tensors_before);
+        CHECK(FixtureLiveness::shared().live_workspaces == 0);
+    };
+
+    // A device without BF16 storage capability rejects the complete binding.
+    FakeDevice unsupported(kSupportedWithoutBf16);
+    unsupported.set_workspace_policy(WorkspacePolicy{2, 32});
+    unsupported.enable_positive_workspace(scratch.data(), scratch.size());
+    rejected(unsupported, "device without BF16 storage capability");
+
+    // A backend that hands back a wrong-shaped owner is rejected the same way.
+    // The mismapped owner is the last published role, so no earlier position
+    // can account for the rejection.
+    FakeDevice mismapped;
+    mismapped.set_workspace_policy(WorkspacePolicy{2, 32});
+    mismapped.enable_positive_workspace(scratch.data(), scratch.size());
+    mismapped.mismap_tensor_at(
+            entries.size(),
+            iom::TensorSpec{iom::TensorShape{{8, 11}}, iom::DataType::BF16,
+                            iom::QuantizationFormat::NONE});
+    rejected(mismapped, "mismapped destination specification");
+
+    // A rejected source is this path's first failure: a missing required weight
+    // stops the factory before a single destination exists, with the mapped
+    // source's own category and message.
+    const TempDir incomplete_dir("model-realization-reject-source");
+    std::vector<SafetensorsEntry> incomplete = required_weight_entries(document);
+    erase_entry(incomplete, "lm_head.weight");
+    write_checkpoint(incomplete_dir, document, incomplete);
+    FakeDevice source_device;
+    const std::size_t source_tensors_before =
+            FixtureLiveness::shared().live_tensors;
+    CHECK(rejected_model_message(incomplete_dir.path(), source_device) ==
+          rejected_source_message(incomplete_dir.path()));
+    CHECK(source_device.tensor_creations() == 0);
+    CHECK(source_device.workspace_creations() == 0);
+    CHECK(FixtureLiveness::shared().live_tensors == source_tensors_before);
+
+    // An exhausted workspace range after the binding passed is a setup failure:
+    // the destination queries reported the positive requirement, the workspace
+    // factory failed, and every created destination was destroyed again.
+    FakeDevice exhausted;
+    exhausted.set_workspace_policy(WorkspacePolicy{2, 32});
+    alignas(32) std::array<std::byte, 8> tiny{};
+    exhausted.enable_positive_workspace(tiny.data(), tiny.size());
+    const std::size_t exhausted_tensors_before =
+            FixtureLiveness::shared().live_tensors;
+    const std::size_t exhausted_queries_before =
+            FixtureLiveness::shared().requirement_queries;
+    CHECK_THROWS_AS((void)iom::load_tinyllama_model(dir.path(), exhausted),
+                    std::bad_alloc);
+    CHECK(exhausted.tensor_creations() == entries.size());
+    CHECK(exhausted.workspace_creations() == 1);
+    CHECK(FixtureLiveness::shared().requirement_queries -
+                  exhausted_queries_before ==
+          entries.size());
+    CHECK(FixtureLiveness::shared().live_tensors == exhausted_tensors_before);
+    CHECK(FixtureLiveness::shared().live_workspaces == 0);
+}
+
+TEST_CASE("TinyLlama model device realization propagates a later upload failure and publishes nothing") {
+    const TempDir dir("model-realization-upload-failure");
+    const nlohmann::json document = two_layer_config();
+    const std::vector<SafetensorsEntry> entries = write_model_case(dir, document);
+
+    alignas(32) std::array<std::byte, 1024> scratch{};
+    const std::size_t tensors_before = FixtureLiveness::shared().live_tensors;
+
+    // The fourth published role fails its first upload, after the three
+    // earlier roles received their exact bytes: the failure stops there,
+    // releases every setup-owned destination and the provisioned scratch, and
+    // publishes no model.
+    FakeDevice device;
+    device.set_workspace_policy(WorkspacePolicy{2, 32});
+    device.enable_positive_workspace(scratch.data(), scratch.size());
+    device.fail_upload_at(4, UploadFailure::runtime_error);
+    const std::size_t uploads_before = FixtureLiveness::shared().uploads;
+    CHECK_THROWS_AS((void)iom::load_tinyllama_model(dir.path(), device),
+                    std::runtime_error);
+    CHECK(device.tensor_creations() == entries.size());
+    CHECK(device.workspace_creations() == 1);
+    CHECK(FixtureLiveness::shared().uploads - uploads_before == 4);
+    CHECK(FixtureLiveness::shared().live_tensors == tensors_before);
+    CHECK(FixtureLiveness::shared().live_workspaces == 0);
+
+    // A later allocation failure escapes with its own category: the model
+    // boundary wraps neither backend failures nor `std::bad_alloc`.
+    FakeDevice allocation_device;
+    allocation_device.set_workspace_policy(WorkspacePolicy{2, 32});
+    allocation_device.enable_positive_workspace(scratch.data(), scratch.size());
+    allocation_device.fail_upload_at(6, UploadFailure::allocation);
+    CHECK_THROWS_AS(
+            (void)iom::load_tinyllama_model(dir.path(), allocation_device),
+            std::bad_alloc);
+    CHECK(allocation_device.tensor_creations() == entries.size());
+    CHECK(FixtureLiveness::shared().live_tensors == tensors_before);
+    CHECK(FixtureLiveness::shared().live_workspaces == 0);
+
+    // No rollback, retry, or poisoned state: an explicit later call on the same
+    // device, with the injection cleared, realizes the complete inventory.
+    device.fail_upload_at(0, UploadFailure::none);
+    std::unique_ptr<iom::TinyLlamaModel> model =
+            iom::load_tinyllama_model(dir.path(), device);
+    REQUIRE(model != nullptr);
+    CHECK(device.workspace_creations() == 2);
+    CHECK(FixtureLiveness::shared().live_tensors ==
+          tensors_before + entries.size());
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        CAPTURE(index);
+        check_realized_entry(realized_owner(*model, index), entries[index]);
+    }
+    check_model_inventory(*model, expected_inventory(document));
+
+    // The published model owns each device owner, and destroying it releases
+    // them all while the borrowed device is still alive.
+    model.reset();
+    CHECK(FixtureLiveness::shared().live_tensors == tensors_before);
 }
 
 }  // namespace
