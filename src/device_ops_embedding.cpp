@@ -46,36 +46,26 @@ namespace iom {
             return false;
         }
 
-        // Reject one output/input relationship that the gather must never
-        // admit: the same owner identity anywhere, and an identical storage
-        // handle or actual backing-range intersection. The checks use each
-        // backend's exposed storage handle and reserved extent.
+        // Keep embedding's output/input policy; only the backing facts differ
+        // between addressable owners and opaque execution descriptors.
         void reject_output_overlap(
-                const TensorView& out, std::size_t out_storage_bytes,
-                const TensorView& input, std::size_t input_storage_bytes) {
+                const TensorView& out, const detail::CheckedViewFacts& out_facts,
+                const TensorView& input, const detail::CheckedViewFacts& input_facts) {
             if (out.owner_identity() == input.owner_identity()) {
                 throw std::invalid_argument(
                         "embedding output aliases an input owner");
             }
-            const void* const out_handle = out.native_handle();
-            const void* const input_handle = input.native_handle();
-            if (out_handle == input_handle) {
+            if (out_facts.backing.key == input_facts.backing.key) {
                 throw std::invalid_argument(
                         "embedding output shares an input storage handle");
             }
-            const std::uintptr_t out_begin =
-                    reinterpret_cast<std::uintptr_t>(out_handle);
-            const std::uintptr_t input_begin =
-                    reinterpret_cast<std::uintptr_t>(input_handle);
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            if (out_storage_bytes > limit - out_begin
-                    || input_storage_bytes > limit - input_begin) {
-                throw std::overflow_error(
-                        "embedding storage range overflows");
-            }
-            if (out_begin < input_begin + input_storage_bytes
-                    && input_begin < out_begin + out_storage_bytes) {
+            const auto out_range = detail::checked_storage_range(
+                    out_facts.backing, 0, out_facts.storage_bytes,
+                    "embedding storage range overflows");
+            const auto input_range = detail::checked_storage_range(
+                    input_facts.backing, 0, input_facts.storage_bytes,
+                    "embedding storage range overflows");
+            if (detail::storage_ranges_overlap(out_range, input_range)) {
                 throw std::invalid_argument(
                         "embedding output storage range overlaps an input");
             }
@@ -149,11 +139,9 @@ namespace iom {
                     validate_checked_view(device, out, kAdmissionContext);
 
             reject_output_overlap(
-                    out, out_facts.storage_bytes, table,
-                    table_facts.storage_bytes);
+                    out, out_facts, table, table_facts);
             reject_output_overlap(
-                    out, out_facts.storage_bytes, indices,
-                    index_facts.storage_bytes);
+                    out, out_facts, indices, index_facts);
 
             if (table.spec().quantization != QuantizationFormat::NONE
                     || indices.spec().quantization

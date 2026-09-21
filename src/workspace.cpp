@@ -56,10 +56,11 @@ namespace iom {
     }
 
     void* RawWorkspaceView::range_address() const noexcept {
-        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(
-                owner_ == nullptr ? nullptr
-                                  : owner_->workspace_address());
-        return reinterpret_cast<void*>(base + offset_);
+        if (owner_ == nullptr) return nullptr;
+        const void* const base = owner_->storage_identity().base;
+        if (base == nullptr) return nullptr;
+        return reinterpret_cast<void*>(
+                reinterpret_cast<std::uintptr_t>(base) + offset_);
     }
 
     RawWorkspace::RawWorkspace(const Device& device, std::size_t bytes)
@@ -86,6 +87,11 @@ namespace iom {
 
     void* RawWorkspace::workspace_address() const noexcept {
         return nullptr;
+    }
+
+    detail::StorageIdentity RawWorkspace::storage_identity() const noexcept {
+        void* const base = workspace_address();
+        return {base, base};
     }
 
     bool Device::owns_workspace(const RawWorkspace* workspace) const noexcept {

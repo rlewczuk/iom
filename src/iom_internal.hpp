@@ -82,6 +82,8 @@ struct CheckedViewFacts {
     std::size_t storage_bytes = 0;
     // Checked logical payload bytes of the view.
     std::size_t logical_bytes = 0;
+    // Canonical backing facts, separate from the execution descriptor.
+    StorageIdentity backing;
 };
 
 // Validate one operand view and report its checked facts: live owner identity
@@ -96,5 +98,13 @@ struct CheckedViewFacts {
 // the rank minimum whose matrix axes it indexes.
 [[nodiscard]] CheckedViewFacts validate_checked_view(
         const Device& device, const TensorView& view, const char* operation);
+
+// Defer address-end checks to the operation's existing overlap-validation
+// stage: binary and RMSNorm deliberately have different alias policies.
+[[nodiscard]] inline StorageRange checked_storage_range(
+        const TensorView& view, std::size_t storage_bytes, const char* what) {
+    return checked_storage_range(
+            StorageAccess::identity(view), 0, storage_bytes, what);
+}
 
 }  // namespace iom::detail
