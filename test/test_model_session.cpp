@@ -1067,7 +1067,9 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
 
     // The generation path observes exactly the admitted request it published:
     // its TTFT, its committed counts, and its single decode interval, while the
-    // load interval keeps covering only the instrumented factory.
+    // load interval keeps covering only the instrumented factory. The prefill
+    // span's two readings share the request-entry window, so they neither
+    // advance the script nor falsify a pinned instant.
     const iom::InferenceSnapshot& snapshot = recorder.snapshot();
     REQUIRE(snapshot.request_admitted);
     CHECK_EQ(snapshot.load.host_nanoseconds, 100);
@@ -1107,6 +1109,10 @@ TEST_CASE("Inference metrics session load leaves generation behavior unchanged")
     CHECK_THROWS_AS(failing_observed->generate_tokens(prompt, 2),
                     std::runtime_error);
     CHECK(failing_observed->poisoned());
+    // The failed attempt keeps its own published request, counts no commit,
+    // and retains the original failure. The prefill span completed before the
+    // selector failed, and its two readings share the armed window, so the
+    // clock stays fully scripted.
     const iom::InferenceSnapshot& failed = failing_recorder.snapshot();
     REQUIRE(failed.request_admitted);
     CHECK_EQ(failed.admitted.ordinal, 1);
@@ -4151,6 +4157,390 @@ TEST_CASE(
                     "recovered/fresh logits");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in prefill completion observation (change `13-performance-trace-probes`,
+// leaf `04-prefill-observation`).
+//
+// Each case drives the real synthetic session through `generate_tokens` with an
+// attached recorder, so the recorded prefill span is the completion-observed
+// interval from immediately before the prefill forward submission to the
+// already-required initial final-logits readiness wait. The supplied host clock
+// below encodes the session's accepted-operation count, which makes a recorded
+// span prove which work it covered — no operation accepted when its begin was
+// read, every prefill operation accepted when its end was read — without
+// depending on how many other observation hooks read the same clock.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using synthetic_session_test::Fixture;
+using synthetic_session_test::RecordingGreedySelector;
+
+// One decoder layer submits exactly seven linear tasks (the three QKV
+// projections, the attention output projection, and the gate/up/down MLP
+// projections), so the final LM-head projection of an `L`-layer prefill is
+// linear task `7 * L + 1`. `arm_linear_failure(7 * L, 1)` therefore fails
+// exactly that producer, which makes the initial final-logits readiness wait
+// fail while the prefill forward itself returns normally.
+constexpr std::size_t kPrefillLinearTasksPerLayer = 7;
+
+// Supplied monotonic host clock that reports the bound session's accepted
+// operation count in the high part of every reading and its own reading ordinal
+// in the low part. `read` neither allocates nor throws, and the readings stay
+// monotone because a request only ever accepts more work, so a recorded span
+// decodes the accepted-operation count it covered as `duration / kScale` with
+// less than one scale unit of reading-ordinal noise.
+class AcceptedOperationsClock {
+public:
+    static constexpr std::uint64_t kScale = 4'096;
+    static constexpr std::uint64_t kMaxReadings = 4'000;
+
+    void bind(const iom::TinyLlamaSession& session) noexcept {
+        session_ = &session;
+    }
+
+    [[nodiscard]] iom::HostClock host_clock() noexcept {
+        return iom::HostClock{&AcceptedOperationsClock::read, this};
+    }
+
+    [[nodiscard]] bool exceeded() const noexcept { return exceeded_; }
+
+    static std::uint64_t read(void* context) noexcept {
+        auto* self = static_cast<AcceptedOperationsClock*>(context);
+        if (self->readings_ >= kMaxReadings) {
+            self->exceeded_ = true;
+            return self->last_;
+        }
+        const std::uint64_t accepted = self->session_ == nullptr
+                ? 0
+                : static_cast<std::uint64_t>(
+                          SessionAccess::accepted(*self->session_).size());
+        self->last_ = accepted * kScale + ++self->readings_;
+        return self->last_;
+    }
+
+private:
+    const iom::TinyLlamaSession* session_ = nullptr;
+    std::uint64_t readings_ = 0;
+    std::uint64_t last_ = 0;
+    bool exceeded_ = false;
+};
+
+// Loads one observed session whose recorder reads `clock`, binds the clock to
+// it, and records the selector for the parity checks below.
+[[nodiscard]] std::unique_ptr<iom::TinyLlamaSession> load_observed_session(
+        Fixture& fixture, AcceptedOperationsClock& clock,
+        iom::InferenceMetrics& recorder, RecordingGreedySelector** observer) {
+    auto selector = std::make_unique<RecordingGreedySelector>();
+    *observer = selector.get();
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(session);
+    REQUIRE_EQ(SessionAccess::metrics(*session), &recorder);
+    clock.bind(*session);
+    return session;
+}
+
+// Accepted operation count of one completed prefill of `fixture`: the probe
+// publishes its request and forwards `prompt` through the private seam, which
+// is exactly the work a recorded prefill span must cover.
+[[nodiscard]] std::size_t prefill_operation_count(
+        Fixture& fixture, std::span<const std::size_t> prompt) {
+    const std::unique_ptr<iom::TinyLlamaSession> probe =
+            fixture.load(std::make_unique<RecordingGreedySelector>());
+    SessionAccess::prepare_forward_request(*probe, prompt.size());
+    const iom::session_detail::ForwardResult forwarded =
+            SessionAccess::forward_prefill(*probe, prompt);
+    const std::size_t operations = SessionAccess::accepted(*probe).size();
+    SessionAccess::wait(*probe, forwarded.producer);
+    return operations;
+}
+
+}  // namespace
+
+TEST_CASE(
+        "Inference metrics prefill records one completion-observed span at "
+        "the initial readiness barrier") {
+    using namespace synthetic_session_test;
+    Fixture fixture(1, "metrics-prefill-span");
+    const std::array<std::size_t, 3> prompt{1, 3, 4};
+    const std::size_t prefill_operations =
+            prefill_operation_count(fixture, prompt);
+
+    // Uninstrumented baseline for the parity checks below.
+    auto plain_selector = std::make_unique<RecordingGreedySelector>();
+    RecordingGreedySelector* plain_observer = plain_selector.get();
+    const std::unique_ptr<iom::TinyLlamaSession> plain =
+            fixture.load(std::move(plain_selector));
+    const iom::TokenGenerationResult expected =
+            plain->generate_tokens(prompt, 2);
+
+    AcceptedOperationsClock clock;
+    iom::InferenceMetrics recorder(clock.host_clock());
+    RecordingGreedySelector* observer = nullptr;
+    const std::unique_ptr<iom::TinyLlamaSession> session =
+            load_observed_session(fixture, clock, recorder, &observer);
+
+    // Request-scoped scalars belong to the admitted request observation, which
+    // the existing request-publication bridge establishes; prefill observation
+    // adds no publication, ordinal, or reset logic of its own.
+    session->prepare_request(prompt.size(), {0, 1}, {0, {0, 1}});
+    REQUIRE(recorder.snapshot().request_admitted);
+    CHECK(recorder.snapshot().admitted.prefill.state
+          == iom::ObservationState::not_run);
+
+    const iom::TokenGenerationResult result =
+            session->generate_tokens(prompt, 2);
+
+    // One completion-observed span covers the whole prefill submission phase:
+    // its begin reading observed no accepted operation, and its end reading
+    // observed every operation of the prefill. A span measured as the forward's
+    // call-return time, as an enqueue-only sum, or closed before the readiness
+    // wait would decode a different accepted-operation count.
+    CHECK_FALSE(clock.exceeded());
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    CHECK(snapshot.request_admitted);
+    CHECK(snapshot.admitted.prefill.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(snapshot.admitted.prefill.host_nanoseconds
+                     / AcceptedOperationsClock::kScale,
+             prefill_operations);
+    // The completion-observed span is a superset of the per-facade
+    // host-enqueue sum of the submission formula: it covers the forward and the
+    // readiness waits, so it is never smaller than that sum, and it is not the
+    // tokenization span.
+    CHECK_GE(snapshot.admitted.prefill.host_nanoseconds,
+             snapshot.admitted.prefill_enqueue.host_nanoseconds);
+    CHECK(snapshot.admitted.tokenization.state
+          == iom::ObservationState::not_run);
+    // Scalar observation stays scalar-only: no trace storage is created.
+    CHECK(recorder.operations().empty());
+    CHECK_EQ(snapshot.trace_rows_dropped, 0);
+
+    // Enabled and disabled paths stay identical: selected ids, observed
+    // histories and producers, logits, tokens, stop reason, and KV prefix.
+    CHECK(result.token_ids == expected.token_ids);
+    CHECK(result.stop_reason == expected.stop_reason);
+    REQUIRE(observer->selected_ids == plain_observer->selected_ids);
+    CHECK(observer->histories == plain_observer->histories);
+    // Each session has its own queue identity, so the borrowed readiness
+    // producers are compared by shape and count rather than by value.
+    REQUIRE_EQ(observer->producers.size(), plain_observer->producers.size());
+    for (const iom::oid producer : observer->producers) {
+        CHECK(iom::oid_is_token(producer));
+    }
+    REQUIRE_EQ(observer->logits_rows.size(),
+               plain_observer->logits_rows.size());
+    for (std::size_t step = 0; step < observer->logits_rows.size(); ++step) {
+        compare_logits(
+                observer->logits_rows[step], plain_observer->logits_rows[step],
+                "prefill observation logits");
+    }
+    const std::span<const iom::session_detail::CacheOwner> observed_caches =
+            SessionAccess::caches(*session);
+    const std::span<const iom::session_detail::CacheOwner> plain_caches =
+            SessionAccess::caches(*plain);
+    REQUIRE_EQ(observed_caches.size(), plain_caches.size());
+    for (std::size_t layer = 0; layer < observed_caches.size(); ++layer) {
+        CHECK_EQ(observed_caches[layer].initialized_length,
+                 plain_caches[layer].initialized_length);
+    }
+    // The recorded span covers the prefill that published this prompt prefix.
+    CHECK_GE(observed_caches[0].initialized_length, prompt.size());
+}
+
+TEST_CASE(
+        "Inference metrics prefill records a full-capacity prompt without "
+        "selecting a token") {
+    using namespace synthetic_session_test;
+    Fixture fixture(1, "metrics-prefill-capacity");
+    const std::vector<std::size_t> prompt(kSyntheticCapacity, 1);
+    const std::size_t prefill_operations =
+            prefill_operation_count(fixture, prompt);
+
+    AcceptedOperationsClock clock;
+    iom::InferenceMetrics recorder(clock.host_clock());
+    RecordingGreedySelector* observer = nullptr;
+    const std::unique_ptr<iom::TinyLlamaSession> session =
+            load_observed_session(fixture, clock, recorder, &observer);
+    session->prepare_request(prompt.size(), {0, 1}, {0, {0, 1}});
+
+    const iom::TokenGenerationResult result =
+            session->generate_tokens(prompt, 3);
+
+    // The full-capacity request still submits one prefill, records its
+    // completion-observed span, and selects no token.
+    CHECK(result.token_ids.empty());
+    CHECK(result.stop_reason == iom::GenerationStopReason::context_capacity);
+    CHECK(observer->logits_rows.empty());
+    CHECK_FALSE(clock.exceeded());
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    CHECK(snapshot.admitted.prefill.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(snapshot.admitted.prefill.host_nanoseconds
+                     / AcceptedOperationsClock::kScale,
+             prefill_operations);
+    CHECK_EQ(snapshot.admitted.generated_tokens, 0);
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length,
+             kSyntheticCapacity);
+}
+
+TEST_CASE(
+        "Inference metrics prefill records no span for a zero-new-token "
+        "request") {
+    using namespace synthetic_session_test;
+    Fixture fixture(1, "metrics-prefill-zero");
+    const std::array<std::size_t, 2> prompt{1, 3};
+
+    AcceptedOperationsClock clock;
+    iom::InferenceMetrics recorder(clock.host_clock());
+    RecordingGreedySelector* observer = nullptr;
+    const std::unique_ptr<iom::TinyLlamaSession> session =
+            load_observed_session(fixture, clock, recorder, &observer);
+    session->prepare_request(prompt.size(), {0, 1}, {0, {0, 1}});
+
+    const iom::TokenGenerationResult result =
+            session->generate_tokens(prompt, 0);
+
+    // The zero-limit early return submits no prefill forward: no operation was
+    // accepted, no cache prefix was published, and prefill stays not-run with
+    // no interval, so no prefill submission or wait was added.
+    CHECK(result.token_ids.empty());
+    CHECK(result.stop_reason == iom::GenerationStopReason::max_new_tokens);
+    CHECK_FALSE(clock.exceeded());
+    CHECK(SessionAccess::accepted(*session).empty());
+    CHECK(SessionAccess::history(*session).empty());
+    CHECK_EQ(SessionAccess::caches(*session)[0].initialized_length, 0);
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    CHECK(snapshot.admitted.prefill.state == iom::ObservationState::not_run);
+    CHECK_EQ(snapshot.admitted.prefill.host_nanoseconds, 0);
+    CHECK_EQ(snapshot.admitted.generated_tokens, 0);
+    CHECK(observer->logits_rows.empty());
+}
+
+TEST_CASE(
+        "Inference metrics prefill records an incomplete span when the "
+        "forward fails") {
+    using namespace synthetic_session_test;
+    Fixture fixture(1, "metrics-prefill-forward-failure");
+    const std::array<std::size_t, 3> prompt{1, 3, 4};
+
+    // The uninstrumented failing attempt defines the expected poisoning and
+    // retained-operation behavior of the same injected port failure.
+    const std::unique_ptr<iom::TinyLlamaSession> plain =
+            fixture.load(std::make_unique<RecordingGreedySelector>());
+    iom::cpu_detail::arm_cache_append_failure();
+    struct ClearCacheAppendFailure {
+        ~ClearCacheAppendFailure() {
+            iom::cpu_detail::clear_cache_append_failure();
+        }
+    } clear_cache_append_failure;
+    CHECK_THROWS_AS(plain->generate_tokens(prompt, 2), std::runtime_error);
+    REQUIRE(plain->poisoned());
+    const std::size_t plain_accepted =
+            SessionAccess::accepted(*plain).size();
+
+    AcceptedOperationsClock clock;
+    iom::InferenceMetrics recorder(clock.host_clock());
+    RecordingGreedySelector* observer = nullptr;
+    const std::unique_ptr<iom::TinyLlamaSession> session =
+            load_observed_session(fixture, clock, recorder, &observer);
+    session->prepare_request(prompt.size(), {0, 1}, {0, {0, 1}});
+
+    iom::cpu_detail::arm_cache_append_failure();
+    // The original exception category is preserved unchanged.
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 2), std::runtime_error);
+    CHECK(session->poisoned());
+    CHECK_EQ(SessionAccess::accepted(*session).size(), plain_accepted);
+    CHECK_EQ(session->request_length(), prompt.size());
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 0), std::logic_error);
+
+    // The failed attempt records an incomplete span with no duration, and the
+    // original poisoning, retained operations, and no-reuse behavior of the
+    // existing failure path are unchanged.
+    CHECK_FALSE(clock.exceeded());
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    CHECK(snapshot.admitted.prefill.state == iom::ObservationState::failed);
+    CHECK_EQ(snapshot.admitted.prefill.host_nanoseconds, 0);
+    CHECK(observer->logits_rows.empty());
+}
+
+TEST_CASE(
+        "Inference metrics prefill records an incomplete span when the "
+        "initial readiness wait fails") {
+    using namespace synthetic_session_test;
+    Fixture fixture(1, "metrics-prefill-wait-failure");
+    const std::array<std::size_t, 3> prompt{1, 3, 4};
+
+    // A completed prefill of the same fixture publishes the exact accepted
+    // operation count the failing attempt must reach, so the failing attempt
+    // can prove that its forward completed before the readiness wait failed.
+    const std::size_t prefill_operations =
+            prefill_operation_count(fixture, prompt);
+
+    AcceptedOperationsClock clock;
+    iom::InferenceMetrics recorder(clock.host_clock());
+    RecordingGreedySelector* observer = nullptr;
+    const std::unique_ptr<iom::TinyLlamaSession> session =
+            load_observed_session(fixture, clock, recorder, &observer);
+    session->prepare_request(prompt.size(), {0, 1}, {0, {0, 1}});
+
+    iom::cpu_detail::arm_linear_failure(kPrefillLinearTasksPerLayer, 1);
+    struct ClearLinearFailure {
+        ~ClearLinearFailure() { iom::cpu_detail::clear_linear_failure(); }
+    } clear_linear_failure;
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 2), std::runtime_error);
+    CHECK(session->poisoned());
+    CHECK_EQ(SessionAccess::accepted(*session).size(), prefill_operations);
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 0), std::logic_error);
+
+    CHECK_FALSE(clock.exceeded());
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    // The readiness wait is what failed here, and the incomplete observation
+    // proves the span was still open after the forward returned: a span closed
+    // at the forward's call return would have been recorded as a successful
+    // completion before this wait failed.
+    CHECK(snapshot.admitted.prefill.state == iom::ObservationState::failed);
+    CHECK_EQ(snapshot.admitted.prefill.host_nanoseconds, 0);
+    CHECK(observer->logits_rows.empty());
+}
+
+TEST_CASE(
+        "Inference metrics prefill closes its span before a failing selector") {
+    using namespace synthetic_session_test;
+    Fixture fixture(1, "metrics-prefill-selector-failure");
+    const std::array<std::size_t, 3> prompt{1, 3, 4};
+    const std::size_t prefill_operations =
+            prefill_operation_count(fixture, prompt);
+
+    AcceptedOperationsClock clock;
+    iom::InferenceMetrics recorder(clock.host_clock());
+    auto selector =
+            std::make_unique<SequenceSelector>(std::vector<std::size_t>{4});
+    selector->throw_failure = true;
+    auto session = iom::load_tinyllama_session(
+            fixture.directory.path(), *fixture.device, std::move(selector),
+            &recorder);
+    REQUIRE(session);
+    clock.bind(*session);
+    session->prepare_request(prompt.size(), {0, 1}, {0, {0, 1}});
+
+    CHECK_THROWS_AS(session->generate_tokens(prompt, 2), std::runtime_error);
+    CHECK(session->poisoned());
+
+    // The span ends at the initial readiness wait, which precedes selection:
+    // the failing selector leaves the completed prefill observation untouched
+    // and is never attributed to prefill.
+    CHECK_FALSE(clock.exceeded());
+    const iom::InferenceSnapshot& snapshot = recorder.snapshot();
+    CHECK(snapshot.admitted.prefill.state
+          == iom::ObservationState::succeeded);
+    CHECK_EQ(snapshot.admitted.prefill.host_nanoseconds
+                     / AcceptedOperationsClock::kScale,
+             prefill_operations);
 }
 
 namespace {

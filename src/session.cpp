@@ -1140,10 +1140,6 @@ TokenGenerationResult TinyLlamaSession::generate_tokens(
             return finish(GenerationStopReason::max_new_tokens);
         }
 
-        session_detail::ForwardResult current =
-                session_detail::SessionAccess::forward_prefill(
-                        *this, token_ids);
-
         const auto require_ready_result =
                 [&](const session_detail::ForwardResult& result) {
                     const bool shape_ok = result.logits != nullptr
@@ -1208,8 +1204,35 @@ TokenGenerationResult TinyLlamaSession::generate_tokens(
                     }
                 };
 
-        require_ready_result(current);
-        session_detail::SessionAccess::wait(*this, current.producer);
+        // Prefill is one completion-observed span per submitted request. It
+        // begins immediately before the forward submission and ends after the
+        // already-required initial final-logits readiness wait below, which is
+        // the existing pre-history boundary: `forward_prefill` contains its own
+        // correctness waits, so the span deliberately includes them and is
+        // never host-enqueue-only time. A failed attempt records an incomplete
+        // `failed` observation and rethrows the original exception unchanged,
+        // without an added drain, second wait, callback, or altered error path.
+        std::uint64_t prefill_begin = 0;
+        if (metrics != nullptr) {
+            prefill_begin = metrics->now();
+        }
+        session_detail::ForwardResult current;
+        try {
+            current = session_detail::SessionAccess::forward_prefill(
+                    *this, token_ids);
+            require_ready_result(current);
+            session_detail::SessionAccess::wait(*this, current.producer);
+        } catch (...) {
+            if (metrics != nullptr) {
+                metrics->record_prefill(
+                        prefill_begin, metrics->now(),
+                        ObservationState::failed);
+            }
+            throw;
+        }
+        if (metrics != nullptr) {
+            metrics->record_prefill(prefill_begin, metrics->now());
+        }
         history.assign(token_ids.begin(), token_ids.end());
 
         if (history.size() == config.max_position_embeddings) {
