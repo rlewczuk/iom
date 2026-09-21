@@ -12,7 +12,6 @@
 #include <cstddef>
 #include <exception>
 #include <span>
-
 #include "iom/iom.hpp"
 #include "iom/tensor.hpp"
 
@@ -306,5 +305,91 @@ struct CacheAttentionStageState {
 void run_cache_attention_stage(
         DeviceOps& ops, CacheAttentionStageRequest& request,
         RawWorkspaceView workspace, CacheAttentionStageState& state);
+
+/**
+ * Fixed scalars of one QKV/RoPE stage invocation. The head geometry
+ * (`F`, `Hq`, `Hkv`, `D`) is read from the supplied views instead of being
+ * restated here, so a mismatch between configuration and storage cannot
+ * pass unnoticed.
+ */
+struct QkvRopeStageParams {
+    // Absolute position of the first rotated row; `a + rows - 1` is checked
+    // before any submission.
+    std::size_t a = 0;
+    // Row count of the prefill run or the fixed one-row decode run.
+    std::size_t rows = 0;
+    // Explicit rotary base of this invocation.
+    double theta = 0.0;
+    // Exact layer RMS normalization epsilon.
+    float epsilon = 0.0F;
+};
+
+/**
+ * Caller-owned views of one layer's attention-normalization, Q/K/V
+ * projection, and Q/K rotation stage. Every view is borrowed for the
+ * duration of one call and never retained; every operand and output stays
+ * owned by the caller.
+ */
+struct QkvRopeStageViews {
+    // Read: pre-projection activation `[R,F]`.
+    TensorView activation;
+    // Read: attention normalization scale `[1,F]`.
+    TensorView attention_scale;
+    // Read: `[Hq*D,F]` query weight in Hugging Face `[out,in]` order.
+    TensorView query_weight;
+    // Read: `[Hkv*D,F]` key weight in Hugging Face `[out,in]` order.
+    TensorView key_weight;
+    // Read: `[Hkv*D,F]` value weight in Hugging Face `[out,in]` order.
+    TensorView value_weight;
+    // Write: normalized activation `[R,F]`, disjoint from `activation`.
+    TensorView normalized;
+    // Write: head-planar query projection `[Hq,R,D]`.
+    TensorView query;
+    // Write: head-planar key projection `[Hkv,R,D]`.
+    TensorView key;
+    // Write: head-planar value projection `[Hkv,R,D]`, left unrotated.
+    TensorView value;
+    // Write: rotated query `[Hq,R,D]`, disjoint from `query`.
+    TensorView rotated_query;
+    // Write: rotated key `[Hkv,R,D]`, disjoint from `key`.
+    TensorView rotated_key;
+};
+
+/**
+ * Caller-provisioned scratch for the three simultaneously submitted
+ * projection branches. RMS normalization and RoPE consume no raw workspace
+ * on any retained backend, so those submissions take the empty view. Each
+ * slice is validated against the pure requirement of its own branch before
+ * the stage has any effect, and two simultaneous positive requirements must
+ * not share one caller range.
+ */
+struct QkvRopeStageWorkspace {
+    RawWorkspaceView query;
+    RawWorkspaceView key;
+    RawWorkspaceView value;
+};
+
+/**
+ * Attention normalization, head-planar Q/K/V projection, and split-half Q/K
+ * RoPE for one layer run.
+ *
+ * Submission order is the frozen producer schedule: RMSNorm first and waited
+ * successfully; then Q, K, and V as three independent head-planar
+ * projections whose accepted OIDs are each waited and drained before either
+ * rotation is submitted; then independent Q and K RoPE at the same absolute
+ * start with the same runtime theta, both waited and drained. V stays the
+ * unrotated projection. No cache append, SDPA, head merge, residual,
+ * allocation, owner release, or allocator reset happens here.
+ *
+ * A normal return is the only publication point of the rotated Q/K and of
+ * the complete Q/K/V stage. Any admission rejection or retained failure is
+ * propagated after every accepted OID of the stage is terminal, with the
+ * operation's own failure category preserved, and without submitting a
+ * dependent stage.
+ */
+void run_qkv_rope_stage(
+        DeviceOps& queue, QkvRopeStageViews views,
+        const QkvRopeStageParams& params,
+        const QkvRopeStageWorkspace& workspace);
 
 }  // namespace iom::session_detail

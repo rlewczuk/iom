@@ -945,4 +945,378 @@ void run_cache_attention_stage(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attention normalization, QKV projection, and Q/K RoPE stage
+// (leaf 03-qkv-rope-stage).
+//
+// One private, allocation-free stage composes the existing RMSNorm, three
+// head-planar linear, and two split-half RoPE facades over caller-supplied
+// views and caller-provisioned scratch. It adds no public stage API, hidden
+// owner, allocation, cache mutation, or schedule of its own: the producer
+// order below is the frozen forward schedule, and every dependent
+// submission happens only after its direct producer was waited
+// successfully.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One diagnostic tag for every rejection this composition makes itself.
+// Per-operation admission keeps its own operation tags.
+constexpr const char* kQkvRopeStage = "TinyLlama QKV RoPE stage";
+
+[[noreturn]] void qkv_rope_reject(const char* what) {
+    throw std::invalid_argument(std::string(kQkvRopeStage) + ": " + what);
+}
+
+// Exact rank and extent agreement of one operand: a view with the same
+// element count in another shape is not the same operand.
+void qkv_rope_require_extents(const TensorView& view,
+        std::span<const std::size_t> expected, const char* what) {
+    const std::span<const std::size_t> actual =
+            view.spec().shape.dimensions();
+    if (actual.size() != expected.size()) qkv_rope_reject(what);
+    for (std::size_t axis = 0; axis < expected.size(); ++axis) {
+        if (actual[axis] != expected[axis]) qkv_rope_reject(what);
+    }
+}
+
+// Head geometry of one invocation, read from the supplied views. The stage
+// never assumes a configured head layout: storage decides the extents, and
+// every relation below is checked against them.
+struct QkvRopeGeometry {
+    std::size_t rows = 0;
+    std::size_t features = 0;
+    std::size_t query_heads = 0;
+    std::size_t kv_heads = 0;
+    std::size_t head_dim = 0;
+
+    [[nodiscard]] std::size_t key_value_features() const {
+        return detail::checked_mul(kv_heads, head_dim,
+                "TinyLlama QKV RoPE stage Hkv*D overflows");
+    }
+};
+
+QkvRopeGeometry prepare_qkv_rope_stage(const QkvRopeStageViews& views,
+        const QkvRopeStageParams& params) {
+    if (params.rows == 0) {
+        qkv_rope_reject("row count must be nonzero");
+    }
+
+    const std::span<const std::size_t> activation =
+            views.activation.spec().shape.dimensions();
+    if (activation.size() != 2) {
+        qkv_rope_reject("activation must be the rank-two [R,F] matrix");
+    }
+    QkvRopeGeometry geometry;
+    geometry.rows = activation[0];
+    geometry.features = activation[1];
+    if (geometry.rows == 0 || geometry.features == 0) {
+        qkv_rope_reject("activation extents must be nonzero");
+    }
+    if (geometry.rows != params.rows) {
+        qkv_rope_reject("activation rows must equal the supplied row count");
+    }
+
+    const std::span<const std::size_t> query =
+            views.query.spec().shape.dimensions();
+    if (query.size() != 3) {
+        qkv_rope_reject(
+                "query projection must be the rank-three [Hq,R,D] tensor");
+    }
+    geometry.query_heads = query[0];
+    geometry.head_dim = query[2];
+    if (geometry.query_heads == 0 || geometry.head_dim == 0) {
+        qkv_rope_reject("query head count and head width must be nonzero");
+    }
+    if ((geometry.head_dim & 1U) != 0) {
+        qkv_rope_reject("head width must be positive and even");
+    }
+    if (query[1] != geometry.rows) {
+        qkv_rope_reject("query rows must equal the stage row count");
+    }
+
+    const std::span<const std::size_t> key =
+            views.key.spec().shape.dimensions();
+    if (key.size() != 3) {
+        qkv_rope_reject(
+                "key projection must be the rank-three [Hkv,R,D] tensor");
+    }
+    geometry.kv_heads = key[0];
+    if (geometry.kv_heads == 0) {
+        qkv_rope_reject("key head count must be nonzero");
+    }
+    if (key[1] != geometry.rows || key[2] != geometry.head_dim) {
+        qkv_rope_reject("key must be [Hkv,R,D] with the query head width");
+    }
+
+    const std::size_t expected_features = detail::checked_mul(
+            geometry.query_heads, geometry.head_dim,
+            "TinyLlama QKV RoPE stage Hq*D overflows");
+    if (expected_features != geometry.features) {
+        qkv_rope_reject("activation features must equal Hq*D");
+    }
+    if (geometry.query_heads % geometry.kv_heads != 0) {
+        qkv_rope_reject(
+                "query head count must be divisible by the KV head count");
+    }
+
+    const std::array<std::size_t, 2> activation_shape{
+            geometry.rows, geometry.features};
+    qkv_rope_require_extents(views.normalized, activation_shape,
+            "normalized output must be [R,F]");
+    const std::array<std::size_t, 2> scale_shape{1, geometry.features};
+    qkv_rope_require_extents(views.attention_scale, scale_shape,
+            "attention scale must be [1,F]");
+    const std::array<std::size_t, 2> query_weight_shape{
+            geometry.features, geometry.features};
+    qkv_rope_require_extents(views.query_weight, query_weight_shape,
+            "query weight must be [Hq*D,F]");
+    const std::array<std::size_t, 2> kv_weight_shape{
+            geometry.key_value_features(), geometry.features};
+    qkv_rope_require_extents(views.key_weight, kv_weight_shape,
+            "key weight must be [Hkv*D,F]");
+    qkv_rope_require_extents(views.value_weight, kv_weight_shape,
+            "value weight must be [Hkv*D,F]");
+    const std::array<std::size_t, 3> query_shape{
+            geometry.query_heads, geometry.rows, geometry.head_dim};
+    qkv_rope_require_extents(views.rotated_query, query_shape,
+            "rotated query must be [Hq,R,D]");
+    const std::array<std::size_t, 3> kv_shape{
+            geometry.kv_heads, geometry.rows, geometry.head_dim};
+    qkv_rope_require_extents(views.value, kv_shape, "value must be [Hkv,R,D]");
+    qkv_rope_require_extents(views.rotated_key, kv_shape,
+            "rotated key must be [Hkv,R,D]");
+
+    // The stage owns an exclusive end-position check in addition to the
+    // operation's inclusive last-position admission.  This keeps `a + R`
+    // representable for the caller's subsequent cache/window handoff even
+    // when the RoPE operation itself would only need `a + R - 1`.
+    (void)detail::checked_add(params.a, geometry.rows,
+            "TinyLlama QKV RoPE stage absolute position range overflows");
+    return geometry;
+}
+
+// Every operand of the stage belongs to the queue's device. The operation
+// facades own the remaining per-operation admission: owners, handles,
+// strides, alias, dtype, quantization, capability, and the rowwise and
+// row-window rules.
+void require_qkv_rope_device(
+        const QkvRopeStageViews& views, const Device& device) {
+    const std::array<const TensorView*, 11> operands{
+            &views.activation, &views.attention_scale, &views.query_weight,
+            &views.key_weight, &views.value_weight, &views.normalized,
+            &views.query, &views.key, &views.value, &views.rotated_query,
+            &views.rotated_key};
+    for (const TensorView* operand : operands) {
+        if (&operand->device() != &device) {
+            qkv_rope_reject("stage operands must belong to the queue's "
+                            "device");
+        }
+    }
+}
+
+// The established category of one synchronous OID rejection. The facades map
+// exactly these classes, so a rejected dependent submission keeps the
+// operation's own failure category instead of being relabelled by this
+// composition. A zero or unknown result is the queue contract's invalid
+// value and stays an internal failure.
+[[nodiscard]] std::exception_ptr qkv_rope_admission_failure(
+        oid value, const char* what) {
+    const std::string context =
+            std::string(kQkvRopeStage) + ": " + what + " was rejected";
+    switch (value) {
+        case to_oid(OidError::InvalidArgument):
+            return std::make_exception_ptr(std::invalid_argument(
+                    context + " as invalid input"));
+        case to_oid(OidError::Unsupported):
+            return std::make_exception_ptr(detail::UnsupportedOperation());
+        case to_oid(OidError::Overflow):
+            return std::make_exception_ptr(std::overflow_error(
+                    context + " by checked arithmetic"));
+        case to_oid(OidError::ResourceExhausted):
+            return std::make_exception_ptr(std::bad_alloc());
+        case to_oid(OidError::DeviceError):
+        case to_oid(OidError::InternalError):
+        default:
+            return std::make_exception_ptr(std::runtime_error(
+                    context + " by the backend"));
+    }
+}
+
+// Observe one branch: a positive token is waited (and a retained failure is
+// captured), while a negative result consumed no sequence and is never
+// passed to `wait`. The returned failure is null exactly when the branch
+// completed successfully.
+[[nodiscard]] std::exception_ptr qkv_rope_branch_failure(
+        DeviceOps& queue, oid value, const char* what) {
+    if (!oid_is_token(value)) {
+        return qkv_rope_admission_failure(value, what);
+    }
+    try {
+        queue.wait(value);
+    } catch (...) {
+        return std::current_exception();
+    }
+    return nullptr;
+}
+
+// Attempt the wait of every branch in one simultaneously submitted group,
+// even after an earlier branch already failed, and report the first failure
+// only once every accepted OID of the group is terminal. A completed failure
+// stays observable through its own token; a later successful branch never
+// substitutes for it.
+[[nodiscard]] std::exception_ptr drain_qkv_rope_branches(DeviceOps& queue,
+        std::span<const oid> tokens, std::span<const char* const> roles) {
+    std::exception_ptr first;
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const std::exception_ptr failure =
+                qkv_rope_branch_failure(queue, tokens[index], roles[index]);
+        if (failure != nullptr && first == nullptr) {
+            first = failure;
+        }
+    }
+    return first;
+}
+
+// Caller scratch is admitted before the first submission. Each positive
+// branch requirement is checked through the established workspace validator,
+// which owns device identity, liveness, exact capacity, required alignment,
+// and range arithmetic for the exact admitted range; the per-branch operand
+// nonoverlap check stays with the submission facade, which receives the
+// caller's own views and is authoritative for it. Two simultaneously
+// submitted positive requirements must not share one caller range. A zero
+// requirement neither validates nor leases a slice, exactly as the operation
+// facades document, so the three branches are never serialized to reuse an
+// overlapping caller range. The preflight copies no view and allocates
+// nothing.
+void admit_qkv_rope_scratch(DeviceOps& queue,
+        const QkvRopeStageWorkspace& workspace,
+        const std::array<WorkspaceRequirements, 3>& requirements) {
+    const Device& device = queue.device();
+    const std::array<const RawWorkspaceView*, 3> slices{
+            &workspace.query, &workspace.key, &workspace.value};
+    for (std::size_t branch = 0; branch < slices.size(); ++branch) {
+        if (requirements[branch].bytes == 0) {
+            continue;
+        }
+        (void)detail::WorkspaceValidation::validated(device,
+                *slices[branch], requirements[branch].bytes,
+                requirements[branch].alignment,
+                std::span<const TensorView>{});
+        for (std::size_t other = branch + 1; other < slices.size(); ++other) {
+            if (requirements[other].bytes == 0) {
+                continue;
+            }
+            const RawWorkspaceView& first = *slices[branch];
+            const RawWorkspaceView& second = *slices[other];
+            if (first.owner_identity() == second.owner_identity()
+                    && first.range_begin() < second.range_end()
+                    && second.range_begin() < first.range_end()) {
+                qkv_rope_reject("simultaneously submitted projection "
+                                "branches must not share caller scratch");
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void run_qkv_rope_stage(DeviceOps& queue, QkvRopeStageViews views,
+        const QkvRopeStageParams& params,
+        const QkvRopeStageWorkspace& workspace) {
+    const QkvRopeGeometry geometry = prepare_qkv_rope_stage(views, params);
+    require_qkv_rope_device(views, queue.device());
+
+    // Every operation query is pure and performs its own complete admission
+    // validation.  Run all of them before RMSNorm can submit, so a malformed
+    // RoPE scalar/view or a capability rejection cannot leave earlier stage
+    // outputs published.
+    const WorkspaceRequirements normalization_requirements =
+            queue.rmsnorm_workspace_requirements(views.activation,
+                    views.attention_scale, views.normalized, params.epsilon);
+    if (normalization_requirements.bytes != 0) {
+        qkv_rope_reject(
+                "RMSNorm requires caller scratch unsupported by this stage");
+    }
+    const std::array<WorkspaceRequirements, 2> rotation_requirements{
+            queue.rope_workspace_requirements(views.query,
+                    views.rotated_query, params.a, params.theta),
+            queue.rope_workspace_requirements(views.key, views.rotated_key,
+                    params.a, params.theta)};
+    for (const WorkspaceRequirements requirements : rotation_requirements) {
+        if (requirements.bytes != 0) {
+            qkv_rope_reject(
+                    "RoPE requires caller scratch unsupported by this stage");
+        }
+    }
+
+    // Pure requirement queries and caller-scratch admission precede every
+    // queue effect. RMSNorm and RoPE consume no raw workspace on any retained
+    // backend, so only the three projection branches carry a requirement
+    // here.
+    const std::array<WorkspaceRequirements, 3> requirements{
+            queue.linear_workspace_requirements(views.normalized,
+                    views.query_weight, views.query, 0, geometry.rows,
+                    LinearOutputLayout::head_planar, geometry.query_heads,
+                    geometry.head_dim),
+            queue.linear_workspace_requirements(views.normalized,
+                    views.key_weight, views.key, 0, geometry.rows,
+                    LinearOutputLayout::head_planar, geometry.kv_heads,
+                    geometry.head_dim),
+            queue.linear_workspace_requirements(views.normalized,
+                    views.value_weight, views.value, 0, geometry.rows,
+                    LinearOutputLayout::head_planar, geometry.kv_heads,
+                    geometry.head_dim)};
+    admit_qkv_rope_scratch(queue, workspace, requirements);
+
+    // 1. Attention normalization is the only producer of every projection
+    //    input, so it is submitted and waited on its own.
+    const oid normalization = queue.rmsnorm(views.activation,
+            views.attention_scale, views.normalized, params.epsilon);
+    if (const std::exception_ptr failure = qkv_rope_branch_failure(
+                queue, normalization, "attention RMSNorm")) {
+        std::rethrow_exception(failure);
+    }
+
+    // 2. Q, K, and V are independent branches over the completed
+    //    normalization: HF `[out,in]` weights are consumed directly and
+    //    head-planar mode writes [Hq,R,D] / [Hkv,R,D] without a transpose, a
+    //    repeated KV head, or a final-axis view transform.
+    const std::array<oid, 3> projections{
+            queue.linear(views.normalized, views.query_weight, views.query, 0,
+                    geometry.rows, LinearOutputLayout::head_planar,
+                    geometry.query_heads, geometry.head_dim, workspace.query),
+            queue.linear(views.normalized, views.key_weight, views.key, 0,
+                    geometry.rows, LinearOutputLayout::head_planar,
+                    geometry.kv_heads, geometry.head_dim, workspace.key),
+            queue.linear(views.normalized, views.value_weight, views.value, 0,
+                    geometry.rows, LinearOutputLayout::head_planar,
+                    geometry.kv_heads, geometry.head_dim, workspace.value)};
+    constexpr std::array<const char*, 3> kProjectionRoles{
+            "query projection", "key projection", "value projection"};
+    // 3. Every projection branch is drained before either rotation: a
+    //    positive OID proves admission only, and a failed or rejected branch
+    //    forbids the dependent rotations entirely.
+    if (const std::exception_ptr failure =
+                drain_qkv_rope_branches(queue, projections,
+                        kProjectionRoles)) {
+        std::rethrow_exception(failure);
+    }
+
+    // 4. Rotated Q and K are independent branches at the same absolute start
+    //    with the same runtime theta. V stays unrotated.
+    const std::array<oid, 2> rotations{
+            queue.rope(views.query, views.rotated_query, params.a,
+                    params.theta),
+            queue.rope(views.key, views.rotated_key, params.a, params.theta)};
+    constexpr std::array<const char*, 2> kRotationRoles{
+            "query rotation", "key rotation"};
+    if (const std::exception_ptr failure = drain_qkv_rope_branches(
+                queue, rotations, kRotationRoles)) {
+        std::rethrow_exception(failure);
+    }
+    // A normal return is the only publication point: every accepted OID of
+    // this stage is terminal, and no owner, allocator, cache, or session
+    // state was touched.
+}
 }  // namespace iom::session_detail

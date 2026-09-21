@@ -208,3 +208,16 @@ not covered by a retained operation port remain `Unsupported`; the implemented
 SiLU hook is governed by the [SiLU activation](silu-activation.md#silu-activation) contract and
 its four-backend gate receipt. This subsection changes no other facade, kernel,
 queue, session, or selector implementation.
+
+The first session-side composition of these facades is implemented: one
+private, allocation-free stage in `src/session.cpp` performs attention RMSNorm,
+the three independent head-planar Q/K/V projections, and the independent Q/K
+split-half rotations over caller-supplied views and caller-provisioned
+workspace, waits the normalization before submitting any projection, waits and
+drains all three projection OIDs before submitting either rotation, and
+publishes nothing after a rejection or retained failure. It adds no public
+stage API, graph, kernel, capability, or contract change; per-backend
+capability, workspace, status, and failure policy stay with the
+operation-owned sections above, and focused CPU coverage lives in
+`test/test_model_session.cpp`. Cache publication, attention, the residual and
+MLP path, whole-layer traversal, generation, and the CLI remain planned.
