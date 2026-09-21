@@ -1,4 +1,4 @@
-#include "session_internal.hpp"
+#include "iom/session.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6,17 +6,637 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
+#include <memory>
 #include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "iom/device.hpp"
+#include "iom/iom.hpp"
+#include "iom/oid.hpp"
 #include "iom_internal.hpp"
+#include "session_internal.hpp"
 
+namespace iom {
+namespace {
+
+using detail::checked_add;
+using detail::checked_mul;
+using session_detail::CacheOwner;
+using session_detail::RunBanks;
+constexpr std::size_t kBaseWorkspaceAlignment = 32;
+constexpr std::size_t kAcceptedOidsPerLayer = 24;
+constexpr std::size_t kAcceptedOidBase = 32;
+
+
+[[nodiscard]] bool is_power_of_two(std::size_t value) noexcept {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+void validate_workspace_requirement(
+        WorkspaceRequirements requirement, const char* label) {
+    if (requirement.bytes == 0) {
+        if (requirement.alignment != 1) {
+            throw std::invalid_argument(
+                    std::string(label) + " zero-byte alignment must be one");
+        }
+        return;
+    }
+    if (requirement.alignment < kBaseWorkspaceAlignment
+            || !is_power_of_two(requirement.alignment)) {
+        throw std::invalid_argument(
+                std::string(label)
+                + " positive workspace alignment must be a power of two"
+                  " of at least 32 bytes");
+    }
+    // The factory takes exact bytes, but its aligned allocation and every
+    // subsequent subrange must also be representable.
+    static_cast<void>(checked_add(
+            requirement.bytes, requirement.alignment - 1,
+            "TinyLlama session workspace alignment overflows"));
+}
+
+[[nodiscard]] std::unique_ptr<Tensor> make_tensor(
+        Device& device, std::vector<std::size_t> dimensions,
+        DataType data_type = DataType::BF16) {
+    TensorSpec spec{
+            TensorShape{std::move(dimensions)}, data_type,
+            QuantizationFormat::NONE};
+    spec.validate();
+    static_cast<void>(spec.logical_nbytes());
+    static_cast<void>(spec.tiled_storage_nbytes());
+    auto owner = device.create_tensor(spec);
+    if (!owner || owner->view().spec() != spec
+            || owner->view().owner_identity() != owner.get()) {
+        throw std::invalid_argument(
+                "TinyLlama session device returned an invalid tensor owner");
+    }
+    static_cast<void>(detail::validate_checked_view(
+            device, owner->view(), "TinyLlama session"));
+    return owner;
+}
+
+struct StorageBytes {
+    std::size_t logical = 0;
+    std::size_t tiled = 0;
+
+    void add(const TensorSpec& spec, std::size_t count = 1) {
+        logical = checked_add(
+                logical, checked_mul(spec.logical_nbytes(), count,
+                                     "session logical bytes overflow"),
+                "session logical bytes overflow");
+        tiled = checked_add(
+                tiled, checked_mul(spec.tiled_storage_nbytes(), count,
+                                   "session tiled bytes overflow"),
+                "session tiled bytes overflow");
+    }
+};
+
+// Preflight all distinct geometries and the full resident total before the
+// first cache/bank allocation, using TensorSpec's standard checked sizing.
+[[nodiscard]] StorageBytes run_storage_bytes(
+        const TinyLlamaConfig& config, std::size_t R) {
+    const std::size_t F = checked_mul(
+            config.num_attention_heads, config.head_dim,
+            "TinyLlama session merged width overflows");
+    StorageBytes bytes;
+    bytes.add({TensorShape{{1, R}}, DataType::U32});
+    bytes.add({TensorShape{{R, F}}, DataType::BF16}, 9);
+    bytes.add({TensorShape{{R, config.intermediate_size}}, DataType::BF16}, 4);
+    bytes.add({TensorShape{{config.num_attention_heads, R, config.head_dim}},
+               DataType::BF16}, 2);
+    bytes.add({TensorShape{{config.num_key_value_heads, R, config.head_dim}},
+               DataType::BF16}, 3);
+    return bytes;
+}
+
+template <class T>
+void validate_vector_capacity(std::size_t count) {
+    static_cast<void>(checked_mul(
+            count, sizeof(T), "TinyLlama session host bytes overflow"));
+    if (count > std::vector<T>{}.max_size()) {
+        throw std::overflow_error("TinyLlama session host capacity overflows");
+    }
+}
+
+void validate_persistent_storage(const TinyLlamaConfig& config) {
+    if (config.vocab_size > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("TinyLlama vocabulary exceeds U32 indices");
+    }
+    auto bytes = run_storage_bytes(config, 1);
+    bytes.add({TensorShape{{1, config.vocab_size}}, DataType::BF16});
+    bytes.add(
+            {TensorShape{{config.num_key_value_heads,
+                          config.max_position_embeddings, config.head_dim}},
+             DataType::BF16},
+            checked_mul(2, config.num_hidden_layers,
+                        "TinyLlama session cache owner count overflows"));
+    validate_vector_capacity<CacheOwner>(config.num_hidden_layers);
+}
+
+struct RequestState {
+    std::size_t run_length = 0;
+    RunBanks banks;
+    std::unique_ptr<RawWorkspace> operation_workspace;
+    std::vector<std::byte> selector_host_scratch;
+    std::unique_ptr<RawWorkspace> selector_device_scratch;
+    std::vector<std::size_t> history;
+    std::vector<std::size_t> results;
+    std::vector<oid> accepted_oids;
+    bool draining = false;
+};
+
+[[nodiscard]] RunBanks allocate_run_banks(
+        Device& device, const TinyLlamaConfig& config, std::size_t R) {
+    RunBanks banks;
+    const std::size_t F = config.hidden_size;
+    const std::size_t M = config.intermediate_size;
+    const std::size_t Hq = config.num_attention_heads;
+    const std::size_t Hkv = config.num_key_value_heads;
+    const std::size_t D = config.head_dim;
+    const std::size_t merged = checked_mul(
+            Hq, D, "TinyLlama session merged width overflows");
+    banks.token_indices = make_tensor(device, {1, R}, DataType::U32);
+    banks.x = make_tensor(device, {R, F});
+    banks.attention_norm = make_tensor(device, {R, F});
+    banks.q = make_tensor(device, {Hq, R, D});
+    banks.k = make_tensor(device, {Hkv, R, D});
+    banks.v = make_tensor(device, {Hkv, R, D});
+    banks.rotated_q = make_tensor(device, {Hq, R, D});
+    banks.rotated_k = make_tensor(device, {Hkv, R, D});
+    banks.attention_merged = make_tensor(device, {R, merged});
+    banks.attention_output = make_tensor(device, {R, F});
+    banks.residual_after_attention = make_tensor(device, {R, F});
+    banks.mlp_norm = make_tensor(device, {R, F});
+    banks.gate = make_tensor(device, {R, M});
+    banks.up = make_tensor(device, {R, M});
+    banks.silu = make_tensor(device, {R, M});
+    banks.product = make_tensor(device, {R, M});
+    banks.down = make_tensor(device, {R, F});
+    banks.residual_after_mlp = make_tensor(device, {R, F});
+    banks.final_norm = make_tensor(device, {R, F});
+    return banks;
+}
+
+[[nodiscard]] std::array<const Tensor*, 19> bank_owners(const RunBanks& banks) {
+    return {banks.token_indices.get(), banks.x.get(), banks.attention_norm.get(),
+            banks.q.get(), banks.k.get(), banks.v.get(), banks.rotated_q.get(),
+            banks.rotated_k.get(), banks.attention_merged.get(),
+            banks.attention_output.get(), banks.residual_after_attention.get(),
+            banks.mlp_norm.get(), banks.gate.get(), banks.up.get(),
+            banks.silu.get(), banks.product.get(), banks.down.get(),
+            banks.residual_after_mlp.get(), banks.final_norm.get()};
+}
+
+void validate_workspace_owner(
+        const RawWorkspace* owner, const Device& device,
+        WorkspaceRequirements requirement, const char* label) {
+    if (owner == nullptr) {
+        throw std::invalid_argument(
+                std::string(label) + " positive workspace returned null");
+    }
+    if (&owner->device() != &device
+            || owner->byte_size() < requirement.bytes) {
+        throw std::invalid_argument(
+                std::string(label) + " workspace has the wrong device or size");
+    }
+    if (owner->byte_size() != requirement.bytes) {
+        throw std::invalid_argument(
+                std::string(label) + " workspace size is not exact");
+    }
+    static_cast<void>(detail::WorkspaceValidation::validated(
+            device, owner->view(), requirement.bytes, requirement.alignment, {}));
+}
+
+}  // namespace
+
+struct TinyLlamaSession::Impl {
+    Device* device = nullptr;
+
+    // Declaration order is intentional.  The queue is destroyed first so it
+    // can close and drain while every tensor/workspace owner remains alive.
+    std::unique_ptr<TinyLlamaModel> model;
+    std::unique_ptr<Tokenizer> tokenizer;
+    std::unique_ptr<ChatFormatter> formatter;
+    std::unique_ptr<TokenSelector> selector;
+    std::vector<CacheOwner> caches;
+    RunBanks fixed;
+    std::unique_ptr<Tensor> logits;
+    std::unique_ptr<RequestState> request;
+    std::unique_ptr<DeviceOps> queue;
+
+    bool poisoned = false;
+
+    ~Impl() noexcept {
+        try {
+            drain_request();
+        } catch (...) {
+            // Failed waits are not terminality proof. The backend queue closes
+            // and drains/quarantines before any operand or scratch is released.
+        }
+        queue.reset();
+    }
+
+    [[nodiscard]] const TinyLlamaConfig& config() const noexcept {
+        return model->config();
+    }
+
+    void require_request() const {
+        if (!request || request->draining || poisoned) {
+            throw std::logic_error(
+                    "TinyLlama session request is not accepting work");
+        }
+    }
+
+    void drain_request() {
+        if (!request) {
+            return;
+        }
+        request->draining = true;
+        std::exception_ptr first;
+        for (const oid token : request->accepted_oids) {
+            try {
+                queue->wait(token);
+            } catch (...) {
+                if (!first) first = std::current_exception();
+                poisoned = true;
+            }
+        }
+        request->draining = false;
+        if (first) {
+            std::rethrow_exception(first);
+        }
+        if (!poisoned) request->accepted_oids.clear();
+    }
+
+    void reset_cache_prefix() noexcept {
+        for (CacheOwner& cache : caches) {
+            cache.initialized_length = 0;
+        }
+    }
+
+    void validate_scratch(
+            const RequestState& candidate, WorkspaceRequirements operation,
+            TokenSelectorScratchRequirements selector_requirements) const {
+        const auto validate_owner = [&](const RawWorkspace* owner,
+                                        WorkspaceRequirements requirement) {
+            if (!owner) return;
+            const auto against = [&](const TensorView& view) {
+                static_cast<void>(detail::WorkspaceValidation::validated(
+                        *device, owner->view(), requirement.bytes,
+                        requirement.alignment, {&view, 1}));
+            };
+            for (std::size_t index = 0; index < model->weights().size(); ++index)
+                against(model->weight(index));
+            for (const auto& cache : caches) {
+                against(cache.key->view());
+                against(cache.value->view());
+            }
+            for (const Tensor* tensor : bank_owners(fixed)) against(tensor->view());
+            for (const Tensor* tensor : bank_owners(candidate.banks))
+                against(tensor->view());
+            against(logits->view());
+        };
+        validate_owner(candidate.operation_workspace.get(), operation);
+        validate_owner(candidate.selector_device_scratch.get(),
+                       selector_requirements.device);
+
+        const auto disjoint = [](const void* first, std::size_t first_bytes,
+                                 const void* second, std::size_t second_bytes) {
+            if (first_bytes == 0 || second_bytes == 0) return;
+            const auto a = reinterpret_cast<std::uintptr_t>(first);
+            const auto b = reinterpret_cast<std::uintptr_t>(second);
+            const auto a_end = checked_add(a, first_bytes, "scratch end overflows");
+            const auto b_end = checked_add(b, second_bytes, "scratch end overflows");
+            if (a < b_end && b < a_end)
+                throw std::invalid_argument("session scratch ranges overlap");
+        };
+        const RawWorkspace* op = candidate.operation_workspace.get();
+        const RawWorkspace* selector_device = candidate.selector_device_scratch.get();
+        const auto address = [](const RawWorkspace* owner) {
+            return owner ? detail::WorkspaceValidation::address(owner->view())
+                         : nullptr;
+        };
+        disjoint(address(op), operation.bytes,
+                 address(selector_device), selector_requirements.device.bytes);
+        for (const RawWorkspace* owner : {op, selector_device}) {
+            if (owner)
+                disjoint(address(owner), owner->byte_size(),
+                         candidate.selector_host_scratch.data(),
+                         candidate.selector_host_scratch.size());
+        }
+    }
+
+    void prepare_request(
+            std::size_t R, WorkspaceRequirements operation,
+            TokenSelectorScratchRequirements selector_requirements) {
+        if (R == 0) {
+            throw std::invalid_argument(
+                    "TinyLlama session request length must be nonzero");
+        }
+        if (R > config().max_position_embeddings) {
+            throw std::invalid_argument(
+                    "TinyLlama session request exceeds model context");
+        }
+        if (poisoned) {
+            throw std::logic_error("TinyLlama session is poisoned");
+        }
+        validate_workspace_requirement(operation, "operation");
+        validate_workspace_requirement(
+                selector_requirements.device, "selector device");
+        validate_vector_capacity<std::byte>(selector_requirements.host_bytes);
+        validate_vector_capacity<std::size_t>(config().max_position_embeddings);
+        static_cast<void>(run_storage_bytes(config(), R));
+        // One prefill plus at most C-1 decode runs. Include the per-run
+        // embedding/final/transfer work, not merely the prompt's R rows.
+        const std::size_t per_run = checked_add(
+                checked_mul(config().num_hidden_layers, kAcceptedOidsPerLayer,
+                            "TinyLlama session accepted-OID capacity overflows"),
+                kAcceptedOidBase,
+                "TinyLlama session accepted-OID capacity overflows");
+        const std::size_t oid_capacity = checked_mul(
+                config().max_position_embeddings, per_run,
+                "TinyLlama session accepted-OID capacity overflows");
+        validate_vector_capacity<oid>(oid_capacity);
+
+        // The caller must pass the exact requirement of this selector and the
+        // fixed logical-R1 logits bank.  Querying is pure and happens before
+        // any candidate request owner is constructed.
+        const TokenSelectorScratchRequirements actual_selector =
+                selector->scratch_requirements(
+                        logits->view(), config().vocab_size);
+        if (actual_selector.host_bytes != selector_requirements.host_bytes
+                || actual_selector.device.bytes
+                        != selector_requirements.device.bytes
+                || actual_selector.device.alignment
+                        != selector_requirements.device.alignment) {
+            throw std::invalid_argument(
+                    "TinyLlama selector scratch requirement does not match"
+                    " the supplied request requirement");
+        }
+
+        // A replacement cannot be published while old queue work is live.
+        // Allocation of the candidate starts only after a successful full
+        // drain, while the old request remains intact if candidate setup throws.
+        drain_request();
+
+        auto candidate = std::make_unique<RequestState>();
+        candidate->run_length = R;
+        candidate->banks = allocate_run_banks(*device, config(), R);
+        candidate->history.reserve(config().max_position_embeddings);
+        candidate->results.reserve(config().max_position_embeddings);
+        candidate->accepted_oids.reserve(oid_capacity);
+
+        if (operation.bytes != 0) {
+            candidate->operation_workspace =
+                    device->create_workspace(operation.bytes);
+            validate_workspace_owner(
+                    candidate->operation_workspace.get(), *device, operation,
+                    "operation");
+        }
+        candidate->selector_host_scratch.resize(
+                selector_requirements.host_bytes);
+        if (selector_requirements.device.bytes != 0) {
+            candidate->selector_device_scratch = device->create_workspace(
+                    selector_requirements.device.bytes);
+            validate_workspace_owner(
+                    candidate->selector_device_scratch.get(), *device,
+                    selector_requirements.device, "selector device");
+        }
+        validate_scratch(*candidate, operation, selector_requirements);
+        // Cache logical prefixes are reset only once the replacement is fully
+        // constructed, so a synchronous setup failure leaves the old request
+        // state untouched after its successful drain.
+        reset_cache_prefix();
+
+        // Publish only after every owner, range, and workspace is complete.
+        request = std::move(candidate);
+    }
+};
+
+TinyLlamaSession::TinyLlamaSession(std::unique_ptr<Impl> impl)
+        : impl_(std::move(impl)) {}
+
+TinyLlamaSession::~TinyLlamaSession() = default;
+
+const TinyLlamaModel& TinyLlamaSession::model() const noexcept {
+    return *impl_->model;
+}
+
+const TinyLlamaConfig& TinyLlamaSession::config() const noexcept {
+    return impl_->config();
+}
+
+const Tokenizer& TinyLlamaSession::tokenizer() const noexcept {
+    return *impl_->tokenizer;
+}
+
+const ChatFormatter& TinyLlamaSession::formatter() const noexcept {
+    return *impl_->formatter;
+}
+
+TokenSelector& TinyLlamaSession::selector() noexcept {
+    return *impl_->selector;
+}
+
+const TokenSelector& TinyLlamaSession::selector() const noexcept {
+    return *impl_->selector;
+}
+
+Device& TinyLlamaSession::device() const noexcept {
+    return *impl_->device;
+}
+
+DeviceOps& TinyLlamaSession::queue() noexcept {
+    return *impl_->queue;
+}
+
+const DeviceOps& TinyLlamaSession::queue() const noexcept {
+    return *impl_->queue;
+}
+
+void TinyLlamaSession::prepare_request(
+        std::size_t run_length, WorkspaceRequirements operation,
+        TokenSelectorScratchRequirements selector_scratch) {
+    impl_->prepare_request(run_length, operation, selector_scratch);
+}
+
+std::size_t TinyLlamaSession::request_length() const noexcept {
+    return impl_->request == nullptr ? 0 : impl_->request->run_length;
+}
+
+bool TinyLlamaSession::poisoned() const noexcept {
+    return impl_->poisoned;
+}
+
+std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
+        const std::filesystem::path& model_directory, Device& device) {
+    return load_tinyllama_session(
+            model_directory, device,
+            std::make_unique<GreedyTokenSelector>());
+}
+
+std::unique_ptr<TinyLlamaSession> load_tinyllama_session(
+        const std::filesystem::path& model_directory, Device& device,
+        std::unique_ptr<TokenSelector> selector) {
+    // This is deliberately the first operation: a null selector is rejected
+    // before the session, queue, model, tokenizer, formatter, tensor, cache,
+    // workspace, history, result, or scratch allocation paths are touched.
+    if (!selector) {
+        throw std::invalid_argument(
+                "TinyLlama session selector must not be null");
+    }
+    const auto supported = device.supported_data_types();
+    for (const DataType type : {DataType::BF16, DataType::U32}) {
+        if (std::find(supported.begin(), supported.end(), type) == supported.end())
+            throw std::invalid_argument(
+                    "TinyLlama session requires BF16 and U32 storage");
+    }
+
+    auto impl = std::make_unique<TinyLlamaSession::Impl>();
+    impl->device = &device;
+    impl->selector = std::move(selector);
+
+    // The model factory is the sole source of mapped checkpoint ownership and
+    // canonical uploaded weight owners.  No session-level weight copy exists.
+    impl->model = load_tinyllama_model(model_directory, device);
+    validate_persistent_storage(impl->model->config());
+    impl->tokenizer = load_tokenizer(model_directory);
+    impl->formatter = load_chat_formatter(model_directory);
+    impl->queue = device.create_ops();
+    if (!impl->queue) {
+        throw std::runtime_error(
+                "TinyLlama session device returned a null operation queue");
+    }
+    if (&impl->queue->device() != &device) {
+        throw std::invalid_argument(
+                "TinyLlama session queue belongs to another Device instance");
+    }
+
+    // Persistent cache owners and all fixed-R1 decode roles are constructed
+    // only after model/configuration validation and exactly once per session.
+    const TinyLlamaConfig& config = impl->model->config();
+    impl->caches.reserve(config.num_hidden_layers);
+    for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+        CacheOwner cache;
+        cache.key = make_tensor(device, {config.num_key_value_heads,
+                                         config.max_position_embeddings,
+                                         config.head_dim});
+        cache.value = make_tensor(device, {config.num_key_value_heads,
+                                           config.max_position_embeddings,
+                                           config.head_dim});
+        impl->caches.push_back(std::move(cache));
+    }
+    impl->fixed = allocate_run_banks(device, config, 1);
+    impl->logits = make_tensor(device, {1, config.vocab_size});
+
+    return std::unique_ptr<TinyLlamaSession>(
+            new TinyLlamaSession(std::move(impl)));
+}
+
+}  // namespace iom
 namespace iom::session_detail {
+
+const RunBanks& SessionAccess::prefill(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    return session.impl_->request->banks;
+}
+
+const RunBanks& SessionAccess::decode(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    return session.impl_->fixed;
+}
+
+TensorView& SessionAccess::logits(TinyLlamaSession& session) {
+    return session.impl_->logits->view();
+}
+
+std::span<CacheOwner> SessionAccess::caches(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    return session.impl_->caches;
+}
+
+RawWorkspaceView SessionAccess::workspace(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    const auto& owner = session.impl_->request->operation_workspace;
+    return owner ? owner->view() : RawWorkspaceView{};
+}
+
+TokenSelectorScratch SessionAccess::selector_scratch(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    auto& request = *session.impl_->request;
+    return {request.selector_host_scratch,
+            request.selector_device_scratch
+                    ? request.selector_device_scratch->view()
+                    : RawWorkspaceView{}};
+}
+
+std::vector<std::size_t>& SessionAccess::history(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    return session.impl_->request->history;
+}
+
+std::vector<std::size_t>& SessionAccess::results(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    return session.impl_->request->results;
+}
+
+std::span<const oid> SessionAccess::accepted(const TinyLlamaSession& session) {
+    return session.impl_->request
+            ? std::span<const oid>{session.impl_->request->accepted_oids}
+            : std::span<const oid>{};
+}
+
+void SessionAccess::require_submission(TinyLlamaSession& session) {
+    session.impl_->require_request();
+    const auto& tokens = session.impl_->request->accepted_oids;
+    if (tokens.size() == tokens.capacity())
+        throw std::overflow_error("TinyLlama session submission bound exceeded");
+}
+
+oid SessionAccess::record_submission(TinyLlamaSession& session, oid token) {
+    if (oid_is_token(token)) {
+        // submit() checked room before the facade accepted anything.
+        session.impl_->request->accepted_oids.push_back(token);
+        return token;
+    }
+    session.impl_->poisoned = true;
+    try { session.impl_->drain_request(); } catch (...) {}
+    switch (token) {
+        case to_oid(OidError::InvalidArgument):
+            throw std::invalid_argument("TinyLlama session submission rejected");
+        case to_oid(OidError::Unsupported):
+            throw detail::UnsupportedOperation{};
+        case to_oid(OidError::Overflow):
+            throw std::overflow_error("TinyLlama session submission overflow");
+        case to_oid(OidError::ResourceExhausted):
+            throw std::bad_alloc{};
+        case to_oid(OidError::DeviceError):
+            throw std::runtime_error("TinyLlama session device failure");
+        default:
+            throw std::logic_error("TinyLlama session invalid admission result");
+    }
+}
+
+void SessionAccess::wait(TinyLlamaSession& session, oid token) {
+    try {
+        session.impl_->queue->wait(token);
+    } catch (...) {
+        session.impl_->poisoned = true;
+        try { session.impl_->drain_request(); } catch (...) {}
+        throw;
+    }
+}
+
+void SessionAccess::drain(TinyLlamaSession& session) {
+    session.impl_->drain_request();
+}
+
 namespace {
 
 // The base alignment every device guarantees for a caller-owned raw workspace
@@ -480,7 +1100,6 @@ void run_mlp_stage(DeviceOps& operations, MlpStageViews& views,
     spool.wait(operations, residual);
     if (spool.failed()) spool.publish();
 }
-
 /*
  * Private TinyLlama session implementation.
  *
@@ -634,7 +1253,7 @@ namespace {
         if (state.initialized_length != request.a) {
             throw std::invalid_argument(
                     "cache attention stage offset must continue the "
-                    "published cache prefix");
+                "published cache prefix");
         }
 
         const Device& device = ops.device();
@@ -1320,3 +1939,4 @@ void run_qkv_rope_stage(DeviceOps& queue, QkvRopeStageViews views,
     // state was touched.
 }
 }  // namespace iom::session_detail
+
