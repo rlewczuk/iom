@@ -3113,13 +3113,13 @@ namespace qkv_rope_stage_test {
             double value, std::size_t count) {
         return std::vector<double>(count, value);
     }
-
     [[nodiscard]] TensorSpec matrix_spec(
             std::size_t planes, std::size_t rows, std::size_t columns) {
         if (planes == 1) {
             return TensorSpec{TensorShape{{rows, columns}}, kLeaf};
         }
-        return TensorSpec{TensorShape{{planes, rows, columns}}, kLeaf};
+        return TensorSpec{
+                TensorShape{{planes, rows, columns}}, kLeaf};
     }
 
     [[nodiscard]] TensorSpec head_spec(std::size_t planes,
@@ -3947,3 +3947,666 @@ namespace qkv_rope_stage_test {
     }
 
 }  // namespace qkv_rope_stage_test
+
+// ---------------------------------------------------------------------------
+// Complete one-layer decoder composition (leaf 06-decoder-layer-forward).
+//
+// This fixture owns every stage boundary explicitly and compares only the
+// final residual against an independent host reference.  It also exercises a
+// cached one-row continuation, causal future-token isolation, exact capacity,
+// and an accepted append failure that must prevent SDPA and the MLP.
+// ---------------------------------------------------------------------------
+
+namespace decoder_layer_forward_test {
+
+using iom::DataType;
+using iom::Device;
+using iom::DeviceOps;
+using iom::LinearOutputLayout;
+using iom::RawWorkspace;
+using iom::Tensor;
+using iom::TensorShape;
+using iom::TensorSpec;
+using iom::TensorView;
+using iom::oid;
+using iom::session_detail::CacheAttentionStageRequest;
+using iom::session_detail::DecoderLayerForwardParams;
+using iom::session_detail::DecoderLayerForwardState;
+using iom::session_detail::DecoderLayerForwardViews;
+using iom::session_detail::DecoderLayerForwardWorkspace;
+using iom::session_detail::MlpStageViews;
+using iom::session_detail::MlpWorkspace;
+using iom::session_detail::QkvRopeStageViews;
+using iom::session_detail::QkvRopeStageWorkspace;
+
+constexpr std::size_t kQueryHeads = 4;
+constexpr std::size_t kKvHeads = 2;
+constexpr std::size_t kHeadDim = 2;
+constexpr std::size_t kFeatures = kQueryHeads * kHeadDim;
+constexpr std::size_t kIntermediate = 6;
+constexpr float kEpsilon = 1.0e-5F;
+constexpr double kTheta = 10000.0;
+constexpr float kUntouched = 64.0F;
+
+[[nodiscard]] float sample(
+        std::uint32_t tag, std::size_t row, std::size_t column) {
+    const std::uint32_t mixed =
+            tag * 37u + static_cast<std::uint32_t>(row) * 17u
+            + static_cast<std::uint32_t>(column) * 11u
+            + static_cast<std::uint32_t>(row * column) * 5u;
+    const float magnitude =
+            static_cast<float>(mixed % 13u + 1u) / 4.0F;
+    return round_bf16((mixed & 1u) == 0u ? magnitude : -magnitude);
+}
+
+[[nodiscard]] std::vector<float> sampled(
+        std::uint32_t tag, std::size_t rows, std::size_t columns,
+        std::size_t row_start = 0) {
+    std::vector<float> values(rows * columns);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t column = 0; column < columns; ++column) {
+            values[row * columns + column] =
+                    sample(tag, row_start + row, column);
+        }
+    }
+    return values;
+}
+
+[[nodiscard]] std::unique_ptr<Tensor> make_tensor(
+        Device& device, std::initializer_list<std::size_t> dimensions) {
+    return device.create_tensor(TensorSpec{
+            TensorShape{std::vector<std::size_t>(
+                    dimensions.begin(), dimensions.end())},
+            DataType::BF16});
+}
+
+void upload(Tensor& tensor, std::span<const float> values) {
+    REQUIRE(values.size() == tensor.view().spec().shape.element_count());
+    std::vector<std::byte> bytes(values.size() * sizeof(std::uint16_t));
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const std::uint16_t code = encode_bf16(values[index]);
+        bytes[2 * index] = static_cast<std::byte>(code & 0xffu);
+        bytes[2 * index + 1] = static_cast<std::byte>(code >> 8);
+    }
+    tensor.view().copy_from_host(bytes);
+}
+
+[[nodiscard]] std::vector<float> read(const Tensor& tensor) {
+    const std::size_t elements = tensor.view().spec().shape.element_count();
+    std::vector<std::byte> bytes(elements * sizeof(std::uint16_t));
+    tensor.view().copy_to_host(bytes);
+    std::vector<float> values(elements);
+    for (std::size_t index = 0; index < elements; ++index) {
+        const std::uint16_t code =
+                static_cast<std::uint16_t>(
+                        std::to_integer<std::uint16_t>(bytes[2 * index]))
+                | static_cast<std::uint16_t>(
+                        std::to_integer<std::uint16_t>(bytes[2 * index + 1])
+                        << 8);
+        values[index] = decode_bf16(code);
+    }
+    return values;
+}
+
+void fill(Tensor& tensor, float value) {
+    const std::size_t elements = tensor.view().spec().shape.element_count();
+    upload(tensor, std::vector<float>(elements, value));
+}
+
+struct ReferenceResult {
+    std::vector<float> k_cache;
+    std::vector<float> v_cache;
+    std::vector<float> next_x;
+};
+
+struct Fixture {
+    Fixture(std::size_t rows, std::size_t capacity, std::size_t offset,
+            std::uint32_t tag, std::size_t input_row_start = 0)
+        : rows(rows),
+          capacity(capacity),
+          offset(offset),
+          tag(tag),
+          input_row_start(input_row_start),
+          input(sampled(tag + 1, rows, kFeatures, input_row_start)),
+          attention_scale(sampled(tag + 2, 1, kFeatures)),
+          post_attention_scale(sampled(tag + 3, 1, kFeatures)),
+          query_weight(sampled(tag + 4, kFeatures, kFeatures)),
+          key_weight(sampled(tag + 5, kKvHeads * kHeadDim, kFeatures)),
+          value_weight(sampled(tag + 6, kKvHeads * kHeadDim, kFeatures)),
+          output_weight(sampled(tag + 7, kFeatures, kFeatures)),
+          gate_weight(sampled(tag + 8, kIntermediate, kFeatures)),
+          up_weight(sampled(tag + 9, kIntermediate, kFeatures)),
+          down_weight(sampled(tag + 10, kFeatures, kIntermediate)),
+          k_cache_values(kKvHeads * capacity * kHeadDim, -7.5F),
+          v_cache_values(kKvHeads * capacity * kHeadDim, 6.25F),
+          cpu(),
+          operations(cpu.device->create_ops()) {
+        activation = make_tensor(*cpu.device, {rows, kFeatures});
+        attention_norm = make_tensor(*cpu.device, {1, kFeatures});
+        post_norm = make_tensor(*cpu.device, {1, kFeatures});
+        query_weight_owner =
+                make_tensor(*cpu.device, {kFeatures, kFeatures});
+        key_weight_owner =
+                make_tensor(*cpu.device, {kKvHeads * kHeadDim, kFeatures});
+        value_weight_owner =
+                make_tensor(*cpu.device, {kKvHeads * kHeadDim, kFeatures});
+        output_weight_owner =
+                make_tensor(*cpu.device, {kFeatures, kFeatures});
+        gate_weight_owner =
+                make_tensor(*cpu.device, {kIntermediate, kFeatures});
+        up_weight_owner =
+                make_tensor(*cpu.device, {kIntermediate, kFeatures});
+        down_weight_owner =
+                make_tensor(*cpu.device, {kFeatures, kIntermediate});
+
+        normalized = make_tensor(*cpu.device, {rows, kFeatures});
+        query = make_tensor(
+                *cpu.device, {kQueryHeads, rows, kHeadDim});
+        key = make_tensor(*cpu.device, {kKvHeads, rows, kHeadDim});
+        value = make_tensor(*cpu.device, {kKvHeads, rows, kHeadDim});
+        rotated_query = make_tensor(
+                *cpu.device, {kQueryHeads, rows, kHeadDim});
+        rotated_key = make_tensor(
+                *cpu.device, {kKvHeads, rows, kHeadDim});
+        k_cache = make_tensor(
+                *cpu.device, {kKvHeads, capacity, kHeadDim});
+        v_cache = make_tensor(
+                *cpu.device, {kKvHeads, capacity, kHeadDim});
+        merged = make_tensor(*cpu.device, {rows, kFeatures});
+        attention_output = make_tensor(*cpu.device, {rows, kFeatures});
+        first_residual = make_tensor(*cpu.device, {rows, kFeatures});
+
+        n2 = make_tensor(*cpu.device, {rows, kFeatures});
+        gate = make_tensor(*cpu.device, {rows, kIntermediate});
+        up = make_tensor(*cpu.device, {rows, kIntermediate});
+        activated_gate = make_tensor(*cpu.device, {rows, kIntermediate});
+        product = make_tensor(*cpu.device, {rows, kIntermediate});
+        down = make_tensor(*cpu.device, {rows, kFeatures});
+        next_x = make_tensor(*cpu.device, {rows, kFeatures});
+
+        upload(*activation, input);
+        upload(*attention_norm, attention_scale);
+        upload(*post_norm, post_attention_scale);
+        upload(*query_weight_owner, query_weight);
+        upload(*key_weight_owner, key_weight);
+        upload(*value_weight_owner, value_weight);
+        upload(*output_weight_owner, output_weight);
+        upload(*gate_weight_owner, gate_weight);
+        upload(*up_weight_owner, up_weight);
+        upload(*down_weight_owner, down_weight);
+        upload(*k_cache, k_cache_values);
+        upload(*v_cache, v_cache_values);
+        fill(*normalized, kUntouched);
+        fill(*query, kUntouched);
+        fill(*key, kUntouched);
+        fill(*value, kUntouched);
+        fill(*rotated_query, kUntouched);
+        fill(*rotated_key, kUntouched);
+        fill(*merged, kUntouched);
+        fill(*attention_output, kUntouched);
+        fill(*first_residual, kUntouched);
+        fill(*n2, kUntouched);
+        fill(*gate, kUntouched);
+        fill(*up, kUntouched);
+        fill(*activated_gate, kUntouched);
+        fill(*product, kUntouched);
+        fill(*down, kUntouched);
+        fill(*next_x, kUntouched);
+
+        const auto requirement = operations->sdpa_workspace_requirements(
+                rotated_query->view(), k_cache->view(), v_cache->view(),
+                merged->view(), offset, offset + rows);
+        attention_workspace = cpu.device->create_workspace(requirement.bytes);
+    }
+
+    [[nodiscard]] DecoderLayerForwardViews views() const {
+        return DecoderLayerForwardViews{
+                QkvRopeStageViews{
+                        activation->view(), attention_norm->view(),
+                        query_weight_owner->view(), key_weight_owner->view(),
+                        value_weight_owner->view(), normalized->view(),
+                        query->view(), key->view(), value->view(),
+                        rotated_query->view(), rotated_key->view()},
+                CacheAttentionStageRequest{
+                        rotated_query->view(), rotated_key->view(), value->view(),
+                        k_cache->view(), v_cache->view(), activation->view(),
+                        output_weight_owner->view(), merged->view(),
+                        attention_output->view(), first_residual->view(),
+                        offset, rows, capacity},
+                MlpStageViews{
+                        first_residual->view(), post_norm->view(),
+                        gate_weight_owner->view(), up_weight_owner->view(),
+                        down_weight_owner->view(), n2->view(), gate->view(),
+                        up->view(), activated_gate->view(), product->view(),
+                        down->view(), next_x->view()}};
+    }
+
+    [[nodiscard]] DecoderLayerForwardParams params() const noexcept {
+        return DecoderLayerForwardParams{
+                offset, rows, capacity, kFeatures, kIntermediate, kTheta,
+                kEpsilon, kEpsilon};
+    }
+
+    [[nodiscard]] DecoderLayerForwardWorkspace workspace() const {
+        return DecoderLayerForwardWorkspace{
+                QkvRopeStageWorkspace{}, attention_workspace->view(),
+                MlpWorkspace{}};
+    }
+
+    void replace_input(std::size_t row, std::span<const float> values) {
+        REQUIRE(row < rows);
+        REQUIRE(values.size() == kFeatures);
+        std::copy(values.begin(), values.end(),
+                input.begin() + static_cast<std::ptrdiff_t>(row * kFeatures));
+        upload(*activation, input);
+    }
+
+    void set_cache(
+            std::span<const float> new_k, std::span<const float> new_v) {
+        REQUIRE(new_k.size() == k_cache_values.size());
+        REQUIRE(new_v.size() == v_cache_values.size());
+        k_cache_values.assign(new_k.begin(), new_k.end());
+        v_cache_values.assign(new_v.begin(), new_v.end());
+        upload(*k_cache, k_cache_values);
+        upload(*v_cache, v_cache_values);
+    }
+
+    std::size_t rows;
+    std::size_t capacity;
+    std::size_t offset;
+    std::uint32_t tag;
+    std::size_t input_row_start;
+    std::vector<float> input;
+    std::vector<float> attention_scale;
+    std::vector<float> post_attention_scale;
+    std::vector<float> query_weight;
+    std::vector<float> key_weight;
+    std::vector<float> value_weight;
+    std::vector<float> output_weight;
+    std::vector<float> gate_weight;
+    std::vector<float> up_weight;
+    std::vector<float> down_weight;
+    std::vector<float> k_cache_values;
+    std::vector<float> v_cache_values;
+
+    MlpCpuFixture cpu;
+    std::unique_ptr<DeviceOps> operations;
+    std::unique_ptr<Tensor> activation;
+    std::unique_ptr<Tensor> attention_norm;
+    std::unique_ptr<Tensor> post_norm;
+    std::unique_ptr<Tensor> query_weight_owner;
+    std::unique_ptr<Tensor> key_weight_owner;
+    std::unique_ptr<Tensor> value_weight_owner;
+    std::unique_ptr<Tensor> output_weight_owner;
+    std::unique_ptr<Tensor> gate_weight_owner;
+    std::unique_ptr<Tensor> up_weight_owner;
+    std::unique_ptr<Tensor> down_weight_owner;
+    std::unique_ptr<Tensor> normalized;
+    std::unique_ptr<Tensor> query;
+    std::unique_ptr<Tensor> key;
+    std::unique_ptr<Tensor> value;
+    std::unique_ptr<Tensor> rotated_query;
+    std::unique_ptr<Tensor> rotated_key;
+    std::unique_ptr<Tensor> k_cache;
+    std::unique_ptr<Tensor> v_cache;
+    std::unique_ptr<Tensor> merged;
+    std::unique_ptr<Tensor> attention_output;
+    std::unique_ptr<Tensor> first_residual;
+    std::unique_ptr<Tensor> n2;
+    std::unique_ptr<Tensor> gate;
+    std::unique_ptr<Tensor> up;
+    std::unique_ptr<Tensor> activated_gate;
+    std::unique_ptr<Tensor> product;
+    std::unique_ptr<Tensor> down;
+    std::unique_ptr<Tensor> next_x;
+    std::unique_ptr<RawWorkspace> attention_workspace;
+};
+
+[[nodiscard]] ReferenceResult reference(const Fixture& fixture) {
+    const std::size_t rows = fixture.rows;
+    const std::size_t features = kFeatures;
+    const std::size_t width = kHeadDim;
+    const std::size_t length = fixture.offset + rows;
+    std::vector<float> normalized(rows * features);
+    for (std::size_t row = 0; row < rows; ++row) {
+        float square_sum = 0.0F;
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            const float value = fixture.input[row * features + feature];
+            square_sum += value * value;
+        }
+        const float inverse = 1.0F / std::sqrt(
+                square_sum / static_cast<float>(features) + kEpsilon);
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            normalized[row * features + feature] = round_bf16(
+                    fixture.input[row * features + feature] * inverse
+                    * fixture.attention_scale[feature]);
+        }
+    }
+
+    std::vector<float> query(kQueryHeads * rows * width);
+    std::vector<float> key(kKvHeads * rows * width);
+    std::vector<float> value(kKvHeads * rows * width);
+    auto project = [&](std::vector<float>& output,
+                       std::span<const float> weight, std::size_t heads) {
+        for (std::size_t head = 0; head < heads; ++head) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                for (std::size_t element = 0; element < width; ++element) {
+                    const std::size_t output_row = head * width + element;
+                    float sum = 0.0F;
+                    for (std::size_t feature = 0; feature < features;
+                         ++feature) {
+                        sum += normalized[row * features + feature]
+                                * weight[output_row * features + feature];
+                    }
+                    output[(head * rows + row) * width + element] =
+                            round_bf16(sum);
+                }
+            }
+        }
+    };
+    project(query, fixture.query_weight, kQueryHeads);
+    project(key, fixture.key_weight, kKvHeads);
+    project(value, fixture.value_weight, kKvHeads);
+
+    auto rotate = [](std::vector<float>& values, std::size_t heads,
+                     std::size_t rows, std::size_t offset) {
+        const std::size_t half = kHeadDim / 2;
+        for (std::size_t head = 0; head < heads; ++head) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const float position =
+                        static_cast<float>(offset + row);
+                const std::size_t base = (head * rows + row) * kHeadDim;
+                for (std::size_t pair = 0; pair < half; ++pair) {
+                    const float angle = position * static_cast<float>(
+                            std::pow(kTheta, -2.0 * static_cast<double>(pair)
+                                                       / kHeadDim));
+                    const float cosine = std::cos(angle);
+                    const float sine = std::sin(angle);
+                    const float first = values[base + pair];
+                    const float second = values[base + half + pair];
+                    values[base + pair] =
+                            round_bf16(first * cosine - second * sine);
+                    values[base + half + pair] =
+                            round_bf16(second * cosine + first * sine);
+                }
+            }
+        }
+    };
+    rotate(query, kQueryHeads, rows, fixture.offset);
+    rotate(key, kKvHeads, rows, fixture.offset);
+
+    ReferenceResult result;
+    result.k_cache = fixture.k_cache_values;
+    result.v_cache = fixture.v_cache_values;
+    for (std::size_t head = 0; head < kKvHeads; ++head) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t feature = 0; feature < width; ++feature) {
+                const std::size_t cache_index =
+                        (head * fixture.capacity + fixture.offset + row)
+                                * width + feature;
+                const std::size_t run_index =
+                        (head * rows + row) * width + feature;
+                result.k_cache[cache_index] = key[run_index];
+                result.v_cache[cache_index] = value[run_index];
+            }
+        }
+    }
+
+    std::vector<float> merged(rows * features, 0.0F);
+    const std::size_t group = kQueryHeads / kKvHeads;
+    for (std::size_t head = 0; head < kQueryHeads; ++head) {
+        const std::size_t kv_head = head / group;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t visible =
+                    std::min(length, fixture.offset + row + 1);
+            std::vector<float> scores(visible);
+            for (std::size_t token = 0; token < visible; ++token) {
+                float dot = 0.0F;
+                for (std::size_t feature = 0; feature < width; ++feature) {
+                    dot += query[(head * rows + row) * width + feature]
+                            * result.k_cache[
+                                    (kv_head * fixture.capacity + token)
+                                            * width + feature];
+                }
+                scores[token] = dot / std::sqrt(static_cast<float>(width));
+            }
+            float maximum = scores[0];
+            for (const float score : scores) maximum = std::max(maximum, score);
+            float probability_sum = 0.0F;
+            for (float& score : scores) {
+                score = std::exp(score - maximum);
+                probability_sum += score;
+            }
+            for (float& score : scores) {
+                score = round_bf16(score / probability_sum);
+            }
+            for (std::size_t feature = 0; feature < width; ++feature) {
+                float accumulated = 0.0F;
+                for (std::size_t token = 0; token < visible; ++token) {
+                    accumulated +=
+                            scores[token]
+                            * result.v_cache[
+                                    (kv_head * fixture.capacity + token)
+                                            * width + feature];
+                }
+                merged[row * features + head * width + feature] =
+                        round_bf16(accumulated);
+            }
+        }
+    }
+
+    std::vector<float> projected(rows * features);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t output = 0; output < features; ++output) {
+            float sum = 0.0F;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                sum += merged[row * features + feature]
+                        * fixture.output_weight[output * features + feature];
+            }
+            projected[row * features + output] = round_bf16(sum);
+        }
+    }
+    std::vector<float> first_residual(rows * features);
+    for (std::size_t index = 0; index < first_residual.size(); ++index) {
+        first_residual[index] =
+                round_bf16(fixture.input[index] + projected[index]);
+    }
+
+    std::vector<float> mlp_norm(rows * features);
+    for (std::size_t row = 0; row < rows; ++row) {
+        float square_sum = 0.0F;
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            const float value = first_residual[row * features + feature];
+            square_sum += value * value;
+        }
+        const float inverse = 1.0F / std::sqrt(
+                square_sum / static_cast<float>(features) + kEpsilon);
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            mlp_norm[row * features + feature] = round_bf16(
+                    first_residual[row * features + feature] * inverse
+                    * fixture.post_attention_scale[feature]);
+        }
+    }
+    std::vector<float> gate(rows * kIntermediate);
+    std::vector<float> up(rows * kIntermediate);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t output = 0; output < kIntermediate; ++output) {
+            float gate_sum = 0.0F;
+            float up_sum = 0.0F;
+            for (std::size_t feature = 0; feature < features; ++feature) {
+                gate_sum += mlp_norm[row * features + feature]
+                        * fixture.gate_weight[output * features + feature];
+                up_sum += mlp_norm[row * features + feature]
+                        * fixture.up_weight[output * features + feature];
+            }
+            gate[row * kIntermediate + output] = round_bf16(gate_sum);
+            up[row * kIntermediate + output] = round_bf16(up_sum);
+        }
+    }
+    std::vector<float> product(rows * kIntermediate);
+    for (std::size_t index = 0; index < product.size(); ++index) {
+        const float activated =
+                round_bf16(gate[index] / (1.0F + std::exp(-gate[index])));
+        product[index] = round_bf16(activated * up[index]);
+    }
+    std::vector<float> down(rows * features);
+    result.next_x.resize(rows * features);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t output = 0; output < features; ++output) {
+            float sum = 0.0F;
+            for (std::size_t intermediate = 0;
+                 intermediate < kIntermediate; ++intermediate) {
+                sum += product[row * kIntermediate + intermediate]
+                        * fixture.down_weight[output * kIntermediate
+                                               + intermediate];
+            }
+            down[row * features + output] = round_bf16(sum);
+            result.next_x[row * features + output] = round_bf16(
+                    first_residual[row * features + output]
+                    + down[row * features + output]);
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] std::vector<float> row(
+        std::span<const float> values, std::size_t row_index,
+        std::size_t width) {
+    return std::vector<float>(
+            values.begin() + static_cast<std::ptrdiff_t>(row_index * width),
+            values.begin()
+                    + static_cast<std::ptrdiff_t>((row_index + 1) * width));
+}
+
+void require_untouched(const Tensor& tensor, const char* label) {
+    const std::vector<float> values = read(tensor);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        CHECK_MESSAGE(encode_bf16(values[index]) == encode_bf16(kUntouched),
+                label << " element " << index << " was published");
+    }
+}
+
+TEST_CASE(
+        "TinyLlama decoder layer forward matches an independent reference "
+        "and cached continuation") {
+    Fixture full(3, 3, 0, 19);
+    const ReferenceResult full_reference = reference(full);
+    auto full_views = full.views();
+    DecoderLayerForwardState full_state;
+    CHECK_NOTHROW(iom::session_detail::run_decoder_layer_forward(
+            *full.operations, full_views, full.params(), full.workspace(), {},
+            full_state));
+    CHECK_FALSE(full_state.failed);
+    CHECK_EQ(full_state.initialized_length, 3u);
+    check_close(read(*full.next_x), full_reference.next_x, 3, 5e-2F,
+            "one-layer full output");
+
+    Fixture prefill(2, 3, 0, 19);
+    const ReferenceResult prefill_reference = reference(prefill);
+    auto prefill_views = prefill.views();
+    DecoderLayerForwardState prefill_state;
+    CHECK_NOTHROW(iom::session_detail::run_decoder_layer_forward(
+            *prefill.operations, prefill_views, prefill.params(),
+            prefill.workspace(), {}, prefill_state));
+    CHECK_EQ(prefill_state.initialized_length, 2u);
+    check_close(read(*prefill.next_x), prefill_reference.next_x, 3, 5e-2F,
+            "one-layer causal prefill");
+
+    Fixture continuation(1, 3, 2, 19, 2);
+    continuation.set_cache(read(*prefill.k_cache), read(*prefill.v_cache));
+    auto continuation_views = continuation.views();
+    DecoderLayerForwardState continuation_state;
+    continuation_state.initialized_length = 2;
+    CHECK_NOTHROW(iom::session_detail::run_decoder_layer_forward(
+            *continuation.operations, continuation_views,
+            continuation.params(), continuation.workspace(), {},
+            continuation_state));
+    CHECK_EQ(continuation_state.initialized_length, 3u);
+    check_close(
+            read(*continuation.next_x),
+            row(read(*full.next_x), 2, kFeatures), 3, 5e-2F,
+            "cached R=1 continuation versus full recomputation");
+}
+
+TEST_CASE(
+        "TinyLlama decoder layer forward preserves causality and exact "
+        "capacity") {
+    Fixture base(2, 2, 0, 23);
+    auto base_views = base.views();
+    DecoderLayerForwardState base_state;
+    CHECK_NOTHROW(iom::session_detail::run_decoder_layer_forward(
+            *base.operations, base_views, base.params(), base.workspace(), {},
+            base_state));
+    CHECK_EQ(base_state.initialized_length, 2u);
+
+    Fixture future(2, 2, 0, 23);
+    std::vector<float> changed = row(future.input, 1, kFeatures);
+    for (float& value : changed) value = round_bf16(value + 0.75F);
+    future.replace_input(1, changed);
+    auto future_views = future.views();
+    DecoderLayerForwardState future_state;
+    CHECK_NOTHROW(iom::session_detail::run_decoder_layer_forward(
+            *future.operations, future_views, future.params(),
+            future.workspace(), {}, future_state));
+    const std::vector<float> base_output = read(*base.next_x);
+    const std::vector<float> future_output = read(*future.next_x);
+    CHECK(std::equal(base_output.begin(), base_output.begin() + kFeatures,
+            future_output.begin()));
+    CHECK(!std::equal(base_output.begin() + kFeatures, base_output.end(),
+            future_output.begin() + kFeatures));
+
+    // `a + R > C` is rejected by the composition before QKV can submit.
+    Fixture beyond(2, 2, 0, 29);
+    auto beyond_views = beyond.views();
+    DecoderLayerForwardParams beyond_params = beyond.params();
+    beyond_params.a = 1;
+    beyond_views.attention.a = 1;
+    DecoderLayerForwardState beyond_state;
+    beyond_state.initialized_length = 1;
+    CHECK_THROWS_AS(iom::session_detail::run_decoder_layer_forward(
+                            *beyond.operations, beyond_views, beyond_params,
+                            beyond.workspace(), {}, beyond_state),
+            std::invalid_argument);
+    CHECK_FALSE(beyond_state.failed);
+    CHECK_EQ(beyond_state.initialized_length, 1u);
+    require_untouched(*beyond.normalized, "rejected normalized output");
+    require_untouched(*beyond.next_x, "rejected final output");
+}
+
+TEST_CASE(
+        "TinyLlama decoder layer forward drains accepted append failure and "
+        "does not submit dependent stages") {
+    Fixture fixture(2, 2, 0, 31);
+    const std::vector<float> initial_k = fixture.k_cache_values;
+    const std::vector<float> initial_v = fixture.v_cache_values;
+    auto views = fixture.views();
+    DecoderLayerForwardState state;
+
+    iom::cpu_detail::arm_cache_append_failure();
+    iom::cpu_detail::arm_sdpa_failure();
+    CHECK_THROWS_AS(iom::session_detail::run_decoder_layer_forward(
+                            *fixture.operations, views, fixture.params(),
+                            fixture.workspace(), {}, state),
+            std::runtime_error);
+    iom::cpu_detail::clear_cache_append_failure();
+    CHECK(state.failed);
+    CHECK_EQ(state.initialized_length, 0u);
+    CHECK(read(*fixture.k_cache) == initial_k);
+    CHECK(read(*fixture.v_cache) != initial_v);
+    require_untouched(*fixture.merged, "failed merged attention");
+    require_untouched(*fixture.next_x, "failed final residual");
+
+    // The armed SDPA failure is still available only if the decoder submitted
+    // no SDPA.  A direct probe consumes it and proves the append barrier.
+    const DecoderLayerForwardWorkspace decoder_workspace =
+            fixture.workspace();
+    const oid probe = fixture.operations->sdpa(
+            views.attention.rotated_q, views.attention.k_cache,
+            views.attention.v_cache, views.attention.attention_merged, 0, 2,
+            decoder_workspace.attention);
+    REQUIRE(iom::oid_is_token(probe));
+    CHECK_THROWS_AS(fixture.operations->wait(probe), std::runtime_error);
+    iom::cpu_detail::clear_sdpa_failure();
+}
+
+}  // namespace decoder_layer_forward_test

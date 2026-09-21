@@ -330,6 +330,10 @@ struct CacheAttentionStageRequest {
 struct CacheAttentionStageState {
     std::size_t initialized_length = 0;
     bool failed = false;
+    // The completed first-residual producer.  A successful decoder-layer
+    // composition waits this token again before handing the residual to the
+    // post-attention MLP stage; zero means that no usable residual exists.
+    oid residual_output = 0;
 };
 
 /**
@@ -455,5 +459,82 @@ void run_qkv_rope_stage(
         DeviceOps& queue, QkvRopeStageViews views,
         const QkvRopeStageParams& params,
         const QkvRopeStageWorkspace& workspace);
+
+/**
+ * Complete exactly one configured TinyLlama decoder layer.
+ *
+ * The nested stage views are supplied by the caller so setup can establish
+ * stable owners, disjoint stores, and exact logical run shapes once.  The
+ * composition performs no tensor/view-owner/workspace allocation and does not
+ * retarget any view:
+ *
+ *   QKV/RoPE -> K/V cache publication + causal attention -> MLP residual.
+ *
+ * `qkv` contains attention RMSNorm, head-planar Q/K/V, and rotated Q/K;
+ * `attention` contains the persistent cache owners, output projection, and
+ * first residual; and `mlp` contains the post-attention normalization,
+ * SwiGLU, down projection, and final residual.  Output stores are disjoint
+ * from unrelated read owners and from every other output store; the
+ * producer-to-consumer aliases for rotated Q/K/V and the two residual seams
+ * are the only permitted cross-stage sharing.
+ */
+struct DecoderLayerForwardViews {
+    QkvRopeStageViews qkv;
+    CacheAttentionStageRequest attention;
+    MlpStageViews mlp;
+};
+
+/** Fixed runtime dimensions and positions of one decoder-layer invocation. */
+struct DecoderLayerForwardParams {
+    std::size_t a = 0;
+    std::size_t rows = 0;
+    std::size_t capacity = 0;
+    std::size_t features = 0;
+    std::size_t intermediate = 0;
+    double theta = 0.0;
+    float attention_epsilon = 0.0F;
+    float mlp_epsilon = 0.0F;
+};
+
+/**
+ * Caller-provisioned scratch for one layer.  The Q/K/V slices are disjoint
+ * because those branches are submitted together.  Attention scratch is reused
+ * by SDPA, output projection, and the first residual only after each wait.
+ * `mlp` is the fixed pre-sliced workspace prepared for the selected run bank.
+ */
+struct DecoderLayerForwardWorkspace {
+    QkvRopeStageWorkspace qkv;
+    RawWorkspaceView attention;
+    MlpWorkspace mlp;
+};
+
+/**
+ * Logical cache publication and poison state of one layer invocation.
+ *
+ * `initialized_length` is advanced only after both cache appends complete.
+ * Any accepted admission/completion failure sets `failed`; a poisoned state
+ * rejects reuse and never submits another dependent stage.
+ */
+struct DecoderLayerForwardState {
+    std::size_t initialized_length = 0;
+    bool failed = false;
+};
+
+/**
+ * Compose exactly one decoder layer over caller-owned stores.
+ *
+ * Optional `readiness` tokens are input producers (for example, embedding or
+ * a prior layer).  Every supplied token is validated and waited independently
+ * before attention RMSNorm.  The function waits the completed cache-stage
+ * residual again as the direct producer of the MLP stage, then returns only
+ * after `mlp.next_x` is complete.  On any accepted failure all stage helpers
+ * drain their accepted OIDs, set `state.failed`, and no later dependent stage
+ * is submitted.
+ */
+void run_decoder_layer_forward(
+        DeviceOps& operations, DecoderLayerForwardViews& views,
+        const DecoderLayerForwardParams& params,
+        const DecoderLayerForwardWorkspace& workspace,
+        std::span<const oid> readiness, DecoderLayerForwardState& state);
 
 }  // namespace iom::session_detail

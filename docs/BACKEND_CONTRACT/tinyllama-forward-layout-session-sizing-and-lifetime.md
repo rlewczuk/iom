@@ -258,5 +258,13 @@ attribution.
 Complete mathematical layer assembly was gated on the four-backend SDPA gate,
 which the revision recorded in
 [Scaled dot-product attention](scaled-dot-product-attention.md#scaled-dot-product-attention) closes.
-Incremental model/session/selector integration is owned by its later siblings,
-not by this documentation plan.
+The first session-side checkpoint is now implemented as one private,
+allocation-free exactly-one-layer composition: it consumes caller-owned
+attention/QKV, cache/attention, and MLP stores, preserves the fixed
+`X -> attention residual -> MLP residual` equations, and publishes the cache
+prefix only after both append completions succeed.  This checkpoint records
+producer waits, poison/drain behavior, absolute positions, GQA, and exact
+capacity without claiming N-layer orchestration, final normalization or the
+untied LM head, selection, generation, CLI behavior, or official-corpus
+validation.  Incremental model/session/selector integration remains owned by
+later siblings.

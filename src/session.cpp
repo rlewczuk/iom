@@ -1435,6 +1435,7 @@ void run_cache_attention_stage(
         DeviceOps& ops, CacheAttentionStageRequest& request,
         RawWorkspaceView workspace, CacheAttentionStageState& state) {
     const CheckedStage stage = validate_stage(ops, request, state);
+    state.residual_output = 0;
 
     // Every downstream operation is preflighted with its actual operands
     // and scratch before the first submission. SDPA, the output projection,
@@ -1551,12 +1552,15 @@ void run_cache_attention_stage(
                 "output projection");
     }
     if (failure == nullptr) {
-        failure = completed(
-                ops,
-                ops.add(
-                        request.residual_input, request.attention_output,
-                        request.residual_output, residual_workspace),
-                "first residual");
+        const oid residual = ops.add(
+                request.residual_input, request.attention_output,
+                request.residual_output, residual_workspace);
+        failure = completed(ops, residual, "first residual");
+        if (failure == nullptr) {
+            // The composition uses the accepted, already-completed token as
+            // the direct producer barrier for post-attention RMSNorm.
+            state.residual_output = residual;
+        }
     }
     if (failure != nullptr) {
         state.failed = true;
@@ -1938,5 +1942,377 @@ void run_qkv_rope_stage(DeviceOps& queue, QkvRopeStageViews views,
     // this stage is terminal, and no owner, allocator, cache, or session
     // state was touched.
 }
+// ---------------------------------------------------------------------------
+// Exactly-one-layer decoder composition (leaf 06-decoder-layer-forward).
+//
+// The three stage helpers above remain the numerical and failure boundaries.
+// This layer only validates the cross-stage geometry/ownership seam, waits an
+// optional input producer group, and calls the helpers in the fixed
+// QKV/RoPE -> cache/attention -> MLP order.  No owner, view, vector, tensor,
+// or workspace is created here.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kDecoderLayerStage =
+        "TinyLlama decoder layer forward";
+
+[[noreturn]] void decoder_reject(const char* what) {
+    throw std::invalid_argument(
+            std::string(kDecoderLayerStage) + ": " + what);
+}
+
+void decoder_require_shape(
+        const TensorView& view, std::initializer_list<std::size_t> expected,
+        const char* role) {
+    const std::span<const std::size_t> actual =
+            view.spec().shape.dimensions();
+    if (actual.size() != expected.size()) decoder_reject(role);
+    std::size_t axis = 0;
+    for (const std::size_t extent : expected) {
+        if (actual[axis++] != extent) decoder_reject(role);
+    }
+}
+
+void decoder_require_bf16(
+        const Device& device, const TensorView& view, const char* role) {
+    if (&view.device() != &device) {
+        decoder_reject("all stage operands must belong to one queue device");
+    }
+    if (view.spec().data_type != DataType::BF16
+            || view.spec().quantization != QuantizationFormat::NONE) {
+        decoder_reject(role);
+    }
+}
+
+void decoder_require_distinct_stores(
+        const DecoderLayerForwardViews& views) {
+    const TensorView* const stores[] = {
+            &views.qkv.normalized,
+            &views.qkv.query,
+            &views.qkv.key,
+            &views.qkv.value,
+            &views.qkv.rotated_query,
+            &views.qkv.rotated_key,
+            &views.attention.k_cache,
+            &views.attention.v_cache,
+            &views.attention.attention_merged,
+            &views.attention.attention_output,
+            &views.attention.residual_output,
+            &views.mlp.n2,
+            &views.mlp.gate,
+            &views.mlp.up,
+            &views.mlp.activated_gate,
+            &views.mlp.product,
+            &views.mlp.down,
+            &views.mlp.next_x};
+    const TensorView* const operands[] = {
+            &views.qkv.activation,
+            &views.qkv.attention_scale,
+            &views.qkv.query_weight,
+            &views.qkv.key_weight,
+            &views.qkv.value_weight,
+            &views.qkv.normalized,
+            &views.qkv.query,
+            &views.qkv.key,
+            &views.qkv.value,
+            &views.qkv.rotated_query,
+            &views.qkv.rotated_key,
+            &views.attention.rotated_q,
+            &views.attention.rotated_k,
+            &views.attention.rotated_v,
+            &views.attention.k_cache,
+            &views.attention.v_cache,
+            &views.attention.residual_input,
+            &views.attention.o_weight,
+            &views.attention.attention_merged,
+            &views.attention.attention_output,
+            &views.attention.residual_output,
+            &views.mlp.x2,
+            &views.mlp.post_attention_scale,
+            &views.mlp.gate_weight,
+            &views.mlp.up_weight,
+            &views.mlp.down_weight,
+            &views.mlp.n2,
+            &views.mlp.gate,
+            &views.mlp.up,
+            &views.mlp.activated_gate,
+            &views.mlp.product,
+            &views.mlp.down,
+            &views.mlp.next_x};
+    for (const TensorView* store : stores) {
+        for (const TensorView* operand : operands) {
+            if (store == operand) continue;
+            // Q/K/V and the first residual intentionally cross stage seams;
+            // those are the only producer-to-consumer aliases allowed here.
+            if ((store == &views.qkv.rotated_query
+                        && operand == &views.attention.rotated_q)
+                    || (store == &views.qkv.rotated_key
+                        && operand == &views.attention.rotated_k)
+                    || (store == &views.qkv.value
+                        && operand == &views.attention.rotated_v)
+                    || (store == &views.attention.residual_output
+                        && operand == &views.mlp.x2)) {
+                continue;
+            }
+            if (store->owner_identity() == operand->owner_identity()) {
+                decoder_reject(
+                        "decoder layer output stores must be disjoint from "
+                        "other operands");
+            }
+        }
+    }
+}
+
+void decoder_validate(
+        const DeviceOps& operations,
+        const DecoderLayerForwardViews& views,
+        const DecoderLayerForwardParams& params,
+        const DecoderLayerForwardState& state) {
+    if (state.failed) {
+        throw std::logic_error(
+                "TinyLlama decoder layer forward refuses poisoned state");
+    }
+    if (params.rows == 0 || params.capacity == 0 || params.features == 0
+            || params.intermediate == 0) {
+        decoder_reject("rows, capacity, features, and intermediate must be "
+                       "nonzero");
+    }
+    if (!std::isfinite(params.theta) || params.theta <= 0.0) {
+        decoder_reject("RoPE theta must be finite and positive");
+    }
+    if (!std::isfinite(params.attention_epsilon)
+            || params.attention_epsilon < 0.0F
+            || !std::isfinite(params.mlp_epsilon)
+            || params.mlp_epsilon < 0.0F) {
+        decoder_reject("RMSNorm epsilons must be finite and nonnegative");
+    }
+    if (params.a > params.capacity) {
+        decoder_reject("absolute offset exceeds cache capacity");
+    }
+    const std::size_t initialized_length = detail::checked_add(
+            params.a, params.rows,
+            "TinyLlama decoder layer initialized length overflows");
+    if (initialized_length > params.capacity) {
+        decoder_reject("run rows exceed cache capacity");
+    }
+    if (state.initialized_length != params.a) {
+        decoder_reject("cache prefix does not continue at the supplied offset");
+    }
+    const CacheAttentionStageRequest& attention = views.attention;
+    if (attention.a != params.a || attention.R != params.rows
+            || attention.C != params.capacity) {
+        decoder_reject("stage positions and cache capacity disagree");
+    }
+    const QkvRopeStageViews& qkv = views.qkv;
+    const std::span<const std::size_t> query_shape =
+            qkv.query.spec().shape.dimensions();
+    const std::span<const std::size_t> key_shape =
+            qkv.key.spec().shape.dimensions();
+    if (query_shape.size() != 3 || key_shape.size() != 3) {
+        decoder_reject("Q and K must be rank-three head-planar views");
+    }
+    const std::size_t query_heads = query_shape[0];
+    const std::size_t rows = query_shape[1];
+    const std::size_t head_dim = query_shape[2];
+    const std::size_t kv_heads = key_shape[0];
+    if (query_heads == 0 || kv_heads == 0 || head_dim == 0
+            || (head_dim & 1U) != 0 || rows != params.rows
+            || key_shape[1] != params.rows || key_shape[2] != head_dim
+            || query_heads % kv_heads != 0) {
+        decoder_reject("Q/K head geometry is inconsistent");
+    }
+    const std::size_t merged_width = detail::checked_mul(
+            query_heads, head_dim,
+            "TinyLlama decoder layer feature width overflows");
+    if (merged_width != params.features) {
+        decoder_reject("configured feature width must equal Hq*D");
+    }
+    const std::size_t kv_width = detail::checked_mul(
+            kv_heads, head_dim,
+            "TinyLlama decoder layer KV width overflows");
+    const Device& device = operations.device();
+    const TensorView* const operands[] = {
+            &qkv.activation, &qkv.attention_scale, &qkv.query_weight,
+            &qkv.key_weight, &qkv.value_weight, &qkv.normalized, &qkv.query,
+            &qkv.key, &qkv.value, &qkv.rotated_query, &qkv.rotated_key,
+            &attention.rotated_q, &attention.rotated_k, &attention.rotated_v,
+            &attention.k_cache, &attention.v_cache,
+            &attention.residual_input, &attention.o_weight,
+            &attention.attention_merged, &attention.attention_output,
+            &attention.residual_output, &views.mlp.x2,
+            &views.mlp.post_attention_scale, &views.mlp.gate_weight,
+            &views.mlp.up_weight, &views.mlp.down_weight, &views.mlp.n2,
+            &views.mlp.gate, &views.mlp.up, &views.mlp.activated_gate,
+            &views.mlp.product, &views.mlp.down, &views.mlp.next_x};
+    for (const TensorView* operand : operands) {
+        decoder_require_bf16(device, *operand, "stage operands must be BF16");
+    }
+
+    decoder_require_shape(qkv.activation, {params.rows, params.features},
+            "activation must be [R,F]");
+    decoder_require_shape(qkv.attention_scale, {1, params.features},
+            "attention scale must be [1,F]");
+    decoder_require_shape(qkv.normalized, {params.rows, params.features},
+            "normalized store must be [R,F]");
+    decoder_require_shape(qkv.query_weight, {params.features, params.features},
+            "query weight must be [F,F]");
+    decoder_require_shape(qkv.key_weight, {kv_width, params.features},
+            "key weight must be [Hkv*D,F]");
+    decoder_require_shape(qkv.value_weight, {kv_width, params.features},
+            "value weight must be [Hkv*D,F]");
+    decoder_require_shape(qkv.query, {query_heads, params.rows, head_dim},
+            "query must be [Hq,R,D]");
+    decoder_require_shape(qkv.key, {kv_heads, params.rows, head_dim},
+            "key must be [Hkv,R,D]");
+    decoder_require_shape(qkv.value, {kv_heads, params.rows, head_dim},
+            "value must be [Hkv,R,D]");
+    decoder_require_shape(qkv.rotated_query,
+            {query_heads, params.rows, head_dim},
+            "rotated query must be [Hq,R,D]");
+    decoder_require_shape(qkv.rotated_key, {kv_heads, params.rows, head_dim},
+            "rotated key must be [Hkv,R,D]");
+
+    decoder_require_shape(attention.rotated_q,
+            {query_heads, params.rows, head_dim},
+            "attention query must match QKV output");
+    decoder_require_shape(attention.rotated_k,
+            {kv_heads, params.rows, head_dim},
+            "attention key must match QKV output");
+    decoder_require_shape(attention.rotated_v,
+            {kv_heads, params.rows, head_dim},
+            "attention value must match QKV output");
+    decoder_require_shape(attention.k_cache, {kv_heads, params.capacity,
+                                               head_dim},
+            "K cache must be [Hkv,C,D]");
+    decoder_require_shape(attention.v_cache, {kv_heads, params.capacity,
+                                               head_dim},
+            "V cache must be [Hkv,C,D]");
+    decoder_require_shape(attention.residual_input,
+            {params.rows, params.features}, "residual input must be [R,F]");
+    decoder_require_shape(attention.o_weight,
+            {params.features, params.features}, "output weight must be [F,F]");
+    decoder_require_shape(attention.attention_merged,
+            {params.rows, params.features},
+            "merged attention must be [R,F]");
+    decoder_require_shape(attention.attention_output,
+            {params.rows, params.features},
+            "attention output must be [R,F]");
+    decoder_require_shape(attention.residual_output,
+            {params.rows, params.features},
+            "first residual must be [R,F]");
+
+    const MlpStageViews& mlp = views.mlp;
+    decoder_require_shape(mlp.x2, {params.rows, params.features},
+            "MLP input must be [R,F]");
+    decoder_require_shape(mlp.post_attention_scale, {1, params.features},
+            "post-attention scale must be [1,F]");
+    decoder_require_shape(mlp.n2, {params.rows, params.features},
+            "MLP norm store must be [R,F]");
+    decoder_require_shape(mlp.gate_weight,
+            {params.intermediate, params.features},
+            "gate weight must be [M,F]");
+    decoder_require_shape(mlp.up_weight,
+            {params.intermediate, params.features},
+            "up weight must be [M,F]");
+    decoder_require_shape(mlp.down_weight,
+            {params.features, params.intermediate},
+            "down weight must be [F,M]");
+    decoder_require_shape(mlp.gate, {params.rows, params.intermediate},
+            "gate store must be [R,M]");
+    decoder_require_shape(mlp.up, {params.rows, params.intermediate},
+            "up store must be [R,M]");
+    decoder_require_shape(mlp.activated_gate,
+            {params.rows, params.intermediate},
+            "activated gate must be [R,M]");
+    decoder_require_shape(mlp.product, {params.rows, params.intermediate},
+            "product store must be [R,M]");
+    decoder_require_shape(mlp.down, {params.rows, params.features},
+            "down store must be [R,F]");
+    decoder_require_shape(mlp.next_x, {params.rows, params.features},
+            "next residual must be [R,F]");
+
+    if (qkv.activation.owner_identity()
+                    != attention.residual_input.owner_identity()
+            || qkv.rotated_query.owner_identity()
+                    != attention.rotated_q.owner_identity()
+            || qkv.rotated_key.owner_identity()
+                    != attention.rotated_k.owner_identity()
+            || qkv.value.owner_identity()
+                    != attention.rotated_v.owner_identity()
+            || attention.residual_output.owner_identity()
+                    != mlp.x2.owner_identity()) {
+        decoder_reject("stage boundaries must share the original X, Q/K/V, "
+                       "and X2 owners");
+    }
+    decoder_require_distinct_stores(views);
+}
+
+[[nodiscard]] std::exception_ptr decoder_wait_readiness(
+        DeviceOps& operations, std::span<const oid> readiness) {
+    std::exception_ptr first;
+    for (const oid token : readiness) {
+        try {
+            operations.wait(token);
+        } catch (...) {
+            if (first == nullptr) first = std::current_exception();
+        }
+    }
+    return first;
+}
+
+}  // namespace
+
+void run_decoder_layer_forward(
+        DeviceOps& operations, DecoderLayerForwardViews& views,
+        const DecoderLayerForwardParams& params,
+        const DecoderLayerForwardWorkspace& workspace,
+        std::span<const oid> readiness, DecoderLayerForwardState& state) {
+    decoder_validate(operations, views, params, state);
+    for (const oid token : readiness) {
+        if (!oid_is_token(token)) {
+            decoder_reject(
+                    "readiness must contain accepted producer tokens");
+        }
+    }
+
+    try {
+        if (const std::exception_ptr failure =
+                    decoder_wait_readiness(operations, readiness)) {
+            std::rethrow_exception(failure);
+        }
+
+        run_qkv_rope_stage(
+                operations, views.qkv,
+                QkvRopeStageParams{params.a, params.rows, params.theta,
+                                   params.attention_epsilon},
+                workspace.qkv);
+
+        CacheAttentionStageState attention_state{
+                state.initialized_length, false, 0};
+        run_cache_attention_stage(
+                operations, views.attention, workspace.attention,
+                attention_state);
+        state.initialized_length = attention_state.initialized_length;
+        if (!oid_is_token(attention_state.residual_output)) {
+            throw std::logic_error(
+                    "TinyLlama decoder layer forward lost first-residual "
+                    "producer");
+        }
+
+        const std::span<const oid> residual_ready(
+                &attention_state.residual_output, 1);
+        MlpStageFailure mlp_failure;
+        run_mlp_stage(
+                operations, views.mlp,
+                MlpStageParams{params.rows, params.features,
+                               params.intermediate, params.mlp_epsilon},
+                workspace.mlp, residual_ready, mlp_failure);
+    } catch (...) {
+        state.failed = true;
+        throw;
+    }
+}
+
 }  // namespace iom::session_detail
 
