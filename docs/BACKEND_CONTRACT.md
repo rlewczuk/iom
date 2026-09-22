@@ -104,6 +104,7 @@ earlier one already fixes.
     record: evidence boundary and installed target, native instruction route,
     logical products and tail mapping, caller-owned flow, and the seven-operation
     decision.
+  - [ROCm pinned synthetic model-reference and causal-cache evidence](BACKEND_CONTRACT/model-inference-rocm-synthetic-evidence.md) — the exact named ROCm cases, shared frozen checkpoint/cache consumers, offline corpus identity, and remote gate receipt.
   - [TinyLlama forward layout — SYCL matrix feasibility](BACKEND_CONTRACT/tinyllama-forward-layout-sycl-matrix-feasibility.md) — the bounded SYCL
     record: the evidence boundary and the per-operation feasibility and support
     status of the seven-operation ABI.
