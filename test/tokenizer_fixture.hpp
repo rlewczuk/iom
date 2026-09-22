@@ -187,6 +187,47 @@ inline nlohmann::json valid_tokenizer_document() {
     return make_tokenizer_document();
 }
 
+
+[[nodiscard]] inline nlohmann::json tokenizer_config() {
+    const auto metadata = [](const char* content) {
+        return nlohmann::json{{"content", content},
+                              {"lstrip", false},
+                              {"normalized", false},
+                              {"rstrip", false},
+                              {"single_word", false},
+                              {"special", true}};
+    };
+    return nlohmann::json{
+            {"added_tokens_decoder",
+             nlohmann::json{{"0", metadata("<unk>")},
+                            {"1", metadata("<s>")},
+                            {"2", metadata("</s>")}}},
+            {"bos_token", "<s>"},
+            {"chat_template",
+             "{% for message in messages %}"
+             "{% if message['role'] == 'system' %}"
+             "{{ message['content'] + eos_token }}"
+             "{% elif message['role'] == 'user' %}"
+             "{{ message['content'] + eos_token }}"
+             "{% elif message['role'] == 'assistant' %}"
+             "{{ message['content'] + eos_token }}"
+             "{% endif %}"
+             "{% if loop.last and add_generation_prompt %}"
+             "{{ '<|assistant|>' }}"
+             "{% endif %}"
+             "{% endfor %}"},
+            {"clean_up_tokenization_spaces", false},
+            {"eos_token", "</s>"},
+            {"legacy", false},
+            {"model_max_length", 2048},
+            {"pad_token", "</s>"},
+            {"padding_side", "right"},
+            {"sp_model_kwargs", nlohmann::json::object()},
+            {"tokenizer_class", "LlamaTokenizer"},
+            {"unk_token", "<unk>"},
+            {"use_default_system_prompt", false},
+    };
+}
 inline std::filesystem::path write_tokenizer(
         const std::filesystem::path& directory,
         const nlohmann::json& document = make_tokenizer_document()) {

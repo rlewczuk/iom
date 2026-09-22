@@ -185,6 +185,62 @@ snapshot/hook rule has exactly one owner:
 - 14 integration-reference-validation owns independent model and
   intermediate-logit fixtures.
 
+The integration-reference-validation owner supplies the independent TinyLlama
+model oracle.  Its frozen, offline corpus is
+[`test/model/synthetic_reference.json`](../../test/model/synthetic_reference.json),
+generated only by the opt-in
+[`test/reference/generate_model_oracles.py`](../../test/reference/generate_model_oracles.py)
+tool in CPython 3.11.16 with the pinned package manifest recorded in the
+corpus.  The reference is the eager
+`transformers.models.llama.modeling_llama.LlamaForCausalLM` path on CPU BF16
+tensors; it is not IOM execution, runtime weight readback, or a copied C++
+recurrence.  The generator records the sensitivity recipe, full per-position
+decoder-layer/final-normalization/logit snapshots, full versus
+`past_key_values` self-consistency, and the artifact/payload digests before
+any candidate measurement.
+
+The corpus uses two fixed configurations (`H18/I22/Hq3/Hkv1/D6` and
+`H8/I12/Hq4/Hkv2/D2`), positions `R=1,15,16,17`, both teacher-forced
+continuations, and the future-token perturbation.  BF16 values are encoded
+with RNE; reductions and softmax are FP32, and the softmax probability `P` is
+rounded to BF16 before BF16-native `PV`.  Candidate checkpoint and logit
+values use the one frozen per-value bound
+`abs(actual-ref) <= 0.05 + 0.02*abs(ref)`.  Greedy IDs are certified only
+when the independent reference intervals are strictly separated; equal
+values use the lowest vocabulary ID for selection but are not margin-stable.
+
+
+Corpus `expected_result.stop_reason` uses the production
+`max_new_tokens` outcome for every captured prefill, including the
+zero-token full-prompt and perturbation runs; `initialized_kv_length` is the
+captured prefix length.  This records a real session-compatible outcome rather
+than inventing a non-production `not_decoded` sentinel.
+For the future perturbation, `prefix_ids` is the unperturbed base prefix
+through index 15, while the prompt changes the next token; for
+teacher-forced cases, `expected_result.token_ids` is exactly the declared
+`decode_ids`, and `production_greedy_ids` remains the observed reference
+selection trace.
+
+
+The ordinary reader/materializer and focused corruption/comparator coverage
+live in
+[`test/model/reference_fixture.hpp`](../../test/model/reference_fixture.hpp)
+and
+[`test/test_model_reference_fixture.cpp`](../../test/test_model_reference_fixture.cpp).
+The reader uses the existing SafeTensors and tokenizer fixtures, so CTest
+does not import Python model packages, access a network, or generate the
+corpus.  These files own only independent model/intermediate/logit evidence;
+operation conformance, tokenizer/chat behavior, and synchronous selector
+coverage remain with their existing owners.
+
+The focused test consumes all 14 corpus cases on CPU, comparing full
+prefill and one-token cached rows for decoder-layer output, final norm, and
+logits with the frozen tolerances; it asserts greedy IDs only at certified
+reference-margin positions and checks teacher-forced IDs independently.
+The committed stdlib-only
+[`test/reference/verify_model_oracles_negative.py`](../../test/reference/verify_model_oracles_negative.py)
+fixture keeps the verifier's policy-mutation rejection coverage reproducible.
+
 Each owner MUST select fixed, justified tolerances and pin the reference
 software or artifact identity before measuring a candidate. A production
 implementation MUST NOT serve as its own oracle. This subsection adds no
