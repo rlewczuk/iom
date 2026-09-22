@@ -127,3 +127,9 @@ artifact-free.
   binds the CPU device-0 registration, caller inputs, official artifact
   identities, numerical/state comparisons, instrumentation parity, and
   host-only timing limitation to this shared contract.
+- [ROCm official TinyLlama inference evidence](model-inference-rocm-official-evidence.md)
+  binds the ROCm device-0 registration, caller inputs including the
+  device-construction arena, official artifact identities, numerical/state
+  comparisons, instrumentation parity, native linear/attention attribution,
+  the bounded `rocprofv3` payload, and the truthful profiler/counter/device-time
+  limitations to this shared contract.

@@ -39,6 +39,9 @@
 #include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 #include "backend/backend_conformance_token_selection.hpp"
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_ROCM
+#include "backend/backend_conformance_model_official.hpp"
+#endif
 #include "iom/rocm/device.hpp"
 #include "rocm/copy.hpp"
 #include "iom/gpu_algorithm.hpp"
@@ -1829,6 +1832,30 @@ TEST_CASE("ROCm real model loading") {
     iom_conformance::run_real_model_loading(*candidate);
 }
 #endif
+
+// Opt-in official TinyLlama inference, compiled only with
+// `IOM_TEST_REAL_MODEL_INFERENCE_ROCM=ON` and independent of
+// `IOM_TEST_REAL_MODEL_LOADING`. The shared runner owns artifact
+// verification, real raw/chat prefill, repeated cached decode, comparison,
+// ownership, and evidence publication; this driver contributes only the
+// selected ROCm device, ordinal 0, which the runner records from
+// `Device::backend_device()`. The caller arena is a device-construction value,
+// so an absent, non-decimal, zero, or misaligned `IOM_TEST_MODEL_ARENA_BYTES`
+// fails here - before any device, allocator, or runtime exists - instead of
+// skipping, shrinking the run, or reusing the synthetic conformance reserve.
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_ROCM
+TEST_CASE("ROCm real model inference") {
+    const std::size_t arena_bytes =
+            iom_conformance::official_model_detail::parse_arena_bytes(
+                    iom_conformance::official_model_detail::required_environment(
+                            "IOM_TEST_MODEL_ARENA_BYTES"));
+    const std::unique_ptr<iom::Device> candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{arena_bytes});
+    REQUIRE(candidate != nullptr);
+    iom_conformance::run_real_model_inference(*candidate);
+}
+#endif
+
 TEST_CASE("ROCm binary conformance: ADD MUL SUB DIV real queue") {
     iom_conformance::TrafficGate gate;
     auto candidate = iom::make_rocm_device(

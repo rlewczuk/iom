@@ -65,6 +65,9 @@ Use these sources when changing or extending the contract:
   backend evidence are `test/cpu/test_cpu_conformance.cpp`,
   `test/CMakeLists.txt`, and
   [CPU official TinyLlama inference evidence](model-inference-cpu-official-evidence.md);
+- ROCm official-model inference registration and retained evidence:
+  `test/rocm/test_rocm_conformance.cpp`, `test/CMakeLists.txt`, and
+  [ROCm official TinyLlama inference evidence](model-inference-rocm-official-evidence.md);
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and

@@ -198,7 +198,7 @@ function(add_iom_backend_tests name)
     cmake_parse_arguments(PARSE_ARGV 1 arg
         ""
         "BACKEND_LIBRARY;CONFORMANCE_DOCTEST_CONFIG"
-        "SMOKE_MAIN_SOURCE;CONFORMANCE_MAIN_SOURCE;SMOKE_SOURCES;CONFORMANCE_SOURCES;COMPILE_DEFINITIONS;SMOKE_INCLUDE_DIRS;CONFORMANCE_INCLUDE_DIRS;COMPILE_OPTIONS;LINK_OPTIONS;RUNTIME_LIBRARIES")
+        "SMOKE_MAIN_SOURCE;CONFORMANCE_MAIN_SOURCE;SMOKE_SOURCES;CONFORMANCE_SOURCES;COMPILE_DEFINITIONS;SMOKE_INCLUDE_DIRS;CONFORMANCE_INCLUDE_DIRS;COMPILE_OPTIONS;LINK_OPTIONS;RUNTIME_LIBRARIES;CONFORMANCE_TEST_ARGUMENTS")
 
     if(NOT DEFINED arg_CONFORMANCE_DOCTEST_CONFIG)
         set(arg_CONFORMANCE_DOCTEST_CONFIG DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -298,8 +298,27 @@ function(add_iom_backend_tests name)
     endif()
 
     add_test(NAME iom_${name}_smoke_tests COMMAND iom_${name}_smoke_tests)
-    add_test(NAME iom_${name}_conformance_tests COMMAND iom_${name}_conformance_tests)
+    # Optional per-backend CTest arguments keep an opt-in guarded case out of the artifact-free aggregate selection.
+    add_test(NAME iom_${name}_conformance_tests
+        COMMAND iom_${name}_conformance_tests ${arg_CONFORMANCE_TEST_ARGUMENTS})
 endfunction()
+
+# ROCm official TinyLlama inference evidence. This is an independent,
+# default-off opt-in next to the ROCm conformance driver and the real-checkpoint
+# loading option: an ordinary configuration needs no model artifact, no Python
+# model library, and no GPU, while an enabled configuration must compile and
+# register its real ROCm case instead of silently selecting nothing.
+option(IOM_TEST_REAL_MODEL_INFERENCE_ROCM
+    "Compile and register the opt-in official TinyLlama inference case for ROCm"
+    OFF
+)
+
+if(IOM_TEST_REAL_MODEL_INFERENCE_ROCM AND NOT ROCM_ENABLED)
+    message(FATAL_ERROR
+        "IOM_TEST_REAL_MODEL_INFERENCE_ROCM requires ROCM_ENABLED=ON; the "
+        "official ROCm case has no non-ROCm substitute"
+    )
+endif()
 
 if(ROCM_ENABLED)
     add_iom_backend_tests(rocm
@@ -314,6 +333,10 @@ if(ROCM_ENABLED)
         BACKEND_LIBRARY iom_rocm
         RUNTIME_LIBRARIES hip::host
         CONFORMANCE_DOCTEST_CONFIG DOCTEST_CONFIG_IMPLEMENT
+        # The guarded official case is compiled into this executable for the
+        # wrapper only: the aggregate registration must never run it without
+        # the wrapper's artifact, digest, and process-supervision checks.
+        CONFORMANCE_TEST_ARGUMENTS "--test-case-exclude=ROCm real model inference"
     )
     target_compile_definitions(iom_rocm_conformance_tests
         PRIVATE
@@ -343,6 +366,66 @@ if(ROCM_ENABLED)
         NAME iom_rocm_sdpa_nonmatrix_tests
         COMMAND iom_rocm_sdpa_nonmatrix_tests
     )
+
+    # Opt-in official TinyLlama inference: exactly one guarded Doctest case is
+    # compiled into the existing ROCm conformance executable, and exactly
+    # `iom_rocm_real_model_inference_tests` selects it through the Python
+    # wrapper, which owns artifact validation, digest recomputation, bounded
+    # process supervision, and evidence publication. The aggregate ROCm
+    # registration excludes the case above and stays artifact-free.
+    if(IOM_TEST_REAL_MODEL_INFERENCE_ROCM)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        cmake_host_system_information(
+            RESULT IOM_ROCM_OFFICIAL_BUILD_HOST QUERY HOSTNAME
+        )
+        cmake_host_system_information(
+            RESULT IOM_ROCM_OFFICIAL_PROCESSOR_NAME QUERY PROCESSOR_NAME
+        )
+        cmake_host_system_information(
+            RESULT IOM_ROCM_OFFICIAL_PROCESSOR_DESCRIPTION
+            QUERY PROCESSOR_DESCRIPTION
+        )
+        string(TOUPPER
+            "${CMAKE_BUILD_TYPE}"
+            IOM_ROCM_OFFICIAL_BUILD_TYPE_UPPER
+        )
+        set(IOM_ROCM_OFFICIAL_CONFIG_FLAGS_VARIABLE
+            "CMAKE_CXX_FLAGS_${IOM_ROCM_OFFICIAL_BUILD_TYPE_UPPER}"
+        )
+        set(IOM_ROCM_OFFICIAL_EFFECTIVE_CXX_FLAGS
+            "${CMAKE_CXX_FLAGS} ${${IOM_ROCM_OFFICIAL_CONFIG_FLAGS_VARIABLE}}"
+        )
+        string(STRIP
+            "${IOM_ROCM_OFFICIAL_EFFECTIVE_CXX_FLAGS}"
+            IOM_ROCM_OFFICIAL_EFFECTIVE_CXX_FLAGS
+        )
+        target_compile_definitions(iom_rocm_conformance_tests
+            PRIVATE
+                IOM_TEST_REAL_MODEL_INFERENCE_ROCM=1
+                IOM_OFFICIAL_BUILD_HOST="${IOM_ROCM_OFFICIAL_BUILD_HOST}"
+                IOM_OFFICIAL_PROCESSOR_NAME="${IOM_ROCM_OFFICIAL_PROCESSOR_NAME}"
+                IOM_OFFICIAL_PROCESSOR_DESCRIPTION="${IOM_ROCM_OFFICIAL_PROCESSOR_DESCRIPTION}"
+                IOM_OFFICIAL_SYSTEM_PROCESSOR="${CMAKE_SYSTEM_PROCESSOR}"
+                IOM_OFFICIAL_CXX_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+                IOM_OFFICIAL_CXX_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+                IOM_OFFICIAL_BUILD_TYPE="$<CONFIG>"
+                IOM_OFFICIAL_CXX_FLAGS="${IOM_ROCM_OFFICIAL_EFFECTIVE_CXX_FLAGS}"
+        )
+        add_test(
+            NAME iom_rocm_real_model_inference_tests
+            COMMAND
+                "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
+                "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/model/run_official_inference.py"
+                --backend rocm
+                --executable "$<TARGET_FILE:iom_rocm_conformance_tests>"
+        )
+        set_tests_properties(iom_rocm_real_model_inference_tests
+            PROPERTIES
+                LABELS "official-model"
+                TIMEOUT 1800
+        )
+    endif()
 endif()
 
 
