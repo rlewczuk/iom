@@ -375,6 +375,10 @@ if(SYCL_ENABLED)
         BACKEND_LIBRARY iom_sycl
         RUNTIME_LIBRARIES
     )
+    target_compile_definitions(iom_sycl_conformance_tests
+        PRIVATE
+            IOM_MODEL_REFERENCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/model"
+    )
 endif()
 
 

@@ -74,6 +74,9 @@ earlier one already fixes.
     `test/test_model_reference_fixture.cpp`, and the complete-model checkpoint
     harness in `test/backend/backend_conformance_model_reference.hpp` consumed by
     `test/test_model_integration.cpp`.
+  - [SYCL synthetic model integration evidence](BACKEND_CONTRACT/model-inference-sycl-synthetic-evidence.md) — the
+    real-device checkpoint and causal-cache results for the pinned offline
+    corpus, with exact runtime identity, commands, and finite comparison results.
   - [TinyLlama forward layout — Normalization and MLP boundaries](BACKEND_CONTRACT/tinyllama-forward-layout-normalization-and-mlp-boundaries.md) — the
     frozen RMSNorm, SiLU, and MLP interfaces with their parameters and storage
     rules, and the operation contracts they defer to.
