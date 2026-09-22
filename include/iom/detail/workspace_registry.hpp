@@ -14,26 +14,28 @@
 #include "fence.hpp"
 #include "outstanding_work_cleanup.hpp"
 #include "outstanding_work_registry_core.hpp"
-#include "storage_identity.hpp"
 
 namespace iom::detail {
 
-// Exclusive logical workspace slices share the existing outstanding-work
-// registry. Each acquisition has its own EntryId, even when opaque slices
-// share a canonical key bucket. Allocation, completion, and retention queries
-// are serialized by RegistryState::allocation_mutex.
+// ---------------------------------------------------------------------------
+// Raw-workspace range leases (leaf 05). A lease is the exclusive right to
+// use one byte range of one raw workspace owner for the lifetime of one
+// queued submission. Records are keyed by the owner's exact identity, and
+// overlap detection is range arithmetic on the leased extents, so disjoint
+// aligned subranges of one owner coexist while overlapping ranges are
+// resource exhaustion. Lease state lives alongside the existing
+// owner-registration state and shares its allocation mutex; it never holds
+// an allocator lock across submission, waits, callbacks, or drains.
 struct WorkspaceLease {
     // Opaque exact-owner identity; only compared, never dereferenced.
     const void* owner_identity = nullptr;
-    StorageRange range;
+    void* address = nullptr;
+    std::size_t bytes = 0;
     // Covering submission sequence of the accepted work using the range.
     std::uint64_t sequence = 0;
     // Outstanding-work entry retaining the owner/range lifetime until the
     // covering completion proof arrives.
     EntryId entry_id = 0;
-    // Preserve the original covering fence even if its registry entry is
-    // invalidated; invalidation is not a replacement completion proof.
-    Fence covering_fence;
 };
 
 // Per-device lease bookkeeping, guarded by
@@ -46,27 +48,16 @@ struct WorkspaceLeaseState {
 };
 
 [[nodiscard]] inline bool workspace_lease_ranges_overlap(
-        const WorkspaceLease& lease, const void* owner_identity,
-        const StorageRange& range) noexcept {
-    // Retain the established exact-owner lease policy for addressable ranges.
-    // Descriptor admission independently rejects cross-owner byte overlap.
-    if (lease.range.backing.base != nullptr && range.backing.base != nullptr) {
-        return lease.owner_identity == owner_identity
-                && storage_ranges_overlap(lease.range, range);
-    }
-    if (lease.owner_identity == owner_identity
-            && lease.range.backing.base == nullptr
-            && range.backing == lease.range.backing) {
-        return range.offset < lease.range.offset + lease.range.bytes
-                && lease.range.offset < range.offset + range.bytes;
-    }
-    // Different wrappers need not share a logical offset origin. Equal opaque
-    // backing keys therefore conflict conservatively across exact owners.
-    return storage_ranges_overlap(lease.range, range);
+        const WorkspaceLease& lease, std::uintptr_t begin,
+        std::uintptr_t end) noexcept {
+    const std::uintptr_t lease_begin =
+            reinterpret_cast<std::uintptr_t>(lease.address);
+    return begin < lease_begin + lease.bytes && lease_begin < end;
 }
 
 struct RegistryState {
     OutstandingWorkRegistry registry;
+    Quarantine quarantine;
     EntryId next_entry_id = 1;
     QueueId next_queue_id = 1;
     // Raw-workspace exclusive-range lease bookkeeping (leaf 05); guarded
@@ -78,8 +69,6 @@ struct RegistryState {
     // submission reserve unique queue IDs and operation entry sets. It is
     // held across each complete copy pair or deduplicated ADD owner set.
     mutable std::mutex allocation_mutex;
-    // Drain before the mutex and lease facts are destroyed.
-    Quarantine quarantine;
 };
 
 
@@ -231,28 +220,40 @@ inline EntryRegistration register_copy_entries(
 }
 
 
-// Acquires one checked nonempty 32-byte-aligned logical slice. Opaque keys
-// are only compared; addressable ranges retain their real checked addresses.
-// Failure leaves neither a lease nor a registry entry.
+// Atomically acquires an exclusive lease on the 32-byte-aligned range
+// [address, address + bytes) of one raw-workspace owner, registering the
+// covering outstanding-work entry through `state` alongside the existing
+// owner-registration machinery. Overlap with any live or quarantined
+// lease of the same owner is resource exhaustion (`std::bad_alloc`);
+// malformed, empty, misaligned, or overflowed ranges, a zero sequence or
+// queue id, and an empty fence are invalid input
+// (`std::invalid_argument`); overflow reports `std::overflow_error`. The
+// transaction is all-or-nothing: a failure leaves neither a lease record
+// nor a registry entry, and no allocator is touched.
 [[nodiscard]] inline WorkspaceLease acquire_workspace_lease(
-        RegistryState& state, const void* owner_identity, StorageRange range,
-        std::uint64_t sequence, QueueId queue_id, const Fence& fence) {
+        RegistryState& state, const void* owner_identity, void* address,
+        std::size_t bytes, std::uint64_t sequence, QueueId queue_id,
+        const Fence& fence) {
     if (owner_identity == nullptr) {
         throw std::invalid_argument(
                 "workspace lease owner identity is null");
     }
-    range = checked_storage_range(
-            range.backing, range.offset, range.bytes,
-            "workspace lease range end overflows");
-    if (range.bytes == 0) {
+    if (address == nullptr) {
+        throw std::invalid_argument(
+                "workspace lease range address is null");
+    }
+    if (bytes == 0) {
         throw std::invalid_argument("workspace lease range is empty");
     }
     const std::uintptr_t range_begin =
-            range.backing.base == nullptr ? range.offset
-                    : reinterpret_cast<std::uintptr_t>(range.address());
+            reinterpret_cast<std::uintptr_t>(address);
     if (range_begin % 32 != 0) {
         throw std::invalid_argument(
                 "workspace lease range is not 32-byte aligned");
+    }
+    if (bytes
+            > std::numeric_limits<std::uintptr_t>::max() - range_begin) {
+        throw std::overflow_error("workspace lease range end overflows");
     }
     if (sequence == 0) {
         throw std::invalid_argument("workspace lease sequence is zero");
@@ -265,30 +266,32 @@ inline EntryRegistration register_copy_entries(
     }
 
     std::lock_guard<std::mutex> lock(state.allocation_mutex);
-    void* const key = range.registry_key();
+    const std::uintptr_t range_end = range_begin + bytes;
     for (const WorkspaceLease& lease :
          state.workspace_leases.leases) {
-        if (workspace_lease_ranges_overlap(lease, owner_identity, range)) {
+        if (lease.owner_identity == owner_identity
+                && workspace_lease_ranges_overlap(
+                        lease, range_begin, range_end)) {
             throw std::bad_alloc();
         }
     }
 
-    WorkspaceLease result{owner_identity, range, sequence, 0, Fence(fence)};
+    WorkspaceLease result{owner_identity, address, bytes, sequence, 0};
     result.entry_id = allocate_registry_id(state.next_entry_id);
     try {
         state.registry.register_entry(
-                result.entry_id, key, sequence, queue_id,
+                result.entry_id, address, sequence, queue_id,
                 Fence(fence));
     } catch (...) {
         // register_entry is atomic: after its own rollback the entry is
         // absent, so the no-throw removal keeps this rollback total.
-        state.registry.remove_entry_if_present(result.entry_id, key);
+        state.registry.remove_entry_if_present(result.entry_id, address);
         throw;
     }
     try {
         state.workspace_leases.leases.push_back(result);
     } catch (...) {
-        state.registry.remove_entry_if_present(result.entry_id, key);
+        state.registry.remove_entry_if_present(result.entry_id, address);
         throw;
     }
     return result;
@@ -303,12 +306,15 @@ inline EntryRegistration register_copy_entries(
 // the range to any allocator; storage release stays at the owning device's
 // bookkeeping boundary.
 inline void complete_workspace_lease(
-        RegistryState& state, EntryId entry_id, bool covering_proof) noexcept {
+        RegistryState& state, const WorkspaceLease& lease,
+        bool covering_proof) noexcept {
     std::lock_guard<std::mutex> lock(state.allocation_mutex);
     std::vector<WorkspaceLease>& leases =
             state.workspace_leases.leases;
     const auto matching = [&](const WorkspaceLease& candidate) {
-        return candidate.entry_id == entry_id;
+        return candidate.owner_identity == lease.owner_identity
+                && candidate.address == lease.address
+                && candidate.bytes == lease.bytes;
     };
     const auto found =
             std::find_if(leases.begin(), leases.end(), matching);
@@ -316,64 +322,36 @@ inline void complete_workspace_lease(
         return;
     }
     if (covering_proof) {
-        state.registry.remove_entry_if_present(
-                entry_id, found->range.registry_key());
         leases.erase(found);
+        state.registry.remove_entry_if_present(
+                lease.entry_id, lease.address);
         return;
     }
-    const std::array<EntryId, 1> quarantine{entry_id};
+    const std::array<EntryId, 1> quarantine{lease.entry_id};
     state.registry.invalidate_entries(quarantine);
 }
 
-// Opaque backing held by other wrappers also retains the allocation; their
-// offsets need not share an origin. Callers hold the allocation mutex.
+// True when any live or quarantined lease of `owner_identity` overlaps
+// [address, address + bytes). The owning device consults this at
+// workspace destruction so a retained lease keeps the arena range out of
+// the allocator until its completion proof arrives.
 [[nodiscard]] inline bool workspace_range_retained(
         const WorkspaceLeaseState& state, const void* owner_identity,
-        const StorageRange& range) noexcept {
-    if (range.bytes == 0) return false;
+        void* address, std::size_t bytes) noexcept {
+    if (address == nullptr || bytes == 0) {
+        return false;
+    }
+    const std::uintptr_t range_begin =
+            reinterpret_cast<std::uintptr_t>(address);
+    const std::uintptr_t range_end = range_begin + bytes;
     for (const WorkspaceLease& lease : state.leases) {
-        if (workspace_lease_ranges_overlap(lease, owner_identity, range)) {
+        if (lease.owner_identity == owner_identity
+                && workspace_lease_ranges_overlap(
+                        lease, range_begin, range_end)) {
             return true;
         }
     }
     return false;
 }
-
-// Retain the cleanup action itself (including any native identity it owns)
-// until every relevant slice has a covering proof. Quarantine is not proof.
-class WorkspaceCleanupAction final : public CleanupAction {
-public:
-    WorkspaceCleanupAction(
-            RegistryState& state, const void* owner_identity, StorageRange range,
-            std::unique_ptr<CleanupAction> cleanup)
-            : state_(state), owner_identity_(owner_identity), range_(range),
-              cleanup_(std::move(cleanup)) {}
-
-    void run() noexcept override {
-        {
-            std::lock_guard<std::mutex> lock(state_.allocation_mutex);
-            if (workspace_range_retained(
-                        state_.workspace_leases, owner_identity_, range_)) return;
-        }
-        cleanup_->run();
-        started_ = true;
-    }
-    [[nodiscard]] bool completed() const noexcept override {
-        return started_ && cleanup_->completed();
-    }
-    [[nodiscard]] bool failed() const noexcept override {
-        return cleanup_->failed();
-    }
-    [[nodiscard]] std::exception_ptr failure() const noexcept override {
-        return cleanup_->failure();
-    }
-
-private:
-    RegistryState& state_;
-    const void* owner_identity_;
-    StorageRange range_;
-    std::unique_ptr<CleanupAction> cleanup_;
-    bool started_ = false;
-};
 
 }  // namespace iom::detail

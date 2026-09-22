@@ -308,7 +308,7 @@ public:
                                                     true);
                                     detail::complete_workspace_lease(
                                             device_->registry_state(),
-                                            captured.workspace_lease.entry_id, true);
+                                            captured.workspace_lease, true);
                                     complete(sequence, std::move(failure));
                                 }});
                     } catch (...) {
@@ -317,7 +317,7 @@ public:
                                         entries.entries.data(), entries.count));
                         detail::complete_workspace_lease(
                                 device_->registry_state(),
-                                captured.workspace_lease.entry_id, true);
+                                captured.workspace_lease, true);
                         throw;
                     }
                 });
@@ -499,7 +499,7 @@ private:
                                             static_cast<bool>(failure), true);
                                     detail::complete_workspace_lease(
                                             device_->registry_state(),
-                                            captured.workspace_lease.entry_id, true);
+                                            captured.workspace_lease, true);
                                     complete(sequence, std::move(failure));
                                 }});
                     } catch (...) {
@@ -508,7 +508,7 @@ private:
                                         entries.entries.data(), entries.count));
                         detail::complete_workspace_lease(
                                 device_->registry_state(),
-                                captured.workspace_lease.entry_id, true);
+                                captured.workspace_lease, true);
                         throw;
                     }
                 });
@@ -658,7 +658,7 @@ private:
                                             static_cast<bool>(failure), true);
                                     detail::complete_workspace_lease(
                                             device_->registry_state(),
-                                            captured.workspace_lease.entry_id, true);
+                                            captured.workspace_lease, true);
                                     complete(sequence, std::move(failure));
                                 }});
                     } catch (...) {
@@ -667,7 +667,7 @@ private:
                                         entries.entries.data(), entries.count));
                         detail::complete_workspace_lease(
                                 device_->registry_state(),
-                                captured.workspace_lease.entry_id, true);
+                                captured.workspace_lease, true);
                         throw;
                     }
                 });
@@ -1154,7 +1154,7 @@ private:
                                                     true);
                                     detail::complete_workspace_lease(
                                             device_->registry_state(),
-                                            captured.workspace_lease.entry_id, true);
+                                            captured.workspace_lease, true);
                                     complete(sequence, std::move(failure));
                                 }});
                     } catch (...) {
@@ -1163,7 +1163,7 @@ private:
                                         entries.entries.data(), entries.count));
                         detail::complete_workspace_lease(
                                 device_->registry_state(),
-                                captured.workspace_lease.entry_id, true);
+                                captured.workspace_lease, true);
                         throw;
                     }
                 });
@@ -1526,7 +1526,7 @@ private:
                                             static_cast<bool>(failure), true);
                                     detail::complete_workspace_lease(
                                             device_->registry_state(),
-                                            captured.workspace_lease.entry_id, true);
+                                            captured.workspace_lease, true);
                                     complete(sequence, std::move(failure));
                                 }});
                     } catch (...) {
@@ -1535,7 +1535,7 @@ private:
                                         entries.entries.data(), entries.count));
                         detail::complete_workspace_lease(
                                 device_->registry_state(),
-                                captured.workspace_lease.entry_id, true);
+                                captured.workspace_lease, true);
                         throw;
                     }
                 });

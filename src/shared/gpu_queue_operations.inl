@@ -1104,7 +1104,7 @@ void GpuQueue<Policy>::complete_task(
                 registry_state_->registry, outcome.cache_append_entries,
                 failed, completion_proven);
         detail::complete_workspace_lease(
-                *registry_state_, outcome.workspace_lease.entry_id,
+                *registry_state_, outcome.workspace_lease,
                 completion_proven);
     } else if (outcome.is_sdpa) {
         (void)detail::release_or_invalidate_sdpa_entries(
@@ -1117,7 +1117,7 @@ void GpuQueue<Policy>::complete_task(
             // and an unproven range stays quarantined by the shared lease
             // protocol. A submission that leased no range has nothing to hold.
             detail::complete_workspace_lease(
-                    *registry_state_, outcome.workspace_lease.entry_id,
+                    *registry_state_, outcome.workspace_lease,
                     completion_proven);
         } else {
             // Successful accepted work keeps its caller workspace live until
@@ -1139,7 +1139,7 @@ void GpuQueue<Policy>::complete_task(
                 // Retaining failed: fall back to the proof-based release
                 // rather than dropping the lease record entirely.
                 detail::complete_workspace_lease(
-                        *registry_state_, outcome.workspace_lease.entry_id,
+                        *registry_state_, outcome.workspace_lease,
                         completion_proven);
             }
         }
@@ -1149,7 +1149,7 @@ void GpuQueue<Policy>::complete_task(
                 registry_state_->registry, outcome.binary_entries,
                 failed, completion_proven);
         detail::complete_workspace_lease(
-                *registry_state_, outcome.workspace_lease.entry_id,
+                *registry_state_, outcome.workspace_lease,
                 completion_proven);
     } else if (outcome.is_silu) {
         // SiLU consumes no raw workspace, so its admitted `{0, 1}`
@@ -1167,7 +1167,7 @@ void GpuQueue<Policy>::complete_task(
                 registry_state_->registry, outcome.rope_entries,
                 failed, completion_proven);
         detail::complete_workspace_lease(
-                *registry_state_, outcome.workspace_lease.entry_id,
+                *registry_state_, outcome.workspace_lease,
                 completion_proven);
     } else if (outcome.is_rmsnorm) {
         // RMSNorm consumes no raw workspace, so its admitted `{0, 1}`
@@ -1201,7 +1201,7 @@ void GpuQueue<Policy>::fence_through_sequence(
     // The caller has now observed this token's terminal state, so its
     // retained workspace range returns to the shared lease registry and may
     // be leased again. Repeated waits find no record and change nothing.
-    detail::complete_workspace_lease(*registry_state_, lease.entry_id, true);
+    detail::complete_workspace_lease(*registry_state_, lease, true);
 }
 
 template <typename Policy>
@@ -1219,7 +1219,7 @@ void GpuQueue<Policy>::release_retained_leases(
     }
     for (const auto& entry : retained) {
         detail::complete_workspace_lease(
-                *registry_state_, entry.second.entry_id, covering_proof);
+                *registry_state_, entry.second, covering_proof);
     }
 }
 

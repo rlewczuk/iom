@@ -60,9 +60,9 @@ namespace iom {
              * facades default to the empty view exactly for this case); a
              * positive capacity additionally requires a non-empty view of
              * a live owner created by this exact device, sufficient
-             * capacity, and the required alignment of its real address or
-             * opaque owner-relative logical offset. Its backing must be
-             * disjoint from every operand/output. Returns the unchanged view.
+             * capacity, a 32-byte-aligned base meeting the required
+             * alignment, and a range disjoint from every operand/output
+             * storage range. Returns the unchanged view.
              */
             [[nodiscard]] static RawWorkspaceView validated(
                     const Device& device,
@@ -72,9 +72,6 @@ namespace iom {
                     std::span<const TensorView> operands);
             [[nodiscard]] static void* address(
                     const RawWorkspaceView& workspace) noexcept;
-            // Checked backing and logical extent of an admitted live view.
-            [[nodiscard]] static StorageRange range(
-                    const RawWorkspaceView& workspace);
         };
 
     }  // namespace detail
@@ -1147,8 +1144,10 @@ namespace iom {
                                                 state,
                                                 prepared->request.workspace
                                                         .owner_identity(),
-                                                detail::WorkspaceValidation::range(
-                                                        prepared->request.workspace),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
                                                 sequence, queue_id, fence);
                                 prepared->request.workspace_lease =
                                         prepared->workspace_lease;
@@ -1165,7 +1164,7 @@ namespace iom {
                             }
                             if (prepared->workspace_lease.entry_id != 0) {
                                 detail::complete_workspace_lease(
-                                        state, prepared->workspace_lease.entry_id, true);
+                                        state, prepared->workspace_lease, true);
                                 prepared->workspace_lease = {};
                                 prepared->request.workspace_lease = {};
                             }
@@ -1186,7 +1185,7 @@ namespace iom {
                         }
                         if (prepared->workspace_lease.entry_id != 0) {
                             detail::complete_workspace_lease(
-                                    state, prepared->workspace_lease.entry_id, true);
+                                    state, prepared->workspace_lease, true);
                         }
                     });
         }
@@ -1251,8 +1250,10 @@ namespace iom {
                                                 state,
                                                 prepared->request.workspace
                                                         .owner_identity(),
-                                                detail::WorkspaceValidation::range(
-                                                        prepared->request.workspace),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
                                                 sequence, queue_id, fence);
                                 prepared->request.workspace_lease =
                                         prepared->workspace_lease;
@@ -1269,7 +1270,7 @@ namespace iom {
                             }
                             if (prepared->workspace_lease.entry_id != 0) {
                                 detail::complete_workspace_lease(
-                                        state, prepared->workspace_lease.entry_id, true);
+                                        state, prepared->workspace_lease, true);
                                 prepared->workspace_lease = {};
                                 prepared->request.workspace_lease = {};
                             }
@@ -1290,7 +1291,7 @@ namespace iom {
                         }
                         if (prepared->workspace_lease.entry_id != 0) {
                             detail::complete_workspace_lease(
-                                    state, prepared->workspace_lease.entry_id, true);
+                                    state, prepared->workspace_lease, true);
                         }
                     });
         }
@@ -1500,8 +1501,10 @@ namespace iom {
                                                 state,
                                                 prepared->request.workspace
                                                         .owner_identity(),
-                                                detail::WorkspaceValidation::range(
-                                                        prepared->request.workspace),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
                                                 sequence, queue_id, fence);
                                 prepared->request.workspace_lease =
                                         prepared->workspace_lease;
@@ -1518,7 +1521,7 @@ namespace iom {
                             }
                             if (prepared->workspace_lease.entry_id != 0) {
                                 detail::complete_workspace_lease(
-                                        state, prepared->workspace_lease.entry_id, true);
+                                        state, prepared->workspace_lease, true);
                                 prepared->workspace_lease = {};
                                 prepared->request.workspace_lease = {};
                             }
@@ -1539,7 +1542,7 @@ namespace iom {
                         }
                         if (prepared->workspace_lease.entry_id != 0) {
                             detail::complete_workspace_lease(
-                                    state, prepared->workspace_lease.entry_id, true);
+                                    state, prepared->workspace_lease, true);
                         }
                     });
         }
@@ -1635,8 +1638,10 @@ namespace iom {
                                                 state,
                                                 prepared->request.workspace
                                                         .owner_identity(),
-                                                detail::WorkspaceValidation::range(
-                                                        prepared->request.workspace),
+                                                prepared->request.workspace
+                                                        .range_address(),
+                                                prepared->request.workspace
+                                                        .byte_size(),
                                                 sequence, queue_id, fence);
                                 prepared->request.workspace_lease =
                                         prepared->workspace_lease;
@@ -1653,7 +1658,7 @@ namespace iom {
                             }
                             if (prepared->workspace_lease.entry_id != 0) {
                                 detail::complete_workspace_lease(
-                                        state, prepared->workspace_lease.entry_id, true);
+                                        state, prepared->workspace_lease, true);
                                 prepared->workspace_lease = {};
                                 prepared->request.workspace_lease = {};
                             }
@@ -1674,7 +1679,7 @@ namespace iom {
                         }
                         if (prepared->workspace_lease.entry_id != 0) {
                             detail::complete_workspace_lease(
-                                    state, prepared->workspace_lease.entry_id, true);
+                                    state, prepared->workspace_lease, true);
                         }
                     });
         }

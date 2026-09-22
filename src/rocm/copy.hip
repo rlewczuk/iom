@@ -971,16 +971,16 @@ WorkspaceAdmission begin_workspace_transfer(
             detail::allocate_queue_id(registry_state);
     return {
             detail::acquire_workspace_lease(
-                    registry_state, checked.owner_identity(),
-                    detail::WorkspaceValidation::range(checked),
-                    queue_id, queue_id, transfer_fence()),
+                    registry_state, workspace.owner_identity(),
+                    detail::WorkspaceValidation::address(checked),
+                    checked.byte_size(), queue_id, queue_id, transfer_fence()),
             detail::WorkspaceValidation::address(checked)};
 }
 
 void finish_workspace_transfer(
         detail::RegistryState& registry_state,
         const detail::WorkspaceLease& lease, bool proof) noexcept {
-    detail::complete_workspace_lease(registry_state, lease.entry_id, proof);
+    detail::complete_workspace_lease(registry_state, lease, proof);
 }
 
 }  // namespace

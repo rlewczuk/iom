@@ -51,8 +51,11 @@ namespace iom {
             return false;
         }
 
-        // Keep projection's output/input policy, including allowed read/read
-        // aliases, without treating an opaque execution descriptor as bytes.
+        // Reject one output/input relationship the projection must never
+        // admit: the same owner identity anywhere, and an identical storage
+        // handle or actual backing-range intersection. The checks use each
+        // backend's exposed storage handle and reserved extent. Input/read
+        // aliases between `x` and `w` are never rejected here.
         void reject_output_overlap(
                 const TensorView& out, std::size_t out_storage_bytes,
                 const TensorView& input, std::size_t input_storage_bytes) {
@@ -60,19 +63,25 @@ namespace iom {
                 throw std::invalid_argument(
                         "LINEAR output aliases an input owner");
             }
-            const auto out_backing = detail::StorageAccess::identity(out);
-            const auto input_backing = detail::StorageAccess::identity(input);
-            if (out_backing.key == input_backing.key) {
+            const void* const out_handle = out.native_handle();
+            const void* const input_handle = input.native_handle();
+            if (out_handle == input_handle) {
                 throw std::invalid_argument(
-                        "LINEAR output shares an input backing");
+                        "LINEAR output shares an input storage handle");
             }
-            const auto out_range = detail::checked_storage_range(
-                    out_backing, 0, out_storage_bytes,
-                    "LINEAR storage range overflows");
-            const auto input_range = detail::checked_storage_range(
-                    input_backing, 0, input_storage_bytes,
-                    "LINEAR storage range overflows");
-            if (detail::storage_ranges_overlap(out_range, input_range)) {
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out_handle);
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input_handle);
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_storage_bytes > limit - out_begin
+                    || input_storage_bytes > limit - input_begin) {
+                throw std::overflow_error(
+                        "LINEAR storage range overflows");
+            }
+            if (out_begin < input_begin + input_storage_bytes
+                    && input_begin < out_begin + out_storage_bytes) {
                 throw std::invalid_argument(
                         "LINEAR output storage range overlaps an input");
             }
@@ -168,17 +177,24 @@ namespace iom {
                 throw std::invalid_argument(
                         "ROPE output aliases an input owner");
             }
-            if (out_facts.backing.key == input_facts.backing.key) {
+            const void* const out_handle = out.native_handle();
+            const void* const input_handle = input.native_handle();
+            if (out_handle == input_handle) {
                 throw std::invalid_argument(
                         "ROPE output shares an input storage handle");
             }
-            const auto out_range = detail::checked_storage_range(
-                    out_facts.backing, 0, out_facts.storage_bytes,
-                    "ROPE storage range overflows");
-            const auto input_range = detail::checked_storage_range(
-                    input_facts.backing, 0, input_facts.storage_bytes,
-                    "ROPE storage range overflows");
-            if (detail::storage_ranges_overlap(out_range, input_range)) {
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out_handle);
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input_handle);
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_facts.storage_bytes > limit - out_begin
+                    || input_facts.storage_bytes > limit - input_begin) {
+                throw std::overflow_error("ROPE storage range overflows");
+            }
+            if (out_begin < input_begin + input_facts.storage_bytes
+                    && input_begin < out_begin + out_facts.storage_bytes) {
                 throw std::invalid_argument(
                         "ROPE output storage range overlaps an input");
             }
@@ -193,17 +209,28 @@ namespace iom {
                 throw std::invalid_argument(
                         "SDPA output aliases an input owner");
             }
-            if (out_facts.backing.key == input_facts.backing.key) {
+            const void* const out_handle = out.native_handle();
+            const void* const input_handle = input.native_handle();
+            if (out_handle == input_handle) {
                 throw std::invalid_argument(
                         "SDPA output shares an input storage handle");
             }
-            const auto out_range = detail::checked_storage_range(
-                    out_facts.backing, 0, out_facts.storage_bytes,
-                    "SDPA storage range overflows");
-            const auto input_range = detail::checked_storage_range(
-                    input_facts.backing, 0, input_facts.storage_bytes,
-                    "SDPA storage range overflows");
-            if (detail::storage_ranges_overlap(out_range, input_range)) {
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out_handle);
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input_handle);
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_facts.storage_bytes > limit - out_begin
+                    || input_facts.storage_bytes > limit - input_begin) {
+                throw std::overflow_error(
+                        "SDPA storage range overflows");
+            }
+            const std::uintptr_t out_end =
+                    out_begin + out_facts.storage_bytes;
+            const std::uintptr_t input_end =
+                    input_begin + input_facts.storage_bytes;
+            if (out_begin < input_end && input_begin < out_end) {
                 throw std::invalid_argument(
                         "SDPA output storage range overlaps an input");
             }
@@ -349,11 +376,20 @@ namespace iom {
                 throw std::invalid_argument(
                         "SILU output aliases an input owner");
             }
-            const auto out_range = detail::checked_storage_range(
-                    out, out_storage_bytes, "SILU storage range overflows");
-            const auto input_range = detail::checked_storage_range(
-                    input, input_storage_bytes, "SILU storage range overflows");
-            if (detail::storage_ranges_overlap(out_range, input_range)) {
+            const std::uintptr_t out_begin =
+                    reinterpret_cast<std::uintptr_t>(out.native_handle());
+            const std::uintptr_t input_begin =
+                    reinterpret_cast<std::uintptr_t>(input.native_handle());
+            const std::uintptr_t limit =
+                    std::numeric_limits<std::uintptr_t>::max();
+            if (out_storage_bytes > limit - out_begin
+                    || input_storage_bytes > limit - input_begin) {
+                throw std::overflow_error("SILU storage range overflows");
+            }
+            const std::uintptr_t out_end = out_begin + out_storage_bytes;
+            const std::uintptr_t input_end =
+                    input_begin + input_storage_bytes;
+            if (out_begin < input_end && input_begin < out_end) {
                 throw std::invalid_argument(
                         "SILU output storage range overlaps an input");
             }
