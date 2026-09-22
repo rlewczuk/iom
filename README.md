@@ -133,6 +133,33 @@ and 4 denotes queue, generation, result, token-selection, or output-execution
 failure. The normal EOS, maximum-token, and context-capacity stop reasons all
 return status 0.
 
+Use `--trace` to opt into one human-readable operation line per accepted
+positive OID:
+
+```text
+iom_generate --model-dir ./tinyllama --backend cpu --device 0 \
+  --max-new-tokens 32 --prompt "Write one sentence." --trace
+```
+
+Trace lines are written only to stderr; generated text on stdout remains
+byte-for-byte identical, including its lack of an added trailing newline.
+Each line reports the request ordinal, positive OID, inference phase, decoder
+layer (`none` for embedding and final-logit operations), absolute input
+position and run length, host enqueue elapsed nanoseconds, and the elapsed
+host time from enqueue begin to the first observed wait when one exists.
+It also reports the wait state (`not_observed`, `succeeded`, or `failed`) and
+always identifies device timing as `unavailable`. A failed wait is an
+observation of the retained failure, not proof that the native operation
+completed.
+
+Trace storage is reserved explicitly after session load and before the first
+generation request. A reservation failure is a setup failure (status 3) and
+does not fall back to untraced generation. The recorder remains alive through
+ordinary session destruction so the existing final drain can update rows; the
+trace report never adds a wait. `--trace` is independent of `--metrics`, and
+trace alone emits no metrics summary. With no observation option, no recorder
+or trace storage is created.
+
 ## Elementwise operation contract
 
 `DeviceOps` exposes four exact three-view asynchronous facades:

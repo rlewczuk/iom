@@ -8916,12 +8916,13 @@ struct ProcessResult {
 }
 
 [[nodiscard]] std::vector<std::string> required_cpu_arguments(
-        const std::filesystem::path& model_directory) {
+        const std::filesystem::path& model_directory,
+        std::size_t max_new_tokens = 0) {
     return {
             "--model-dir", model_directory.string(),
             "--backend", "cpu",
             "--device", "0",
-            "--max-new-tokens", "0",
+            "--max-new-tokens", std::to_string(max_new_tokens),
     };
 }
 
@@ -8972,6 +8973,22 @@ TEST_CASE("TinyLlama generation CLI rejects malformed process input") {
     CHECK_EQ(conflicting_input.exit_code, 2);
     CHECK(conflicting_input.stderr_text.find("usage/input")
           != std::string::npos);
+
+    const auto duplicate_trace = invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0",
+            "--prompt", "hello", "--trace", "--trace"});
+    CHECK_EQ(duplicate_trace.exit_code, 2);
+    CHECK(duplicate_trace.stderr_text.find("usage/input")
+          != std::string::npos);
+
+    const auto valued_trace = invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0",
+            "--prompt", "hello", "--trace=value"});
+    CHECK_EQ(valued_trace.exit_code, 2);
+    CHECK(valued_trace.stderr_text.find("usage/input")
+          != std::string::npos);
 }
 
 TEST_CASE("TinyLlama generation CLI classifies backend setup failures") {
@@ -9018,3 +9035,89 @@ TEST_CASE(
     CHECK(rejected.stdout_text.empty());
     CHECK(rejected.stderr_text.find("usage/input") != std::string::npos);
 }
+
+TEST_CASE(
+        "Inference trace CLI preserves raw and chat output semantics") {
+    const auto trace_fields = [](const std::string& stderr_text) {
+        std::size_t rows = 0;
+        std::size_t begin = 0;
+        while (begin < stderr_text.size()) {
+            const std::size_t end = stderr_text.find('\n', begin);
+            const std::size_t length =
+                    end == std::string::npos ? stderr_text.size() - begin
+                                             : end - begin;
+            const std::string line = stderr_text.substr(begin, length);
+            CHECK(line.find("iom_generate: trace") != std::string::npos);
+            CHECK(line.find("request_ordinal=1") != std::string::npos);
+            CHECK(line.find("oid=") != std::string::npos);
+            CHECK(line.find("phase=") != std::string::npos);
+            CHECK(line.find("layer=") != std::string::npos);
+            CHECK(line.find("position_start=") != std::string::npos);
+            CHECK(line.find("run_length=") != std::string::npos);
+            CHECK(line.find("host_enqueue elapsed_ns=")
+                  != std::string::npos);
+            CHECK(line.find("wait state=") != std::string::npos);
+            CHECK(line.find("device_time=unavailable")
+                  != std::string::npos);
+            ++rows;
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        }
+        return rows;
+    };
+
+    ForwardFixture fixture("generation-cli-trace",
+                           text_generation_config());
+    const std::vector<std::string> base =
+            generation_cli_test::required_cpu_arguments(
+                    fixture.directory.path(), 1);
+
+    std::vector<std::string> raw_arguments = base;
+    raw_arguments.insert(raw_arguments.end(), {"--prompt", "hello"});
+    const auto raw_plain =
+            generation_cli_test::invoke(raw_arguments);
+    raw_arguments.push_back("--trace");
+    const auto raw_traced =
+            generation_cli_test::invoke(std::move(raw_arguments));
+    CHECK_EQ(raw_traced.exit_code, raw_plain.exit_code);
+    CHECK(raw_traced.stdout_text == raw_plain.stdout_text);
+    CHECK(raw_traced.exit_code == 0);
+    CHECK(trace_fields(raw_traced.stderr_text) > 0);
+
+    CHECK(raw_traced.stderr_text.find("layer=none")
+          != std::string::npos);
+    CHECK(raw_traced.stderr_text.find("wait state=succeeded")
+          != std::string::npos);
+    std::vector<std::string> chat_arguments = base;
+    chat_arguments.insert(
+            chat_arguments.end(),
+            {"--message", "system", "Be concise.",
+             "--message", "user", "hello"});
+    const auto chat_plain =
+            generation_cli_test::invoke(chat_arguments);
+    chat_arguments.push_back("--trace");
+    const auto chat_traced =
+            generation_cli_test::invoke(std::move(chat_arguments));
+    CHECK_EQ(chat_traced.exit_code, chat_plain.exit_code);
+    CHECK(chat_traced.stdout_text == chat_plain.stdout_text);
+    CHECK(chat_traced.exit_code == 0);
+    CHECK(trace_fields(chat_traced.stderr_text) > 0);
+    CHECK(chat_traced.stderr_text.find("layer=none")
+          != std::string::npos);
+    CHECK(chat_traced.stderr_text.find("wait state=succeeded")
+          != std::string::npos);
+}
+
+TEST_CASE("Inference trace CLI has no rows for zero-token requests") {
+    ForwardFixture fixture("generation-cli-trace-zero",
+                           text_generation_config());
+    std::vector<std::string> arguments =
+            generation_cli_test::required_cpu_arguments(
+                    fixture.directory.path());
+    arguments.insert(arguments.end(), {"--prompt", "hello", "--trace"});
+    const auto traced = generation_cli_test::invoke(std::move(arguments));
+    CHECK_EQ(traced.exit_code, 0);
+    CHECK(traced.stdout_text.empty());
+    CHECK(traced.stderr_text.empty());
+}
+
