@@ -215,9 +215,12 @@ an explicit `<s>` in raw text remains an additional atomic token and is never
 deduplicated. Decode retains IDs `0/1/2` by default and removes only those
 IDs when `skip_special_tokens=true`.
 
-Task 10 owns the sole cross-component composition join: its future focused
-case passes formatter output through the tokenizer and checks the resulting
-boundary without creating a second formatter/tokenizer contract.
+The cross-component composition boundary is exercised by the existing
+[`test/test_chat_format.cpp`](../../test/test_chat_format.cpp) cases `Chat
+format composes raw and structured owner paths` and `Chat format composes
+formatter override and generation policy`. They pass formatter output through
+the tokenizer and check the resulting boundary without creating a second
+formatter/tokenizer contract.
 
 ## Errors, atomic publication, references, and focused ownership
 
@@ -230,9 +233,10 @@ string, compiled formatter, or rendered prompt is published. Diagnostics name
 the artifact path and field, or the template byte offset, and include the
 expected and actual values where applicable.
 
-The independent offline reference runs with the CPython version in use for
-this snapshot (CPython 3.14.4) and the pinned packages
-`transformers==4.35.0`, `tokenizers==0.14.1`,
+The independent offline reference runs under the pinned CPython version for
+this snapshot, **CPython 3.11.16**, as recorded in
+[`tokenizer_reference_manifest.json`](../../test/reference/tokenizer_reference_manifest.json),
+and the pinned packages `transformers==4.35.0`, `tokenizers==0.14.1`,
 `sentencepiece==0.1.99`, and `jinja2==3.1.2`. The caller supplies an
 artifact-relative `--model-dir`; the reference performs no downloads and
 contains no hardcoded model path. `test/reference/tokenizer_reference.py`
@@ -243,12 +247,13 @@ SHA-256 and byte-size identities for the artifacts,
 MUST NOT serve as its own tokenizer or formatter oracle.
 
 This contract is backend-neutral and has no backend-specific tokenizer,
-formatter, device, or queue variation. Future focused ownership is split
-between [`test/test_tokenizer.cpp`](../../test/test_tokenizer.cpp) for artifact,
-encode/decode, special-token, pair, error, and atomic-output cases and
-[`test/test_chat_format.cpp`](../../test/test_chat_format.cpp) for metadata,
-override, grammar, lowering, rendering, error, and empty-list cases. The
-task-10 composition join is linked from
-[`test/test_chat_format.cpp#composition-join`](../../test/test_chat_format.cpp#composition-join).
-These links name future cases only; they do not claim that the tests, builds,
-or any backend conformance gate have run.
+formatter, device, or queue variation. Existing focused ownership is split
+between [`test/test_tokenizer.cpp`](../../test/test_tokenizer.cpp) for
+artifact, encode/decode, special-token, pair, error, and atomic-output cases
+and [`test/test_chat_format.cpp`](../../test/test_chat_format.cpp) for
+metadata, override, grammar, lowering, rendering, error, empty-list, and
+composition cases. Session raw/chat, selector-injection/no-commit, and
+borrowed-lifetime behavior is exercised by
+[`test/test_model_session.cpp`](../../test/test_model_session.cpp) and
+[`test/test_token_selection.cpp`](../../test/test_token_selection.cpp); no
+duplicate composition or selector test is owned by this contract.
