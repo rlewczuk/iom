@@ -133,6 +133,10 @@ earlier one already fixes.
   - [CPU official TinyLlama inference evidence](BACKEND_CONTRACT/model-inference-cpu-official-evidence.md) — the
     artifact-bound CPU device-0 prefill, cached-decode, numerical, state,
     instrumentation, ownership, and host-only timing record.
+  - [CUDA official TinyLlama inference evidence](BACKEND_CONTRACT/model-inference-cuda-official-evidence.md) — the
+    artifact-bound CUDA prefill, cached-decode, numerical, state,
+    instrumentation, ownership, native BF16 matrix, and profiler-capability
+    record.
 - [11. Tokenizer and prompt boundary](BACKEND_CONTRACT/tokenizer-and-prompt-boundary.md) — public owners and APIs,
   authoritative artifacts and tokenizer semantics, formatter metadata and fixed
   grammar, rendering and composition, and the error and reference rules of the

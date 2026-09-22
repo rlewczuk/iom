@@ -441,6 +441,7 @@ if(CUDA_ENABLED)
         CONFORMANCE_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src
         BACKEND_LIBRARY iom_cuda
         RUNTIME_LIBRARIES CUDA::cuda_driver
+        CONFORMANCE_TEST_ARGUMENTS "--test-case-exclude=CUDA real model inference"
     )
     add_executable(iom_cuda_sdpa_nonmatrix_tests
         cuda/test_cuda_sdpa_nonmatrix.cpp
@@ -462,6 +463,73 @@ if(CUDA_ENABLED)
     add_test(
         NAME iom_cuda_sdpa_nonmatrix_tests
         COMMAND iom_cuda_sdpa_nonmatrix_tests
+    )
+endif()
+
+
+# CUDA official TinyLlama inference evidence. Like the CPU case this path is
+# independent of IOM_TEST_REAL_MODEL_LOADING, defaults OFF, and never enters
+# ordinary CTest: enabling it compiles the guarded case into the CUDA
+# conformance binary, the aggregate registration keeps excluding that case, and
+# exactly `iom_cuda_real_model_inference_tests` selects it through the Python
+# wrapper that validates the caller artifacts and supervises the child.
+option(IOM_TEST_REAL_MODEL_INFERENCE_CUDA
+    "Compile and register the opt-in official TinyLlama inference case for CUDA"
+    OFF
+)
+
+if(IOM_TEST_REAL_MODEL_INFERENCE_CUDA)
+    if(NOT CUDA_ENABLED)
+        message(FATAL_ERROR
+            "IOM_TEST_REAL_MODEL_INFERENCE_CUDA requires CUDA_ENABLED=ON"
+        )
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    cmake_host_system_information(
+        RESULT IOM_OFFICIAL_CUDA_BUILD_HOST QUERY HOSTNAME
+    )
+    cmake_host_system_information(
+        RESULT IOM_OFFICIAL_CUDA_PROCESSOR_NAME QUERY PROCESSOR_NAME
+    )
+    cmake_host_system_information(
+        RESULT IOM_OFFICIAL_CUDA_PROCESSOR_DESCRIPTION QUERY PROCESSOR_DESCRIPTION
+    )
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" IOM_OFFICIAL_CUDA_BUILD_TYPE_UPPER)
+    set(IOM_OFFICIAL_CUDA_CONFIG_FLAGS_VARIABLE
+        "CMAKE_CXX_FLAGS_${IOM_OFFICIAL_CUDA_BUILD_TYPE_UPPER}"
+    )
+    set(IOM_OFFICIAL_CUDA_EFFECTIVE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS} ${${IOM_OFFICIAL_CUDA_CONFIG_FLAGS_VARIABLE}}"
+    )
+    string(STRIP
+        "${IOM_OFFICIAL_CUDA_EFFECTIVE_CXX_FLAGS}"
+        IOM_OFFICIAL_CUDA_EFFECTIVE_CXX_FLAGS
+    )
+    target_compile_definitions(iom_cuda_conformance_tests
+        PRIVATE
+            IOM_TEST_REAL_MODEL_INFERENCE_CUDA=1
+            IOM_OFFICIAL_BUILD_HOST="${IOM_OFFICIAL_CUDA_BUILD_HOST}"
+            IOM_OFFICIAL_PROCESSOR_NAME="${IOM_OFFICIAL_CUDA_PROCESSOR_NAME}"
+            IOM_OFFICIAL_PROCESSOR_DESCRIPTION="${IOM_OFFICIAL_CUDA_PROCESSOR_DESCRIPTION}"
+            IOM_OFFICIAL_SYSTEM_PROCESSOR="${CMAKE_SYSTEM_PROCESSOR}"
+            IOM_OFFICIAL_CXX_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+            IOM_OFFICIAL_CXX_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+            IOM_OFFICIAL_BUILD_TYPE="$<CONFIG>"
+            IOM_OFFICIAL_CXX_FLAGS="${IOM_OFFICIAL_CUDA_EFFECTIVE_CXX_FLAGS}"
+    )
+    add_test(
+        NAME iom_cuda_real_model_inference_tests
+        COMMAND
+            "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/model/run_official_inference.py"
+            --backend cuda
+            --executable "$<TARGET_FILE:iom_cuda_conformance_tests>"
+    )
+    set_tests_properties(iom_cuda_real_model_inference_tests
+        PROPERTIES
+            LABELS "official-model"
+            TIMEOUT 1800
     )
 endif()
 

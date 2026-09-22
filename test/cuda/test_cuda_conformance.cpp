@@ -33,6 +33,9 @@
 #include "backend/backend_conformance_cache_append.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 #include "backend/backend_conformance_token_selection.hpp"
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_CUDA
+#include "backend/backend_conformance_model_official.hpp"
+#endif
 
 #include "iom/cpu/device.hpp"
 #include "iom/cuda/device.hpp"
@@ -1861,6 +1864,107 @@ TEST_CASE("CUDA real model loading") {
             0, iom_conformance::real_model_memory_config());
     iom_conformance::run_real_model_loading(*candidate);
 }
+#endif
+
+// Opt-in official TinyLlama inference, compiled only with
+// `IOM_TEST_REAL_MODEL_INFERENCE_CUDA=ON`. The shared runner owns artifact
+// verification, real raw/chat prefill and repeated cached decode, the frozen
+// comparison policy, and evidence publication; this driver contributes only
+// the selected CUDA device with its caller-selected arena, and records the
+// runtime/toolchain facts of that exact execution. The arena is a
+// device-construction value, so a missing, invalid, or misaligned
+// `IOM_TEST_MODEL_ARENA_BYTES` fails before any device exists.
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_CUDA
+
+namespace {
+
+// The execution record of the opt-in official CUDA run: the exact invocation,
+// the selected ordinal, the runtime device identity and queried compute
+// capability, the caller's arena, the toolchain versions, and the native BF16
+// facility the profiled execution is attributed to. It is printed to stdout,
+// which the wrapper retains verbatim in its result JSON beside the shared
+// harness measurement. The result line reports failure unless the shared
+// runner returned normally.
+class CudaOfficialInferenceEvidence final {
+public:
+    CudaOfficialInferenceEvidence(
+            std::uint32_t ordinal, std::size_t arena_bytes) {
+        record("iom cuda official model inference evidence");
+        record("  invocation      : "
+               + iom_conformance::official_model_detail::invocation_record()
+                         .dump());
+        record("  backend kind    : "
+               + iom_conformance::official_model_detail::backend_name(
+                       iom::BackendKind::CUDA));
+        record("  backend ordinal : " + std::to_string(ordinal));
+        record("  arena bytes     : " + std::to_string(arena_bytes));
+        cudaDeviceProp properties{};
+        int runtime_version = 0;
+        int driver_version = 0;
+        if (cudaGetDeviceProperties(
+                    &properties, static_cast<int>(ordinal))
+                    == cudaSuccess
+                && cudaRuntimeGetVersion(&runtime_version) == cudaSuccess
+                && cudaDriverGetVersion(&driver_version) == cudaSuccess) {
+            record("  device name     : " + std::string(properties.name));
+            record("  compute capability: " + std::to_string(properties.major)
+                   + "." + std::to_string(properties.minor));
+            record("  cuda runtime    : " + std::to_string(runtime_version));
+            record("  cuda driver     : " + std::to_string(driver_version));
+        } else {
+            record("  device facts    : unavailable (the device properties or "
+                   "runtime/driver version query failed)");
+        }
+        record("  native bf16 wmma: "
+               + std::string(cuda_bf16_wmma_device_fact(ordinal)
+                                     ? "supported"
+                                     : "unsupported")
+               + ", compiled image arch "
+               + std::to_string(
+                       iom::cuda_detail::linear_bf16_wmma_image_arch()));
+    }
+
+    CudaOfficialInferenceEvidence(const CudaOfficialInferenceEvidence&) =
+            delete;
+    CudaOfficialInferenceEvidence& operator=(
+            const CudaOfficialInferenceEvidence&) = delete;
+
+    void pass() noexcept { passed_ = true; }
+
+    ~CudaOfficialInferenceEvidence() {
+        record(std::string("  result          : ")
+               + (passed_ ? "PASS" : "FAIL"));
+        std::fflush(stdout);
+    }
+
+private:
+    static void record(const std::string& line) {
+        std::printf("%s\n", line.c_str());
+    }
+
+    bool passed_ = false;
+};
+
+}  // namespace
+
+TEST_CASE("CUDA real model inference") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    // The caller-selected arena is a device-construction value, so the shared
+    // official intake validates the positive decimal byte count divisible by
+    // 32 before any device, context, or allocation exists.
+    const iom::DeviceMemoryConfig memory_config{
+            iom_conformance::official_model_detail::parse_arena_bytes(
+                    iom_conformance::official_model_detail::required_environment(
+                            "IOM_TEST_MODEL_ARENA_BYTES"))};
+    const std::uint32_t ordinal = kCudaConformanceOrdinal;
+    const std::unique_ptr<iom::Device> device =
+            iom::make_cuda_device(ordinal, memory_config);
+    CudaOfficialInferenceEvidence evidence(
+            ordinal, memory_config.tensor_arena_bytes);
+    iom_conformance::run_real_model_inference(*device);
+    evidence.pass();
+}
+
 #endif
 
 TEST_CASE("CUDA binary conformance: ADD MUL SUB DIV real queue") {

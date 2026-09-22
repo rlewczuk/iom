@@ -406,6 +406,58 @@ exits with status 0 and writes only generated text to stdout; wording may vary.
 Diagnostics go to stderr. Usage/input errors exit 2, setup/load errors exit 3,
 and execution errors exit 4. These fixed paths and settings describe only the
 configured `bv1` example and are not library or CLI defaults.
+
+### CUDA official-model inference (opt-in)
+
+The CUDA official-model gate is separate from both ordinary CTest and the
+real-checkpoint loading option. It never downloads or discovers a model and has
+no skip, fallback, or CPU substitution path: a missing artifact, reference
+pack, digest, arena, or usable CUDA device fails the enabled case. When
+enabled, the ordinary aggregate CTest keeps excluding the guarded case, so the
+Python wrapper remains the sole registered artifact-validation, digest,
+supervision, and evidence-publication route.
+
+Configure the case explicitly on the configured CUDA host (`bv1`), supply the
+model directory, pinned revision, exported reference pack, evidence
+destination, and the caller-selected tensor arena, and build only the CUDA
+conformance executable:
+
+```sh
+cmake -S . -B build/cuda-official \
+  -DBUILD_TESTING=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCUDA_ENABLED=ON \
+  -DROCM_ENABLED=OFF \
+  -DSYCL_ENABLED=OFF \
+  -DIOM_TEST_REAL_MODEL_INFERENCE_CUDA=ON
+cmake --build build/cuda-official --target iom_cuda_conformance_tests
+
+IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+IOM_TEST_MODEL_REFERENCE=/path/to/tinyllama-official-reference.json \
+IOM_TEST_MODEL_EVIDENCE=/path/to/cuda-official-evidence.json \
+IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
+flock -w 120 /tmp/agent-gpu0.lock \
+timeout --kill-after=30s 1800s \
+  ctest --test-dir build/cuda-official --output-on-failure \
+    --no-tests=error --timeout 1800 \
+    -R '^iom_cuda_real_model_inference_tests$'
+```
+
+`IOM_TEST_MODEL_ARENA_BYTES` is a device-construction value: it must be a
+positive decimal byte count divisible by 32 that covers the checked aggregate
+weight total plus the queried scratch maximum, and it is validated before any
+device, context, or allocation exists. The wrapper verifies the complete model
+and reference identity before launching only `CUDA real model inference` in
+`iom_cuda_conformance_tests` through an argument vector. The registered CTest
+deadline is 1800 seconds. The case runs production raw and chat prefill,
+repeated cached decode, the zero-new-token control, full-vocabulary logit
+comparison under the frozen official envelope, and disabled/metrics/trace
+parity on the selected CUDA ordinal with caller-owned storage. Exact
+identities, policy, state outcomes, native BF16 matrix attribution, and CUDA
+timing/capability limitations are recorded in
+[CUDA official TinyLlama inference evidence](docs/BACKEND_CONTRACT/model-inference-cuda-official-evidence.md).
+
 ### SYCL TinyLlama sample
 
 The SYCL sample targets the configured `bv2` host and requires the Intel
