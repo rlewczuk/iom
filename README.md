@@ -259,6 +259,30 @@ existing stop behavior and exit statuses. Duplicate or value-bearing forms of
 retain their existing status and primary diagnostic while the report exposes
 only observations actually collected.
 
+## CUDA CLI samples
+
+These sample scripts are repository-root examples for the configured CUDA host
+`bv1`; they do not download a model or provide remote orchestration. On `bv1`,
+`/home/rlew/cuda_env.sh` supplies the CUDA toolkit environment. From the IOM
+checkout root, run:
+
+```sh
+./samples/build-cuda.sh
+./samples/run-cuda.sh
+```
+
+The build script configures a Release `build-cuda` tree with testing disabled,
+CUDA enabled, and ROCm and SYCL disabled, then builds only `iom_generate`. The
+run script loads `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0` on CUDA device 0
+with a 4 GiB tensor arena and up to 16 new tokens. It supplies the unchanged
+question `What is the capital of Poland ?` as a user message so the production
+CLI applies TinyLlama's official chat formatting and assistant-generation
+prefix; raw `--prompt` behavior remains unchanged. A successful normal stop
+exits with status 0 and writes only generated text to stdout; wording may vary.
+Diagnostics go to stderr. Usage/input errors exit 2, setup/load errors exit 3,
+and execution errors exit 4. These fixed paths and settings describe only the
+configured `bv1` example and are not library or CLI defaults.
+
 ## Elementwise operation contract
 
 `DeviceOps` exposes four exact three-view asynchronous facades:
