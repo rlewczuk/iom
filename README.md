@@ -259,6 +259,27 @@ existing stop behavior and exit statuses. Duplicate or value-bearing forms of
 retain their existing status and primary diagnostic while the report exposes
 only observations actually collected.
 
+### ROCm CLI sample
+
+Run the samples from the repository root on configured ROCm host `bv2` (not
+`bv1`). Each script sources `/home/rlew/rocm_env.sh` for the ROCm toolchain:
+
+```sh
+./samples/build-rocm.sh
+./samples/run-rocm.sh
+```
+
+The build script configures a Release `build-rocm` tree with testing, CUDA,
+and SYCL disabled, then builds only `iom_generate`. The run script uses
+`/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`, ROCm device `0`, a 4 GiB tensor
+arena, and 16 new tokens. It supplies `What is the capital of Poland ?` as a
+user message so the production CLI renders the model's official chat template;
+the raw `--prompt` form documented above is unchanged.
+Generated text is the only stdout payload (without an added trailing newline);
+diagnostics go to stderr. Normal completion returns status `0`; usage/input,
+setup/load, and execution failures retain statuses `2`, `3`, and `4`,
+respectively. Setup or build failures propagate from the scripts.
+
 ## CUDA CLI samples
 
 These sample scripts are repository-root examples for the configured CUDA host
