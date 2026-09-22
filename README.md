@@ -133,6 +133,71 @@ and 4 denotes queue, generation, result, token-selection, or output-execution
 failure. The normal EOS, maximum-token, and context-capacity stop reasons all
 return status 0.
 
+### Session input and request boundaries
+
+`--prompt` is the raw-input path: the value is passed directly to the
+session-owned tokenizer and bypasses chat formatting. Repeated
+`--message ROLE CONTENT` values are ordered structured input: the session
+renders them with the selected chat template, appends its generation prompt,
+and then passes the rendered bytes to the tokenizer. At the formatter
+boundary, an engaged template override is authoritative, even when it is
+empty or invalid; it never falls back to `chat_template`. With no engaged
+override, the model's configured `tokenizer_config.json` `chat_template` is
+selected.
+
+The session owns the model, tokenizer, formatter, selector, KV/cache storage,
+and request storage. Final-logit selection is synchronous: the queue, the
+borrowed logits view and its owner, the complete history, and caller-provided
+scratch must remain live and unchanged through the call, and the selector
+retains none of them. History contains the full prompt (including any
+policy-added special tokens) followed by successfully committed generated
+IDs. A successful result owns its returned vectors and text: generated
+`token_ids` retain a committed EOS ID, while decoded `text` skips the
+special IDs `0`, `1`, and `2`.
+
+Every selected ID is committed before stopping. Stop precedence is
+`EOS > max-new-tokens > context capacity`. The generated-token count and
+initialized KV length are distinct: a nonterminal token is processed by the
+next decode only after both K/V appends succeed, while a terminal token
+remains in the result and history without a KV append merely for bookkeeping.
+With `--max-new-tokens 0`, the prompt is still validated, tokenized, and
+provisioned, but no forward or selector call is made; the result is empty and
+the request stops at the new-token limit.
+
+Starting a second request first drains every accepted operation from the
+current request. Only a successful drain permits a fresh request to be
+published, with a reset cache prefix and new history; a previously returned
+result remains owned independently of that reset. If any accepted operation
+reports a retained failure, the old request remains owned, the session is
+poisoned, and no replacement is published. A failed selection or out-of-range
+selected ID likewise commits no token; poisoning then rejects later work while
+drain still attempts every accepted operation and preserves the first failure.
+The ownership and cache boundaries are specified by [final-logit selection
+and ownership](docs/BACKEND_CONTRACT/tinyllama-forward-layout-final-logits-selection-and-ownership.md#tinyllama-forward-layout--final-logits-selection-and-ownership)
+and [session sizing and lifetime](docs/BACKEND_CONTRACT/tinyllama-forward-layout-session-sizing-and-lifetime.md#forward-stores-and-live-ranges),
+including its [producer schedule, cache publication, and abort](docs/BACKEND_CONTRACT/tinyllama-forward-layout-session-sizing-and-lifetime.md#producer-schedule-cache-publication-and-abort).
+
+Existing behavioral evidence covers these boundaries: [chat composition
+tests](test/test_chat_format.cpp) (`Chat format composes raw and structured
+owner paths` and `Chat format composes formatter override and generation
+policy`); [session tests](test/test_model_session.cpp) (`TinyLlama text chat
+generation composes raw tokenizer input`, `TinyLlama text chat generation
+renders roles and assistant prefix`, `TinyLlama text chat generation forwards
+every stop reason`, `TinyLlama text chat generation owns results across session
+reuse`, `TinyLlama generation state machine applies EOS and limit precedence`,
+`TinyLlama generation state machine commits history and decodes only for
+nonterminal tokens`, and `TinyLlama generation state machine rejects selector
+failures without reuse`); and [selector lifetime tests](test/test_token_selection.cpp)
+(`token selection readiness and lifetime rejects invalid producer OIDs before
+effects`, `token selection readiness and lifetime waits for deferred producer
+and releases borrowed inputs`, and `token selection readiness and lifetime
+retains failures and reuses scratch`). The CLI process case `TinyLlama
+generation CLI runs raw and structured chat process forms`, the selector
+injection/no-commit case, and `TinyLlama synthetic session integration
+recovers after accepted failure at the poison boundary` provide the remaining
+raw/chat, no-commit, and drain evidence; these are existing executable tests,
+not a second harness.
+
 Use `--trace` to opt into one human-readable operation line per accepted
 positive OID:
 
