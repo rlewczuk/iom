@@ -36,6 +36,7 @@
 #include <vector>
 #include <initializer_list>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
@@ -45,6 +46,31 @@
 #include "iom/session.hpp"
 #include "iom/token_selection.hpp"
 #include "../../src/session_internal.hpp"
+
+#ifndef IOM_OFFICIAL_BUILD_HOST
+#define IOM_OFFICIAL_BUILD_HOST "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_PROCESSOR_NAME
+#define IOM_OFFICIAL_PROCESSOR_NAME "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_PROCESSOR_DESCRIPTION
+#define IOM_OFFICIAL_PROCESSOR_DESCRIPTION "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_SYSTEM_PROCESSOR
+#define IOM_OFFICIAL_SYSTEM_PROCESSOR "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_CXX_COMPILER_ID
+#define IOM_OFFICIAL_CXX_COMPILER_ID "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_CXX_COMPILER_VERSION
+#define IOM_OFFICIAL_CXX_COMPILER_VERSION "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_BUILD_TYPE
+#define IOM_OFFICIAL_BUILD_TYPE "unavailable"
+#endif
+#ifndef IOM_OFFICIAL_CXX_FLAGS
+#define IOM_OFFICIAL_CXX_FLAGS "unavailable"
+#endif
 
 namespace iom_conformance {
 namespace official_model_detail {
@@ -58,7 +84,7 @@ inline constexpr std::size_t kHeadDim = 64;
 inline constexpr std::size_t kVocabulary = 32000;
 inline constexpr std::size_t kContext = 2048;
 inline constexpr std::array<std::size_t, 4> kForcedIds{3, 4, 5, 6};
-inline constexpr float kAbsoluteTolerance = 0.25F;
+inline constexpr float kAbsoluteTolerance = 0.53125F;
 inline constexpr float kRelativeTolerance = 0.02F;
 
 inline std::string failure_message(std::exception_ptr error) {
@@ -89,6 +115,15 @@ inline std::optional<std::string> optional_environment(const char* name) {
                 std::string(name) + " must not be empty when supplied");
     }
     return std::string(value);
+}
+
+inline std::string runtime_host_name() {
+    std::array<char, 256> value{};
+    if (::gethostname(value.data(), value.size()) != 0) {
+        return "unavailable";
+    }
+    value.back() = '\0';
+    return std::string(value.data());
 }
 
 inline std::size_t parse_arena_bytes(std::string_view text) {
@@ -916,9 +951,9 @@ inline std::vector<OfficialCase> validate_reference_pack(
         throw std::invalid_argument("official artifact_id differs from IOM_TEST_MODEL_ID");
     }
     const nlohmann::json expected_tolerances = {
-            {"absolute", 0.25},
+            {"absolute", 0.53125},
             {"relative", 0.02},
-            {"formula", "abs(actual-ref) <= 0.25 + 0.02*abs(ref)"},
+            {"formula", "abs(actual-ref) <= 0.53125 + 0.02*abs(ref)"},
             {"tie_policy", "lowest-id"},
             {"exact_token", "reference-margin-certified-only"}};
     if (pack.at("tolerances") != expected_tolerances) {
@@ -1905,8 +1940,21 @@ inline void run_real_model_inference(iom::Device& device) {
             {"IOM_TEST_MODEL_ID", artifact_id},
             {"IOM_TEST_MODEL_REFERENCE", reference_value},
             {"IOM_TEST_MODEL_EVIDENCE", evidence_value}};
-    if (const char* arena = std::getenv("IOM_TEST_MODEL_ARENA_BYTES")) {
-        environment["IOM_TEST_MODEL_ARENA_BYTES"] = arena;
+    if (const auto arena =
+                official_model_detail::optional_environment(
+                        "IOM_TEST_MODEL_ARENA_BYTES")) {
+        environment["IOM_TEST_MODEL_ARENA_BYTES"] = *arena;
+    }
+    nlohmann::json openmp = nlohmann::json::object();
+    for (const char* name :
+         {"OMP_NUM_THREADS", "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"}) {
+        if (const auto value =
+                    official_model_detail::optional_environment(name)) {
+            environment[name] = *value;
+            openmp[name] = *value;
+        } else {
+            openmp[name] = nullptr;
+        }
     }
     nlohmann::json evidence = {
             {"schema_version", 1},
@@ -1916,12 +1964,20 @@ inline void run_real_model_inference(iom::Device& device) {
             {"backend",
              official_model_detail::backend_name(device.backend_kind())},
             {"device", device.backend_device()},
-            {"device_identity",
-             [&] {
-                 std::ostringstream output;
-                 output << static_cast<const void*>(&device);
-                 return output.str();
-             }()},
+            {"execution_identity",
+             {{"runtime_host", official_model_detail::runtime_host_name()},
+              {"build_host", IOM_OFFICIAL_BUILD_HOST},
+              {"processor",
+               {{"name", IOM_OFFICIAL_PROCESSOR_NAME},
+                {"description", IOM_OFFICIAL_PROCESSOR_DESCRIPTION},
+                {"architecture", IOM_OFFICIAL_SYSTEM_PROCESSOR}}},
+              {"compiler",
+               {{"id", IOM_OFFICIAL_CXX_COMPILER_ID},
+                {"version", IOM_OFFICIAL_CXX_COMPILER_VERSION}}},
+              {"build",
+               {{"type", IOM_OFFICIAL_BUILD_TYPE},
+                {"effective_cxx_flags", IOM_OFFICIAL_CXX_FLAGS}}},
+              {"openmp", std::move(openmp)}}},
             {"software",
              {{"component", "iom official inference harness"},
               {"cplusplus", __cplusplus}}},

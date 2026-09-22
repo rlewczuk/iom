@@ -236,6 +236,49 @@ Run these examples from the repository root on a CPU host (`bv1` or `bv2`) after
 
 The build sample configures a host-native OpenMP Release `build-cpu` tree with accelerator backends and tests disabled, then builds `iom_generate`. OpenMP parallelizes independent CPU projection output columns for byte-sized-or-wider element formats without changing each column's ordered fused-multiply-add accumulation; packed sub-byte formats remain serial so neighboring elements cannot race within a shared byte. Build the sample separately on each CPU host rather than copying the executable between machines. The run sample supplies the exact user message `What is the capital of Poland ?`; `iom_generate` renders the distribution's official chat template, including its assistant-generation prefix, before tokenization. It uses CPU device `0` and a one-token generation limit, the smallest limit that can produce nonempty text. A successful run exits `0` and writes nonempty generated text to stdout; diagnostics go to stderr and no trailing newline is added. The CLI retains status `2` for usage/input errors, `3` for setup or load failures, and `4` for execution failures.
 
+### CPU official-model inference (opt-in)
+
+The CPU official-model gate is separate from both ordinary CTest and the
+real-checkpoint loading option. It never downloads or discovers a model and it
+has no skip or fallback path. When enabled, the ordinary aggregate CTest
+explicitly excludes the guarded case, so the Python wrapper is the sole
+registered route. Configure the case explicitly, then supply the model, pinned
+revision, exported reference pack, and evidence destination:
+
+```sh
+cmake -S . -B build/cpu-official \
+  -DBUILD_TESTING=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native -fopenmp" \
+  -DCUDA_ENABLED=OFF \
+  -DROCM_ENABLED=OFF \
+  -DSYCL_ENABLED=OFF \
+  -DIOM_TEST_REAL_MODEL_INFERENCE_CPU=ON
+cmake --build build/cpu-official \
+  --target iom_backend_conformance_cpu_tests
+
+OMP_NUM_THREADS="$(nproc)" \
+IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+IOM_TEST_MODEL_REFERENCE=/path/to/tinyllama-official-reference.json \
+IOM_TEST_MODEL_EVIDENCE=/path/to/cpu-official-evidence.json \
+timeout --kill-after=30s 4200s \
+  ctest --test-dir build/cpu-official --output-on-failure \
+    --no-tests=error --timeout 3900 \
+    -R '^iom_cpu_real_model_inference_tests$'
+```
+
+The Python wrapper verifies the complete model/reference identity before
+launching only `CPU real model inference` in the already-built CPU conformance
+executable. Its child budget is 3600 seconds; the registered CTest allows 3900
+seconds for prelaunch validation plus the wrapper's bounded 60-second
+termination/reap protocol, and the documented shell supervisor allows 4200
+seconds so CTest can finish first. The case runs production raw and chat
+prefill, repeated cached decode, zero-new-token behavior, full-logit comparison,
+and disabled/metrics/trace parity on CPU device `0` with caller-owned storage.
+Exact identities, policy, state outcomes, and CPU timing/capability limitations
+are recorded in [CPU official TinyLlama inference evidence](docs/BACKEND_CONTRACT/model-inference-cpu-official-evidence.md).
+
 ### Optional scalar metrics
 
 Pass the value-free `--metrics` option to print one bounded scalar report on

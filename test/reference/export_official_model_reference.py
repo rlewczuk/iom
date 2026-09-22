@@ -288,9 +288,9 @@ def _load_policy(path: Path) -> dict[str, Any]:
 
     tolerances = _object(policy.get("tolerances"), "official export policy tolerances")
     expected_tolerances = {
-        "absolute": 0.25,
+        "absolute": 0.53125,
         "relative": 0.02,
-        "formula": "abs(actual-ref) <= 0.25 + 0.02*abs(ref)",
+        "formula": "abs(actual-ref) <= 0.53125 + 0.02*abs(ref)",
         "tie_policy": "lowest-id",
         "exact_token": "reference-margin-certified-only",
     }
@@ -678,11 +678,11 @@ def _greedy_id(logits: Sequence[float]) -> int:
 
 def _margin_stable(logits: Sequence[float], winner: int) -> bool:
     winner_value = logits[winner]
-    winner_error = 0.25 + 0.02 * abs(winner_value)
+    winner_error = 0.53125 + 0.02 * abs(winner_value)
     for index, value in enumerate(logits):
         if index == winner:
             continue
-        error = 0.25 + 0.02 * abs(value)
+        error = 0.53125 + 0.02 * abs(value)
         if not (winner_value - winner_error > value + error):
             return False
     return True

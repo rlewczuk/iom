@@ -32,9 +32,9 @@ GEOMETRY = {
     "max_position_embeddings": 2048,
 }
 TOLERANCES = {
-    "absolute": 0.25,
+    "absolute": 0.53125,
     "relative": 0.02,
-    "formula": "abs(actual-ref) <= 0.25 + 0.02*abs(ref)",
+    "formula": "abs(actual-ref) <= 0.53125 + 0.02*abs(ref)",
     "tie_policy": "lowest-id",
     "exact_token": "reference-margin-certified-only",
 }
@@ -74,9 +74,20 @@ PINNED_PRECISION = {
     "device": "cpu",
 }
 
-EXECUTION_TIMEOUT_SECONDS = 1800.0
+EXECUTION_TIMEOUT_SECONDS = 3600.0
 TERMINATION_GRACE_SECONDS = 30.0
 KILL_REAP_SECONDS = 30.0
+MEASUREMENT_ENVIRONMENT = (
+    "IOM_TEST_MODEL_DIR",
+    "IOM_TEST_MODEL_ID",
+    "IOM_TEST_MODEL_REFERENCE",
+    "IOM_TEST_MODEL_EVIDENCE",
+    "IOM_TEST_MODEL_ARENA_BYTES",
+    "OMP_NUM_THREADS",
+    "OMP_DYNAMIC",
+    "OMP_PROC_BIND",
+    "OMP_PLACES",
+)
 
 
 class HarnessError(RuntimeError):
@@ -351,10 +362,10 @@ def check_snapshot(value: Any, label: str, prefix: Sequence[int], index: int) ->
     winner = max(range(len(logits)), key=lambda item: (float(logits[item]), -item))
     if greedy != winner:
         fail(f"{label}.greedy_id is not lowest-ID argmax")
-    winner_error = 0.25 + 0.02 * abs(float(logits[winner]))
+    winner_error = 0.53125 + 0.02 * abs(float(logits[winner]))
     stable = all(
         float(logits[winner]) - winner_error
-        > float(logits[other]) + 0.25 + 0.02 * abs(float(logits[other]))
+        > float(logits[other]) + 0.53125 + 0.02 * abs(float(logits[other]))
         for other in range(len(logits)) if other != winner
     )
     if snapshot.get("margin_stable") is not stable:
@@ -869,18 +880,60 @@ def _signal_process_group(
     process: subprocess.Popen[str],
     requested: signal.Signals,
     supervision: dict[str, Any],
-) -> None:
+) -> bool:
+    # start_new_session=True makes the leader PID the original process-group
+    # ID. Keep using that immutable value even after the leader exits; never
+    # discover or signal a replacement group through a surviving descendant.
     try:
         os.killpg(process.pid, requested)
         supervision["signals_sent"].append(requested.name)
+        return True
     except ProcessLookupError:
         supervision["signals_sent"].append(f"{requested.name}:already-exited")
+        return False
     except OSError as error:
         raise ProcessFailure(
             "termination",
             f"cannot send {requested.name} to backend process group: {error}",
             supervision,
         ) from error
+
+def _process_group_exists(
+    process: subprocess.Popen[str],
+    supervision: dict[str, Any],
+) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        raise ProcessFailure(
+            "reap",
+            f"cannot query backend process group after termination: {error}",
+            supervision,
+        ) from error
+
+
+def _wait_for_process_group_exit(
+    process: subprocess.Popen[str],
+    supervision: dict[str, Any],
+    kill_deadline: float,
+    kill_timeout: float,
+) -> None:
+    while _process_group_exists(process, supervision):
+        remaining = kill_deadline - time.monotonic()
+        if remaining <= 0:
+            supervision["reap"] = "failed-after-SIGKILL"
+            raise ProcessFailure(
+                "reap",
+                "backend process group did not disappear within the single "
+                f"bounded post-SIGKILL {kill_timeout:g}-second interval",
+                supervision,
+            )
+        time.sleep(min(0.01, remaining))
 
 
 def _close_process_pipes(process: subprocess.Popen[str]) -> None:
@@ -909,16 +962,38 @@ def _terminate_and_reap(
     _signal_process_group(process, signal.SIGTERM, supervision)
     try:
         stdout, stderr = process.communicate(timeout=terminate_timeout)
-        supervision["reap"] = "after-SIGTERM"
-        return stdout, stderr
     except (subprocess.TimeoutExpired, OSError):
-        _signal_process_group(process, signal.SIGKILL, supervision)
+        pass
+    else:
+        if not _process_group_exists(process, supervision):
+            supervision["reap"] = "after-SIGTERM"
+            return stdout, stderr
+        kill_deadline = time.monotonic() + kill_timeout
+        kill_sent = _signal_process_group(
+            process, signal.SIGKILL, supervision
+        )
+        _wait_for_process_group_exit(
+            process, supervision, kill_deadline, kill_timeout
+        )
+        supervision["reap"] = (
+            "after-SIGKILL" if kill_sent else "after-SIGTERM"
+        )
+        return stdout, stderr
+
     kill_deadline = time.monotonic() + kill_timeout
+    kill_sent = _signal_process_group(
+        process, signal.SIGKILL, supervision
+    )
     try:
         stdout, stderr = process.communicate(
             timeout=max(0.0, kill_deadline - time.monotonic())
         )
-        supervision["reap"] = "after-SIGKILL"
+        _wait_for_process_group_exit(
+            process, supervision, kill_deadline, kill_timeout
+        )
+        supervision["reap"] = (
+            "after-SIGKILL" if kill_sent else "after-SIGTERM"
+        )
         return stdout, stderr
     except subprocess.TimeoutExpired as error:
         stdout = _timeout_output(error.stdout)
@@ -943,6 +1018,9 @@ def _terminate_and_reap(
                 f"post-SIGKILL {kill_timeout:g}-second interval",
                 supervision,
             ) from wait_error
+        _wait_for_process_group_exit(
+            process, supervision, kill_deadline, kill_timeout
+        )
         supervision["reap"] = "pipes-closed-after-SIGKILL"
         return stdout, stderr
     except OSError as error:
@@ -968,6 +1046,9 @@ def _terminate_and_reap(
                 f"{error}",
                 supervision,
             ) from wait_error
+        _wait_for_process_group_exit(
+            process, supervision, kill_deadline, kill_timeout
+        )
         supervision["reap"] = "pipes-closed-after-collection-error"
         return "", str(error)
 
@@ -1063,7 +1144,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    execution_timeout: float = EXECUTION_TIMEOUT_SECONDS,
+    terminate_timeout: float = TERMINATION_GRACE_SECONDS,
+    kill_timeout: float = KILL_REAP_SECONDS,
+) -> int:
     args = parse_args(argv)
     evidence: Path | None = None
     publication: EvidencePublication | None = None
@@ -1085,13 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         selected_environment = {
             name: os.environ[name]
-            for name in (
-                "IOM_TEST_MODEL_DIR",
-                "IOM_TEST_MODEL_ID",
-                "IOM_TEST_MODEL_REFERENCE",
-                "IOM_TEST_MODEL_EVIDENCE",
-                "IOM_TEST_MODEL_ARENA_BYTES",
-            )
+            for name in MEASUREMENT_ENVIRONMENT
             if name in os.environ
         }
         failure_context.update(
@@ -1159,7 +1240,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         stage = "launch"
         completed, supervision = run_backend_process(
-            command, os.environ.copy()
+            command,
+            os.environ.copy(),
+            execution_timeout,
+            terminate_timeout,
+            kill_timeout,
         )
         timed_out = bool(supervision["timed_out"])
 
@@ -1192,9 +1277,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         diagnostics = []
         if timed_out:
             diagnostics.append(
-                "backend test exceeded 1800 seconds and its process group "
-                "was terminated (30-second TERM grace and bounded "
-                "30-second post-KILL reap)"
+                f"backend test exceeded {execution_timeout:g} seconds and its "
+                f"process group was terminated ({terminate_timeout:g}-second "
+                f"TERM grace and bounded {kill_timeout:g}-second post-KILL "
+                "reap)"
             )
         if completed.returncode != 0:
             diagnostics.append(

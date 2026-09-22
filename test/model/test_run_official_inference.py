@@ -2,8 +2,10 @@
 """Standard-library regression tests for the official inference wrapper."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -233,6 +235,37 @@ class WrapperRegressionTest(unittest.TestCase):
         self.assertEqual(
             evidence["argv"],
             [str(sentinel), "--test-case=*real model inference*"],
+        )
+
+
+    def test_old_tolerance_pack_rejects_before_sentinel_launch(self) -> None:
+        marker = self.root / "launched"
+        sentinel = self.root / "sentinel.py"
+        sentinel.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('launched')\n",
+            encoding="utf-8",
+        )
+        sentinel.chmod(0o755)
+        pack = json.loads(self.reference.read_text(encoding="utf-8"))
+        pack["tolerances"]["absolute"] = 0.25
+        pack["tolerances"]["formula"] = (
+            "abs(actual-ref) <= 0.25 + 0.02*abs(ref)"
+        )
+        self.reference.write_text(
+            json.dumps(pack, allow_nan=False), encoding="utf-8"
+        )
+
+        completed = self.invoke(sentinel)
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertFalse(marker.exists())
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["stage"], "input-validation")
+        self.assertIn(
+            "comparison policy differs from the frozen policy",
+            evidence["diagnostics"][0],
         )
 
     def test_launch_oserror_preserves_machine_readable_evidence(self) -> None:
@@ -486,19 +519,14 @@ class WrapperRegressionTest(unittest.TestCase):
         self,
     ) -> None:
         environment = self.environment()
+        environment["OMP_NUM_THREADS"] = "3"
         reference_identity = WRAPPER.file_identity(
             self.reference, str(self.reference)
         )
         artifacts = WRAPPER.model_artifacts(self.model)
         selected_environment = {
             name: environment[name]
-            for name in (
-                "IOM_TEST_MODEL_DIR",
-                "IOM_TEST_MODEL_ID",
-                "IOM_TEST_MODEL_REFERENCE",
-                "IOM_TEST_MODEL_EVIDENCE",
-                "IOM_TEST_MODEL_ARENA_BYTES",
-            )
+            for name in WRAPPER.MEASUREMENT_ENVIRONMENT
             if name in environment
         }
         measurement = {
@@ -549,6 +577,152 @@ class WrapperRegressionTest(unittest.TestCase):
         )
         self.assertEqual(wrapper_evidence["status"], "passed")
         self.assertEqual(wrapper_evidence["measurement"], measurement)
+
+    def test_registered_timeout_reaps_child_and_publishes_evidence(
+        self,
+    ) -> None:
+        marker = self.root / "timeout-child.pid"
+        sleeper = self.root / "timeout-backend.py"
+        sleeper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+            "while True: time.sleep(1)\n",
+            encoding="utf-8",
+        )
+        sleeper.chmod(0o755)
+        environment = self.environment()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with contextlib.redirect_stdout(stdout):
+                with contextlib.redirect_stderr(stderr):
+                    result = WRAPPER.main(
+                        [
+                            "--backend",
+                            "cpu",
+                            "--executable",
+                            str(sleeper),
+                        ],
+                        execution_timeout=0.2,
+                        terminate_timeout=0.1,
+                        kill_timeout=0.5,
+                    )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result, 124, stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertLess(elapsed, 2.0)
+        child_pid = int(marker.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["status"], "failed")
+        self.assertLess(evidence["returncode"], 0)
+        self.assertEqual(
+            evidence["supervision"],
+            {
+                "execution_timeout_seconds": 0.2,
+                "terminate_grace_seconds": 0.1,
+                "kill_reap_seconds": 0.5,
+                "timed_out": True,
+                "signals_sent": ["SIGTERM", "SIGKILL"],
+                "reap": "after-SIGKILL",
+            },
+        )
+        self.assertIn("exceeded 0.2 seconds", evidence["diagnostics"][0])
+
+    def test_registered_timeout_drains_residual_process_group(
+        self,
+    ) -> None:
+        leader_marker = self.root / "timeout-leader.pid"
+        descendant_marker = self.root / "timeout-descendant.pid"
+        descendant_source = (
+            "import os, signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"Path({str(descendant_marker)!r}).write_text(str(os.getpid()))\n"
+            "while True: time.sleep(1)\n"
+        )
+        leader = self.root / "timeout-process-group.py"
+        leader.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, signal, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "def stop(_signum, _frame): raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            f"descendant_source = {descendant_source!r}\n"
+            "subprocess.Popen(\n"
+            "    [sys.executable, '-c', descendant_source],\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            "    close_fds=True,\n"
+            ")\n"
+            f"descendant_marker = Path({str(descendant_marker)!r})\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not descendant_marker.exists():\n"
+            "    if time.monotonic() >= deadline: raise RuntimeError("
+            "'descendant did not start')\n"
+            "    time.sleep(0.01)\n"
+            f"Path({str(leader_marker)!r}).write_text(str(os.getpid()))\n"
+            "print('leader-timeout-output', flush=True)\n"
+            "print('leader-timeout-error', file=sys.stderr, flush=True)\n"
+            "while True: time.sleep(1)\n",
+            encoding="utf-8",
+        )
+        leader.chmod(0o755)
+        environment = self.environment()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with contextlib.redirect_stdout(stdout):
+                with contextlib.redirect_stderr(stderr):
+                    result = WRAPPER.main(
+                        [
+                            "--backend",
+                            "cpu",
+                            "--executable",
+                            str(leader),
+                        ],
+                        execution_timeout=1.0,
+                        terminate_timeout=0.2,
+                        kill_timeout=1.0,
+                    )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result, 124, stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertLess(elapsed, 3.0)
+        leader_pid = int(leader_marker.read_text(encoding="utf-8"))
+        descendant_pid = int(
+            descendant_marker.read_text(encoding="utf-8")
+        )
+        for pid in (leader_pid, descendant_pid):
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(evidence["returncode"], 0)
+        self.assertEqual(evidence["stdout"], "leader-timeout-output\n")
+        self.assertEqual(evidence["stderr"], "leader-timeout-error\n")
+        self.assertEqual(
+            evidence["supervision"],
+            {
+                "execution_timeout_seconds": 1.0,
+                "terminate_grace_seconds": 0.2,
+                "kill_reap_seconds": 1.0,
+                "timed_out": True,
+                "signals_sent": ["SIGTERM", "SIGKILL"],
+                "reap": "after-SIGKILL",
+            },
+        )
 
     def test_post_sigkill_collection_and_wait_share_one_deadline(self) -> None:
         class DeadlineProcess:
@@ -610,7 +784,7 @@ class WrapperRegressionTest(unittest.TestCase):
             normal["execution_timeout_seconds"],
             WRAPPER.EXECUTION_TIMEOUT_SECONDS,
         )
-        self.assertEqual(WRAPPER.EXECUTION_TIMEOUT_SECONDS, 1800.0)
+        self.assertEqual(WRAPPER.EXECUTION_TIMEOUT_SECONDS, 3600.0)
 
         sleeper = self.root / "ignore-term.py"
         sleeper.write_text(
