@@ -35,48 +35,8 @@ using iom_model_loading::h16_config;
 using iom_model_loading::one_layer_config;
 using iom_model_loading::write_config;
 using iom_model_loading::write_file;
+using iom_tokenizer_test::tokenizer_config;
 using iom_tokenizer_test::write_tokenizer;
-
-[[nodiscard]] inline nlohmann::json tokenizer_config() {
-    const auto metadata = [](const char* content) {
-        return nlohmann::json{{"content", content},
-                              {"lstrip", false},
-                              {"normalized", false},
-                              {"rstrip", false},
-                              {"single_word", false},
-                              {"special", true}};
-    };
-    return nlohmann::json{
-            {"added_tokens_decoder",
-             nlohmann::json{{"0", metadata("<unk>")},
-                            {"1", metadata("<s>")},
-                            {"2", metadata("</s>")}}},
-            {"bos_token", "<s>"},
-            {"chat_template",
-             "{% for message in messages %}"
-             "{% if message['role'] == 'system' %}"
-             "{{ message['content'] + eos_token }}"
-             "{% elif message['role'] == 'user' %}"
-             "{{ message['content'] + eos_token }}"
-             "{% elif message['role'] == 'assistant' %}"
-             "{{ message['content'] + eos_token }}"
-             "{% endif %}"
-             "{% if loop.last and add_generation_prompt %}"
-             "{{ '<|assistant|>' }}"
-             "{% endif %}"
-             "{% endfor %}"},
-            {"clean_up_tokenization_spaces", false},
-            {"eos_token", "</s>"},
-            {"legacy", false},
-            {"model_max_length", 2048},
-            {"pad_token", "</s>"},
-            {"padding_side", "right"},
-            {"sp_model_kwargs", nlohmann::json::object()},
-            {"tokenizer_class", "LlamaTokenizer"},
-            {"unk_token", "<unk>"},
-            {"use_default_system_prompt", false},
-    };
-}
 
 [[nodiscard]] inline std::uint16_t forward_encode_bf16(float value) noexcept {
     const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);

@@ -104,6 +104,7 @@ add_executable(iom_tests
         test_alloc.cpp
         test_gpu_status.cpp
         test_inference_metrics.cpp
+        test_model_reference_fixture.cpp
 )
 set_source_files_properties(test_iom.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -118,6 +119,7 @@ add_dependencies(iom_tests iom_generate)
 target_compile_definitions(iom_tests
     PRIVATE
         IOM_GENERATE_EXECUTABLE="$<TARGET_FILE:iom_generate>"
+        IOM_MODEL_REFERENCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/model"
 )
 
 add_test(NAME iom_tests COMMAND iom_tests)
