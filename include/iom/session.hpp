@@ -109,13 +109,15 @@ public:
             std::size_t max_new_tokens);
 
     /**
-     * Generate from raw text using the session-owned tokenizer directly.
+     * Generate from raw text using the session-owned tokenizer's automatic
+     * special-token policy.
      */
     [[nodiscard]] GenerationResult generate_raw(
             std::string_view text, std::size_t max_new_tokens);
 
     /**
-     * Render structured chat with a generation prompt, then tokenize it.
+     * Render structured chat with a generation prompt, then tokenize it
+     * without inserting automatic special tokens.
      */
     [[nodiscard]] GenerationResult generate_chat(
             std::span<const ChatMessageView> messages,

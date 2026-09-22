@@ -1348,10 +1348,10 @@ inline ModeObservation run_mode(
     if (mode == 2) session->prepare_operation_trace();
 
     // Raw and chat prompts pass through the actual immutable formatter and
-    // tokenizer owners.  Chat deliberately submits the validated no-BOS IDs
-    // to generate_tokens: generate_chat adds a BOS by production policy, while
-    // the frozen official chat policy explicitly forbids one.  The tokens mode
-    // is an internal seam used only by the genuine tiny-fixture offline proof.
+    // tokenizer owners.  The chat encoding below first proves the frozen
+    // no-BOS prompt IDs; generate_chat then exercises that same supported
+    // production policy.  The tokens mode is an internal seam used only by
+    // the genuine tiny-fixture offline proof.
     const std::array<iom::ChatMessageView, 1> chat_messages{
             iom::ChatMessageView{"user", "Hello."}};
     const std::string raw_text = test_case.mode == "raw"
@@ -1415,6 +1415,12 @@ inline ModeObservation run_mode(
         result_ids.assign(result.token_ids.begin(), result.token_ids.end());
         result_stop = result.stop_reason;
         result_text = result.text;
+    } else if (test_case.mode == "chat") {
+        const iom::GenerationResult result =
+                session->generate_chat(chat_messages, test_case.limit);
+        result_ids.assign(result.token_ids.begin(), result.token_ids.end());
+        result_stop = result.stop_reason;
+        result_text = result.text;
     } else {
         const iom::TokenGenerationResult result =
                 session->generate_tokens(test_case.prompt, test_case.limit);
@@ -1428,11 +1434,11 @@ inline ModeObservation run_mode(
     }
     const std::string decoded = session->tokenizer().decode(
             decoded_ids, iom::DecodeOptions{true});
-    if (test_case.mode == "raw" && decoded != result_text) {
+    if (test_case.mode != "tokens" && decoded != result_text) {
         throw std::runtime_error(
-                test_case.name + " decoded raw text mismatch");
+                test_case.name + " decoded generated text mismatch");
     }
-    if (test_case.mode != "raw") result_text = decoded;
+    if (test_case.mode == "tokens") result_text = decoded;
     if (result_text.find("<s>") != std::string::npos
             || result_text.find("</s>") != std::string::npos) {
         throw std::runtime_error(

@@ -1339,7 +1339,7 @@ GenerationResult TinyLlamaSession::generate_chat(
     std::vector<std::uint32_t> encoded =
             observed_encode(observation, [&] {
                 return tokenizer().encode(
-                        rendered, EncodeOptions{.add_special_tokens = true});
+                        rendered, EncodeOptions{.add_special_tokens = false});
             });
     return finish_text_generation(
             *this, std::move(encoded), max_new_tokens, observation);

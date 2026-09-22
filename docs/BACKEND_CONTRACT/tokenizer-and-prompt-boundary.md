@@ -207,13 +207,15 @@ add_generation_prompt=true:  "<|user|>\nx</s>\n<|assistant|>\n"
 
 The first string includes its terminal LF; the second includes both the
 terminal message LF and the generation-prefix LF. The formatter does not add
-BOS. A structured prompt is composed by calling `format` first and then
-passing the returned bytes to `Tokenizer::encode`; a raw text prompt calls
-`Tokenizer::encode` directly. The tokenizer's processor-BOS policy therefore
-still applies to the latter encode call unless the caller disables it, while
-an explicit `<s>` in raw text remains an additional atomic token and is never
-deduplicated. Decode retains IDs `0/1/2` by default and removes only those
-IDs when `skip_special_tokens=true`.
+BOS. `TinyLlamaSession::generate_chat` composes a structured prompt by calling
+`format(..., true)` first and then passing the returned bytes to
+`Tokenizer::encode` with `add_special_tokens=false`; the rendered template is
+the complete chat prompt, so no automatic BOS precedes its first byte.
+`TinyLlamaSession::generate_raw` passes raw text directly to
+`Tokenizer::encode` with `add_special_tokens=true`, retaining the processor's
+BOS policy. An explicit `<s>` in either input remains an atomic token and is
+never heuristically deduplicated. Decode retains IDs `0/1/2` by default and
+removes only those IDs when `skip_special_tokens=true`.
 
 The cross-component composition boundary is exercised by the existing
 [`test/test_chat_format.cpp`](../../test/test_chat_format.cpp) cases `Chat

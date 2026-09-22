@@ -3610,11 +3610,13 @@ TEST_CASE("TinyLlama text chat generation renders roles and assistant prefix") {
     CHECK(structured.text == "hello");
     CHECK(structured.stop_reason == iom::GenerationStopReason::max_new_tokens);
     REQUIRE_EQ(observer->histories.size(), 1);
+    REQUIRE(!observer->histories[0].empty());
+    CHECK_NE(observer->histories[0].front(), session->tokenizer().bos_id());
     CHECK(observer->histories[0]
           == std::vector<std::size_t>{
-                  1,   259, 123, 2,   259, 123, 2,   259, 123, 2,
-                  259, 63,  127, 100, 118, 118, 108, 118, 119, 100,
-                  113, 119, 127, 65});
+                  259, 123, 2,   259, 123, 2,   259, 123, 2,   259,
+                  63,  127, 100, 118, 118, 108, 118, 119, 100, 113,
+                  119, 127, 65});
 
     const iom::ChatMessageView empty_user[] = {{"user", ""}};
     CHECK(session->formatter().format(empty_user, true)
@@ -3625,9 +3627,11 @@ TEST_CASE("TinyLlama text chat generation renders roles and assistant prefix") {
     CHECK(empty_content.text.empty());
     CHECK(empty_content.stop_reason == iom::GenerationStopReason::eos);
     REQUIRE_EQ(observer->histories.size(), 2);
+    REQUIRE(!observer->histories[1].empty());
+    CHECK_NE(observer->histories[1].front(), session->tokenizer().bos_id());
     CHECK(observer->histories[1]
           == std::vector<std::size_t>{
-                  1, 2, 259, 63, 127, 100, 118, 118, 108, 118,
+                  2, 259, 63, 127, 100, 118, 118, 108, 118,
                   119, 100, 113, 119, 127, 65});
 }
 
