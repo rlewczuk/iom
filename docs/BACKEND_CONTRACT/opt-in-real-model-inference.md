@@ -127,6 +127,11 @@ artifact-free.
   binds the CPU device-0 registration, caller inputs, official artifact
   identities, numerical/state comparisons, instrumentation parity, and
   host-only timing limitation to this shared contract.
+- [CUDA official TinyLlama inference evidence](model-inference-cuda-official-evidence.md)
+  binds the CUDA registration, caller inputs, official artifact identities,
+  numerical/state comparisons, instrumentation parity, native BF16 matrix
+  attribution, and truthful profiler/timing limitations to this shared
+  contract.
 - [ROCm official TinyLlama inference evidence](model-inference-rocm-official-evidence.md)
   binds the ROCm device-0 registration, caller inputs including the
   device-construction arena, official artifact identities, numerical/state
