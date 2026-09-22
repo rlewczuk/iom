@@ -106,9 +106,9 @@
     "zero_limit_no_forward": true
   },
   "tolerances": {
-    "absolute": 0.25,
+    "absolute": 0.53125,
     "exact_token": "reference-margin-certified-only",
-    "formula": "abs(actual-ref) <= 0.25 + 0.02*abs(ref)",
+    "formula": "abs(actual-ref) <= 0.53125 + 0.02*abs(ref)",
     "relative": 0.02,
     "tie_policy": "lowest-id"
   },

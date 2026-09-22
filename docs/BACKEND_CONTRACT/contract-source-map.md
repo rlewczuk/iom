@@ -58,6 +58,13 @@ Use these sources when changing or extending the contract:
   `test/model_loading_fixture.hpp`;
 - shared model loading and realization scenario:
   `test/backend/backend_conformance_model_loading.hpp`;
+- shared official-model inference validation and launch:
+  `test/backend/backend_conformance_model_official.hpp`,
+  `test/model/run_official_inference.py`, and
+  `test/model/test_run_official_inference.py`; the CPU registration and retained
+  backend evidence are `test/cpu/test_cpu_conformance.cpp`,
+  `test/CMakeLists.txt`, and
+  [CPU official TinyLlama inference evidence](model-inference-cpu-official-evidence.md);
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and

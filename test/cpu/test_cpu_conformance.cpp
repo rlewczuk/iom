@@ -25,6 +25,9 @@
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_inference_metrics.hpp"
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_CPU
+#include "backend/backend_conformance_model_official.hpp"
+#endif
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 
@@ -758,6 +761,17 @@ TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and obs
 TEST_CASE("CPU real model loading") {
     CpuDevices devices;
     iom_conformance::run_real_model_loading(*devices.candidate);
+}
+#endif
+
+// Opt-in official TinyLlama inference, compiled only with
+// `IOM_TEST_REAL_MODEL_INFERENCE_CPU=ON`. The common runner owns artifact
+// verification, real prefill/cached decode, comparisons, and evidence; this
+// driver contributes only CPU device 0 backed by its caller-owned allocator.
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_CPU
+TEST_CASE("CPU real model inference") {
+    CpuDevices devices;
+    iom_conformance::run_real_model_inference(*devices.candidate);
 }
 #endif
 

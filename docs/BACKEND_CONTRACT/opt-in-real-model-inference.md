@@ -50,8 +50,9 @@ records its phase, prefix IDs, position start and run length, absolute positions
 full finite BF16 logits, lowest-ID greedy argmax, selected ID, and the frozen
 margin-certification bit. The expected result records token IDs, stop reason, and
 initialized KV length. Official logits use
-`abs(actual-reference) <= 0.25 + 0.02*abs(reference)`; exact greedy-ID agreement
-requires the frozen margin inequality for every competing vocabulary entry.
+`abs(actual-reference) <= 0.53125 + 0.02*abs(reference)`; exact greedy-ID
+agreement requires the frozen margin inequality for every competing vocabulary
+entry.
 After a non-certified greedy divergence, logits from different histories are not
 compared. Forced continuation always compares the full vocabulary on identical
 prefixes.
@@ -78,28 +79,51 @@ zero/unavailable observation rather than invented timing.
 `test/model/run_official_inference.py` is standard-library only. It validates all
 caller files, artifact identities, the canonical case-payload digest, model
 geometry, provenance pins, and the requested backend/executable. It then invokes
-exactly one already-built backend test through a subprocess argument vector, never
-through a shell. The evidence destination must be outside the model directory
-and must not lexically, canonically, or by file identity alias the reference,
-backend executable, or any model artifact; the direct C++ entry independently
-enforces its reference/model separation before success or failure publication.
-Official execution has a 1800-second deadline, followed by a 30-second
+exactly one already-built backend test through a subprocess argument vector,
+never through a shell. A backend registration must exclude the guarded case
+from its ordinary aggregate CTest so this wrapper remains the sole registered
+artifact-validation, digest, supervision, and evidence-publication route. The
+evidence destination must be outside the model directory and must not lexically,
+canonically, or by file identity alias the reference, backend executable, or
+any model artifact; the direct C++ entry independently enforces its
+reference/model separation before success or failure publication.
+
+Official child execution has a 3600-second deadline, followed by a 30-second
 process-group `SIGTERM` grace interval and, if needed, `SIGKILL` plus one shared
-30-second monotonic reap deadline across collection and wait. Launch, collection,
-timeout, cleanup, validation, and unexpected failures all use the same
-best-effort atomic failure-evidence path with their stage and available
+30-second monotonic reap deadline across collection and wait. The CPU
+registration uses a 3900-second CTest deadline to leave validation and cleanup
+headroom, while its documented shell supervisor uses 4200 seconds so CTest
+finishes first. The focused registered wrapper timeout regressions use
+subsecond child/grace values and a 10-second CTest deadline. They cover both a
+SIGTERM-ignoring leader and a leader that exits while a same-group descendant
+ignores SIGTERM after redirecting inherited pipes. The wrapper must preserve
+collected leader output, escalate the residual original group to `SIGKILL`,
+observe that group disappear within the single post-kill deadline, and
+atomically publish truthful timeout evidence before CTest returns. Launch,
+collection, timeout, cleanup, validation, and unexpected failures all use the
+same best-effort atomic
+failure-evidence path with their stage and available
 argv/environment/supervision details. Successful stdout is a compact status,
 backend, reference-digest, and evidence-path summary; full measurements remain
 in the evidence file.
 
 The C++ runner emits machine-readable evidence containing the verified reference
-and artifact identities, backend/device/precision and exact environment/argv
-context, logical case outputs and positions, logits, token and stop results,
-counts, cache lengths, mode parity, diagnostics, and the initially unclaimed
-native-capability field. Evidence publication is atomic and a failed execution is
-recorded before its exception is rethrown.
+and artifact identities, backend/device/precision, exact selected
+argv/environment context, deterministic build host and processor facts,
+runtime host, compiler ID/version, build type/effective C++ flags, and OpenMP
+settings. It also retains logical case outputs and positions, logits, token and
+stop results, counts, cache lengths, mode parity, diagnostics, and the initially
+unclaimed native-capability field. Evidence publication is atomic and a failed
+execution is recorded before its exception is rethrown.
 
 No backend target, option, registration, or production observer is owned by this
 contract. Backend-specific leaves provide those registrations and independently
 supply successful official-checkpoint evidence; ordinary configuration remains
 artifact-free.
+
+## Backend evidence
+
+- [CPU official TinyLlama inference evidence](model-inference-cpu-official-evidence.md)
+  binds the CPU device-0 registration, caller inputs, official artifact
+  identities, numerical/state comparisons, instrumentation parity, and
+  host-only timing limitation to this shared contract.

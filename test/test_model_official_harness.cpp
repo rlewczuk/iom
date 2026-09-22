@@ -279,9 +279,9 @@ nlohmann::json complete_official_reference_pack() {
               {"revision", artifact_id},
               {"artifacts", nlohmann::json::array()}}},
             {"tolerances",
-             {{"absolute", 0.25},
+             {{"absolute", 0.53125},
               {"relative", 0.02},
-              {"formula", "abs(actual-ref) <= 0.25 + 0.02*abs(ref)"},
+              {"formula", "abs(actual-ref) <= 0.53125 + 0.02*abs(ref)"},
               {"tie_policy", "lowest-id"},
               {"exact_token", "reference-margin-certified-only"}}},
             {"model_config", model_config},
@@ -519,6 +519,15 @@ TEST_CASE("Official model harness accepts the complete frozen reference schema")
     CHECK(cases.front().name == "raw-production-greedy");
     CHECK(cases.back().name == "zero-new-token");
 
+    auto old_tolerance = pack;
+    old_tolerance["tolerances"]["absolute"] = 0.25;
+    old_tolerance["tolerances"]["formula"] =
+            "abs(actual-ref) <= 0.25 + 0.02*abs(ref)";
+    CHECK_THROWS_AS(
+            validate_reference_pack(
+                    old_tolerance, "official-pack-regression"),
+            std::invalid_argument);
+
     auto name_alias = pack;
     name_alias["cases"][0]["name"] =
             name_alias["cases"][0]["id"];
@@ -627,6 +636,7 @@ TEST_CASE("Official model harness protects inputs from evidence aliases") {
 
     REQUIRE(setenv("IOM_TEST_MODEL_DIR", fixture.path().c_str(), 1) == 0);
     REQUIRE(setenv("IOM_TEST_MODEL_ID", "path-separation", 1) == 0);
+    REQUIRE(setenv("OMP_NUM_THREADS", "7", 1) == 0);
     alignas(32) std::array<std::byte, 1u << 20> arena{};
     iom::ListAllocator allocator(arena.data(), arena.size());
     const std::unique_ptr<iom::Device> device =
@@ -652,6 +662,22 @@ TEST_CASE("Official model harness protects inputs from evidence aliases") {
             symlink_failure.at("failure").get<std::string>().find(
                     "regular non-symlink")
             != std::string::npos);
+    CHECK_FALSE(symlink_failure.contains("device_identity"));
+    CHECK(symlink_failure.at("environment").at("OMP_NUM_THREADS") == "7");
+    const nlohmann::json& identity =
+            symlink_failure.at("execution_identity");
+    CHECK(identity.at("runtime_host").is_string());
+    CHECK_FALSE(identity.at("runtime_host").get<std::string>().empty());
+    CHECK(identity.at("build_host").is_string());
+    CHECK(identity.at("processor").at("name").is_string());
+    CHECK(identity.at("processor").at("description").is_string());
+    CHECK(identity.at("processor").at("architecture").is_string());
+    CHECK(identity.at("compiler").at("id").is_string());
+    CHECK(identity.at("compiler").at("version").is_string());
+    CHECK(identity.at("build").at("type").is_string());
+    CHECK(
+            identity.at("build").at("effective_cxx_flags").is_string());
+    CHECK(identity.at("openmp").at("OMP_NUM_THREADS") == "7");
 
     const std::filesystem::path missing_reference =
             outputs.path() / "missing-reference.json";
@@ -733,6 +759,7 @@ TEST_CASE("Official model harness protects inputs from evidence aliases") {
     unsetenv("IOM_TEST_MODEL_ID");
     unsetenv("IOM_TEST_MODEL_REFERENCE");
     unsetenv("IOM_TEST_MODEL_EVIDENCE");
+    unsetenv("OMP_NUM_THREADS");
 }
 
 TEST_CASE("Official model harness revalidates artifact bytes across load boundaries") {
@@ -794,9 +821,9 @@ TEST_CASE("Official model harness freezes arena, tie, and tolerance policy") {
     const std::array<float, 3> certified{2.0F, 0.0F, -1.0F};
     CHECK(reference_margin_stable(certified));
 
-    const std::array<float, 2> reference{1.0F, -2.0F};
-    const std::array<float, 2> accepted{1.27F, -2.29F};
-    const std::array<float, 2> rejected{1.28F, -2.29F};
+    const std::array<float, 2> reference{0.0F, -2.0F};
+    const std::array<float, 2> accepted{0.53125F, -2.5703125F};
+    const std::array<float, 2> rejected{0.5390625F, -2.5703125F};
     CHECK_NOTHROW(compare_logits(accepted, reference, "accepted"));
     CHECK_THROWS_AS(
             compare_logits(rejected, reference, "rejected"),

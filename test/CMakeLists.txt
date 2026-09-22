@@ -136,6 +136,18 @@ add_test(
             "${CMAKE_CURRENT_SOURCE_DIR}/model/test_run_official_inference.py"
 )
 set_tests_properties(iom_official_wrapper_tests PROPERTIES TIMEOUT 30)
+add_test(
+        NAME iom_official_wrapper_timeout_tests
+        COMMAND
+            "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
+            "${IOM_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/model/test_run_official_inference.py"
+            "WrapperRegressionTest.test_registered_timeout_reaps_child_and_publishes_evidence"
+            "WrapperRegressionTest.test_registered_timeout_drains_residual_process_group"
+)
+set_tests_properties(
+        iom_official_wrapper_timeout_tests PROPERTIES TIMEOUT 10
+)
 
 add_executable(iom_cpu_tests
         cpu/test_cpu.cpp
@@ -397,6 +409,14 @@ if(SYCL_ENABLED)
 endif()
 
 
+# CPU-only official TinyLlama inference evidence. This remains independent of
+# IOM_TEST_REAL_MODEL_LOADING and is absent from ordinary CTest unless callers
+# explicitly provide and enable the verified official artifacts.
+option(IOM_TEST_REAL_MODEL_INFERENCE_CPU
+    "Compile and register the opt-in official TinyLlama inference case for CPU"
+    OFF
+)
+
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
         backend/backend_conformance_sdpa.hpp
@@ -416,7 +436,14 @@ target_link_libraries(iom_backend_conformance_cpu_tests
         libiom
 )
 
-add_test(NAME iom_backend_conformance_cpu_tests COMMAND iom_backend_conformance_cpu_tests)
+# The official case is compiled into this binary only for the opt-in wrapper,
+# but the ordinary aggregate registration must never bypass that wrapper's
+# artifact validation, digest recomputation, or process supervision.
+add_test(
+        NAME iom_backend_conformance_cpu_tests
+        COMMAND iom_backend_conformance_cpu_tests
+                "--test-case-exclude=CPU real model inference"
+)
 
 # The CPU conformance executable is created directly rather than through
 # `add_iom_backend_tests`, so the opt-in real-checkpoint loading case is enabled
@@ -425,6 +452,56 @@ if(IOM_TEST_REAL_MODEL_LOADING)
     target_compile_definitions(iom_backend_conformance_cpu_tests
         PRIVATE
             IOM_TEST_REAL_MODEL_LOADING=1
+    )
+endif()
+
+if(IOM_TEST_REAL_MODEL_INFERENCE_CPU)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    cmake_host_system_information(
+        RESULT IOM_OFFICIAL_BUILD_HOST QUERY HOSTNAME
+    )
+    cmake_host_system_information(
+        RESULT IOM_OFFICIAL_PROCESSOR_NAME QUERY PROCESSOR_NAME
+    )
+    cmake_host_system_information(
+        RESULT IOM_OFFICIAL_PROCESSOR_DESCRIPTION QUERY PROCESSOR_DESCRIPTION
+    )
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" IOM_OFFICIAL_BUILD_TYPE_UPPER)
+    set(IOM_OFFICIAL_CONFIG_FLAGS_VARIABLE
+        "CMAKE_CXX_FLAGS_${IOM_OFFICIAL_BUILD_TYPE_UPPER}"
+    )
+    set(IOM_OFFICIAL_EFFECTIVE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS} ${${IOM_OFFICIAL_CONFIG_FLAGS_VARIABLE}}"
+    )
+    string(STRIP
+        "${IOM_OFFICIAL_EFFECTIVE_CXX_FLAGS}"
+        IOM_OFFICIAL_EFFECTIVE_CXX_FLAGS
+    )
+    target_compile_definitions(iom_backend_conformance_cpu_tests
+        PRIVATE
+            IOM_TEST_REAL_MODEL_INFERENCE_CPU=1
+            IOM_OFFICIAL_BUILD_HOST="${IOM_OFFICIAL_BUILD_HOST}"
+            IOM_OFFICIAL_PROCESSOR_NAME="${IOM_OFFICIAL_PROCESSOR_NAME}"
+            IOM_OFFICIAL_PROCESSOR_DESCRIPTION="${IOM_OFFICIAL_PROCESSOR_DESCRIPTION}"
+            IOM_OFFICIAL_SYSTEM_PROCESSOR="${CMAKE_SYSTEM_PROCESSOR}"
+            IOM_OFFICIAL_CXX_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+            IOM_OFFICIAL_CXX_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+            IOM_OFFICIAL_BUILD_TYPE="$<CONFIG>"
+            IOM_OFFICIAL_CXX_FLAGS="${IOM_OFFICIAL_EFFECTIVE_CXX_FLAGS}"
+    )
+    add_test(
+        NAME iom_cpu_real_model_inference_tests
+        COMMAND
+            "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/model/run_official_inference.py"
+            --backend cpu
+            --executable "$<TARGET_FILE:iom_backend_conformance_cpu_tests>"
+    )
+    set_tests_properties(iom_cpu_real_model_inference_tests
+        PROPERTIES
+            LABELS "official-model"
+            TIMEOUT 3900
     )
 endif()
 
