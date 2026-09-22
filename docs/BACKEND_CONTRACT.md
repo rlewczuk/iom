@@ -125,6 +125,8 @@ earlier one already fixes.
     inventory each of them checks.
   - [Opt-in real-checkpoint loading verification](BACKEND_CONTRACT/opt-in-real-checkpoint-loading-verification.md) — the default-off load of
     a caller-supplied official checkpoint on each retained backend.
+- [Opt-in real-model inference harness](BACKEND_CONTRACT/opt-in-real-model-inference.md) — the default-off, caller-supplied
+  official TinyLlama checkpoint/reference-pack harness and its backend-neutral evidence contract.
 - [11. Tokenizer and prompt boundary](BACKEND_CONTRACT/tokenizer-and-prompt-boundary.md) — public owners and APIs,
   authoritative artifacts and tokenizer semantics, formatter metadata and fixed
   grammar, rendering and composition, and the error and reference rules of the

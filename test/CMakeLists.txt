@@ -107,6 +107,7 @@ add_executable(iom_tests
         test_model_reference_fixture.cpp
         test_model_cache_integration.cpp
         test_model_integration.cpp
+        test_model_official_harness.cpp
 )
 set_source_files_properties(test_iom.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -125,6 +126,16 @@ target_compile_definitions(iom_tests
 )
 
 add_test(NAME iom_tests COMMAND iom_tests)
+
+find_program(IOM_PYTHON3_EXECUTABLE NAMES python3 REQUIRED)
+add_test(
+        NAME iom_official_wrapper_tests
+        COMMAND
+            "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
+            "${IOM_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/model/test_run_official_inference.py"
+)
+set_tests_properties(iom_official_wrapper_tests PROPERTIES TIMEOUT 30)
 
 add_executable(iom_cpu_tests
         cpu/test_cpu.cpp
