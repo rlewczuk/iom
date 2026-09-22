@@ -70,8 +70,10 @@ earlier one already fixes.
   - [TinyLlama forward layout — Dtype and numerical policy](BACKEND_CONTRACT/tinyllama-forward-layout-dtype-and-numerical-policy.md) — semantic
     applicability per leaf, SiLU-specific scalar and numerical policy, storage,
     rounding, masking, nonfinite handling, and reference ownership and coverage,
-    including the pinned independent model corpus and
-    `test/test_model_reference_fixture.cpp` acceptance coverage.
+    including the pinned independent model corpus,
+    `test/test_model_reference_fixture.cpp`, and the complete-model checkpoint
+    harness in `test/backend/backend_conformance_model_reference.hpp` consumed by
+    `test/test_model_integration.cpp`.
   - [TinyLlama forward layout — Normalization and MLP boundaries](BACKEND_CONTRACT/tinyllama-forward-layout-normalization-and-mlp-boundaries.md) — the
     frozen RMSNorm, SiLU, and MLP interfaces with their parameters and storage
     rules, and the operation contracts they defer to.
