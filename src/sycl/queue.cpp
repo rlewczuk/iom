@@ -967,13 +967,13 @@ void SyclQueue::complete_task(
                     state_->registry, *outcome.binary_entries,
                     release_failed, fence_succeeded);
             detail::complete_workspace_lease(
-                    *state_, outcome.workspace_lease.entry_id, completion_proven);
+                    *state_, outcome.workspace_lease, completion_proven);
         } else if (outcome.binary_entries.has_value()) {
             (void)detail::release_or_invalidate_binary_entries(
                     state_->registry, *outcome.binary_entries, failed,
                     fence_succeeded);
             detail::complete_workspace_lease(
-                    *state_, outcome.workspace_lease.entry_id, completion_proven);
+                    *state_, outcome.workspace_lease, completion_proven);
         } else if (outcome.cache_append_entries.has_value()) {
             // Cache append is direct and consumes no caller workspace; keep
             // the common owner registrations on the same proof path as the
@@ -982,7 +982,7 @@ void SyclQueue::complete_task(
                     state_->registry, *outcome.cache_append_entries,
                     failed, fence_succeeded);
             detail::complete_workspace_lease(
-                    *state_, outcome.workspace_lease.entry_id, completion_proven);
+                    *state_, outcome.workspace_lease, completion_proven);
         } else if (outcome.rmsnorm_entries.has_value()) {
             // RMS normalization registers the same read/read-deduplicated
             // owner set but consumes no `RawWorkspace`, so only the owner
@@ -1001,7 +1001,7 @@ void SyclQueue::complete_task(
                     state_->registry, *outcome.linear_entries, failed,
                     fence_succeeded);
             detail::complete_workspace_lease(
-                    *state_, outcome.workspace_lease.entry_id, completion_proven);
+                    *state_, outcome.workspace_lease, completion_proven);
         } else if (outcome.rope_entries.has_value()) {
             // RoPE uses the fixed zero-workspace requirement, so only its
             // deduplicated input/output owner registrations are released.
@@ -1023,7 +1023,7 @@ void SyclQueue::complete_task(
                     state_->registry, *outcome.sdpa_entries, failed,
                     fence_succeeded);
             detail::complete_workspace_lease(
-                    *state_, outcome.workspace_lease.entry_id, completion_proven);
+                    *state_, outcome.workspace_lease, completion_proven);
         } else {
             (void)detail::release_or_invalidate_entries(
                     state_->registry, outcome.common, failed,

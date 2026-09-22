@@ -279,16 +279,12 @@ namespace iom {
             std::lock_guard<std::mutex> lock(
                     registry_state_.allocation_mutex);
             retained = detail::workspace_range_retained(
-                    registry_state_.workspace_leases, owner,
-                    {{address, address}, 0, bytes});
+                    registry_state_.workspace_leases, owner, address, bytes);
         }
         if (retained) {
             try {
-                registry_state_.quarantine.emplace<detail::WorkspaceCleanupAction>(
-                        registry_state_, owner,
-                        detail::StorageRange{{address, address}, 0, bytes},
-                        std::make_unique<detail::AllocatorCleanupAction>(
-                                *data_allocator_, address, bytes));
+                registry_state_.quarantine.emplace<detail::AllocatorCleanupAction>(
+                        *data_allocator_, address, bytes);
             } catch (...) {
                 // Keep failed storage unavailable if quarantine allocation
                 // itself fails.

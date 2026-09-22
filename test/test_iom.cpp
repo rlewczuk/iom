@@ -1056,7 +1056,7 @@ public:
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             iom::detail::complete_workspace_lease(
-                    registry_state_, record.workspace_lease.entry_id, true);
+                    registry_state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -1113,7 +1113,7 @@ public:
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             iom::detail::complete_workspace_lease(
-                    registry_state_, record.workspace_lease.entry_id,
+                    registry_state_, record.workspace_lease,
                     !record.retained_failure);
             complete(sequence);
             return;
@@ -1153,7 +1153,7 @@ public:
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             iom::detail::complete_workspace_lease(
-                    registry_state_, record.workspace_lease.entry_id, true);
+                    registry_state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -1182,7 +1182,7 @@ public:
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             iom::detail::complete_workspace_lease(
-                    registry_state_, record.workspace_lease.entry_id, true);
+                    registry_state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -1645,7 +1645,7 @@ public:
                     registry_state_.registry, record.entries,
                     record.retained_failure, !record.retained_failure);
             iom::detail::complete_workspace_lease(
-                    registry_state_, record.workspace_lease.entry_id, true);
+                    registry_state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -1751,7 +1751,7 @@ public:
                     registry_state_.registry, record.entries,
                     record.retained_failure, true);
             iom::detail::complete_workspace_lease(
-                    registry_state_, record.workspace_lease.entry_id, true);
+                    registry_state_, record.workspace_lease, true);
             complete(sequence);
             return;
         }
@@ -3289,6 +3289,9 @@ TEST_CASE("SDPA retains workspace and repeats deferred failures") {
             failed_workspace.view().subrange(0, 32));
     REQUIRE(iom::oid_is_token(failed));
     CHECK(failing.sdpa_records().back().workspace_lease.entry_id != 0);
+    CHECK_EQ(
+            failing.sdpa_records().back().workspace_lease.address,
+            reinterpret_cast<void*>(0x4a00));
     CHECK_EQ(
             failing.registered_at(reinterpret_cast<void*>(0x4a00)),
             std::size_t{1});
@@ -7799,7 +7802,7 @@ TEST_CASE(
     const iom::detail::Fence fence = make_test_fence(&fence_calls);
 
     const iom::detail::WorkspaceLease first = iom::detail::
-            acquire_workspace_lease(state, owner, {{base, base}, 0, 64}, 1, 1, fence);
+            acquire_workspace_lease(state, owner, base, 64, 1, 1, fence);
     CHECK(first.entry_id != 0);
     CHECK_EQ(first.sequence, 1);
     REQUIRE_EQ(state.workspace_leases.leases.size(), 1);
@@ -7809,102 +7812,112 @@ TEST_CASE(
     // rejected acquisitions leave no state behind.
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 64}, 2, 1, fence),
+                    state, owner, base, 64, 2, 1, fence),
             std::bad_alloc);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 32}, 2, 1, fence),
+                    state, owner, base, 32, 2, 1, fence),
             std::bad_alloc);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 32, 32}, 2, 1, fence),
+                    state, owner, static_cast<char*>(base) + 32, 32, 2, 1,
+                    fence),
             std::bad_alloc);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 16, 32}, 2, 1, fence),
+                    state, owner, static_cast<char*>(base) + 16, 32, 2, 1,
+                    fence),
             std::invalid_argument);
     CHECK_EQ(state.workspace_leases.leases.size(), 1);
 
-    // Disjoint aligned ranges coexist, including across owners.
+    // Disjoint aligned subranges of one owner coexist, and another
+    // owner's identical range is independent.
     CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
-            state, owner, {{base, base}, 64, 32}, 2, 1, fence));
+            state, owner, static_cast<char*>(base) + 64, 32, 2, 1, fence));
     CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
-            state, other_owner, {{base, base}, 256, 64}, 3, 1, fence));
+            state, other_owner, static_cast<char*>(base) + 256, 64, 3, 1,
+            fence));
     CHECK_EQ(state.workspace_leases.leases.size(), 3);
 
     // Malformed requests are rejected before any state is touched.
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, nullptr, {{base, base}, 0, 64}, 4, 1, fence),
+                    state, nullptr, base, 64, 4, 1, fence),
             std::invalid_argument);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{}, 0, 64}, 4, 1, fence),
+                    state, owner, nullptr, 64, 4, 1, fence),
             std::invalid_argument);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 0}, 4, 1, fence),
+                    state, owner, base, 0, 4, 1, fence),
             std::invalid_argument);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 1, 64}, 4, 1, fence),
+                    state, owner, static_cast<char*>(base) + 1, 64, 4, 1,
+                    fence),
             std::invalid_argument);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 64}, 0, 1, fence),
+                    state, owner, base, 64, 0, 1, fence),
             std::invalid_argument);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 64}, 4, 0, fence),
+                    state, owner, base, 64, 4, 0, fence),
             std::invalid_argument);
     const iom::detail::Fence empty_fence{};
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 64}, 4, 1, empty_fence),
+                    state, owner, base, 64, 4, 1, empty_fence),
             std::invalid_argument);
     CHECK_EQ(state.workspace_leases.leases.size(), 3);
 
     // A covering completion proof releases the lease and its registry
     // entry, so the range can be leased again.
-    iom::detail::complete_workspace_lease(state, first.entry_id, true);
+    iom::detail::complete_workspace_lease(state, first, true);
     CHECK_EQ(state.workspace_leases.leases.size(), 2);
     CHECK(state.registry.snapshot_for(base).empty());
     const iom::detail::WorkspaceLease reacquired = iom::detail::
-            acquire_workspace_lease(state, owner, {{base, base}, 0, 64}, 5, 1, fence);
+            acquire_workspace_lease(state, owner, base, 64, 5, 1, fence);
     CHECK_EQ(state.workspace_leases.leases.size(), 3);
 
     // Runtime failure alone is not proof: the range is quarantined, its
     // covering entry invalidated, and no overlapping reuse is possible.
-    iom::detail::complete_workspace_lease(state, reacquired.entry_id, false);
+    iom::detail::complete_workspace_lease(state, reacquired, false);
     REQUIRE_EQ(state.registry.snapshot_for(base).size(), 1);
     CHECK(state.registry.snapshot_for(base)[0].state
           == iom::detail::EntryState::Invalidated);
     CHECK_THROWS_AS(
             (void)iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 64}, 6, 1, fence),
+                    state, owner, base, 64, 6, 1, fence),
             std::bad_alloc);
     CHECK_EQ(state.workspace_leases.leases.size(), 3);
 
     // A later covering proof resolves the quarantine.
-    iom::detail::complete_workspace_lease(state, reacquired.entry_id, true);
+    iom::detail::complete_workspace_lease(state, reacquired, true);
     CHECK_EQ(state.workspace_leases.leases.size(), 2);
     CHECK(state.registry.snapshot_for(base).empty());
     CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
-            state, owner, {{base, base}, 0, 64}, 7, 1, fence));
+            state, owner, base, 64, 7, 1, fence));
 
     // The device-side retention query follows the same lifecycle.
     const iom::detail::WorkspaceLease retained_lease = iom::detail::
             acquire_workspace_lease(
-                    state, owner, {{base, base}, 128, 64}, 8, 1, fence);
+                    state, owner, static_cast<char*>(base) + 128, 64, 8, 1,
+                    fence);
     CHECK(iom::detail::workspace_range_retained(
-            state.workspace_leases, owner, {{base, base}, 128, 64}));
+            state.workspace_leases, owner,
+            static_cast<char*>(base) + 128, 64));
     CHECK_FALSE(iom::detail::workspace_range_retained(
-            state.workspace_leases, owner, {{base, base}, 192, 64}));
+            state.workspace_leases, owner,
+            static_cast<char*>(base) + 192, 64));
     CHECK_FALSE(iom::detail::workspace_range_retained(
-            state.workspace_leases, other_owner, {{base, base}, 128, 64}));
-    iom::detail::complete_workspace_lease(state, retained_lease.entry_id, true);
+            state.workspace_leases, other_owner,
+            static_cast<char*>(base) + 128, 64));
+    iom::detail::complete_workspace_lease(state, retained_lease, true);
     CHECK_FALSE(iom::detail::workspace_range_retained(
-            state.workspace_leases, owner, {{base, base}, 128, 64}));
+            state.workspace_leases, owner,
+            static_cast<char*>(base) + 128, 64));
 }
 
 TEST_CASE(
@@ -7917,10 +7930,10 @@ TEST_CASE(
 
     iom_test::arm_counting();
     const iom::detail::WorkspaceLease probe = iom::detail::
-            acquire_workspace_lease(state, owner, {{base, base}, 0, 64}, 1, 1, fence);
+            acquire_workspace_lease(state, owner, base, 64, 1, 1, fence);
     const std::size_t allocation_count = iom_test::disarm();
     REQUIRE(allocation_count > 0);
-    iom::detail::complete_workspace_lease(state, probe.entry_id, true);
+    iom::detail::complete_workspace_lease(state, probe, true);
 
     for (std::size_t ordinal = 1; ordinal <= allocation_count; ++ordinal) {
         iom_test::arm_failure(ordinal);
@@ -7929,7 +7942,7 @@ TEST_CASE(
         iom::detail::WorkspaceLease attempt;
         try {
             attempt = iom::detail::acquire_workspace_lease(
-                    state, owner, {{base, base}, 0, 64}, 2, 1, fence);
+                    state, owner, base, 64, 2, 1, fence);
             succeeded = true;
         } catch (const std::bad_alloc&) {
             threw_bad_alloc = true;
@@ -7939,7 +7952,7 @@ TEST_CASE(
             // The injected failure landed outside this transaction
             // (allocation counts shifted with registry growth); release
             // the lease so the loop keeps its precondition.
-            iom::detail::complete_workspace_lease(state, attempt.entry_id, true);
+            iom::detail::complete_workspace_lease(state, attempt, true);
             continue;
         }
         CHECK(threw_bad_alloc);
@@ -7950,306 +7963,5 @@ TEST_CASE(
 
     // A clean acquisition still succeeds after every rolled-back attempt.
     CHECK_NOTHROW((void)iom::detail::acquire_workspace_lease(
-            state, owner, {{base, base}, 0, 64}, 3, 1, fence));
-}
-
-namespace {
-
-struct OpaqueDescriptor {
-    void* backing;
-};
-
-class OpaqueTensor final : public iom::Tensor {
-public:
-    OpaqueTensor(
-            iom::Device& device, std::vector<std::size_t> dimensions,
-            OpaqueDescriptor& descriptor,
-            iom::DataType type = iom::DataType::BF16)
-            : Tensor(make_spec(std::move(dimensions), type), device),
-              descriptor_(descriptor) {}
-
-private:
-    iom::WorkspaceRequirements host_transfer_workspace_requirements(
-            std::size_t) const override { return {0, 1}; }
-    void* storage_handle() noexcept override { return &descriptor_; }
-    iom::detail::StorageIdentity storage_identity() const noexcept override {
-        return {descriptor_.backing, nullptr};
-    }
-    void region_from_host(
-            const iom::TensorView&, std::span<const std::byte>,
-            iom::RawWorkspaceView) override {
-        throw std::logic_error("descriptor-only fixture cannot transfer");
-    }
-    void region_to_host(
-            const iom::TensorView&, std::span<std::byte>,
-            iom::RawWorkspaceView) const override {
-        throw std::logic_error("descriptor-only fixture cannot transfer");
-    }
-    OpaqueDescriptor& descriptor_;
-};
-
-class OpaqueWorkspace final : public iom::RawWorkspace {
-public:
-    OpaqueWorkspace(iom::Device& device, void* backing, std::size_t bytes)
-            : RawWorkspace(device, bytes), backing_(backing) {}
-private:
-    iom::detail::StorageIdentity storage_identity() const noexcept override {
-        return {backing_, nullptr};
-    }
-    void* backing_;
-};
-
-struct OpaqueBacking {
-    int& destructions;
-    ~OpaqueBacking() { ++destructions; }
-};
-
-class OpaqueBackingCleanup final : public iom::detail::CleanupAction {
-public:
-    explicit OpaqueBackingCleanup(std::unique_ptr<OpaqueBacking> backing)
-            : backing_(std::move(backing)) {}
-    void run() noexcept override { backing_.reset(); }
-    bool failed() const noexcept override { return false; }
-    std::exception_ptr failure() const noexcept override { return nullptr; }
-private:
-    std::unique_ptr<OpaqueBacking> backing_;
-};
-
-iom::detail::Fence controlled_workspace_fence(bool& proven) {
-    iom::detail::Fence fence;
-    bool* pointer = &proven;
-    std::memcpy(fence.storage, &pointer, sizeof(pointer));
-    fence.invoke = [](const iom::detail::Fence& value) noexcept {
-        bool* proof;
-        std::memcpy(&proof, value.storage, sizeof(proof));
-        return *proof ? iom::detail::FenceResult::success()
-                      : iom::detail::FenceResult::pending();
-    };
-    return fence;
-}
-
-}  // namespace
-
-TEST_CASE("Opaque descriptors use canonical backing rather than nearby handles") {
-    FakeDevice device;
-    FakeQueue queue(device);
-    // Small real descriptors are adjacent, far closer than one tiled payload.
-    std::array<char, 3> keys{};
-    std::array<OpaqueDescriptor, 4> descriptors{{
-            {&keys[0]}, {&keys[1]}, {&keys[2]}, {&keys[0]}}};
-    OpaqueTensor x(device, {16, 16}, descriptors[0]);
-    OpaqueTensor ids(device, {1, 16}, descriptors[1], iom::DataType::U32);
-    OpaqueTensor y(device, {16, 16}, descriptors[2]);
-    OpaqueTensor shared(device, {16, 16}, descriptors[3]);
-    const auto invalid = iom::to_oid(iom::OidError::InvalidArgument);
-
-    const auto embedding = queue.embedding(x.view(), ids.view(), y.view());
-    REQUIRE(iom::oid_is_token(embedding));
-    queue.finish_embedding(token_sequence(embedding));
-    CHECK_EQ(queue.embedding(x.view(), ids.view(), shared.view()), invalid);
-    const auto silu = queue.silu(x.view(), y.view());
-    REQUIRE(iom::oid_is_token(silu));
-    queue.finish_silu(token_sequence(silu));
-    CHECK_EQ(queue.silu(x.view(), shared.view()), invalid);
-    const auto linear = queue.linear(
-            x.view(), x.view(), y.view(), 0, 16,
-            iom::LinearOutputLayout::ordinary, 1, 16);
-    REQUIRE(iom::oid_is_token(linear));
-    queue.finish_linear(token_sequence(linear));
-    CHECK_EQ(queue.linear(
-            x.view(), x.view(), shared.view(), 0, 16,
-            iom::LinearOutputLayout::ordinary, 1, 16), invalid);
-
-    OpaqueTensor q(device, {1, 1, 16, 16}, descriptors[0]);
-    OpaqueTensor out(device, {1, 1, 16, 16}, descriptors[2]);
-    OpaqueTensor alias(device, {1, 1, 16, 16}, descriptors[3]);
-    RopeQueue rope(device);
-    const auto rotated = rope.rope(q.view(), out.view(), 0, 1.0);
-    REQUIRE(iom::oid_is_token(rotated));
-    rope.finish(token_sequence(rotated));
-    CHECK_EQ(rope.rope(q.view(), alias.view(), 0, 1.0), invalid);
-    auto destination = out.view().select(0, 0);
-    auto shared_destination = alias.view().select(0, 0);
-    const auto attention = queue.sdpa(
-            q.view(), q.view(), q.view(), destination, 0, 16);
-    REQUIRE(iom::oid_is_token(attention));
-    queue.finish_sdpa(token_sequence(attention));
-    CHECK_EQ(queue.sdpa(
-            q.view(), q.view(), q.view(), shared_destination, 0, 16), invalid);
-
-    CacheAppendQueue cache(device);
-    const auto source = q.view().select(0, 0);
-    const auto appended = cache.cache_append(source, destination, 0);
-    REQUIRE(iom::oid_is_token(appended));
-    cache.finish(token_sequence(appended));
-    CHECK_EQ(cache.cache_append(source, shared_destination, 0), invalid);
-
-    // Structural invalid input still precedes capability and consumes no OID.
-    OpaqueDescriptor no_key{nullptr};
-    OpaqueTensor invalid_owner(device, {16, 16}, no_key);
-    CHECK_EQ(queue.silu(invalid_owner.view(), y.view()), invalid);
-}
-
-TEST_CASE("Opaque backing preserves binary RMSNorm and zero workspace policies") {
-    FakeDevice device;
-    FakeDevice foreign;
-    FakeQueue queue(device);
-    char key;
-    std::array<OpaqueDescriptor, 3> descriptors{{{&key}, {&key}, {&key}}};
-    OpaqueTensor x(device, {16, 16}, descriptors[0]);
-    OpaqueTensor other_wrapper(device, {16, 16}, descriptors[1]);
-    OpaqueTensor scale(device, {1, 16}, descriptors[2]);
-    // Binary and RMSNorm have owner-based policies, not the conservative
-    // whole-backing rejection used by embedding, linear, and the unary ops.
-    const auto binary = queue.add(x.view(), x.view(), other_wrapper.view());
-    REQUIRE(iom::oid_is_token(binary));
-    queue.finish_add(token_sequence(binary));
-    const auto rms = queue.rmsnorm(
-            x.view(), scale.view(), other_wrapper.view(), 1e-6F);
-    REQUIRE(iom::oid_is_token(rms));
-    queue.finish_rmsnorm(token_sequence(rms));
-    CHECK_EQ(queue.rmsnorm(x.view(), scale.view(), x.view(), 1e-6F),
-             iom::to_oid(iom::OidError::InvalidArgument));
-
-    OpaqueWorkspace unused(foreign, nullptr, 0);
-    const auto generic = queue.add(
-            x.view(), x.view(), other_wrapper.view(), unused.view());
-    REQUIRE(iom::oid_is_token(generic));
-    queue.finish_add(token_sequence(generic));
-    const auto invalid = iom::to_oid(iom::OidError::InvalidArgument);
-    CHECK_EQ(queue.rmsnorm(x.view(), scale.view(), other_wrapper.view(),
-                          1e-6F, unused.view()), invalid);
-    UnportedQueue unsupported(device);
-    CHECK_EQ(unsupported.rmsnorm(x.view(), scale.view(), other_wrapper.view(),
-                                1e-6F, unused.view()),
-             iom::to_oid(iom::OidError::Unsupported));
-
-    char second_key;
-    OpaqueDescriptor second{&second_key};
-    OpaqueTensor rope_x(device, {1, 1, 16, 16}, descriptors[0]);
-    OpaqueTensor rope_y(device, {1, 1, 16, 16}, second);
-    RopeQueue rope(device);
-    CHECK_EQ(rope.rope(rope_x.view(), rope_y.view(), 0, 1.0, unused.view()),
-             invalid);
-    CHECK_EQ(unsupported.rope(
-            rope_x.view(), rope_y.view(), 0, 1.0, unused.view()),
-            iom::to_oid(iom::OidError::Unsupported));
-}
-
-TEST_CASE("Opaque workspace validates logical slices before prepared admission") {
-    FakeDevice device;
-    FakeDevice foreign;
-    FakeQueue queue(device);
-    queue.set_embedding_requirements({32, 32});
-    std::array<char, 4> keys{};
-    std::array<OpaqueDescriptor, 3> descriptors{{
-            {&keys[0]}, {&keys[1]}, {&keys[2]}}};
-    OpaqueTensor table(device, {16, 16}, descriptors[0]);
-    OpaqueTensor ids(device, {1, 16}, descriptors[1], iom::DataType::U32);
-    OpaqueTensor out(device, {16, 16}, descriptors[2]);
-    // In particular, an opaque key need not meet any byte alignment.
-    OpaqueWorkspace workspace(device, &keys[3], 64);
-    OpaqueWorkspace overlapping(device, &keys[0], 64);
-    OpaqueWorkspace small(device, &keys[3], 16);
-    OpaqueWorkspace foreign_workspace(foreign, &keys[3], 64);
-    const auto invalid = iom::to_oid(iom::OidError::InvalidArgument);
-    const auto submit = [&](const iom::RawWorkspaceView& view) {
-        return queue.embedding(table.view(), ids.view(), out.view(), view);
-    };
-    CHECK_EQ(submit(overlapping.view()), invalid);
-    CHECK_EQ(submit(small.view()), invalid);
-    CHECK_EQ(submit(foreign_workspace.view()), invalid);
-    const auto dead = [&] {
-        OpaqueWorkspace owner(device, &keys[3], 64);
-        return owner.view();
-    }();
-    CHECK_EQ(submit(dead), invalid);
-    CHECK_THROWS_AS(workspace.view().subrange(1, 32), std::invalid_argument);
-    CHECK_THROWS_AS(workspace.view().subrange(64, 1), std::out_of_range);
-    CHECK_THROWS_AS((void)iom::detail::WorkspaceValidation::validated(
-            device, workspace.view().subrange(32, 32), 32, 64, {}),
-            std::invalid_argument);
-    const auto first = submit(workspace.view().subrange(0, 32));
-    const auto second = submit(workspace.view().subrange(32, 32));
-    REQUIRE(iom::oid_is_token(first));
-    REQUIRE(iom::oid_is_token(second));
-    CHECK_EQ(submit(workspace.view().subrange(0, 32)),
-             iom::to_oid(iom::OidError::ResourceExhausted));
-    queue.finish_embedding(token_sequence(second));
-    const auto reused = submit(workspace.view().subrange(32, 32));
-    REQUIRE(iom::oid_is_token(reused));
-    queue.finish_embedding(token_sequence(first));
-    queue.finish_embedding(token_sequence(reused));
-    CHECK_NOTHROW(queue.wait(reused));
-}
-
-TEST_CASE("Opaque adjacent slices retire by EntryId and retain unknown backing") {
-    for (const bool right_first : {false, true}) {
-        FakeDevice device;
-        iom::detail::RegistryState state;
-        int destructions = 0;
-        auto backing = std::make_unique<OpaqueBacking>(destructions);
-        void* key = backing.get();
-        auto owner = std::make_unique<OpaqueWorkspace>(device, key, 64);
-        OpaqueWorkspace wrapper(device, key, 128);
-        const void* owner_identity = owner.get();
-        const auto full = iom::detail::WorkspaceValidation::range(owner->view());
-        const auto left = iom::detail::WorkspaceValidation::range(
-                owner->view().subrange(0, 32));
-        const auto right = iom::detail::WorkspaceValidation::range(
-                owner->view().subrange(32, 32));
-        bool left_proof = false;
-        bool right_proof = false;
-        const auto left_fence = controlled_workspace_fence(left_proof);
-        const auto right_fence = controlled_workspace_fence(right_proof);
-        const auto a = iom::detail::acquire_workspace_lease(
-                state, owner_identity, left, 1, 1, left_fence);
-        const auto b = iom::detail::acquire_workspace_lease(
-                state, owner_identity, right, 2, 1, right_fence);
-        const auto proven = right_first ? b : a;
-        const auto unknown = right_first ? a : b;
-        auto& proof = right_first ? right_proof : left_proof;
-        const auto& fence = right_first ? right_fence : left_fence;
-        proof = true;
-        iom::detail::complete_workspace_lease(
-                state, proven.entry_id, fence().succeeded);
-        // Shared wrappers have no common offset origin; even an apparently
-        // disjoint offset in another wrapper must not bypass the unknown lease.
-        CHECK_THROWS_AS((void)iom::detail::acquire_workspace_lease(
-                state, &wrapper, iom::detail::WorkspaceValidation::range(
-                        wrapper.view().subrange(96, 32)), 3, 1, fence),
-                std::bad_alloc);
-        const auto reused = iom::detail::acquire_workspace_lease(
-                state, owner_identity, proven.range, 3, 1, fence);
-        // A stale completion cannot remove a new acquisition of the same slice.
-        iom::detail::complete_workspace_lease(state, proven.entry_id, true);
-        iom::detail::complete_workspace_lease(state, proven.entry_id, false);
-        CHECK_THROWS_AS((void)iom::detail::acquire_workspace_lease(
-                state, owner_identity, proven.range, 4, 1, fence), std::bad_alloc);
-        iom::detail::complete_workspace_lease(state, unknown.entry_id, false);
-        iom::detail::complete_workspace_lease(state, reused.entry_id, true);
-        const auto reused_again = iom::detail::acquire_workspace_lease(
-                state, owner_identity, proven.range, 5, 1, fence);
-        iom::detail::complete_workspace_lease(state, reused_again.entry_id, true);
-        CHECK_THROWS_AS((void)iom::detail::acquire_workspace_lease(
-                state, owner_identity, unknown.range, 6, 1, fence), std::bad_alloc);
-
-        state.quarantine.emplace<iom::detail::WorkspaceCleanupAction>(
-                state, owner_identity, full,
-                std::make_unique<OpaqueBackingCleanup>(std::move(backing)));
-        owner.reset();
-        state.quarantine.drain();
-        CHECK_EQ(destructions, 0);
-        // Invalidating one EntryId leaves its sibling's proof and release
-        // independent. Only a later covering proof permits native destruction.
-        auto& later_proof = right_first ? left_proof : right_proof;
-        const auto& later_fence = right_first ? left_fence : right_fence;
-        later_proof = true;
-        iom::detail::complete_workspace_lease(
-                state, unknown.entry_id, later_fence().succeeded);
-        state.quarantine.drain();
-        CHECK_EQ(destructions, 1);
-        state.quarantine.drain();
-        CHECK_EQ(destructions, 1);
-    }
+            state, owner, base, 64, 3, 1, fence));
 }

@@ -299,11 +299,6 @@ namespace iom {
             : device_(&device),
               full_view_(*this, spec, 0, validated_dense_plane_strides(spec)) {}
 
-    detail::StorageIdentity Tensor::storage_identity() const noexcept {
-        void* const base = const_cast<Tensor*>(this)->storage_handle();
-        return {base, base};
-    }
-
     TensorView& Tensor::view() noexcept {
         return full_view_;
     }

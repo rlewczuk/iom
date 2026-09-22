@@ -70,7 +70,7 @@ void validate_history(std::span<const std::size_t> history) {
 
 void validate_host_scratch(
         std::span<std::byte> host, std::size_t required_bytes,
-        const TensorView& logits, const detail::CheckedViewFacts& facts) {
+        const TensorView& logits, std::size_t owner_storage_bytes) {
     if (host.size() < required_bytes) {
         throw std::invalid_argument(
                 "greedy token selection host scratch is too small");
@@ -87,13 +87,28 @@ void validate_host_scratch(
     }
     if (host.empty()) return;
 
-    const auto host_range = detail::checked_storage_range(
-            {host.data(), host.data()}, 0, host.size(),
-            "greedy token selection scratch range overflows");
-    const auto owner_range = detail::checked_storage_range(
-            facts.backing, 0, facts.storage_bytes,
-            "greedy token selection scratch range overflows");
-    if (detail::storage_ranges_overlap(host_range, owner_range)) {
+    const std::uintptr_t host_begin =
+            reinterpret_cast<std::uintptr_t>(host.data());
+    const std::uintptr_t owner_begin =
+            reinterpret_cast<std::uintptr_t>(owner_handle);
+    const std::uintptr_t address_limit =
+            std::numeric_limits<std::uintptr_t>::max();
+    if (host.size() > address_limit
+            || owner_storage_bytes > address_limit) {
+        throw std::overflow_error(
+                "greedy token selection scratch range overflows");
+    }
+    const std::uintptr_t host_size = static_cast<std::uintptr_t>(host.size());
+    const std::uintptr_t owner_size =
+            static_cast<std::uintptr_t>(owner_storage_bytes);
+    if (host_size > address_limit - host_begin
+            || owner_size > address_limit - owner_begin) {
+        throw std::overflow_error(
+                "greedy token selection scratch range overflows");
+    }
+    const std::uintptr_t host_end = host_begin + host_size;
+    const std::uintptr_t owner_end = owner_begin + owner_size;
+    if (host_begin < owner_end && owner_begin < host_end) {
         throw std::invalid_argument(
                 "greedy token selection host scratch overlaps logits");
     }
@@ -196,7 +211,7 @@ std::size_t GreedyTokenSelector::select(
                 "greedy token selection logits have inconsistent byte extent");
     }
     validate_host_scratch(
-            scratch.host, host_bytes, logits, facts);
+            scratch.host, host_bytes, logits, facts.storage_bytes);
     validate_device_scratch(
             *queue_device, logits, scratch.device, device_requirements);
 
