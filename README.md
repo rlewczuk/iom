@@ -136,14 +136,14 @@ return status 0.
 ### Session input and request boundaries
 
 `--prompt` is the raw-input path: the value is passed directly to the
-session-owned tokenizer and bypasses chat formatting. Repeated
-`--message ROLE CONTENT` values are ordered structured input: the session
-renders them with the selected chat template, appends its generation prompt,
-and then passes the rendered bytes to the tokenizer. At the formatter
-boundary, an engaged template override is authoritative, even when it is
-empty or invalid; it never falls back to `chat_template`. With no engaged
-override, the model's configured `tokenizer_config.json` `chat_template` is
-selected.
+session-owned tokenizer with its automatic special-token policy and bypasses
+chat formatting. Repeated `--message ROLE CONTENT` values are ordered
+structured input: the session renders them with the selected chat template,
+appends its generation prompt, and tokenizes those complete rendered bytes
+without inserting an automatic BOS. At the formatter boundary, an engaged
+template override is authoritative, even when it is empty or invalid; it
+never falls back to `chat_template`. With no engaged override, the model's
+configured `tokenizer_config.json` `chat_template` is selected.
 
 The session owns the model, tokenizer, formatter, selector, KV/cache storage,
 and request storage. Final-logit selection is synchronous: the queue, the
@@ -303,6 +303,27 @@ exits with status 0 and writes only generated text to stdout; wording may vary.
 Diagnostics go to stderr. Usage/input errors exit 2, setup/load errors exit 3,
 and execution errors exit 4. These fixed paths and settings describe only the
 configured `bv1` example and are not library or CLI defaults.
+### SYCL TinyLlama sample
+
+The SYCL sample targets the configured `bv2` host and requires the Intel
+oneAPI environment plus a Level Zero GPU; it does not assume SYCL hardware on
+`bv1`. From the repository root, use an isolated oneAPI setup subshell for
+the device probe, then run the scripts; each script initializes oneAPI for its
+own process:
+
+```sh
+( set +u; source /opt/intel/oneapi/setvars.sh >/tmp/iom-sample-sycl-setvars.log 2>&1 && sycl-ls )
+./samples/build-sycl.sh
+./samples/run-sycl.sh
+```
+
+The build enables only SYCL and produces `iom_generate` in `build-sycl`. The
+run uses `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`, device `0`, a 4 GiB
+tensor arena, and 16 new tokens. It submits `What is the capital of Poland ?`
+as a `user` message so the model receives its official chat formatting without
+changing the CLI's raw-prompt behavior. On success, stdout contains only the
+generated text and the process exits `0`; setup, model, and execution
+diagnostics remain on stderr with the CLI's documented nonzero status classes.
 
 ## Elementwise operation contract
 
