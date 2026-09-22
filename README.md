@@ -160,6 +160,40 @@ trace report never adds a wait. `--trace` is independent of `--metrics`, and
 trace alone emits no metrics summary. With no observation option, no recorder
 or trace storage is created.
 
+### Optional scalar metrics
+
+Pass the value-free `--metrics` option to print one bounded scalar report on
+stderr. The generated text remains the only stdout payload and is byte-for-byte
+unchanged, including its lack of a trailing newline:
+
+```text
+iom_generate --model-dir ./tinyllama --backend cpu --device 0 \
+  --max-new-tokens 32 --prompt "Write one sentence." --metrics
+```
+
+The report includes explicit `ns` units for load, encode/tokenization, the
+completion-observed prefill and decode phases, and each phase's host-enqueue
+sum. It also reports prompt, generated, decode-forward, and decode-token
+counts; TTFT; the decode-throughput numerator, denominator, and tokens/second;
+and the observed request status and stop reason. A phase that did not run, a
+zero-token or zero-denominator result, an incomplete or failed rate, and TTFT
+without a committed token are printed as `unavailable`. Current CPU, CUDA,
+ROCm, and SYCL configurations have no genuine native device timer, so
+`device_time=unavailable` is always explicit. Host enqueue and completion
+spans MUST NOT be read as kernel or device time, and no throughput floor is
+implied.
+
+The load interval excludes outer device/allocator setup and caller selector
+construction. Encode/tokenization covers only the tokenizer's encode call:
+chat rendering and output decoding are outside it. Prefill and decode complete
+at the existing final-logits readiness waits, while host enqueue is the sum of
+the individual facade-call intervals, including blocking inside those calls.
+The report does not prepare operation-trace storage, add a wait, or change the
+existing stop behavior and exit statuses. Duplicate or value-bearing forms of
+`--metrics` remain usage errors (status 2); setup/load and execution failures
+retain their existing status and primary diagnostic while the report exposes
+only observations actually collected.
+
 ## Elementwise operation contract
 
 `DeviceOps` exposes four exact three-view asynchronous facades:

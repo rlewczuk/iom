@@ -136,6 +136,9 @@ earlier one already fixes.
   - The [CLI operation trace presentation](BACKEND_CONTRACT/inference-timing-and-observation.md#cli-operation-trace-presentation)
     subsection fixes the opt-in stderr fields, stream and setup boundaries,
     retained-wait semantics, and unavailable device timing.
+  - [CLI metric presentation](BACKEND_CONTRACT/inference-timing-and-observation.md#cli-metric-presentation) —
+    the stderr-only scalar report, unavailable-value rules, lifetime and
+    timing-boundary obligations, and explicit absence of native device timing.
 
 ### Part III — Operation contracts
 
