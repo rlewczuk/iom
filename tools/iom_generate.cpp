@@ -78,6 +78,7 @@ struct Arguments {
     bool has_device = false;
     bool has_max_new_tokens = false;
     bool has_tensor_arena_bytes = false;
+    bool trace = false;
     std::optional<std::string> prompt;
     std::vector<ParsedMessage> messages;
 };
@@ -164,6 +165,11 @@ struct Arguments {
             arguments.tensor_arena_bytes = parse_size(
                     next_value(argc, argv, index, option), option);
             arguments.has_tensor_arena_bytes = true;
+        } else if (option == "--trace") {
+            if (arguments.trace) {
+                usage_error("duplicate --trace");
+            }
+            arguments.trace = true;
         } else if (option == "--prompt") {
             if (arguments.prompt.has_value()) {
                 usage_error("duplicate --prompt");
@@ -258,16 +264,107 @@ void report_exception(std::string_view category, const std::exception& error) {
     report(category, error.what());
 }
 
+[[nodiscard]] const char* trace_phase_name(
+        iom::InferencePhase phase) noexcept {
+    switch (phase) {
+    case iom::InferencePhase::load:
+        return "load";
+    case iom::InferencePhase::tokenization:
+        return "tokenization";
+    case iom::InferencePhase::prefill:
+        return "prefill";
+    case iom::InferencePhase::decode:
+        return "decode";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] const char* trace_wait_state_name(
+        iom::WaitState state) noexcept {
+    switch (state) {
+    case iom::WaitState::not_observed:
+        return "not_observed";
+    case iom::WaitState::succeeded:
+        return "succeeded";
+    case iom::WaitState::failed:
+        return "failed";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] std::uint64_t trace_elapsed(
+        std::uint64_t begin, std::uint64_t end) noexcept {
+    return end >= begin ? end - begin : 0;
+}
+
+// Operation traces are a secondary presentation.  A stream or formatting
+// failure must never replace a primary input, load, or execution result.
+void report_operation_trace(const iom::InferenceMetrics& recorder) noexcept {
+    try {
+        for (const iom::InferenceTraceRecord& operation :
+             recorder.operations()) {
+            std::cerr << "iom_generate: trace"
+                      << " request_ordinal=" << operation.request_ordinal
+                      << " oid=" << operation.operation
+                      << " phase=" << trace_phase_name(operation.phase)
+                      << " layer=";
+            if (operation.decoder_layer.has_value()) {
+                std::cerr << *operation.decoder_layer;
+            } else {
+                std::cerr << "none";
+            }
+            std::cerr << " position_start=" << operation.position_start
+                      << " run_length=" << operation.run_length
+                      << " host_enqueue elapsed_ns="
+                      << trace_elapsed(operation.enqueue_begin_ns,
+                                      operation.enqueue_end_ns);
+            if (operation.wait_observed_ns.has_value()) {
+                std::cerr << " completion_observed elapsed_ns="
+                          << trace_elapsed(operation.enqueue_begin_ns,
+                                          *operation.wait_observed_ns);
+            }
+            std::cerr << " wait state="
+                      << trace_wait_state_name(operation.wait_state)
+                      << " device_time=unavailable\n";
+            if (!std::cerr) break;
+        }
+        std::cerr.flush();
+    } catch (...) {
+        // Trace reporting is deliberately best-effort and never changes the
+        // status or diagnostic selected by the primary operation.
+    }
+}
+
 [[nodiscard]] int execute(const Arguments& arguments) {
     // Declaration order is deliberate: the CPU allocator outlives the device,
     // the device outlives the session, and the session outlives the result.
+    // The optional recorder is declared before the session so its storage and
+    // clock remain alive through ordinary session destruction and its final
+    // queue drain.
     ProcessAllocator cpu_allocator;
+    std::unique_ptr<iom::InferenceMetrics> recorder;
     std::unique_ptr<iom::Device> device;
     std::unique_ptr<iom::TinyLlamaSession> session;
     try {
+        if (arguments.trace) {
+            recorder = std::make_unique<iom::InferenceMetrics>();
+        }
         device = make_device(arguments, cpu_allocator);
-        session = iom::load_tinyllama_session(
-                std::filesystem::path(arguments.model_directory), *device);
+        if (recorder) {
+            session = iom::load_tinyllama_session(
+                    std::filesystem::path(arguments.model_directory), *device,
+                    std::make_unique<iom::GreedyTokenSelector>(),
+                    recorder.get());
+            // Trace storage is reserved only after load succeeds and before
+            // the first generation request.  A failed reservation is setup
+            // failure, never an untraced generation.
+            if (arguments.trace) {
+                session->prepare_operation_trace();
+            }
+        } else {
+            session = iom::load_tinyllama_session(
+                    std::filesystem::path(arguments.model_directory), *device);
+        }
     } catch (const std::exception& error) {
         report_exception("setup/load", error);
         return 3;
@@ -278,6 +375,7 @@ void report_exception(std::string_view category, const std::exception& error) {
 
     std::vector<iom::ChatMessageView> message_views;
     std::optional<iom::GenerationResult> result;
+    int status = 0;
     try {
         if (arguments.prompt.has_value()) {
             result.emplace(session->generate_raw(
@@ -294,30 +392,40 @@ void report_exception(std::string_view category, const std::exception& error) {
         }
     } catch (const std::invalid_argument& error) {
         report_exception("usage/input", error);
-        return 2;
+        status = 2;
     } catch (const std::exception& error) {
         report_exception("execution", error);
-        return 4;
+        status = 4;
     } catch (...) {
         report("execution", "unknown generation failure");
-        return 4;
+        status = 4;
     }
 
-    try {
-        std::cout.write(result->text.data(),
-                        static_cast<std::streamsize>(result->text.size()));
-        std::cout.flush();
-        if (!std::cout) {
-            throw std::runtime_error("decoded output write failed");
+    if (status == 0) {
+        try {
+            std::cout.write(result->text.data(),
+                            static_cast<std::streamsize>(result->text.size()));
+            std::cout.flush();
+            if (!std::cout) {
+                throw std::runtime_error("decoded output write failed");
+            }
+        } catch (const std::exception& error) {
+            report_exception("execution", error);
+            status = 4;
+        } catch (...) {
+            report("execution", "unknown output failure");
+            status = 4;
         }
-    } catch (const std::exception& error) {
-        report_exception("execution", error);
-        return 4;
-    } catch (...) {
-        report("execution", "unknown output failure");
-        return 4;
     }
-    return 0;
+
+    // Release the session explicitly before reporting.  Its normal destructor
+    // performs the existing final drain, which is allowed to complete pending
+    // trace rows; the report itself never waits.
+    session.reset();
+    if (arguments.trace && recorder) {
+        report_operation_trace(*recorder);
+    }
+    return status;
 }
 
 }  // namespace

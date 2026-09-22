@@ -484,3 +484,37 @@ adapter.
 6. The recorder never labels a host duration as kernel or device time,
    never claims a throughput floor, and never substitutes host or
    elementwise work for unsupported native matrix evidence.
+
+## CLI operation trace presentation
+
+1. The CLI accepts a value-free `--trace` option. It rejects repeated,
+   value-bearing, and unknown forms as usage/input errors (status 2).
+   The option is independent of `--metrics`; trace alone creates exactly one
+   scalar `InferenceMetrics` recorder, prepares its bounded operation table,
+   and emits no metrics summary. When both options are present they share that
+   one recorder and produce their independent presentations.
+2. Trace preparation is performed explicitly after successful instrumented
+   session load and before the first raw or chat generation request. It is
+   outside inference and performs no device work or wait. A reservation or
+   recorder-configuration failure is a setup failure (status 3), leaves
+   tracing disabled, and never falls back to an untraced generation. With no
+   observation option, the CLI creates no recorder or trace storage.
+3. The recorder remains alive through ordinary session destruction. The CLI
+   releases the session before formatting rows so its existing destructor drain
+   can update final wait observations; reporting never adds a wait, poll, or
+   synchronization. Trace formatting is secondary: it cannot replace the
+   primary input, load, or execution status or diagnostic.
+4. Each collected row is emitted on stderr in accepted positive-OID order as a
+   bounded human-readable line containing the request ordinal, positive OID,
+   phase, decoder layer (or `none`), absolute input-position start and run
+   length, `host_enqueue` elapsed nanoseconds, and `device_time=unavailable`.
+   When a wait was actually observed, the line also contains
+   `completion_observed` elapsed host nanoseconds measured from enqueue begin;
+   a pending row has no fabricated completion time. The wait state is exactly
+   `not_observed`, `succeeded`, or `failed`.
+5. The presentation reports only rows currently owned by the recorder.
+   Unknown, rejected, and unregistered OIDs do not receive fabricated
+   identity. A repeated wait retains the first observed success or failure,
+   and a failed wait is reported as a failed observation rather than proof of
+   native completion. Generated stdout bytes, normal stop reasons, primary
+   diagnostics, and statuses 0, 2, 3, and 4 are unchanged.
