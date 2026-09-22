@@ -292,6 +292,10 @@ if(ROCM_ENABLED)
         RUNTIME_LIBRARIES hip::host
         CONFORMANCE_DOCTEST_CONFIG DOCTEST_CONFIG_IMPLEMENT
     )
+    target_compile_definitions(iom_rocm_conformance_tests
+        PRIVATE
+            IOM_MODEL_REFERENCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/model"
+    )
     add_executable(iom_rocm_sdpa_nonmatrix_tests
         rocm/test_rocm_sdpa_nonmatrix.cpp
         backend/backend_conformance_sdpa_reference.hpp

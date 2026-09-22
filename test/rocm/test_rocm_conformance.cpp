@@ -33,7 +33,9 @@
 #include "backend/backend_conformance_rmsnorm.hpp"
 #include "backend/backend_conformance_silu.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
+#include "backend/backend_conformance_model_cache.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_model_reference.hpp"
 #include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 #include "backend/backend_conformance_token_selection.hpp"
@@ -1789,6 +1791,20 @@ TEST_CASE("ROCm model loading realizes every published weight role of each synth
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     iom_conformance::run_model_loading_conformance(devices);
+}
+
+TEST_CASE("ROCm pinned model reference") {
+    const std::unique_ptr<iom::Device> candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    REQUIRE(candidate != nullptr);
+    iom_conformance::run_model_reference_conformance(*candidate);
+}
+
+TEST_CASE("ROCm pinned causal cache") {
+    const std::unique_ptr<iom::Device> candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    REQUIRE(candidate != nullptr);
+    iom_conformance::run_model_cache_reference_conformance(*candidate);
 }
 
 TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and observations") {
