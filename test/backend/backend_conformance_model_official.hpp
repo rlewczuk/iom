@@ -928,23 +928,20 @@ inline std::vector<OfficialCase> validate_reference_pack(
     const auto& runtime = object_member(provenance, "runtime", "official provenance");
     exact_fields(runtime, {"implementation", "version"}, "official provenance.runtime");
     if (string_member(runtime, "implementation", "official provenance.runtime") != "CPython"
-            || string_member(runtime, "version", "official provenance.runtime") != "3.11.16") {
+            || string_member(runtime, "version", "official provenance.runtime") != "3.12.3") {
         throw std::invalid_argument("official provenance runtime pin mismatch");
     }
     const auto& packages = object_member(provenance, "packages", "official provenance");
     const std::array<std::pair<std::string_view, std::string_view>, 7> package_pins{{
-            {"jinja2", "3.1.2"}, {"numpy", "1.26.4"}, {"safetensors", "0.4.1"},
-            {"sentencepiece", "0.1.99"}, {"tokenizers", "0.14.1"},
-            {"torch", "2.1.2"}, {"transformers", "4.35.0"}}};
+            {"jinja2", "3.1.6"}, {"numpy", "1.26.4"}, {"safetensors", "0.4.3"},
+            {"sentencepiece", "0.2.0"}, {"tokenizers", "0.19.1"},
+            {"torch", "2.3.1+cpu"}, {"transformers", "4.41.2"}}};
     if (!packages.is_object() || packages.size() != package_pins.size()) {
         throw std::invalid_argument("official provenance package set mismatch");
     }
     for (const auto [package, version] : package_pins) {
         const std::string actual = string_member(packages, package, "official provenance.packages");
-        if (actual != version
-                && (actual.size() <= version.size()
-                    || actual.compare(0, version.size(), version) != 0
-                    || actual[version.size()] != '+')) {
+        if (actual != version) {
             throw std::invalid_argument("official provenance package pin mismatch");
         }
     }
@@ -959,7 +956,6 @@ inline std::vector<OfficialCase> validate_reference_pack(
         throw std::invalid_argument("official provenance precision policy mismatch");
     }
     validate_lower_sha256(provenance, "generator_sha256", "official provenance");
-    validate_lower_sha256(provenance, "exporter_sha256", "official provenance");
     const auto& command = object_member(provenance, "command", "official provenance");
     if (!command.is_array() || command.empty()
             || std::any_of(command.begin(), command.end(), [](const nlohmann::json& value) {

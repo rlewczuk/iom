@@ -144,7 +144,6 @@ def write_reference(model: Path, reference: Path, artifact_id: str) -> None:
             "packages": WRAPPER.PINNED_PACKAGES,
             "precision": WRAPPER.PINNED_PRECISION,
             "generator_sha256": "0" * 64,
-            "exporter_sha256": "1" * 64,
             "case_payload_sha256": hashlib.sha256(canonical).hexdigest(),
             "command": ["python3", "wrapper-regression"],
             "model_id": config["model_id"],
@@ -412,6 +411,19 @@ class WrapperRegressionTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             self.assertFalse(marker.exists())
             self.assertFalse(destination.exists())
+
+    def test_pack_model_id_allows_an_undeclared_caller_identity(self) -> None:
+        pack = json.loads(self.reference.read_text(encoding="utf-8"))
+        config_path = self.model / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config.pop("model_id")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        WRAPPER.validate_config(self.model, pack["model_config"])
+
+        config["_name_or_path"] = "TinyLlama/conflicting-distribution"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaises(WRAPPER.HarnessError):
+            WRAPPER.validate_config(self.model, pack["model_config"])
 
     def test_frozen_cases_are_id_only_and_exactly_typed(self) -> None:
         pack = json.loads(self.reference.read_text(encoding="utf-8"))

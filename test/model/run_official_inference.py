@@ -56,15 +56,15 @@ EXPECTED_CASES = [
 ]
 
 PINNED_PACKAGES = {
-    "jinja2": "3.1.2",
+    "jinja2": "3.1.6",
     "numpy": "1.26.4",
-    "safetensors": "0.4.1",
-    "sentencepiece": "0.1.99",
-    "tokenizers": "0.14.1",
-    "torch": "2.1.2",
-    "transformers": "4.35.0",
+    "safetensors": "0.4.3",
+    "sentencepiece": "0.2.0",
+    "tokenizers": "0.19.1",
+    "torch": "2.3.1+cpu",
+    "transformers": "4.41.2",
 }
-PINNED_RUNTIME = {"implementation": "CPython", "version": "3.11.16"}
+PINNED_RUNTIME = {"implementation": "CPython", "version": "3.12.3"}
 PINNED_PRECISION = {
     "weights": "BF16",
     "activations": "BF16",
@@ -290,11 +290,15 @@ def validate_config(root: Path, pack_config: Mapping[str, Any]) -> None:
             )
         if actual.get(field) != expected:
             fail(f"caller model_config {field} does not match official geometry")
-    model_id = config.get(
+    declared_model_id = config.get(
         "model_id", config.get("_name_or_path", config.get("name_or_path"))
     )
-    if "model_id" in expected_pack and expected_pack["model_id"] != model_id:
-        fail("reference model_config model_id does not match the caller model config")
+    if (
+        "model_id" in expected_pack
+        and declared_model_id is not None
+        and expected_pack["model_id"] != declared_model_id
+    ):
+        fail("reference model_config model_id conflicts with the caller model config")
     for field, value in expected_pack.items():
         if field in GEOMETRY or field in (
             "model_type",
@@ -528,16 +532,18 @@ def validate_provenance(
         actual = nonempty_string(
             packages.get(package), f"official provenance package {package}"
         )
-        if actual.split("+", 1)[0] != expected:
+        if actual != expected:
             fail(f"official provenance package {package} is not pinned to {expected}")
     if object_value(provenance.get("precision"), "official provenance precision") != PINNED_PRECISION:
         fail("official provenance precision policy mismatch")
-    for field in ("generator_sha256", "exporter_sha256"):
-        digest = nonempty_string(provenance.get(field), f"official provenance {field}")
-        if len(digest) != 64 or digest.lower() != digest or any(
-            character not in "0123456789abcdef" for character in digest
-        ):
-            fail(f"official provenance {field} is not a lowercase SHA-256")
+    digest = nonempty_string(
+        provenance.get("generator_sha256"),
+        "official provenance generator_sha256",
+    )
+    if len(digest) != 64 or digest.lower() != digest or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        fail("official provenance generator_sha256 is not a lowercase SHA-256")
     command = provenance.get("command")
     if not isinstance(command, list) or not command or any(
         not isinstance(value, str) or not value for value in command
@@ -545,6 +551,8 @@ def validate_provenance(
         fail("official provenance command must be a non-empty argv list")
     if provenance.get("model_id") != model_id or provenance.get("revision") != artifact_id:
         fail("official provenance model/revision identity mismatch")
+
+
 def validate_reference(reference_path: Path, model_dir: Path, artifact_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     pack = object_value(load_json(reference_path, "official reference pack"), "official reference pack")
     if set(pack) != {"schema_version", "kind", "provenance", "tolerances", "model_config", "artifact_id", "cases"}:

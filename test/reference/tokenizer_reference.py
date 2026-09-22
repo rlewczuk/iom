@@ -23,15 +23,15 @@ from typing import Any, Mapping, Sequence
 # Keep these values as the one authority shared by later reference tools.
 PINNED_RUNTIME: dict[str, str] = {
     "implementation": "CPython",
-    "version": "3.11.16",
+    "version": "3.12.3",
 }
 
 # Keep these values as the one authority shared by later reference tools.
 PINNED_PACKAGES: dict[str, str] = {
-    "jinja2": "3.1.2",
-    "sentencepiece": "0.1.99",
-    "tokenizers": "0.14.1",
-    "transformers": "4.35.0",
+    "jinja2": "3.1.6",
+    "sentencepiece": "0.2.0",
+    "tokenizers": "0.19.1",
+    "transformers": "4.41.2",
 }
 
 REQUIRED_ARTIFACTS: tuple[str, ...] = (
@@ -121,14 +121,27 @@ def check_packages(
             "reference package pin is malformed; expected an object, "
             f"actual {type(expected).__name__}"
         )
+    expected_versions = dict(expected)
+    missing_shared = set(PINNED_PACKAGES) - set(expected_versions)
+    if missing_shared:
+        raise ProvenanceError(
+            "reference package pin omits shared tokenizer authorities: "
+            f"{sorted(missing_shared)!r}"
+        )
+    for package_name, shared_version in PINNED_PACKAGES.items():
+        if expected_versions[package_name] != shared_version:
+            raise ProvenanceError(
+                f"reference package pin for shared authority {package_name!r} "
+                f"must be {shared_version!r}; actual "
+                f"{expected_versions[package_name]!r}"
+            )
 
     actual: dict[str, str] = {}
-    for package_name in sorted(PINNED_PACKAGES):
-        expected_version = expected.get(package_name)
-        if expected_version is None:
+    for package_name in sorted(expected_versions):
+        expected_version = expected_versions[package_name]
+        if not isinstance(expected_version, str) or not expected_version:
             raise ProvenanceError(
-                "reference package pin is incomplete: missing "
-                f"{package_name!r}"
+                f"reference package pin {package_name!r} must be a non-empty string"
             )
         try:
             actual_version = importlib.metadata.version(package_name)
@@ -145,8 +158,8 @@ def check_packages(
         if actual_version != expected_version:
             raise ProvenanceError(
                 "reference package mismatch for "
-                f"{package_name!r}: expected {expected_version!r}, "
-                f"actual {actual_version!r}"
+                f"{package_name!r}: expected exact full version "
+                f"{expected_version!r}, actual {actual_version!r}"
             )
 
     return actual

@@ -253,6 +253,47 @@ The committed stdlib-only
 [`test/reference/verify_model_oracles_negative.py`](../../test/reference/verify_model_oracles_negative.py)
 fixture keeps the verifier's policy-mutation rejection coverage reproducible.
 
+### Official reference export
+
+Task `14-integration-reference-validation` owns the independent official
+TinyLlama model and intermediate-logit reference pack. The pinned offline
+exporter is
+[`test/reference/export_official_model_reference.py`](../../test/reference/export_official_model_reference.py);
+its fixed geometry, tokenizer/artifact provenance, BF16 reference arithmetic,
+and comparison policy are frozen in
+[`test/model/official_reference_policy.json`](../../test/model/official_reference_policy.json).
+The policy binds repository model ID
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0` to revision
+`fe8a4ea1ffedaf415f4da2f062534de366a451e6`, including the fixed config and
+SafeTensors identities. That revision SHA is both the caller-supplied artifact
+identity and the pack's `artifact_id`; `model_id` remains the repository ID.
+Generation uses CPython 3.12.3 with `transformers==4.41.2`,
+`tokenizers==0.19.1`, `sentencepiece==0.2.0`, `jinja2==3.1.6`,
+`torch==2.3.1+cpu`, `numpy==1.26.4`, and `safetensors==0.4.3`. The shared
+tokenizer runtime/package subset is owned by
+[`test/reference/tokenizer_reference.py`](../../test/reference/tokenizer_reference.py);
+the exporter adds only the neural-generation dependencies.
+The exporter takes an explicit caller-supplied distribution, revision identity,
+policy, and output path. It never discovers or downloads weights, consults an
+IOM output, or runs as ordinary CTest. Its `--verify` path is stdlib-only and
+rechecks the explicit model directory, artifact sizes and SHA-256 values,
+recorded runtime/package policy, authenticated generation argv, tokenizer IDs
+and rendered bytes, finite snapshots, positions, and the case-payload digest
+without requiring the verifier host to run the generation interpreter.
+
+For each nonzero raw or chat prompt, the pack records two distinct policies:
+`production-greedy` is the production-style EOS/max-new-token/context path and
+may enforce an exact token only when the independent reference margin is
+certified; `fixed-reference-continuation` teacher-forces the frozen
+`[3, 4, 5, 6]` IDs to retain comparable cached prefixes even when greedy
+generation stops early. The forced continuation is never a greedy-token
+golden. A zero-new-token case records no forward snapshot. Comparison uses
+`abs(actual - ref) <= 0.25 + 0.02*abs(ref)`, with lowest-ID ties and no
+backend-specific or candidate-fitted relaxation. Stop bookkeeping considers
+EOS before the token limit, the token limit before context exhaustion, and
+keeps a committed terminal token in the result without appending it to KV
+state.
+
 Each owner MUST select fixed, justified tolerances and pin the reference
 software or artifact identity before measuring a candidate. A production
 implementation MUST NOT serve as its own oracle. This subsection adds no

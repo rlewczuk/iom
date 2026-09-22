@@ -9,12 +9,15 @@ only validation, execution, comparison, and evidence publication.
 ## Inputs and fixed policy
 
 The caller must set `IOM_TEST_MODEL_DIR`, `IOM_TEST_MODEL_ID`,
-`IOM_TEST_MODEL_REFERENCE`, and `IOM_TEST_MODEL_EVIDENCE`. An optional
-`IOM_TEST_MODEL_ARENA_BYTES` is a positive decimal byte count divisible by 32.
-The directory and reference pack are verified before model execution. The pack
-binds the asserted artifact ID to actual relative files, sizes, and SHA-256
-values, and records the case-payload digest, generator/exporter provenance,
-software pins, precision policy, and model configuration. The caller must keep
+`IOM_TEST_MODEL_REFERENCE`, and `IOM_TEST_MODEL_EVIDENCE`. For the frozen
+TinyLlama distribution, `IOM_TEST_MODEL_ID` is the pinned revision SHA
+`fe8a4ea1ffedaf415f4da2f062534de366a451e6`, not the repository model name.
+An optional `IOM_TEST_MODEL_ARENA_BYTES` is a positive decimal byte count
+divisible by 32. The directory and reference pack are verified before model
+execution. The pack binds that asserted revision identity to actual relative
+files, sizes, and SHA-256 values, and records the case-payload digest,
+generator provenance, software pins, precision policy, and model
+configuration. The caller must keep
 the model directory immutable for the complete run. Because the production
 loader accepts paths rather than retained file handles, the shared runner
 recomputes the complete size/SHA-256 inventory immediately before every

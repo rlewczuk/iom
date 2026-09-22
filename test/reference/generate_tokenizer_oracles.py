@@ -664,23 +664,30 @@ def _measure_chat_case(
     context: str,
     template_label: str,
 ) -> dict[str, Any]:
+    conversation = [dict(message) for message in messages]
     try:
-        rendered = fast_tokenizer.apply_chat_template(
-            list(messages),
+        rendered_batch = fast_tokenizer.apply_chat_template(
+            [conversation],
             chat_template=template,
             add_generation_prompt=add_generation_prompt,
             tokenize=False,
         )
-        ids = fast_tokenizer.apply_chat_template(
-            list(messages),
-            chat_template=template,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=True,
-        )
     except Exception as error:
         raise OracleError(f"{context} chat rendering failed: {error}") from error
-    if not isinstance(rendered, str):
-        raise OracleError(f"{context} chat rendering returned {type(rendered).__name__}")
+    if (
+        not isinstance(rendered_batch, list)
+        or len(rendered_batch) != 1
+        or not isinstance(rendered_batch[0], str)
+    ):
+        raise OracleError(
+            f"{context} batched chat rendering returned malformed output: "
+            f"{rendered_batch!r}"
+        )
+    rendered = rendered_batch[0]
+    try:
+        ids = fast_tokenizer.encode(rendered, add_special_tokens=False)
+    except Exception as error:
+        raise OracleError(f"{context} rendered-chat encoding failed: {error}") from error
     if not isinstance(ids, list) or any(
         isinstance(identifier, bool) or not isinstance(identifier, int) for identifier in ids
     ):
@@ -693,12 +700,12 @@ def _measure_chat_case(
         raise OracleError(f"{context} direct fast-reference encoding failed: {error}") from error
     if list(direct.ids) != ids:
         raise OracleError(
-            f"{context} chat ID mismatch between apply_chat_template and direct encoding: "
-            f"apply={ids!r}, direct={list(direct.ids)!r}"
+            f"{context} chat ID mismatch between public and direct encoding: "
+            f"public={ids!r}, direct={list(direct.ids)!r}"
         )
     return {
         "name": name,
-        "messages": [dict(message) for message in messages],
+        "messages": conversation,
         "add_generation_prompt": add_generation_prompt,
         "template_label": template_label,
         "template_source": template,

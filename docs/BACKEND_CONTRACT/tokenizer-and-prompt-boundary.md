@@ -236,10 +236,10 @@ the artifact path and field, or the template byte offset, and include the
 expected and actual values where applicable.
 
 The independent offline reference runs under the pinned CPython version for
-this snapshot, **CPython 3.11.16**, as recorded in
+this snapshot, **CPython 3.12.3**, as recorded in
 [`tokenizer_reference_manifest.json`](../../test/reference/tokenizer_reference_manifest.json),
-and the pinned packages `transformers==4.35.0`, `tokenizers==0.14.1`,
-`sentencepiece==0.1.99`, and `jinja2==3.1.2`. The caller supplies an
+and the pinned packages `transformers==4.41.2`, `tokenizers==0.19.1`,
+`sentencepiece==0.2.0`, and `jinja2==3.1.6`. The caller supplies an
 artifact-relative `--model-dir`; the reference performs no downloads and
 contains no hardcoded model path. `test/reference/tokenizer_reference.py`
 defines the independent behavior, `tokenizer_reference_manifest.json` records

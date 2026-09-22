@@ -2034,7 +2034,7 @@
           "decoded_bytes": null,
           "exception_type": "ValueError",
           "ids": null,
-          "message": "text input must of type `str` (single example), `List[str]` (batch or single pretokenized example) or `List[List[str]]` (batch of pretokenized examples).",
+          "message": "text input must be of type `str` (single example), `List[str]` (batch or single pretokenized example) or `List[List[str]]` (batch of pretokenized examples).",
           "status": "rejected"
         },
         "input_bytes": [
@@ -2266,14 +2266,14 @@
       ]
     },
     "packages": {
-      "jinja2": "3.1.2",
-      "sentencepiece": "0.1.99",
-      "tokenizers": "0.14.1",
-      "transformers": "4.35.0"
+      "jinja2": "3.1.6",
+      "sentencepiece": "0.2.0",
+      "tokenizers": "0.19.1",
+      "transformers": "4.41.2"
     },
     "runtime": {
       "implementation": "CPython",
-      "version": "3.11.16"
+      "version": "3.12.3"
     }
   },
   "report_version": "tinyllama-tokenizer-model-equivalence-v1",
