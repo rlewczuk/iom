@@ -268,3 +268,56 @@ capacity without claiming N-layer orchestration, final normalization or the
 untied LM head, selection, generation, CLI behavior, or official-corpus
 validation.  Incremental model/session/selector integration remains owned by
 later siblings.
+
+## Pinned full-stack causal/cache conformance
+
+The independent synthetic corpus now has a composed full-session boundary
+check. `test/backend/backend_conformance_model_cache.hpp` consumes the corpus
+reader and fixed comparator from `test/model/reference_fixture.hpp`; it does
+not reproduce the corpus generator or depend on a checkpoint-stage header.
+`test/test_model_cache_integration.cpp` supplies the backend device and runs
+the shared routine, while backend-specific setup remains in the owning driver.
+
+For both pinned geometries (`Hq=3,Hkv=1,D=6,F=18` and
+`Hq=4,Hkv=2,D=2,F=8`), the routine runs complete length-17 base and
+future-perturbed prompts. Every final-layer residual row before absolute
+position 15 must be invariant within the fixed
+`abs(actual-ref) <= 0.05 + 0.02*abs(ref)` bound and must match its own
+independent per-position record; rows at and after position 15 are not used
+for the cross-prompt claim. Each prompt's terminal `[1,V]` logits are checked
+against that prompt's own independent record.
+
+Pinned cached continuations start at prefixes of length 1 and 14 and decode
+token IDs 4, 5, and 6. The length-14 run crosses absolute positions 15, 16,
+and 17, and both runs check every layer's published cache length after every
+forward. Each cached residual/final-normalization row and terminal logit is
+checked against the cached record; every corresponding logit is also checked
+against a separately loaded, fresh full-prefill session at the same absolute
+position. The checks therefore cover non-tile geometry, tile crossing, GQA
+head mapping, exact capacity, and the rule that only the initialized prefix is
+observable.
+
+After a successful length-17 prefill, a decode beyond capacity and an
+overlong length-18 request must both be rejected. The per-layer lengths and a
+copied terminal output are checked before and after each rejection, proving
+that failed admission does not commit cache state or alter previously returned
+owned output. Reset/reuse, accepted-failure, selector, SDPA, and cache-append
+state-machine coverage remains in their existing tests rather than being
+duplicated here.
+
+**Acceptance and source map**
+
+- Future perturbation: strict residual-row invariance for positions `<15` and
+  independent terminal-logit checks in
+  `backend_conformance_model_cache.hpp`.
+- Cached decode: pinned prefixes `1/14`, decode IDs `4/5/6`, per-layer lengths,
+  independent fresh recomputation, and capacity rejection in the same header.
+- Corpus and comparison policy: `test/model/reference_fixture.hpp` and
+  `test/model/synthetic_reference.json`; the fixed finite-value bound is not
+  relaxed or aggregated.
+- Executable entry: `test/test_model_cache_integration.cpp`, registered in
+  `test/CMakeLists.txt` as the `iom_tests` source
+  `TinyLlama pinned causal cache reference conformance`.
+- Existing operation/state ownership: `test/backend/backend_conformance_sdpa.hpp`,
+  `test/backend/backend_conformance_cache_append.hpp`, and the reset/failure
+  cases in `test/test_model_session.cpp`.
