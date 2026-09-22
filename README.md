@@ -279,6 +279,55 @@ and disabled/metrics/trace parity on CPU device `0` with caller-owned storage.
 Exact identities, policy, state outcomes, and CPU timing/capability limitations
 are recorded in [CPU official TinyLlama inference evidence](docs/BACKEND_CONTRACT/model-inference-cpu-official-evidence.md).
 
+### ROCm official-model inference (opt-in)
+
+The ROCm official-model gate is the ROCm counterpart of the CPU gate above and
+is likewise separate from both ordinary CTest and the real-checkpoint loading
+option. It never downloads or discovers a model and it has no skip or fallback
+path. Enabling `IOM_TEST_REAL_MODEL_INFERENCE_ROCM` with `ROCM_ENABLED=OFF`
+fails configuration instead of compiling nothing, and the ordinary aggregate
+`iom_rocm_conformance_tests` registration excludes the guarded case, so the
+Python wrapper is the sole registered route. The ROCm case additionally
+requires `IOM_TEST_MODEL_ARENA_BYTES`, because the tensor arena is a
+device-construction value; it runs on ROCm device ordinal `0`. Run this gate on
+the configured ROCm host (`bv2`) after its ROCm toolchain is initialized, and
+supply the caller artifacts explicitly:
+
+```sh
+cmake -S . -B build/rocm-official \
+  -DBUILD_TESTING=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCUDA_ENABLED=OFF \
+  -DROCM_ENABLED=ON \
+  -DSYCL_ENABLED=OFF \
+  -DIOM_TEST_REAL_MODEL_INFERENCE_ROCM=ON
+cmake --build build/rocm-official \
+  --target iom_rocm_conformance_tests
+
+IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+IOM_TEST_MODEL_REFERENCE=/path/to/tinyllama-official-reference.json \
+IOM_TEST_MODEL_EVIDENCE=/path/to/rocm-official-evidence.json \
+IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
+timeout --kill-after=30s 1830s \
+  ctest --test-dir build/rocm-official --output-on-failure \
+    --no-tests=error --timeout 1800 \
+    -R '^iom_rocm_real_model_inference_tests$'
+```
+
+The wrapper verifies the complete model/reference identity before launching only
+`ROCm real model inference` in the already-built ROCm conformance executable.
+Its registered CTest deadline is 1800 seconds; a missing, invalid, or
+misaligned arena fails before any device exists, and a missing
+path/reference/digest, an unsupported configuration or device, or a failed run
+is failure rather than a skip. The case runs production raw and chat prefill,
+repeated cached decode, zero-new-token behavior, full-logit comparison, and
+disabled/metrics/trace parity on ROCm device `0`. Exact identities, policy, the
+ROCm runtime/ordinal record, native linear/QK/PV attribution, the bounded
+`rocprofv3` payload, and the truthful profiler/counter/device-time limitations
+are recorded in
+[ROCm official TinyLlama inference evidence](docs/BACKEND_CONTRACT/model-inference-rocm-official-evidence.md).
+
 ### Optional scalar metrics
 
 Pass the value-free `--metrics` option to print one bounded scalar report on
