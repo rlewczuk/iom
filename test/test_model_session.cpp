@@ -9121,3 +9121,179 @@ TEST_CASE("Inference trace CLI has no rows for zero-token requests") {
     CHECK(traced.stderr_text.empty());
 }
 
+TEST_CASE("Inference metrics CLI validates the value-free option") {
+    const auto duplicate = generation_cli_test::invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0", "--prompt", "hello",
+            "--metrics", "--metrics"});
+    CHECK_EQ(duplicate.exit_code, 2);
+    CHECK(duplicate.stdout_text.empty());
+    CHECK(duplicate.stderr_text.find("usage/input") != std::string::npos);
+
+    const auto value_bearing = generation_cli_test::invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0", "--prompt", "hello",
+            "--metrics=summary"});
+    CHECK_EQ(value_bearing.exit_code, 2);
+    CHECK(value_bearing.stdout_text.empty());
+    CHECK(value_bearing.stderr_text.find("usage/input") != std::string::npos);
+
+    const auto positional_value = generation_cli_test::invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0", "--prompt", "hello",
+            "--metrics", "summary"});
+    CHECK_EQ(positional_value.exit_code, 2);
+    CHECK(positional_value.stdout_text.empty());
+    CHECK(positional_value.stderr_text.find("usage/input")
+          != std::string::npos);
+}
+
+TEST_CASE("Inference metrics CLI preserves raw and chat zero-token output") {
+    ForwardFixture fixture("generation-cli-metrics-zero", text_generation_config());
+    const std::vector<std::string> base =
+            generation_cli_test::required_cpu_arguments(fixture.directory.path());
+
+    std::vector<std::string> raw_plain_arguments = base;
+    raw_plain_arguments.insert(
+            raw_plain_arguments.end(), {"--prompt", "hello"});
+    const auto raw_plain =
+            generation_cli_test::invoke(std::move(raw_plain_arguments));
+
+    std::vector<std::string> raw_metrics_arguments = base;
+    raw_metrics_arguments.insert(
+            raw_metrics_arguments.end(), {"--prompt", "hello", "--metrics"});
+    const auto raw_metrics =
+            generation_cli_test::invoke(std::move(raw_metrics_arguments));
+    CHECK_EQ(raw_metrics.exit_code, 0);
+    CHECK_EQ(raw_metrics.stdout_text, raw_plain.stdout_text);
+    CHECK(raw_metrics.stderr_text.find("iom_generate: metrics:")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("load_ns=") != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("load_state=succeeded")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("tokenization_state=succeeded")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find(
+                  "prefill_completion_ns=unavailable")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("decode_completion_ns=unavailable")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("generated_tokens=0")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("decode_token_count=0")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("ttft_ns=unavailable")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find(
+                  "throughput_tokens_per_second=unavailable")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("request_status=success")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("stop_reason=max_new_tokens")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("device_time=unavailable")
+          != std::string::npos);
+    CHECK(raw_metrics.stderr_text.find("operation=") == std::string::npos);
+
+    std::vector<std::string> chat_plain_arguments = base;
+    chat_plain_arguments.insert(
+            chat_plain_arguments.end(),
+            {"--message", "system", "Be concise.",
+             "--message", "user", "hello"});
+    const auto chat_plain =
+            generation_cli_test::invoke(std::move(chat_plain_arguments));
+
+    std::vector<std::string> chat_metrics_arguments = base;
+    chat_metrics_arguments.insert(
+            chat_metrics_arguments.end(),
+            {"--message", "system", "Be concise.",
+             "--message", "user", "hello", "--metrics"});
+    const auto chat_metrics =
+            generation_cli_test::invoke(std::move(chat_metrics_arguments));
+    CHECK_EQ(chat_metrics.exit_code, 0);
+    CHECK_EQ(chat_metrics.stdout_text, chat_plain.stdout_text);
+    CHECK(chat_metrics.stderr_text.find("tokenization_state=succeeded")
+          != std::string::npos);
+    CHECK(chat_metrics.stderr_text.find("request_status=success")
+          != std::string::npos);
+}
+
+TEST_CASE(
+        "Inference metrics CLI reports first-token counts without decode work") {
+    ForwardFixture fixture("generation-cli-metrics-first-token",
+                           text_generation_config());
+    std::vector<std::string> plain_arguments =
+            generation_cli_test::required_cpu_arguments(
+                    fixture.directory.path());
+    plain_arguments[7] = "1";
+    plain_arguments.insert(plain_arguments.end(), {"--prompt", "hello"});
+    const auto plain =
+            generation_cli_test::invoke(std::move(plain_arguments));
+
+    std::vector<std::string> metrics_arguments =
+            generation_cli_test::required_cpu_arguments(
+                    fixture.directory.path());
+    metrics_arguments[7] = "1";
+    metrics_arguments.insert(
+            metrics_arguments.end(), {"--prompt", "hello", "--metrics"});
+    const auto metrics =
+            generation_cli_test::invoke(std::move(metrics_arguments));
+    CHECK_EQ(metrics.exit_code, 0);
+    CHECK_EQ(metrics.stdout_text, plain.stdout_text);
+    CHECK(metrics.stderr_text.find("generated_tokens=1")
+          != std::string::npos);
+    CHECK(metrics.stderr_text.find("decode_forward_count=0")
+          != std::string::npos);
+    CHECK(metrics.stderr_text.find("decode_token_count=0")
+          != std::string::npos);
+    CHECK(metrics.stderr_text.find("ttft_ns=") != std::string::npos);
+    CHECK(metrics.stderr_text.find("ttft_ns=unavailable")
+          == std::string::npos);
+    CHECK(metrics.stderr_text.find("decode_completion_state=not_run")
+          != std::string::npos);
+    CHECK(metrics.stderr_text.find(
+                  "throughput_tokens_per_second=unavailable")
+          != std::string::npos);
+    CHECK(metrics.stderr_text.find("stop_reason=unavailable")
+          == std::string::npos);
+}
+
+TEST_CASE("Inference metrics CLI reports preprocessing failures as failures") {
+    ForwardFixture fixture("generation-cli-metrics-failure",
+                           text_generation_config());
+    std::vector<std::string> arguments =
+            generation_cli_test::required_cpu_arguments(
+                    fixture.directory.path());
+    arguments.insert(
+            arguments.end(),
+            {"--message", "tool", "unsupported", "--metrics"});
+    const auto result = generation_cli_test::invoke(std::move(arguments));
+    CHECK_EQ(result.exit_code, 2);
+    CHECK(result.stdout_text.empty());
+    CHECK(result.stderr_text.find("usage/input") != std::string::npos);
+    CHECK(result.stderr_text.find("iom_generate: metrics:")
+          != std::string::npos);
+    CHECK(result.stderr_text.find("request_status=failure")
+          != std::string::npos);
+    CHECK(result.stderr_text.find("generated_tokens=unavailable")
+          != std::string::npos);
+    CHECK(result.stderr_text.find("stop_reason=unavailable")
+          != std::string::npos);
+}
+
+TEST_CASE("Inference metrics CLI reports load failures without a fake request") {
+    const auto result = generation_cli_test::invoke({
+            "--model-dir", "/missing", "--backend", "cpu",
+            "--device", "0", "--max-new-tokens", "0", "--prompt", "hello",
+            "--metrics"});
+    CHECK_EQ(result.exit_code, 3);
+    CHECK(result.stdout_text.empty());
+    CHECK(result.stderr_text.find("setup/load") != std::string::npos);
+    CHECK(result.stderr_text.find("iom_generate: metrics:")
+          != std::string::npos);
+    CHECK(result.stderr_text.find("load_state=failed") != std::string::npos);
+    CHECK(result.stderr_text.find("request_status=unavailable")
+          != std::string::npos);
+    CHECK(result.stderr_text.find("stop_reason=unavailable")
+          != std::string::npos);
+}

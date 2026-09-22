@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -79,6 +80,7 @@ struct Arguments {
     bool has_max_new_tokens = false;
     bool has_tensor_arena_bytes = false;
     bool trace = false;
+    bool metrics = false;
     std::optional<std::string> prompt;
     std::vector<ParsedMessage> messages;
 };
@@ -158,6 +160,11 @@ struct Arguments {
             arguments.max_new_tokens = parse_size(
                     next_value(argc, argv, index, option), option);
             arguments.has_max_new_tokens = true;
+        } else if (option == "--metrics") {
+            if (arguments.metrics) {
+                usage_error("duplicate --metrics");
+            }
+            arguments.metrics = true;
         } else if (option == "--tensor-arena-bytes") {
             if (arguments.has_tensor_arena_bytes) {
                 usage_error("duplicate --tensor-arena-bytes");
@@ -292,6 +299,19 @@ void report_exception(std::string_view category, const std::exception& error) {
     return "unknown";
 }
 
+[[nodiscard]] const char* observation_state(
+        iom::ObservationState state) noexcept {
+    switch (state) {
+    case iom::ObservationState::not_run:
+        return "not_run";
+    case iom::ObservationState::succeeded:
+        return "succeeded";
+    case iom::ObservationState::failed:
+        return "failed";
+    }
+    return "unknown";
+}
+
 [[nodiscard]] std::uint64_t trace_elapsed(
         std::uint64_t begin, std::uint64_t end) noexcept {
     return end >= begin ? end - begin : 0;
@@ -335,6 +355,149 @@ void report_operation_trace(const iom::InferenceMetrics& recorder) noexcept {
     }
 }
 
+[[nodiscard]] const char* stop_reason(
+        iom::GenerationStopReason reason) noexcept {
+    switch (reason) {
+    case iom::GenerationStopReason::eos:
+        return "eos";
+    case iom::GenerationStopReason::max_new_tokens:
+        return "max_new_tokens";
+    case iom::GenerationStopReason::context_capacity:
+        return "context_capacity";
+    }
+    return "unknown";
+}
+
+void write_phase_timing(
+        std::string_view name, const iom::PhaseTiming& timing) {
+    std::cerr << "  " << name << "_ns=";
+    if (timing.state == iom::ObservationState::succeeded) {
+        std::cerr << timing.host_nanoseconds << "ns\n";
+    } else {
+        std::cerr << "unavailable\n";
+    }
+    std::cerr << "  " << name << "_state="
+              << observation_state(timing.state) << '\n';
+}
+
+void write_enqueue_timing(
+        std::string_view name, const iom::PhaseTiming& phase,
+        const iom::PhaseEnqueue& enqueue) {
+    std::cerr << "  " << name << "_enqueue_ns=";
+    if (phase.state == iom::ObservationState::succeeded) {
+        std::cerr << enqueue.host_nanoseconds << "ns\n";
+    } else {
+        std::cerr << "unavailable\n";
+    }
+}
+
+[[nodiscard]] bool report_metrics(
+        const iom::InferenceMetrics& metrics) noexcept {
+    try {
+        const iom::InferenceSnapshot& snapshot = metrics.snapshot();
+        // A failed preprocessing or request-setup attempt may not have been
+        // published.  In that case the recorder intentionally retains the
+        // previous admitted request, which must not be presented as the
+        // current CLI request.
+        const bool admitted = snapshot.request_admitted
+                && snapshot.attempt.ordinal == snapshot.admitted.ordinal;
+        const iom::AdmittedObservation& request = snapshot.admitted;
+
+        std::cerr << "iom_generate: metrics:\n";
+        write_phase_timing("load", snapshot.load);
+        if (admitted) {
+            write_phase_timing("tokenization", request.tokenization);
+            write_phase_timing("prefill_completion", request.prefill);
+            write_phase_timing("decode_completion", request.decode);
+            write_enqueue_timing(
+                    "prefill", request.prefill, request.prefill_enqueue);
+            write_enqueue_timing(
+                    "decode", request.decode, request.decode_enqueue);
+        } else {
+            std::cerr << "  tokenization_ns=unavailable\n"
+                      << "  tokenization_state=not_run\n"
+                      << "  prefill_completion_ns=unavailable\n"
+                      << "  prefill_completion_state=not_run\n"
+                      << "  decode_completion_ns=unavailable\n"
+                      << "  decode_completion_state=not_run\n"
+                      << "  prefill_enqueue_ns=unavailable\n"
+                      << "  decode_enqueue_ns=unavailable\n";
+        }
+
+        if (admitted) {
+            std::cerr << "  prompt_tokens=" << request.prompt_tokens << '\n'
+                      << "  generated_tokens=" << request.generated_tokens
+                      << '\n'
+                      << "  decode_forward_count="
+                      << request.decode_forward_count << '\n'
+                      << "  decode_token_count=" << request.decode_token_count
+                      << '\n';
+        } else {
+            std::cerr << "  prompt_tokens=unavailable\n"
+                      << "  generated_tokens=unavailable\n"
+                      << "  decode_forward_count=unavailable\n"
+                      << "  decode_token_count=unavailable\n";
+        }
+
+        std::cerr << "  ttft_ns=";
+        if (admitted && request.time_to_first_token_valid) {
+            std::cerr << request.time_to_first_token_ns << "ns\n";
+        } else {
+            std::cerr << "unavailable\n";
+        }
+        std::cerr << "  throughput_numerator_tokens=";
+        if (admitted) {
+            std::cerr << request.decode_token_count << '\n';
+        } else {
+            std::cerr << "unavailable\n";
+        }
+        std::cerr << "  throughput_denominator_ns=";
+        if (admitted && request.decode_throughput_denominator_ns != 0) {
+            std::cerr << request.decode_throughput_denominator_ns << "ns\n";
+        } else {
+            std::cerr << "unavailable\n";
+        }
+        std::cerr << "  throughput_tokens_per_second=";
+        if (admitted && request.decode_throughput_valid) {
+            std::cerr << std::setprecision(
+                    std::numeric_limits<double>::max_digits10)
+                      << request.tokens_per_second << " tokens/s\n";
+        } else {
+            std::cerr << "unavailable\n";
+        }
+
+        std::cerr << "  attempt_status=";
+        if (snapshot.attempt.outcome == iom::AttemptOutcome::succeeded) {
+            std::cerr << "success\n";
+        } else if (snapshot.attempt.outcome == iom::AttemptOutcome::failed) {
+            std::cerr << "failure\n";
+        } else {
+            std::cerr << "unavailable\n";
+        }
+        std::cerr << "  request_status=";
+        if (snapshot.attempt.outcome == iom::AttemptOutcome::succeeded) {
+            std::cerr << "success\n";
+        } else if (snapshot.attempt.outcome == iom::AttemptOutcome::failed) {
+            std::cerr << "failure\n";
+        } else {
+            std::cerr << "unavailable\n";
+        }
+        std::cerr << "  stop_reason=";
+        if (admitted && request.stop_reason_valid
+                && snapshot.attempt.outcome
+                        == iom::AttemptOutcome::succeeded) {
+            std::cerr << stop_reason(request.stop_reason) << '\n';
+        } else {
+            std::cerr << "unavailable\n";
+        }
+        std::cerr << "  device_time=unavailable\n";
+        std::cerr.flush();
+        return static_cast<bool>(std::cerr);
+    } catch (...) {
+        return false;
+    }
+}
+
 [[nodiscard]] int execute(const Arguments& arguments) {
     // Declaration order is deliberate: the CPU allocator outlives the device,
     // the device outlives the session, and the session outlives the result.
@@ -345,8 +508,25 @@ void report_operation_trace(const iom::InferenceMetrics& recorder) noexcept {
     std::unique_ptr<iom::InferenceMetrics> recorder;
     std::unique_ptr<iom::Device> device;
     std::unique_ptr<iom::TinyLlamaSession> session;
+
+    const auto finish = [&]() {
+        // Session destruction may drain accepted work.  Keep the recorder
+        // alive until that ordinary destruction has completed, then release
+        // the device before formatting the final observation snapshots.
+        session.reset();
+        device.reset();
+        bool report_ok = true;
+        if (arguments.metrics && recorder) {
+            report_ok = report_metrics(*recorder);
+        }
+        if (arguments.trace && recorder) {
+            report_operation_trace(*recorder);
+        }
+        return report_ok;
+    };
+
     try {
-        if (arguments.trace) {
+        if (arguments.metrics || arguments.trace) {
             recorder = std::make_unique<iom::InferenceMetrics>();
         }
         device = make_device(arguments, cpu_allocator);
@@ -367,9 +547,11 @@ void report_operation_trace(const iom::InferenceMetrics& recorder) noexcept {
         }
     } catch (const std::exception& error) {
         report_exception("setup/load", error);
+        static_cast<void>(finish());
         return 3;
     } catch (...) {
         report("setup/load", "unknown setup failure");
+        static_cast<void>(finish());
         return 3;
     }
 
@@ -418,12 +600,9 @@ void report_operation_trace(const iom::InferenceMetrics& recorder) noexcept {
         }
     }
 
-    // Release the session explicitly before reporting.  Its normal destructor
-    // performs the existing final drain, which is allowed to complete pending
-    // trace rows; the report itself never waits.
-    session.reset();
-    if (arguments.trace && recorder) {
-        report_operation_trace(*recorder);
+    if (!finish() && status == 0) {
+        report("execution", "metrics report failed");
+        status = 4;
     }
     return status;
 }

@@ -518,3 +518,43 @@ adapter.
    and a failed wait is reported as a failed observation rather than proof of
    native completion. Generated stdout bytes, normal stop reasons, primary
    diagnostics, and statuses 0, 2, 3, and 4 are unchanged.
+
+## CLI metric presentation
+
+1. The value-free `--metrics` option is independent of operation tracing. The
+   CLI MUST create exactly one scalar-only, caller-owned `InferenceMetrics`
+   recorder when metrics is selected, and MUST NOT call
+   `prepare_operation_trace()` for metrics-only requests. When tracing is also
+   selected, both presentations MUST consume the same recorder owner.
+2. The CLI MUST write the metrics report to stderr only. Generated text on
+   stdout MUST remain byte-identical, including the absence of an added
+   trailing newline. The report MUST be bounded and human-readable; it MUST
+   include explicit `ns` (or equivalent seconds) units for load,
+   encode/tokenization, completion-observed prefill and decode, and the
+   per-phase host-enqueue sums. It MUST include prompt, generated,
+   decode-forward, and decode-token counts; TTFT; the decode-throughput
+   numerator, denominator, and tokens-per-second; and request status and stop
+   reason when those observations exist.
+3. A phase that did not run, a zero-token or zero-denominator result, an
+   incomplete or failed rate, and TTFT without a committed token MUST be
+   presented as `unavailable`; the CLI MUST NOT turn an absent observation
+   into a successful zero-duration or normal stop. Generated count MUST retain
+   committed terminal tokens, while decode-token count MUST exclude the
+   prefill-produced token and KV-only appends. Throughput MUST use the
+   decode-token count over the sum of successful decode-start-to-corresponding
+   valid-commit intervals, including synchronous selection time.
+4. The recorder MUST remain alive through ordinary session destruction so
+   destructor drains can update the final scalar snapshot. Reporting MUST
+   occur after session release and MUST NOT add a report-driven wait. A primary
+   input, setup/load, or execution failure MUST retain its existing diagnostic
+   and exit status over any secondary report failure; a report failure on an
+   otherwise successful invocation follows the existing execution-failure
+   policy.
+5. The report MUST state `device_time=unavailable` for the current CPU, CUDA,
+   ROCm, and SYCL arrangements. Host load, completion, and enqueue durations
+   MUST NOT be called kernel or device time, and the presentation MUST NOT
+   imply a throughput floor or native profiler capability. The load interval
+   excludes outer device/allocator setup and selector construction; tokenization
+   covers only `tokenizer.encode`; prefill/decode completion ends at the
+   existing final-logits readiness wait; and host enqueue is the sum of
+   individual facade-call intervals, including blocking inside those calls.
