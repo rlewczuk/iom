@@ -558,3 +558,35 @@ adapter.
    covers only `tokenizer.encode`; prefill/decode completion ends at the
    existing final-logits readiness wait; and host enqueue is the sum of
    individual facade-call intervals, including blocking inside those calls.
+
+## Behavioral coverage and current backend limitations
+
+The four backend conformance drivers register the same focused scenario,
+`Inference instrumentation parity*`, over a driver-created device and the
+shared synthetic TinyLlama checkpoint. It runs five independent branches:
+first-token EOS, a zero/new-token limit, an exact-capacity prompt,
+multi-step decode, and two requests that reuse one session. Each branch is
+compared within that backend in disabled, scalar metrics-only, and explicitly
+trace-prepared modes. The comparison covers the generated IDs and decoded
+text, stop reason, selector history and accepted producer OIDs, KV
+initialization lengths, failure/poison category, BF16 logits within the
+existing inference tolerance, scalar phase/count state, and the owned trace
+rows. It does not compare logits or host timings across different backends.
+
+The trace checks require positive OIDs, copied phase/layer attribution,
+absolute prefill and decode windows, enqueue intervals, first wait states,
+request ordinals, and zero dropped rows. A zero-token request intentionally
+has no prefill, selector, accepted operation, wait, or trace row; a
+full-capacity nonzero request still records prefill and returns
+`context_capacity`. The scenario uses native BF16 checkpoint entries and
+does not add a CPU or other host fallback for an accelerator.
+
+The parity case checks disabled mode through the existing nullable recorder
+path; it does not inspect source text, private recorder storage, or a
+backend-specific field. Retained accepted-failure behavior remains covered
+by the existing injectable CPU/deferred seams and by the shared selector
+failure path, rather than by inventing a vendor failure for a backend that
+does not expose one. The backend limitation remains unchanged: all four
+drivers observe host-clock timing only. CPU has no device clock, CUDA and
+ROCm completion events disable timing, and SYCL queues remain in-order
+without profiling, so no case claims kernel or device duration.

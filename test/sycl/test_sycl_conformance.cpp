@@ -37,6 +37,7 @@
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/sycl/device.hpp"
@@ -1739,6 +1740,11 @@ TEST_CASE("SYCL conformance: workspace requirement queries are pure and exact") 
 TEST_CASE("SYCL model loading realizes every published weight role of each synthetic checkpoint") {
     SyclDevices devices;
     iom_conformance::run_model_loading_conformance(devices.conformance());
+}
+
+TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and observations") {
+    SyclDevices devices;
+    iom_conformance::run_inference_instrumentation_conformance(*devices.candidate);
 }
 
 // Opt-in real-checkpoint loading, compiled only with

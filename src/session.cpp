@@ -3471,13 +3471,21 @@ ForwardResult SessionAccess::forward_prefill(
                                  request.run_length});
         const oid final_norm = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
+                    const TensorView& input = final_layer_output(
+                            request.banks,
+                            impl.config().num_hidden_layers);
+                    const WorkspaceRequirements requirement =
+                            operations.rmsnorm_workspace_requirements(
+                                    input, impl.model->weight(1),
+                                    request.banks.final_norm->view(),
+                                    impl.config().rms_norm_eps);
+                    const RawWorkspaceView workspace =
+                            requirement.bytes == 0 ? RawWorkspaceView{}
+                                                   : sequential;
                     return operations.rmsnorm(
-                            final_layer_output(
-                                    request.banks,
-                                    impl.config().num_hidden_layers),
-                            impl.model->weight(1),
+                            input, impl.model->weight(1),
                             request.banks.final_norm->view(),
-                            impl.config().rms_norm_eps, sequential);
+                            impl.config().rms_norm_eps, workspace);
                 });
         SessionAccess::wait(session, final_norm);
         SessionAccess::set_operation_context(
@@ -3486,12 +3494,23 @@ ForwardResult SessionAccess::forward_prefill(
                                  request.run_length - 1, 1});
         const oid producer = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
+                    const TensorView& input =
+                            request.banks.final_norm->view();
+                    const TensorView& weight = impl.model->weight(2);
+                    const WorkspaceRequirements requirement =
+                            operations.linear_workspace_requirements(
+                                    input, weight, impl.logits->view(),
+                                    request.run_length - 1, 1,
+                                    LinearOutputLayout::ordinary, 1,
+                                    impl.config().vocab_size);
+                    const RawWorkspaceView workspace =
+                            requirement.bytes == 0 ? RawWorkspaceView{}
+                                                   : sequential;
                     return operations.linear(
-                            request.banks.final_norm->view(),
-                            impl.model->weight(2), impl.logits->view(),
+                            input, weight, impl.logits->view(),
                             request.run_length - 1, 1,
                             LinearOutputLayout::ordinary, 1,
-                            impl.config().vocab_size, sequential);
+                            impl.config().vocab_size, workspace);
                 });
         return ForwardResult{&impl.logits->view(), producer};
     } catch (...) {
@@ -3579,22 +3598,39 @@ ForwardResult SessionAccess::forward_decode(
                                  1});
         const oid final_norm = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
+                    const TensorView& input = final_layer_output(
+                            impl.fixed,
+                            impl.config().num_hidden_layers);
+                    const WorkspaceRequirements requirement =
+                            operations.rmsnorm_workspace_requirements(
+                                    input, impl.model->weight(1),
+                                    impl.fixed.final_norm->view(),
+                                    impl.config().rms_norm_eps);
+                    const RawWorkspaceView workspace =
+                            requirement.bytes == 0 ? RawWorkspaceView{}
+                                                   : sequential;
                     return operations.rmsnorm(
-                            final_layer_output(
-                                    impl.fixed,
-                                    impl.config().num_hidden_layers),
-                            impl.model->weight(1),
+                            input, impl.model->weight(1),
                             impl.fixed.final_norm->view(),
-                            impl.config().rms_norm_eps, sequential);
+                            impl.config().rms_norm_eps, workspace);
                 });
         SessionAccess::wait(session, final_norm);
         const oid producer = SessionAccess::submit(
                 session, [&](DeviceOps& operations) {
+                    const TensorView& input = impl.fixed.final_norm->view();
+                    const TensorView& weight = impl.model->weight(2);
+                    const WorkspaceRequirements requirement =
+                            operations.linear_workspace_requirements(
+                                    input, weight, impl.logits->view(), 0, 1,
+                                    LinearOutputLayout::ordinary, 1,
+                                    impl.config().vocab_size);
+                    const RawWorkspaceView workspace =
+                            requirement.bytes == 0 ? RawWorkspaceView{}
+                                                   : sequential;
                     return operations.linear(
-                            impl.fixed.final_norm->view(),
-                            impl.model->weight(2), impl.logits->view(), 0, 1,
+                            input, weight, impl.logits->view(), 0, 1,
                             LinearOutputLayout::ordinary, 1,
-                            impl.config().vocab_size, sequential);
+                            impl.config().vocab_size, workspace);
                 });
         return ForwardResult{&impl.logits->view(), producer};
     } catch (...) {

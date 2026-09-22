@@ -24,6 +24,7 @@
 
 #include "backend/backend_conformance_add.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_inference_metrics.hpp"
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
 
@@ -740,6 +741,11 @@ TEST_CASE("CPU conformance: full shared suite composes every shared case") {
 TEST_CASE("CPU model loading realizes every published weight role of each synthetic checkpoint") {
     CpuDevices devices;
     iom_conformance::run_model_loading_conformance(devices.conformance());
+}
+
+TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and observations") {
+    CpuDevices devices;
+    iom_conformance::run_inference_instrumentation_conformance(*devices.candidate);
 }
 
 // Opt-in real-checkpoint loading, compiled only with

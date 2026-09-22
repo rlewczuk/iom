@@ -29,6 +29,7 @@
 #include "backend/backend_conformance_rope_contract.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 #include "backend/backend_conformance_token_selection.hpp"
@@ -1838,6 +1839,13 @@ TEST_CASE("CUDA model loading realizes every published weight role of each synth
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_model_loading_conformance(devices.conformance());
+}
+
+TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and observations") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_inference_instrumentation_conformance(
+            *devices.candidate);
 }
 
 // Opt-in real-checkpoint loading, compiled only with

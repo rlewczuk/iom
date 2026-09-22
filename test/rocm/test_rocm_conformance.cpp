@@ -34,6 +34,7 @@
 #include "backend/backend_conformance_silu.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
 #include "backend/backend_conformance_token_selection.hpp"
 #include "iom/rocm/device.hpp"
@@ -1788,6 +1789,16 @@ TEST_CASE("ROCm model loading realizes every published weight role of each synth
     const iom_conformance::ConformanceDevices devices{
             *reference, *candidate, *foreign};
     iom_conformance::run_model_loading_conformance(devices);
+}
+
+TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and observations") {
+    auto candidate = iom::make_rocm_device(
+            0, iom::DeviceMemoryConfig{kConformanceArenaBytes});
+    const std::span<const iom::DataType> supported =
+            candidate->supported_data_types();
+    REQUIRE(std::find(supported.begin(), supported.end(),
+                      iom::DataType::BF16) != supported.end());
+    iom_conformance::run_inference_instrumentation_conformance(*candidate);
 }
 
 // Opt-in real-checkpoint loading, compiled only with
