@@ -1425,6 +1425,9 @@ private:
                 for (std::size_t head = 0; head < heads; ++head) {
                     const std::size_t head_plane =
                             out_plane + head * head_stride;
+#if defined(_OPENMP)
+#pragma omp parallel for if(detail::leaf_bits(request.x.spec.data_type) >= 8)
+#endif
                     for (std::size_t column = 0; column < head_dim; ++column) {
                         project_element(
                                 x_plane, source_row,

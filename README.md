@@ -225,6 +225,17 @@ trace report never adds a wait. `--trace` is independent of `--metrics`, and
 trace alone emits no metrics summary. With no observation option, no recorder
 or trace storage is created.
 
+### CPU sample scripts
+
+Run these examples from the repository root on a CPU host (`bv1` or `bv2`) after its CPU toolchain is initialized. The configured `bv1` profile uses `/home/rlew/cpu_env.sh`; the samples do not perform remote setup or download a model. The TinyLlama distribution must already be available at `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`.
+
+```sh
+./samples/build-cpu.sh
+./samples/run-cpu.sh
+```
+
+The build sample configures a host-native OpenMP Release `build-cpu` tree with accelerator backends and tests disabled, then builds `iom_generate`. OpenMP parallelizes independent CPU projection output columns for byte-sized-or-wider element formats without changing each column's ordered fused-multiply-add accumulation; packed sub-byte formats remain serial so neighboring elements cannot race within a shared byte. Build the sample separately on each CPU host rather than copying the executable between machines. The run sample supplies the exact user message `What is the capital of Poland ?`; `iom_generate` renders the distribution's official chat template, including its assistant-generation prefix, before tokenization. It uses CPU device `0` and a one-token generation limit, the smallest limit that can produce nonempty text. A successful run exits `0` and writes nonempty generated text to stdout; diagnostics go to stderr and no trailing newline is added. The CLI retains status `2` for usage/input errors, `3` for setup or load failures, and `4` for execution failures.
+
 ### Optional scalar metrics
 
 Pass the value-free `--metrics` option to print one bounded scalar report on
