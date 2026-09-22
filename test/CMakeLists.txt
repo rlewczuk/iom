@@ -106,6 +106,7 @@ add_executable(iom_tests
         test_inference_metrics.cpp
         test_model_reference_fixture.cpp
         test_model_cache_integration.cpp
+        test_model_integration.cpp
 )
 set_source_files_properties(test_iom.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN

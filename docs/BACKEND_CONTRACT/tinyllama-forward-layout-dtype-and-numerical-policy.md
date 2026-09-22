@@ -232,6 +232,18 @@ does not import Python model packages, access a network, or generate the
 corpus.  These files own only independent model/intermediate/logit evidence;
 operation conformance, tokenizer/chat behavior, and synchronous selector
 coverage remain with their existing owners.
+The complete-model integration checkpoint is owned separately by
+[`test/backend/backend_conformance_model_reference.hpp`](../../test/backend/backend_conformance_model_reference.hpp)
+and its CPU consumer
+[`test/test_model_integration.cpp`](../../test/test_model_integration.cpp).
+It materializes both pinned configurations through the same fixture, waits for
+the positive full-prefill producer, then compares the completed final
+`residual_after_mlp` (retaining every logical row), final normalization, and
+last-position vocabulary logits at `R=1,15,16,17` using the frozen per-value
+bound.  The shared function takes only `iom::Device&`; runtime setup remains
+owned by each independent backend driver, and the private `RunBanks` seam is
+used without publishing a snapshot API.
+
 
 The focused test consumes all 14 corpus cases on CPU, comparing full
 prefill and one-token cached rows for decoder-layer output, final norm, and
