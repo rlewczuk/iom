@@ -443,6 +443,10 @@ if(CUDA_ENABLED)
         RUNTIME_LIBRARIES CUDA::cuda_driver
         CONFORMANCE_TEST_ARGUMENTS "--test-case-exclude=CUDA real model inference"
     )
+    target_compile_definitions(iom_cuda_conformance_tests
+        PRIVATE
+            IOM_MODEL_REFERENCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/model"
+    )
     add_executable(iom_cuda_sdpa_nonmatrix_tests
         cuda/test_cuda_sdpa_nonmatrix.cpp
     )

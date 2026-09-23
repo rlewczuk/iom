@@ -29,6 +29,8 @@
 #include "backend/backend_conformance_rope_contract.hpp"
 #include "backend/backend_conformance_add_gpu.hpp"
 #include "backend/backend_conformance_model_loading.hpp"
+#include "backend/backend_conformance_model_reference.hpp"
+#include "backend/backend_conformance_model_cache.hpp"
 #include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_cache_append.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
@@ -1842,6 +1844,20 @@ TEST_CASE("CUDA model loading realizes every published weight role of each synth
     REQUIRE(cuInit(0) == CUDA_SUCCESS);
     CudaDevices devices;
     iom_conformance::run_model_loading_conformance(devices.conformance());
+}
+
+TEST_CASE("CUDA pinned model reference") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_model_reference_conformance(*devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CUDA pinned causal cache") {
+    REQUIRE(cuInit(0) == CUDA_SUCCESS);
+    CudaDevices devices;
+    iom_conformance::run_model_cache_reference_conformance(*devices.candidate);
+    CHECK_FALSE(devices.gate.armed());
 }
 
 TEST_CASE("Inference instrumentation parity preserves TinyLlama behavior and observations") {

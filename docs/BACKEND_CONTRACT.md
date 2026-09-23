@@ -77,6 +77,8 @@ earlier one already fixes.
   - [SYCL synthetic model integration evidence](BACKEND_CONTRACT/model-inference-sycl-synthetic-evidence.md) — the
     real-device checkpoint and causal-cache results for the pinned offline
     corpus, with exact runtime identity, commands, and finite comparison results.
+  - [CUDA pinned synthetic model-reference evidence](BACKEND_CONTRACT/model-inference-cuda-synthetic-evidence.md) — the CUDA device, corpus identity, and named
+    complete-model/cache gate record.
   - [TinyLlama forward layout — Normalization and MLP boundaries](BACKEND_CONTRACT/tinyllama-forward-layout-normalization-and-mlp-boundaries.md) — the
     frozen RMSNorm, SiLU, and MLP interfaces with their parameters and storage
     rules, and the operation contracts they defer to.
