@@ -328,6 +328,54 @@ ROCm runtime/ordinal record, native linear/QK/PV attribution, the bounded
 are recorded in
 [ROCm official TinyLlama inference evidence](docs/BACKEND_CONTRACT/model-inference-rocm-official-evidence.md).
 
+### SYCL official-model inference (opt-in)
+
+The SYCL official-model gate is separate from ordinary conformance and
+real-checkpoint loading. It defaults off, requires `SYCL_ENABLED=ON`, and
+never downloads, discovers, skips, or falls back to another backend. The
+ordinary SYCL aggregate explicitly excludes the guarded case; the
+standard-library Python wrapper is the only registered route for artifact
+validation and process supervision. Run it on the configured SYCL host after
+confirming that oneAPI enumerates a Level Zero GPU:
+
+```sh
+set +u
+source /opt/intel/oneapi/setvars.sh >/tmp/iom-official-sycl-setvars.log 2>&1
+set -u
+sycl-ls
+cmake -S . -B build-official \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON \
+  -DCUDA_ENABLED=OFF -DROCM_ENABLED=OFF -DSYCL_ENABLED=ON \
+  -DIOM_TEST_REAL_MODEL_INFERENCE_SYCL=ON
+cmake --build build-official --target iom_sycl_conformance_tests
+
+IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+IOM_TEST_MODEL_REFERENCE=/path/to/tinyllama-official-reference.json \
+IOM_TEST_MODEL_EVIDENCE=/path/to/sycl-official-evidence.json \
+IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
+flock -w 120 /tmp/agent-gpu0.lock \
+  timeout --kill-after=30s 1800s \
+  ctest --test-dir build-official --output-on-failure \
+    --no-tests=error --timeout 1800 \
+    -R '^iom_sycl_real_model_inference_tests$'
+```
+
+The wrapper verifies the complete model/reference inventory and digest before
+launching only `SYCL real model inference`. The case uses SYCL device ordinal
+`0`, validates the positive arena size before device construction, and runs
+raw/chat prefill, repeated cached decode, the zero-new-token control,
+full-vocabulary BF16 comparisons, margin-certified IDs, state/ownership
+checks, and disabled/metrics/trace parity. The evidence records SYCL/UR
+runtime and toolchain identity, ordinal and device facts, BF16 storage with
+FP32 accumulation, host-only timing limits, and truthful
+`ext_intel_matrix`/profiler facility observations. See [SYCL official
+TinyLlama inference evidence](docs/BACKEND_CONTRACT/model-inference-sycl-official-evidence.md)
+for the frozen artifact identities, numerical policy, native matrix linkage,
+and the retained `sycl-trace` dispatch attribution with its launcher and
+interpreter-tracing limitations.
+
 ### Optional scalar metrics
 
 Pass the value-free `--metrics` option to print one bounded scalar report on

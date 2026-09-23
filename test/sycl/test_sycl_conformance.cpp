@@ -36,8 +36,11 @@
 #include "backend/backend_conformance_rope_contract.hpp"
 #include "iom/alloc.hpp"
 #include "backend/backend_conformance_add.hpp"
-#include "backend/backend_conformance_model_loading.hpp"
 #include "backend/backend_conformance_model_cache.hpp"
+#include "backend/backend_conformance_model_loading.hpp"
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_SYCL
+#include "backend/backend_conformance_model_official.hpp"
+#endif
 #include "backend/backend_conformance_model_reference.hpp"
 #include "backend/backend_conformance_inference_metrics.hpp"
 #include "backend/backend_conformance_sdpa.hpp"
@@ -1771,5 +1774,20 @@ TEST_CASE("SYCL real model loading") {
     const std::unique_ptr<iom::Device> candidate = iom::make_sycl_device(
             0, iom_conformance::real_model_memory_config());
     iom_conformance::run_real_model_loading(*candidate);
+}
+#endif
+
+#ifdef IOM_TEST_REAL_MODEL_INFERENCE_SYCL
+// The official runner owns all artifact, reference, comparison, state, and
+// evidence checks.  Parse the caller's arena before creating any SYCL device so
+// invalid input cannot trigger a runtime or allocator construction.
+TEST_CASE("SYCL real model inference") {
+    const std::size_t arena_bytes =
+            iom_conformance::official_model_detail::parse_arena_bytes(
+                    iom_conformance::official_model_detail::required_environment(
+                            "IOM_TEST_MODEL_ARENA_BYTES"));
+    const std::unique_ptr<iom::Device> candidate = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{arena_bytes});
+    iom_conformance::run_real_model_inference(*candidate);
 }
 #endif
