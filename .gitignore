@@ -7,3 +7,4 @@ _local/
 .work/
 /.cswd
 *.pyc
+/.omp
