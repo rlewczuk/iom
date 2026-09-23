@@ -139,6 +139,9 @@ earlier one already fixes.
     artifact-bound CUDA prefill, cached-decode, numerical, state,
     instrumentation, ownership, native BF16 matrix, and profiler-capability
     record.
+  - [SYCL official TinyLlama inference evidence](BACKEND_CONTRACT/model-inference-sycl-official-evidence.md) — the
+    artifact-bound SYCL ordinal-0 prefill, cached-decode, numerical, state,
+    instrumentation, matrix-facility, UR-runtime, and host-only timing record.
 - [11. Tokenizer and prompt boundary](BACKEND_CONTRACT/tokenizer-and-prompt-boundary.md) — public owners and APIs,
   authoritative artifacts and tokenizer semantics, formatter metadata and fixed
   grammar, rendering and composition, and the error and reference rules of the

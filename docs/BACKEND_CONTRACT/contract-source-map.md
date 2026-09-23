@@ -71,6 +71,9 @@ Use these sources when changing or extending the contract:
 - ROCm official-model inference registration and retained evidence:
   `test/rocm/test_rocm_conformance.cpp`, `test/CMakeLists.txt`, and
   [ROCm official TinyLlama inference evidence](model-inference-rocm-official-evidence.md);
+- SYCL official-model registration and retained backend evidence:
+  `test/sycl/test_sycl_conformance.cpp`, `test/CMakeLists.txt`, and
+  [SYCL official TinyLlama inference evidence](model-inference-sycl-official-evidence.md);
 - backend-local full suites: `test/cpu/test_cpu_conformance.cpp`,
   `test/cuda/test_cuda_conformance.cpp`, `test/rocm/test_rocm_conformance.cpp`,
   `test/sycl/test_sycl_conformance.cpp`, and

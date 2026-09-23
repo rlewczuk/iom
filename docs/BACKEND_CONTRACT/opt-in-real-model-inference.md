@@ -138,3 +138,9 @@ artifact-free.
   comparisons, instrumentation parity, native linear/attention attribution,
   the bounded `rocprofv3` payload, and the truthful profiler/counter/device-time
   limitations to this shared contract.
+- [SYCL official TinyLlama inference evidence](model-inference-sycl-official-evidence.md)
+  binds the SYCL registration, caller inputs, official artifact identities,
+  numerical/state comparisons, instrumentation parity, the retained
+  `sycl-trace` joint-matrix dispatch attribution with its launcher and
+  interpreter-tracing limitations, and host-only timing limitation to this
+  shared contract.
