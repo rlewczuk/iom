@@ -1,4 +1,9 @@
-# Inference of Oversized Models
+# Inference of Oversized Models (IOM)
+
+This is experiment in building complex software projects using AI to generate 100% of code from specs.
+This is NOT production code in any way.
+
+## Installation
 
 Installing dependencies (Ubuntu):
 
@@ -6,7 +11,7 @@ Installing dependencies (Ubuntu):
 sudo apt install build-essential cmake doctest-dev doxygen clangd lldb-20 nlohmann-json3-dev
 ```
 
-Install ROCm 7.2 or newer separately when accelerator builds are needed. The
+Install ROCm 7.2 or newer (10.0 recommended) separately when accelerator builds are needed. The
 ROCm SDK must provide its HIP CMake package, normally under `/opt/rocm`.
 
 Install the CUDA Toolkit separately when NVIDIA accelerator builds are
@@ -527,47 +532,3 @@ as a `user` message so the model receives its official chat formatting without
 changing the CLI's raw-prompt behavior. On success, stdout contains only the
 generated text and the process exits `0`; setup, model, and execution
 diagnostics remain on stderr with the CLI's documented nonzero status classes.
-
-## Elementwise operation contract
-
-`DeviceOps` exposes four exact three-view asynchronous facades:
-
-```cpp
-oid add(const TensorView&, const TensorView&, TensorView&) noexcept;
-oid mul(const TensorView&, const TensorView&, TensorView&) noexcept;
-oid sub(const TensorView&, const TensorView&, TensorView&) noexcept;
-oid div(const TensorView&, const TensorView&, TensorView&) noexcept;
-```
-
-ADD, MUL, and SUB accept `QuantizationFormat::NONE` and the 21 numeric leaves
-`I2,U2,I4,U4,I8,U8,I16,U16,I32,U32,I64,U64,F4_E2M1,F6_E2M3,F6_E3M2,
-F8_E4M3FN,F8_E5M2,F16,BF16,F32,F64`. DIV accepts only the nine floating
-leaves `F4_E2M1,F6_E2M3,F6_E3M2,F8_E4M3FN,F8_E5M2,F16,BF16,F32,F64`.
-BOOL, F8_E8M0, non-NONE quantization, and integer DIV are `Unsupported`;
-matching-type validation happens first. There is no promotion, public query,
-fallback selector, or SDK dtype narrowing.
-
-Operations use right-aligned broadcasting (with `[1,1]` as the scalar
-convention), transformed leading views, tiled tails without padding reads, and
-exact in-place aliases only; read/read overlap is valid. Integer MUL/SUB are
-modulo `2^w`; floating operations decode, compute once in extended precision,
-and encode once with RNE, gradual underflow, format-specific special-value
-rules, and a one-ULP finite envelope. Operand order is `lhs-rhs` and `lhs/rhs`.
-Positive OIDs are accepted in-order queue work (CPU may complete inline);
-waits are repeatable and retained failures rethrow. Callers provide stable
-storage and owners—operations never allocate or relocate operands/results.
-SUB and DIV are additive APIs, while valid MUL now accepts work; rebuild
-consumers and do not mix header/library versions (no mixed-version ABI).
-
-Run:
-
-```sh
-./build/iom
-```
-
-Test:
-
-```
-cmake --build build --target iom_tests
-ctest --test-dir build --output-on-failure
-```
