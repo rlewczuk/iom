@@ -7,7 +7,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -63,19 +62,17 @@ namespace iom {
                 throw std::invalid_argument(
                         "embedding output shares an input storage handle");
             }
-            const std::uintptr_t out_begin =
-                    reinterpret_cast<std::uintptr_t>(out_handle);
-            const std::uintptr_t input_begin =
-                    reinterpret_cast<std::uintptr_t>(input_handle);
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            if (out_storage_bytes > limit - out_begin
-                    || input_storage_bytes > limit - input_begin) {
+            const detail::BackingRangeRelation range =
+                    detail::checked_backing_range_relation(
+                            reinterpret_cast<std::uintptr_t>(out_handle),
+                            out_storage_bytes,
+                            reinterpret_cast<std::uintptr_t>(input_handle),
+                            input_storage_bytes);
+            if (range == detail::BackingRangeRelation::overflow) {
                 throw std::overflow_error(
                         "embedding storage range overflows");
             }
-            if (out_begin < input_begin + input_storage_bytes
-                    && input_begin < out_begin + out_storage_bytes) {
+            if (range == detail::BackingRangeRelation::overlap) {
                 throw std::invalid_argument(
                         "embedding output storage range overlaps an input");
             }

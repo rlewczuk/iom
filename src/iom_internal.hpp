@@ -3,6 +3,7 @@
 #include "iom/tensor.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
@@ -96,5 +97,31 @@ struct CheckedViewFacts {
 // the rank minimum whose matrix axes it indexes.
 [[nodiscard]] CheckedViewFacts validate_checked_view(
         const Device& device, const TensorView& view, const char* operation);
+
+// Result of comparing two validated, complete backing-owner ranges.
+enum class BackingRangeRelation {
+    disjoint,
+    overlap,
+    overflow,
+};
+
+// Compare half-open backing ranges while checking both address-end additions.
+// The caller owns the operation-specific response to overflow or overlap.
+[[nodiscard]] inline BackingRangeRelation checked_backing_range_relation(
+        std::uintptr_t lhs_begin, std::size_t lhs_bytes,
+        std::uintptr_t rhs_begin, std::size_t rhs_bytes) noexcept {
+    const std::uintptr_t limit =
+            std::numeric_limits<std::uintptr_t>::max();
+    if (lhs_bytes > limit - lhs_begin || rhs_bytes > limit - rhs_begin) {
+        return BackingRangeRelation::overflow;
+    }
+    const std::uintptr_t lhs_end =
+            lhs_begin + static_cast<std::uintptr_t>(lhs_bytes);
+    const std::uintptr_t rhs_end =
+            rhs_begin + static_cast<std::uintptr_t>(rhs_bytes);
+    return lhs_begin < rhs_end && rhs_begin < lhs_end
+            ? BackingRangeRelation::overlap
+            : BackingRangeRelation::disjoint;
+}
 
 }  // namespace iom::detail

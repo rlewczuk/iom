@@ -69,19 +69,17 @@ namespace iom {
                 throw std::invalid_argument(
                         "LINEAR output shares an input storage handle");
             }
-            const std::uintptr_t out_begin =
-                    reinterpret_cast<std::uintptr_t>(out_handle);
-            const std::uintptr_t input_begin =
-                    reinterpret_cast<std::uintptr_t>(input_handle);
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            if (out_storage_bytes > limit - out_begin
-                    || input_storage_bytes > limit - input_begin) {
+            const detail::BackingRangeRelation range =
+                    detail::checked_backing_range_relation(
+                            reinterpret_cast<std::uintptr_t>(out_handle),
+                            out_storage_bytes,
+                            reinterpret_cast<std::uintptr_t>(input_handle),
+                            input_storage_bytes);
+            if (range == detail::BackingRangeRelation::overflow) {
                 throw std::overflow_error(
                         "LINEAR storage range overflows");
             }
-            if (out_begin < input_begin + input_storage_bytes
-                    && input_begin < out_begin + out_storage_bytes) {
+            if (range == detail::BackingRangeRelation::overlap) {
                 throw std::invalid_argument(
                         "LINEAR output storage range overlaps an input");
             }
@@ -183,18 +181,16 @@ namespace iom {
                 throw std::invalid_argument(
                         "ROPE output shares an input storage handle");
             }
-            const std::uintptr_t out_begin =
-                    reinterpret_cast<std::uintptr_t>(out_handle);
-            const std::uintptr_t input_begin =
-                    reinterpret_cast<std::uintptr_t>(input_handle);
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            if (out_facts.storage_bytes > limit - out_begin
-                    || input_facts.storage_bytes > limit - input_begin) {
+            const detail::BackingRangeRelation range =
+                    detail::checked_backing_range_relation(
+                            reinterpret_cast<std::uintptr_t>(out_handle),
+                            out_facts.storage_bytes,
+                            reinterpret_cast<std::uintptr_t>(input_handle),
+                            input_facts.storage_bytes);
+            if (range == detail::BackingRangeRelation::overflow) {
                 throw std::overflow_error("ROPE storage range overflows");
             }
-            if (out_begin < input_begin + input_facts.storage_bytes
-                    && input_begin < out_begin + out_facts.storage_bytes) {
+            if (range == detail::BackingRangeRelation::overlap) {
                 throw std::invalid_argument(
                         "ROPE output storage range overlaps an input");
             }
@@ -215,22 +211,17 @@ namespace iom {
                 throw std::invalid_argument(
                         "SDPA output shares an input storage handle");
             }
-            const std::uintptr_t out_begin =
-                    reinterpret_cast<std::uintptr_t>(out_handle);
-            const std::uintptr_t input_begin =
-                    reinterpret_cast<std::uintptr_t>(input_handle);
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            if (out_facts.storage_bytes > limit - out_begin
-                    || input_facts.storage_bytes > limit - input_begin) {
+            const detail::BackingRangeRelation range =
+                    detail::checked_backing_range_relation(
+                            reinterpret_cast<std::uintptr_t>(out_handle),
+                            out_facts.storage_bytes,
+                            reinterpret_cast<std::uintptr_t>(input_handle),
+                            input_facts.storage_bytes);
+            if (range == detail::BackingRangeRelation::overflow) {
                 throw std::overflow_error(
                         "SDPA storage range overflows");
             }
-            const std::uintptr_t out_end =
-                    out_begin + out_facts.storage_bytes;
-            const std::uintptr_t input_end =
-                    input_begin + input_facts.storage_bytes;
-            if (out_begin < input_end && input_begin < out_end) {
+            if (range == detail::BackingRangeRelation::overlap) {
                 throw std::invalid_argument(
                         "SDPA output storage range overlaps an input");
             }
@@ -376,20 +367,18 @@ namespace iom {
                 throw std::invalid_argument(
                         "SILU output aliases an input owner");
             }
-            const std::uintptr_t out_begin =
-                    reinterpret_cast<std::uintptr_t>(out.native_handle());
-            const std::uintptr_t input_begin =
-                    reinterpret_cast<std::uintptr_t>(input.native_handle());
-            const std::uintptr_t limit =
-                    std::numeric_limits<std::uintptr_t>::max();
-            if (out_storage_bytes > limit - out_begin
-                    || input_storage_bytes > limit - input_begin) {
+            const detail::BackingRangeRelation range =
+                    detail::checked_backing_range_relation(
+                            reinterpret_cast<std::uintptr_t>(
+                                    out.native_handle()),
+                            out_storage_bytes,
+                            reinterpret_cast<std::uintptr_t>(
+                                    input.native_handle()),
+                            input_storage_bytes);
+            if (range == detail::BackingRangeRelation::overflow) {
                 throw std::overflow_error("SILU storage range overflows");
             }
-            const std::uintptr_t out_end = out_begin + out_storage_bytes;
-            const std::uintptr_t input_end =
-                    input_begin + input_storage_bytes;
-            if (out_begin < input_end && input_begin < out_end) {
+            if (range == detail::BackingRangeRelation::overlap) {
                 throw std::invalid_argument(
                         "SILU output storage range overlaps an input");
             }
