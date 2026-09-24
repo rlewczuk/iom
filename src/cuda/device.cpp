@@ -19,6 +19,7 @@
 #include "driver.hpp"
 #include "iom/detail/gpu_arena_config.hpp"
 #include "../shared/standard_tiled_copy.hpp"
+#include "../shared/queue_resources.hpp"
 
 namespace iom {
 
@@ -165,38 +166,10 @@ detail::QueueResourceLease CudaDevice::reserve_queue_resources() {
     activate();
     std::lock_guard<std::mutex> lock(bookkeeping_mutex_);
     const std::size_t slot_count = queue_slot_count_;
-    std::vector<std::size_t> indices;
-    indices.reserve(slot_count);
-    try {
-        for (std::size_t index = 0; index < slot_count; ++index) {
-            void* block = metadata_allocator_->alloc(detail::kMetadataSlotBytes);
-            indices.push_back(metadata_allocator_->index_of(block));
-        }
-    } catch (...) {
-        for (const std::size_t index : indices) {
-            metadata_allocator_->free(metadata_allocator_->ptr_from_index(index));
-        }
-        throw;
-    }
-    std::sort(indices.begin(), indices.end());
-    const std::size_t base = indices.front();
-    for (std::size_t index = 0; index < slot_count; ++index) {
-        if (indices[index] != base + index || base % slot_count != 0) {
-            release_queue_resources_locked(base, slot_count);
-            throw std::logic_error(
-                    "metadata partition reservation lost the device's C-slot "
-                    "geometry");
-        }
-    }
-    const std::size_t mirror_bytes =
-            slot_count * detail::kMetadataSlotBytes;
-    std::unique_ptr<std::byte[]> host_mirrors;
-    try {
-        host_mirrors = std::make_unique<std::byte[]>(mirror_bytes);
-    } catch (...) {
-        release_queue_resources_locked(base, slot_count);
-        throw;
-    }
+    auto reservation = detail::reserve_queue_partition(
+            *metadata_allocator_, slot_count);
+    const std::size_t base = reservation.first_slot;
+    auto host_mirrors = std::move(reservation.host_mirrors);
 
     if (slot_count > std::numeric_limits<std::size_t>::max()
             / sizeof(std::uint32_t)) {

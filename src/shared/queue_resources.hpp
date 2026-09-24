@@ -10,12 +10,19 @@
 // stream, worker, or completion-resource creation, and a fifth live queue
 // reports std::bad_alloc from that first step.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <utility>
+#include <vector>
+
+#include "iom/alloc.hpp"
+
 namespace iom::detail {
 
 inline constexpr std::size_t kMaxLiveGpuQueues = 4;
@@ -25,7 +32,57 @@ inline constexpr std::size_t kMaxLiveGpuQueues = 4;
 // metadata arena backing.
 inline constexpr std::size_t kMetadataSlotBytes = 512;
 
+struct QueueResourceReservation final {
+    std::size_t first_slot;
+    std::unique_ptr<std::byte[]> host_mirrors;
+};
+
+// Reserve one aligned, contiguous C-slot partition and its fixed host mirrors.
+// The caller owns allocator synchronization and the returned slots.
+[[nodiscard]] inline QueueResourceReservation reserve_queue_partition(
+        FixedSizeAllocator& allocator, std::size_t slot_count) {
+    std::vector<std::size_t> indices;
+    indices.reserve(slot_count);
+    try {
+        for (std::size_t index = 0; index < slot_count; ++index) {
+            void* block = allocator.alloc(kMetadataSlotBytes);
+            indices.push_back(allocator.index_of(block));
+        }
+    } catch (...) {
+        for (const std::size_t index : indices) {
+            allocator.free(allocator.ptr_from_index(index));
+        }
+        throw;
+    }
+
+    std::sort(indices.begin(), indices.end());
+    const std::size_t base = indices.front();
+    for (std::size_t index = 0; index < slot_count; ++index) {
+        if (indices[index] != base + index || base % slot_count != 0) {
+            for (const std::size_t reserved : indices) {
+                allocator.free(allocator.ptr_from_index(reserved));
+            }
+            throw std::logic_error(
+                    "metadata partition reservation lost the device's C-slot "
+                    "geometry");
+        }
+    }
+
+    std::unique_ptr<std::byte[]> host_mirrors;
+    try {
+        host_mirrors = std::make_unique<std::byte[]>(
+                slot_count * kMetadataSlotBytes);
+    } catch (...) {
+        for (const std::size_t index : indices) {
+            allocator.free(allocator.ptr_from_index(index));
+        }
+        throw;
+    }
+    return {base, std::move(host_mirrors)};
+}
+
 class QueueResourceProvider;
+
 
 // One queue's fixed resource lease: the queue-count credit, one disjoint
 // C-slot partition of the Device-wide metadata FixedSizeAllocator, the
