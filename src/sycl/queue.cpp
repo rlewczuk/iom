@@ -743,6 +743,8 @@ void SyclQueue::execute(Task& task) {
         throw std::bad_alloc();
     }
     {
+        // Submission overlaps completion of earlier tasks on this queue.
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto [it, inserted] = outcomes_.emplace(
                 task.sequence,
                 SyclSequenceOutcome{
@@ -844,6 +846,7 @@ void SyclQueue::execute_cache_append(Task& task) {
         outcome.workspace_lease =
                 task.cache_append_request->workspace_lease;
         outcome.cache_append_entries = task.cache_append_entries;
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto [it, inserted] = outcomes_.emplace(
                 task.sequence, std::move(outcome));
         if (!inserted) {

@@ -430,6 +430,7 @@ void SyclQueue::execute_rope(Task& task) {
         throw std::bad_alloc();
     }
     {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto [it, inserted] = outcomes_.emplace(
                 task.sequence,
                 SyclSequenceOutcome{

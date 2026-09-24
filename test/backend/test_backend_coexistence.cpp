@@ -5,6 +5,7 @@
 #include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <new>
 #include <optional>
@@ -57,6 +58,7 @@ constexpr int kHipSuccess = 0;
 #include <sycl/sycl.hpp>
 
 #include "iom/sycl/device.hpp"
+#include "copy.hpp"
 #include "runtime.hpp"
 #endif
 
@@ -549,20 +551,21 @@ void run_concurrent_queue_scenario(
 
         std::vector<std::unique_ptr<iom::DeviceOps>> queue(kQueues);
         std::vector<std::vector<iom::oid>> tokens(kQueues);
-        std::atomic<bool> failed = false;
+        std::vector<std::exception_ptr> failures(kQueues);
+        std::vector<const char*> phases(kQueues, "create queue");
+        std::vector<int> copy_indices(kQueues, -1);
         std::barrier gate(kQueues + 1);
         std::vector<std::thread> threads;
         threads.reserve(kQueues);
         for (int worker = 0; worker < kQueues; ++worker) {
             threads.emplace_back([&, worker] {
-                // A worker that fails must still contribute its remaining
-                // barrier arrivals so a phase can never strand the main
-                // thread; non-blocking arrive() drains without disturbing
-                // the healthy workers' phase waits.
+                // A failed worker still participates in each remaining
+                // phase. Waiting is essential: repeated non-blocking
+                // arrivals could otherwise all count toward one phase.
                 int arrivals = 0;
                 auto drain_arrivals = [&] {
                     while (arrivals < 3) {
-                        (void)gate.arrive();
+                        gate.arrive_and_wait();
                         ++arrivals;
                     }
                 };
@@ -576,19 +579,22 @@ void run_concurrent_queue_scenario(
                     // counter across the queues' worker paths.
                     gate.arrive_and_wait();
                     ++arrivals;
+                    phases[worker] = "submit copy";
                     for (int copy_index = 0;
                          copy_index < kCopiesPerQueue; ++copy_index) {
+                        copy_indices[worker] = copy_index;
                         tokens[worker].push_back(queue[worker]->copy(
                                 source->view(),
                                 destination[worker]->view()));
                     }
                     gate.arrive_and_wait();
                     ++arrivals;
+                    phases[worker] = "wait";
                     for (const iom::oid token : tokens[worker]) {
                         queue[worker]->wait(token);
                     }
                 } catch (...) {
-                    failed.store(true, std::memory_order_release);
+                    failures[worker] = std::current_exception();
                     drain_arrivals();
                 }
             });
@@ -599,7 +605,38 @@ void run_concurrent_queue_scenario(
         for (std::thread& thread : threads) {
             thread.join();
         }
-        CHECK_FALSE(failed.load(std::memory_order_acquire));
+        std::string failure_message;
+        for (int worker = 0; worker < kQueues; ++worker) {
+            if (!failures[worker]) continue;
+            failure_message += std::string(name) + " worker "
+                    + std::to_string(worker) + " phase " + phases[worker]
+                    + " copy " + std::to_string(copy_indices[worker]) + ": ";
+            try {
+                std::rethrow_exception(failures[worker]);
+            } catch (const std::exception& error) {
+                failure_message += error.what();
+            } catch (...) {
+                failure_message += "non-standard exception";
+            }
+            failure_message += '\n';
+        }
+        // Do not inspect destinations or use survivor queues after any
+        // worker failure. All workers have joined before this unwinds.
+        if (!failure_message.empty()) {
+            throw std::runtime_error(failure_message);
+        }
+        std::set<iom::oid> distinct_tokens;
+        std::set<unsigned> distinct_queues;
+        for (int worker = 0; worker < kQueues; ++worker) {
+            REQUIRE(queue[worker] != nullptr);
+            REQUIRE_EQ(tokens[worker].size(), kCopiesPerQueue);
+            CHECK(distinct_queues.insert(
+                    iom_conformance::token_queue(tokens[worker].front())).second);
+            for (const iom::oid token : tokens[worker]) {
+                REQUIRE(iom::oid_is_token(token));
+                CHECK(distinct_tokens.insert(token).second);
+            }
+        }
 
         // Every operation completed; every destination matches the CPU
         // reference, proving each copy ran with its own unique entry pair.
@@ -623,6 +660,8 @@ void run_concurrent_queue_scenario(
                     source->view(),
                     late_destination[survivor - 1]->view());
         }
+        const auto released_id =
+                iom_conformance::token_queue(tokens[0].front());
         queue[0].reset();
         for (int survivor = 1; survivor < kQueues; ++survivor) {
             queue[survivor]->wait(late_tokens[survivor - 1]);
@@ -651,6 +690,16 @@ void run_concurrent_queue_scenario(
             iom_conformance::require_logical_bytes(
                     destination[survivor]->view(), expected, name);
         }
+        // Reuse the released queue credit and metadata partition while
+        // all three survivors remain alive.
+        auto recreated = device.create_ops();
+        const iom::oid reused_token =
+                recreated->copy(source->view(), destination[0]->view());
+        REQUIRE(iom::oid_is_token(reused_token));
+        CHECK_EQ(iom_conformance::token_queue(reused_token), released_id);
+        recreated->wait(reused_token);
+        iom_conformance::require_logical_bytes(
+                destination[0]->view(), expected, name);
     }
 
     // All 2 * kQueues tensor storages (one source + kQueues destinations +
@@ -670,8 +719,8 @@ void run_concurrent_queue_scenario(
 }
 
 // The registry stores per-device queue and entry ids; concurrent queue
-// creation and submission on one device must stay serialized so every queue
-// receives a distinct registry identity and every copy a unique entry pair.
+// creation and submission must retain distinct registry identities and
+// unique entry pairs without serializing entire queue lifetimes.
 TEST_CASE(
         "Backend coexistence: concurrent queue creation and submission "
         "on one device") {
@@ -705,6 +754,22 @@ TEST_CASE(
     }
 #endif
 }
+
+#ifdef IOM_COEXIST_SYCL
+TEST_CASE("SYCL concurrent queue creation reports worker failure and recovers") {
+    auto device = iom::make_sycl_device(
+            0, iom::DeviceMemoryConfig{kCoexistenceArenaBytes});
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::queue_stream_create);
+    CHECK_THROWS_AS(
+            run_concurrent_queue_scenario<int>("sycl", *device, nullptr),
+            std::runtime_error);
+    iom::sycl_detail::inject_submission_fault_for_testing(
+            iom::sycl_detail::SubmissionFault::none);
+    // Failure joined every worker and released every queue reservation.
+    run_concurrent_queue_scenario<int>("sycl", *device, nullptr);
+}
+#endif
 namespace {
 
 std::vector<std::byte> coexistence_uniform(

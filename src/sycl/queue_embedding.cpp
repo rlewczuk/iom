@@ -62,6 +62,7 @@ void SyclQueue::execute_embedding(Task& task) {
     }
     const EmbeddingRequest captured = *task.embedding_request;
     {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto [it, inserted] = outcomes_.emplace(
                 task.sequence,
                 SyclSequenceOutcome{

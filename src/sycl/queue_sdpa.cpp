@@ -360,6 +360,7 @@ void SyclQueue::execute_sdpa(Task& task) {
         outcome.state = task.state;
         outcome.workspace_lease = task.sdpa_lease;
         outcome.sdpa_entries = task.sdpa_entries;
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto [it, inserted] = outcomes_.emplace(
                 task.sequence, std::move(outcome));
         if (!inserted) {

@@ -1196,6 +1196,7 @@ void SyclQueue::execute_linear(Task& task) {
         throw std::bad_alloc();
     }
     {
+        std::lock_guard<std::mutex> lock(outcome_mutex_);
         const auto [it, inserted] = outcomes_.emplace(
                 task.sequence,
                 SyclSequenceOutcome{
