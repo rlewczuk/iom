@@ -168,6 +168,15 @@ target_link_libraries(iom_cpu_tests
         libiom
 )
 
+# The AVX-512 BF16 stage/path observation seam exists only in test builds; this
+# target defines it exactly as libiom does, so a CPU test can record and query
+# executed stage work. The test directory itself is added only when
+# BUILD_TESTING is enabled.
+target_compile_definitions(iom_cpu_tests
+    PRIVATE
+        IOM_AVX512_BF16_TESTING
+)
+
 add_test(NAME iom_cpu_tests COMMAND iom_cpu_tests)
 
 add_executable(iom_cpu_bench
@@ -652,6 +661,26 @@ target_link_libraries(iom_backend_conformance_cpu_tests
         doctest::doctest
         libiom
 )
+
+# The AVX-512 BF16 stage/path observation seam exists only in test builds; this
+# target defines it exactly as libiom does, so a CPU test can record and query
+# executed stage work.
+target_compile_definitions(iom_backend_conformance_cpu_tests
+    PRIVATE
+        IOM_AVX512_BF16_TESTING
+)
+
+# Whether this configuration contains the isolated AVX-512 BF16 sources is a
+# property of the configured build alone, so the eligibility case below is told
+# which answer this configuration owes. The comparison it performs is still
+# against CPUID/XCR0 read independently inside the test, and libiom's own
+# marker remains private to libiom.
+if(AVX_512_BF16_ENABLED)
+    target_compile_definitions(iom_backend_conformance_cpu_tests
+        PRIVATE
+            IOM_TEST_AVX512_BF16_ENABLED
+    )
+endif()
 
 # The official case is compiled into this binary only for the opt-in wrapper,
 # but the ordinary aggregate registration must never bypass that wrapper's

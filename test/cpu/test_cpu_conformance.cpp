@@ -1,5 +1,9 @@
 #include <doctest/doctest.h>
 
+#if defined(__x86_64__)
+#include <cpuid.h>
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -30,6 +34,8 @@
 #endif
 #include "iom/alloc.hpp"
 #include "iom/cpu/device.hpp"
+
+#include "../../src/cpu/avx512_bf16.hpp"
 
 namespace {
 
@@ -334,6 +340,77 @@ TEST_CASE("CPU conformance: binary operations are supported") {
             *devices.candidate, devices.candidate->supported_data_types(),
             &devices.gate, "CPU", true, true, true);
     CHECK_FALSE(devices.gate.armed());
+}
+
+// The AVX-512 BF16 detector must answer from this machine's real CPUID and
+// OS-managed vector state, so this case reads both itself rather than reusing
+// the library's query. Only baseline instructions are involved: CPUID leaves 1
+// and 7 exist on any x86-64, and XGETBV runs only when CPUID reports OSXSAVE.
+//
+// The case does not observe the ordering of those two steps: a host whose
+// OSXSAVE bit is set cannot show that the other branch skips XGETBV, so that
+// half of the contract is checked against the compiled detector instead.
+namespace {
+
+struct HostVectorState {
+    bool avx512f = false;
+    bool avx512_bf16 = false;
+    bool osxsave = false;
+    std::uint64_t xcr0 = 0;
+
+    // The same five XCR0 bits the workers' instructions need the OS to have
+    // enabled: XMM, YMM, opmask, upper ZMM, and high ZMM.
+    [[nodiscard]] bool supports_avx512_bf16() const {
+        constexpr std::uint64_t required =
+                (std::uint64_t{1} << 1) | (std::uint64_t{1} << 2) |
+                (std::uint64_t{1} << 5) | (std::uint64_t{1} << 6) |
+                (std::uint64_t{1} << 7);
+        return avx512f && avx512_bf16 && osxsave &&
+                (xcr0 & required) == required;
+    }
+};
+
+HostVectorState read_host_vector_state() {
+    HostVectorState state;
+#if defined(__x86_64__)
+    unsigned int registers[4] = {};
+    __cpuid_count(7, 0, registers[0], registers[1], registers[2], registers[3]);
+    state.avx512f = (registers[1] & (1u << 16)) != 0;
+    const unsigned int highest_subleaf = registers[0];
+    if (highest_subleaf >= 1) {
+        __cpuid_count(
+                7, 1, registers[0], registers[1], registers[2], registers[3]);
+        state.avx512_bf16 = (registers[0] & (1u << 5)) != 0;
+    }
+
+    __cpuid_count(1, 0, registers[0], registers[1], registers[2], registers[3]);
+    state.osxsave = (registers[2] & (1u << 27)) != 0;
+    if (state.osxsave) {
+        std::uint32_t low = 0;
+        std::uint32_t high = 0;
+        __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+        state.xcr0 = (static_cast<std::uint64_t>(high) << 32) | low;
+    }
+#endif
+    return state;
+}
+
+}  // namespace
+
+TEST_CASE("CPU AVX-512 BF16 eligibility follows this host's vector state") {
+    const HostVectorState host = read_host_vector_state();
+    const bool eligible = iom::cpu_detail::avx512_bf16_available();
+
+#ifdef IOM_TEST_AVX512_BF16_ENABLED
+    // This configuration compiles the isolated AVX-512 BF16 sources, so the
+    // detector reports exactly the features and vector-state bits this machine
+    // offers.
+    CHECK_EQ(eligible, host.supports_avx512_bf16());
+#else
+    // A configuration without those sources has no target code to enter, so it
+    // answers false whatever the host reports.
+    CHECK_FALSE(eligible);
+#endif
 }
 
 TEST_CASE("CPU conformance: SDPA reference, admission, and lifetime") {

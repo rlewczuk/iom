@@ -178,6 +178,7 @@ set(IOM_SOURCES
         src/tensor_view.cpp
         src/token_selection.cpp
         src/cpu/device.cpp
+        src/cpu/avx512_bf16_dispatch.cpp
         src/cpu/tensor.cpp
         src/cpu/sdpa.cpp
         src/cpu/queue.cpp
@@ -565,6 +566,16 @@ if(BUILD_TESTING)
     if(ROCM_ENABLED)
         target_compile_definitions(iom_rocm PUBLIC IOM_ENABLE_TESTING)
     endif()
+
+    # The AVX-512 BF16 stage/path observation seam is a test-build-only
+    # contract: the definition is private to libiom and to the CPU test targets
+    # that query it, so a production build contains neither the observation
+    # functions nor their counter state. The detector itself is unaffected; it
+    # is baseline code in every configuration.
+    target_compile_definitions(libiom
+        PRIVATE
+            IOM_AVX512_BF16_TESTING
+    )
 endif()
 
 if(BUILD_TESTING)
