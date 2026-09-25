@@ -69,6 +69,101 @@ option(CUDA_ENABLED "Build with CUDA support" OFF)
 set(CUDA_PATH "/usr/local/cuda" CACHE PATH "Path to the CUDA Toolkit")
 option(ROCM_ENABLED "Build with ROCm support" OFF)
 set(ROCM_PATH "/opt/rocm" CACHE PATH "Path to the ROCm SDK")
+option(AVX_512_BF16_ENABLED
+    "Build explicitly registered CPU sources with isolated AVX-512 BF16 target options"
+    OFF)
+
+# The AVX-512 BF16 acceleration path is opt-in and stays out of every portable
+# configuration: the option is OFF by default, and its ISA options are applied
+# per source rather than to libiom as a whole. Consequently the capability
+# probes below run only when the option is ON; a toolchain, target
+# architecture, or command line that cannot support the isolated sources fails
+# here with a reason instead of producing a library that mixes ISA targets.
+if(AVX_512_BF16_ENABLED)
+    include(CheckCXXCompilerFlag)
+    include(CheckCXXSourceCompiles)
+
+    # The exact option list iom_add_avx512_bf16_source() applies to a
+    # registered source. AVX512BF16 builds on the AVX512F vector facility, so
+    # both are requested explicitly; nothing else is enabled globally.
+    set(IOM_AVX512_BF16_COMPILE_OPTIONS "-mavx512f;-mavx512bf16")
+
+    # 1. Target architecture: AVX-512 exists only on x86-64, and the resulting
+    #    objects are linked into the host library, so a non-x86-64 target is a
+    #    configuration error rather than a compile failure deep in a source.
+    check_cxx_source_compiles("
+        #if !defined(__x86_64__) && !defined(_M_X64)
+        #error \"AVX-512 BF16 requires an x86-64 target\"
+        #endif
+        int main() { return 0; }
+    " IOM_AVX512_BF16_TARGET_IS_X86_64)
+    if(NOT IOM_AVX512_BF16_TARGET_IS_X86_64)
+        message(FATAL_ERROR
+            "AVX_512_BF16_ENABLED=ON requires an x86-64 target architecture; "
+            "the configured compiler targets '${CMAKE_SYSTEM_PROCESSOR}'. "
+            "Configure with AVX_512_BF16_ENABLED=OFF for the portable build.")
+    endif()
+
+    # 2. Compiler support for the target options themselves.
+    check_cxx_compiler_flag("-mavx512f" IOM_AVX512_BF16_HAS_AVX512F_OPTION)
+    check_cxx_compiler_flag("-mavx512bf16"
+        IOM_AVX512_BF16_HAS_AVX512BF16_OPTION)
+    if(NOT IOM_AVX512_BF16_HAS_AVX512F_OPTION
+            OR NOT IOM_AVX512_BF16_HAS_AVX512BF16_OPTION)
+        message(FATAL_ERROR
+            "AVX_512_BF16_ENABLED=ON requires a compiler that accepts the "
+            "-mavx512f and -mavx512bf16 target options; "
+            "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} does not "
+            "accept them. Configure with AVX_512_BF16_ENABLED=OFF for the "
+            "portable build.")
+    endif()
+
+    # 3. The required intrinsics: the BF16 vector packing types, the paired
+    #    BF16 dot product into FP32, and the FP32-to-BF16 packing conversion
+    #    the kernels depend on, compiled with exactly the per-source option
+    #    list above.
+    string(REPLACE ";" " " IOM_AVX512_BF16_REQUIRED_FLAGS "${IOM_AVX512_BF16_COMPILE_OPTIONS}")
+    set(CMAKE_REQUIRED_FLAGS "${IOM_AVX512_BF16_REQUIRED_FLAGS}")
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        int main() {
+            __m512 values = _mm512_set1_ps(1.0f);
+            __m512bh packed = _mm512_cvtne2ps_pbh(values, values);
+            __m512 dots = _mm512_dpbf16_ps(values, packed, packed);
+            return _mm512_cvtsi512_si32(_mm512_castps_si512(dots)) == 0;
+        }
+    " IOM_AVX512_BF16_HAS_INTRINSICS)
+    if(NOT IOM_AVX512_BF16_HAS_INTRINSICS)
+        message(FATAL_ERROR
+            "AVX_512_BF16_ENABLED=ON requires the AVX512_BF16 intrinsics "
+            "_mm512_cvtne2ps_pbh and _mm512_dpbf16_ps to compile with "
+            "'${IOM_AVX512_BF16_COMPILE_OPTIONS}'; they do not. Configure with "
+            "AVX_512_BF16_ENABLED=OFF for the portable build.")
+    endif()
+
+    # 4. Target isolation: the shared baseline command line must not already
+    #    target AVX-512, otherwise the per-source options are decorative and
+    #    every baseline object would acquire AVX-512 code generation. MSVC
+    #    spells the same fact with /arch:AVX512, so its predefined macro is
+    #    probed too.
+    set(CMAKE_REQUIRED_FLAGS "")
+    check_cxx_source_compiles("
+        #if defined(__AVX512F__) || defined(__AVX512BF16__) \\
+                || defined(_M_AVX512)
+        #error \"the baseline command line already enables AVX-512\"
+        #endif
+        int main() { return 0; }
+    " IOM_AVX512_BF16_BASELINE_IS_PORTABLE)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(NOT IOM_AVX512_BF16_BASELINE_IS_PORTABLE)
+        message(FATAL_ERROR
+            "AVX_512_BF16_ENABLED=ON requires AVX-512 BF16 code generation to "
+            "stay behind the per-source target options, but "
+            "${CMAKE_CXX_COMPILER} enables AVX-512 for every translation unit "
+            "(configured flags: '${CMAKE_CXX_FLAGS}'). Remove the global ISA "
+            "options or configure with AVX_512_BF16_ENABLED=OFF.")
+    endif()
+endif()
 
 set(IOM_SOURCES
         src/device_ops.cpp
@@ -123,6 +218,67 @@ add_library(libiom STATIC
 set_target_properties(libiom PROPERTIES
     OUTPUT_NAME iom
 )
+
+# The definition marks a build whose isolated AVX-512 BF16 sources exist. It
+# is private to libiom: no other target, and no installed interface, may
+# depend on the optional path's presence.
+if(AVX_512_BF16_ENABLED)
+    target_compile_definitions(libiom
+        PRIVATE
+            IOM_AVX512_BF16_COMPILED
+    )
+endif()
+
+# Register one existing CPU translation unit as an isolated AVX-512 BF16
+# source of libiom. Only the named source receives the AVX512F/AVX512BF16
+# target options and the file is added directly to libiom, so no auxiliary
+# object or helper library is created and every other libiom source keeps the
+# portable baseline command line. The name must be a source that exists in the
+# source tree and is not already part of the baseline list; a source that does
+# not exist yet cannot be registered ahead of its implementation.
+function(iom_add_avx512_bf16_source source)
+    if("${source}" STREQUAL "")
+        message(FATAL_ERROR
+            "iom_add_avx512_bf16_source() requires a source argument")
+    endif()
+    if(NOT AVX_512_BF16_ENABLED)
+        message(FATAL_ERROR
+            "iom_add_avx512_bf16_source(${source}) requires "
+            "AVX_512_BF16_ENABLED=ON; a portable build must not register an "
+            "AVX-512 BF16 source.")
+    endif()
+
+    if(IS_ABSOLUTE "${source}")
+        set(iom_avx512_bf16_source_path "${source}")
+    else()
+        set(iom_avx512_bf16_source_path "${PROJECT_SOURCE_DIR}/${source}")
+    endif()
+    if(NOT EXISTS "${iom_avx512_bf16_source_path}"
+            OR IS_DIRECTORY "${iom_avx512_bf16_source_path}")
+        message(FATAL_ERROR
+            "iom_add_avx512_bf16_source() requires an existing source file; "
+            "'${source}' resolves to '${iom_avx512_bf16_source_path}'")
+    endif()
+    foreach(iom_baseline_source IN LISTS IOM_SOURCES)
+        get_filename_component(iom_baseline_source_path
+            "${PROJECT_SOURCE_DIR}/${iom_baseline_source}" REALPATH)
+        if(iom_avx512_bf16_source_path STREQUAL
+                iom_baseline_source_path)
+            message(FATAL_ERROR
+                "iom_add_avx512_bf16_source() cannot register the baseline "
+                "source '${source}'; baseline sources keep the portable "
+                "command line")
+        endif()
+    endforeach()
+
+    target_sources(libiom
+        PRIVATE
+            "${iom_avx512_bf16_source_path}"
+    )
+    set_source_files_properties("${iom_avx512_bf16_source_path}" PROPERTIES
+        COMPILE_OPTIONS "${IOM_AVX512_BF16_COMPILE_OPTIONS}"
+    )
+endfunction()
 
 
 target_include_directories(libiom
