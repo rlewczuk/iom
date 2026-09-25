@@ -532,3 +532,41 @@ as a `user` message so the model receives its official chat formatting without
 changing the CLI's raw-prompt behavior. On success, stdout contains only the
 generated text and the process exits `0`; setup, model, and execution
 diagnostics remain on stderr with the CLI's documented nonzero status classes.
+
+## Controlled performance experiments
+
+The installed CSW commands separate discovery from execution:
+
+```text
+/csw-perf <task> [remarks]
+/csw-perf-run <task>
+```
+
+`<task>` is a validated path below `.cswd/tasks/`, including nested names.
+Discovery creates HLD hypotheses only; it does not build, benchmark, or
+implement them. It requires the configured `@csw-senior` lane (or explicitly
+selected `@csw-yoda`) and checks prior attempts. The run command coordinates
+independent hypotheses, with one evolving experiment per hypothesis.
+
+Each hypothesis retains `measurements.md` with raw-evidence references and
+all outcomes, including rejected and inconclusive work. Backend indexes live
+in [CPU](docs/perf/CHANGES_CPU.md), [CUDA](docs/perf/CHANGES_CUDA.md),
+[ROCm](docs/perf/CHANGES_ROCM.md), and [SYCL](docs/perf/CHANGES_SYCL.md).
+Non-integrated experiments do not satisfy task dependencies. A candidate
+needs a frozen, matched baseline/candidate comparison before the existing
+all-backend conformance and exact-commit dual-review integration gates.
+Instrumentation and maintained benchmarks use separate leaves and commits;
+intrusive probes must be behind a backend-checked CMake option defaulting OFF.
+
+See the [tool inventory](docs/perf/TOOLS.md) and selected-tool guides for
+[CPU](docs/perf/INSTALL_CPU.md), [CUDA](docs/perf/INSTALL_CUDA.md),
+[ROCm](docs/perf/INSTALL_ROCM.md), and [SYCL](docs/perf/INSTALL_SYCL.md).
+Installed tools do not imply supported counters or sufficient permissions.
+Measurements use the exact remote workspace and bounded host-wide
+`/tmp/iom-perf.lock`; GPU measurements acquire `/tmp/agent-gpu0.lock` second.
+Host elapsed time is not GPU device duration.
+
+Command, skill, agent, and helper assets reside in the existing local `.omp/`
+installation, which this repository ignores; task-local evidence in `.cswd/`
+is also ignored. Preserve those installed assets separately from source
+commits. Ordinary `csw-run` remains a direct-leaf dispatcher.
