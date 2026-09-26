@@ -3,7 +3,6 @@
 #include "transfer_helpers.hpp"
 
 #if defined(IOM_AVX512_BF16_COMPILED)
-#include "avx512_bf16.hpp"
 #include "avx512_bf16_rope.hpp"
 #endif
 #include "avx512_bf16_linear.hpp"
@@ -207,6 +206,16 @@ void avx512_bf16_silu_row(
         const unsigned char* x_base, unsigned char* y_base,
         std::span<const std::size_t> dimensions, std::size_t x_plane,
         std::size_t y_plane, std::size_t run, std::size_t features);
+
+// BF16 DIV vector work of one full tile-column run, defined by the isolated
+// AVX-512 BF16 source `src/cpu/avx512_bf16_binary_div.cpp` that
+// `iom_add_avx512_bf16_source` registers. The signature is scalar-ABI only, so
+// the baseline queue may call it after establishing eligibility, and only a
+// build that compiles that isolated source defines the symbol at all.
+void avx512_bf16_div_run(
+        const unsigned char* lhs, std::size_t lhs_bit,
+        const unsigned char* rhs, std::size_t rhs_bit,
+        unsigned char* out, std::size_t out_bit) noexcept;
 
 }  // namespace cpu_detail
 
@@ -528,7 +537,7 @@ private:
     // Which optional AVX-512 BF16 worker an operation has. `None` also covers
     // an operation whose worker this build cannot enter; either way the scalar
     // codec stays the accepted authority for every operation and leaf.
-    enum class Bf16BinaryOp { None, Mul };
+    enum class Bf16BinaryOp { None, Mul, Div };
 
     // The execution route of one binary request: the codec that serves every
     // operation and leaf, and the optional isolated worker this operation may
@@ -557,6 +566,7 @@ private:
             case DeviceOps::BinaryOperation::Div:
                 route.scalar = &detail::scalar_binary<
                         detail::scalar_add_detail::BinaryOp::div>;
+                route.bf16 = Bf16BinaryOp::Div;
                 break;
         }
         if (route.scalar == nullptr) {
@@ -661,6 +671,77 @@ private:
                     }
                 });
     }
+
+    // One BF16 DIV leaf of the scalar authority inside the optional worker.
+    // The observation seam counts exactly these lanes as the operation's
+    // fallback work, so a test can separate committed SIMD work from the
+    // authority's work without any production telemetry.
+    static void bf16_div_reference_leaf(
+            const DeviceOps::BinaryRequest& request, ScalarBinary scalar,
+            std::size_t bits, const unsigned char* lhs_base,
+            const unsigned char* rhs_base, unsigned char* out_base,
+            std::size_t lhs_plane, std::size_t rhs_plane,
+            std::size_t out_plane, std::size_t row, std::size_t column) {
+#if defined(IOM_AVX512_BF16_TESTING)
+        cpu_detail::avx512_bf16_test_record(
+                cpu_detail::Avx512Bf16Stage::BinaryDiv,
+                cpu_detail::Avx512Bf16Path::Fallback);
+#endif
+        binary_element(
+                request, scalar, bits, lhs_base, rhs_base, out_base,
+                binary_element_slots(
+                        request, lhs_plane, rhs_plane, out_plane, row, column));
+    }
+
+    // The BF16 DIV worker: whole standard-tile column groups of one output row
+    // at a time through the isolated target code, everything else through the
+    // authority above. One group is exactly the sixteen contiguous owner slots
+    // of one tile column, so the target entry is used only for an equally wide,
+    // unbroadcasted operand pair; a broadcast column, a shorter last tile
+    // column and a transformed leading view keep the mapping they already have
+    // and stay with the authority. The target entry decides per lane, from the
+    // two operands and before any arithmetic, whether a lane may cross its
+    // vector divide at all, and writes every excluded lane with the codec, so
+    // an exceptional group is still produced leaf by leaf here rather than by a
+    // partial store.
+    static void binary_bf16_div_elements(
+            const DeviceOps::BinaryRequest& request, ScalarBinary scalar) {
+        const std::size_t columns = request.result_shape.dimensions().back();
+        const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
+        auto* out_base = static_cast<unsigned char*>(request.out.native_handle);
+        const auto* lhs_base =
+                static_cast<const unsigned char*>(request.lhs.native_handle);
+        const auto* rhs_base =
+                static_cast<const unsigned char*>(request.rhs.native_handle);
+        constexpr std::size_t kTileColumn = TensorSpec::TILE;
+        const bool contiguous_columns = !request.lhs.broadcast_columns
+                && !request.rhs.broadcast_columns;
+        visit_binary_rows(
+                request,
+                [&](std::size_t lhs_plane, std::size_t rhs_plane,
+                    std::size_t out_plane, std::size_t row) {
+                    std::size_t column = 0;
+                    if (contiguous_columns) {
+                        for (; column + kTileColumn <= columns;
+                             column += kTileColumn) {
+                            const BinaryElementSlots first =
+                                    binary_element_slots(
+                                            request, lhs_plane, rhs_plane,
+                                            out_plane, row, column);
+                            cpu_detail::avx512_bf16_div_run(
+                                    lhs_base, first.lhs * bits, rhs_base,
+                                    first.rhs * bits, out_base,
+                                    first.out * bits);
+                        }
+                    }
+                    for (; column < columns; ++column) {
+                        bf16_div_reference_leaf(
+                                request, scalar, bits, lhs_base, rhs_base,
+                                out_base, lhs_plane, rhs_plane, out_plane, row,
+                                column);
+                    }
+                });
+    }
 #endif  // IOM_AVX512_BF16_COMPILED
 
     // The BF16 worker the route gate selected: one arm per operation with an
@@ -675,6 +756,16 @@ private:
                 binary_bf16_mul_elements(request, route.scalar);
 #else
                 // Without this build's isolated MUL source the route gate can
+                // never select this arm; deferring to the authority still writes
+                // the result rather than nothing.
+                binary_reference_elements(request, route.scalar);
+#endif
+                break;
+            case Bf16BinaryOp::Div:
+#if defined(IOM_AVX512_BF16_COMPILED)
+                binary_bf16_div_elements(request, route.scalar);
+#else
+                // Without this build's isolated DIV source the route gate can
                 // never select this arm; deferring to the authority still writes
                 // the result rather than nothing.
                 binary_reference_elements(request, route.scalar);

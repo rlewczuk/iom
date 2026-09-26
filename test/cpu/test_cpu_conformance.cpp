@@ -2,6 +2,7 @@
 
 #if defined(__x86_64__)
 #include <cpuid.h>
+#include <immintrin.h>
 #endif
 
 #include <algorithm>
@@ -302,6 +303,575 @@ TEST_CASE("CPU conformance: binary MUL SUB and floating DIV values through real 
                  iom_conformance::BinaryOperation::div}) {
         iom_conformance::run_binary_value_conformance(
                 *devices.candidate, operation);
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+// BF16 DIV is the one binary route whose accelerated work is a per-lane
+// decision taken from the two operands alone: the kernel divides and converts
+// only lanes whose operands are both normal and whose exponent difference keeps
+// the quotient inside the normal FP32 range, and leaves every other lane - NaN,
+// 0/0, infinity/infinity, zero, infinity, overflow, subnormal operand, subnormal
+// result or an out-of-window quotient - to the scalar reference inside the same
+// accepted worker without ever dividing or converting it. These cases pin that
+// whole class list, the mapping, alias and untouched-storage boundaries against
+// the independent oracle, and observe which of the two paths produced the work.
+// They run in every configuration: without the isolated sources, or on a host
+// that cannot enter them, the same values must come out of the scalar
+// traversal.
+namespace {
+
+std::vector<std::byte> bf16_div_bytes(std::span<const std::uint16_t> values) {
+    std::vector<std::byte> bytes(values.size() * 2);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        iom_conformance::write_bits(
+                reinterpret_cast<unsigned char*>(bytes.data()), index * 16, 16,
+                values[index]);
+    }
+    return bytes;
+}
+
+[[nodiscard]] std::uint16_t bf16_div_expected(
+        std::uint16_t lhs, std::uint16_t rhs) {
+    return static_cast<std::uint16_t>(iom_conformance::add_oracle::binary(
+            iom::DataType::BF16, lhs, rhs,
+            iom_conformance::add_oracle::operation::div));
+}
+
+// Submits one BF16 DIV over the given views and compares every logical
+// destination leaf bit for bit against the independent oracle.
+void run_bf16_div_views(
+        iom::DeviceOps& queue, const iom::TensorView& lhs,
+        const iom::TensorView& rhs, iom::TensorView& out,
+        std::span<const std::uint16_t> expected) {
+    REQUIRE_EQ(expected.size(), out.spec().shape.element_count());
+    const iom::oid token = iom_conformance::submit_binary_operation(
+            queue, iom_conformance::BinaryOperation::div, lhs, rhs, out);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue.wait(token));
+    const std::vector<std::byte> observed = iom_conformance::read_logical(out);
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        CAPTURE(index);
+        CHECK_EQ(
+                static_cast<std::uint16_t>(
+                        iom_conformance::add_read_bits(observed, index, 16)),
+                expected[index]);
+    }
+}
+
+// Every physical byte of a freshly zeroed destination storage that no logical
+// element of `view` addresses must still be zero after the operation. The
+// addressed set is derived through the same plane mapping the queue uses - the
+// view's own plane offset and leading strides - so a transformed or sliced view
+// is checked against the storage it really touches, and the vector route's
+// whole in-tile row stores may spill neither into the tile padding of a short
+// logical row nor into a plane the view does not address.
+void require_bf16_div_padding_untouched(
+        const iom::TensorSpec& storage_spec, const iom::TensorView& view) {
+    const std::span<const std::size_t> dimensions =
+            view.spec().shape.dimensions();
+    const std::size_t matrix_rank = dimensions.size() - 2;
+    const std::span<const std::size_t> strides = view.plane_strides();
+    REQUIRE_EQ(strides.size(), matrix_rank);
+    std::vector<unsigned char> touched(storage_spec.tiled_storage_nbytes(), 0);
+    const auto mark_plane = [&](std::size_t plane) {
+        for (std::size_t row = 0; row < dimensions[matrix_rank]; ++row) {
+            for (std::size_t column = 0;
+                 column < dimensions[matrix_rank + 1]; ++column) {
+                const std::size_t byte = iom::detail::standard_plane_slot(
+                        view.spec(), plane, row, column) * 2;
+                touched[byte] = 1;
+                touched[byte + 1] = 1;
+            }
+        }
+    };
+    auto visit = [&](auto&& self, std::size_t axis, std::size_t plane) -> void {
+        if (axis == matrix_rank) {
+            mark_plane(plane);
+            return;
+        }
+        for (std::size_t index = 0; index < dimensions[axis]; ++index) {
+            self(self, axis + 1, plane + index * strides[axis]);
+        }
+    };
+    visit(visit, 0, view.plane_offset());
+    const auto* storage =
+            static_cast<const unsigned char*>(view.native_handle());
+    for (std::size_t byte = 0; byte < touched.size(); ++byte) {
+        if (touched[byte] == 0) {
+            CHECK_EQ(storage[byte], 0);
+        }
+    }
+}
+
+[[nodiscard]] std::uint64_t bf16_div_native_runs() {
+    return iom::cpu_detail::avx512_bf16_test_observation(
+            iom::cpu_detail::Avx512Bf16Stage::BinaryDiv,
+            iom::cpu_detail::Avx512Bf16Path::Native);
+}
+
+[[nodiscard]] std::uint64_t bf16_div_fallback_runs() {
+    return iom::cpu_detail::avx512_bf16_test_observation(
+            iom::cpu_detail::Avx512Bf16Stage::BinaryDiv,
+            iom::cpu_detail::Avx512Bf16Path::Fallback);
+}
+
+// Operand lists covering every class BF16 DIV separates, used as a full
+// dividend-by-divisor cross product: signed zeros, zero divisors and dividends,
+// both infinities, quiet NaNs, subnormals on both sides, the smallest and
+// largest finite values, quotients that underflow, and division probes whose
+// result is not representable in eight significand bits.
+constexpr std::uint16_t kDivDividends[] = {
+        0x0000, 0x8000, 0x3f80, 0xbf80, 0x4000, 0x7f80, 0xff80, 0x7fc0,
+        0x0001, 0x0003, 0x0080, 0x7f7f, 0x3f81, 0x3e80, 0x4048, 0x7fc1,
+};
+constexpr std::uint16_t kDivDivisors[] = {
+        0x3f80, 0x4000, 0xbf80, 0x0000, 0x8000, 0x7f80, 0xff80, 0x7fc0,
+        0x0001, 0x0002, 0x0080, 0x7f7f, 0x3d00, 0x4100, 0x3f01, 0x7f7e,
+};
+constexpr std::size_t kDivDividendCount =
+        sizeof(kDivDividends) / sizeof(kDivDividends[0]);
+constexpr std::size_t kDivDivisorCount =
+        sizeof(kDivDivisors) / sizeof(kDivDivisors[0]);
+// Ordinary BF16 operands: every decoded operand and every quotient stays in the
+// normal FP32 range, which is exactly the parity-safe class the vector kernel
+// may compute on.
+constexpr std::uint16_t kDivOrdinary[] = {
+        0x3f80, 0x4000, 0x4040, 0x4080, 0x3f00, 0x3e80, 0x4048, 0x3fc0,
+        0xbf80, 0xc000, 0x40c0, 0x3d00, 0x4120, 0x3f81, 0x40a0, 0x3e00,
+};
+constexpr std::size_t kDivOrdinaryCount =
+        sizeof(kDivOrdinary) / sizeof(kDivOrdinary[0]);
+// Directed operand pairs in which no lane is parity-safe: at least one operand
+// is NaN, zero, infinity or subnormal, or both operands are normal but their
+// exponent difference puts the quotient outside the normal FP32 range, so a
+// lane either cannot keep the vector divide's exception behaviour or cannot
+// keep its result.
+constexpr std::uint16_t kDivExceptional[][2] = {
+        {0x0000, 0x0000}, {0x8000, 0x0000}, {0x7f80, 0x7f80},
+        {0xff80, 0x7f80}, {0x7fc0, 0x3f80}, {0xbf80, 0x7fc0},
+        {0x3f80, 0x7f80}, {0xbf80, 0x7f80}, {0x0000, 0x3f80},
+        {0x3f80, 0x0000}, {0xbf80, 0x8000}, {0x0001, 0x3f80},
+        {0x3f80, 0x0001}, {0x0002, 0x0003}, {0x7f7f, 0x0001},
+        {0x0003, 0x0002}, {0x0080, 0x7f7f}, {0x7f7f, 0x0080},
+};
+constexpr std::size_t kDivExceptionalCount =
+        sizeof(kDivExceptional) / sizeof(kDivExceptional[0]);
+
+}  // namespace
+
+TEST_CASE("CPU conformance: BF16 DIV exceptional, subnormal and rounding parity") {
+    CpuDevices devices;
+    auto queue = devices.candidate->create_ops();
+
+    // The full cross product of both class lists: every dividend class meets
+    // every divisor class in a 16x16 matrix, so each pair's contract result -
+    // NaN, signed zero, infinity, subnormal, overflow or a rounded finite
+    // quotient - is compared against the independent oracle.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{kDivDividendCount, kDivDivisorCount}},
+                iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t row = 0; row < kDivDividendCount; ++row) {
+            for (std::size_t column = 0; column < kDivDivisorCount; ++column) {
+                const std::size_t index = row * kDivDivisorCount + column;
+                lhs_values[index] = kDivDividends[row];
+                rhs_values[index] = kDivDivisors[column];
+                expected[index] = bf16_div_expected(
+                        kDivDividends[row], kDivDivisors[column]);
+            }
+        }
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(spec.logical_nbytes(), std::byte{0}));
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), out->view(), expected);
+        require_bf16_div_padding_untouched(spec, out->view());
+    }
+
+    // A logically short row: 33 columns are two whole tile-column groups plus a
+    // one-column tail, and the twelve padding columns of every tile row must
+    // stay untouched while the tail lane still follows the contract.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{16, 33}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] = kDivDividends[index % kDivDividendCount];
+            rhs_values[index] =
+                    kDivDivisors[(index / 33) % kDivDivisorCount];
+            expected[index] =
+                    bf16_div_expected(lhs_values[index], rhs_values[index]);
+        }
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(spec.logical_nbytes(), std::byte{0}));
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), out->view(), expected);
+        require_bf16_div_padding_untouched(spec, out->view());
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU conformance: BF16 DIV broadcast, transformed views and exact alias") {
+    CpuDevices devices;
+    auto queue = devices.candidate->create_ops();
+
+    // Broadcast singleton mapping ahead of the tiled slot mapping, with a short
+    // logical tail: the dividend broadcasts its row extent, the divisor
+    // broadcasts its column extent, and 33 columns are two whole groups plus
+    // one.
+    {
+        const iom::TensorSpec lhs_spec{
+                iom::TensorShape{{2, 1, 33}}, iom::DataType::BF16};
+        const iom::TensorSpec rhs_spec{
+                iom::TensorShape{{1, 17, 1}}, iom::DataType::BF16};
+        const iom::TensorSpec out_spec{
+                iom::TensorShape{{2, 17, 33}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(lhs_spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] = kDivDividends[index % kDivDividendCount];
+        }
+        std::vector<std::uint16_t> rhs_values(rhs_spec.shape.element_count());
+        for (std::size_t index = 0; index < rhs_values.size(); ++index) {
+            rhs_values[index] = kDivDivisors[(index + 3) % kDivDivisorCount];
+        }
+        std::vector<std::uint16_t> expected(out_spec.shape.element_count());
+        for (std::size_t plane = 0; plane < 2; ++plane) {
+            for (std::size_t row = 0; row < 17; ++row) {
+                for (std::size_t column = 0; column < 33; ++column) {
+                    expected[(plane * 17 + row) * 33 + column] =
+                            bf16_div_expected(
+                                    lhs_values[plane * 33 + column],
+                                    rhs_values[row]);
+                }
+            }
+        }
+        auto lhs = devices.candidate->create_tensor(lhs_spec);
+        auto rhs = devices.candidate->create_tensor(rhs_spec);
+        auto out = devices.candidate->create_tensor(out_spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(out_spec.logical_nbytes(), std::byte{0}));
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), out->view(), expected);
+        require_bf16_div_padding_untouched(out_spec, out->view());
+    }
+
+    // Transformed views: a four-plane owner sliced to physical planes 1 and 3,
+    // so the operands and the destination carry a non-zero plane offset and a
+    // plane stride of two, every physical plane holds its own values, and the
+    // planes the view does not address - like the tile padding - must stay
+    // untouched.
+    {
+        const iom::TensorSpec owner_spec{
+                iom::TensorShape{{1, 4, 16, 16}}, iom::DataType::BF16};
+        constexpr std::size_t plane_elements = 16 * 16;
+        const std::size_t elements = owner_spec.shape.element_count();
+        std::vector<std::uint16_t> lhs_values(elements);
+        std::vector<std::uint16_t> rhs_values(elements);
+        for (std::size_t index = 0; index < elements; ++index) {
+            const std::size_t plane = index / plane_elements;
+            lhs_values[index] =
+                    kDivOrdinary[(index + plane) % kDivOrdinaryCount];
+            rhs_values[index] =
+                    kDivDividends[(index / 17 + plane) % kDivDividendCount];
+        }
+        auto lhs = devices.candidate->create_tensor(owner_spec);
+        auto rhs = devices.candidate->create_tensor(owner_spec);
+        auto out = devices.candidate->create_tensor(owner_spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(
+                        owner_spec.logical_nbytes(), std::byte{0}));
+        iom::TensorView lhs_view = lhs->view().slice(1, 1, 2, 2);
+        iom::TensorView rhs_view = rhs->view().slice(1, 1, 2, 2);
+        iom::TensorView out_view = out->view().slice(1, 1, 2, 2);
+        REQUIRE_EQ(lhs_view.plane_offset(), std::size_t{1});
+        REQUIRE_EQ(lhs_view.spec().shape.element_count(), 2 * plane_elements);
+        std::vector<std::uint16_t> expected(
+                out_view.spec().shape.element_count());
+        for (std::size_t plane = 0; plane < 2; ++plane) {
+            // View plane `plane` is the owner's physical plane 1 + 2 * plane.
+            const std::size_t owner_plane = 1 + 2 * plane;
+            for (std::size_t row = 0; row < 16; ++row) {
+                for (std::size_t column = 0; column < 16; ++column) {
+                    const std::size_t owner =
+                            (owner_plane * 16 + row) * 16 + column;
+                    expected[plane * plane_elements + row * 16 + column] =
+                            bf16_div_expected(
+                                    lhs_values[owner], rhs_values[owner]);
+                }
+            }
+        }
+        run_bf16_div_views(*queue, lhs_view, rhs_view, out_view, expected);
+        // The sliced view addresses the owner's planes 1 and 3; planes 0 and 2
+        // must still be zero.
+        require_bf16_div_padding_untouched(owner_spec, out_view);
+    }
+
+    // Exact alias: the destination is the dividend's own view. Both operands
+    // must be read before the destination store, which the vector route keeps
+    // in registers.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{3, 32}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] = kDivDividends[index % kDivDividendCount];
+            rhs_values[index] = kDivDivisors[index % kDivDivisorCount];
+            expected[index] =
+                    bf16_div_expected(lhs_values[index], rhs_values[index]);
+        }
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), lhs->view(), expected);
+        require_bf16_div_padding_untouched(spec, lhs->view());
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU AVX-512 BF16 DIV vector work and fallback are observed separately") {
+    CpuDevices devices;
+    auto queue = devices.candidate->create_ops();
+    const bool accelerated = iom::cpu_detail::avx512_bf16_available();
+
+    // Ordinary operands on a tile-aligned shape: every lane is parity-safe, so
+    // the whole request must be vector work and no lane may fall back.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{4, 32}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] = kDivOrdinary[index % kDivOrdinaryCount];
+            rhs_values[index] = kDivOrdinary[(index + 5) % kDivOrdinaryCount];
+            expected[index] =
+                    bf16_div_expected(lhs_values[index], rhs_values[index]);
+        }
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(spec.logical_nbytes(), std::byte{0}));
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), out->view(), expected);
+        if (accelerated) {
+            CHECK_GT(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        } else {
+            // A request that never enters target code records nothing: choosing
+            // a kernel is not work.
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        }
+    }
+
+    // Directed pairs with no parity-safe lane: the scalar reference must be the
+    // observed producer of the whole request.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{16, 16}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] =
+                    kDivExceptional[index % kDivExceptionalCount][0];
+            rhs_values[index] =
+                    kDivExceptional[index % kDivExceptionalCount][1];
+            expected[index] =
+                    bf16_div_expected(lhs_values[index], rhs_values[index]);
+        }
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(spec.logical_nbytes(), std::byte{0}));
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), out->view(), expected);
+        if (accelerated) {
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_GT(bf16_div_fallback_runs(), std::uint64_t{0});
+        } else {
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        }
+    }
+
+    // The class cross product mixes both: exceptional lanes force the scalar
+    // reference group by group while ordinary lanes stay vector work, so both
+    // producers must be visible in the same request.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{kDivDividendCount, kDivDivisorCount}},
+                iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t row = 0; row < kDivDividendCount; ++row) {
+            for (std::size_t column = 0; column < kDivDivisorCount; ++column) {
+                const std::size_t index = row * kDivDivisorCount + column;
+                lhs_values[index] = kDivDividends[row];
+                rhs_values[index] = kDivDivisors[column];
+                expected[index] =
+                        bf16_div_expected(lhs_values[index], rhs_values[index]);
+            }
+        }
+        auto lhs = devices.candidate->create_tensor(spec);
+        auto rhs = devices.candidate->create_tensor(spec);
+        auto out = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(lhs->view(), bf16_div_bytes(lhs_values));
+        iom_conformance::copy_from_host(rhs->view(), bf16_div_bytes(rhs_values));
+        iom_conformance::copy_from_host(
+                out->view(),
+                std::vector<std::byte>(spec.logical_nbytes(), std::byte{0}));
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        run_bf16_div_views(
+                *queue, lhs->view(), rhs->view(), out->view(), expected);
+        if (accelerated) {
+            // The mixed request records both producers from their own work
+            // loops; an ineligible host records neither.
+            CHECK_GT(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_GT(bf16_div_fallback_runs(), std::uint64_t{0});
+        } else {
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        }
+    }
+    CHECK_FALSE(devices.gate.armed());
+}
+
+TEST_CASE("CPU AVX-512 BF16 DIV excluded lanes never execute the excluded arithmetic") {
+    CpuDevices devices;
+    const bool accelerated = iom::cpu_detail::avx512_bf16_available();
+
+    // The worker thread inherits this thread's FP environment when it is
+    // created. Unmasking the invalid, denormal-operand, divide-by-zero,
+    // overflow and underflow SIMD exceptions makes any lane that ran the vector
+    // divide or conversion on excluded operands signal SIGFPE and kill this
+    // process - the excluded work is observable without reading the worker's
+    // state. Precision stays masked, because an ordinary correctly rounded
+    // division is inexact by definition.
+    const auto submit_with_unmasked_worker =
+            [&](const iom::TensorSpec& spec,
+                std::span<const std::uint16_t> lhs_values,
+                std::span<const std::uint16_t> rhs_values,
+                std::span<const std::uint16_t> expected) {
+#if defined(__x86_64__)
+                const unsigned int saved_control = _mm_getcsr();
+                _mm_setcsr(
+                        (saved_control & ~(0x1Fu << 7))
+                        | (1u << 12));
+#endif
+                std::unique_ptr<iom::Device> device =
+                        iom::make_cpu_device(devices.candidate_allocator);
+                std::unique_ptr<iom::DeviceOps> queue = device->create_ops();
+#if defined(__x86_64__)
+                _mm_setcsr(saved_control);
+#endif
+                auto lhs = device->create_tensor(spec);
+                auto rhs = device->create_tensor(spec);
+                auto out = device->create_tensor(spec);
+                iom_conformance::copy_from_host(
+                        lhs->view(), bf16_div_bytes(lhs_values));
+                iom_conformance::copy_from_host(
+                        rhs->view(), bf16_div_bytes(rhs_values));
+                iom_conformance::copy_from_host(
+                        out->view(),
+                        std::vector<std::byte>(
+                                spec.logical_nbytes(), std::byte{0}));
+                run_bf16_div_views(
+                        *queue, lhs->view(), rhs->view(), out->view(),
+                        expected);
+            };
+
+    // No lane of this request may be divided or converted: every pair is 0/0,
+    // infinity/infinity, a zero or subnormal operand, or two normal operands
+    // whose exponent difference puts the quotient outside the normal FP32
+    // range (underflowing or overflowing). The scalar reference must produce
+    // the whole request instead.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{16, 16}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] =
+                    kDivExceptional[index % kDivExceptionalCount][0];
+            rhs_values[index] =
+                    kDivExceptional[index % kDivExceptionalCount][1];
+            expected[index] =
+                    bf16_div_expected(lhs_values[index], rhs_values[index]);
+        }
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        submit_with_unmasked_worker(spec, lhs_values, rhs_values, expected);
+        if (accelerated) {
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_GT(bf16_div_fallback_runs(), std::uint64_t{0});
+        } else {
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        }
+    }
+
+    // Ordinary lanes keep running the vector arithmetic under exactly that
+    // environment: only inexact, which stays masked, can be raised there.
+    {
+        const iom::TensorSpec spec{
+                iom::TensorShape{{4, 32}}, iom::DataType::BF16};
+        std::vector<std::uint16_t> lhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> rhs_values(spec.shape.element_count());
+        std::vector<std::uint16_t> expected(spec.shape.element_count());
+        for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+            lhs_values[index] = kDivOrdinary[index % kDivOrdinaryCount];
+            rhs_values[index] = kDivOrdinary[(index + 5) % kDivOrdinaryCount];
+            expected[index] =
+                    bf16_div_expected(lhs_values[index], rhs_values[index]);
+        }
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        submit_with_unmasked_worker(spec, lhs_values, rhs_values, expected);
+        if (accelerated) {
+            CHECK_GT(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        } else {
+            CHECK_EQ(bf16_div_native_runs(), std::uint64_t{0});
+            CHECK_EQ(bf16_div_fallback_runs(), std::uint64_t{0});
+        }
     }
     CHECK_FALSE(devices.gate.armed());
 }
