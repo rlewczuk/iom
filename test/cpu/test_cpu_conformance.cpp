@@ -4,9 +4,12 @@
 #include <cpuid.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -567,6 +570,236 @@ TEST_CASE("CPU conformance: RMSNorm reference, admission, and lifetime") {
     iom_conformance::run_rmsnorm_conformance(config);
     CHECK_FALSE(devices.gate.armed());
 }
+
+// The reduction stage's own focused coverage, independent of the shared matrix.
+//
+// A request may be a transformed view of a larger owner, so its first pass has
+// to reduce exactly the selected plane's logical features: the owner's
+// unselected planes and the tile padding beside the feature tail are seeded with
+// values that would both change a row inverse and trip the exception check if
+// either were read. The submission is a real queue request, its expected values
+// come from the shared independent oracle, and the case also runs as a baseline
+// control in a configuration without the isolated AVX-512 BF16 sources.
+TEST_CASE("CPU conformance: BF16 RMSNorm reduction honors a selected view, a feature tail, and padding") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    constexpr std::size_t kRows = 5;
+    constexpr std::size_t kFeatures = 17;
+    constexpr std::size_t kSelectedPlanes = 3;
+    constexpr float kEpsilon = 1.0e-5F;
+
+    // Two leading axes, so the sliced view has a nonzero plane offset *and*
+    // multi-plane leading strides: it selects the owner's second group of three
+    // planes, which the oracle evaluates as its planes zero through two.
+    const iom::TensorSpec owner_spec{
+            iom::TensorShape{{2, kSelectedPlanes, kRows, kFeatures}},
+            iom::DataType::BF16};
+    const iom::TensorSpec scale_spec{
+            iom::TensorShape{{1, kFeatures}}, iom::DataType::BF16};
+    const iom_conformance::RmsNormReferenceCase reference_case =
+            iom_conformance::rmsnorm_oracle::make_case(
+                    iom_conformance::RmsNormReferenceCaseKind::mixed,
+                    iom::DataType::BF16, kSelectedPlanes, kRows, kFeatures,
+                    kEpsilon,
+                    iom_conformance::rmsnorm_oracle::pattern_content(
+                            kSelectedPlanes, kRows, kFeatures),
+                    iom_conformance::rmsnorm_oracle::scale_content(kFeatures));
+
+    // The owner's unselected planes carry a magnitude no row wants, and the
+    // output owner carries a distinct sentinel, so an operand-wide walk is
+    // distinguishable from the selected view's own planes.
+    const std::uint64_t unselected_code =
+            iom_conformance::rmsnorm_oracle::value_bits(
+                    iom::DataType::BF16, 4096.0);
+    const std::uint64_t output_sentinel =
+            iom_conformance::rmsnorm_oracle::value_bits(
+                    iom::DataType::BF16, -123.5);
+    const std::size_t owner_elements =
+            2 * kSelectedPlanes * kRows * kFeatures;
+    std::vector<std::uint64_t> input_codes(owner_elements, unselected_code);
+    std::copy(
+            reference_case.x_bits.begin(), reference_case.x_bits.end(),
+            input_codes.begin()
+                    + static_cast<std::ptrdiff_t>(kSelectedPlanes * kRows
+                                                  * kFeatures));
+    const std::vector<std::uint64_t> output_codes(
+            owner_elements, output_sentinel);
+
+    auto x_owner = devices.candidate->create_tensor(owner_spec);
+    auto out_owner = devices.candidate->create_tensor(owner_spec);
+    auto scale = devices.candidate->create_tensor(scale_spec);
+    oracle.set_owner_spec(owner_spec);
+    oracle.seed(
+            x_owner->view(),
+            iom_conformance::rmsnorm_padded_image(
+                    owner_spec, input_codes,
+                    iom_conformance::kRmsNormPaddingPoison));
+    oracle.seed(
+            out_owner->view(),
+            iom_conformance::rmsnorm_padded_image(
+                    owner_spec, output_codes,
+                    iom_conformance::kRmsNormPaddingPoison));
+    oracle.set_owner_spec(scale_spec);
+    oracle.seed(
+            scale->view(),
+            iom_conformance::rmsnorm_padded_image(
+                    scale_spec, reference_case.scale_bits,
+                    iom_conformance::kRmsNormPaddingPoison));
+
+    const iom::TensorView x_view = x_owner->view().slice(0, 1, 1);
+    iom::TensorView out_view = out_owner->view().slice(0, 1, 1);
+    REQUIRE_EQ(x_view.spec().shape.rank(), std::size_t{4});
+    REQUIRE_EQ(x_view.plane_offset(), kSelectedPlanes);
+    REQUIRE_EQ(out_view.plane_offset(), kSelectedPlanes);
+
+    auto queue = devices.candidate->create_ops();
+    devices.gate.setup_complete();
+    const iom::oid token =
+            queue->rmsnorm(x_view, scale->view(), out_view, kEpsilon);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
+    devices.gate.case_complete();
+    CHECK_FALSE(devices.gate.armed());
+
+    const std::vector<iom_conformance::RmsNormReferenceValue> expected =
+            iom_conformance::evaluate(reference_case);
+    iom_conformance::check_rmsnorm_image(
+            iom::DataType::BF16, iom_conformance::read_logical(out_view),
+            expected,
+            "cpu BF16 selected view, leading strides, feature tail 17");
+
+    // Exactly the selected view's logical slots moved: the owner's other planes
+    // and every padded bit keep the pattern they were seeded with, in both
+    // operands.
+    std::vector<std::uint64_t> expected_output_codes = output_codes;
+    for (std::size_t plane = 0; plane < kSelectedPlanes; ++plane) {
+        for (std::size_t row = 0; row < kRows; ++row) {
+            for (std::size_t feature = 0; feature < kFeatures; ++feature) {
+                const std::size_t element = row * kFeatures + feature;
+                expected_output_codes[(kSelectedPlanes + plane) * kRows
+                                              * kFeatures
+                                      + element] =
+                        expected[plane * kRows * kFeatures + element].bits;
+            }
+        }
+    }
+    oracle.set_owner_spec(owner_spec);
+    CHECK(
+            oracle.observe(x_owner->view())
+            == iom_conformance::rmsnorm_padded_image(
+                    owner_spec, input_codes,
+                    iom_conformance::kRmsNormPaddingPoison));
+    CHECK(
+            oracle.observe(out_owner->view())
+            == iom_conformance::rmsnorm_padded_image(
+                    owner_spec, expected_output_codes,
+                    iom_conformance::kRmsNormPaddingPoison));
+}
+
+#ifdef IOM_TEST_AVX512_BF16_ENABLED
+// This configuration compiles the isolated AVX-512 BF16 sources, so a BF16
+// request on a capable host must execute the vector row reduction, and a row
+// whose features are not all finite must be visible as scalar fallback work
+// instead. Both paths are asserted against the same independent oracle, so the
+// executed-work observation is paired with the arithmetic it claims.
+TEST_CASE("CPU conformance: AVX-512 BF16 RMSNorm reduction executes vector work") {
+    CpuDevices devices;
+    const iom_conformance::RmsNormConformanceConfig config{
+            devices.conformance(), iom_conformance::kRmsNormWideLeafSpan};
+    auto queue = devices.candidate->create_ops();
+
+    // An ordinary finite geometry with a non-tile feature width: two full
+    // blocks and a one-lane masked tail per row, over two independent planes.
+    constexpr std::size_t kPlanes = 2;
+    constexpr std::size_t kRows = 4;
+    constexpr std::size_t kFeatures = 33;
+    const iom_conformance::RmsNormReferenceCase ordinary =
+            iom_conformance::rmsnorm_oracle::make_case(
+                    iom_conformance::RmsNormReferenceCaseKind::mixed,
+                    iom::DataType::BF16, kPlanes, kRows, kFeatures, 1.0e-5F,
+                    iom_conformance::rmsnorm_oracle::pattern_content(
+                            kPlanes, kRows, kFeatures),
+                    iom_conformance::rmsnorm_oracle::scale_content(kFeatures));
+
+    if (!iom::cpu_detail::avx512_bf16_available()) {
+        MESSAGE(
+                "host is not AVX-512 BF16 eligible: this build contains the "
+                "isolated sources, but no vector work can execute here and no "
+                "native observation is asserted");
+        return;
+    }
+
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    iom_conformance::run_rmsnorm_reference_case(
+            config, *queue, ordinary,
+            std::vector<std::size_t>{kPlanes},
+            "accelerated row reduction");
+    const std::uint64_t native_blocks =
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    iom::cpu_detail::Avx512Bf16Stage::RmsReduction,
+                    iom::cpu_detail::Avx512Bf16Path::Native);
+    const std::uint64_t native_fallbacks =
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    iom::cpu_detail::Avx512Bf16Stage::RmsReduction,
+                    iom::cpu_detail::Avx512Bf16Path::Fallback);
+    CHECK_MESSAGE(
+            native_blocks >= kPlanes * kRows,
+            "the vector row reduction executed for every ordinary row: "
+            "native blocks = " << native_blocks << ", rows = "
+                               << kPlanes * kRows);
+    CHECK_EQ(native_fallbacks, std::uint64_t{0});
+
+    // A row holding a NaN or an infinity feature is reduced by the sequential
+    // recurrence inside the same queued worker, so a request whose every row is
+    // exceptional must show exactly fallback work, no vector reduction beside
+    // it, and the contract's special-value classes from the oracle.
+    constexpr std::size_t kExceptionalRows = 2;
+    std::vector<double> nan_values =
+            iom_conformance::rmsnorm_oracle::pattern_content(
+                    1, kExceptionalRows, kFeatures);
+    nan_values[2] = std::numeric_limits<double>::quiet_NaN();
+    nan_values[kFeatures + 2] = std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> infinity_values =
+            iom_conformance::rmsnorm_oracle::pattern_content(
+                    1, kExceptionalRows, kFeatures);
+    infinity_values[2] = std::numeric_limits<double>::infinity();
+    infinity_values[5] = -std::numeric_limits<double>::infinity();
+    infinity_values[kFeatures + 2] = std::numeric_limits<double>::infinity();
+    infinity_values[kFeatures + 5] = -std::numeric_limits<double>::infinity();
+    const std::array<iom_conformance::RmsNormReferenceCase, 2> exceptional{
+            iom_conformance::rmsnorm_oracle::make_case(
+                    iom_conformance::RmsNormReferenceCaseKind::nan_row,
+                    iom::DataType::BF16, 1, kExceptionalRows, kFeatures, 1.0e-5F,
+                    nan_values,
+                    iom_conformance::rmsnorm_oracle::scale_content(kFeatures)),
+            iom_conformance::rmsnorm_oracle::make_case(
+                    iom_conformance::RmsNormReferenceCaseKind::infinity_row,
+                    iom::DataType::BF16, 1, kExceptionalRows, kFeatures, 1.0e-5F,
+                    infinity_values,
+                    iom_conformance::rmsnorm_oracle::scale_content(kFeatures))};
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    for (const iom_conformance::RmsNormReferenceCase& reference_case :
+         exceptional) {
+        iom_conformance::run_rmsnorm_reference_case(
+                config, *queue, reference_case, {}, "scalar fallback row");
+    }
+    CHECK_EQ(
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    iom::cpu_detail::Avx512Bf16Stage::RmsReduction,
+                    iom::cpu_detail::Avx512Bf16Path::Native),
+            std::uint64_t{0});
+    const std::uint64_t exceptional_fallbacks =
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    iom::cpu_detail::Avx512Bf16Stage::RmsReduction,
+                    iom::cpu_detail::Avx512Bf16Path::Fallback);
+    CHECK_MESSAGE(
+            exceptional_fallbacks >= kExceptionalRows,
+            "every exceptional row stayed with the in-worker scalar "
+            "recurrence: fallback rows = "
+                    << exceptional_fallbacks);
+}
+#endif
+
 // CPU's declared SiLU expectation: the nine applicable signed floating leaves,
 // the frozen `{0, 1}` zero-workspace requirement, and positive execution through
 // the real in-order CPU queue, observed by the shared independent oracle over

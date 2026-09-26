@@ -2,6 +2,7 @@
 #include "device_internal.hpp"
 #include "transfer_helpers.hpp"
 
+#include "avx512_bf16.hpp"
 #include "../iom_internal.hpp"
 #include <array>
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -744,11 +746,13 @@ private:
     // One independent leading plane. Every row reduces exactly its own
     // logical features in the accumulator domain of its leaf, and each
     // dependent value is rounded there before the single destination encode.
+    // `native_reduction` selects the AVX-512 BF16 row reduction for a request
+    // that may use it; every other request keeps the sequential recurrence.
     template <typename Carrier>
     static void rmsnorm_plane(
             const RmsnormRequest& request, const RmsnormFormat& format,
             std::size_t x_plane, std::size_t out_plane, std::size_t rows,
-            std::size_t features) {
+            std::size_t features, bool native_reduction) {
         const TensorSpec& x_spec = request.x.spec;
         const TensorSpec& scale_spec = request.scale.spec;
         const TensorSpec& out_spec = request.out.spec;
@@ -762,16 +766,43 @@ private:
         const Carrier divisor = static_cast<Carrier>(features);
         const Carrier epsilon = static_cast<Carrier>(request.epsilon);
         for (std::size_t row = 0; row < rows; ++row) {
-            Carrier sum = static_cast<Carrier>(0);
-            for (std::size_t feature = 0; feature < features; ++feature) {
-                const Carrier value = decode_element<Carrier>(
-                        x_base, x_spec, format, x_plane, row, feature);
-                sum = sum + value * value;
+            Carrier inverse = static_cast<Carrier>(0);
+            bool reduced = false;
+#if defined(IOM_AVX512_BF16_COMPILED)
+            if (native_reduction) {
+                float native_inverse = 0.0F;
+                reduced = cpu_detail::avx512_bf16_rmsnorm_reduce(
+                        x_base, x_spec, x_plane, row, features,
+                        request.epsilon, native_inverse);
+                if (reduced) {
+                    inverse = static_cast<Carrier>(native_inverse);
+                }
             }
-            const Carrier mean = sum / divisor;
-            const Carrier shifted = mean + epsilon;
-            const Carrier root = std::sqrt(shifted);
-            const Carrier inverse = static_cast<Carrier>(1) / root;
+#else
+            (void)native_reduction;
+#endif
+            if (!reduced) {
+                Carrier sum = static_cast<Carrier>(0);
+                for (std::size_t feature = 0; feature < features; ++feature) {
+                    const Carrier value = decode_element<Carrier>(
+                            x_base, x_spec, format, x_plane, row, feature);
+                    sum = sum + value * value;
+                }
+                const Carrier mean = sum / divisor;
+                const Carrier shifted = mean + epsilon;
+                const Carrier root = std::sqrt(shifted);
+                inverse = static_cast<Carrier>(1) / root;
+#if defined(IOM_AVX512_BF16_TESTING)
+                if (native_reduction) {
+                    // A BF16 row the vector entry declined is reduced here by
+                    // the sequential recurrence, and that executed work is
+                    // reported apart from the native counter.
+                    cpu_detail::avx512_bf16_test_record(
+                            cpu_detail::Avx512Bf16Stage::RmsReduction,
+                            cpu_detail::Avx512Bf16Path::Fallback);
+                }
+#endif
+            }
             for (std::size_t feature = 0; feature < features; ++feature) {
                 const Carrier value = decode_element<Carrier>(
                         x_base, x_spec, format, x_plane, row, feature);
@@ -799,6 +830,13 @@ private:
         const std::size_t features = dimensions[rank - 1];
         const RmsnormFormat format =
                 detail::scalar_add_detail::format(spec.data_type);
+        // One per-request eligibility decision: only a BF16 request on a leaf
+        // whose carrier is FP32 can use the AVX-512 BF16 row reduction, and the
+        // detector decides once whether this process may enter target code.
+        const bool native_reduction =
+                std::is_same_v<Carrier, float>
+                && spec.data_type == DataType::BF16
+                && cpu_detail::avx512_bf16_available();
         const std::span<const std::size_t> x_strides = request.x.plane_strides;
         const std::span<const std::size_t> out_strides =
                 request.out.plane_strides;
@@ -806,7 +844,8 @@ private:
                          std::size_t out_plane) -> void {
             if (axis + 2 == rank) {
                 rmsnorm_plane<Carrier>(
-                        request, format, x_plane, out_plane, rows, features);
+                        request, format, x_plane, out_plane, rows, features,
+                        native_reduction);
                 return;
             }
             for (std::size_t index = 0; index < dimensions[axis]; ++index) {
