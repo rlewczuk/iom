@@ -19,21 +19,26 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <new>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "iom/alloc.hpp"
 #include "iom/iom.hpp"
 #include "iom/cpu/device.hpp"
 #include "iom/tensor.hpp"
+#include "../../src/cpu/avx512_bf16.hpp"
 
 namespace {
 
@@ -296,8 +301,176 @@ bool runner_matches_reference() {
     return false;
 #endif
 }
+template <typename Submit>
+void report_bf16_operation(
+        const char* name, std::string_view shape, std::size_t elements,
+        iom::cpu_detail::Avx512Bf16Stage stage, Submit&& submit) {
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    const std::vector<double> samples = timed_samples(
+            kThroughputSampleRuns, std::forward<Submit>(submit));
+    const SampleStats stats = sample_stats(samples);
+    const double elements_per_second =
+            static_cast<double>(elements) / stats.median;
+    const std::uint64_t native =
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    stage, iom::cpu_detail::Avx512Bf16Path::Native);
+    const std::uint64_t fallback =
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    stage, iom::cpu_detail::Avx512Bf16Path::Fallback);
+    const char* path = native != 0 && fallback != 0
+            ? "native SIMD + compliant fallback"
+            : native != 0 ? "native SIMD"
+            : fallback != 0 ? "compliant fallback"
+                            : "scalar/OFF";
+    std::ostringstream report;
+    report << name << " BF16 " << shape << ", " << elements
+           << " elements, " << elements_per_second / 1.0e6
+           << " M elements/s (median " << format_microseconds(stats.median)
+           << " us; " << path << "; native-work=" << native
+           << ", fallback-work=" << fallback << ")";
+    MESSAGE(report.str());
+}
+
+std::unique_ptr<iom::Tensor> make_bf16_tensor(
+        iom::Device& device, iom::TensorShape shape, std::uint16_t value) {
+    const iom::TensorSpec spec{std::move(shape), iom::DataType::BF16};
+    auto tensor = device.create_tensor(spec);
+    std::vector<std::uint16_t> values(spec.shape.element_count(), value);
+    tensor->view().copy_from_host(std::as_bytes(
+            std::span<const std::uint16_t>(values)));
+    return tensor;
+}
+
+void wait_for(iom::DeviceOps& queue, iom::oid token) {
+    REQUIRE(iom::oid_is_token(token));
+    queue.wait(token);
+}
 
 }  // namespace
+
+TEST_CASE("CPU benchmark: BF16 operation throughput and executed path") {
+    HostAllocator allocator;
+    std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
+    std::unique_ptr<iom::DeviceOps> queue = device->create_ops();
+    constexpr std::uint16_t kOne = 0x3F80;
+
+    auto lhs = make_bf16_tensor(*device, iom::TensorShape{{64, 128}}, kOne);
+    auto rhs = make_bf16_tensor(*device, iom::TensorShape{{64, 128}}, kOne);
+    auto output = make_bf16_tensor(*device, iom::TensorShape{{64, 128}}, 0);
+    iom::TensorView lhs_view = lhs->view();
+    iom::TensorView rhs_view = rhs->view();
+    iom::TensorView output_view = output->view();
+    constexpr std::size_t kBinaryElements = 64 * 128;
+
+    const auto binary = [&](const char* name,
+                            iom::cpu_detail::Avx512Bf16Stage stage,
+                            auto operation) {
+        report_bf16_operation(name, "64x128", kBinaryElements, stage, [&] {
+            wait_for(*queue, operation(lhs_view, rhs_view, output_view));
+        });
+    };
+    binary("BinaryAdd", iom::cpu_detail::Avx512Bf16Stage::BinaryAdd,
+           [&](auto& a, auto& b, auto& out) { return queue->add(a, b, out); });
+    binary("BinarySub", iom::cpu_detail::Avx512Bf16Stage::BinarySub,
+           [&](auto& a, auto& b, auto& out) { return queue->sub(a, b, out); });
+    binary("BinaryMul", iom::cpu_detail::Avx512Bf16Stage::BinaryMul,
+           [&](auto& a, auto& b, auto& out) { return queue->mul(a, b, out); });
+    binary("BinaryDiv", iom::cpu_detail::Avx512Bf16Stage::BinaryDiv,
+           [&](auto& a, auto& b, auto& out) { return queue->div(a, b, out); });
+
+    auto x = make_bf16_tensor(*device, iom::TensorShape{{1, 16, 64}}, kOne);
+    auto weights =
+            make_bf16_tensor(*device, iom::TensorShape{{32, 64}}, kOne);
+    auto linear_output =
+            make_bf16_tensor(*device, iom::TensorShape{{1, 16, 32}}, 0);
+    iom::TensorView x_view = x->view();
+    iom::TensorView weights_view = weights->view();
+    iom::TensorView linear_output_view = linear_output->view();
+    report_bf16_operation(
+            "Linear", "X=1x16x64 W=32x64 out=1x16x32", 16 * 32,
+            iom::cpu_detail::Avx512Bf16Stage::Linear, [&] {
+                wait_for(*queue, queue->linear(
+                        x_view, weights_view, linear_output_view, 0, 16,
+                        iom::LinearOutputLayout::ordinary, 1, 32));
+            });
+
+    auto norm_x =
+            make_bf16_tensor(*device, iom::TensorShape{{16, 128}}, kOne);
+    auto norm_scale =
+            make_bf16_tensor(*device, iom::TensorShape{{1, 128}}, kOne);
+    auto norm_output =
+            make_bf16_tensor(*device, iom::TensorShape{{16, 128}}, 0);
+    iom::TensorView norm_x_view = norm_x->view();
+    iom::TensorView norm_scale_view = norm_scale->view();
+    iom::TensorView norm_output_view = norm_output->view();
+    report_bf16_operation(
+            "RmsReduction", "16x128", 16 * 128,
+            iom::cpu_detail::Avx512Bf16Stage::RmsReduction, [&] {
+                wait_for(*queue, queue->rmsnorm(
+                        norm_x_view, norm_scale_view, norm_output_view,
+                        1.0e-5F));
+            });
+    report_bf16_operation(
+            "RmsStore", "16x128", 16 * 128,
+            iom::cpu_detail::Avx512Bf16Stage::RmsStore, [&] {
+                wait_for(*queue, queue->rmsnorm(
+                        norm_x_view, norm_scale_view, norm_output_view,
+                        1.0e-5F));
+            });
+
+    auto rope_x = make_bf16_tensor(
+            *device, iom::TensorShape{{1, 1, 16, 128}}, kOne);
+    auto rope_output = make_bf16_tensor(
+            *device, iom::TensorShape{{1, 1, 16, 128}}, 0);
+    iom::TensorView rope_x_view = rope_x->view();
+    iom::TensorView rope_output_view = rope_output->view();
+    report_bf16_operation(
+            "RoPE", "1x1x16x128", 16 * 128,
+            iom::cpu_detail::Avx512Bf16Stage::Rope, [&] {
+                wait_for(*queue, queue->rope(
+                        rope_x_view, rope_output_view, 1, 10000.0));
+            });
+    report_bf16_operation(
+            "SiLU", "64x128", kBinaryElements,
+            iom::cpu_detail::Avx512Bf16Stage::Silu, [&] {
+                wait_for(*queue, queue->silu(lhs_view, output_view));
+            });
+
+    auto q = make_bf16_tensor(
+            *device, iom::TensorShape{{2, 4, 2, 16}}, kOne);
+    auto k = make_bf16_tensor(
+            *device, iom::TensorShape{{2, 2, 5, 16}}, kOne);
+    auto v = make_bf16_tensor(
+            *device, iom::TensorShape{{2, 2, 5, 16}}, kOne);
+    auto sdpa_output = make_bf16_tensor(
+            *device, iom::TensorShape{{2, 2, 64}}, 0);
+    iom::TensorView q_view = q->view();
+    iom::TensorView k_view = k->view();
+    iom::TensorView v_view = v->view();
+    iom::TensorView sdpa_output_view = sdpa_output->view();
+    // CPU SDPA requires caller-owned score/probability scratch. Allocate it
+    // once outside the timed submissions and reuse it only after each wait.
+    const iom::WorkspaceRequirements sdpa_requirements =
+            queue->sdpa_workspace_requirements(
+                    q_view, k_view, v_view, sdpa_output_view, 1, 4);
+    auto sdpa_workspace = device->create_workspace(sdpa_requirements.bytes);
+    const auto sdpa = [&] {
+        wait_for(*queue, queue->sdpa(
+                q_view, k_view, v_view, sdpa_output_view, 1, 4,
+                sdpa_workspace->view()));
+    };
+    constexpr char kSdpaShape[] =
+            "Q=2x4x2x16 K/V=2x2x5x16 out=2x2x64 a=1 L=4";
+    report_bf16_operation(
+            "SdpaQk", kSdpaShape, 2 * 4 * 2 * 16,
+            iom::cpu_detail::Avx512Bf16Stage::SdpaQk, sdpa);
+    report_bf16_operation(
+            "SdpaSoftmax", kSdpaShape, 2 * 4 * 2 * 16,
+            iom::cpu_detail::Avx512Bf16Stage::SdpaSoftmax, sdpa);
+    report_bf16_operation(
+            "SdpaPv", kSdpaShape, 2 * 4 * 2 * 16,
+            iom::cpu_detail::Avx512Bf16Stage::SdpaPv, sdpa);
+}
 
 TEST_CASE("CPU benchmark: blocked copy throughput vs memory floor") {
     // Workload unchanged: 4096x4096 F32 and 2048x2048 I4 host/queued

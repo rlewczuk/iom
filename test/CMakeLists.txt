@@ -192,6 +192,12 @@ target_link_libraries(iom_cpu_bench
 set_source_files_properties(cpu/test_cpu_bench.cpp PROPERTIES
     COMPILE_DEFINITIONS DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 )
+# The BF16 benchmark reports executed native/fallback stage work through the
+# private observation seam; the definitions remain local to this test target.
+target_compile_definitions(iom_cpu_bench
+    PRIVATE
+        IOM_AVX512_BF16_TESTING
+)
 
 # CPU bandwidth/latency benchmark. Registered as a generic CTest test, the
 # executable reports workload, compiler/OS, detected hardware, and sample
