@@ -286,6 +286,7 @@ endfunction()
 # registers nothing, and an enabled configuration compiles exactly these files
 # with the target options above.
 if(AVX_512_BF16_ENABLED)
+    iom_add_avx512_bf16_source(src/cpu/avx512_bf16_sdpa_qk.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_rmsnorm_reduction.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_silu.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_binary_mul.cpp)

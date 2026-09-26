@@ -11,6 +11,14 @@
 
 #include "../iom_internal.hpp"
 #include "../shared/scalar_binary_codec.hpp"
+#include "avx512_bf16.hpp"
+
+#if defined(IOM_AVX512_BF16_COMPILED)
+// The BF16 QK stage entry point lives in the target-isolated translation unit
+// registered through iom_add_avx512_bf16_source(); this baseline worker only
+// calls it after the runtime eligibility check.
+#include "avx512_bf16_sdpa_qk.hpp"
+#endif
 
 namespace iom::cpu_detail {
 namespace {
@@ -98,7 +106,8 @@ void store_probability(
 void sdpa_plane(
         const SdpaRequest& request, std::size_t q_plane,
         std::size_t k_plane, std::size_t v_plane, std::size_t out_plane,
-        std::size_t scratch_plane, std::size_t probability_base) {
+        std::size_t scratch_plane, std::size_t probability_base,
+        bool bf16_qk_target) {
 #if defined(IOM_AVX512_BF16_COMPILED)
     // One dispatch decision per plane: eligibility is a process-level property,
     // so neither the row loop nor the probability loop re-queries it.
@@ -133,21 +142,47 @@ void sdpa_plane(
             const std::size_t visible_limit =
                     std::min(request.L, request.a + row + 1);
 
-            for (std::size_t token = 0; token < request.L; ++token) {
-                if (token >= visible_limit) continue;
-                float dot = 0.0f;
-                for (std::size_t feature = 0; feature < request.D;
-                     ++feature) {
-                    const float q = matrix_daz(load_bf16(
-                            request.q, q_head_plane, row, feature));
-                    const float k = matrix_daz(load_bf16(
-                            request.k, k_head_plane, token, feature));
-                    const volatile float product = q * k;
-                    const volatile float next = dot + product;
-                    dot = next;
+            // QK: the isolated BF16 pair-dot stage when this build contains it
+            // and this process passed the runtime eligibility check, otherwise
+            // the portable scalar recurrence. The stage re-decides per row for
+            // operands its native association cannot represent exactly and
+            // reports that through a false result, after which this same scalar
+            // loop recomputes every visible score of the row.
+            bool native_scores = false;
+#if defined(IOM_AVX512_BF16_COMPILED)
+            if (bf16_qk_target) {
+                native_scores = avx512_bf16_sdpa_qk_row(
+                        request, q_head_plane, k_head_plane, row,
+                        visible_limit, scale, score_storage);
+            }
+#else
+            (void)bf16_qk_target;
+#endif
+            if (!native_scores) {
+                for (std::size_t token = 0; token < request.L; ++token) {
+                    if (token >= visible_limit) continue;
+                    float dot = 0.0f;
+                    for (std::size_t feature = 0; feature < request.D;
+                         ++feature) {
+                        const float q = matrix_daz(load_bf16(
+                                request.q, q_head_plane, row, feature));
+                        const float k = matrix_daz(load_bf16(
+                                request.k, k_head_plane, token, feature));
+                        const volatile float product = q * k;
+                        const volatile float next = dot + product;
+                        dot = next;
+                    }
+                    const volatile float scaled = dot / scale;
+                    score_storage[token] = scaled;
                 }
-                const volatile float scaled = dot / scale;
-                score_storage[token] = scaled;
+                // The compliant scalar worker runs as this stage's fallback
+                // whenever a build containing the stage does not use the native
+                // path for the row.
+#if defined(IOM_AVX512_BF16_COMPILED) \
+        && defined(IOM_AVX512_BF16_TESTING)
+                avx512_bf16_test_record(
+                        Avx512Bf16Stage::SdpaQk, Avx512Bf16Path::Fallback);
+#endif
             }
 
             bool has_nan = false;
@@ -296,13 +331,24 @@ void sdpa_elements(const SdpaRequest& request) {
             leading_planes, request.Hq, request.R, request.L);
     const std::size_t score_segment = score_bytes(elements);
 
+    // One dispatch decision for the whole accepted request: the isolated BF16
+    // pair-dot stage exists in this build, and this process may enter its target
+    // code. An ineligible CPU, OS, or portable build keeps the scalar worker for
+    // every plane, and every plane of an eligible request selects the native
+    // stage.
+#if defined(IOM_AVX512_BF16_COMPILED)
+    const bool bf16_qk_target = avx512_bf16_available();
+#else
+    const bool bf16_qk_target = false;
+#endif
+
     auto visit = [&](auto&& self, std::size_t axis, std::size_t q_plane,
                      std::size_t k_plane, std::size_t v_plane,
                      std::size_t out_plane, std::size_t plane) -> void {
         if (axis == leading_rank) {
             sdpa_plane(
                     request, q_plane, k_plane, v_plane, out_plane, plane,
-                    score_segment);
+                    score_segment, bf16_qk_target);
             return;
         }
         for (std::size_t index = 0;

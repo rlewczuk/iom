@@ -436,6 +436,176 @@ TEST_CASE("CPU conformance: SDPA reference, admission, and lifetime") {
     CHECK_FALSE(devices.gate.armed());
 }
 
+#if defined(IOM_TEST_AVX512_BF16_ENABLED)
+namespace {
+
+// Directed SDPA QK fixtures for the case below: one leading plane, two query
+// heads over one KV head, two rows, and L == C == 4, so row 0 attends to one
+// token and row 1 to two. Uniform Q/K magnitudes leave every visible score of a
+// row equal, which keeps the comparison against the independent oracle a plain
+// finite case, while the magnitude itself selects the native safety band.
+iom_conformance::SdpaReferenceCase uniform_magnitude_case(
+        double q_value, double k_value, std::size_t head_dim) {
+    constexpr std::size_t planes = 1;
+    constexpr std::size_t hq = 2;
+    constexpr std::size_t hkv = 1;
+    constexpr std::size_t rows = 2;
+    constexpr std::size_t capacity = 4;
+    constexpr std::size_t position = 0;
+    constexpr std::size_t length = 4;
+    return iom_conformance::sdpa_oracle::make_case(
+            iom_conformance::SdpaReferenceCaseKind::mixed_gqa,
+            iom::DataType::BF16, {planes}, hq, hkv, rows, head_dim, capacity,
+            position, length,
+            std::vector<double>(
+                    planes * hq * rows * head_dim, q_value),
+            std::vector<double>(
+                    planes * hkv * capacity * head_dim, k_value),
+            std::vector<double>(
+                    planes * hkv * capacity * head_dim, 1.0));
+}
+
+// Directed in-band case whose ordered scalar recurrence overflows before the
+// native pair lanes can cancel it: head dimension 32, every Q value 2^62, a
+// first visible token of sixteen +2^62 followed by sixteen -2^62 (feature order
+// reaches 16 * 2^124 = 2^128 and forms +inf), and a second visible token of
+// zeros. The first row sees only the +inf token, the second sees the +inf token
+// and the zero token, so the special-score policy and the row output both
+// distinguish the required scalar recurrence from a native cancellation, and the
+// 1.0/4.0 V values keep the two outcomes apart in the compared bits.
+iom_conformance::SdpaReferenceCase ordered_overflow_case() {
+    constexpr std::size_t planes = 1;
+    constexpr std::size_t hq = 2;
+    constexpr std::size_t hkv = 1;
+    constexpr std::size_t rows = 2;
+    constexpr std::size_t head_dim = 32;
+    constexpr std::size_t capacity = 2;
+    constexpr std::size_t position = 0;
+    constexpr std::size_t length = 2;
+    const double magnitude = std::ldexp(1.0, 62);
+    std::vector<double> q(planes * hq * rows * head_dim, magnitude);
+    std::vector<double> k(planes * hkv * capacity * head_dim, 0.0);
+    for (std::size_t feature = 0; feature < head_dim; ++feature) {
+        k[feature] = feature < head_dim / 2 ? magnitude : -magnitude;
+    }
+    std::vector<double> v(planes * hkv * capacity * head_dim, 0.0);
+    for (std::size_t feature = 0; feature < head_dim; ++feature) {
+        v[feature] = 1.0;
+        v[head_dim + feature] = 4.0;
+    }
+    return iom_conformance::sdpa_oracle::make_case(
+            iom_conformance::SdpaReferenceCaseKind::mixed_gqa,
+            iom::DataType::BF16, {planes}, hq, hkv, rows, head_dim, capacity,
+            position, length, q, k, v);
+}
+
+struct SdpaQkObservations {
+    std::uint64_t native = 0;
+    std::uint64_t fallback = 0;
+};
+
+SdpaQkObservations read_sdpa_qk_observations() {
+    return {
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    iom::cpu_detail::Avx512Bf16Stage::SdpaQk,
+                    iom::cpu_detail::Avx512Bf16Path::Native),
+            iom::cpu_detail::avx512_bf16_test_observation(
+                    iom::cpu_detail::Avx512Bf16Stage::SdpaQk,
+                    iom::cpu_detail::Avx512Bf16Path::Fallback)};
+}
+
+}  // namespace
+
+// Directed evidence for the isolated BF16 SDPA QK stage. The stage/path
+// counters are process-wide, so every step resets them and then drives real
+// queued submissions through the same conformance driver the shared matrix
+// uses, which keeps the independent oracle comparison attached to each step.
+TEST_CASE("CPU SDPA QK: BF16 native dot work and compliant fallback") {
+    if (!iom::cpu_detail::avx512_bf16_available()) {
+        MESSAGE(
+                "AVX-512 BF16 is unavailable on this host, so this build keeps "
+                "the scalar QK worker and no native stage work can be observed");
+        return;
+    }
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kSdpaCurrentSupportedDataTypes,
+            true,
+            &devices.gate,
+            &oracle,
+            {},
+            {&iom::cpu_detail::arm_sdpa_failure,
+             &iom::cpu_detail::clear_sdpa_failure,
+             "cpu_detail::sdpa",
+             {}}};
+
+    // Ordinary in-band operands: all sixteen rows of the fixture must be formed
+    // by executed pair-dot accumulation with no fallback row, and the request
+    // must still match the independent oracle once the softmax and PV stages
+    // consume those scores.
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config,
+            iom_conformance::sdpa_oracle::make_ones_case(iom::DataType::BF16),
+            "BF16 SDPA QK native rows");
+    SdpaQkObservations observed = read_sdpa_qk_observations();
+    CHECK_EQ(observed.native, std::uint64_t{16});
+    CHECK_EQ(observed.fallback, std::uint64_t{0});
+
+    // A head dimension of 40 features covers a full pair-dot operand plus a
+    // short staged span, so the wide packing path is exercised natively too.
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, uniform_magnitude_case(1.0, -2.0, 40),
+            "BF16 SDPA QK native wide head");
+    observed = read_sdpa_qk_observations();
+    CHECK_EQ(observed.native, std::uint64_t{4});
+    CHECK_EQ(observed.fallback, std::uint64_t{0});
+
+    // Directed FTZ-sensitive operands: both matrices hold normal BF16 values
+    // whose products land in the FP32 subnormal range, where the native pair-dot
+    // is not gradual. Every row must be recomputed by the compliant scalar
+    // worker instead of being reported as native work.
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config,
+            uniform_magnitude_case(
+                    std::ldexp(1.0, -70), std::ldexp(1.0, -70), 16),
+            "BF16 SDPA QK subnormal-product fallback");
+    observed = read_sdpa_qk_observations();
+    CHECK_EQ(observed.native, std::uint64_t{0});
+    CHECK_EQ(observed.fallback, std::uint64_t{4});
+
+    // Directed overflow-sensitive operands: a Q magnitude far above the native
+    // band could overflow the product formed by the native association, so the
+    // row takes the same compliant fallback even though its scores stay finite.
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, uniform_magnitude_case(std::ldexp(1.0, 100), 1.0, 16),
+            "BF16 SDPA QK overflow-sensitive fallback");
+    observed = read_sdpa_qk_observations();
+    CHECK_EQ(observed.native, std::uint64_t{0});
+    CHECK_EQ(observed.fallback, std::uint64_t{4});
+
+    // Directed in-band case whose ordered scalar recurrence overflows before the
+    // native pair lanes cancel: every operand is inside the accepted band, so
+    // only the product-envelope screen can route the row to the compliant scalar
+    // worker, and the oracle comparison below is what distinguishes the scalar
+    // +inf token policy from a native finite cancellation.
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, ordered_overflow_case(),
+            "BF16 SDPA QK ordered-recurrence overflow fallback");
+    observed = read_sdpa_qk_observations();
+    CHECK_EQ(observed.native, std::uint64_t{0});
+    CHECK_EQ(observed.fallback, std::uint64_t{4});
+
+    CHECK_FALSE(devices.gate.armed());
+}
+#endif
+
 // CPU's declared embedding expectation covers the complete 23-payload/12-index
 // matrix and the fixed `{0, 1}` scratch policy.
 constexpr iom_conformance::EmbeddingDeclaration kCpuEmbeddingDeclaration{
