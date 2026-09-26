@@ -84,5 +84,34 @@ void avx512_bf16_test_reset_observations() noexcept;
         Avx512Bf16Stage stage, Avx512Bf16Path path) noexcept;
 #endif
 
+// Multiplies one standard-tile row of BF16 leaves in the caller's standard
+// 16x16 tiled owner storage. The entry is baseline code: every argument is a
+// scalar, no target type appears in its signature, its own translation unit is
+// the only place that contains AVX-512 BF16 code, and the caller reaches it
+// only from an accepted queued worker after avx512_bf16_available() reported
+// true.
+//
+// The three bases are owner storage and the three bit offsets name the run's
+// first leaf; the run is exactly the 16 logical features of one tile row, which
+// the shared layout keeps in 16 contiguous slots. A column-broadcast operand
+// therefore passes the bit offset of its single lane together with its
+// broadcast flag instead of a contiguous run. Both operands are read before the
+// result is stored, so an exact in-place alias stays correct.
+//
+// The vector arithmetic commits only when every lane's exact product is an FP32
+// normal below 2^127: such a lane is exact in FP32 (two BF16 significands carry
+// at most 16 significant bits), needs no second rounding step, and never meets
+// the denormal handling of the FP32 to BF16 conversion. When any lane is
+// exceptional -- `0 * infinity`, NaN, infinity, a signed zero, a product that
+// underflows to subnormal or zero, or a product that could round to infinity --
+// nothing is stored, the function answers false, and the caller recomputes the
+// whole row with the scalar codec, which remains the semantic authority for
+// BF16 MUL. The answer never reports work that was not committed.
+[[nodiscard]] bool avx512_bf16_binary_mul_row(
+        const unsigned char* lhs, std::size_t lhs_bit,
+        const unsigned char* rhs, std::size_t rhs_bit,
+        unsigned char* out, std::size_t out_bit,
+        bool lhs_broadcast, bool rhs_broadcast) noexcept;
+
 }  // namespace cpu_detail
 }  // namespace iom

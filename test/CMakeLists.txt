@@ -645,6 +645,7 @@ option(IOM_TEST_REAL_MODEL_INFERENCE_CPU
 
 add_executable(iom_backend_conformance_cpu_tests
         cpu/test_cpu_conformance.cpp
+        cpu/test_cpu_avx512_bf16_binary_mul.cpp
         backend/backend_conformance_sdpa.hpp
 )
 set_source_files_properties(cpu/test_cpu_conformance.cpp PROPERTIES

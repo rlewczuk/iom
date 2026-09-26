@@ -413,36 +413,17 @@ private:
         return plane;
     }
 
-    static ScalarBinary select_binary(DeviceOps::BinaryOperation operation) {
-        switch (operation) {
-            case DeviceOps::BinaryOperation::Add:
-                return &detail::scalar_binary<
-                        detail::scalar_add_detail::BinaryOp::add>;
-            case DeviceOps::BinaryOperation::Mul:
-                return &detail::scalar_binary<
-                        detail::scalar_add_detail::BinaryOp::mul>;
-            case DeviceOps::BinaryOperation::Sub:
-                return &detail::scalar_binary<
-                        detail::scalar_add_detail::BinaryOp::sub>;
-            case DeviceOps::BinaryOperation::Div:
-                return &detail::scalar_binary<
-                        detail::scalar_add_detail::BinaryOp::div>;
-        }
-        throw std::invalid_argument("unknown CPU binary operation");
-    }
-
-    static void binary_elements(
-            const DeviceOps::BinaryRequest& request, ScalarBinary scalar) {
+    // One traversal owner for every binary body: the result's leading planes in
+    // row-major order, then each row of the final two dimensions, handed to the
+    // body as the three owner plane offsets an element rule needs. Columns stay
+    // with the body, because the scalar codec visits one leaf at a time while a
+    // BF16 worker consumes a whole tile row of contiguous leaves.
+    template <typename RowBody>
+    static void visit_binary_rows(
+            const DeviceOps::BinaryRequest& request, RowBody&& row_body) {
         const auto dimensions = request.result_shape.dimensions();
         const std::size_t rank = dimensions.size();
         const std::size_t rows = dimensions[rank - 2];
-        const std::size_t columns = dimensions[rank - 1];
-        const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
-        auto* out_base = static_cast<unsigned char*>(request.out.native_handle);
-        const auto* lhs_base =
-                static_cast<const unsigned char*>(request.lhs.native_handle);
-        const auto* rhs_base =
-                static_cast<const unsigned char*>(request.rhs.native_handle);
         std::vector<std::size_t> coordinates(rank);
         auto visit = [&](auto&& self, std::size_t axis) -> void {
             if (axis + 2 < rank) {
@@ -458,51 +439,277 @@ private:
                     source_plane(request.rhs, dimensions, coordinates);
             const std::size_t out_plane =
                     source_plane(request.out, dimensions, coordinates);
-            for (std::size_t row = 0; row < rows; ++row) {
-                for (std::size_t column = 0; column < columns; ++column) {
-                    const std::size_t lhs_row =
-                            request.lhs.broadcast_rows ? 0 : row;
-                    const std::size_t rhs_row =
-                            request.rhs.broadcast_rows ? 0 : row;
-                    const std::size_t lhs_column =
-                            request.lhs.broadcast_columns ? 0 : column;
-                    const std::size_t rhs_column =
-                            request.rhs.broadcast_columns ? 0 : column;
-                    const std::size_t lhs_slot = detail::standard_plane_slot(
-                            request.lhs.spec, lhs_plane, lhs_row, lhs_column);
-                    const std::size_t rhs_slot = detail::standard_plane_slot(
-                            request.rhs.spec, rhs_plane, rhs_row, rhs_column);
-                    const std::size_t out_slot = detail::standard_plane_slot(
-                            request.out.spec, out_plane, row, column);
-                    const std::uint64_t lhs = cpu_detail::load_bits(
-                            lhs_base, lhs_slot * bits, bits);
-                    const std::uint64_t rhs = cpu_detail::load_bits(
-                            rhs_base, rhs_slot * bits, bits);
-                    cpu_detail::store_bits(
-                            out_base, out_slot * bits, bits,
-                            scalar(request.out.spec.data_type, lhs, rhs));
-                }
+            for (std::size_t result_row = 0; result_row < rows; ++result_row) {
+                row_body(lhs_plane, rhs_plane, out_plane, result_row);
             }
         };
         visit(visit, 0);
     }
 
+    // The three owner slots one logical result element reads and writes. A
+    // singleton coordinate, including a tiled tail, maps to zero before tile
+    // mapping, so a broadcast operand keeps the right-aligned mapping the
+    // binary contract defines.
+    struct BinaryElementSlots {
+        std::size_t lhs;
+        std::size_t rhs;
+        std::size_t out;
+    };
+
+    static BinaryElementSlots binary_element_slots(
+            const DeviceOps::BinaryRequest& request, std::size_t lhs_plane,
+            std::size_t rhs_plane, std::size_t out_plane, std::size_t row,
+            std::size_t column) {
+        const std::size_t lhs_row = request.lhs.broadcast_rows ? 0 : row;
+        const std::size_t rhs_row = request.rhs.broadcast_rows ? 0 : row;
+        const std::size_t lhs_column =
+                request.lhs.broadcast_columns ? 0 : column;
+        const std::size_t rhs_column =
+                request.rhs.broadcast_columns ? 0 : column;
+        return {
+                detail::standard_plane_slot(
+                        request.lhs.spec, lhs_plane, lhs_row, lhs_column),
+                detail::standard_plane_slot(
+                        request.rhs.spec, rhs_plane, rhs_row, rhs_column),
+                detail::standard_plane_slot(
+                        request.out.spec, out_plane, row, column)};
+    }
+
+    // The one element rule of the scalar authority: both operand leaves are
+    // loaded before the result is stored, so an exact in-place alias reads its
+    // own inputs, and the codec's single encode is the operation's only
+    // rounding. Every operation and leaf keeps this rule as its reference and
+    // its fallback.
+    static void binary_element(
+            const DeviceOps::BinaryRequest& request, ScalarBinary scalar,
+            std::size_t bits, const unsigned char* lhs_base,
+            const unsigned char* rhs_base, unsigned char* out_base,
+            const BinaryElementSlots& slots) {
+        const std::uint64_t lhs =
+                cpu_detail::load_bits(lhs_base, slots.lhs * bits, bits);
+        const std::uint64_t rhs =
+                cpu_detail::load_bits(rhs_base, slots.rhs * bits, bits);
+        cpu_detail::store_bits(
+                out_base, slots.out * bits, bits,
+                scalar(request.out.spec.data_type, lhs, rhs));
+    }
+
+    // The scalar reference body of every operation and leaf: the shared
+    // traversal and the element rule above, with no optional acceleration.
+    static void binary_reference_elements(
+            const DeviceOps::BinaryRequest& request, ScalarBinary scalar) {
+        const std::size_t columns = request.result_shape.dimensions().back();
+        const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
+        auto* out_base = static_cast<unsigned char*>(request.out.native_handle);
+        const auto* lhs_base =
+                static_cast<const unsigned char*>(request.lhs.native_handle);
+        const auto* rhs_base =
+                static_cast<const unsigned char*>(request.rhs.native_handle);
+        visit_binary_rows(
+                request,
+                [&](std::size_t lhs_plane, std::size_t rhs_plane,
+                    std::size_t out_plane, std::size_t row) {
+                    for (std::size_t column = 0; column < columns; ++column) {
+                        binary_element(
+                                request, scalar, bits, lhs_base, rhs_base,
+                                out_base,
+                                binary_element_slots(
+                                        request, lhs_plane, rhs_plane,
+                                        out_plane, row, column));
+                    }
+                });
+    }
+
+    // Which optional AVX-512 BF16 worker an operation has. `None` also covers
+    // an operation whose worker this build cannot enter; either way the scalar
+    // codec stays the accepted authority for every operation and leaf.
+    enum class Bf16BinaryOp { None, Mul };
+
+    // The execution route of one binary request: the codec that serves every
+    // operation and leaf, and the optional isolated worker this operation may
+    // use for the BF16 leaf instead.
+    struct BinaryRoute {
+        ScalarBinary scalar = nullptr;
+        Bf16BinaryOp bf16 = Bf16BinaryOp::None;
+    };
+
+    static BinaryRoute select_binary(DeviceOps::BinaryOperation operation) {
+        BinaryRoute route;
+        switch (operation) {
+            case DeviceOps::BinaryOperation::Add:
+                route.scalar = &detail::scalar_binary<
+                        detail::scalar_add_detail::BinaryOp::add>;
+                break;
+            case DeviceOps::BinaryOperation::Mul:
+                route.scalar = &detail::scalar_binary<
+                        detail::scalar_add_detail::BinaryOp::mul>;
+                route.bf16 = Bf16BinaryOp::Mul;
+                break;
+            case DeviceOps::BinaryOperation::Sub:
+                route.scalar = &detail::scalar_binary<
+                        detail::scalar_add_detail::BinaryOp::sub>;
+                break;
+            case DeviceOps::BinaryOperation::Div:
+                route.scalar = &detail::scalar_binary<
+                        detail::scalar_add_detail::BinaryOp::div>;
+                break;
+        }
+        if (route.scalar == nullptr) {
+            throw std::invalid_argument("unknown CPU binary operation");
+        }
+        return route;
+    }
+
+    // Whether one accepted request takes its operation's isolated AVX-512 BF16
+    // worker. The decision is taken once per request and never per element: it
+    // needs this build to contain the isolated sources, an eligible CPU and
+    // OS-managed vector state, the BF16 leaf, and an operation with a worker.
+    // A portable build answers false without naming a target symbol at all.
+    static bool bf16_binary_route(
+            const DeviceOps::BinaryRequest& request,
+            const BinaryRoute& route) noexcept {
+#if defined(IOM_AVX512_BF16_COMPILED)
+        return route.bf16 != Bf16BinaryOp::None
+                && request.out.spec.data_type == DataType::BF16
+                && cpu_detail::avx512_bf16_available();
+#else
+        static_cast<void>(request);
+        static_cast<void>(route);
+        return false;
+#endif
+    }
+
+    // The isolated MUL source is registered only in a build that contains it, so
+    // the worker and its entry are compiled in only there. A portable build
+    // answers false from the route gate above and never names the entry at all.
+#if defined(IOM_AVX512_BF16_COMPILED)
+    // One BF16 MUL leaf of the scalar authority inside the optional worker.
+    // The observation seam counts exactly these lanes as the operation's
+    // fallback work, so a test can separate committed SIMD work from the
+    // authority's work without any production telemetry.
+    static void bf16_mul_reference_leaf(
+            const DeviceOps::BinaryRequest& request, ScalarBinary scalar,
+            std::size_t bits, const unsigned char* lhs_base,
+            const unsigned char* rhs_base, unsigned char* out_base,
+            std::size_t lhs_plane, std::size_t rhs_plane,
+            std::size_t out_plane, std::size_t row, std::size_t column) {
+#if defined(IOM_AVX512_BF16_TESTING)
+        cpu_detail::avx512_bf16_test_record(
+                cpu_detail::Avx512Bf16Stage::BinaryMul,
+                cpu_detail::Avx512Bf16Path::Fallback);
+#endif
+        binary_element(
+                request, scalar, bits, lhs_base, rhs_base, out_base,
+                binary_element_slots(
+                        request, lhs_plane, rhs_plane, out_plane, row, column));
+    }
+
+    // The BF16 MUL worker: a whole standard-tile row at a time through the
+    // isolated target code, everything else through the authority above. One
+    // tile row is 16 logical features in 16 contiguous owner slots, so the
+    // target code is entered exactly for a tile-aligned feature run of 16: a
+    // feature tail, a shorter last tile column, and every transformed leading
+    // view keep the mapping they already have, and a column-broadcast operand
+    // enters as a broadcast lane. A row the target code declines -- one with a
+    // NaN, an infinity, a signed zero, an underflowing or subnormal product --
+    // is recomputed leaf by leaf by the authority, which never saw a partial
+    // store. Nothing is scanned before the worker runs.
+    static void binary_bf16_mul_elements(
+            const DeviceOps::BinaryRequest& request, ScalarBinary scalar) {
+        const std::size_t columns = request.result_shape.dimensions().back();
+        const std::size_t bits = detail::leaf_bits(request.out.spec.data_type);
+        auto* out_base = static_cast<unsigned char*>(request.out.native_handle);
+        const auto* lhs_base =
+                static_cast<const unsigned char*>(request.lhs.native_handle);
+        const auto* rhs_base =
+                static_cast<const unsigned char*>(request.rhs.native_handle);
+        constexpr std::size_t kTileRow = TensorSpec::TILE;
+        visit_binary_rows(
+                request,
+                [&](std::size_t lhs_plane, std::size_t rhs_plane,
+                    std::size_t out_plane, std::size_t row) {
+                    std::size_t column = 0;
+                    for (; column + kTileRow <= columns; column += kTileRow) {
+                        const BinaryElementSlots first = binary_element_slots(
+                                request, lhs_plane, rhs_plane, out_plane, row,
+                                column);
+                        if (cpu_detail::avx512_bf16_binary_mul_row(
+                                    lhs_base, first.lhs * bits, rhs_base,
+                                    first.rhs * bits, out_base,
+                                    first.out * bits,
+                                    request.lhs.broadcast_columns,
+                                    request.rhs.broadcast_columns)) {
+                            continue;
+                        }
+                        for (std::size_t lane = 0; lane < kTileRow; ++lane) {
+                            bf16_mul_reference_leaf(
+                                    request, scalar, bits, lhs_base, rhs_base,
+                                    out_base, lhs_plane, rhs_plane, out_plane,
+                                    row, column + lane);
+                        }
+                    }
+                    for (; column < columns; ++column) {
+                        bf16_mul_reference_leaf(
+                                request, scalar, bits, lhs_base, rhs_base,
+                                out_base, lhs_plane, rhs_plane, out_plane, row,
+                                column);
+                    }
+                });
+    }
+#endif  // IOM_AVX512_BF16_COMPILED
+
+    // The BF16 worker the route gate selected: one arm per operation with an
+    // isolated worker. The arm owns its row work; the accepted queued worker,
+    // the traversal, and the authority above stay here.
+    static void binary_bf16_elements(
+            const DeviceOps::BinaryRequest& request,
+            const BinaryRoute& route) {
+        switch (route.bf16) {
+            case Bf16BinaryOp::Mul:
+#if defined(IOM_AVX512_BF16_COMPILED)
+                binary_bf16_mul_elements(request, route.scalar);
+#else
+                // Without this build's isolated MUL source the route gate can
+                // never select this arm; deferring to the authority still writes
+                // the result rather than nothing.
+                binary_reference_elements(request, route.scalar);
+#endif
+                break;
+            case Bf16BinaryOp::None:
+                // Unreachable: the route gate enters this body only for a named
+                // worker. Deferring to the authority still writes the result
+                // rather than nothing.
+                binary_reference_elements(request, route.scalar);
+                break;
+        }
+    }
+
+    static void binary_elements(
+            const DeviceOps::BinaryRequest& request,
+            const BinaryRoute& route) {
+        if (bf16_binary_route(request, route)) {
+            binary_bf16_elements(request, route);
+            return;
+        }
+        binary_reference_elements(request, route.scalar);
+    }
+
     oid binary_impl(const BinaryRequest& request) override {
         std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
-        const ScalarBinary scalar = select_binary(request.operation);
+        const BinaryRoute route = select_binary(request.operation);
         detail::Fence fence;
         fence.invoke = &fence_pending;
         return submit_binary(
                 request, device_->registry_state(), registry_queue_id_, fence,
-                [this, scalar](std::uint64_t sequence,
-                               const BinaryRequest& captured,
-                               detail::BinaryEntryRegistration entries) {
+                [this, route](std::uint64_t sequence,
+                              const BinaryRequest& captured,
+                              detail::BinaryEntryRegistration entries) {
                     try {
                         enqueue(HostTask{
-                                [this, scalar, sequence, captured, entries] {
+                                [this, route, sequence, captured, entries] {
                                     std::exception_ptr failure;
                                     try {
-                                        binary_elements(captured, scalar);
+                                        binary_elements(captured, route);
                                     } catch (...) {
                                         failure = std::current_exception();
                                     }
