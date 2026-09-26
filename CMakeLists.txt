@@ -293,6 +293,7 @@ if(AVX_512_BF16_ENABLED)
     # BF16 RoPE split-half pair arithmetic.
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_rope.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_linear.cpp)
+    iom_add_avx512_bf16_source(src/cpu/avx512_bf16_sdpa_softmax.cpp)
 endif()
 
 

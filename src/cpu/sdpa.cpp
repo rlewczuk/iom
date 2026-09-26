@@ -1,3 +1,4 @@
+#include "avx512_bf16.hpp"
 #include "device_internal.hpp"
 #include "transfer_helpers.hpp"
 
@@ -98,6 +99,11 @@ void sdpa_plane(
         const SdpaRequest& request, std::size_t q_plane,
         std::size_t k_plane, std::size_t v_plane, std::size_t out_plane,
         std::size_t scratch_plane, std::size_t probability_base) {
+#if defined(IOM_AVX512_BF16_COMPILED)
+    // One dispatch decision per plane: eligibility is a process-level property,
+    // so neither the row loop nor the probability loop re-queries it.
+    const bool native_sdpa_softmax = avx512_bf16_available();
+#endif
     const std::size_t q_head_stride =
             request.q.plane_strides[request.q.rank - 3];
     const std::size_t k_head_stride =
@@ -209,12 +215,29 @@ void sdpa_plane(
                     sum = next;
                     score_storage[token] = exponent;
                 }
-                for (std::size_t token = 0; token < visible_limit; ++token) {
-                    const volatile float normalized =
-                            score_storage[token] / sum;
-                    store_probability(
-                            request.workspace, probability_base,
-                            p_index + token, normalized);
+                // The isolated AVX-512 BF16 stage completes the whole visible
+                // range of this row when this build contains the target sources
+                // and the process may enter them; otherwise, and for an
+                // ineligible process, the portable loop below keeps the row.
+                // Both paths perform the same single BF16 RNE conversion.
+                bool probabilities_stored = false;
+#if defined(IOM_AVX512_BF16_COMPILED)
+                if (native_sdpa_softmax) {
+                    avx512_bf16_sdpa_softmax_probabilities(
+                            score_storage, visible_limit, sum,
+                            request.workspace, probability_base, p_index);
+                    probabilities_stored = true;
+                }
+#endif
+                if (!probabilities_stored) {
+                    for (std::size_t token = 0; token < visible_limit;
+                         ++token) {
+                        const volatile float normalized =
+                                score_storage[token] / sum;
+                        store_probability(
+                                request.workspace, probability_base,
+                                p_index + token, normalized);
+                    }
                 }
                 for (std::size_t token = visible_limit;
                      token < request.L; ++token) {

@@ -143,5 +143,26 @@ void avx512_bf16_rmsnorm_store(
         std::size_t scale_plane, std::size_t row, std::size_t features,
         float inverse);
 
+#if defined(IOM_AVX512_BF16_COMPILED)
+// Entry point of the isolated AVX-512 BF16 SDPA softmax/probability stage. The
+// caller has already classified the row and evaluated the FP32 stable-softmax
+// numerator in `exponentials`: one `exp(score - max)` per visible token, with a
+// materialized zero where the score was `-inf`, together with their FP32 `sum`.
+// This worker completes the row's probability stage by dividing each visible
+// numerator by `sum`, converting each probability exactly once to BF16 RNE, and
+// storing them at `probability_base + (row_index + token) * 2` bytes of the
+// caller-owned workspace; the masked entries beyond `visible` stay the caller's
+// canonical `+0`. A lane whose quotient is an FP32 subnormal -- which the native
+// conversion would flush, unlike the gradual-underflow codec -- or nonfinite is
+// converted by the compliant scalar fallback inside the same call, so this
+// entry never loses an underflowing probability. The function is target code:
+// it is declared only for a build that contains the isolated AVX-512 BF16
+// sources and must be entered only behind avx512_bf16_available().
+void avx512_bf16_sdpa_softmax_probabilities(
+        const float* exponentials, std::size_t visible, float sum,
+        unsigned char* workspace, std::size_t probability_base,
+        std::size_t row_index) noexcept;
+#endif
+
 }  // namespace cpu_detail
 }  // namespace iom
