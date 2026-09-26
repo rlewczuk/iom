@@ -460,29 +460,68 @@ TEST_CASE("CPU conformance: embedding lookup reference, admission, and lifetime"
     CHECK_EQ(workspace->byte_size(), 1);
 }
 
-// CPU's declared linear expectation: the complete 21-leaf applicable matrix,
-// one scalar recurrence covering every applicable leaf (including BF16, whose
-// CPU path is that same recurrence), and the fixed `{0, 1}` scratch path. The
-// CPU port implements that whole matrix, so the implemented span is the
-// complete applicable leaf span and every declared leaf is compared
-// numerically against the independent reference.
-const iom_conformance::LinearDeclaration kCpuLinearDeclaration{
-        iom_conformance::kLinearLeafSpan,
-        iom_conformance::kLinearLeafSpan,
-        iom_conformance::kNoLinearSpan,
-        iom_conformance::kLinearLeafSpan,
-        {},
-        iom_conformance::LinearWorkspacePath::zero,
-        iom_conformance::LinearWorkspacePath::zero};
+// The scalar path covers every CPU linear leaf except BF16 when this build and
+// host can enter the isolated AVX-512 worker. A native declaration is therefore
+// an observed runtime fact, not a dispatch or build-only claim.
+constexpr std::array<iom::DataType, iom_conformance::kLinearLeafSpan.size() - 1>
+        kCpuScalarLinearLeaves = [] {
+            std::array<iom::DataType,
+                       iom_conformance::kLinearLeafSpan.size() - 1> leaves{};
+            std::size_t next = 0;
+            for (const iom::DataType leaf : iom_conformance::kLinearLeafSpan) {
+                if (leaf != iom::DataType::BF16) {
+                    leaves[next++] = leaf;
+                }
+            }
+            return leaves;
+        }();
+constexpr std::array<iom::DataType, 1> kCpuNativeBf16LinearLeaf{
+        iom::DataType::BF16};
 
+[[nodiscard]] iom_conformance::LinearDeclaration cpu_linear_declaration() {
+    const bool native_bf16 = iom::cpu_detail::avx512_bf16_available();
+    return {
+            iom_conformance::kLinearLeafSpan,
+            native_bf16 ? std::span<const iom::DataType>(
+                                  kCpuScalarLinearLeaves)
+                        : iom_conformance::kLinearLeafSpan,
+            native_bf16 ? std::span<const iom::DataType>(
+                                  kCpuNativeBf16LinearLeaf)
+                        : iom_conformance::kNoLinearSpan,
+            iom_conformance::kLinearLeafSpan,
+            {},
+            iom_conformance::LinearWorkspacePath::zero,
+            iom_conformance::LinearWorkspacePath::zero};
+}
+
+// CPU covers the complete applicable linear matrix, with BF16 classified as
+// native only when the runtime detector can actually enter that worker.
 TEST_CASE("CPU conformance: linear projection reference, admission, and lifetime") {
     CpuDevices devices;
     iom_conformance::CpuStorageOracle oracle;
+    const iom_conformance::LinearDeclaration declaration =
+            cpu_linear_declaration();
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
     iom_conformance::run_linear_conformance(
-            devices.conformance(), kCpuLinearDeclaration, &devices.gate,
-            &oracle);
+            devices.conformance(), declaration, &devices.gate, &oracle);
     CHECK_FALSE(devices.gate.armed());
+    if (iom::cpu_detail::avx512_bf16_available()) {
+        // Classification requires completed SIMD arithmetic in the shared
+        // ordinary/head-planar, transformed-view oracle matrix.
+        CHECK_GT(
+                iom::cpu_detail::avx512_bf16_test_observation(
+                        iom::cpu_detail::Avx512Bf16Stage::Linear,
+                        iom::cpu_detail::Avx512Bf16Path::Native),
+                std::uint64_t{0});
+    } else {
+        CHECK_EQ(
+                iom::cpu_detail::avx512_bf16_test_observation(
+                        iom::cpu_detail::Avx512Bf16Stage::Linear,
+                        iom::cpu_detail::Avx512Bf16Path::Native),
+                std::uint64_t{0});
+    }
 }
+
 
 namespace {
 
