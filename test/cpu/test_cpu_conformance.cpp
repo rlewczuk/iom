@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include "backend/backend_conformance_common.hpp"
@@ -800,6 +802,254 @@ TEST_CASE("CPU conformance: AVX-512 BF16 RMSNorm reduction executes vector work"
 }
 #endif
 
+// The optional AVX-512 BF16 store worker reports the work it really executed:
+// an eligible ordinary BF16 request must store every full feature group from
+// the SIMD normalization, scale, and encode result, a value the ISA conversion
+// cannot encode under the contract must be stored by the compliant scalar codec
+// inside the same worker, and a request that never enters the worker must leave
+// the native count at zero. Every case is still compared against the
+// independent oracle, and the two contract facts the comparison policy cannot
+// see -- the canonical positive NaN encoding and a non-flushed subnormal
+// result -- are asserted on the stored raw bits.
+TEST_CASE("CPU AVX-512 BF16 RMSNorm store observes native groups and in-worker fallback") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    iom_conformance::RmsNormConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kRmsNormAllLeafSpan,
+            &devices.gate,
+            &oracle};
+    auto queue = devices.candidate->create_ops();
+
+    constexpr iom::DataType kBf16 = iom::DataType::BF16;
+    constexpr auto kStore = iom::cpu_detail::Avx512Bf16Stage::RmsStore;
+    constexpr auto kNative = iom::cpu_detail::Avx512Bf16Path::Native;
+    constexpr auto kFallback = iom::cpu_detail::Avx512Bf16Path::Fallback;
+    // This build and this host decide which store path a BF16 request takes;
+    // both outcomes are asserted, and the eligible one is the point of the
+    // case, so the observed operand is reported with the verdict.
+    const bool accelerated = iom::cpu_detail::avx512_bf16_available();
+    INFO("AVX-512 BF16 store worker entered: " << accelerated);
+
+    // One row-major `[1, rows, features]` BF16 fixture whose raw codes come
+    // from the oracle's own encoder, so a case pins exactly the bits the
+    // expectation is derived from.
+    const auto bf16_case = [](iom_conformance::RmsNormReferenceCaseKind kind,
+                              std::size_t rows, std::size_t features, float eps,
+                              const std::vector<double>& x,
+                              const std::vector<double>& scale) {
+        iom_conformance::RmsNormReferenceCase reference_case;
+        reference_case.kind = kind;
+        reference_case.data_type = kBf16;
+        reference_case.planes = 1;
+        reference_case.rows = rows;
+        reference_case.features = features;
+        reference_case.eps = eps;
+        for (const double value : x) {
+            reference_case.x_bits.push_back(
+                    iom_conformance::rmsnorm_oracle::value_bits(kBf16, value));
+        }
+        for (const double value : scale) {
+            reference_case.scale_bits.push_back(
+                    iom_conformance::rmsnorm_oracle::value_bits(kBf16, value));
+        }
+        return reference_case;
+    };
+
+    struct StoreRun {
+        std::vector<std::byte> logical;
+        std::uint64_t native = 0;
+        std::uint64_t fallback = 0;
+    };
+    // One fixture through the real queue, with the stage counts of exactly that
+    // request and the oracle comparison of its logical readback.
+    const auto run_fixture = [&](const iom_conformance::RmsNormReferenceCase&
+                                         reference_case,
+                                 std::string_view label) {
+        StoreRun run;
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        iom_conformance::run_rmsnorm_fixture(
+                config, *queue, reference_case, {}, run.logical);
+        run.native = iom::cpu_detail::avx512_bf16_test_observation(
+                kStore, kNative);
+        run.fallback = iom::cpu_detail::avx512_bf16_test_observation(
+                kStore, kFallback);
+        iom_conformance::check_rmsnorm_image(
+                kBf16, run.logical,
+                iom_conformance::evaluate(reference_case), label);
+        return run;
+    };
+
+    // Ordinary in-range BF16 values: every full group is stored from the SIMD
+    // result, and no element needs the scalar codec. `pattern_content` and
+    // `scale_content` are nonzero everywhere and exactly representable in
+    // BF16, so no result is a zero, a subnormal, or a NaN.
+    {
+        constexpr std::size_t rows = 2;
+        constexpr std::size_t features = 48;
+        const StoreRun run = run_fixture(
+                bf16_case(
+                        iom_conformance::RmsNormReferenceCaseKind::scaled, rows,
+                        features, 1.0e-5f,
+                        iom_conformance::rmsnorm_oracle::pattern_content(
+                                1, rows, features),
+                        iom_conformance::rmsnorm_oracle::scale_content(
+                                features)),
+                "BF16 ordinary native store");
+        CHECK_EQ(
+                run.native,
+                accelerated ? static_cast<std::uint64_t>(rows * features / 16)
+                            : 0u);
+        CHECK_EQ(
+                run.fallback,
+                accelerated ? 0u : static_cast<std::uint64_t>(rows * features));
+    }
+
+    // Directed in-worker fallback: a unit row with `eps == 0` has an exact
+    // inverse of one, so the first group's result is the nonzero BF16 subnormal
+    // `8 * 2^-133` -- below the smallest FP32 normal, where the ISA conversion
+    // flushes instead of rounding -- and the second group's result is exactly
+    // one. The first group must be stored by the scalar codec, the second by
+    // the vector worker, and the subnormal must survive as its own encoding
+    // rather than a flushed zero.
+    {
+        constexpr std::size_t features = 32;
+        std::vector<double> scale(features, 1.0);
+        for (std::size_t feature = 0; feature < 16; ++feature) {
+            scale[feature] = std::ldexp(1.0, -130);
+        }
+        const StoreRun run = run_fixture(
+                bf16_case(
+                        iom_conformance::RmsNormReferenceCaseKind::
+                                destination_underflow,
+                        1, features, 0.0f,
+                        std::vector<double>(features, 1.0), scale),
+                "BF16 subnormal-result fallback store");
+        CHECK_EQ(run.native, accelerated ? 1u : 0u);
+        CHECK_EQ(run.fallback, accelerated ? 16u : features);
+        for (std::size_t feature = 0; feature < 16; ++feature) {
+            CHECK_EQ(
+                    iom_conformance::rmsnorm_code_at(run.logical, kBf16,
+                                                     feature),
+                    0x8u);
+        }
+    }
+
+    // A NaN feature poisons its whole row, so every stored result of that row
+    // is a NaN and must take the compliant scalar encode; the sibling row is
+    // ordinary and stays on the vector path. The stored NaN must be the
+    // contract's canonical positive quiet NaN, which the comparison policy
+    // deliberately does not distinguish from any other NaN payload.
+    {
+        constexpr std::size_t rows = 2;
+        constexpr std::size_t features = 32;
+        std::vector<double> x = iom_conformance::rmsnorm_oracle::pattern_content(
+                1, rows, features);
+        x[3] = std::numeric_limits<double>::quiet_NaN();
+        const StoreRun run = run_fixture(
+                bf16_case(
+                        iom_conformance::RmsNormReferenceCaseKind::nan_row, rows,
+                        features, 1.0e-5f, x,
+                        iom_conformance::rmsnorm_oracle::scale_content(
+                                features)),
+                "BF16 NaN row fallback store");
+        CHECK_EQ(run.native,
+                 accelerated ? static_cast<std::uint64_t>(rows - 1) * features
+                                     / 16
+                             : 0u);
+        CHECK_EQ(
+                run.fallback,
+                accelerated ? static_cast<std::uint64_t>(features)
+                            : static_cast<std::uint64_t>(rows * features));
+        for (std::size_t feature = 0; feature < features; ++feature) {
+            CHECK_EQ(
+                    iom_conformance::rmsnorm_code_at(run.logical, kBf16,
+                                                     feature),
+                    0x7FC0u);
+        }
+    }
+
+    // A selected leading plane of a larger owner with a non-tile feature width:
+    // only the view's logical features change, each full group comes from the
+    // vector worker, the eight-feature tail is the scalar codec's, and the
+    // other planes plus every padded element of the owner keep the caller's
+    // sentinel. The input operand must be left exactly as it was.
+    {
+        constexpr std::size_t owner_planes = 3;
+        constexpr std::size_t rows = 2;
+        constexpr std::size_t features = 40;
+        const iom::TensorSpec spec = iom_conformance::rmsnorm_spec(
+                {owner_planes, rows, features}, kBf16);
+        const iom::TensorSpec scale_spec =
+                iom_conformance::rmsnorm_spec({1, features}, kBf16);
+        auto x_owner = devices.candidate->create_tensor(spec);
+        auto out_owner = devices.candidate->create_tensor(spec);
+        auto scale = devices.candidate->create_tensor(scale_spec);
+        iom::TensorView x = x_owner->view().slice(0, 1, 1);
+        iom::TensorView out = out_owner->view().slice(0, 1, 1);
+        const iom_conformance::RmsNormReferenceCase reference_case = bf16_case(
+                iom_conformance::RmsNormReferenceCaseKind::boundary_sizes, rows,
+                features, 1.0e-5f,
+                iom_conformance::rmsnorm_oracle::pattern_content(
+                        1, rows, features),
+                iom_conformance::rmsnorm_oracle::scale_content(features));
+        constexpr std::byte kSentinel{0x5A};
+        std::vector<std::byte> sentinel(
+                spec.tiled_storage_nbytes(), kSentinel);
+        oracle.set_owner_spec(spec);
+        iom_conformance::copy_from_host(
+                x, iom_conformance::rmsnorm_pack_codes(
+                           reference_case.x_bits, kBf16));
+        iom_conformance::copy_from_host(
+                scale->view(), iom_conformance::rmsnorm_pack_codes(
+                                       reference_case.scale_bits, kBf16));
+        oracle.seed(out, sentinel);
+        const std::vector<std::byte> input_before = oracle.observe(x);
+        const std::vector<std::byte> padding_evidence = oracle.observe(out);
+
+        devices.gate.setup_complete();
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        const iom::oid token =
+                queue->rmsnorm(x, scale->view(), out, reference_case.eps);
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+        devices.gate.case_complete();
+
+        const std::uint64_t native = iom::cpu_detail::avx512_bf16_test_observation(
+                kStore, kNative);
+        const std::uint64_t fallback =
+                iom::cpu_detail::avx512_bf16_test_observation(
+                        kStore, kFallback);
+        // The independent expectation of the whole owner: the caller's
+        // sentinel everywhere except the selected view's logical elements.
+        const std::vector<iom_conformance::RmsNormReferenceValue> expected =
+                iom_conformance::evaluate(reference_case);
+        std::vector<std::uint64_t> expected_codes;
+        expected_codes.reserve(expected.size());
+        for (const iom_conformance::RmsNormReferenceValue& value : expected) {
+            expected_codes.push_back(value.bits);
+        }
+        std::vector<std::byte> expected_image = sentinel;
+        iom_conformance::apply_standard_tiled_view(
+                out, spec,
+                iom_conformance::rmsnorm_pack_codes(expected_codes, kBf16),
+                expected_image);
+        CHECK(oracle.observe(out) == expected_image);
+        CHECK(oracle.observe(x) == input_before);
+        // The image the operation must reproduce writes the selected view's
+        // logical elements, so it cannot equal the untouched sentinel storage;
+        // a comparison that could not tell them apart would be vacuous.
+        CHECK(expected_image != padding_evidence);
+        CHECK_EQ(
+                native,
+                accelerated ? static_cast<std::uint64_t>(rows * (features / 16))
+                            : 0u);
+        CHECK_EQ(
+                fallback,
+                accelerated ? static_cast<std::uint64_t>(rows * (features % 16))
+                            : static_cast<std::uint64_t>(rows * features));
+    }
+}
 // CPU's declared SiLU expectation: the nine applicable signed floating leaves,
 // the frozen `{0, 1}` zero-workspace requirement, and positive execution through
 // the real in-order CPU queue, observed by the shared independent oracle over

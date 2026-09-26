@@ -289,6 +289,7 @@ if(AVX_512_BF16_ENABLED)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_rmsnorm_reduction.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_silu.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_binary_mul.cpp)
+    iom_add_avx512_bf16_source(src/cpu/avx512_bf16_rmsnorm_store.cpp)
 endif()
 
 

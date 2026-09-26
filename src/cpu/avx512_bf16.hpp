@@ -113,5 +113,35 @@ void avx512_bf16_test_reset_observations() noexcept;
         unsigned char* out, std::size_t out_bit,
         bool lhs_broadcast, bool rhs_broadcast) noexcept;
 
+// Second RMSNorm pass for one logical BF16 row of one plane. The worker decodes
+// the row's logical BF16 features, applies the row inverse the scalar first
+// pass produced and the shared per-feature scale in FP32, and stores every
+// logical output with exactly one BF16 round-to-nearest-even encode. Feature
+// tails, selected plane offsets and view strides are honored through the same
+// standard tiled addressing the portable pass uses: only logical features are
+// addressed, so tile padding, other rows, and other planes keep their bits.
+//
+// Lanes whose value the ISA conversion cannot encode under this operation's
+// contract -- a zero exponent field, i.e. a signed zero or a BF16-subnormal
+// result, and NaN results, which the contract stores in canonical positive
+// form -- are encoded by the compliant scalar codec inside the same worker.
+// The function records `RmsStore`/`Native` once per executed 16-feature vector
+// group that stored at least one lane from its SIMD result and
+// `RmsStore`/`Fallback` once per logical feature whose encoding came from the
+// compliant scalar path (a corrected lane, the scalar feature tail, or the
+// whole row when the caller did not enter this worker).
+//
+// Contract precondition, checked by admission before the request is accepted:
+// `x`, `scale`, and `out` are BF16 standard tiled views whose logical features
+// are within their owners, so every group offset is inside the operand's
+// storage.
+void avx512_bf16_rmsnorm_store(
+        unsigned char* out_base, const TensorSpec& out_spec,
+        std::size_t out_plane, const unsigned char* x_base,
+        const TensorSpec& x_spec, std::size_t x_plane,
+        const unsigned char* scale_base, const TensorSpec& scale_spec,
+        std::size_t scale_plane, std::size_t row, std::size_t features,
+        float inverse);
+
 }  // namespace cpu_detail
 }  // namespace iom

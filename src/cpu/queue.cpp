@@ -2,7 +2,6 @@
 #include "device_internal.hpp"
 #include "transfer_helpers.hpp"
 
-#include "avx512_bf16.hpp"
 #include "../iom_internal.hpp"
 #include <array>
 #include <atomic>
@@ -955,11 +954,14 @@ private:
     // dependent value is rounded there before the single destination encode.
     // `native_reduction` selects the AVX-512 BF16 row reduction for a request
     // that may use it; every other request keeps the sequential recurrence.
+    // `avx512_bf16_store` selects the AVX-512 BF16 second pass, which consumes
+    // the row inverse either reduction path produced.
     template <typename Carrier>
     static void rmsnorm_plane(
             const RmsnormRequest& request, const RmsnormFormat& format,
             std::size_t x_plane, std::size_t out_plane, std::size_t rows,
-            std::size_t features, bool native_reduction) {
+            std::size_t features, bool native_reduction,
+            bool avx512_bf16_store) {
         const TensorSpec& x_spec = request.x.spec;
         const TensorSpec& scale_spec = request.scale.spec;
         const TensorSpec& out_spec = request.out.spec;
@@ -972,6 +974,14 @@ private:
         const std::size_t scale_plane = request.scale.plane_offset;
         const Carrier divisor = static_cast<Carrier>(features);
         const Carrier epsilon = static_cast<Carrier>(request.epsilon);
+#if defined(IOM_AVX512_BF16_TESTING)
+        // A BF16 request that did not enter the target worker stores all of its
+        // logical features through the portable codec; the observation seam
+        // reports exactly those features, so a test can tell this path apart
+        // from an executed vector worker.
+        const bool scalar_bf16_row =
+                !avx512_bf16_store && x_spec.data_type == DataType::BF16;
+#endif
         for (std::size_t row = 0; row < rows; ++row) {
             Carrier inverse = static_cast<Carrier>(0);
             bool reduced = false;
@@ -1010,6 +1020,23 @@ private:
                 }
 #endif
             }
+            if constexpr (std::is_same_v<Carrier, float>) {
+#if defined(IOM_AVX512_BF16_COMPILED)
+                if (avx512_bf16_store) {
+                    // The target worker consumes the row inverse the reduction
+                    // above produced and owns the entire second pass: its
+                    // vector groups, the lanes it corrects with the portable
+                    // codec, and the scalar feature tail.
+                    cpu_detail::avx512_bf16_rmsnorm_store(
+                            out_base, out_spec, out_plane, x_base, x_spec,
+                            x_plane, scale_base, scale_spec, scale_plane, row,
+                            features, inverse);
+                    continue;
+                }
+#else
+                (void)avx512_bf16_store;
+#endif
+            }
             for (std::size_t feature = 0; feature < features; ++feature) {
                 const Carrier value = decode_element<Carrier>(
                         x_base, x_spec, format, x_plane, row, feature);
@@ -1020,6 +1047,13 @@ private:
                 encode_element<Carrier>(
                         out_base, out_spec, format, out_plane, row, feature,
                         normalized * scale);
+#if defined(IOM_AVX512_BF16_TESTING)
+                if (scalar_bf16_row) {
+                    cpu_detail::avx512_bf16_test_record(
+                            cpu_detail::Avx512Bf16Stage::RmsStore,
+                            cpu_detail::Avx512Bf16Path::Fallback);
+                }
+#endif
             }
         }
     }
@@ -1044,6 +1078,19 @@ private:
                 std::is_same_v<Carrier, float>
                 && spec.data_type == DataType::BF16
                 && cpu_detail::avx512_bf16_available();
+#if defined(IOM_AVX512_BF16_COMPILED)
+        // This build contains the isolated AVX-512 BF16 sources, so the
+        // baseline-safe detector decides per request whether this host may
+        // enter them. Only a BF16 request is a candidate; selecting the pass is
+        // not work, so the decision is taken once here rather than per row.
+        const bool avx512_bf16_store =
+                spec.data_type == DataType::BF16
+                && cpu_detail::avx512_bf16_available();
+#else
+        // A portable build has no target code to enter; every request keeps the
+        // portable row pass, and no target symbol is referenced at all.
+        const bool avx512_bf16_store = false;
+#endif
         const std::span<const std::size_t> x_strides = request.x.plane_strides;
         const std::span<const std::size_t> out_strides =
                 request.out.plane_strides;
@@ -1052,7 +1099,7 @@ private:
             if (axis + 2 == rank) {
                 rmsnorm_plane<Carrier>(
                         request, format, x_plane, out_plane, rows, features,
-                        native_reduction);
+                        native_reduction, avx512_bf16_store);
                 return;
             }
             for (std::size_t index = 0; index < dimensions[axis]; ++index) {
