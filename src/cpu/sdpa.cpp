@@ -60,6 +60,32 @@ void store_bf16(
             ? std::copysign(0.0f, value) : value;
 }
 
+// Hand one PV row to the isolated AVX-512 BF16 stage. The stage exists only in
+// a build that registered its source, and it may only run after the runtime
+// eligibility check; anything else - including a row whose operand scale cannot
+// rule out a subnormal result - leaves the row to the gradual scalar
+// recurrence below, which stays the contract authority.
+[[nodiscard]] bool try_native_sdpa_pv(
+        const SdpaRequest& request, const unsigned char* probability_row,
+        std::size_t v_head_plane, std::size_t out_plane, std::size_t row,
+        std::size_t out_column, std::size_t visible_limit) noexcept {
+#if defined(IOM_AVX512_BF16_COMPILED)
+    return avx512_bf16_available()
+            && sdpa_pv_bf16_row(
+                       request, probability_row, v_head_plane, out_plane, row,
+                       out_column, visible_limit);
+#else
+    (void)request;
+    (void)probability_row;
+    (void)v_head_plane;
+    (void)out_plane;
+    (void)row;
+    (void)out_column;
+    (void)visible_limit;
+    return false;
+#endif
+}
+
 [[nodiscard]] std::size_t workspace_elements(
         std::size_t leading_planes, std::size_t heads, std::size_t rows,
         std::size_t length) {
@@ -282,23 +308,32 @@ void sdpa_plane(
                 }
             }
 
-            for (std::size_t feature = 0; feature < request.D; ++feature) {
-                float result = 0.0f;
-                for (std::size_t token = 0; token < visible_limit; ++token) {
-                    const float probability = matrix_daz(load_probability(
-                            request.workspace, probability_base,
-                            p_index + token));
-                    const float value = matrix_daz(load_bf16(
-                            request.v, v_head_plane, token, feature));
-                    const volatile float product = probability * value;
-                    const volatile float next = result + product;
-                    result = next;
+            if (!try_native_sdpa_pv(
+                        request,
+                        request.workspace + probability_base
+                                + p_index * sizeof(std::uint16_t),
+                        v_head_plane, out_plane, row, head * request.D,
+                        visible_limit)) {
+                for (std::size_t feature = 0; feature < request.D;
+                     ++feature) {
+                    float result = 0.0f;
+                    for (std::size_t token = 0; token < visible_limit;
+                         ++token) {
+                        const float probability = matrix_daz(load_probability(
+                                request.workspace, probability_base,
+                                p_index + token));
+                        const float value = matrix_daz(load_bf16(
+                                request.v, v_head_plane, token, feature));
+                        const volatile float product = probability * value;
+                        const volatile float next = result + product;
+                        result = next;
+                    }
+                    // Canonicalize a -0 accumulator to +0 before the final BF16 store.
+                    if (result == 0.0f) result = 0.0f;
+                    store_bf16(
+                            request.out, out_plane, row,
+                            head * request.D + feature, result);
                 }
-                // Canonicalize a -0 accumulator to +0 before the final BF16 store.
-                if (result == 0.0f) result = 0.0f;
-                store_bf16(
-                        request.out, out_plane, row,
-                        head * request.D + feature, result);
             }
         }
     }

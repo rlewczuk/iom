@@ -47,6 +47,29 @@ namespace cpu_detail {
         std::size_t plane, std::size_t row, std::size_t features,
         float epsilon, float& inverse);
 
+// The CPU SDPA worker's request snapshot; declared here because the isolated
+// stage below takes it by reference and this header stays independent of the
+// device internals that define it.
+struct SdpaRequest;
+
+// Produces one probability-value (PV) row of the CPU SDPA worker with the
+// isolated AVX-512 BF16 paired dot product. `probability_row` addresses the
+// first of `visible_limit` contiguous BF16 probabilities of the row inside the
+// caller's workspace, `v_head_plane` is the V plane slot of the row's grouped
+// key/value head, and the row's `request.D` BF16 outputs are written to
+// `out_plane` starting at column `out_column`. The stage returns true once it
+// has produced the whole row and false to leave every feature of the row to
+// the caller's gradual scalar stage, which remains the contract authority for
+// subnormal-scale operands.
+//
+// Declared for any build so the baseline worker can name it, but defined only
+// in the isolated AVX-512 BF16 source: every call must be both compiled under
+// `IOM_AVX512_BF16_COMPILED` and guarded by avx512_bf16_available().
+[[nodiscard]] bool sdpa_pv_bf16_row(
+        const SdpaRequest& request, const unsigned char* probability_row,
+        std::size_t v_head_plane, std::size_t out_plane, std::size_t row,
+        std::size_t out_column, std::size_t visible_limit) noexcept;
+
 // Settled execution stages of the AVX-512 BF16 workers. A stage reports its own
 // work, so SDPA's three stages stay individually observable.
 enum class Avx512Bf16Stage : std::uint8_t {

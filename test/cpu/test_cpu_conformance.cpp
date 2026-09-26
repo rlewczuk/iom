@@ -3011,3 +3011,91 @@ TEST_CASE("CPU conformance: workspace requirement queries report exact zero") {
     devices.gate.case_complete();
     CHECK_FALSE(devices.gate.armed());
 }
+
+// The BF16 SDPA probability-value stage has two routes, and both must keep the
+// same contract. The shared SDPA matrix already compares every fixture with the
+// independent oracle, so this case adds what that comparison cannot see: which
+// route each kind of row took, and that a representable BF16 subnormal output
+// survives instead of being flushed. Ordinary equal-score rows are the eligible
+// case and must run the isolated vector stage; a row whose only product is
+// 0.5 * 2^-126 must defer to the gradual scalar stage and store the subnormal
+// 2^-127 unchanged.
+TEST_CASE("CPU conformance: SDPA PV native route and preserved subnormal") {
+    CpuDevices devices;
+    iom_conformance::CpuStorageOracle oracle;
+    const iom_conformance::SdpaConformanceConfig config{
+            devices.conformance(),
+            iom_conformance::kSdpaCurrentSupportedDataTypes,
+            true,
+            &devices.gate,
+            &oracle,
+            {},
+            {&iom::cpu_detail::arm_sdpa_failure,
+             &iom::cpu_detail::clear_sdpa_failure,
+             "cpu_detail::sdpa",
+             {}}};
+
+#if defined(IOM_AVX512_BF16_TESTING)
+    const bool eligible = iom::cpu_detail::avx512_bf16_available();
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+#endif
+    (void)iom_conformance::sdpa_detail::run_reference_case(
+            config, iom_conformance::sdpa_oracle::make_ones_case(
+                            iom::DataType::BF16),
+            "ordinary SDPA PV rows");
+#if defined(IOM_AVX512_BF16_TESTING)
+    const auto probability_value_observation = [](auto path) {
+        return iom::cpu_detail::avx512_bf16_test_observation(
+                iom::cpu_detail::Avx512Bf16Stage::SdpaPv, path);
+    };
+    if (eligible) {
+        CHECK_MESSAGE(
+                probability_value_observation(
+                        iom::cpu_detail::Avx512Bf16Path::Native) > 0,
+                "an eligible ordinary SDPA PV row ran no native work");
+        CHECK_EQ(probability_value_observation(
+                         iom::cpu_detail::Avx512Bf16Path::Fallback), 0);
+    } else {
+        CHECK_EQ(probability_value_observation(
+                         iom::cpu_detail::Avx512Bf16Path::Native), 0);
+    }
+#endif
+
+    const iom_conformance::SdpaReferenceCase subnormal =
+            iom_conformance::sdpa_oracle::make_case(
+                    iom_conformance::SdpaReferenceCaseKind::gradual_underflow,
+                    iom::DataType::BF16, {}, 1, 1, 1, 1, 2, 1, 2,
+                    {0.0}, {0.0, 0.0}, {0x1p-126, 0.0});
+    const std::vector<iom_conformance::SdpaReferenceValue> expected =
+            iom_conformance::evaluate(subnormal);
+    REQUIRE_EQ(expected.size(), std::size_t{1});
+    // The fixture's only product is 0.5 * 2^-126, whose BF16 round-to-nearest
+    // encoding is the subnormal 2^-127.
+    REQUIRE_EQ(expected[0].bits, std::uint64_t{0x0040});
+    CHECK(expected[0].value_class
+          == iom_conformance::SdpaReferenceClass::finite);
+#if defined(IOM_AVX512_BF16_TESTING)
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+#endif
+    const std::vector<std::byte> observed =
+            iom_conformance::sdpa_detail::run_reference_case(
+                    config, subnormal, "subnormal SDPA PV row");
+    REQUIRE_EQ(observed.size(), std::size_t{2});
+    CHECK_EQ(
+            iom_conformance::read_storage_bits(observed.data(), 0, 16),
+            expected[0].bits);
+#if defined(IOM_AVX512_BF16_TESTING)
+    if (eligible) {
+        CHECK_MESSAGE(
+                probability_value_observation(
+                        iom::cpu_detail::Avx512Bf16Path::Fallback) > 0,
+                "a subnormal-scale SDPA PV row ran no scalar fallback");
+        CHECK_EQ(probability_value_observation(
+                         iom::cpu_detail::Avx512Bf16Path::Native), 0);
+    } else {
+        CHECK_EQ(probability_value_observation(
+                         iom::cpu_detail::Avx512Bf16Path::Fallback), 0);
+    }
+#endif
+    CHECK_FALSE(devices.gate.armed());
+}
