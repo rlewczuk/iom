@@ -6,6 +6,7 @@
 #include "avx512_bf16.hpp"
 #include "avx512_bf16_rope.hpp"
 #endif
+#include "avx512_bf16_linear.hpp"
 
 #include "../iom_internal.hpp"
 #include <array>
@@ -1886,6 +1887,69 @@ private:
                 });
     }
 
+#if defined(IOM_AVX512_BF16_COMPILED)
+    // The BF16 worker of an eligible build. Each output element is projected by
+    // the isolated AVX-512 BF16 dot source; when that source reports the
+    // participating values are not numerically safe for the instruction — a
+    // BF16 subnormal or nonfinite operand, an operand magnitude range whose
+    // ordered FP32 recurrence could overflow although the lane-wise reduction
+    // stays finite, or an FP32 accumulation that reached the hardware's
+    // flush-to-zero range — the same element is projected by the contract's
+    // scalar recurrence below, with the identical FP32 fused multiply-add order
+    // and the identical single RNE encode every other floating leaf uses. The
+    // decision stays inside this accepted queued worker: admission, ownership,
+    // lifetime, and the zero workspace are untouched, and no operand is scanned
+    // before it.
+    static void linear_bf16_elements(const LinearRequest& request) {
+        const LinearFormat format =
+                detail::scalar_add_detail::format(DataType::BF16);
+        const std::size_t features =
+                request.x.spec.shape.dimensions().back();
+        const auto* const x_base =
+                static_cast<const unsigned char*>(request.x.native_handle);
+        const auto* const w_base =
+                static_cast<const unsigned char*>(request.w.native_handle);
+        auto* const out_base =
+                static_cast<unsigned char*>(request.out.native_handle);
+        linear_planes(
+                request,
+                [&request, format, features, x_base, w_base, out_base](
+                        std::size_t x_plane, std::size_t source_row,
+                        std::size_t weight_row, std::size_t out_plane,
+                        std::size_t out_row, std::size_t out_column) {
+                    // Feature zero of each participating logical row is the
+                    // checked logical element offset of that row's first tile
+                    // column; the target worker advances inside the row by the
+                    // tile stride, never by a contiguous logical row.
+                    const unsigned char* const x_row =
+                            x_base + cpu_detail::logical_element_bits(
+                                             request.x.spec, x_plane,
+                                             source_row, 0)
+                                             / 8;
+                    const unsigned char* const w_row =
+                            w_base + cpu_detail::logical_element_bits(
+                                             request.w.spec,
+                                             request.w.plane_offset,
+                                             weight_row, 0)
+                                             / 8;
+                    if (cpu_detail::avx512_bf16_linear_dot(
+                                x_row, w_row, features, request.out.spec,
+                                out_base, out_plane, out_row, out_column)) {
+                        return;
+                    }
+#if defined(IOM_AVX512_BF16_TESTING)
+                    cpu_detail::avx512_bf16_test_record(
+                            cpu_detail::Avx512Bf16Stage::Linear,
+                            cpu_detail::Avx512Bf16Path::Fallback);
+#endif
+                    linear_float_element<float>(
+                            request, format, x_plane, source_row, weight_row,
+                            out_plane, out_row, out_column);
+                });
+    }
+
+#endif  // IOM_AVX512_BF16_COMPILED
+
     static void linear_elements(const LinearRequest& request) {
         const DataType data_type = request.x.spec.data_type;
         if (data_type == DataType::F64) {
@@ -1893,6 +1957,18 @@ private:
             return;
         }
         if (detail::scalar_add_detail::format(data_type).bits != 0) {
+#if defined(IOM_AVX512_BF16_COMPILED)
+            // Only a build that contains the isolated AVX-512 BF16 sources can
+            // reach the target worker, and only after the baseline-callable
+            // detector has approved this host's ISA features and OS-managed
+            // vector state. Every other host keeps the scalar recurrence below
+            // unchanged, so BF16 stays available everywhere.
+            if (data_type == DataType::BF16
+                    && cpu_detail::avx512_bf16_available()) {
+                linear_bf16_elements(request);
+                return;
+            }
+#endif
             linear_floating_elements<float>(request);
             return;
         }

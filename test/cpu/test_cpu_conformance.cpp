@@ -483,6 +483,350 @@ TEST_CASE("CPU conformance: linear projection reference, admission, and lifetime
             &oracle);
     CHECK_FALSE(devices.gate.armed());
 }
+
+namespace {
+
+// The native BF16 linear dot worker is entered only by a build that contains the
+// isolated AVX-512 BF16 sources and only on a host whose ISA features and
+// OS-managed vector state the detector approved. Its two working paths are
+// observable through the private stage seam, and this fixture pins both on the
+// boundaries the vector loop can get wrong: a 33-feature reduction (five
+// 16-wide inner tiles, three 32-wide vector blocks, and a one-feature vector
+// tail), an ordinary all-finite fixture versus directed fixtures whose every
+// participating dot carries a BF16 subnormal, a nonfinite value, or products
+// that accumulate below the FP32 range a flush-to-zero accumulation preserves,
+// and an allocator whose owner base is 32-byte aligned but 64-byte misaligned.
+//
+// Every output element is compared against the contract's independent FP64
+// equation under the BF16 policy, so a native result that flushed a subnormal
+// operand, rounded a partial sum through BF16, read tile padding, or addressed
+// the wrong tile is observable instead of plausible.
+constexpr std::size_t kBf16LinearSourceRows = 4;
+constexpr std::size_t kBf16LinearSelectedRows = 3;
+constexpr std::size_t kBf16LinearOuter = 4;
+constexpr std::size_t kBf16LinearInner = 33;
+constexpr std::size_t kBf16LinearElements =
+        kBf16LinearSelectedRows * kBf16LinearOuter;
+// The positive BF16 subnormal `0x0001`: a value the dot instruction replaces
+// with zero, and exactly the input the compliant recurrence must keep.
+constexpr std::uint64_t kBf16SubnormalCode = 0x0001;
+// The BF16 infinity `0x7F80`: a class whose instruction rules are the
+// instruction's own rather than the named format's.
+constexpr std::uint64_t kBf16InfinityCode = 0x7F80;
+// `2^-127`, the smallest positive BF16 normal value: an operand the instruction
+// handles exactly, but whose products accumulate below the FP32 range a
+// flush-to-zero accumulation could keep, so the dot belongs to the gradual
+// recurrence. It is the cancellation/underflow boundary the native path must
+// detect rather than round through the hardware's flush.
+constexpr std::uint64_t kBf16TinyNormalCode = 0x0080;
+
+// The largest finite BF16 codes the overflow fixture plants: `2^126` and
+// `2^125`, whose products with unit weights drive the ordered FP32 recurrence
+// out of the finite range while lane-wise native lanes cancel.
+constexpr std::uint64_t kBf16TwoTo126Code = 0x7E80;
+constexpr std::uint64_t kBf16TwoTo125Code = 0x7E00;
+// BF16 `1.0` and `-1.0`, the overflow fixture's weights.
+constexpr std::uint64_t kBf16OneCode = 0x3F80;
+constexpr std::uint64_t kBf16MinusOneCode = 0xBF80;
+// The nonzero byte every fixture writes into the owner storage before the
+// logical values are uploaded, so tile padding a worker consumed or rewrote is
+// observable.
+constexpr unsigned char kBf16PaddingPoison = 0x5A;
+
+// What the directed fixture plants, so the one helper covers the ordinary case
+// and every exceptional class the native path must refuse. `short_tail`
+// repeats the ordinary values with a reduction shorter than one vector block.
+enum class Bf16LinearFixture {
+    ordinary,
+    short_tail,
+    subnormal,
+    nonfinite,
+    underflow,
+    finite_overflow,
+};
+
+struct Bf16LinearStageCounts {
+    std::uint64_t native = 0;
+    std::uint64_t fallback = 0;
+};
+
+// Requires every byte of one owner's tiled storage that holds no logical
+// element bit to still carry the fixture's padding poison: the recorded native
+// block loads may read tile padding, but no padding value may reach a result and
+// no padding byte may be rewritten.
+void require_padding_poison(
+        const iom::TensorSpec& owner_spec, const iom::TensorView& view) {
+    constexpr std::size_t kBits = 16;
+    const std::size_t storage_bytes = owner_spec.tiled_storage_nbytes();
+    const std::span<const std::size_t> dims = view.spec().shape.dimensions();
+    REQUIRE_EQ(dims.size(), 2);
+    std::vector<bool> logical(storage_bytes * 8, false);
+    for (std::size_t row = 0; row < dims[0]; ++row) {
+        for (std::size_t column = 0; column < dims[1]; ++column) {
+            const std::size_t bit = iom::detail::standard_plane_slot(
+                    owner_spec, view.plane_offset(), row, column) * kBits;
+            for (std::size_t offset = 0; offset < kBits; ++offset) {
+                logical[bit + offset] = true;
+            }
+        }
+    }
+    const auto* storage =
+            static_cast<const unsigned char*>(view.native_handle());
+    for (std::size_t byte = 0; byte < storage_bytes; ++byte) {
+        bool addressed = false;
+        for (std::size_t offset = 0; offset < 8 && !addressed; ++offset) {
+            addressed = logical[byte * 8 + offset];
+        }
+        if (!addressed) {
+            CHECK_EQ(
+                    static_cast<unsigned int>(storage[byte]),
+                    static_cast<unsigned int>(kBf16PaddingPoison));
+        }
+    }
+}
+
+// Submits one fixture through the real queue of a CPU device whose tensor
+// storage comes from a 32-byte-aligned, 64-byte-misaligned base, verifies the
+// whole projected window, the untouched inputs and the untouched padding
+// against the independent policy, and returns the `Linear` stage/path counts the
+// worker recorded. `inner` selects the reduction length, so one helper covers a
+// full-block reduction and a reduction shorter than one 32-feature vector
+// operand.
+[[nodiscard]] Bf16LinearStageCounts run_bf16_linear_native_case(
+        Bf16LinearFixture fixture,
+        std::size_t inner = kBf16LinearInner) {
+    REQUIRE(inner >= 1);
+    alignas(64) std::byte storage[16384];
+    iom::LinearAllocator allocator(storage + 32, sizeof(storage) - 32);
+    const std::unique_ptr<iom::Device> device = iom::make_cpu_device(allocator);
+    auto x_owner = device->create_tensor(iom::TensorSpec{
+            iom::TensorShape{{kBf16LinearSourceRows, inner}},
+            iom::DataType::BF16});
+    auto w_owner = device->create_tensor(iom::TensorSpec{
+            iom::TensorShape{{kBf16LinearOuter, inner}},
+            iom::DataType::BF16});
+    auto out_owner = device->create_tensor(iom::TensorSpec{
+            iom::TensorShape{{kBf16LinearSelectedRows, kBf16LinearOuter}},
+            iom::DataType::BF16});
+    // This is the alignment boundary itself: the port may rely on 32 bytes and
+    // on nothing more, so an implementation that assumed a 64-byte-aligned
+    // owner would read outside the intended chunk here.
+    CHECK_EQ(
+            reinterpret_cast<std::uintptr_t>(
+                    x_owner->view().native_handle()) % 64,
+            std::uintptr_t{32});
+
+    std::vector<std::byte> x_image = iom_conformance::linear_logical_image(
+            iom::DataType::BF16, kBf16LinearSourceRows * inner,
+            0x51EDull, false);
+    std::vector<std::byte> w_image = iom_conformance::linear_logical_image(
+            iom::DataType::BF16, kBf16LinearOuter * inner,
+            0x1D0Full, false);
+    const auto plant = [&x_image, &w_image, inner](
+                               bool into_weights, std::size_t row,
+                               std::size_t feature, std::uint64_t code) {
+        std::vector<std::byte>& image = into_weights ? w_image : x_image;
+        iom_conformance::write_storage_bits(
+                image.data(), (row * inner + feature) * 16, 16, code);
+    };
+    if (fixture == Bf16LinearFixture::subnormal
+            || fixture == Bf16LinearFixture::nonfinite) {
+        // Feature zero of every participating row carries the directed class in
+        // both operands, so every output element's dot contains it.
+        const std::uint64_t code = fixture == Bf16LinearFixture::subnormal
+                ? kBf16SubnormalCode
+                : kBf16InfinityCode;
+        for (std::size_t row = 0; row < kBf16LinearSourceRows; ++row) {
+            plant(false, row, 0, code);
+        }
+        for (std::size_t row = 0; row < kBf16LinearOuter; ++row) {
+            plant(true, row, 0, code);
+        }
+    }
+    if (fixture == Bf16LinearFixture::underflow) {
+        // Every weight is the smallest positive BF16 normal value, so each dot
+        // of the unit-magnitude activations accumulates far below the FP32
+        // range the instruction's flush-to-zero accumulation preserves.
+        for (std::size_t row = 0; row < kBf16LinearOuter; ++row) {
+            for (std::size_t feature = 0; feature < inner; ++feature) {
+                plant(true, row, feature, kBf16TinyNormalCode);
+            }
+        }
+    }
+    if (fixture == Bf16LinearFixture::finite_overflow) {
+        // Finite, normal operands whose ordered FP32 recurrence overflows while
+        // the lane-wise native reduction cancels: activations `2^126` in the
+        // first eight features and `2^125` in the ninth, weights `+1` for
+        // features 0..3, `-1` for 4..7 and `+1` for 8, everything else zero.
+        // The increasing-feature recurrence reaches `2^128` and stays infinite,
+        // so the contract's result is the format's infinity and the magnitude
+        // screen must route the element to the scalar recurrence instead of
+        // storing the finite native cancellation.
+        for (std::size_t row = 0; row < kBf16LinearSourceRows; ++row) {
+            for (std::size_t feature = 0; feature < inner; ++feature) {
+                std::uint64_t code = 0;
+                if (feature < 8) {
+                    code = kBf16TwoTo126Code;
+                } else if (feature == 8) {
+                    code = kBf16TwoTo125Code;
+                }
+                plant(false, row, feature, code);
+            }
+        }
+        for (std::size_t row = 0; row < kBf16LinearOuter; ++row) {
+            for (std::size_t feature = 0; feature < inner; ++feature) {
+                std::uint64_t code = 0;
+                if (feature < 4 || feature == 8) {
+                    code = kBf16OneCode;
+                } else if (feature < 8) {
+                    code = kBf16MinusOneCode;
+                }
+                plant(true, row, feature, code);
+            }
+        }
+    }
+    // Every owner's storage carries the padding poison before the logical host
+    // copies below, so each byte that holds no logical element keeps a known
+    // nonzero pattern: a worker that read tile padding as a value, or that wrote
+    // outside its selected coordinates, is observable rather than neutral.
+    for (iom::Tensor* const owner :
+         {x_owner.get(), w_owner.get(), out_owner.get()}) {
+        auto* const bytes =
+                static_cast<unsigned char*>(owner->view().native_handle());
+        const std::size_t storage_bytes =
+                owner->view().spec().tiled_storage_nbytes();
+        for (std::size_t byte = 0; byte < storage_bytes; ++byte) {
+            bytes[byte] = kBf16PaddingPoison;
+        }
+    }
+    iom_conformance::copy_from_host(x_owner->view(), x_image);
+    iom_conformance::copy_from_host(w_owner->view(), w_image);
+    auto queue = device->create_ops();
+
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    const iom::oid token = queue->linear(
+            x_owner->view(), w_owner->view(), out_owner->view(), 0,
+            kBf16LinearSelectedRows, iom::LinearOutputLayout::ordinary, 1,
+            kBf16LinearOuter);
+    REQUIRE(iom::oid_is_token(token));
+    CHECK_NOTHROW(queue->wait(token));
+
+    const std::vector<std::byte> observed =
+            iom_conformance::read_logical(out_owner->view());
+    for (std::size_t row = 0; row < kBf16LinearSelectedRows; ++row) {
+        for (std::size_t column = 0; column < kBf16LinearOuter; ++column) {
+            // The contract's exact scalar recurrence owns the expectation's
+            // result class, and the independent FP64 evaluation of the same
+            // equation carries the fixed tolerance. These are the same two
+            // quantities the shared linear oracle compares a projection
+            // against, and they legitimately differ in class exactly where the
+            // recurrence leaves the finite range that the wide equation still
+            // spans, which is what the directed overflow fixture plants.
+            std::vector<std::uint64_t> x_codes(inner);
+            std::vector<std::uint64_t> w_codes(inner);
+            for (std::size_t feature = 0; feature < inner; ++feature) {
+                x_codes[feature] = iom_conformance::linear_logical_code(
+                        x_image, iom::DataType::BF16,
+                        row * inner + feature);
+                w_codes[feature] = iom_conformance::linear_logical_code(
+                        w_image, iom::DataType::BF16,
+                        column * inner + feature);
+            }
+            const std::uint64_t expected_code =
+                    iom_conformance::linear_scalar_recurrence(
+                            iom::DataType::BF16, x_codes, w_codes);
+            const double value = iom_conformance::linear_wide_value(
+                    iom::DataType::BF16, x_codes, w_codes);
+            const std::uint64_t observed_code =
+                    iom_conformance::linear_logical_code(
+                            observed, iom::DataType::BF16,
+                            row * kBf16LinearOuter + column);
+            const std::optional<std::string> mismatch =
+                    iom_conformance::linear_compare_element(
+                            iom::DataType::BF16, observed_code, expected_code,
+                            value);
+            CHECK_MESSAGE(
+                    !mismatch.has_value(),
+                    "row " << row << " column " << column << ": "
+                           << mismatch.value_or(std::string{}));
+        }
+    }
+    iom_conformance::require_logical_bytes(
+            x_owner->view(), x_image, "the projection changed the input");
+    iom_conformance::require_logical_bytes(
+            w_owner->view(), w_image, "the projection changed the weight");
+    // Every byte outside the logical elements of all three owners still holds
+    // the fixture's padding poison, so the block loads neither consumed tile
+    // padding as a value nor rewrote it.
+    require_padding_poison(x_owner->view().spec(), x_owner->view());
+    require_padding_poison(w_owner->view().spec(), w_owner->view());
+    require_padding_poison(out_owner->view().spec(), out_owner->view());
+
+    Bf16LinearStageCounts counts;
+    counts.native = iom::cpu_detail::avx512_bf16_test_observation(
+            iom::cpu_detail::Avx512Bf16Stage::Linear,
+            iom::cpu_detail::Avx512Bf16Path::Native);
+    counts.fallback = iom::cpu_detail::avx512_bf16_test_observation(
+            iom::cpu_detail::Avx512Bf16Stage::Linear,
+            iom::cpu_detail::Avx512Bf16Path::Fallback);
+    return counts;
+}
+
+}  // namespace
+
+TEST_CASE("CPU conformance: BF16 linear dot records native work and compliant fallback") {
+    // `ordinary` is a full-block reduction; `short_tail` repeats the same
+    // ordinary values with a one-feature and a nine-feature reduction, whose
+    // only vector operand block is shorter than the instruction consumes; the
+    // directed fixtures cover every exceptional class the native path refuses.
+    const Bf16LinearStageCounts ordinary =
+            run_bf16_linear_native_case(Bf16LinearFixture::ordinary);
+    const Bf16LinearStageCounts one_feature =
+            run_bf16_linear_native_case(Bf16LinearFixture::short_tail, 1);
+    const Bf16LinearStageCounts short_tail =
+            run_bf16_linear_native_case(Bf16LinearFixture::short_tail, 9);
+    const Bf16LinearStageCounts subnormal =
+            run_bf16_linear_native_case(Bf16LinearFixture::subnormal);
+    const Bf16LinearStageCounts nonfinite =
+            run_bf16_linear_native_case(Bf16LinearFixture::nonfinite);
+    const Bf16LinearStageCounts underflow =
+            run_bf16_linear_native_case(Bf16LinearFixture::underflow);
+    const Bf16LinearStageCounts overflow =
+            run_bf16_linear_native_case(Bf16LinearFixture::finite_overflow);
+    const std::array<Bf16LinearStageCounts, 4> refused{
+            subnormal, nonfinite, underflow, overflow};
+    if (iom::cpu_detail::avx512_bf16_available()) {
+        // An eligible host must execute the vector dot for every ordinary
+        // fixture — including the short ones, whose unused operand half must be
+        // a defined zero — must route every directed exceptional fixture to the
+        // compliant fallback, and records every projected element exactly once
+        // and never as both: the native counter cannot claim an element whose
+        // value came from the scalar recurrence, and the fallback counter
+        // cannot claim native work.
+        CHECK_EQ(one_feature.native, kBf16LinearElements);
+        CHECK_EQ(short_tail.native, kBf16LinearElements);
+        CHECK_EQ(ordinary.native, kBf16LinearElements);
+        for (const Bf16LinearStageCounts counts : refused) {
+            CHECK_EQ(counts.native, std::uint64_t{0});
+            CHECK_EQ(counts.fallback, kBf16LinearElements);
+        }
+        for (const Bf16LinearStageCounts counts :
+             {one_feature, short_tail, ordinary, subnormal, nonfinite,
+              underflow, overflow}) {
+            CHECK_EQ(counts.native + counts.fallback, kBf16LinearElements);
+        }
+    } else {
+        // Without the emitted instructions, or without this configuration's
+        // isolated sources, there is no target worker to enter: every fixture
+        // keeps the scalar port and records no stage work at all.
+        for (const Bf16LinearStageCounts counts :
+             {one_feature, short_tail, ordinary, subnormal, nonfinite,
+              underflow, overflow}) {
+            CHECK_EQ(counts.native, std::uint64_t{0});
+            CHECK_EQ(counts.fallback, std::uint64_t{0});
+        }
+    }
+}
 // CPU's cache append port is the direct zero-workspace implementation. The
 // shared runner owns the independent byte oracle, all 23 opaque leaves,
 // transformed view offsets/strides, admission boundaries, FIFO pipeline,
