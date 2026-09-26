@@ -1333,6 +1333,96 @@ TEST_CASE("CPU conformance: RoPE reference, admission, and lifetime") {
             iom_conformance::rope_reference::kRopeCpuExpectedSupported);
     CHECK_FALSE(devices.gate.armed());
 }
+#ifdef IOM_TEST_AVX512_BF16_ENABLED
+// The configured build contains the isolated AVX-512 BF16 sources. On a host
+// whose CPUID and vector state the detector accepts, an ordinary
+// nonzero-position BF16 RoPE request must execute the isolated pair kernel and
+// record that arithmetic there; a request whose products overflow FP32 or stay
+// FP32 subnormal must record the compliant scalar fallback instead, and a
+// position-zero request must stay the encoded-bit copy and record neither.
+//
+// The oracle comparison for the values themselves belongs to the RoPE
+// conformance case above, which runs the same kernel over every BF16 case of
+// the independent split-half reference; this case reports which path did the
+// arithmetic those values came from.
+//
+// The case exists only in the accelerated configuration: the portable
+// configuration has no target code to enter and no stage to observe.
+TEST_CASE("CPU AVX-512 BF16 RoPE records executed pair arithmetic") {
+    using iom::cpu_detail::Avx512Bf16Path;
+    using iom::cpu_detail::Avx512Bf16Stage;
+    if (!iom::cpu_detail::avx512_bf16_available()) {
+        // The eligibility case reports this host's own CPUID and OS vector
+        // state; without it there is no target path to exercise.
+        MESSAGE("this host does not report AVX-512 BF16 eligibility");
+        return;
+    }
+    CpuDevices devices;
+    // One head, one row, four features: two split-half pairs, each an
+    // independent observation.
+    const iom::TensorSpec spec{
+            iom::TensorShape{{1, 1, 4}}, iom::DataType::BF16};
+    const std::vector<std::byte> base = iom_conformance::encode_logical(spec, 0);
+    std::vector<std::byte> ordinary = base;
+    std::vector<std::byte> exceptional = base;
+    std::vector<std::byte> position_zero = base;
+    const auto set_element = [](std::vector<std::byte>& bytes,
+                                std::size_t index, std::uint16_t bits) {
+        bytes[index * 2] = static_cast<std::byte>(bits & 0xFFu);
+        bytes[index * 2 + 1] = static_cast<std::byte>(bits >> 8);
+    };
+    // 1.0 and 0.5: every product and every result is a finite normal value.
+    set_element(ordinary, 0, 0x3F80u);
+    set_element(ordinary, 1, 0x3F00u);
+    set_element(ordinary, 2, 0x3F80u);
+    set_element(ordinary, 3, 0x3F00u);
+    // The largest finite BF16 value next to the smallest BF16 subnormal: the
+    // first pair's sum overflows FP32 and the second pair's products stay FP32
+    // subnormal, so neither pair may be encoded by the vector kernel.
+    set_element(exceptional, 0, 0x7F7Fu);
+    set_element(exceptional, 1, 0x0001u);
+    set_element(exceptional, 2, 0x7F7Fu);
+    set_element(exceptional, 3, 0x0001u);
+    // Position zero is an encoded-bit copy, so its payload is arbitrary.
+    set_element(position_zero, 0, 0x0000u);
+    set_element(position_zero, 1, 0x8000u);
+    set_element(position_zero, 2, 0xFF80u);
+    set_element(position_zero, 3, 0x7FC1u);
+
+    auto queue = devices.candidate->create_ops();
+    auto source = devices.candidate->create_tensor(spec);
+    auto destination = devices.candidate->create_tensor(spec);
+    iom::TensorView destination_view = destination->view();
+    const auto observation = [](Avx512Bf16Path path) {
+        return iom::cpu_detail::avx512_bf16_test_observation(
+                Avx512Bf16Stage::Rope, path);
+    };
+    const auto run = [&](const std::vector<std::byte>& input,
+                         std::size_t position) {
+        iom_conformance::copy_from_host(source->view(), input);
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        const iom::oid token = queue->rope(
+                source->view(), destination_view, position, 10000.0);
+        REQUIRE(iom::oid_is_token(token));
+        queue->wait(token);
+    };
+
+    run(ordinary, 1);
+    CHECK_EQ(observation(Avx512Bf16Path::Native), std::uint64_t{2});
+    CHECK_EQ(observation(Avx512Bf16Path::Fallback), std::uint64_t{0});
+
+    run(exceptional, 1);
+    CHECK_EQ(observation(Avx512Bf16Path::Native), std::uint64_t{0});
+    CHECK_EQ(observation(Avx512Bf16Path::Fallback), std::uint64_t{2});
+
+    run(position_zero, 0);
+    CHECK_EQ(observation(Avx512Bf16Path::Native), std::uint64_t{0});
+    CHECK_EQ(observation(Avx512Bf16Path::Fallback), std::uint64_t{0});
+    CHECK(iom_conformance::read_logical(destination_view) == position_zero);
+    CHECK_FALSE(devices.gate.armed());
+}
+#endif
+
 TEST_CASE("CPU conformance: RoPE keeps inapplicable leaves explicitly unsupported") {
     CpuDevices devices;
     auto queue = devices.candidate->create_ops();

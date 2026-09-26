@@ -2,6 +2,11 @@
 #include "device_internal.hpp"
 #include "transfer_helpers.hpp"
 
+#if defined(IOM_AVX512_BF16_COMPILED)
+#include "avx512_bf16.hpp"
+#include "avx512_bf16_rope.hpp"
+#endif
+
 #include "../iom_internal.hpp"
 #include <array>
 #include <atomic>
@@ -1164,6 +1169,23 @@ private:
                 format);
     }
 
+    // The frequency, angle, sine, and cosine of one split-half pair: the
+    // transcendental values the RoPE contract fixes outside the pair
+    // arithmetic. The scalar pair evaluation and the vector chunk loop both
+    // take them from this one expression, so the two paths cannot drift.
+    template <typename Carrier>
+    static void rope_angle(
+            std::size_t column, std::size_t width, std::size_t position,
+            Carrier theta, Carrier& sine, Carrier& cosine) {
+        const Carrier exponent = static_cast<Carrier>(
+                (-2.0 * static_cast<double>(column))
+                / static_cast<double>(width));
+        const Carrier frequency = std::pow(theta, exponent);
+        const Carrier angle = static_cast<Carrier>(position) * frequency;
+        sine = std::sin(angle);
+        cosine = std::cos(angle);
+    }
+
     template <typename Carrier>
     static void rope_pair(
             const RopeRequest& request, const RopeFormat& format,
@@ -1181,14 +1203,10 @@ private:
         const Carrier second = rope_decode<Carrier>(
                 x_base, x_dimensions, request.x.data_type, format, x_plane,
                 row, second_column);
-        const Carrier exponent = static_cast<Carrier>(
-                (-2.0 * static_cast<double>(first_column))
-                / static_cast<double>(width));
-        const Carrier frequency = std::pow(theta, exponent);
-        const Carrier position = static_cast<Carrier>(request.a + row);
-        const Carrier angle = position * frequency;
-        const Carrier sine = std::sin(angle);
-        const Carrier cosine = std::cos(angle);
+        Carrier sine = static_cast<Carrier>(0);
+        Carrier cosine = static_cast<Carrier>(0);
+        rope_angle<Carrier>(
+                first_column, width, request.a + row, theta, sine, cosine);
 
         // Keep the two products and the following add/subtract as separate
         // operations. Volatile intermediates prevent contraction into FMA
@@ -1211,6 +1229,56 @@ private:
                 row, second_column,
                 CpuRopeCodec<Carrier>::encode(second_output, format));
     }
+
+#if defined(IOM_AVX512_BF16_COMPILED)
+    // One nonzero-position BF16 row through the isolated AVX-512 BF16 pair
+    // kernel: the same pairs, the same transcendental values, and the same
+    // compliant scalar pair for anything the vector arithmetic declines. The
+    // target code owns only the four products, the following
+    // subtraction/addition, and the single BF16 encode of each result.
+    static void rope_bf16_row(
+            const RopeRequest& request, const RopeFormat& format,
+            const unsigned char* x_base, unsigned char* out_base,
+            std::span<const std::size_t> x_dimensions,
+            std::span<const std::size_t> out_dimensions,
+            std::size_t x_plane, std::size_t out_plane, std::size_t row,
+            std::size_t half, float theta) {
+        const std::size_t width = x_dimensions.back();
+        for (std::size_t first_pair = 0; first_pair < half;
+             first_pair += cpu_detail::kAvx512Bf16RopePairs) {
+            const std::size_t remaining = half - first_pair;
+            const std::size_t count =
+                    remaining < cpu_detail::kAvx512Bf16RopePairs
+                    ? remaining : cpu_detail::kAvx512Bf16RopePairs;
+            // The kernel receives the transcendental values this CPU port
+            // would otherwise evaluate per pair, in the same order.
+            alignas(64) float sine[cpu_detail::kAvx512Bf16RopePairs] = {};
+            alignas(64) float cosine[cpu_detail::kAvx512Bf16RopePairs] = {};
+            for (std::size_t lane = 0; lane < count; ++lane) {
+                rope_angle<float>(
+                        first_pair + lane, width, request.a + row, theta,
+                        sine[lane], cosine[lane]);
+            }
+            const std::uint32_t declined =
+                    cpu_detail::avx512_bf16_rope_pairs(
+                            x_base, out_base, x_dimensions, out_dimensions,
+                            x_plane, out_plane, row, first_pair, count, sine,
+                            cosine);
+            for (std::size_t lane = 0; lane < count; ++lane) {
+                if (((declined >> lane) & 1u) == 0) continue;
+#if defined(IOM_AVX512_BF16_TESTING)
+                cpu_detail::avx512_bf16_test_record(
+                        cpu_detail::Avx512Bf16Stage::Rope,
+                        cpu_detail::Avx512Bf16Path::Fallback);
+#endif
+                rope_pair<float>(
+                        request, format, x_base, out_base, x_dimensions,
+                        out_dimensions, x_plane, out_plane, row,
+                        first_pair + lane, theta);
+            }
+        }
+    }
+#endif
 
     template <typename Carrier>
     static void rope_plane(
@@ -1271,6 +1339,23 @@ private:
                     }
                     continue;
                 }
+
+#if defined(IOM_AVX512_BF16_COMPILED)
+                // The isolated BF16 pair kernel is entered only for the
+                // carrier and data type it implements, and only when this
+                // process may run its instructions; every other request keeps
+                // the scalar pair loop below.
+                if constexpr (std::is_same_v<Carrier, float>) {
+                    if (request.x.data_type == DataType::BF16
+                            && cpu_detail::avx512_bf16_available()) {
+                        rope_bf16_row(
+                                request, format, x_base, out_base,
+                                x_dimensions, out_dimensions, x_plane,
+                                out_plane, row, half, theta);
+                        continue;
+                    }
+                }
+#endif
 
                 for (std::size_t tile_column = 0;
                      tile_column < pair_tiles; ++tile_column) {
