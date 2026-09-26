@@ -1,3 +1,4 @@
+#include "avx512_bf16.hpp"
 #include "device_internal.hpp"
 #include "transfer_helpers.hpp"
 
@@ -189,6 +190,16 @@ void clear_cache_append_wait_observation() noexcept {
 [[nodiscard]] std::size_t observed_cache_append_waits() noexcept {
     return observed_append_wait_count.load(std::memory_order_acquire);
 }
+
+// One logical BF16 SiLU feature row of the isolated AVX-512 BF16 source
+// registered as `src/cpu/avx512_bf16_silu.cpp`. The queued worker calls it only
+// after `avx512_bf16_available()` accepts the request, and only a build that
+// registered that source contains a definition; this declaration is baseline
+// code that names the hook without containing a target instruction.
+void avx512_bf16_silu_row(
+        const unsigned char* x_base, unsigned char* y_base,
+        std::span<const std::size_t> dimensions, std::size_t x_plane,
+        std::size_t y_plane, std::size_t run, std::size_t features);
 
 }  // namespace cpu_detail
 
@@ -1180,15 +1191,22 @@ private:
 
 
     // ------------------------------------------------------------------
-    // SiLU: an asynchronous, in-order scalar activation over caller-owned tiled
+    // SiLU: an asynchronous, in-order activation over caller-owned tiled
     // storage. Nothing below allocates: the admitted request was already
     // captured by value, every element is addressed through the shared checked
-    // layout helpers, and `src/shared/scalar_silu.hpp` is the only evaluator —
-    // it decodes the named destination format, evaluates the stable expression,
+    // layout helpers, and `src/shared/scalar_silu.hpp` is the evaluator — it
+    // decodes the named destination format, evaluates the stable expression,
     // and encodes each logical element exactly once with destination RNE. Only
     // the selected logical element of a plane is read and only its own output
     // element is written, so no padding, other plane, or other run
     // contributes.
+    //
+    // An eligible BF16 request instead runs every row through the isolated
+    // AVX-512 BF16 source: the same traversal and layout helpers, vector
+    // arithmetic for complete tile rows, the same shared evaluator for every
+    // element that source leaves to it, and one RNE encode per logical element
+    // either way. Every other leaf, and the same BF16 leaf in a build or on a
+    // host without that path, keeps the scalar loop below unchanged.
 
     // Every independent leading plane of `x` and `y`, through its own selected
     // plane offset and own transformed leading strides. The carrier is the CPU
@@ -1211,9 +1229,31 @@ private:
                 request.x.leading_plane_strides();
         const std::span<const std::size_t> y_strides =
                 request.y.leading_plane_strides();
+        // The optional AVX-512 BF16 leaf is one immutable per-request decision:
+        // whether this build contains the isolated source at all, and whether
+        // this host offers the ISA features and OS-managed vector state it
+        // needs, are process facts. An ineligible request keeps the scalar loop
+        // below, which is also the entire path of a portable build.
+#if defined(IOM_AVX512_BF16_COMPILED)
+        const bool vectorized_bf16 = data_type == DataType::BF16
+                && cpu_detail::avx512_bf16_available();
+#endif
         auto visit = [&](auto&& self, std::size_t axis, std::size_t x_plane,
                          std::size_t y_plane) -> void {
             if (axis + 2 == rank) {
+#if defined(IOM_AVX512_BF16_COMPILED)
+                // The isolated source owns the whole row: complete tile rows
+                // run vectorized, the feature tail keeps the shared scalar
+                // evaluator, and both are observed there.
+                if (vectorized_bf16) {
+                    for (std::size_t run = 0; run < runs; ++run) {
+                        cpu_detail::avx512_bf16_silu_row(
+                                x_base, y_base, dimensions, x_plane, y_plane,
+                                run, features);
+                    }
+                    return;
+                }
+#endif
                 for (std::size_t run = 0; run < runs; ++run) {
                     for (std::size_t feature = 0; feature < features;
                          ++feature) {

@@ -281,6 +281,14 @@ function(iom_add_avx512_bf16_source source)
     )
 endfunction()
 
+# The isolated AVX-512 BF16 sources, one per accelerated operation. A source is
+# registered only once its implementation exists: a portable configuration
+# registers nothing, and an enabled configuration compiles exactly these files
+# with the target options above.
+if(AVX_512_BF16_ENABLED)
+    iom_add_avx512_bf16_source(src/cpu/avx512_bf16_silu.cpp)
+endif()
+
 
 target_include_directories(libiom
     PUBLIC

@@ -694,6 +694,151 @@ TEST_CASE("CPU SiLU retains owners and repeats accepted failures") {
     iom::cpu_detail::clear_silu_failure();
     CHECK_FALSE(devices.gate.armed());
 }
+// The eligible BF16 leaf is the only SiLU path that runs the isolated AVX-512
+// BF16 worker, so its executed element work is observable at the `Silu` stage:
+// one `Native` record per complete 16-feature tile row the vector kernel
+// executes, and one `Fallback` record per element the shared scalar evaluator
+// computes instead - every feature beyond the last complete tile row, plus
+// every NaN or infinity inside one. Selecting the kernel is not work and is
+// never recorded, so an ineligible host or a portable build records nothing
+// here. The shared independent oracle keeps owning value parity, tile padding,
+// transformed views, and the exceptional classes; this case pairs the
+// executed-stage evidence with that oracle on the same submissions.
+namespace {
+
+// One `Native` record per complete tile row of each logical row, and one
+// `Fallback` record per element the vector worker leaves to the scalar
+// evaluator: the tail of a row that does not end on a tile boundary, and every
+// contract-incompatible NaN or infinity inside its complete groups.
+struct SiluVectorWorkExpectation {
+    std::size_t native_groups = 0;
+    std::size_t fallback_elements = 0;
+};
+
+[[nodiscard]] bool silu_nonfinite(iom::DataType type, std::uint64_t bits) {
+    const iom_conformance::SiluReferenceClass value_class =
+            iom_conformance::silu_oracle::class_of_bits(type, bits);
+    return value_class == iom_conformance::SiluReferenceClass::quiet_nan
+            || value_class
+                    == iom_conformance::SiluReferenceClass::positive_infinity
+            || value_class
+                    == iom_conformance::SiluReferenceClass::negative_infinity;
+}
+
+[[nodiscard]] SiluVectorWorkExpectation silu_vector_work(
+        const iom_conformance::SiluReferenceCase& reference_case) {
+    const std::size_t rows =
+            iom_conformance::silu_plane_count(
+                    reference_case.leading_dimensions)
+            * reference_case.runs;
+    const std::size_t groups =
+            reference_case.features / iom::TensorSpec::TILE;
+    const std::size_t grouped_features = groups * iom::TensorSpec::TILE;
+    SiluVectorWorkExpectation work;
+    work.native_groups = rows * groups;
+    work.fallback_elements =
+            rows * (reference_case.features - grouped_features);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t feature = 0; feature < grouped_features; ++feature) {
+            if (silu_nonfinite(
+                        reference_case.data_type,
+                        reference_case.input_bits[
+                                row * reference_case.features + feature])) {
+                ++work.fallback_elements;
+            }
+        }
+    }
+    return work;
+}
+
+}  // namespace
+
+TEST_CASE("CPU AVX-512 BF16 SiLU records the vector element work it executes") {
+    CpuDevices devices;
+    const bool eligible = iom::cpu_detail::avx512_bf16_available();
+    auto queue = devices.candidate->create_ops();
+    const auto observed = [](iom::cpu_detail::Avx512Bf16Path path) {
+        return iom::cpu_detail::avx512_bf16_test_observation(
+                iom::cpu_detail::Avx512Bf16Stage::Silu, path);
+    };
+    const std::vector<iom_conformance::SiluReferenceCase> fixtures = {
+            // Both stable branches and signed zeros with no feature tail:
+            // every element of this fixture must be vector arithmetic, so a
+            // nonzero fallback count is itself a defect.
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::boundary_sizes,
+                    iom::DataType::BF16, {2}, 3, 32,
+                    "cpu-avx512-bf16-silu/groups"),
+            // A non-multiple feature tail over the shared pattern, which ends
+            // rows on a partial tile.
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::boundary_sizes,
+                    iom::DataType::BF16, {2}, 2, 17,
+                    "cpu-avx512-bf16-silu/tail"),
+            // The shared special-value pattern: NaN and both infinities inside
+            // complete groups, plus its own feature tail.
+            iom_conformance::silu_make_special_case(iom::DataType::BF16),
+    };
+    for (const iom_conformance::SiluReferenceCase& fixture : fixtures) {
+        const iom::TensorSpec spec = iom_conformance::silu_case_spec(fixture);
+        auto input = devices.candidate->create_tensor(spec);
+        auto activated = devices.candidate->create_tensor(spec);
+        iom_conformance::copy_from_host(
+                input->view(),
+                iom_conformance::silu_pack_bits(
+                        fixture.data_type, fixture.input_bits));
+        iom::cpu_detail::avx512_bf16_test_reset_observations();
+        {
+            iom_conformance::SiluCaseWindow window(&devices.gate);
+            const iom::oid token =
+                    queue->silu(input->view(), activated->view());
+            REQUIRE(iom::oid_is_token(token));
+            CHECK_NOTHROW(queue->wait(token));
+        }
+        const std::string mismatch = iom_conformance::silu_compare(
+                fixture.data_type,
+                iom_conformance::read_logical(activated->view()),
+                iom_conformance::silu_evaluate(fixture), fixture.label);
+        CHECK_MESSAGE(mismatch.empty(), mismatch);
+        const SiluVectorWorkExpectation work = silu_vector_work(fixture);
+        CHECK_EQ(
+                observed(iom::cpu_detail::Avx512Bf16Path::Native),
+                eligible ? std::uint64_t{work.native_groups} : 0);
+        CHECK_EQ(
+                observed(iom::cpu_detail::Avx512Bf16Path::Fallback),
+                eligible ? std::uint64_t{work.fallback_elements} : 0);
+    }
+    // A leaf outside the BF16 vector path is not that path's fallback: an F32
+    // request keeps its own scalar path and records no stage work at all.
+    const iom_conformance::SiluReferenceCase scalar =
+            iom_conformance::silu_make_pattern_case(
+                    iom_conformance::SiluReferenceCaseKind::boundary_sizes,
+                    iom::DataType::F32, {1}, 2, 17,
+                    "cpu-avx512-bf16-silu/F32-control");
+    const iom::TensorSpec scalar_spec = iom_conformance::silu_case_spec(scalar);
+    auto scalar_input = devices.candidate->create_tensor(scalar_spec);
+    auto scalar_output = devices.candidate->create_tensor(scalar_spec);
+    iom_conformance::copy_from_host(
+            scalar_input->view(),
+            iom_conformance::silu_pack_bits(
+                    scalar.data_type, scalar.input_bits));
+    iom::cpu_detail::avx512_bf16_test_reset_observations();
+    {
+        iom_conformance::SiluCaseWindow window(&devices.gate);
+        const iom::oid token =
+                queue->silu(scalar_input->view(), scalar_output->view());
+        REQUIRE(iom::oid_is_token(token));
+        CHECK_NOTHROW(queue->wait(token));
+    }
+    const std::string scalar_mismatch = iom_conformance::silu_compare(
+            scalar.data_type,
+            iom_conformance::read_logical(scalar_output->view()),
+            iom_conformance::silu_evaluate(scalar), scalar.label);
+    CHECK_MESSAGE(scalar_mismatch.empty(), scalar_mismatch);
+    CHECK_EQ(observed(iom::cpu_detail::Avx512Bf16Path::Native), 0);
+    CHECK_EQ(observed(iom::cpu_detail::Avx512Bf16Path::Fallback), 0);
+    CHECK_FALSE(devices.gate.armed());
+}
 // The CPU port covers the complete nine-leaf RoPE span. The runner owns the
 // independent split-half oracle and exercises transformed views, tails,
 // poisoned padding, absolute positions, and the fixed zero-workspace query
