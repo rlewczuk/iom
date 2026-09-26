@@ -297,6 +297,7 @@ if(AVX_512_BF16_ENABLED)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_sdpa_softmax.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_binary_div.cpp)
     iom_add_avx512_bf16_source(src/cpu/avx512_bf16_sdpa_pv.cpp)
+    iom_add_avx512_bf16_source(src/cpu/avx512_bf16_binary_add_sub.cpp)
 endif()
 
 

@@ -186,6 +186,43 @@ void avx512_bf16_sdpa_softmax_probabilities(
         unsigned char* workspace, std::size_t probability_base,
         std::size_t row_index) noexcept;
 #endif
+// Scalar ABI of the baseline binary codec routine the queue selects for one
+// operation: raw operand leaves in, one raw result leaf out. The AVX-512 BF16
+// binary workers receive it as an argument, so a lane whose result the vector
+// arithmetic cannot reproduce exactly is resolved by the same routine the
+// scalar path executes rather than by a second copy of those semantics.
+using Avx512Bf16ScalarBinary = std::uint64_t (*)(
+        DataType, std::uint64_t, std::uint64_t) noexcept;
+
+// Executes BF16 ADD (`subtract` false) or SUB for one span of `lanes` (1 to
+// `TensorSpec::TILE`) contiguous logical leaves that share one standard-layout
+// tile row, and writes exactly those `lanes` output leaves: the tiled padding
+// beside a shorter logical row is neither read nor written. Both operand
+// values are loaded before the single store, so an exact in-place alias is
+// safe.
+//
+// `lhs` and `rhs` point at the first leaf of their span; when the operand
+// broadcasts its single logical column they point at that column's leaf and
+// `lhs_broadcast`/`rhs_broadcast` repeat it across the span. `out` points at
+// the first leaf of the output span. Leaves whose result needs the codec's
+// exceptional-value semantics are resolved through `scalar` before the store.
+//
+// Defined by the isolated source registered through
+// iom_add_avx512_bf16_source(), so a portable build contains no target code
+// and never resolves this symbol.
+void avx512_bf16_binary_span(
+        bool subtract, const std::uint16_t* lhs, const std::uint16_t* rhs,
+        std::uint16_t* out, unsigned lanes, bool lhs_broadcast,
+        bool rhs_broadcast, Avx512Bf16ScalarBinary scalar) noexcept;
+
+// Reads and writes the floating-point control word (MXCSR) that governs
+// binary32 arithmetic in this thread, through the same baseline scalar ABI as
+// the detector. The BF16 workers exist so the vector arithmetic runs in the
+// mode the binary contract specifies -- round-to-nearest-even with gradual
+// underflow -- whatever mode the accepted queue worker was entered with, and
+// the caller saves and restores the word around its request.
+[[nodiscard]] std::uint32_t avx512_bf16_mxcsr() noexcept;
+void avx512_bf16_set_mxcsr(std::uint32_t control) noexcept;
 
 }  // namespace cpu_detail
 }  // namespace iom

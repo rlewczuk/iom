@@ -8,6 +8,7 @@
 #include "avx512_bf16_linear.hpp"
 
 #include "../iom_internal.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -427,11 +428,11 @@ private:
         return plane;
     }
 
-    // One traversal owner for every binary body: the result's leading planes in
-    // row-major order, then each row of the final two dimensions, handed to the
-    // body as the three owner plane offsets an element rule needs. Columns stay
-    // with the body, because the scalar codec visits one leaf at a time while a
-    // BF16 worker consumes a whole tile row of contiguous leaves.
+    // One traversal owns every logical binary result row: it walks the
+    // result's leading-plane coordinates and rows of the final two dimensions,
+    // passing source/output plane offsets and the row to each body. Scalar
+    // bodies consume individual leaves; BF16 workers consume contiguous
+    // tile-row spans.
     template <typename RowBody>
     static void visit_binary_rows(
             const DeviceOps::BinaryRequest& request, RowBody&& row_body) {
@@ -537,7 +538,7 @@ private:
     // Which optional AVX-512 BF16 worker an operation has. `None` also covers
     // an operation whose worker this build cannot enter; either way the scalar
     // codec stays the accepted authority for every operation and leaf.
-    enum class Bf16BinaryOp { None, Mul, Div };
+    enum class Bf16BinaryOp { None, Add, Sub, Mul, Div };
 
     // The execution route of one binary request: the codec that serves every
     // operation and leaf, and the optional isolated worker this operation may
@@ -553,6 +554,7 @@ private:
             case DeviceOps::BinaryOperation::Add:
                 route.scalar = &detail::scalar_binary<
                         detail::scalar_add_detail::BinaryOp::add>;
+                route.bf16 = Bf16BinaryOp::Add;
                 break;
             case DeviceOps::BinaryOperation::Mul:
                 route.scalar = &detail::scalar_binary<
@@ -562,6 +564,7 @@ private:
             case DeviceOps::BinaryOperation::Sub:
                 route.scalar = &detail::scalar_binary<
                         detail::scalar_add_detail::BinaryOp::sub>;
+                route.bf16 = Bf16BinaryOp::Sub;
                 break;
             case DeviceOps::BinaryOperation::Div:
                 route.scalar = &detail::scalar_binary<
@@ -751,6 +754,14 @@ private:
             const DeviceOps::BinaryRequest& request,
             const BinaryRoute& route) {
         switch (route.bf16) {
+            case Bf16BinaryOp::Add:
+            case Bf16BinaryOp::Sub:
+#if defined(IOM_AVX512_BF16_COMPILED)
+                binary_bf16_add_sub_elements(request, route);
+#else
+                binary_reference_elements(request, route.scalar);
+#endif
+                break;
             case Bf16BinaryOp::Mul:
 #if defined(IOM_AVX512_BF16_COMPILED)
                 binary_bf16_mul_elements(request, route.scalar);
@@ -789,6 +800,83 @@ private:
         }
         binary_reference_elements(request, route.scalar);
     }
+#if defined(IOM_AVX512_BF16_COMPILED)
+    // The vector BF16 arithmetic must run in the mode the binary contract
+    // specifies: round-to-nearest-even with gradual underflow. The accepted
+    // worker may have been entered with any floating-point control word the
+    // embedding process selected, and this kernel computes in binary32 -- a BF16
+    // subnormal widens to a binary32 subnormal -- so denormals-are-zero would
+    // flush subnormal operands, flush-to-zero would drop subnormal results, and
+    // a non-nearest rounding mode would change the result of an exact
+    // cancellation that the codec normalizes to positive zero.
+    //
+    // The guard selects the contract's three fields for the whole ADD/SUB
+    // request -- one mode switch instead of one per tile-row span -- and the
+    // scalar fallback lanes run under the same mode. It restores the worker's
+    // original word afterwards, including on early returns. A word that already
+    // carries those fields is left untouched.
+    class Bf16VectorMode {
+    public:
+        Bf16VectorMode() noexcept
+                : saved_(cpu_detail::avx512_bf16_mxcsr()) {
+            if ((saved_ & kContractBits) != 0) {
+                cpu_detail::avx512_bf16_set_mxcsr(saved_ & ~kContractBits);
+                restored_ = true;
+            }
+        }
+        ~Bf16VectorMode() noexcept {
+            if (restored_) {
+                cpu_detail::avx512_bf16_set_mxcsr(saved_);
+            }
+        }
+        Bf16VectorMode(const Bf16VectorMode&) = delete;
+        Bf16VectorMode& operator=(const Bf16VectorMode&) = delete;
+
+    private:
+        // Rounding control (bits 13-14), flush-to-zero (bit 15), and
+        // denormals-are-zero (bit 6). Every other bit of the word, including
+        // the caller's exception masks and sticky flags, is preserved.
+        static constexpr std::uint32_t kContractBits = 0xE040u;
+        std::uint32_t saved_ = 0;
+        bool restored_ = false;
+    };
+
+    // ADD/SUB consumes spans through the shared row traversal and slot mapping.
+    // Both operands are read by the isolated worker before its store; broadcast
+    // lanes, exact aliases, and logical tails retain the shared mapping rules.
+    static void binary_bf16_add_sub_elements(
+            const DeviceOps::BinaryRequest& request,
+            const BinaryRoute& route) {
+        const Bf16VectorMode mode;
+        const std::size_t columns = request.result_shape.dimensions().back();
+        auto* out_base =
+                static_cast<std::uint16_t*>(request.out.native_handle);
+        const auto* lhs_base =
+                static_cast<const std::uint16_t*>(request.lhs.native_handle);
+        const auto* rhs_base =
+                static_cast<const std::uint16_t*>(request.rhs.native_handle);
+        visit_binary_rows(
+                request,
+                [&](std::size_t lhs_plane, std::size_t rhs_plane,
+                    std::size_t out_plane, std::size_t row) {
+                    std::size_t column = 0;
+                    while (column < columns) {
+                        const unsigned lanes = static_cast<unsigned>(
+                                std::min(TensorSpec::TILE, columns - column));
+                        const BinaryElementSlots slots = binary_element_slots(
+                                request, lhs_plane, rhs_plane, out_plane, row,
+                                column);
+                        cpu_detail::avx512_bf16_binary_span(
+                                route.bf16 == Bf16BinaryOp::Sub,
+                                lhs_base + slots.lhs, rhs_base + slots.rhs,
+                                out_base + slots.out, lanes,
+                                request.lhs.broadcast_columns,
+                                request.rhs.broadcast_columns, route.scalar);
+                        column += lanes;
+                    }
+                });
+    }
+#endif  // IOM_AVX512_BF16_COMPILED
 
     oid binary_impl(const BinaryRequest& request) override {
         std::lock_guard<std::mutex> submission_lock(submission_order_mutex_);
