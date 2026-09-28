@@ -22,20 +22,46 @@ instead of silently registering an unusable case.
 
 The retained official input set is immutable for the complete run:
 
-- model directory: `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`;
+- model directory: caller-supplied TinyLlama files matching the inventory below;
 - model identity/revision:
   `fe8a4ea1ffedaf415f4da2f062534de366a451e6`;
-- reference pack:
-  `/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json`;
-- reference-pack SHA-256:
-  `8eba795ed856e2eeef3f92d2db05163b4df5094ce05a72c12979be0010af043a`;
-- reference case-payload SHA-256:
-  `21816a453e20142711c5c04ff44ff94912ce13bb2bb274272b3fb107843cac01`;
-- reference generator SHA-256:
-  `207008c8afce174a1c57c365a4e16fb4aecebb6cd5b498220643cad1c29cfdd4`.
 
-The wrapper and the C++ runner hash these caller files instead of trusting the
-names above. The pack binds this exact inventory:
+The official reference pack is generated output, not a repository asset. The
+current reference implementation and policy are pinned to commit
+`5e2a60e088fc1f3743877ad1eb455a5c38ded3c9`; the original exporter was introduced
+at `ff0d6b3ec6de265058d79224c581c0763dae9c0d`. Recreate the pack from that
+current reference commit, the exact model directory, and the pinned environment:
+
+```sh
+git checkout 5e2a60e088fc1f3743877ad1eb455a5c38ded3c9
+uv python install 3.12.3
+uv venv --python 3.12.3 /tmp/official-reference-venv
+uv pip install --python /tmp/official-reference-venv/bin/python \
+  torch==2.3.1+cpu --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python /tmp/official-reference-venv/bin/python \
+  transformers==4.41.2 tokenizers==0.19.1 safetensors==0.4.3 \
+  sentencepiece==0.2.0 numpy==1.26.4 jinja2==3.1.6
+/tmp/official-reference-venv/bin/python \
+  test/reference/export_official_model_reference.py \
+  --model-dir /path/to/TinyLlama-1.1B-Chat-v1.0 \
+  --artifact-id fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+  --policy test/model/official_reference_policy.json \
+  --output /tmp/tinyllama14-official-053125.json
+stat -c %s /tmp/tinyllama14-official-053125.json
+```
+
+The run used CPython 3.12.3 with `torch 2.3.1+cpu`, `transformers 4.41.2`,
+`tokenizers 0.19.1`, `safetensors 0.4.3`, `sentencepiece 0.2.0`,
+`numpy 1.26.4`, and `jinja2 3.1.6`. On the configured CUDA host, the pack
+regenerated at the documented output path measured **11,403,321 bytes**. It
+exceeds the 10,000,000-byte threshold and is not copied into the repository.
+The upstream source artifact hashes below remain input-integrity evidence, not
+hashes of generated output.
+
+## Pack-bound source artifact inventory
+
+The wrapper and C++ runner hash the caller-supplied model files rather than
+trusting their names. The pack binds this exact inventory:
 
 | Relative artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -46,10 +72,6 @@ names above. The pack binds this exact inventory:
 | `tokenizer.json` | 1842767 | `bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e` |
 | `tokenizer.model` | 499723 | `9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347` |
 | `tokenizer_config.json` | 1289 | `7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a` |
-
-The independent export used CPython 3.12.3 with `torch 2.3.1+cpu`,
-`transformers 4.41.2`, `tokenizers 0.19.1`, `safetensors 0.4.3`,
-`sentencepiece 0.2.0`, `numpy 1.26.4`, and `jinja2 3.1.6`.
 
 ## Exact invocation
 
@@ -69,10 +91,10 @@ cmake -S . -B build-official \
   -DIOM_TEST_REAL_MODEL_INFERENCE_CUDA=ON
 cmake --build build-official --target iom_cuda_conformance_tests
 
-IOM_TEST_MODEL_DIR=/home/rlew/models/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
 IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
-IOM_TEST_MODEL_REFERENCE=/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json \
-IOM_TEST_MODEL_EVIDENCE=/home/rlew/agent-work/iom-reference/tinyllama15-cuda-official-evidence.json \
+IOM_TEST_MODEL_REFERENCE=/tmp/tinyllama14-official-053125.json \
+IOM_TEST_MODEL_EVIDENCE=/path/to/cuda-official-evidence.json \
 IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
 flock -w 120 /tmp/agent-gpu0.lock \
 timeout --kill-after=30s 1800s \
@@ -116,7 +138,7 @@ shared harness measurement. The retained run reported:
 
 ```text
 iom cuda official model inference evidence
-  invocation      : ["/home/rlew/agent-work/iom/csw00614-15-cuda-a1/build-official/test/iom_cuda_conformance_tests","--test-case=*real model inference*"]
+  invocation      : ["/path/to/build-official/test/iom_cuda_conformance_tests","--test-case=*real model inference*"]
   backend kind    : cuda
   backend ordinal : 0
   arena bytes     : 4294967296
@@ -207,48 +229,61 @@ the projections are executed by the native BF16 matrix specialization
 `standard_tiled_linear_bf16_kernel`, and the attention QK/PV stages by
 `sdpa_qk_kernel` and `sdpa_pv_kernel`.
 
-The profiler payload wraps the wrapper itself, so its observed launches belong
-to exactly the official prefill and logical `R=1` cached-decode submissions of
-the five fixed cases. The retained payload was
+The profiler report was regenerated using CUDA implementation commit
+`e4e6a4f820301e3db420386d709091211abdb6f6`. After generating the reference pack
+at the pinned exporter commit above, check out the CUDA implementation commit
+and build the target with:
+
+```sh
+git checkout e4e6a4f820301e3db420386d709091211abdb6f6
+cmake -S . -B build-official \
+  -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCUDA_ENABLED=ON -DROCM_ENABLED=OFF -DSYCL_ENABLED=OFF \
+  -DIOM_TEST_REAL_MODEL_INFERENCE_CUDA=ON
+cmake --build build-official --target iom_cuda_conformance_tests
+```
+
+Run the profiler on the CUDA host:
 
 ```sh
 flock -w 120 /tmp/agent-gpu0.lock \
 timeout --kill-after=30s 1800s \
-env IOM_TEST_MODEL_DIR=/home/rlew/models/TinyLlama-1.1B-Chat-v1.0 \
+env IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
     IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
-    IOM_TEST_MODEL_REFERENCE=/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json \
-    IOM_TEST_MODEL_EVIDENCE=/home/rlew/agent-work/iom-reference/tinyllama15-cuda-official-nsys-evidence.json \
+    IOM_TEST_MODEL_REFERENCE=/tmp/tinyllama14-official-053125.json \
+    IOM_TEST_MODEL_EVIDENCE=/tmp/cuda-e4-nsys-evidence.json \
     IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
   nsys profile --force-overwrite=true \
-    -o /home/rlew/agent-work/iom-reference/cuda-model \
+    -o /tmp/cuda-e4-model \
     python3 test/model/run_official_inference.py --backend cuda \
       --executable build-official/test/iom_cuda_conformance_tests
-nsys stats --report cuda_gpu_kern_sum \
-  /home/rlew/agent-work/iom-reference/cuda-model.nsys-rep
+nsys stats --force-export=true --report cuda_gpu_kern_sum /tmp/cuda-e4-model.nsys-rep
 ```
 
-The profiled run passed the same numerical gate and published the same
-`status: passed` summary with reference SHA-256
-`8eba795ed856e2eeef3f92d2db05163b4df5094ce05a72c12979be0010af043a`. The
-retained 14,209,954-byte report
-`/home/rlew/agent-work/iom-reference/cuda-model.nsys-rep` attributes these
-executed launches:
+The profiler run completed with `status: "passed"`. Its report at
+`/tmp/cuda-e4-model.nsys-rep` measured **14,234,503 bytes** and is not committed
+because it exceeds the 10,000,000-byte threshold. The generated reference pack
+at `/tmp/tinyllama14-official-053125.json` measured **11,403,321 bytes**; these
+two CUDA generated outputs total **25,637,824 bytes**. Both are recreated from
+their pinned implementation commits above.
+The regenerated report's matrix and related kernel rows were:
+
 
 | Kernel | Instances | Total device time (ns) |
 | --- | ---: | ---: |
-| `iom::cuda_detail::standard_tiled_linear_bf16_kernel` | 7,440 | 4,200,553,774 |
-| `iom::detail::silu_kernel` | 1,056 | 74,862,605 |
-| `iom::detail::scatter_plane_kernel` | 3,063 | 69,090,605 |
-| `iom::detail::standard_tiled_rmsnorm_kernel` | 2,160 | 45,739,803 |
-| `iom::cuda_detail::sdpa_qk_kernel` | 1,056 | 8,288,403 |
-| `iom::detail::standard_tiled_rope_kernel` | 2,112 | 6,988,546 |
-| `iom::detail::cache_append_kernel` | 2,112 | 6,284,101 |
-| `iom::cuda_detail::sdpa_pv_kernel` | 1,056 | 5,554,789 |
-| `iom::cuda_detail::softmax_kernel` | 1,056 | 5,180,929 |
-| `iom::cuda_detail::scale_mask_kernel` | 1,056 | 1,052,934 |
-| `iom::cuda_detail::canonicalize_output_kernel` | 1,056 | 917,445 |
-| `iom::detail::embedding_word_kernel` | 48 | 113,248 |
-| `iom::detail::gather_plane_kernel` | 48 | 70,304 |
+| `iom::cuda_detail::standard_tiled_linear_bf16_kernel` | 7,440 | 4,200,717,915 |
+| `iom::detail::silu_kernel` | 1,056 | 74,839,796 |
+| `iom::detail::scatter_plane_kernel` | 3,063 | 69,173,458 |
+| `iom::detail::standard_tiled_rmsnorm_kernel` | 2,160 | 45,666,772 |
+| `iom::cuda_detail::sdpa_qk_kernel` | 1,056 | 8,286,315 |
+| `iom::detail::standard_tiled_rope_kernel` | 2,112 | 6,983,686 |
+| `iom::detail::cache_append_kernel` | 2,112 | 6,269,994 |
+| `iom::cuda_detail::sdpa_pv_kernel` | 1,056 | 5,557,182 |
+| `iom::cuda_detail::softmax_kernel` | 1,056 | 5,190,201 |
+| `iom::cuda_detail::scale_mask_kernel` | 1,056 | 1,052,195 |
+| `iom::cuda_detail::canonicalize_output_kernel` | 1,056 | 917,831 |
+| `iom::detail::embedding_word_kernel` | 48 | 113,280 |
+| `iom::detail::gather_plane_kernel` | 48 | 71,072 |
 
 The counts are the execution attribution. Four nonzero cases in three
 instrumentation modes give twelve independent runs, each with one prefill and
@@ -282,12 +317,10 @@ connected to the guarded child and reported
 ```
 
 without collecting counters or SASS. That run nevertheless completed the
-official gate with `status: "passed"` for the same reference SHA-256, and its
-log is retained at
-`/home/rlew/agent-work/iom-reference/tinyllama15-cuda-ncu.log`. No counter,
-occupancy, or disassembly-level claim is made: the native BF16 matrix evidence
-above comes from executed Nsight Systems launches tied to the official prefill
-and logical `R=1` decode.
+official gate with `status: "passed"`. The log from the failed measurement is
+not distributed. No counter, occupancy, or disassembly-level claim is made: the
+native BF16 matrix evidence above comes from executed Nsight Systems launches
+tied to the official prefill and logical `R=1` decode.
 
 ## Capability and timing limitations
 

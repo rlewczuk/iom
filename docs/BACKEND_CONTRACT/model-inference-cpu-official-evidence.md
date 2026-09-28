@@ -20,21 +20,66 @@ wrapper test is labelled `official-model` with a 3900-second CTest timeout.
 
 The retained official input set is immutable for the complete run:
 
-- model directory: `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`;
+- model directory: caller-provided TinyLlama distribution matching the pinned
+  inventory below;
 - model identity/revision:
   `fe8a4ea1ffedaf415f4da2f062534de366a451e6`;
-- reference pack:
-  `/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json`;
-- reference-pack SHA-256:
-  `8eba795ed856e2eeef3f92d2db05163b4df5094ce05a72c12979be0010af043a`;
-- reference case-payload SHA-256:
-  `21816a453e20142711c5c04ff44ff94912ce13bb2bb274272b3fb107843cac01`;
-- reference generator SHA-256:
-  `207008c8afce174a1c57c365a4e16fb4aecebb6cd5b498220643cad1c29cfdd4`.
+- reference implementation source commit:
+  `ff0d6b3ec6de265058d79224c581c0763dae9c0d`;
+- CPU implementation-under-test/policy commit:
+  `5e2a60e088fc1f3743877ad1eb455a5c38ded3c9`;
 
-The pre-cutover historical `tinyllama14-02-official-a4.json` pack remains
-retained under its original name and bytes. It is not an alias for the
-regenerated canonical pack.
+The exporter and original policy were introduced at `ff0d6b3`; regenerating
+that commit's pack on the CPU remote produced a verified 11,403,357-byte output.
+That initial pack uses the original 0.25 tolerance policy, so it is not the
+input for this CPU evidence, which uses the 0.53125 envelope. The CPU
+implementation-under-test commit `5e2a60e` applies that policy revision; its
+exporter and policy produce the current, verified 11,403,369-byte
+pack. Both are over 10,000,000 bytes and remain local regenerated inputs rather
+than documentation assets.
+The source pack and case-payload content hashes are intentionally not pinned;
+the exporter source commit, CPU policy revision, and verification procedure
+below identify how to recreate the CPU reference.
+
+To recreate the pack used by this CPU evidence, use the exporter and policy from
+the CPU evidence commit (based on the reference implementation source commit
+above), the official model directory matching the inventory below, and CPython
+3.12.3 with the pinned packages. Run on the configured `cpu` remote profile:
+
+```sh
+git worktree add --detach /tmp/iom-cpu-reference-source \
+  5e2a60e088fc1f3743877ad1eb455a5c38ded3c9
+cd /tmp/iom-cpu-reference-source
+```
+
+Sync this exact worktree to the configured `cpu` profile. Run the following
+commands remotely in that synchronized workspace:
+```sh
+python3 -m venv /tmp/iom-official-reference-venv
+/tmp/iom-official-reference-venv/bin/python -m pip install \
+  torch==2.3.1+cpu --index-url https://download.pytorch.org/whl/cpu
+/tmp/iom-official-reference-venv/bin/python -m pip install \
+  transformers==4.41.2 tokenizers==0.19.1 safetensors==0.4.3 \
+  sentencepiece==0.2.0 numpy==1.26.4 jinja2==3.1.6
+export IOM_REFERENCE_DIR=/path/to/reference-output
+mkdir -p "$IOM_REFERENCE_DIR"
+/tmp/iom-official-reference-venv/bin/python \
+  test/reference/export_official_model_reference.py \
+  --model-dir /path/to/TinyLlama-1.1B-Chat-v1.0 \
+  --artifact-id fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+  --output "$IOM_REFERENCE_DIR/tinyllama14-official-053125.json" \
+  --policy test/model/official_reference_policy.json
+wc -c "$IOM_REFERENCE_DIR/tinyllama14-official-053125.json"
+/tmp/iom-official-reference-venv/bin/python \
+  test/reference/export_official_model_reference.py \
+  --model-dir /path/to/TinyLlama-1.1B-Chat-v1.0 \
+  --verify "$IOM_REFERENCE_DIR/tinyllama14-official-053125.json" \
+  --policy test/model/official_reference_policy.json
+```
+
+The recorded run generated 11,403,369 bytes. Recreation writes to the
+caller-selected `$IOM_REFERENCE_DIR`; the measured size is an observation, not
+a content pin.
 
 The wrapper and C++ runner hash the caller files rather than trusting these
 names. The pack binds this exact inventory:
@@ -68,10 +113,10 @@ cmake -S . -B build-official -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-official --target iom_backend_conformance_cpu_tests
 
 OMP_NUM_THREADS=32 \
-IOM_TEST_MODEL_DIR=/home/rlew/models/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0 \
 IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
-IOM_TEST_MODEL_REFERENCE=/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json \
-IOM_TEST_MODEL_EVIDENCE=/home/rlew/agent-work/iom-reference/tinyllama14-14-cpu-official-053125-evidence.json \
+IOM_TEST_MODEL_REFERENCE="$IOM_REFERENCE_DIR/tinyllama14-official-053125.json" \
+IOM_TEST_MODEL_EVIDENCE="$IOM_REFERENCE_DIR/tinyllama14-14-cpu-official-053125-evidence.json" \
 timeout --kill-after=30s 4200s \
   ctest --test-dir build-official --output-on-failure --no-tests=error \
     --timeout 3900 -R '^iom_cpu_real_model_inference_tests$'
@@ -100,9 +145,8 @@ The retained measurement records `OMP_NUM_THREADS` and any supplied
 runtime/build host, configured processor name/description/architecture,
 compiler ID/version, build type/effective C++ flags, and CPU device ordinal.
 
-The retained attempt-4 evidence at
-`/home/rlew/agent-work/iom-reference/tinyllama14-14-cpu-official-053125-evidence.json`
-records these exact execution values:
+The historical attempt-4 execution record reports these exact execution
+values:
 
 - runtime host and build host: `beha`;
 - processor name: `Unknown AMD family`;

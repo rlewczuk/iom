@@ -136,8 +136,9 @@ Machine-readable official JSON records the selected SYCL ordinal, runtime and
 toolchain identity, BF16/FP32 policy, exact command/environment, artifact
 digests, per-case outcomes, and host-only timing capability. It does not claim
 UR device fields, subgroup or `ext_intel_matrix` facility observations, or
-trace attribution. Those observations live in the separately retained
-`sycl-ls` and `sycl-trace` payload records. Current SYCL configurations do not
+trace attribution. The device enumeration and trace observations are summarized
+below; the trace payloads are reproducible using the cited implementation
+commit and command.
 expose a genuine native device timer; host enqueue/completion spans are
 observations only and must never be reported as kernel duration or throughput.
 
@@ -243,8 +244,9 @@ IntelLLVM `2026.1.0`, Release `-O3 -DNDEBUG`, and processor
 and nested measurement `native_capability` as `unclaimed`; it provides no
 UR-facility or kernel attribution field. The JSON therefore claims the
 numerical BF16 inference, state, ownership, and instrumentation parity, while
-the native joint-matrix dispatch attribution comes from the retained
-`sycl-trace` payload documented below. No hardware counter, ISA instruction
+the native joint-matrix dispatch attribution comes from the original
+`sycl-trace` runs summarized below and can be recreated using the cited commit
+and command. No hardware counter, ISA instruction
 count, or device duration is claimed anywhere.
 
 The frozen bounded profiler payload was attempted repeatedly after fresh syncs
@@ -258,22 +260,46 @@ Each attempt enumerated the same Level Zero GPUs but `sycl-trace` returned
 exit `255` with `Failed to launch target application. Error code -1`. The
 complete invocations and diagnostics remain in the task `remote.log`; the
 bounded controls above identify bare-name target resolution as the cause, and
-the corrected and supplementary payloads below then produced the retained
-trace. No ISA instruction count or device-time claim is made.
+the corrected and supplementary payloads below produced the trace observations
+summarized here. No ISA instruction count or device-time claim is made.
 
-The supplementary payload exited `0` on mirrors
-`tinyllama-17-sycl-official-inference-owner3-trace` and
-`tinyllama-17-sycl-official-inference-owner4-official` after fresh syncs under
-the same GPU lock. Both retained verbose traces have `1,448,611` lines; the
-post-repair trace is retained as SHA-256
-`0ccec1ea948b19ae815dc25f985101fbcae9d737108bb64fcd3764ea5b33a342` and the
-earlier one as
-`b2b493d6d9664c2aadc1230572110b7801382b8c37bb9459d939a04dd377fee0`. Each
-trace creates exactly six native kernels — `LinearBf16MadKernel<16>`,
-`LinearBf16TailKernel<16>`, `LinearBf16TailKernel<1>`, `LinearBf16PackKernel`,
+The two original traces were generated from reference implementation commit
+`3cf44f6e67667aa96a0d64c01b5a057f3aba906c`. Recreated twice on that commit,
+the supplementary verbose traces measured `104,901,619` and `104,901,567`
+bytes (`209,803,186` bytes combined; `1,448,611` lines each), above the 10 MB
+artifact threshold; raw traces are therefore not stored in this repository.
+Check out that commit in a clean worktree, configure and build as in [Exact
+build and execution](#exact-build-and-execution), then recreate them with the
+configured oneAPI runtime and model/reference inputs above. Write stdout and
+stderr to a local file if retaining the trace:
+
+```sh
+set +u
+source /opt/intel/oneapi/setvars.sh >/tmp/iom-setvars.log 2>&1
+set -u
+IOM_TEST_MODEL_DIR=/home/rlew/models/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
+IOM_TEST_MODEL_REFERENCE=/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json \
+IOM_TEST_MODEL_EVIDENCE=/tmp/sycl-trace-supplementary.json \
+IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
+flock -w 120 /tmp/agent-gpu0.lock timeout --kill-after=30s 2400s \
+  sycl-trace --print-format=verbose --ur.call \
+  ./build-official/test/iom_sycl_conformance_tests \
+  --test-case="SYCL real model inference" > sycl-trace.txt 2>&1
+```
+
+The original pair and both regenerated traces each contain `1,448,611` lines.
+The independent original traces agree on the six native kernels and the
+`44,355` Unified Runtime kernel-launch records described below. The regenerated
+traces confirm the expected size; they do not replace the original execution
+observations.
+
+In each original trace, the run creates exactly six native kernels —
+`LinearBf16MadKernel<16>`, `LinearBf16TailKernel<16>`,
+`LinearBf16TailKernel<1>`, `LinearBf16PackKernel`,
 `SdpaQkJointMatrixTailKernelTag`, and `SdpaPvJointMatrixTailKernelTag` — and
-each records exactly `44,355` Unified Runtime kernel-launch records in total,
-of which the six native kernels hold these attributed shares:
+records exactly `44,355` Unified Runtime kernel-launch records in total, of
+which the six native kernels hold these attributed shares:
 
 | Kernel | Launch records (trace 1 / trace 2) |
 | --- | --- |

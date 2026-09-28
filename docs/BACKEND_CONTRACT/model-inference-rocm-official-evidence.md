@@ -36,17 +36,13 @@ never substituted for it. There is no skip return for the enabled case.
 
 The retained official input set is immutable for the complete run:
 
-- model directory: `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`;
-- model identity/revision:
+- model directory used by the retained run:
+  `/home/rlew/models/TinyLlama-1.1B-Chat-v1.0`;
+- model repository and identity/revision:
+  `TinyLlama/TinyLlama-1.1B-Chat-v1.0` at
   `fe8a4ea1ffedaf415f4da2f062534de366a451e6`;
-- reference pack:
-  `/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json`;
-- reference-pack SHA-256:
-  `8eba795ed856e2eeef3f92d2db05163b4df5094ce05a72c12979be0010af043a`;
-- reference case-payload SHA-256:
-  `21816a453e20142711c5c04ff44ff94912ce13bb2bb274272b3fb107843cac01`;
-- reference generator SHA-256:
-  `207008c8afce174a1c57c365a4e16fb4aecebb6cd5b498220643cad1c29cfdd4`.
+- official reference pack: regenerate it using the committed reference
+  exporter at `5e2a60e088fc1f3743877ad1eb455a5c38ded3c9` as instructed below;
 
 The wrapper and the C++ runner hash the caller files rather than trusting these
 names. The pack binds this exact inventory, independently of the ROCm backend:
@@ -66,6 +62,51 @@ The independent export used CPython 3.12.3 with `torch 2.3.1+cpu`,
 `sentencepiece 0.2.0`, `numpy 1.26.4`, and `jinja2 3.1.6`; that pin describes
 the reference generator, not the ROCm wrapper interpreter, which is
 standard-library only and hashes the pack itself.
+
+Exporter commit `5e2a60e088fc1f3743877ad1eb455a5c38ded3c9`, with the exact
+package pins below, regenerated the pack at
+`/tmp/rocm-official-reference-exact.json`, measured at **11,403,340 bytes**.
+This exceeds the 10,000,000-byte limit, so the pack is not copied into this
+repository. The model artifact inventory and source revision identify its
+inputs without pinning the generated pack's content.
+
+From this repository, reproduce the pack and its official model inputs as
+follows:
+
+```sh
+git worktree add --detach /tmp/iom-official-reference \
+  5e2a60e088fc1f3743877ad1eb455a5c38ded3c9
+cd /tmp/iom-official-reference
+
+MODEL_ID=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+MODEL_REVISION=fe8a4ea1ffedaf415f4da2f062534de366a451e6
+MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0
+REFERENCE_PACK=/tmp/rocm-official-reference-exact.json
+
+python3 -m pip install --user uv
+uv python install 3.12.3
+uv venv --python 3.12.3 /tmp/iom-official-reference-venv
+uv pip install --python /tmp/iom-official-reference-venv/bin/python \
+  --index-url https://download.pytorch.org/whl/cpu 'torch==2.3.1+cpu'
+uv pip install --python /tmp/iom-official-reference-venv/bin/python \
+  --index-url https://pypi.org/simple \
+  'transformers==4.41.2' 'tokenizers==0.19.1' 'safetensors==0.4.3' \
+  'sentencepiece==0.2.0' 'numpy==1.26.4' 'jinja2==3.1.6' \
+  'huggingface_hub==0.36.2'
+/tmp/iom-official-reference-venv/bin/hf download \
+  "$MODEL_ID" --revision "$MODEL_REVISION" --local-dir "$MODEL_DIR" \
+  config.json generation_config.json model.safetensors \
+  special_tokens_map.json tokenizer.json tokenizer.model tokenizer_config.json
+/tmp/iom-official-reference-venv/bin/python \
+  test/reference/export_official_model_reference.py \
+  --model-dir "$MODEL_DIR" --artifact-id "$MODEL_REVISION" \
+  --policy test/model/official_reference_policy.json --output "$REFERENCE_PACK"
+stat -c '%s bytes' "$REFERENCE_PACK"
+```
+
+The resulting pack is the caller's `IOM_TEST_MODEL_REFERENCE`. Its inventory
+binds the exact upstream artifact sizes and SHA-256 values in the table above;
+the pack file itself is intentionally not content-hash-pinned in this evidence.
 
 ## Exact invocation
 
@@ -87,10 +128,10 @@ cmake -S . -B build/rocm-official \
 cmake --build build/rocm-official \
   --target iom_rocm_conformance_tests
 
-IOM_TEST_MODEL_DIR=/home/rlew/models/TinyLlama-1.1B-Chat-v1.0 \
+IOM_TEST_MODEL_DIR="$MODEL_DIR" \
 IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
-IOM_TEST_MODEL_REFERENCE=/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json \
-IOM_TEST_MODEL_EVIDENCE=/home/rlew/agent-work/iom-reference/tinyllama16-rocm-official-evidence.json \
+IOM_TEST_MODEL_REFERENCE="$REFERENCE_PACK" \
+IOM_TEST_MODEL_EVIDENCE=/path/to/rocm-official-evidence.json \
 IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
 flock -w120 /tmp/agent-gpu0.lock \
 timeout --kill-after=30s 1800s \
@@ -194,19 +235,88 @@ facility statement rests on the executed probe and the traced kernel dispatches
 of the submitted work. No performance threshold, accelerator speedup, or
 counter-derived claim is made.
 
-## Bounded profiler payload
+## Bounded kernel trace
 
 The exact preserved command, run against the same verified inputs through the
 ROCm host, is:
 
 ```sh
-flock -w120 /tmp/agent-gpu0.lock \
+flock -w 120 /tmp/agent-gpu0.lock \
 timeout --kill-after=30s 1800s \
-rocprofv3 --kernel-trace --hip-trace --sys-trace -f csv \
+rocprofv3 --kernel-trace -f csv \
   -d "$IOM_EVIDENCE_DIR/rocm-model" -- \
   python3 test/model/run_official_inference.py --backend rocm \
     --executable build-official/test/iom_rocm_conformance_tests
 ```
+
+## Recreating oversized ROCm evidence outputs
+
+The ROCm runner and its evidence wrapper are sourced from commit
+`acfe4cb1befb07933afc658427cb1d46f8866d6f`. The generated official-run JSON,
+profiled-run JSON, and profiler output aggregate each exceed 10,000,000 bytes;
+none is copied into the repository. Recreate them from that exact worktree on the
+configured ROCm host. Accelerator configure/build/run and profiling commands
+must go through a freshly synced `csw-remote` ROCm mirror; each GPU execution
+uses the host-wide lock and deadline below.
+
+From the worktree at the source commit, configure and build the opt-in runner:
+
+```sh
+git worktree add --detach /tmp/iom-rocm-official \
+  acfe4cb1befb07933afc658427cb1d46f8866d6f
+cd /tmp/iom-rocm-official
+cmake -S . -B build-official -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DIOM_TEST_REAL_MODEL_INFERENCE_ROCM=ON -DCUDA_ENABLED=OFF \
+  -DROCM_ENABLED=ON -DSYCL_ENABLED=OFF
+cmake --build build-official --target iom_rocm_conformance_tests --parallel 16
+
+MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0
+REFERENCE_PACK=/tmp/rocm-official-reference-exact.json
+ROCM_EVIDENCE_JSON=/path/to/rocm-official-evidence.json
+ROCM_PROFILED_EVIDENCE_JSON=/path/to/rocm-official-profiled-evidence.json
+ROCM_PROFILE_DIR=/path/to/rocm-official-profile
+export IOM_TEST_MODEL_DIR="$MODEL_DIR"
+export IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6
+export IOM_TEST_MODEL_REFERENCE="$REFERENCE_PACK"
+export IOM_TEST_MODEL_ARENA_BYTES=4294967296
+
+export IOM_TEST_MODEL_EVIDENCE="$ROCM_EVIDENCE_JSON"
+flock -w 120 /tmp/agent-gpu0.lock \
+timeout --kill-after=30s 1800s \
+  ctest --test-dir build-official --output-on-failure --no-tests=error \
+    --timeout 1800 -R '^iom_rocm_real_model_inference_tests$'
+stat -c '%s bytes' "$ROCM_EVIDENCE_JSON"
+
+export IOM_TEST_MODEL_EVIDENCE="$ROCM_PROFILED_EVIDENCE_JSON"
+export IOM_EVIDENCE_DIR="$ROCM_PROFILE_DIR"
+flock -w 120 /tmp/agent-gpu0.lock \
+timeout --kill-after=30s 1800s \
+  rocprofv3 --kernel-trace -f csv \
+    -d "$IOM_EVIDENCE_DIR/rocm-model" -- \
+    python3 test/model/run_official_inference.py --backend rocm \
+      --executable build-official/test/iom_rocm_conformance_tests
+stat -c '%s bytes' "$ROCM_PROFILED_EVIDENCE_JSON"
+find "$ROCM_PROFILE_DIR/rocm-model" -type f -printf '%s %p\n' | sort -n
+find "$ROCM_PROFILE_DIR/rocm-model" -type f -printf '%s\n' |
+  python3 -c 'import sys; print(sum(map(int, sys.stdin)))'
+```
+
+Use a fresh sync immediately before each remote execution. At the source commit
+above, the official-run and kernel-only profiled outputs passed and measured:
+
+| Regenerated output | Bytes |
+| --- | ---: |
+| Official-run evidence JSON | 11419804 |
+| Profiled-run evidence JSON | 11428609 |
+| Profiler `*_kernel_trace.csv` (65,598 dispatch rows) | 13969809 |
+| Profiler `*_agent_info.csv` | 1576 |
+| Profiler directory total | 13971385 |
+| All ROCm-specific outputs above | 36819798 |
+
+The official reference pack is a shared input generated separately above
+(11,403,340 bytes). Including it, the corresponding artifact set totals
+48,223,138 bytes. No external output is copied under the 10,000,000-byte
+per-backend limit; the source commits and commands above reproduce it.
 
 ## Verification receipt
 
@@ -229,10 +339,10 @@ leaf begin at line 3544.
   ```sh
   flock -w120 /tmp/agent-gpu0.lock \
   timeout --kill-after=30s 1800s \
-  env IOM_TEST_MODEL_DIR=/home/rlew/models/TinyLlama-1.1B-Chat-v1.0 \
+  env IOM_TEST_MODEL_DIR="$MODEL_DIR" \
       IOM_TEST_MODEL_ID=fe8a4ea1ffedaf415f4da2f062534de366a451e6 \
-      IOM_TEST_MODEL_REFERENCE=/home/rlew/agent-work/iom-reference/tinyllama14-official-053125.json \
-      IOM_TEST_MODEL_EVIDENCE=/home/rlew/agent-work/iom-reference/tinyllama16-rocm-official-a1-evidence.json \
+      IOM_TEST_MODEL_REFERENCE="$REFERENCE_PACK" \
+      IOM_TEST_MODEL_EVIDENCE=/path/to/rocm-official-evidence.json \
       IOM_TEST_MODEL_ARENA_BYTES=4294967296 \
       ctest --test-dir build-official --output-on-failure --no-tests=error \
         --timeout 1800 -R '^iom_rocm_real_model_inference_tests$'
@@ -243,8 +353,8 @@ leaf begin at line 3544.
   evidence records wrapper `status: passed`, backend `rocm`, return code `0`,
   supervision `timed_out: false`, `reap: normal`, `signals_sent: []`, and the
   measurement `status: passed` with device ordinal `0`, BF16 weights,
-  activations, and logits with FP32 accumulation, reference SHA-256
-  `8eba795e…43a`, and all five fixed cases in order. Per case the measurement
+  activations, and logits with FP32 accumulation, and all five fixed cases in
+  order. Per case the measurement
   records: raw production greedy `token_ids 3681,29889,13,13`,
   `stop_reason max_new_tokens`, cache lengths `9` for all 22 layers,
   `decode_forward_count 3`, `time_to_first_token 49222253 ns`,
@@ -258,16 +368,11 @@ leaf begin at line 3544.
   zero-token case), and the trace rows retain unique operation IDs with
   `prefill`/`decode` phases, position windows, run lengths `6`/`18` then `1`,
   and `succeeded` wait states.
-- **Bounded profiler payload**, mirror `tinyllama16-official-a1`, fresh sync,
-  the exact command in the section above with
-  `IOM_EVIDENCE_DIR=/home/rlew/agent-work/iom-reference/tinyllama16-rocm-profile`
-  and `IOM_TEST_MODEL_EVIDENCE=/home/rlew/agent-work/iom-reference/tinyllama16-rocm-official-profiled-evidence.json`:
-  exit `0` in 127 seconds including profiling, the wrapper again reporting
-  `status: passed` for backend `rocm` with the same reference digest, and the
-  profiled measurement again passing all five cases with mode parity. The
-  kernel trace is retained at
-  `/home/rlew/agent-work/iom-reference/tinyllama16-rocm-profile/rocm-model/bh2/3834784_kernel_trace.csv`
-  (65598 dispatches, 14 MB) beside the HIP, HSA, memory, and agent traces.
+- **Kernel-trace regeneration**, source commit `acfe4cb1befb07933afc658427cb1d46f8866d6f`,
+  after fresh `csw-remote` sync: the documented `rocprofv3 --kernel-trace -f csv`
+  command completed with exit `0` in `115.98` seconds under the bounded ROCm
+  device lock. Its wrapper evidence reports `status: passed`; the regenerated
+  CSV contains `65,598` dispatch rows. Exact output sizes are in the table above.
 
   Its dispatch counts decompose exactly into the executed forwards:
   `linear_bf16_pack_kernel`, `linear_bf16_wmma_kernel`, and
